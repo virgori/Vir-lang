@@ -1,13 +1,10 @@
 # Vir – VIRGORI-CORE Engine
 
-> **Natural Language Programming • Abstract Q-IR Core • Binary Self-Patching**
-
-🌐 **Language / Ngôn ngữ / 语言:**
-[English](README_EN.md) | [Tiếng Việt](README_VI.md) | [简体中文](README_ZH_CN.md) | [繁體中文](README_ZH_TW.md)
+> **Lập trình bằng ngôn ngữ tự nhiên • Lõi máy trừu tượng Q-IR • Tự vá mã máy**
 
 ---
 
-## Overview / Tổng quan
+## Tổng quan
 
 **Vir** là một ngôn ngữ lập trình thử nghiệm cho phép viết code bằng **ngôn ngữ tự nhiên** (Tiếng Việt, 中文, 日本語, 한국어, English), biên dịch xuống một tầng máy trừu tượng (Q-IR), và runtime có khả năng **tự vá mã nhị phân** (binary self-patching) dựa trên trạng thái CPU thực tế.
 
@@ -38,7 +35,7 @@ Mỗi sublib adapter ánh xạ các cụm từ bản địa → `TokenKind` chu�
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  Tầng 1: Multilingual Frontend                      │
+│  Tầng 1: Giao diện Đa ngôn ngữ (Frontend)           │
 │  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
 │  │ N-Gram       │→ │ Parser   │→ │ AST           │  │
 │  │ Tokenizer    │  │          │  │               │  │
@@ -46,29 +43,29 @@ Mỗi sublib adapter ánh xạ các cụm từ bản địa → `TokenKind` chu�
 │          ↑                                           │
 │    SubLibAdapter (vi / zh / ja / ko / en / …)        │
 ├─────────────────────────────────────────────────────┤
-│  Tầng 2: Virtual Machine (Q-IR)                     │
+│  Tầng 2: Máy ảo (Q-IR)                              │
 │  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
 │  │ IR Builder   │→ │Optimizer │→ │ QModule       │  │
 │  │              │  │ (fold,   │  │ (SSA form)    │  │
 │  │              │  │  DCE)    │  │               │  │
 │  └──────────────┘  └──────────┘  └───────────────┘  │
-│  Virtual Registers: R₀, R₁, …, Rₙ (unlimited)      │
+│  Thanh ghi ảo: R₀, R₁, …, Rₙ (không giới hạn)       │
 ├─────────────────────────────────────────────────────┤
-│  Tầng 3: Self-Patching Backend                      │
+│  Tầng 3: Backend Tự-vá mã                           │
 │  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
 │  │ CodeGen      │→ │ Binary   │→ │ Jump Table    │  │
 │  │ (x86_64 /   │  │ Patcher  │  │ Indirection   │  │
 │  │  arm64)      │  │          │  │               │  │
 │  └──────────────┘  └──────────┘  └───────────────┘  │
-│  Multi-versioning: Bản A (Safe) / Bản B (Fast)      │
+│  Multi-versioning: Bản A (An toàn) / Bản B (Nhanh)  │
 ├─────────────────────────────────────────────────────┤
-│  Tầng 4: Runtime & Security                         │
+│  Tầng 4: Runtime & Bảo mật                          │
 │  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
 │  │ JIT Engine   │  │ Bridge   │  │ Internal      │  │
 │  │ (Evolution   │  │ API      │  │ Signer        │  │
 │  │  Loop)       │  │ (OS)     │  │ (HMAC-SHA256) │  │
 │  └──────────────┘  └──────────┘  └───────────────┘  │
-│  Register Pressure Monitor → Auto-patch khi CPU rảnh │
+│  Monitor áp lực thanh ghi → Tự vá khi CPU rảnh      │
 └─────────────────────────────────────────────────────┘
 ```
 
@@ -142,41 +139,41 @@ python examples/demo.py
 ```
 Vir/
 ├── src/
-│   ├── lib/              # 🔑 Single Source of Truth (English)
+│   ├── lib/              # 🔑 Nguồn chuẩn duy nhất (Tiếng Anh)
 │   │   └── keywords.py   # TokenKind enum, KeywordRegistry
-│   ├── sublib/           # 🌍 Native Language Adapters
+│   ├── sublib/           # 🌍 Adapter Ngôn ngữ Bản địa
 │   │   ├── base.py       # SubLibAdapter ABC, SubLibRegistry
-│   │   ├── vi.py         # 🇻🇳 Tiếng Việt  (~100+ phrases)
-│   │   ├── zh.py         # 🇨🇳 中文         (~90+ phrases)
-│   │   ├── ja.py         # 🇯🇵 日本語       (~90+ phrases)
-│   │   ├── ko.py         # 🇰🇷 한국어       (~70+ phrases)
-│   │   └── en.py         # 🇬🇧 English     (auto-generated)
+│   │   ├── vi.py         # 🇻🇳 Tiếng Việt  (~100+ cụm từ)
+│   │   ├── zh.py         # 🇨🇳 中文         (~90+ cụm từ)
+│   │   ├── ja.py         # 🇯🇵 日本語       (~90+ cụm từ)
+│   │   ├── ko.py         # 🇰🇷 한국어       (~70+ cụm từ)
+│   │   └── en.py         # 🇬🇧 English     (tự sinh)
 │   ├── frontend/         # Tầng 1: Tokens → AST
-│   │   ├── tokenizer/    # N-Gram Tokenizer (uses SubLibAdapter)
-│   │   ├── parser/       # Recursive-descent Parser (uses TokenKind)
-│   │   └── sublib/       # [Legacy] Sublib Mapping loader
-│   ├── ir/               # Tầng 2: Q-IR Virtual Machine
+│   │   ├── tokenizer/    # N-Gram Tokenizer (dùng SubLibAdapter)
+│   │   ├── parser/       # Recursive-descent Parser (dùng TokenKind)
+│   │   └── sublib/       # [Di sản] Sublib Mapping loader
+│   ├── ir/               # Tầng 2: Máy ảo Q-IR
 │   │   ├── instructions/ # Opcode, QInstruction, IR Builder
 │   │   ├── optimizer/    # Constant folding, DCE
-│   │   └── registers/    # Virtual register allocator
-│   ├── backend/          # Tầng 3: Self-Patching Backend
-│   │   ├── codegen/      # x86_64 / arm64 code generation
-│   │   ├── patcher/      # Binary patching, JIT memory
-│   │   └── monitor/      # Register pressure monitor
-│   ├── runtime/          # Tầng 4: Runtime lifecycle
+│   │   └── registers/    # Bộ cấp phát thanh ghi ảo
+│   ├── backend/          # Tầng 3: Backend Tự-vá mã
+│   │   ├── codegen/      # Sinh mã x86_64 / arm64
+│   │   ├── patcher/      # Vá nhị phân, bộ nhớ JIT
+│   │   └── monitor/      # Monitor áp lực thanh ghi
+│   ├── runtime/          # Tầng 4: Vòng đời Runtime
 │   │   ├── lifecycle/    # Orchestrator + CLI
-│   │   ├── jit/          # JIT Engine (evolution loop)
+│   │   ├── jit/          # JIT Engine (vòng tiến hóa)
 │   │   └── bridge/       # OS Bridge API
 │   └── security/         # Bảo mật
-│       ├── signer/       # Internal HMAC signer
-│       └── validator/    # Code integrity validator
-├── core/                 # 🔧 C/ASM Native Core (libvir_core)
-│   ├── src/              # C11 sources
-│   ├── asm/              # ARM64 & x86_64 Assembly
-│   ├── include/          # Public headers
+│       ├── signer/       # Bộ ký HMAC nội bộ
+│       └── validator/    # Bộ xác thực tính toàn vẹn mã
+├── core/                 # 🔧 Lõi Native C/ASM (libvir_core)
+│   ├── src/              # Mã nguồn C11
+│   ├── asm/              # Assembly ARM64 & x86_64
+│   ├── include/          # Header công khai
 │   └── lib/              # libvir_core.a / .dylib
 ├── config/
-│   └── sublib_mapping.json   # [Legacy] Bảng ánh xạ JSON
+│   └── sublib_mapping.json   # [Di sản] Bảng ánh xạ JSON
 ├── tests/                # Unit & integration tests
 ├── examples/             # Ví dụ .vir + demo scripts
 └── docs/                 # Tài liệu kiến trúc
@@ -200,7 +197,7 @@ class ThaiAdapter(SubLibAdapter):
             PhraseEntry("ถ้า", TokenKind.IF, "control_flow"),
             PhraseEntry("ฟังก์ชัน", TokenKind.FUNC_DEF, "definition"),
             PhraseEntry("บวก", TokenKind.OP_ADD, "arithmetic"),
-            # ... thêm phrases
+            # ... thêm các cụm từ khác
         ]
 
     def _define_stop_words(self):
@@ -213,17 +210,17 @@ class ThaiAdapter(SubLibAdapter):
 
 | Giai đoạn | Mô tả |
 |-----------|-------|
-| **1. Soạn thảo** | Coder viết Tiếng Việt → Frontend dịch sang Q-IR |
+| **1. Soạn thảo** | Lập trình viên viết ngôn ngữ tự nhiên → Frontend dịch sang Q-IR |
 | **2. Chuẩn bị** | Backend tạo file nhị phân + Q_PATCH_POINT |
 | **3. Khởi chạy** | Chương trình xin quyền JIT từ OS |
-| **4. Tiến hóa** | AI Agent liên tục kiểm tra chip → vá Assembly khi CPU rảnh |
+| **4. Tiến hóa** | AI Agent liên tục theo dõi CPU → vá Assembly khi CPU rảnh |
 
 ---
 
-## Tương thích OS
+## Tương thích hệ điều hành
 
 | OS | Cơ chế JIT |
-|----|-----------|
+|----|------------|
 | **macOS** | `MAP_JIT` + `pthread_jit_write_protect_np(0/1)` |
 | **Linux** | `mmap(MAP_ANONYMOUS)` + `sys_mprotect` |
 | **Windows** | `VirtualAlloc(PAGE_EXECUTE_READWRITE)` |
@@ -239,6 +236,6 @@ python -m pytest tests/ -v
 
 ---
 
-## License
+## Giấy phép
 
 MIT

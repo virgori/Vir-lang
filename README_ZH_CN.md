@@ -1,19 +1,16 @@
-# Vir – VIRGORI-CORE Engine
+# Vir – VIRGORI-CORE 引擎
 
-> **Natural Language Programming • Abstract Q-IR Core • Binary Self-Patching**
-
-🌐 **Language / Ngôn ngữ / 语言:**
-[English](README_EN.md) | [Tiếng Việt](README_VI.md) | [简体中文](README_ZH_CN.md) | [繁體中文](README_ZH_TW.md)
+> **自然语言编程 • Q-IR 抽象机核心 • 二进制自修补**
 
 ---
 
-## Overview / Tổng quan
+## 概述
 
-**Vir** là một ngôn ngữ lập trình thử nghiệm cho phép viết code bằng **ngôn ngữ tự nhiên** (Tiếng Việt, 中文, 日本語, 한국어, English), biên dịch xuống một tầng máy trừu tượng (Q-IR), và runtime có khả năng **tự vá mã nhị phân** (binary self-patching) dựa trên trạng thái CPU thực tế.
+**Vir** 是一种实验性编程语言，允许使用**自然语言**（越南语、中文、日语、韩语、英语）编写代码，编译到抽象机层（Q-IR），运行时能够根据实际 CPU 状态进行**二进制自修补**。
 
-### Kiến trúc lib / sublib
+### lib / sublib 架构
 
-Vir tách biệt **lib** (chuẩn Tiếng Anh – single source of truth) và **sublib** (lớp ánh xạ ngôn ngữ bản địa):
+Vir 将 **lib**（英语标准 – 唯一真实来源）和 **sublib**（本地语言映射层）分离：
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -32,13 +29,13 @@ Vir tách biệt **lib** (chuẩn Tiếng Anh – single source of truth) và **
   "nếu"→IF    "如果"→IF  "もし"→IF "만약"→IF  "if"→IF
 ```
 
-Mỗi sublib adapter ánh xạ các cụm từ bản địa → `TokenKind` chuẩn, cho phép Tokenizer + Parser hoạt động thống nhất bất kể ngôn ngữ đầu vào.
+每个 sublib 适配器将本地短语映射到标准 `TokenKind`，使 Tokenizer + Parser 能够统一工作，无论输入语言是什么。
 
-### Kiến trúc 4 tầng
+### 四层架构
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  Tầng 1: Multilingual Frontend                      │
+│  第一层：多语言前端                                   │
 │  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
 │  │ N-Gram       │→ │ Parser   │→ │ AST           │  │
 │  │ Tokenizer    │  │          │  │               │  │
@@ -46,59 +43,59 @@ Mỗi sublib adapter ánh xạ các cụm từ bản địa → `TokenKind` chu�
 │          ↑                                           │
 │    SubLibAdapter (vi / zh / ja / ko / en / …)        │
 ├─────────────────────────────────────────────────────┤
-│  Tầng 2: Virtual Machine (Q-IR)                     │
+│  第二层：虚拟机 (Q-IR)                               │
 │  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
 │  │ IR Builder   │→ │Optimizer │→ │ QModule       │  │
 │  │              │  │ (fold,   │  │ (SSA form)    │  │
 │  │              │  │  DCE)    │  │               │  │
 │  └──────────────┘  └──────────┘  └───────────────┘  │
-│  Virtual Registers: R₀, R₁, …, Rₙ (unlimited)      │
+│  虚拟寄存器：R₀, R₁, …, Rₙ（无限制）                  │
 ├─────────────────────────────────────────────────────┤
-│  Tầng 3: Self-Patching Backend                      │
+│  第三层：自修补后端                                   │
 │  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
 │  │ CodeGen      │→ │ Binary   │→ │ Jump Table    │  │
 │  │ (x86_64 /   │  │ Patcher  │  │ Indirection   │  │
 │  │  arm64)      │  │          │  │               │  │
 │  └──────────────┘  └──────────┘  └───────────────┘  │
-│  Multi-versioning: Bản A (Safe) / Bản B (Fast)      │
+│  多版本：版本 A（安全）/ 版本 B（快速）                │
 ├─────────────────────────────────────────────────────┤
-│  Tầng 4: Runtime & Security                         │
+│  第四层：运行时 & 安全                               │
 │  ┌──────────────┐  ┌──────────┐  ┌───────────────┐  │
 │  │ JIT Engine   │  │ Bridge   │  │ Internal      │  │
 │  │ (Evolution   │  │ API      │  │ Signer        │  │
 │  │  Loop)       │  │ (OS)     │  │ (HMAC-SHA256) │  │
 │  └──────────────┘  └──────────┘  └───────────────┘  │
-│  Register Pressure Monitor → Auto-patch khi CPU rảnh │
+│  寄存器压力监控 → CPU 空闲时自动修补                   │
 └─────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Cài đặt
+## 安装
 
 ```bash
 cd Vir
 pip install -e ".[dev]"
 ```
 
-## Sử dụng
+## 使用
 
-### REPL tương tác
+### 交互式 REPL
 
 ```bash
 python -m src.runtime.lifecycle.lifecycle --interactive --dump-ir --dump-asm
 ```
 
 ```
-vir> Nếu máy rảnh, tính tổng A và B bằng thanh ghi.
+vir> 如果 机器空闲 加 A 和 B 用 寄存器
 [Compiled in 0.42ms]
 
 ── Tokens ──
-<Token IF 'máy rảnh' @4>
-<Token OP_ADD 'tính tổng' @15>
+<Token IF '机器空闲' @4>
+<Token OP_ADD '加' @15>
 <Token IDENTIFIER 'a' @26>
 <Token IDENTIFIER 'b' @30>
-<Token TARGET_REGISTER 'thanh ghi' @38>
+<Token TARGET_REGISTER '寄存器' @38>
 
 ── Q-IR ──
 ; module main
@@ -112,7 +109,7 @@ func @__main__():
   Fast: 48 01 D8 90
 ```
 
-### Đa ngôn ngữ – Cùng một chương trình, nhiều ngôn ngữ
+### 多语言 – 同一程序，不同语言
 
 ```
 🇻🇳  Nếu máy rảnh, tính tổng A và B bằng thanh ghi.
@@ -121,15 +118,15 @@ func @__main__():
 🇰🇷  만약 CPU여유 더하기 A 와 B 레지스터로
 🇬🇧  if cpu_idle add A and B register
 ```
-Tất cả đều biên dịch ra cùng một Q-IR → cùng một mã máy.
+全部编译为相同的 Q-IR → 相同的机器码。
 
-### Biên dịch file `.vir`
+### 编译 `.vir` 文件
 
 ```bash
 python -m src.runtime.lifecycle.lifecycle examples/hello.vir --dump-ir
 ```
 
-### Demo script
+### 演示脚本
 
 ```bash
 python examples/demo.py
@@ -137,54 +134,54 @@ python examples/demo.py
 
 ---
 
-## Cấu trúc dự án
+## 项目结构
 
 ```
 Vir/
 ├── src/
-│   ├── lib/              # 🔑 Single Source of Truth (English)
+│   ├── lib/              # 🔑 唯一真实来源（英语）
 │   │   └── keywords.py   # TokenKind enum, KeywordRegistry
-│   ├── sublib/           # 🌍 Native Language Adapters
+│   ├── sublib/           # 🌍 本地语言适配器
 │   │   ├── base.py       # SubLibAdapter ABC, SubLibRegistry
-│   │   ├── vi.py         # 🇻🇳 Tiếng Việt  (~100+ phrases)
-│   │   ├── zh.py         # 🇨🇳 中文         (~90+ phrases)
-│   │   ├── ja.py         # 🇯🇵 日本語       (~90+ phrases)
-│   │   ├── ko.py         # 🇰🇷 한국어       (~70+ phrases)
-│   │   └── en.py         # 🇬🇧 English     (auto-generated)
-│   ├── frontend/         # Tầng 1: Tokens → AST
-│   │   ├── tokenizer/    # N-Gram Tokenizer (uses SubLibAdapter)
-│   │   ├── parser/       # Recursive-descent Parser (uses TokenKind)
-│   │   └── sublib/       # [Legacy] Sublib Mapping loader
-│   ├── ir/               # Tầng 2: Q-IR Virtual Machine
+│   │   ├── vi.py         # 🇻🇳 越南语   (~100+ 短语)
+│   │   ├── zh.py         # 🇨🇳 中文     (~90+ 短语)
+│   │   ├── ja.py         # 🇯🇵 日语     (~90+ 短语)
+│   │   ├── ko.py         # 🇰🇷 韩语     (~70+ 短语)
+│   │   └── en.py         # 🇬🇧 英语     (自动生成)
+│   ├── frontend/         # 第一层：Tokens → AST
+│   │   ├── tokenizer/    # N-Gram Tokenizer (使用 SubLibAdapter)
+│   │   ├── parser/       # 递归下降解析器 (使用 TokenKind)
+│   │   └── sublib/       # [遗留] Sublib 映射加载器
+│   ├── ir/               # 第二层：Q-IR 虚拟机
 │   │   ├── instructions/ # Opcode, QInstruction, IR Builder
-│   │   ├── optimizer/    # Constant folding, DCE
-│   │   └── registers/    # Virtual register allocator
-│   ├── backend/          # Tầng 3: Self-Patching Backend
-│   │   ├── codegen/      # x86_64 / arm64 code generation
-│   │   ├── patcher/      # Binary patching, JIT memory
-│   │   └── monitor/      # Register pressure monitor
-│   ├── runtime/          # Tầng 4: Runtime lifecycle
-│   │   ├── lifecycle/    # Orchestrator + CLI
-│   │   ├── jit/          # JIT Engine (evolution loop)
+│   │   ├── optimizer/    # 常量折叠, DCE
+│   │   └── registers/    # 虚拟寄存器分配器
+│   ├── backend/          # 第三层：自修补后端
+│   │   ├── codegen/      # x86_64 / arm64 代码生成
+│   │   ├── patcher/      # 二进制修补, JIT 内存
+│   │   └── monitor/      # 寄存器压力监控
+│   ├── runtime/          # 第四层：运行时生命周期
+│   │   ├── lifecycle/    # 编排器 + CLI
+│   │   ├── jit/          # JIT 引擎 (进化循环)
 │   │   └── bridge/       # OS Bridge API
-│   └── security/         # Bảo mật
-│       ├── signer/       # Internal HMAC signer
-│       └── validator/    # Code integrity validator
-├── core/                 # 🔧 C/ASM Native Core (libvir_core)
-│   ├── src/              # C11 sources
-│   ├── asm/              # ARM64 & x86_64 Assembly
-│   ├── include/          # Public headers
+│   └── security/         # 安全
+│       ├── signer/       # 内部 HMAC 签名器
+│       └── validator/    # 代码完整性验证器
+├── core/                 # 🔧 C/ASM 原生核心 (libvir_core)
+│   ├── src/              # C11 源代码
+│   ├── asm/              # ARM64 & x86_64 汇编
+│   ├── include/          # 公共头文件
 │   └── lib/              # libvir_core.a / .dylib
 ├── config/
-│   └── sublib_mapping.json   # [Legacy] Bảng ánh xạ JSON
-├── tests/                # Unit & integration tests
-├── examples/             # Ví dụ .vir + demo scripts
-└── docs/                 # Tài liệu kiến trúc
+│   └── sublib_mapping.json   # [遗留] JSON 映射表
+├── tests/                # 单元测试 & 集成测试
+├── examples/             # 示例 .vir + 演示脚本
+└── docs/                 # 架构文档
 ```
 
-### Thêm ngôn ngữ mới
+### 添加新语言
 
-Tạo file `src/sublib/<lang>.py` kế thừa `SubLibAdapter`:
+创建文件 `src/sublib/<lang>.py` 继承 `SubLibAdapter`：
 
 ```python
 from src.sublib.base import SubLibAdapter, SubLibRegistry, PhraseEntry
@@ -200,7 +197,7 @@ class ThaiAdapter(SubLibAdapter):
             PhraseEntry("ถ้า", TokenKind.IF, "control_flow"),
             PhraseEntry("ฟังก์ชัน", TokenKind.FUNC_DEF, "definition"),
             PhraseEntry("บวก", TokenKind.OP_ADD, "arithmetic"),
-            # ... thêm phrases
+            # ... 添加更多短语
         ]
 
     def _define_stop_words(self):
@@ -209,28 +206,28 @@ class ThaiAdapter(SubLibAdapter):
 
 ---
 
-## Quy trình thực thi (Runtime Life-cycle)
+## 运行时生命周期
 
-| Giai đoạn | Mô tả |
-|-----------|-------|
-| **1. Soạn thảo** | Coder viết Tiếng Việt → Frontend dịch sang Q-IR |
-| **2. Chuẩn bị** | Backend tạo file nhị phân + Q_PATCH_POINT |
-| **3. Khởi chạy** | Chương trình xin quyền JIT từ OS |
-| **4. Tiến hóa** | AI Agent liên tục kiểm tra chip → vá Assembly khi CPU rảnh |
+| 阶段 | 描述 |
+|------|------|
+| **1. 编写** | 程序员使用自然语言编写 → 前端翻译为 Q-IR |
+| **2. 准备** | 后端创建二进制文件 + Q_PATCH_POINT |
+| **3. 启动** | 程序向 OS 请求 JIT 权限 |
+| **4. 进化** | AI Agent 持续监控 CPU → CPU 空闲时修补汇编 |
 
 ---
 
-## Tương thích OS
+## 操作系统兼容性
 
-| OS | Cơ chế JIT |
-|----|-----------|
+| OS | JIT 机制 |
+|----|----------|
 | **macOS** | `MAP_JIT` + `pthread_jit_write_protect_np(0/1)` |
 | **Linux** | `mmap(MAP_ANONYMOUS)` + `sys_mprotect` |
 | **Windows** | `VirtualAlloc(PAGE_EXECUTE_READWRITE)` |
 
 ---
 
-## Chạy tests
+## 运行测试
 
 ```bash
 cd Vir
@@ -239,6 +236,6 @@ python -m pytest tests/ -v
 
 ---
 
-## License
+## 许可证
 
 MIT
