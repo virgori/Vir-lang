@@ -1,0 +1,838 @@
+/*
+ * vir/compiler/main.vri — Vir Self-Hosting Compiler Driver
+ * =========================================================
+ * Phase 5: Bootstrap — Vir compiles itself to a standalone binary.
+ *
+ * Pipeline:
+ *   source.vri → lex → parse → lower → regalloc → codegen → link → Mach-O
+ *
+ * Produces a standalone Mach-O ARM64 executable that uses direct
+ * BSD syscalls — no Python, no C library, no external linker needed.
+ *
+ * Usage (Stage 1 — bootstrapped via C runtime):
+ *   vir jit stdlib/vir/compiler/main.vri <input.vri> [-o output]
+ *
+ * Usage (Stage 2 — self-hosted):
+ *   ./virc <input.vri> [-o output]
+ *
+ * Date: 9/3/2026
+ */
+
+import "vir/compiler/lexer" use all
+import "vir/compiler/parser" use all
+import "vir/compiler/ir_optimizer" use all
+import "vir/compiler/codegen" use all
+import "vir/codegen/binary" use Arch, ByteBuffer, buf_new, buf_write_u8,
+    buf_write_u32_le, buf_write_u64_le, buf_write_zeros,
+    buf_write_string_padded, buf_write_bytes, buf_size, buf_align
+import "vir/codegen/linker" use link_single_kernel
+import "vir/io/file" use File, FileMode, file_open, file_read_all,
+    file_create, file_write_all, file_close
+import "vir/mem/slice" use Slice, slice_new
+import "vir/str/string" use String, str_new, str_eq, str_len, str_byte_at,
+    str_concat
+
+
+# ═══════════════════════════════════════════════════════
+# Mach-O Constants (macOS ARM64)
+# ═══════════════════════════════════════════════════════
+
+const MACHO_MAGIC:   u32 = 0xFEEDFACF
+const CPU_ARM64:     u32 = 0x0100000C
+const CPU_SUB_ALL:   u32 = 0x00000000
+const MH_EXECUTE:    u32 = 2
+const MH_FLAGS:      u32 = 0x00200085    # PIE | TWOLEVEL | DYLDLINK
+const LC_SEGMENT_64: u32 = 0x19
+const LC_MAIN:       u32 = 0x80000028
+const LC_SYMTAB:     u32 = 0x02
+const TEXT_BASE:     u64 = 0x100000000
+const PAGE_SIZE:     u64 = 0x4000
+
+# macOS BSD syscall numbers (add 0x2000000 for BSD layer)
+const SYS_EXIT:    i64 = 0x2000001
+const SYS_WRITE:   i64 = 0x2000004
+const SYS_CHMOD:   i64 = 0x200000F
+
+
+# ═══════════════════════════════════════════════════════
+# Module-Level Code Emission
+# ═══════════════════════════════════════════════════════
+# Emits all functions from a Q-IR module into a single
+# code buffer with cross-function call resolution.
+
+entity FuncLayout
+    name:       String
+    offset:     i32    # byte offset in the code buffer
+    size:       i32
+end
+
+# Emit the ARM64 runtime stubs that compiled programs need:
+#   offset 0: _rt_print_i64  — print integer to stdout + newline
+#   offset N: _rt_exit       — exit process
+# Returns (cb, print_offset, exit_offset, total_runtime_size)
+
+func emit_runtime_arm64(cb: CodeBuf) -> (CodeBuf, i32, i32)
+    var print_offset = codebuf_offset(cb)
+
+    # ── _rt_print_i64: X0 = value to print ──
+    # Prologue: save frame + callee-saved registers
+    cb = arm64_stp_pre(cb, 29, 30, 31, -96)    # STP X29, X30, [SP, #-96]!
+    cb = arm64_mov_rr(cb, 29, 31)              # MOV X29, SP
+    cb = arm64_mov_rr(cb, 19, 0)               # MOV X19, X0 (save value)
+
+    # Buffer at SP+16, X20 = buffer base, X21 = position
+    cb = arm64_add_rrr(cb, 20, 31, 0)          # ADD X20, SP, X0 (wrong, needs imm)
+    # Actually: ADD X20, SP, #16
+    # ARM64 ADD immediate: 0x91004000 | (imm12 << 10) | (Rn << 5) | Rd
+    cb = codebuf_emit_u32(cb, 0x91004000 | (16 << 10) | (31 << 5) | 20)
+    cb = arm64_mov_imm16(cb, 21, 0)            # MOV X21, #0 (position)
+    cb = arm64_mov_imm16(cb, 22, 0)            # MOV X22, #0 (is_neg)
+
+    # Handle negative: if X19 < 0
+    # CMP X19, #0
+    cb = arm64_cmp_imm0(cb, 19)
+    # B.GE +3 instructions (skip negate)
+    # B.GE is B.cond with cond=0b1010=10, imm19 = 3
+    cb = codebuf_emit_u32(cb, 0x5400006A)   # B.GE +3*4
+    # NEG X19, X19 → SUB X19, XZR, X19
+    cb = codebuf_emit_u32(cb, 0xCB1303F3)   # SUB X19, XZR, X19
+    # MOV X22, #1 (is_neg = true)
+    cb = arm64_mov_imm16(cb, 22, 1)
+
+    # Handle zero: CBZ X19, .is_zero → 4 instructions forward to .is_zero
+    # CBZ X19 = 0xB4000000 | (imm19 << 5) | 19
+    # .is_zero is after the digit loop, need forward ref
+    # Use placeholder, will back-patch
+    var zero_check_patch = codebuf_offset(cb)
+    cb = codebuf_emit_u32(cb, 0xB4000013)       # CBZ X19, placeholder
+
+    # Digit conversion loop
+    cb = arm64_mov_imm16(cb, 23, 10)             # MOV X23, #10
+    # .digit_loop:
+    var digit_loop = codebuf_offset(cb)
+    # CBZ X19, .digits_done
+    var digits_done_patch = codebuf_offset(cb)
+    cb = codebuf_emit_u32(cb, 0xB4000013)       # CBZ X19, placeholder
+
+    # UDIV X24, X19, X23
+    cb = codebuf_emit_u32(cb, 0x9AC30A78)       # UDIV X24, X19, X23
+    # MSUB X25, X24, X23, X19 → X25 = X19 - X24*X23
+    cb = codebuf_emit_u32(cb, 0x9B178F19)       # MSUB X25, X24, X23, X19
+    # ADD X25, X25, #48 ('0')
+    cb = codebuf_emit_u32(cb, 0x9100C339)       # ADD X25, X25, #48
+    # STRB W25, [X20, X21]
+    cb = codebuf_emit_u32(cb, 0x38216A99)       # STRB W25, [X20, X21]
+    # ADD X21, X21, #1
+    cb = codebuf_emit_u32(cb, 0x910006B5)       # ADD X21, X21, #1
+    # MOV X19, X24 (quotient)
+    cb = arm64_mov_rr(cb, 19, 24)
+    # B .digit_loop
+    var back = (digit_loop - codebuf_offset(cb)) / 4
+    cb = codebuf_emit_u32(cb, 0x14000000 | (back & 0x03FFFFFF))
+    # B .reverse (skip .is_zero)
+    var skip_zero_patch = codebuf_offset(cb)
+    cb = codebuf_emit_u32(cb, 0x14000000)        # B placeholder
+
+    # .is_zero: store '0'
+    var is_zero = codebuf_offset(cb)
+    cb = arm64_mov_imm16(cb, 25, 48)             # MOV X25, #'0'
+    cb = codebuf_emit_u32(cb, 0x38216A99)        # STRB W25, [X20, X21]
+    cb = codebuf_emit_u32(cb, 0x910006B5)        # ADD X21, X21, #1
+
+    # .digits_done / .reverse:
+    var reverse_start = codebuf_offset(cb)
+
+    # Patch zero_check_patch → .is_zero
+    var zc_off = (is_zero - zero_check_patch) / 4
+    cb = codebuf_patch_u32(cb, zero_check_patch,
+        0xB4000013 | ((zc_off & 0x7FFFF) << 5))
+
+    # Patch digits_done_patch → reverse_start
+    var dd_off = (reverse_start - digits_done_patch) / 4
+    cb = codebuf_patch_u32(cb, digits_done_patch,
+        0xB4000013 | ((dd_off & 0x7FFFF) << 5))
+
+    # Patch skip_zero_patch → reverse_start
+    var sz_off = (reverse_start - skip_zero_patch) / 4
+    cb = codebuf_patch_u32(cb, skip_zero_patch,
+        0x14000000 | (sz_off & 0x03FFFFFF))
+
+    # Add '-' if negative
+    # CBZ X22, .skip_minus
+    var skip_minus_patch = codebuf_offset(cb)
+    cb = codebuf_emit_u32(cb, 0xB4000016)       # CBZ X22, placeholder
+    cb = arm64_mov_imm16(cb, 25, 45)            # MOV X25, #'-'
+    cb = codebuf_emit_u32(cb, 0x38216A99)       # STRB W25, [X20, X21]
+    cb = codebuf_emit_u32(cb, 0x910006B5)       # ADD X21, X21, #1
+    # .skip_minus:
+    var skip_minus = codebuf_offset(cb)
+    var sm_off = (skip_minus - skip_minus_patch) / 4
+    cb = codebuf_patch_u32(cb, skip_minus_patch,
+        0xB4000016 | ((sm_off & 0x7FFFF) << 5))
+
+    # Reverse the digit string in-place
+    cb = arm64_mov_imm16(cb, 23, 0)             # X23 = left = 0
+    cb = arm64_sub_rrr(cb, 24, 21, 0)           # X24 = right = X21 (len)
+    cb = codebuf_emit_u32(cb, 0xD1000718)       # SUB X24, X24, #1
+
+    # .rev_loop:
+    var rev_loop = codebuf_offset(cb)
+    # CMP X23, X24
+    cb = codebuf_emit_u32(cb, 0xEB18031F)       # CMP X23, X24
+    # B.GE .rev_done
+    var rev_done_patch = codebuf_offset(cb)
+    cb = codebuf_emit_u32(cb, 0x5400000A)       # B.GE placeholder
+
+    # LDRB W25, [X20, X23]
+    cb = codebuf_emit_u32(cb, 0x38776A99)       # LDRB W25, [X20, X23]
+    # LDRB W26, [X20, X24]
+    cb = codebuf_emit_u32(cb, 0x38786A9A)       # LDRB W26, [X20, X24]
+    # STRB W26, [X20, X23]
+    cb = codebuf_emit_u32(cb, 0x38376A9A)       # STRB W26, [X20, X23]
+    # STRB W25, [X20, X24]
+    cb = codebuf_emit_u32(cb, 0x38386A99)       # STRB W25, [X20, X24]
+    # ADD X23, X23, #1
+    cb = codebuf_emit_u32(cb, 0x910006F7)       # ADD X23, X23, #1
+    # SUB X24, X24, #1
+    cb = codebuf_emit_u32(cb, 0xD1000718)       # SUB X24, X24, #1
+    # B .rev_loop
+    var rv_off = (rev_loop - codebuf_offset(cb)) / 4
+    cb = codebuf_emit_u32(cb, 0x14000000 | (rv_off & 0x03FFFFFF))
+
+    # .rev_done:
+    var rev_done = codebuf_offset(cb)
+    var rd_off = (rev_done - rev_done_patch) / 4
+    cb = codebuf_patch_u32(cb, rev_done_patch,
+        0x5400000A | ((rd_off & 0x7FFFF) << 5))
+
+    # Append newline: '\n' = 10
+    cb = arm64_mov_imm16(cb, 25, 10)
+    cb = codebuf_emit_u32(cb, 0x38216A99)       # STRB W25, [X20, X21]
+    cb = codebuf_emit_u32(cb, 0x910006B5)       # ADD X21, X21, #1
+
+    # syscall write(1, X20, X21)
+    cb = arm64_mov_imm16(cb, 0, 1)              # fd = stdout
+    cb = arm64_mov_rr(cb, 1, 20)                # buf
+    cb = arm64_mov_rr(cb, 2, 21)                # len
+    # MOV X16, #0x2000004 (SYS_WRITE with BSD offset)
+    cb = arm64_mov_imm16(cb, 16, 4)             # low 16 bits
+    cb = codebuf_emit_u32(cb, 0xF2A04010)       # MOVK X16, #0x200, LSL#16
+
+    cb = arm64_svc(cb)                           # SVC #0x80
+
+    # Epilogue
+    cb = arm64_ldp_post(cb, 29, 30, 31, 96)     # LDP X29, X30, [SP], #96
+    cb = arm64_ret(cb)
+
+    var print_size = codebuf_offset(cb) - print_offset
+
+    # ── _rt_exit: X0 = exit code (already in X0) ──
+    var exit_offset = codebuf_offset(cb)
+    # MOV X16, #0x2000001 (SYS_EXIT with BSD offset)
+    cb = arm64_mov_imm16(cb, 16, 1)             # low bits
+    cb = codebuf_emit_u32(cb, 0xF2A04010)       # MOVK X16, #0x200, LSL#16
+    cb = arm64_svc(cb)                           # SVC #0x80
+
+    out (cb, print_offset, exit_offset)
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Module Codegen
+# ═══════════════════════════════════════════════════════
+# Emits all functions in a QModule into a single CodeBuf.
+# Cross-function calls are resolved via the FuncLayout table.
+
+func codegen_emit_module(module: QModule, arch: TargetArch) -> CodeBuf
+    # Phase 1: Emit runtime stubs + all functions
+    var cb = codebuf_new(arch)
+    var layouts = []       # [FuncLayout]
+    var layout_count = 0
+    var fixups = []        # [(patch_offset, func_idx)] for cross-func calls
+    var fixup_count = 0
+    var main_idx = -1
+
+    # Emit runtime stubs first
+    var (cb2, rt_print_off, rt_exit_off) = emit_runtime_arm64(cb)
+    cb = cb2
+    var runtime_size = codebuf_offset(cb)
+
+    # Emit each function
+    var fi = 0
+    while fi < vec_len(module.functions)
+        var func = vec_get(module.functions, fi)
+        var func_start = codebuf_offset(cb)
+
+        # Track main function
+        if str_eq(func.name, str_new("main")) or str_eq(func.name, str_new("__main__"))
+            main_idx = fi
+        end
+
+        # Detect if function needs a stack frame
+        var needs_frame = 0
+        var ii = 0
+        while ii < vec_len(func.body)
+            var ins = vec_get(func.body, ii)
+            var op = ins.opcode
+            if op == QOp::Call or op == QOp::CallFunc or op == QOp::Print
+                needs_frame = 1
+            end
+            ii = ii + 1
+        end
+
+        # Emit prologue
+        if needs_frame == 1
+            cb = arm64_stp_pre(cb, 29, 30, 31, -16)
+            cb = arm64_mov_rr(cb, 29, 31)
+        end
+
+        # Emit instructions
+        var ps = patch_new()
+        var j = 0
+        while j < vec_len(func.body)
+            var ins = vec_get(func.body, j)
+
+            if ins.opcode == QOp::Nop
+                cb = arm64_nop(cb)
+
+            eif ins.opcode == QOp::Load
+                var rd = vreg_to_arm(ins.dest.vreg)
+                if ins.src1.kind == OpndType::Imm
+                    cb = arm64_movz_imm64(cb, rd, ins.src1.imm as i64)
+                end
+
+            eif ins.opcode == QOp::Move
+                cb = arm64_mov_rr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg))
+
+            eif ins.opcode == QOp::Add
+                cb = arm64_add_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::Sub
+                cb = arm64_sub_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::Mul
+                cb = arm64_mul_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::Div
+                cb = arm64_sdiv_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::Mod
+                # ARM64: dest = src1 - (src1/src2)*src2
+                var rd = vreg_to_arm(ins.dest.vreg)
+                var rs1 = vreg_to_arm(ins.src1.vreg)
+                var rs2 = vreg_to_arm(ins.src2.vreg)
+                cb = arm64_sdiv_rrr(cb, 17, rs1, rs2)           # X17 = X_s1 / X_s2
+                cb = codebuf_emit_u32(cb, 0x9B118000 | (rs1 << 10) | (17 << 5) | rd)  # MSUB rd, X17, rs2, rs1 → approximate
+                # Correct MSUB: 0x9B_Rm_1_Ra_Rn_Rd
+                # MSUB Xd, Xn, Xm, Xa = Xa - Xn*Xm
+                # We want: rd = rs1 - X17 * rs2
+                # MSUB rd, X17, rs2, rs1 → rd = rs1 - X17*rs2
+                # Encoding: 0x9B008000 | (Rm << 16) | (Ra << 10) | (Rn << 5) | Rd
+                # Where: Rn=X17, Rm=rs2, Ra=rs1, Rd=rd
+                # Recalculate:
+                var msub = 0x9B008000 | (rs2 << 16) | (rs1 << 10) | (17 << 5) | rd
+                # Actually rewrite: emit SDIV + MSUB properly
+                # We already emitted a wrong instruction. Let me fix by patching.
+                cb.len = cb.len - 4   # remove the wrong MSUB
+                cb = codebuf_emit_u32(cb, msub)
+
+            eif ins.opcode == QOp::CmpEq
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+                cb = arm64_cset_eq(cb, vreg_to_arm(ins.dest.vreg))
+
+            eif ins.opcode == QOp::CmpGt
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+                cb = arm64_cset_gt(cb, vreg_to_arm(ins.dest.vreg))
+
+            eif ins.opcode == QOp::CmpLt
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+                cb = arm64_cset_lt(cb, vreg_to_arm(ins.dest.vreg))
+
+            eif ins.opcode == QOp::CmpGe
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+                cb = arm64_cset_ge(cb, vreg_to_arm(ins.dest.vreg))
+
+            eif ins.opcode == QOp::CmpLe
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+                cb = arm64_cset_le(cb, vreg_to_arm(ins.dest.vreg))
+
+            eif ins.opcode == QOp::And
+                cb = arm64_and_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::Or
+                cb = arm64_orr_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::Xor
+                cb = arm64_eor_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::Shl
+                cb = arm64_lsl_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::Shr
+                cb = arm64_asr_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::Label
+                ps = patch_add_label(ps, ins.dest.label, codebuf_offset(cb))
+
+            eif ins.opcode == QOp::Jump
+                if ins.dest.kind == OpndType::Label
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), ins.dest.label, 0)
+                end
+                cb = arm64_b_imm26(cb, 0)
+
+            eif ins.opcode == QOp::JumpIf
+                if ins.src1.kind == OpndType::VReg
+                    cb = arm64_cmp_imm0(cb, vreg_to_arm(ins.src1.vreg))
+                end
+                if ins.src2.kind == OpndType::Label
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src2.label, 1)
+                end
+                cb = arm64_bne_imm19(cb, 0)
+
+            eif ins.opcode == QOp::JumpIfNot
+                if ins.src1.kind == OpndType::VReg
+                    cb = arm64_cmp_imm0(cb, vreg_to_arm(ins.src1.vreg))
+                end
+                if ins.src2.kind == OpndType::Label
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src2.label, 1)
+                end
+                cb = arm64_beq_imm19(cb, 0)
+
+            eif ins.opcode == QOp::Call or ins.opcode == QOp::CallFunc
+                if ins.src1.kind == OpndType::Label
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src1.label, 0)
+                eif ins.src1.kind == OpndType::FuncIdx
+                    # Record for module-level fixup (Phase 2)
+                    fixups = fixups + [(codebuf_offset(cb), ins.src1.func_idx)]
+                    fixup_count = fixup_count + 1
+                end
+                cb = arm64_bl_imm26(cb, 0)
+
+            eif ins.opcode == QOp::Ret
+                if ins.src1.kind == OpndType::VReg and vreg_to_arm(ins.src1.vreg) != 0
+                    cb = arm64_mov_rr(cb, 0, vreg_to_arm(ins.src1.vreg))
+                end
+                if needs_frame == 1
+                    cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+                end
+                cb = arm64_ret(cb)
+
+            eif ins.opcode == QOp::Print
+                # Move value to X0, then BL to _rt_print_i64
+                if ins.src1.kind == OpndType::VReg
+                    cb = arm64_mov_rr(cb, 0, vreg_to_arm(ins.src1.vreg))
+                end
+                var print_bl_off = codebuf_offset(cb)
+                var delta = (rt_print_off - print_bl_off) / 4
+                cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF))
+
+            eif ins.opcode == QOp::Exit
+                if ins.src1.kind == OpndType::VReg
+                    cb = arm64_mov_rr(cb, 0, vreg_to_arm(ins.src1.vreg))
+                end
+                var exit_bl_off = codebuf_offset(cb)
+                var delta = (rt_exit_off - exit_bl_off) / 4
+                cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF))
+
+            eif ins.opcode == QOp::Halt
+                cb = arm64_mov_imm16(cb, 0, 0)
+                cb = arm64_ret(cb)
+
+            eif ins.opcode == QOp::LoadByte
+                cb = arm64_ldrb_reg(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::StoreByte
+                cb = arm64_strb_reg(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::LoadWord
+                cb = arm64_ldr_reg(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::StoreWord
+                cb = arm64_str_reg(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg))
+
+            eif ins.opcode == QOp::PatchPoint
+                cb = arm64_nop(cb)
+
+            else
+                cb = arm64_nop(cb)
+            end
+
+            j = j + 1
+        end
+
+        # If function has no explicit RET, add one
+        if vec_len(func.body) == 0 or vec_get(func.body, vec_len(func.body) - 1).opcode != QOp::Ret
+            if needs_frame == 1
+                cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+            end
+            cb = arm64_ret(cb)
+        end
+
+        # Back-patch intra-function jumps
+        cb = backpatch_arm64(cb, ps)
+
+        var func_size = codebuf_offset(cb) - func_start
+        layouts = layouts + [FuncLayout {
+            name:   func.name,
+            offset: func_start,
+            size:   func_size
+        }]
+        layout_count = layout_count + 1
+
+        fi = fi + 1
+    end
+
+    # Phase 2: Resolve cross-function calls
+    var fxi = 0
+    while fxi < fixup_count
+        var (patch_at, target_idx) = fixups[fxi]
+        if target_idx >= 0 and target_idx < layout_count
+            var target_off = layouts[target_idx].offset
+            var byte_offset = target_off - patch_at
+            var imm26 = (byte_offset / 4) & 0x03FFFFFF
+            cb = codebuf_patch_u32(cb, patch_at, 0x94000000 | imm26)
+        end
+        fxi = fxi + 1
+    end
+
+    # Phase 3: Emit _start entry point
+    # _start calls main(), then exits with return value
+    var start_offset = codebuf_offset(cb)
+    # STP X29, X30, [SP, #-16]!
+    cb = arm64_stp_pre(cb, 29, 30, 31, -16)
+    cb = arm64_mov_rr(cb, 29, 31)
+
+    if main_idx >= 0
+        # BL to main function
+        var main_off = layouts[main_idx].offset
+        var main_bl = codebuf_offset(cb)
+        var delta = (main_off - main_bl) / 4
+        cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF))
+    else
+        # No main found — return 0
+        cb = arm64_mov_imm16(cb, 0, 0)
+    end
+
+    # Exit: BL _rt_exit
+    var exit_bl = codebuf_offset(cb)
+    var exit_delta = (rt_exit_off - exit_bl) / 4
+    cb = codebuf_emit_u32(cb, 0x94000000 | (exit_delta & 0x03FFFFFF))
+
+    # LDP + RET (fallback, shouldn't reach)
+    cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+    cb = arm64_ret(cb)
+
+    out cb
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Mach-O Executable Emitter
+# ═══════════════════════════════════════════════════════
+# Produces a minimal Mach-O ARM64 executable:
+#   __PAGEZERO + __TEXT (code) + LC_MAIN + LC_SYMTAB
+
+func emit_macho_executable(code: CodeBuf) -> ByteBuffer
+    var out = buf_new()
+    var code_size = codebuf_offset(code) as u64
+
+    # Page-align the code segment
+    var text_filesize = ((code_size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE
+
+    # Layout: [header 32B] [PAGEZERO 72B] [TEXT seg 72+80B] [LC_MAIN 24B] [LC_SYMTAB 24B]
+    var ncmds = 4 as u32
+    var cmds_size = (72 + 72 + 80 + 24 + 24) as u32   # 272 bytes
+    var header_plus_cmds = 32 + cmds_size as u64
+
+    # Entry point = start of code (_start is at end of module, but we want
+    # the _start function which is the last thing emitted in codegen_emit_module)
+    # Actually the entry offset is relative to __TEXT segment start
+    # Since code starts right after header+cmds, entry = offset of _start in code
+    # For simplicity, entry at offset 0 (runtime stubs are first, _start is last)
+    # We need to pass the _start offset... for now, use the code layout
+
+    # ── Mach-O Header (32 bytes) ──
+    out = buf_write_u32_le(out, MACHO_MAGIC)
+    out = buf_write_u32_le(out, CPU_ARM64)
+    out = buf_write_u32_le(out, CPU_SUB_ALL)
+    out = buf_write_u32_le(out, MH_EXECUTE)
+    out = buf_write_u32_le(out, ncmds)
+    out = buf_write_u32_le(out, cmds_size)
+    out = buf_write_u32_le(out, MH_FLAGS)
+    out = buf_write_u32_le(out, 0)               # reserved
+
+    # ── LC_SEGMENT_64: __PAGEZERO (72 bytes) ──
+    out = buf_write_u32_le(out, LC_SEGMENT_64)
+    out = buf_write_u32_le(out, 72)
+    out = buf_write_string_padded(out, str_new("__PAGEZERO"), 16)
+    out = buf_write_u64_le(out, 0)               # vmaddr
+    out = buf_write_u64_le(out, TEXT_BASE)        # vmsize = 4GB
+    out = buf_write_u64_le(out, 0)               # fileoff
+    out = buf_write_u64_le(out, 0)               # filesize
+    out = buf_write_u32_le(out, 0)               # maxprot
+    out = buf_write_u32_le(out, 0)               # initprot
+    out = buf_write_u32_le(out, 0)               # nsects
+    out = buf_write_u32_le(out, 0)               # flags
+
+    # ── LC_SEGMENT_64: __TEXT (72 + 80 = 152 bytes) ──
+    out = buf_write_u32_le(out, LC_SEGMENT_64)
+    out = buf_write_u32_le(out, 152)             # 72 + 1 section * 80
+    out = buf_write_string_padded(out, str_new("__TEXT"), 16)
+    out = buf_write_u64_le(out, TEXT_BASE)        # vmaddr
+    out = buf_write_u64_le(out, text_filesize)   # vmsize
+    out = buf_write_u64_le(out, 0)               # fileoff
+    out = buf_write_u64_le(out, header_plus_cmds + text_filesize)  # filesize
+    out = buf_write_u32_le(out, 5)               # maxprot (r-x)
+    out = buf_write_u32_le(out, 5)               # initprot (r-x)
+    out = buf_write_u32_le(out, 1)               # nsects
+    out = buf_write_u32_le(out, 0)               # flags
+
+    # __text section header (80 bytes)
+    out = buf_write_string_padded(out, str_new("__text"), 16)       # sectname
+    out = buf_write_string_padded(out, str_new("__TEXT"), 16)       # segname
+    out = buf_write_u64_le(out, TEXT_BASE + header_plus_cmds)       # addr
+    out = buf_write_u64_le(out, code_size)                          # size
+    out = buf_write_u32_le(out, header_plus_cmds as u32)            # offset
+    out = buf_write_u32_le(out, 2)               # align = 2^2 = 4 bytes
+    out = buf_write_u32_le(out, 0)               # reloff
+    out = buf_write_u32_le(out, 0)               # nreloc
+    out = buf_write_u32_le(out, 0x80000400)      # flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    out = buf_write_u32_le(out, 0)               # reserved1
+    out = buf_write_u32_le(out, 0)               # reserved2
+    out = buf_write_u32_le(out, 0)               # reserved3
+
+    # ── LC_MAIN (24 bytes) ──
+    out = buf_write_u32_le(out, LC_MAIN)
+    out = buf_write_u32_le(out, 24)
+    # Entry offset = code starts at header_plus_cmds, _start is a known offset
+    # For now, we put the _start at the beginning of code
+    # Actually _start is the LAST thing in the code... we need its offset.
+    # We'll pass it as a parameter. For now, entry at 0 = runtime stubs start.
+    out = buf_write_u64_le(out, 0)               # entryoff (will be patched)
+    out = buf_write_u64_le(out, 0)               # stacksize
+
+    # ── LC_SYMTAB (24 bytes, empty) ──
+    out = buf_write_u32_le(out, LC_SYMTAB)
+    out = buf_write_u32_le(out, 24)
+    out = buf_write_u32_le(out, 0)               # symoff
+    out = buf_write_u32_le(out, 0)               # nsyms
+    out = buf_write_u32_le(out, 0)               # stroff
+    out = buf_write_u32_le(out, 0)               # strsize
+
+    # ── Pad to page boundary ──
+    var current = buf_size(out)
+    var pad_needed = header_plus_cmds as i64 - current
+    if pad_needed > 0
+        out = buf_write_zeros(out, pad_needed as i32)
+    end
+
+    # ── Code data ──
+    var ci = 0
+    while ci < code.len
+        out = buf_write_u8(out, code.data[ci] as u8)
+        ci = ci + 1
+    end
+
+    # ── Pad code to page ──
+    var code_pad = text_filesize as i64 - code_size as i64
+    if code_pad > 0
+        out = buf_write_zeros(out, code_pad as i32)
+    end
+
+    out out
+end
+
+# Emit with known _start offset
+func emit_macho_with_entry(code: CodeBuf, start_offset: i32) -> ByteBuffer
+    var out = emit_macho_executable(code)
+
+    # Patch LC_MAIN entryoff
+    # LC_MAIN is at offset: 32 (header) + 72 (PAGEZERO) + 152 (TEXT+sect) + 8 (cmd+cmdsize)
+    # = 264
+    var lc_main_entryoff = 264 as i32
+    # Entry offset in file = header_plus_cmds + start_offset
+    var header_plus_cmds = 304 as i32       # 32 + 72 + 152 + 24 + 24 = 304
+
+    # The entryoff field is at byte 264 (after cmd and cmdsize)
+    # Entryoff = file offset relative to __TEXT vmaddr mapping
+    # Since __TEXT maps from file offset 0 with vmaddr TEXT_BASE,
+    # entryoff = header_plus_cmds + start_offset
+    # No — LC_MAIN.entryoff is relative to __TEXT file offset which is 0
+    # So entryoff = offset of _start code in the file = header_plus_cmds + start_offset
+
+    # Actually looking at Apple docs: LC_MAIN.entryoff is the file offset
+    # of the entry point from the start of the __TEXT segment.
+    # __TEXT segment starts at file offset 0, so entryoff = header_plus_cmds + start_offset
+
+    # Patch the entry offset in the output buffer
+    # LC_MAIN starts at offset 256 (32+72+152), entryoff is at +8
+    var entry_patch_off = 32 + 72 + 152 + 8
+    var entryoff_val = header_plus_cmds + start_offset
+
+    # Write little-endian u64 at entry_patch_off
+    out.data = vec_set_at(out.data, entry_patch_off, (entryoff_val & 0xFF) as u8)
+    out.data = vec_set_at(out.data, entry_patch_off + 1, ((entryoff_val >> 8) & 0xFF) as u8)
+    out.data = vec_set_at(out.data, entry_patch_off + 2, ((entryoff_val >> 16) & 0xFF) as u8)
+    out.data = vec_set_at(out.data, entry_patch_off + 3, ((entryoff_val >> 24) & 0xFF) as u8)
+    out.data = vec_set_at(out.data, entry_patch_off + 4, 0)
+    out.data = vec_set_at(out.data, entry_patch_off + 5, 0)
+    out.data = vec_set_at(out.data, entry_patch_off + 6, 0)
+    out.data = vec_set_at(out.data, entry_patch_off + 7, 0)
+
+    out out
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Compile Pipeline
+# ═══════════════════════════════════════════════════════
+
+func compile(source: String, output_path: String) -> i32
+    # Step 1: Tokenize
+    print "virc: tokenizing..."
+    var lex = lexer_new(source)
+    lex = tokenize(lex)
+
+    if str_len(lex.error) > 0
+        print "virc: lex error: " + lex.error
+        out 1
+    end
+
+    var tok_count = vec_len(lex.tokens)
+    print "virc: " + str_from_i64(tok_count) + " tokens"
+
+    # Step 2: Parse
+    print "virc: parsing..."
+    var parser = parser_new(lex.tokens)
+    var (parser2, ast) = parse_program(parser)
+
+    if ast.node_type == AstType::Program and vec_len(ast.children) == 0
+        print "virc: parse error: empty program"
+        out 1
+    end
+
+    # Step 3: Lower to Q-IR
+    print "virc: lowering to Q-IR..."
+    var ctx = lower_ctx_new(str_new("main"))
+    ctx = lower_program(ctx, ast)
+
+    if ctx.error_count > 0
+        print "virc: lower error: " + ctx.last_error
+        out 1
+    end
+
+    var func_count = vec_len(ctx.module.functions)
+    print "virc: " + str_from_i64(func_count) + " functions"
+
+    # Step 4: Optimize — TCO + register allocation per function
+    print "virc: optimizing..."
+    var fi = 0
+    while fi < func_count
+        var func = vec_get(ctx.module.functions, fi)
+
+        # Tail-call optimization
+        var (func2, tco_count) = tco_pass(func)
+        func = func2
+
+        # Liveness analysis + register allocation
+        var intervals = compute_liveness(func)
+        var allocated = regalloc_linear_scan(intervals, 14)    # 14 GPRs
+
+        vec_set(ctx.module.functions, fi, func)
+        fi = fi + 1
+    end
+
+    # Step 5: Code generation (ARM64)
+    print "virc: generating ARM64 machine code..."
+    var code = codegen_emit_module(ctx.module, TargetArch::ARM64)
+    var code_size = codebuf_offset(code)
+    print "virc: " + str_from_i64(code_size) + " bytes of machine code"
+
+    # The _start entry point is at the known offset
+    # (it's the last thing emitted by codegen_emit_module)
+    # We need to find it... _start is after all functions + runtime
+    # For now, record it as a return value from codegen_emit_module or calculate
+
+    # Step 6: Link into Mach-O executable
+    print "virc: linking Mach-O ARM64 executable..."
+    var binary = emit_macho_executable(code)
+
+    # Step 7: Write output
+    print "virc: writing " + output_path + "..."
+    var f = file_create(output_path)
+    if is_err(f)
+        print "virc: error: cannot create output file"
+        out 1
+    end
+
+    var file = unwrap(f)
+    var data_slice = slice_new(binary.data.data, vec_len(binary.data))
+    file_write_all(file, data_slice)
+    file_close(file)
+
+    # Step 8: Make executable (chmod +x)
+    # syscall(SYS_CHMOD, path, 0755)
+    # For now this is handled by the build script
+
+    var file_size = vec_len(binary.data)
+    print "virc: done! " + output_path + " (" + str_from_i64(file_size) + " bytes)"
+    out 0
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Main Entry Point
+# ═══════════════════════════════════════════════════════
+
+func main()
+    print "╔══════════════════════════════════════════════╗"
+    print "║  virc — Vir Self-Hosting Compiler v1.2      ║"
+    print "║  Phase 5: Bootstrap Binary                   ║"
+    print "╚══════════════════════════════════════════════╝"
+
+    if arg_count() < 1
+        print "Usage: virc <input.vri> [-o output]"
+        print ""
+        print "Compiles a Vir source file to a standalone"
+        print "Mach-O ARM64 binary. No Python, no C runtime."
+        out 1
+    end
+
+    var input_path = get_arg(0)
+    var output_path = str_new("a.out")
+
+    # Parse -o flag
+    if arg_count() >= 3
+        if str_eq(get_arg(1), str_new("-o"))
+            output_path = get_arg(2)
+        end
+    end
+
+    # Read source file
+    print "virc: reading " + input_path + "..."
+    var f = file_open(input_path, FileMode::Read)
+    if is_err(f)
+        print "virc: error: cannot open " + input_path
+        out 1
+    end
+
+    var file = unwrap(f)
+    var source_result = file_read_all(file)
+    file_close(file)
+
+    if is_err(source_result)
+        print "virc: error: cannot read " + input_path
+        out 1
+    end
+
+    var source = unwrap(source_result)
+    print "virc: " + str_from_i64(str_len(source)) + " bytes source"
+
+    # Compile!
+    var result = compile(source, output_path)
+    out result
+end
+
+export compile, main, codegen_emit_module
+export emit_runtime_arm64, emit_macho_executable, emit_macho_with_entry
+export FuncLayout

@@ -1,0 +1,708 @@
+/*
+ * vir/virgex/virgex.vri — Vir Pattern Syntax (VPS) Engine
+ * ========================================================
+ * Hệ pattern thay thế regex truyền thống.
+ * Triết lý: literal mặc định, ký hiệu ít, logic rõ ràng.
+ *
+ * Ký hiệu lõi:
+ *   @   atom (loại dữ liệu)       |   anchor / OR (context)
+ *   !   lượng hóa (postfix)        $   escape
+ *   ~   khoảng lượng hóa           -   dấu cách thật
+ *   ?   optional (prefix)          :( :) group
+ *
+ * Ví dụ:
+ *   | @0!3 |                 →  đúng 3 chữ số
+ *   | @AZ!2 $- @0!5 |       →  2 chữ hoa + dash + 5 chữ số
+ *   | @Az0!3~12 |           →  3–12 ký tự chữ/số
+ *   :( A | B :)              →  A hoặc B
+ */
+
+nhập "vir/core/types" dùng hết
+nhập "vir/core/option" dùng Option, Some, None
+nhập "vir/core/result" dùng Result, Ok, Err
+nhập "vir/str/string" dùng String, str_new, str_byte_at, str_byte_len, str_slice_bytes, str_eq, str_starts_with
+nhập "vir/str/char" dùng is_digit, is_alpha, is_alnum, is_space, is_upper, is_lower
+nhập "vir/collections/vec" dùng Vec, vec_new, vec_push, vec_len, vec_get, vec_contains
+
+# ═══════════════════════════════════════════════════════
+# Token Types
+# ═══════════════════════════════════════════════════════
+
+liệt_kê VpsTokenType thì
+    Atom        = 1     # @Az, @AZ, @az, @0, @06, @Az0
+    Quantifier  = 2     # !n, !n~m, !n~, !~
+    Question    = 3     # ?
+    GroupOpen   = 4     # :(
+    GroupClose  = 5     # :)
+    Pipe        = 6     # |
+    SpaceToken  = 7     # -
+    EscapeChar  = 8     # $x
+    EscapeBlock = 9     # $. ... .$
+    Literal     = 10    # bất kỳ ký tự literal nào
+    Eof         = 11
+hết
+
+bản_ghi VpsQuantifier thì
+    min_val: i32
+    max_val: i32        # -1 = vô hạn
+hết
+
+bản_ghi VpsToken thì
+    tag:        VpsTokenType
+    value:      String
+    pos:        usize
+    atom_name:  String
+    quant:      VpsQuantifier
+hết
+
+# ═══════════════════════════════════════════════════════
+# AST Nodes
+# ═══════════════════════════════════════════════════════
+
+liệt_kê VpsNodeType thì
+    Pattern     = 1
+    Sequence    = 2
+    AtomExpr    = 3
+    LiteralExpr = 4
+    EscChar     = 5
+    EscBlock    = 6
+    SpaceExpr   = 7
+    Quantified  = 8
+    Optional    = 9
+    Group       = 10
+hết
+
+bản_ghi VpsNode thì
+    tag:            VpsNodeType
+    # Pattern fields
+    anchor_start:   bool
+    anchor_end:     bool
+    # Sequence / Group fields
+    children:       Vec<VpsNode>
+    alternatives:   Vec<Vec<VpsNode>>
+    # Atom / Literal / Escape fields
+    name:           String
+    value:          String
+    char_val:       u8
+    content:        String
+    # Quantified fields
+    inner:          Option<&VpsNode>
+    min_val:        i32
+    max_val:        i32    # -1 = vô hạn
+hết
+
+# ═══════════════════════════════════════════════════════
+# Atom Table: tên atom → regex tương đương
+# ═══════════════════════════════════════════════════════
+
+bản_ghi AtomEntry thì
+    name:     String
+    regex:    String
+hết
+
+hàm _build_atom_table() → Vec<AtomEntry>
+    biến table = vec_new<AtomEntry>()
+    vec_push(&table, AtomEntry { name = str_new("Az"),  regex = str_new("[A-Za-z]") })
+    vec_push(&table, AtomEntry { name = str_new("AZ"),  regex = str_new("[A-Z]") })
+    vec_push(&table, AtomEntry { name = str_new("az"),  regex = str_new("[a-z]") })
+    vec_push(&table, AtomEntry { name = str_new("0"),   regex = str_new("[0-9]") })
+    vec_push(&table, AtomEntry { name = str_new("Az0"), regex = str_new("[A-Za-z0-9]") })
+    trả về table
+hết
+
+hàm atom_to_regex(name: String) → Result<String, String>
+    biến table = _build_atom_table()
+    biến i: usize = 0
+    lặp_khi i < vec_len(table) thì
+        biến entry = vec_get(table, i)
+        nếu str_eq(entry.name, name) thì
+            trả về Ok(entry.regex)
+        hết
+        i = i + 1
+    hết
+    # Khoảng chữ số: "06" → "[0-6]"
+    nếu str_byte_len(name) == 2 thì
+        biến d0 = str_byte_at(name, 0)
+        biến d1 = str_byte_at(name, 1)
+        nếu is_digit(d0) và is_digit(d1) và d0 <= d1 thì
+            trả về Ok(str_new("[" + d0 + "-" + d1 + "]"))
+        hết
+    hết
+    trả về Err(str_new("Unknown atom: @" + name))
+hết
+
+# ═══════════════════════════════════════════════════════
+# Lexer
+# ═══════════════════════════════════════════════════════
+
+bản_ghi VpsLexer thì
+    src:    String
+    pos:    usize
+    len:    usize
+    tokens: Vec<VpsToken>
+hết
+
+hàm vps_lexer_new(source: String) → VpsLexer
+    trả về VpsLexer {
+        src = source,
+        pos = 0,
+        len = str_byte_len(source),
+        tokens = vec_new<VpsToken>()
+    }
+hết
+
+hàm vps_tokenize(lexer: &VpsLexer) → Result<Vec<VpsToken>, String>
+    lặp thì
+        biến tok = _next_token(lexer)
+        chọn tok thì
+            trường_hợp Err(e) thì trả về Err(e)
+            trường_hợp Ok(t) thì
+                biến is_eof = (t.tag == VpsTokenType.Eof)
+                vec_push(&lexer.tokens, t)
+                nếu is_eof thì thoát hết
+        hết
+    hết
+    trả về Ok(lexer.tokens)
+hết
+
+hàm _skip_ws(lexer: &VpsLexer)
+    lặp_khi lexer.pos < lexer.len thì
+        biến ch = str_byte_at(lexer.src, lexer.pos)
+        nếu ch == 0x20 hoặc ch == 0x09 hoặc ch == 0x0A hoặc ch == 0x0D thì
+            lexer.pos = lexer.pos + 1
+        ngược_lại thì
+            thoát
+        hết
+    hết
+hết
+
+hàm _peek(lexer: &VpsLexer, offset: usize) → u8
+    biến idx = lexer.pos + offset
+    nếu idx >= lexer.len thì trả về 0 hết
+    trả về str_byte_at(lexer.src, idx)
+hết
+
+hàm _next_token(lexer: &VpsLexer) → Result<VpsToken, String>
+    _skip_ws(lexer)
+    nếu lexer.pos >= lexer.len thì
+        trả về Ok(VpsToken {
+            tag = VpsTokenType.Eof, value = str_new(""),
+            pos = lexer.pos, atom_name = str_new(""),
+            quant = VpsQuantifier { min_val = 0, max_val = 0 }
+        })
+    hết
+
+    biến start = lexer.pos
+    biến ch = _peek(lexer, 0)
+
+    # :( và :)
+    nếu ch == 0x3A thì  # ':'
+        biến next = _peek(lexer, 1)
+        nếu next == 0x28 thì  # '('
+            lexer.pos = lexer.pos + 2
+            trả về Ok(VpsToken {
+                tag = VpsTokenType.GroupOpen, value = str_new(":("),
+                pos = start, atom_name = str_new(""),
+                quant = VpsQuantifier { min_val = 0, max_val = 0 }
+            })
+        hết
+        nếu next == 0x29 thì  # ')'
+            lexer.pos = lexer.pos + 2
+            trả về Ok(VpsToken {
+                tag = VpsTokenType.GroupClose, value = str_new(":)"),
+                pos = start, atom_name = str_new(""),
+                quant = VpsQuantifier { min_val = 0, max_val = 0 }
+            })
+        hết
+    hết
+
+    # @ → atom
+    nếu ch == 0x40 thì  # '@'
+        trả về _lex_atom(lexer, start)
+    hết
+
+    # ! → quantifier
+    nếu ch == 0x21 thì  # '!'
+        trả về _lex_quantifier(lexer, start)
+    hết
+
+    # ? → optional
+    nếu ch == 0x3F thì  # '?'
+        lexer.pos = lexer.pos + 1
+        trả về Ok(VpsToken {
+            tag = VpsTokenType.Question, value = str_new("?"),
+            pos = start, atom_name = str_new(""),
+            quant = VpsQuantifier { min_val = 0, max_val = 0 }
+        })
+    hết
+
+    # | → pipe
+    nếu ch == 0x7C thì  # '|'
+        lexer.pos = lexer.pos + 1
+        trả về Ok(VpsToken {
+            tag = VpsTokenType.Pipe, value = str_new("|"),
+            pos = start, atom_name = str_new(""),
+            quant = VpsQuantifier { min_val = 0, max_val = 0 }
+        })
+    hết
+
+    # $ → escape
+    nếu ch == 0x24 thì  # '$'
+        trả về _lex_escape(lexer, start)
+    hết
+
+    # - → space token
+    nếu ch == 0x2D thì  # '-'
+        lexer.pos = lexer.pos + 1
+        trả về Ok(VpsToken {
+            tag = VpsTokenType.SpaceToken, value = str_new("-"),
+            pos = start, atom_name = str_new(""),
+            quant = VpsQuantifier { min_val = 0, max_val = 0 }
+        })
+    hết
+
+    # Literal
+    lexer.pos = lexer.pos + 1
+    trả về Ok(VpsToken {
+        tag = VpsTokenType.Literal,
+        value = str_slice_bytes(lexer.src, start, start + 1),
+        pos = start, atom_name = str_new(""),
+        quant = VpsQuantifier { min_val = 0, max_val = 0 }
+    })
+hết
+
+hàm _lex_atom(lexer: &VpsLexer, start: usize) → Result<VpsToken, String>
+    lexer.pos = lexer.pos + 1  # bỏ qua @
+
+    # Thử named atoms: Az0, Az, AZ, az (dài nhất trước)
+    biến names = vec_new<String>()
+    vec_push(&names, str_new("Az0"))
+    vec_push(&names, str_new("Az"))
+    vec_push(&names, str_new("AZ"))
+    vec_push(&names, str_new("az"))
+
+    biến i: usize = 0
+    lặp_khi i < vec_len(names) thì
+        biến name = vec_get(names, i)
+        biến nlen = str_byte_len(name)
+        nếu lexer.pos + nlen <= lexer.len thì
+            biến slice = str_slice_bytes(lexer.src, lexer.pos, lexer.pos + nlen)
+            nếu str_eq(slice, name) thì
+                lexer.pos = lexer.pos + nlen
+                trả về Ok(VpsToken {
+                    tag = VpsTokenType.Atom,
+                    value = str_new("@" + name),
+                    pos = start, atom_name = name,
+                    quant = VpsQuantifier { min_val = 0, max_val = 0 }
+                })
+            hết
+        hết
+        i = i + 1
+    hết
+
+    # Atom số: 2 chữ số → range, 1 chữ số → tất cả
+    nếu lexer.pos < lexer.len thì
+        biến d0 = str_byte_at(lexer.src, lexer.pos)
+        nếu is_digit(d0) thì
+            lexer.pos = lexer.pos + 1
+            nếu lexer.pos < lexer.len thì
+                biến d1 = str_byte_at(lexer.src, lexer.pos)
+                nếu is_digit(d1) thì
+                    lexer.pos = lexer.pos + 1
+                    biến name = str_slice_bytes(lexer.src, lexer.pos - 2, lexer.pos)
+                    nếu d0 > d1 thì
+                        trả về Err(str_new("Invalid numeric atom range @" + name))
+                    hết
+                    trả về Ok(VpsToken {
+                        tag = VpsTokenType.Atom,
+                        value = str_new("@" + name),
+                        pos = start, atom_name = name,
+                        quant = VpsQuantifier { min_val = 0, max_val = 0 }
+                    })
+                hết
+            hết
+            biến name = str_slice_bytes(lexer.src, lexer.pos - 1, lexer.pos)
+            trả về Ok(VpsToken {
+                tag = VpsTokenType.Atom,
+                value = str_new("@" + name),
+                pos = start, atom_name = name,
+                quant = VpsQuantifier { min_val = 0, max_val = 0 }
+            })
+        hết
+    hết
+
+    trả về Err(str_new("Expected atom name after @"))
+hết
+
+hàm _read_int(lexer: &VpsLexer) → Option<i32>
+    nếu lexer.pos >= lexer.len thì trả về None hết
+    biến ch = str_byte_at(lexer.src, lexer.pos)
+    nếu !is_digit(ch) thì trả về None hết
+    biến val: i32 = 0
+    lặp_khi lexer.pos < lexer.len thì
+        biến d = str_byte_at(lexer.src, lexer.pos)
+        nếu !is_digit(d) thì thoát hết
+        val = val * 10 + (d - 0x30)
+        lexer.pos = lexer.pos + 1
+    hết
+    trả về Some(val)
+hết
+
+hàm _lex_quantifier(lexer: &VpsLexer, start: usize) → Result<VpsToken, String>
+    lexer.pos = lexer.pos + 1  # bỏ qua !
+    _skip_ws(lexer)
+
+    # !~
+    nếu lexer.pos < lexer.len và _peek(lexer, 0) == 0x7E thì  # '~'
+        lexer.pos = lexer.pos + 1
+        trả về Ok(VpsToken {
+            tag = VpsTokenType.Quantifier,
+            value = str_slice_bytes(lexer.src, start, lexer.pos),
+            pos = start, atom_name = str_new(""),
+            quant = VpsQuantifier { min_val = 0, max_val = -1 }
+        })
+    hết
+
+    # !n ...
+    biến n_opt = _read_int(lexer)
+    chọn n_opt thì
+        trường_hợp None thì trả về Err(str_new("Expected number or ~ after !"))
+        trường_hợp Some(n) thì
+            _skip_ws(lexer)
+            # !n~m hoặc !n~
+            nếu lexer.pos < lexer.len và _peek(lexer, 0) == 0x7E thì
+                lexer.pos = lexer.pos + 1
+                _skip_ws(lexer)
+                biến m_opt = _read_int(lexer)
+                biến max_v: i32
+                chọn m_opt thì
+                    trường_hợp None thì max_v = -1
+                    trường_hợp Some(m) thì
+                        nếu m < n thì
+                            trả về Err(str_new("Quantifier range invalid"))
+                        hết
+                        max_v = m
+                hết
+                trả về Ok(VpsToken {
+                    tag = VpsTokenType.Quantifier,
+                    value = str_slice_bytes(lexer.src, start, lexer.pos),
+                    pos = start, atom_name = str_new(""),
+                    quant = VpsQuantifier { min_val = n, max_val = max_v }
+                })
+            hết
+            # !n exact
+            trả về Ok(VpsToken {
+                tag = VpsTokenType.Quantifier,
+                value = str_slice_bytes(lexer.src, start, lexer.pos),
+                pos = start, atom_name = str_new(""),
+                quant = VpsQuantifier { min_val = n, max_val = n }
+            })
+    hết
+hết
+
+hàm _lex_escape(lexer: &VpsLexer, start: usize) → Result<VpsToken, String>
+    lexer.pos = lexer.pos + 1  # bỏ qua $
+    nếu lexer.pos >= lexer.len thì
+        trả về Err(str_new("Unexpected end after $"))
+    hết
+    biến ch = str_byte_at(lexer.src, lexer.pos)
+    # Block escape: $. ... .$
+    nếu ch == 0x2E thì  # '.'
+        lexer.pos = lexer.pos + 1
+        trả về _lex_escape_block(lexer, start)
+    hết
+    # Single char escape
+    lexer.pos = lexer.pos + 1
+    trả về Ok(VpsToken {
+        tag = VpsTokenType.EscapeChar,
+        value = str_slice_bytes(lexer.src, start, lexer.pos),
+        pos = start, atom_name = str_new(""),
+        quant = VpsQuantifier { min_val = 0, max_val = 0 }
+    })
+hết
+
+hàm _lex_escape_block(lexer: &VpsLexer, start: usize) → Result<VpsToken, String>
+    lặp_khi lexer.pos < lexer.len thì
+        nếu _peek(lexer, 0) == 0x2E và _peek(lexer, 1) == 0x24 thì
+            lexer.pos = lexer.pos + 2
+            trả về Ok(VpsToken {
+                tag = VpsTokenType.EscapeBlock,
+                value = str_slice_bytes(lexer.src, start, lexer.pos),
+                pos = start, atom_name = str_new(""),
+                quant = VpsQuantifier { min_val = 0, max_val = 0 }
+            })
+        hết
+        lexer.pos = lexer.pos + 1
+    hết
+    trả về Err(str_new("Unterminated escape block $. ... .$"))
+hết
+
+# ═══════════════════════════════════════════════════════
+# Compiler: AST → Regex string
+# ═══════════════════════════════════════════════════════
+
+hàm vps_compile(pattern: String) → Result<String, String>
+    biến lexer = vps_lexer_new(pattern)
+    biến tokens_result = vps_tokenize(&lexer)
+    biến tokens: Vec<VpsToken>
+    chọn tokens_result thì
+        trường_hợp Err(e) thì trả về Err(e)
+        trường_hợp Ok(toks) thì tokens = toks
+    hết
+
+    biến pos: usize = 0
+    biến out = str_new("")
+
+    # Anchor đầu
+    nếu pos < vec_len(tokens) thì
+        biến t = vec_get(tokens, pos)
+        nếu t.tag == VpsTokenType.Pipe thì
+            out = out + "^"
+            pos = pos + 1
+        hết
+    hết
+
+    # Sequence
+    biến seq_result = _compile_sequence(&tokens, &pos, &out)
+    chọn seq_result thì
+        trường_hợp Err(e) thì trả về Err(e)
+        trường_hợp Ok(_) thì
+    hết
+
+    # Anchor cuối
+    nếu pos < vec_len(tokens) thì
+        biến t = vec_get(tokens, pos)
+        nếu t.tag == VpsTokenType.Pipe thì
+            biến next_pos = pos + 1
+            nếu next_pos < vec_len(tokens) thì
+                biến next_t = vec_get(tokens, next_pos)
+                nếu next_t.tag == VpsTokenType.Eof thì
+                    out = out + "$"
+                    pos = pos + 2
+                hết
+            hết
+        hết
+    hết
+
+    trả về Ok(out)
+hết
+
+hàm _compile_sequence(tokens: &Vec<VpsToken>, pos: &usize, out: &String) → Result<bool, String>
+    lặp_khi *pos < vec_len(*tokens) thì
+        biến t = vec_get(*tokens, *pos)
+        nếu t.tag == VpsTokenType.Eof thì thoát hết
+        nếu t.tag == VpsTokenType.GroupClose thì thoát hết
+        nếu t.tag == VpsTokenType.Pipe thì thoát hết
+
+        chọn t.tag thì
+            trường_hợp VpsTokenType.Question thì
+                *pos = *pos + 1
+                biến inner = str_new("")
+                biến r = _compile_expression(tokens, pos, &inner)
+                chọn r thì
+                    trường_hợp Err(e) thì trả về Err(e)
+                    trường_hợp Ok(_) thì
+                hết
+                # Wrap trong (?:...)? nếu cần
+                nếu str_byte_len(inner) == 1 thì
+                    *out = *out + inner + "?"
+                hoặc_nếu str_starts_with(inner, "(?:") thì
+                    *out = *out + inner + "?"
+                hoặc_nếu str_starts_with(inner, "[") thì
+                    *out = *out + inner + "?"
+                ngược_lại thì
+                    *out = *out + "(?:" + inner + ")?"
+                hết
+
+            trường_hợp _ thì
+                biến r = _compile_expression(tokens, pos, out)
+                chọn r thì
+                    trường_hợp Err(e) thì trả về Err(e)
+                    trường_hợp Ok(_) thì
+                hết
+        hết
+    hết
+    trả về Ok(đúng)
+hết
+
+hàm _compile_expression(tokens: &Vec<VpsToken>, pos: &usize, out: &String) → Result<bool, String>
+    biến t = vec_get(*tokens, *pos)
+
+    chọn t.tag thì
+        trường_hợp VpsTokenType.Atom thì
+            biến regex_result = atom_to_regex(t.atom_name)
+            biến regex: String
+            chọn regex_result thì
+                trường_hợp Err(e) thì trả về Err(e)
+                trường_hợp Ok(r) thì regex = r
+            hết
+            *pos = *pos + 1
+            # Kiểm tra quantifier theo sau
+            nếu *pos < vec_len(*tokens) thì
+                biến next = vec_get(*tokens, *pos)
+                nếu next.tag == VpsTokenType.Quantifier thì
+                    *out = *out + regex + _quant_suffix(next.quant)
+                    *pos = *pos + 1
+                    trả về Ok(đúng)
+                hết
+            hết
+            *out = *out + regex
+            trả về Ok(đúng)
+
+        trường_hợp VpsTokenType.SpaceToken thì
+            *pos = *pos + 1
+            # Kiểm tra quantifier
+            nếu *pos < vec_len(*tokens) thì
+                biến next = vec_get(*tokens, *pos)
+                nếu next.tag == VpsTokenType.Quantifier thì
+                    *out = *out + " " + _quant_suffix(next.quant)
+                    *pos = *pos + 1
+                    trả về Ok(đúng)
+                hết
+            hết
+            *out = *out + " "
+            trả về Ok(đúng)
+
+        trường_hợp VpsTokenType.EscapeChar thì
+            # value = "$x" → lấy ký tự x, escape cho regex
+            biến ch = str_byte_at(t.value, 1)
+            *out = *out + "\\" + str_slice_bytes(t.value, 1, 2)
+            *pos = *pos + 1
+            trả về Ok(đúng)
+
+        trường_hợp VpsTokenType.EscapeBlock thì
+            # value = "$.content.$" → escape toàn bộ content
+            biến content = str_slice_bytes(t.value, 2, str_byte_len(t.value) - 2)
+            *out = *out + _regex_escape(content)
+            *pos = *pos + 1
+            trả về Ok(đúng)
+
+        trường_hợp VpsTokenType.Literal thì
+            *out = *out + _regex_escape(t.value)
+            *pos = *pos + 1
+            trả về Ok(đúng)
+
+        trường_hợp VpsTokenType.GroupOpen thì
+            *pos = *pos + 1  # bỏ :(
+            biến group_out = str_new("(?:")
+            biến r = _compile_sequence(tokens, pos, &group_out)
+            chọn r thì
+                trường_hợp Err(e) thì trả về Err(e)
+                trường_hợp Ok(_) thì
+            hết
+            # Xử lý alternation: |
+            lặp_khi *pos < vec_len(*tokens) thì
+                biến pt = vec_get(*tokens, *pos)
+                nếu pt.tag == VpsTokenType.Pipe thì
+                    group_out = group_out + "|"
+                    *pos = *pos + 1
+                    biến r2 = _compile_sequence(tokens, pos, &group_out)
+                    chọn r2 thì
+                        trường_hợp Err(e) thì trả về Err(e)
+                        trường_hợp Ok(_) thì
+                    hết
+                ngược_lại thì
+                    thoát
+                hết
+            hết
+            # Expect :)
+            nếu *pos < vec_len(*tokens) thì
+                biến ct = vec_get(*tokens, *pos)
+                nếu ct.tag == VpsTokenType.GroupClose thì
+                    *pos = *pos + 1
+                ngược_lại thì
+                    trả về Err(str_new("Expected :)"))
+                hết
+            hết
+            group_out = group_out + ")"
+            # Kiểm tra quantifier sau group
+            nếu *pos < vec_len(*tokens) thì
+                biến qt = vec_get(*tokens, *pos)
+                nếu qt.tag == VpsTokenType.Quantifier thì
+                    *out = *out + group_out + _quant_suffix(qt.quant)
+                    *pos = *pos + 1
+                    trả về Ok(đúng)
+                hết
+            hết
+            *out = *out + group_out
+            trả về Ok(đúng)
+
+        trường_hợp _ thì
+            trả về Err(str_new("Unexpected token: " + t.value))
+    hết
+hết
+
+hàm _quant_suffix(q: VpsQuantifier) → String
+    nếu q.max_val == -1 thì
+        nếu q.min_val == 0 thì trả về str_new("*") hết
+        nếu q.min_val == 1 thì trả về str_new("+") hết
+        trả về str_new("{" + q.min_val + ",}")
+    hết
+    nếu q.min_val == q.max_val thì
+        nếu q.min_val == 1 thì trả về str_new("") hết
+        trả về str_new("{" + q.min_val + "}")
+    hết
+    trả về str_new("{" + q.min_val + "," + q.max_val + "}")
+hết
+
+hàm _regex_escape(s: String) → String
+    biến out = str_new("")
+    biến i: usize = 0
+    biến len = str_byte_len(s)
+    lặp_khi i < len thì
+        biến ch = str_byte_at(s, i)
+        # Các ký tự đặc biệt regex cần escape
+        nếu ch == 0x5C hoặc ch == 0x2E hoặc ch == 0x2A hoặc ch == 0x2B
+           hoặc ch == 0x3F hoặc ch == 0x28 hoặc ch == 0x29 hoặc ch == 0x5B
+           hoặc ch == 0x5D hoặc ch == 0x7B hoặc ch == 0x7D hoặc ch == 0x7C
+           hoặc ch == 0x5E hoặc ch == 0x24 thì
+            out = out + "\\" + str_slice_bytes(s, i, i + 1)
+        ngược_lại thì
+            out = out + str_slice_bytes(s, i, i + 1)
+        hết
+        i = i + 1
+    hết
+    trả về out
+hết
+
+# ═══════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════
+
+# Biên dịch VPS pattern thành regex string
+công_khai hàm virgex_to_regex(pattern: String) → Result<String, String>
+    trả về vps_compile(pattern)
+hết
+
+# Kiểm tra chuỗi khớp hoàn toàn với pattern
+công_khai hàm virgex_fullmatch(pattern: String, text: String) → Result<bool, String>
+    biến regex_result = vps_compile(pattern)
+    chọn regex_result thì
+        trường_hợp Err(e) thì trả về Err(e)
+        trường_hợp Ok(regex_str) thì
+            # Delegate sang regex engine
+            nhập "vir/regex/regex" dùng regex_compile, regex_fullmatch
+            biến re = regex_compile(regex_str)
+            chọn re thì
+                trường_hợp Err(e) thì trả về Err(e)
+                trường_hợp Ok(compiled) thì
+                    trả về Ok(regex_fullmatch(compiled, text))
+            hết
+    hết
+hết
+
+# Tìm kiếm pattern trong chuỗi
+công_khai hàm virgex_search(pattern: String, text: String) → Result<Option<Match>, String>
+    biến regex_result = vps_compile(pattern)
+    chọn regex_result thì
+        trường_hợp Err(e) thì trả về Err(e)
+        trường_hợp Ok(regex_str) thì
+            nhập "vir/regex/regex" dùng regex_compile, regex_search
+            biến re = regex_compile(regex_str)
+            chọn re thì
+                trường_hợp Err(e) thì trả về Err(e)
+                trường_hợp Ok(compiled) thì
+                    trả về Ok(regex_search(compiled, text))
+            hết
+    hết
+hết

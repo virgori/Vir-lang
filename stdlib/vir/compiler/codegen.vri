@@ -1,0 +1,1663 @@
+/*
+ * vir/compiler/codegen.vri — Machine Code Generator (Pure Vir)
+ * =============================================================
+ * Translated from core/src/codegen.c (3408 lines).
+ *
+ * Emits real machine code bytes into a code buffer.
+ * Supports x86_64 and ARM64 targets with:
+ *   - Code buffer (growable byte array)
+ *   - x86_64 instruction encoding (REX, ModR/M, VEX)
+ *   - ARM64 instruction encoding (32-bit fixed-width)
+ *   - NEON / AVX SIMD emitters
+ *   - Back-patching for branch offsets
+ *   - Safe (stack-based), Fast (register-direct), Full generators
+ *   - Intrinsic call dispatch
+ */
+
+module vir::compiler::codegen
+
+import "vir/core/types" use all
+
+# ═══════════════════════════════════════════════════════
+# Architecture Detection
+# ═══════════════════════════════════════════════════════
+
+enum TargetArch
+    Unknown = 0
+    X86_64  = 1
+    ARM64   = 2
+end
+
+func detect_arch() -> TargetArch
+    # Compile-time constant based on host
+    # On ARM64 macOS, this returns ARM64
+    out TargetArch::ARM64
+end
+
+# ═══════════════════════════════════════════════════════
+# x86_64 Register IDs
+# ═══════════════════════════════════════════════════════
+
+enum X86Reg
+    RAX = 0
+    RCX = 1
+    RDX = 2
+    RBX = 3
+    RSP = 4
+    RBP = 5
+    RSI = 6
+    RDI = 7
+    R8  = 8
+    R9  = 9
+    R10 = 10
+    R11 = 11
+    R12 = 12
+    R13 = 13
+    R14 = 14
+    R15 = 15
+end
+
+# ═══════════════════════════════════════════════════════
+# ARM64 Register IDs
+# ═══════════════════════════════════════════════════════
+
+enum ArmReg
+    X0  = 0
+    X1  = 1
+    X2  = 2
+    X3  = 3
+    X4  = 4
+    X5  = 5
+    X6  = 6
+    X7  = 7
+    X8  = 8
+    X9  = 9
+    X10 = 10
+    X11 = 11
+    X12 = 12
+    X13 = 13
+    X14 = 14
+    X15 = 15
+    X16 = 16
+    X17 = 17
+    X29 = 29   # FP
+    X30 = 30   # LR
+    SP  = 31
+end
+
+# ═══════════════════════════════════════════════════════
+# Code Buffer — growable byte array
+# ═══════════════════════════════════════════════════════
+
+const CODEBUF_INIT_CAP = 4096
+
+entity CodeBuf
+    data:   [i32]    # byte values stored as i32 (0-255)
+    len:    i32
+    cap:    i32
+    arch:   TargetArch
+end
+
+func codebuf_new(arch: TargetArch) -> CodeBuf
+    var buf = CodeBuf {
+        data: [],
+        len:  0,
+        cap:  CODEBUF_INIT_CAP,
+        arch: arch
+    }
+    out buf
+end
+
+func codebuf_emit_byte(buf: CodeBuf, byte: i32) -> CodeBuf
+    buf.data = buf.data + [byte & 0xFF]
+    buf.len = buf.len + 1
+    out buf
+end
+
+func codebuf_emit_u32(buf: CodeBuf, val: i32) -> CodeBuf
+    buf = codebuf_emit_byte(buf, val & 0xFF)
+    buf = codebuf_emit_byte(buf, (val >> 8) & 0xFF)
+    buf = codebuf_emit_byte(buf, (val >> 16) & 0xFF)
+    buf = codebuf_emit_byte(buf, (val >> 24) & 0xFF)
+    out buf
+end
+
+func codebuf_emit_u64(buf: CodeBuf, val: i32) -> CodeBuf
+    buf = codebuf_emit_u32(buf, val & 0xFFFFFFFF)
+    buf = codebuf_emit_u32(buf, (val >> 32) & 0xFFFFFFFF)
+    out buf
+end
+
+func codebuf_emit_i32(buf: CodeBuf, val: i32) -> CodeBuf
+    out codebuf_emit_u32(buf, val)
+end
+
+func codebuf_offset(buf: CodeBuf) -> i32
+    out buf.len
+end
+
+func codebuf_patch_i32(buf: CodeBuf, offset: i32, val: i32) -> CodeBuf
+    if offset + 4 <= buf.len
+        buf.data[offset]     = val & 0xFF
+        buf.data[offset + 1] = (val >> 8) & 0xFF
+        buf.data[offset + 2] = (val >> 16) & 0xFF
+        buf.data[offset + 3] = (val >> 24) & 0xFF
+    end
+    out buf
+end
+
+func codebuf_patch_u32(buf: CodeBuf, offset: i32, val: i32) -> CodeBuf
+    out codebuf_patch_i32(buf, offset, val)
+end
+
+# ═══════════════════════════════════════════════════════
+# x86_64 Encoding Helpers
+# ═══════════════════════════════════════════════════════
+
+func rex_w(r: i32, rm: i32) -> i32
+    var rex = 0x48
+    if r >= 8
+        rex = rex | 0x04
+    end
+    if rm >= 8
+        rex = rex | 0x01
+    end
+    out rex
+end
+
+func modrm(mod_: i32, reg: i32, rm: i32) -> i32
+    out (mod_ << 6) | ((reg & 7) << 3) | (rm & 7)
+end
+
+# ═══════════════════════════════════════════════════════
+# x86_64 Instruction Emitters
+# ═══════════════════════════════════════════════════════
+
+func x86_add_rr(cb: CodeBuf, dst: i32, src: i32) -> CodeBuf
+    # ADD dst, src -> REX.W 01 /r
+    cb = codebuf_emit_byte(cb, rex_w(src, dst))
+    cb = codebuf_emit_byte(cb, 0x01)
+    cb = codebuf_emit_byte(cb, modrm(0x03, src, dst))
+    out cb
+end
+
+func x86_sub_rr(cb: CodeBuf, dst: i32, src: i32) -> CodeBuf
+    # SUB dst, src -> REX.W 29 /r
+    cb = codebuf_emit_byte(cb, rex_w(src, dst))
+    cb = codebuf_emit_byte(cb, 0x29)
+    cb = codebuf_emit_byte(cb, modrm(0x03, src, dst))
+    out cb
+end
+
+func x86_imul_rr(cb: CodeBuf, dst: i32, src: i32) -> CodeBuf
+    # IMUL dst, src -> REX.W 0F AF /r
+    cb = codebuf_emit_byte(cb, rex_w(dst, src))
+    cb = codebuf_emit_byte(cb, 0x0F)
+    cb = codebuf_emit_byte(cb, 0xAF)
+    cb = codebuf_emit_byte(cb, modrm(0x03, dst, src))
+    out cb
+end
+
+func x86_mov_reg_imm64(cb: CodeBuf, dst: i32, imm: i32) -> CodeBuf
+    # MOV dst, imm64 -> REX.W B8+rd [8 bytes]
+    var rex = 0x48
+    if dst >= 8
+        rex = rex | 0x01
+    end
+    cb = codebuf_emit_byte(cb, rex)
+    cb = codebuf_emit_byte(cb, 0xB8 + (dst & 7))
+    cb = codebuf_emit_u64(cb, imm)
+    out cb
+end
+
+func x86_mov_reg_imm32(cb: CodeBuf, dst: i32, imm: i32) -> CodeBuf
+    # MOV dst, imm32 -> REX.W C7 /0 [4 bytes]
+    var rex = 0x48
+    if dst >= 8
+        rex = rex | 0x01
+    end
+    cb = codebuf_emit_byte(cb, rex)
+    cb = codebuf_emit_byte(cb, 0xC7)
+    cb = codebuf_emit_byte(cb, modrm(0x03, 0, dst))
+    cb = codebuf_emit_i32(cb, imm)
+    out cb
+end
+
+func x86_mov_rr(cb: CodeBuf, dst: i32, src: i32) -> CodeBuf
+    # MOV dst, src -> REX.W 89 /r
+    cb = codebuf_emit_byte(cb, rex_w(src, dst))
+    cb = codebuf_emit_byte(cb, 0x89)
+    cb = codebuf_emit_byte(cb, modrm(0x03, src, dst))
+    out cb
+end
+
+func x86_push(cb: CodeBuf, reg: i32) -> CodeBuf
+    if reg >= 8
+        cb = codebuf_emit_byte(cb, 0x41)
+    end
+    cb = codebuf_emit_byte(cb, 0x50 + (reg & 7))
+    out cb
+end
+
+func x86_pop(cb: CodeBuf, reg: i32) -> CodeBuf
+    if reg >= 8
+        cb = codebuf_emit_byte(cb, 0x41)
+    end
+    cb = codebuf_emit_byte(cb, 0x58 + (reg & 7))
+    out cb
+end
+
+func x86_ret(cb: CodeBuf) -> CodeBuf
+    out codebuf_emit_byte(cb, 0xC3)
+end
+
+func x86_nop(cb: CodeBuf) -> CodeBuf
+    out codebuf_emit_byte(cb, 0x90)
+end
+
+func x86_jmp_rel32(cb: CodeBuf, offset: i32) -> CodeBuf
+    cb = codebuf_emit_byte(cb, 0xE9)
+    cb = codebuf_emit_i32(cb, offset)
+    out cb
+end
+
+func x86_call_rel32(cb: CodeBuf, offset: i32) -> CodeBuf
+    cb = codebuf_emit_byte(cb, 0xE8)
+    cb = codebuf_emit_i32(cb, offset)
+    out cb
+end
+
+func x86_cmp_rr(cb: CodeBuf, a: i32, b: i32) -> CodeBuf
+    # CMP a, b -> REX.W 39 /r
+    cb = codebuf_emit_byte(cb, rex_w(b, a))
+    cb = codebuf_emit_byte(cb, 0x39)
+    cb = codebuf_emit_byte(cb, modrm(0x03, b, a))
+    out cb
+end
+
+func x86_sete(cb: CodeBuf, dst: i32) -> CodeBuf
+    if dst >= 8
+        cb = codebuf_emit_byte(cb, 0x41)
+    end
+    cb = codebuf_emit_byte(cb, 0x0F)
+    cb = codebuf_emit_byte(cb, 0x94)
+    cb = codebuf_emit_byte(cb, modrm(0x03, 0, dst))
+    out cb
+end
+
+func x86_setg(cb: CodeBuf, dst: i32) -> CodeBuf
+    if dst >= 8
+        cb = codebuf_emit_byte(cb, 0x41)
+    end
+    cb = codebuf_emit_byte(cb, 0x0F)
+    cb = codebuf_emit_byte(cb, 0x9F)
+    cb = codebuf_emit_byte(cb, modrm(0x03, 0, dst))
+    out cb
+end
+
+func x86_setl(cb: CodeBuf, dst: i32) -> CodeBuf
+    if dst >= 8
+        cb = codebuf_emit_byte(cb, 0x41)
+    end
+    cb = codebuf_emit_byte(cb, 0x0F)
+    cb = codebuf_emit_byte(cb, 0x9C)
+    cb = codebuf_emit_byte(cb, modrm(0x03, 0, dst))
+    out cb
+end
+
+func x86_setge(cb: CodeBuf, dst: i32) -> CodeBuf
+    if dst >= 8
+        cb = codebuf_emit_byte(cb, 0x41)
+    end
+    cb = codebuf_emit_byte(cb, 0x0F)
+    cb = codebuf_emit_byte(cb, 0x9D)
+    cb = codebuf_emit_byte(cb, modrm(0x03, 0, dst))
+    out cb
+end
+
+func x86_setle(cb: CodeBuf, dst: i32) -> CodeBuf
+    if dst >= 8
+        cb = codebuf_emit_byte(cb, 0x41)
+    end
+    cb = codebuf_emit_byte(cb, 0x0F)
+    cb = codebuf_emit_byte(cb, 0x9E)
+    cb = codebuf_emit_byte(cb, modrm(0x03, 0, dst))
+    out cb
+end
+
+func x86_je_rel32(cb: CodeBuf, offset: i32) -> CodeBuf
+    cb = codebuf_emit_byte(cb, 0x0F)
+    cb = codebuf_emit_byte(cb, 0x84)
+    cb = codebuf_emit_i32(cb, offset)
+    out cb
+end
+
+func x86_jne_rel32(cb: CodeBuf, offset: i32) -> CodeBuf
+    cb = codebuf_emit_byte(cb, 0x0F)
+    cb = codebuf_emit_byte(cb, 0x85)
+    cb = codebuf_emit_i32(cb, offset)
+    out cb
+end
+
+func x86_xor_rr(cb: CodeBuf, dst: i32, src: i32) -> CodeBuf
+    cb = codebuf_emit_byte(cb, rex_w(src, dst))
+    cb = codebuf_emit_byte(cb, 0x31)
+    cb = codebuf_emit_byte(cb, modrm(0x03, src, dst))
+    out cb
+end
+
+func x86_and_rr(cb: CodeBuf, dst: i32, src: i32) -> CodeBuf
+    # AND dst, src -> REX.W 21 /r
+    cb = codebuf_emit_byte(cb, rex_w(src, dst))
+    cb = codebuf_emit_byte(cb, 0x21)
+    cb = codebuf_emit_byte(cb, modrm(0x03, src, dst))
+    out cb
+end
+
+func x86_or_rr(cb: CodeBuf, dst: i32, src: i32) -> CodeBuf
+    # OR dst, src -> REX.W 09 /r
+    cb = codebuf_emit_byte(cb, rex_w(src, dst))
+    cb = codebuf_emit_byte(cb, 0x09)
+    cb = codebuf_emit_byte(cb, modrm(0x03, src, dst))
+    out cb
+end
+
+func x86_shl_cl(cb: CodeBuf, dst: i32) -> CodeBuf
+    # SHL dst, CL -> REX.W D3 /4
+    var r = 0x48
+    if dst >= 8
+        r = r | 0x01
+    end
+    cb = codebuf_emit_byte(cb, r)
+    cb = codebuf_emit_byte(cb, 0xD3)
+    cb = codebuf_emit_byte(cb, modrm(0x03, 4, dst))
+    out cb
+end
+
+func x86_sar_cl(cb: CodeBuf, dst: i32) -> CodeBuf
+    # SAR dst, CL -> REX.W D3 /7
+    var r = 0x48
+    if dst >= 8
+        r = r | 0x01
+    end
+    cb = codebuf_emit_byte(cb, r)
+    cb = codebuf_emit_byte(cb, 0xD3)
+    cb = codebuf_emit_byte(cb, modrm(0x03, 7, dst))
+    out cb
+end
+
+func x86_idiv(cb: CodeBuf, divisor: i32) -> CodeBuf
+    # IDIV divisor -> REX.W F7 /7
+    var rex = 0x48
+    if divisor >= 8
+        rex = rex | 0x01
+    end
+    cb = codebuf_emit_byte(cb, rex)
+    cb = codebuf_emit_byte(cb, 0xF7)
+    cb = codebuf_emit_byte(cb, modrm(0x03, 7, divisor))
+    out cb
+end
+
+func x86_cqo(cb: CodeBuf) -> CodeBuf
+    # CQO -> 48 99
+    cb = codebuf_emit_byte(cb, 0x48)
+    cb = codebuf_emit_byte(cb, 0x99)
+    out cb
+end
+
+func x86_syscall(cb: CodeBuf) -> CodeBuf
+    cb = codebuf_emit_byte(cb, 0x0F)
+    cb = codebuf_emit_byte(cb, 0x05)
+    out cb
+end
+
+func x86_test_rr(cb: CodeBuf, r: i32) -> CodeBuf
+    # TEST r, r -> REX.W 85 /r (same reg)
+    cb = codebuf_emit_byte(cb, rex_w(r, r))
+    cb = codebuf_emit_byte(cb, 0x85)
+    cb = codebuf_emit_byte(cb, modrm(0x03, r, r))
+    out cb
+end
+
+# ═══════════════════════════════════════════════════════
+# x86_64 VEX prefix (2-byte form for AVX)
+# ═══════════════════════════════════════════════════════
+
+func x86_vex2(cb: CodeBuf, vvvv: i32, l: i32, pp: i32) -> CodeBuf
+    # C5 [R/vvvv/L/pp] — R=1 for XMM0-7
+    var byte2 = 0x80 | (((~vvvv) & 0x0F) << 3) | ((l & 1) << 2) | (pp & 3)
+    cb = codebuf_emit_byte(cb, 0xC5)
+    cb = codebuf_emit_byte(cb, byte2)
+    out cb
+end
+
+func avx_vaddps(cb: CodeBuf, dst: i32, s1: i32, s2: i32) -> CodeBuf
+    cb = x86_vex2(cb, s1, 0, 0)
+    cb = codebuf_emit_byte(cb, 0x58)
+    cb = codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (s2 & 7))
+    out cb
+end
+
+func avx_vsubps(cb: CodeBuf, dst: i32, s1: i32, s2: i32) -> CodeBuf
+    cb = x86_vex2(cb, s1, 0, 0)
+    cb = codebuf_emit_byte(cb, 0x5C)
+    cb = codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (s2 & 7))
+    out cb
+end
+
+func avx_vmulps(cb: CodeBuf, dst: i32, s1: i32, s2: i32) -> CodeBuf
+    cb = x86_vex2(cb, s1, 0, 0)
+    cb = codebuf_emit_byte(cb, 0x59)
+    cb = codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (s2 & 7))
+    out cb
+end
+
+func avx_vdivps(cb: CodeBuf, dst: i32, s1: i32, s2: i32) -> CodeBuf
+    cb = x86_vex2(cb, s1, 0, 0)
+    cb = codebuf_emit_byte(cb, 0x5E)
+    cb = codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (s2 & 7))
+    out cb
+end
+
+func avx_vminps(cb: CodeBuf, dst: i32, s1: i32, s2: i32) -> CodeBuf
+    cb = x86_vex2(cb, s1, 0, 0)
+    cb = codebuf_emit_byte(cb, 0x5D)
+    cb = codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (s2 & 7))
+    out cb
+end
+
+func avx_vmaxps(cb: CodeBuf, dst: i32, s1: i32, s2: i32) -> CodeBuf
+    cb = x86_vex2(cb, s1, 0, 0)
+    cb = codebuf_emit_byte(cb, 0x5F)
+    cb = codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (s2 & 7))
+    out cb
+end
+
+func avx_vmovaps_load(cb: CodeBuf, xmm_dst: i32, base: i32) -> CodeBuf
+    cb = x86_vex2(cb, 0, 0, 0)
+    cb = codebuf_emit_byte(cb, 0x28)
+    cb = codebuf_emit_byte(cb, ((xmm_dst & 7) << 3) | (base & 7))
+    out cb
+end
+
+func avx_vmovaps_store(cb: CodeBuf, base: i32, xmm_src: i32) -> CodeBuf
+    cb = x86_vex2(cb, 0, 0, 0)
+    cb = codebuf_emit_byte(cb, 0x29)
+    cb = codebuf_emit_byte(cb, ((xmm_src & 7) << 3) | (base & 7))
+    out cb
+end
+
+func avx_vbroadcastss(cb: CodeBuf, dst: i32, src: i32) -> CodeBuf
+    # VEX.128.66.0F38 18 /r — 3-byte VEX
+    cb = codebuf_emit_byte(cb, 0xC4)
+    cb = codebuf_emit_byte(cb, 0xE2)
+    cb = codebuf_emit_byte(cb, 0x79)
+    cb = codebuf_emit_byte(cb, 0x18)
+    cb = codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (src & 7))
+    out cb
+end
+
+func avx_vhaddps(cb: CodeBuf, dst: i32, s1: i32, s2: i32) -> CodeBuf
+    # VHADDPS: VEX.128.F2.0F 7C /r  (pp=11 for F2)
+    cb = x86_vex2(cb, s1, 0, 3)
+    cb = codebuf_emit_byte(cb, 0x7C)
+    cb = codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (s2 & 7))
+    out cb
+end
+
+# ═══════════════════════════════════════════════════════
+# ARM64 Instruction Emitters
+# ═══════════════════════════════════════════════════════
+
+func arm64_add_rrr(cb: CodeBuf, rd: i32, rn: i32, rm: i32) -> CodeBuf
+    # ADD Xd, Xn, Xm -> 0x8B000000
+    var instr = 0x8B000000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_sub_rrr(cb: CodeBuf, rd: i32, rn: i32, rm: i32) -> CodeBuf
+    # SUB Xd, Xn, Xm -> 0xCB000000
+    var instr = 0xCB000000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_mul_rrr(cb: CodeBuf, rd: i32, rn: i32, rm: i32) -> CodeBuf
+    # MUL = MADD Xd, Xn, Xm, XZR -> 0x9B007C00
+    var instr = 0x9B007C00 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_sdiv_rrr(cb: CodeBuf, rd: i32, rn: i32, rm: i32) -> CodeBuf
+    # SDIV Xd, Xn, Xm -> 0x9AC00C00
+    var instr = 0x9AC00C00 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_mov_imm16(cb: CodeBuf, rd: i32, imm: i32) -> CodeBuf
+    # MOVZ Xd, #imm16 -> 0xD2800000
+    var instr = 0xD2800000 | ((imm & 0xFFFF) << 5) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_movz_imm64(cb: CodeBuf, rd: i32, imm: i32) -> CodeBuf
+    # Full 64-bit load: MOVZ + up to 3 MOVK
+    var uimm = imm
+
+    # MOVZ Xd, #imm16, LSL #0
+    var instr = 0xD2800000 | ((uimm & 0xFFFF) << 5) | (rd & 0x1F)
+    cb = codebuf_emit_u32(cb, instr)
+
+    # MOVK for bits [31:16]
+    if (uimm >> 16) != 0
+        instr = 0xF2A00000 | (((uimm >> 16) & 0xFFFF) << 5) | (rd & 0x1F)
+        cb = codebuf_emit_u32(cb, instr)
+    end
+
+    # MOVK for bits [47:32]
+    if (uimm >> 32) != 0
+        instr = 0xF2C00000 | (((uimm >> 32) & 0xFFFF) << 5) | (rd & 0x1F)
+        cb = codebuf_emit_u32(cb, instr)
+    end
+
+    # MOVK for bits [63:48]
+    if (uimm >> 48) != 0
+        instr = 0xF2E00000 | (((uimm >> 48) & 0xFFFF) << 5) | (rd & 0x1F)
+        cb = codebuf_emit_u32(cb, instr)
+    end
+
+    out cb
+end
+
+func arm64_mov_rr(cb: CodeBuf, rd: i32, rm: i32) -> CodeBuf
+    # MOV = ORR Xd, XZR, Xm -> 0xAA0003E0
+    var instr = 0xAA0003E0 | ((rm & 0x1F) << 16) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_cmp_rr(cb: CodeBuf, rn: i32, rm: i32) -> CodeBuf
+    # CMP = SUBS XZR, Xn, Xm -> 0xEB00001F
+    var instr = 0xEB00001F | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_cset_eq(cb: CodeBuf, rd: i32) -> CodeBuf
+    # CSET EQ = CSINC Xd, XZR, XZR, NE
+    out codebuf_emit_u32(cb, 0x9A9F17E0 | (rd & 0x1F))
+end
+
+func arm64_cset_gt(cb: CodeBuf, rd: i32) -> CodeBuf
+    # CSET GT = CSINC Xd, XZR, XZR, LE
+    out codebuf_emit_u32(cb, 0x9A9FD7E0 | (rd & 0x1F))
+end
+
+func arm64_cset_lt(cb: CodeBuf, rd: i32) -> CodeBuf
+    # CSET LT = CSINC Xd, XZR, XZR, GE
+    out codebuf_emit_u32(cb, 0x9A9FA7E0 | (rd & 0x1F))
+end
+
+func arm64_cset_ge(cb: CodeBuf, rd: i32) -> CodeBuf
+    # CSET GE = CSINC Xd, XZR, XZR, LT
+    out codebuf_emit_u32(cb, 0x9A9FB7E0 | (rd & 0x1F))
+end
+
+func arm64_cset_le(cb: CodeBuf, rd: i32) -> CodeBuf
+    # CSET LE = CSINC Xd, XZR, XZR, GT
+    out codebuf_emit_u32(cb, 0x9A9FC7E0 | (rd & 0x1F))
+end
+
+func arm64_b_imm26(cb: CodeBuf, offset: i32) -> CodeBuf
+    # B offset -> 0x14000000
+    var imm26 = (offset >> 2) & 0x03FFFFFF
+    out codebuf_emit_u32(cb, 0x14000000 | imm26)
+end
+
+func arm64_beq_imm19(cb: CodeBuf, offset: i32) -> CodeBuf
+    # B.EQ -> 0x54000000
+    var imm19 = (offset >> 2) & 0x7FFFF
+    out codebuf_emit_u32(cb, 0x54000000 | (imm19 << 5))
+end
+
+func arm64_bne_imm19(cb: CodeBuf, offset: i32) -> CodeBuf
+    # B.NE -> 0x54000001
+    var imm19 = (offset >> 2) & 0x7FFFF
+    out codebuf_emit_u32(cb, 0x54000001 | (imm19 << 5))
+end
+
+func arm64_bl_imm26(cb: CodeBuf, offset: i32) -> CodeBuf
+    var imm26 = (offset >> 2) & 0x03FFFFFF
+    out codebuf_emit_u32(cb, 0x94000000 | imm26)
+end
+
+func arm64_ret(cb: CodeBuf) -> CodeBuf
+    out codebuf_emit_u32(cb, 0xD65F03C0)
+end
+
+func arm64_nop(cb: CodeBuf) -> CodeBuf
+    out codebuf_emit_u32(cb, 0xD503201F)
+end
+
+func arm64_stp_pre(cb: CodeBuf, rt: i32, rt2: i32, rn: i32, imm: i32) -> CodeBuf
+    # STP Xt, Xt2, [Xn, #imm]!
+    var simm7 = (imm / 8) & 0x7F
+    var instr = 0xA9800000 | (simm7 << 15) | ((rt2 & 0x1F) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_ldp_post(cb: CodeBuf, rt: i32, rt2: i32, rn: i32, imm: i32) -> CodeBuf
+    # LDP Xt, Xt2, [Xn], #imm
+    var simm7 = (imm / 8) & 0x7F
+    var instr = 0xA8C00000 | (simm7 << 15) | ((rt2 & 0x1F) << 10) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_str_pre(cb: CodeBuf, rt: i32, rn: i32, imm: i32) -> CodeBuf
+    # STR Xt, [Xn, #imm]!
+    var simm9 = imm & 0x1FF
+    var instr = 0xF8000C00 | (simm9 << 12) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_ldr_post(cb: CodeBuf, rt: i32, rn: i32, imm: i32) -> CodeBuf
+    # LDR Xt, [Xn], #imm
+    var simm9 = imm & 0x1FF
+    var instr = 0xF8400400 | (simm9 << 12) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_svc(cb: CodeBuf, imm: i32) -> CodeBuf
+    out codebuf_emit_u32(cb, 0xD4000001 | ((imm & 0xFFFF) << 5))
+end
+
+func arm64_cmp_imm0(cb: CodeBuf, rn: i32) -> CodeBuf
+    # CMP Xn, #0 = SUBS XZR, Xn, #0
+    out codebuf_emit_u32(cb, 0xF100001F | ((rn & 0x1F) << 5))
+end
+
+func arm64_blr_x16(cb: CodeBuf) -> CodeBuf
+    # BLR X16 -> 0xD63F0200
+    out codebuf_emit_u32(cb, 0xD63F0200)
+end
+
+# ── ARM64 bitwise ──
+
+func arm64_and_rrr(cb: CodeBuf, rd: i32, rn: i32, rm: i32) -> CodeBuf
+    var instr = 0x8A000000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_orr_rrr(cb: CodeBuf, rd: i32, rn: i32, rm: i32) -> CodeBuf
+    var instr = 0xAA000000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_eor_rrr(cb: CodeBuf, rd: i32, rn: i32, rm: i32) -> CodeBuf
+    var instr = 0xCA000000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_lsl_rrr(cb: CodeBuf, rd: i32, rn: i32, rm: i32) -> CodeBuf
+    var instr = 0x9AC02000 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_asr_rrr(cb: CodeBuf, rd: i32, rn: i32, rm: i32) -> CodeBuf
+    var instr = 0x9AC02800 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rd & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+# ── ARM64 memory ──
+
+func arm64_ldrb_reg(cb: CodeBuf, rt: i32, rn: i32, rm: i32) -> CodeBuf
+    var instr = 0x38606800 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_strb_reg(cb: CodeBuf, rt: i32, rn: i32, rm: i32) -> CodeBuf
+    var instr = 0x38206800 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_ldr_reg(cb: CodeBuf, rt: i32, rn: i32, rm: i32) -> CodeBuf
+    # LDR Xt, [Xn, Xm, LSL #3]
+    var instr = 0xF8607800 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+func arm64_str_reg(cb: CodeBuf, rt: i32, rn: i32, rm: i32) -> CodeBuf
+    # STR Xt, [Xn, Xm, LSL #3]
+    var instr = 0xF8207800 | ((rm & 0x1F) << 16) | ((rn & 0x1F) << 5) | (rt & 0x1F)
+    out codebuf_emit_u32(cb, instr)
+end
+
+# ═══════════════════════════════════════════════════════
+# NEON (ARM64 SIMD) Instruction Emitters
+# ═══════════════════════════════════════════════════════
+
+func neon_ld1_4s(cb: CodeBuf, vt: i32, xn: i32) -> CodeBuf
+    out codebuf_emit_u32(cb, 0x4C40A800 | ((xn & 0x1F) << 5) | (vt & 0x1F))
+end
+
+func neon_st1_4s(cb: CodeBuf, vt: i32, xn: i32) -> CodeBuf
+    out codebuf_emit_u32(cb, 0x4C00A800 | ((xn & 0x1F) << 5) | (vt & 0x1F))
+end
+
+func neon_add_4s(cb: CodeBuf, vd: i32, vn: i32, vm: i32) -> CodeBuf
+    var enc = 0x4EA08400 | ((vm & 0x1F) << 16) | ((vn & 0x1F) << 5) | (vd & 0x1F)
+    out codebuf_emit_u32(cb, enc)
+end
+
+func neon_sub_4s(cb: CodeBuf, vd: i32, vn: i32, vm: i32) -> CodeBuf
+    var enc = 0x6EA08400 | ((vm & 0x1F) << 16) | ((vn & 0x1F) << 5) | (vd & 0x1F)
+    out codebuf_emit_u32(cb, enc)
+end
+
+func neon_mul_4s(cb: CodeBuf, vd: i32, vn: i32, vm: i32) -> CodeBuf
+    var enc = 0x4EA09C00 | ((vm & 0x1F) << 16) | ((vn & 0x1F) << 5) | (vd & 0x1F)
+    out codebuf_emit_u32(cb, enc)
+end
+
+func neon_fadd_4s(cb: CodeBuf, vd: i32, vn: i32, vm: i32) -> CodeBuf
+    var enc = 0x4E20D400 | ((vm & 0x1F) << 16) | ((vn & 0x1F) << 5) | (vd & 0x1F)
+    out codebuf_emit_u32(cb, enc)
+end
+
+func neon_fmul_4s(cb: CodeBuf, vd: i32, vn: i32, vm: i32) -> CodeBuf
+    var enc = 0x6E20DC00 | ((vm & 0x1F) << 16) | ((vn & 0x1F) << 5) | (vd & 0x1F)
+    out codebuf_emit_u32(cb, enc)
+end
+
+func neon_fdiv_4s(cb: CodeBuf, vd: i32, vn: i32, vm: i32) -> CodeBuf
+    var enc = 0x6E20FC00 | ((vm & 0x1F) << 16) | ((vn & 0x1F) << 5) | (vd & 0x1F)
+    out codebuf_emit_u32(cb, enc)
+end
+
+func neon_fmla_4s(cb: CodeBuf, vd: i32, vn: i32, vm: i32) -> CodeBuf
+    var enc = 0x4E20CC00 | ((vm & 0x1F) << 16) | ((vn & 0x1F) << 5) | (vd & 0x1F)
+    out codebuf_emit_u32(cb, enc)
+end
+
+func neon_smin_4s(cb: CodeBuf, vd: i32, vn: i32, vm: i32) -> CodeBuf
+    var enc = 0x4EA06C00 | ((vm & 0x1F) << 16) | ((vn & 0x1F) << 5) | (vd & 0x1F)
+    out codebuf_emit_u32(cb, enc)
+end
+
+func neon_smax_4s(cb: CodeBuf, vd: i32, vn: i32, vm: i32) -> CodeBuf
+    var enc = 0x4EA06400 | ((vm & 0x1F) << 16) | ((vn & 0x1F) << 5) | (vd & 0x1F)
+    out codebuf_emit_u32(cb, enc)
+end
+
+func neon_addv_4s(cb: CodeBuf, vd: i32, vn: i32) -> CodeBuf
+    out codebuf_emit_u32(cb, 0x4EB1B800 | ((vn & 0x1F) << 5) | (vd & 0x1F))
+end
+
+func neon_dup_4s_gpr(cb: CodeBuf, vd: i32, xn: i32) -> CodeBuf
+    out codebuf_emit_u32(cb, 0x4E040C00 | ((xn & 0x1F) << 5) | (vd & 0x1F))
+end
+
+func neon_tbl_16b(cb: CodeBuf, vd: i32, vn: i32, vm: i32) -> CodeBuf
+    var enc = 0x4E000000 | ((vm & 0x1F) << 16) | ((vn & 0x1F) << 5) | (vd & 0x1F)
+    out codebuf_emit_u32(cb, enc)
+end
+
+# ═══════════════════════════════════════════════════════
+# Virtual Register -> Physical Register Mapping
+# ═══════════════════════════════════════════════════════
+
+func vreg_to_x86(vreg: i32) -> i32
+    # RAX=0, RCX=1, RDX=2, RSI=6, RDI=7, R8-R11, RBX=3, R12-R15
+    var map = [0, 1, 2, 6, 7, 8, 9, 10, 11, 3, 12, 13, 14, 15]
+    if vreg >= 0 and vreg < 14
+        out map[vreg]
+    end
+    out 0  # spill to RAX
+end
+
+func vreg_to_arm(vreg: i32) -> i32
+    if vreg >= 0 and vreg < 16
+        out vreg
+    end
+    out 0  # spill to X0
+end
+
+func vreg_to_neon(vreg: i32) -> i32
+    if vreg >= 0 and vreg < 16
+        out vreg
+    end
+    out 0
+end
+
+func vreg_to_xmm(vreg: i32) -> i32
+    if vreg >= 0 and vreg < 8
+        out vreg
+    end
+    out 0
+end
+
+# ═══════════════════════════════════════════════════════
+# Back-Patching Infrastructure
+# ═══════════════════════════════════════════════════════
+
+const CG_MAX_LABELS = 1024
+const CG_MAX_FIXUPS = 4096
+
+entity CgLabel
+    label_id:   i32
+    offset:     i32
+end
+
+entity CgFixup
+    patch_offset:   i32
+    target_label:   i32
+    is_cond:        i32
+end
+
+entity PatchState
+    labels:         [CgLabel]
+    fixups:         [CgFixup]
+    label_count:    i32
+    fixup_count:    i32
+end
+
+func patch_new() -> PatchState
+    out PatchState {
+        labels: [],
+        fixups: [],
+        label_count: 0,
+        fixup_count: 0
+    }
+end
+
+func patch_add_label(ps: PatchState, label_id: i32, offset: i32) -> PatchState
+    if ps.label_count < CG_MAX_LABELS
+        ps.labels = ps.labels + [CgLabel { label_id: label_id, offset: offset }]
+        ps.label_count = ps.label_count + 1
+    end
+    out ps
+end
+
+func patch_add_fixup(ps: PatchState, patch_offset: i32, target_label: i32, is_cond: i32) -> PatchState
+    if ps.fixup_count < CG_MAX_FIXUPS
+        ps.fixups = ps.fixups + [CgFixup { patch_offset: patch_offset, target_label: target_label, is_cond: is_cond }]
+        ps.fixup_count = ps.fixup_count + 1
+    end
+    out ps
+end
+
+func patch_find_label(ps: PatchState, label_id: i32) -> i32
+    var i = 0
+    while i < ps.label_count
+        if ps.labels[i].label_id == label_id
+            out ps.labels[i].offset
+        end
+        i = i + 1
+    end
+    out -1  # not found
+end
+
+func backpatch_x86(cb: CodeBuf, ps: PatchState) -> CodeBuf
+    var f = 0
+    while f < ps.fixup_count
+        var target = patch_find_label(ps, ps.fixups[f].target_label)
+        if target >= 0
+            var patch_at = ps.fixups[f].patch_offset
+            var instr_end = patch_at + 4
+            var rel = target - instr_end
+            cb = codebuf_patch_i32(cb, patch_at, rel)
+        end
+        f = f + 1
+    end
+    out cb
+end
+
+func backpatch_arm64(cb: CodeBuf, ps: PatchState) -> CodeBuf
+    var f = 0
+    while f < ps.fixup_count
+        var target = patch_find_label(ps, ps.fixups[f].target_label)
+        if target >= 0
+            var patch_at = ps.fixups[f].patch_offset
+            var byte_offset = target - patch_at
+            # Read original instruction (little-endian)
+            var orig = cb.data[patch_at] | (cb.data[patch_at + 1] << 8) | (cb.data[patch_at + 2] << 16) | (cb.data[patch_at + 3] << 24)
+            if ps.fixups[f].is_cond == 1
+                # B.cond: imm19 at bits [23:5]
+                var imm19 = (byte_offset >> 2) & 0x7FFFF
+                orig = (orig & (~(0x7FFFF << 5))) | (imm19 << 5)
+            else
+                # B / BL: imm26 at bits [25:0]
+                var imm26 = (byte_offset >> 2) & 0x03FFFFFF
+                orig = (orig & (~0x03FFFFFF)) | imm26
+            end
+            cb = codebuf_patch_u32(cb, patch_at, orig)
+        end
+        f = f + 1
+    end
+    out cb
+end
+
+func backpatch(cb: CodeBuf, ps: PatchState) -> CodeBuf
+    if cb.arch == TargetArch::ARM64
+        out backpatch_arm64(cb, ps)
+    else
+        out backpatch_x86(cb, ps)
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Q-IR Opcodes (matching ir_optimizer.vri)
+# ═══════════════════════════════════════════════════════
+
+enum QOp
+    Nop             = 0
+    Load            = 1
+    Store           = 2
+    Move            = 3
+    Add             = 4
+    Sub             = 5
+    Mul             = 6
+    Div             = 7
+    Mod             = 8
+    CmpEq           = 9
+    CmpGt           = 10
+    CmpLt           = 11
+    CmpGe           = 12
+    CmpLe           = 13
+    And             = 14
+    Or              = 15
+    Xor             = 16
+    Shl             = 17
+    Shr             = 18
+    Label           = 19
+    Jump            = 20
+    JumpIf          = 21
+    JumpIfNot       = 22
+    Call            = 23
+    CallFunc        = 24
+    Ret             = 25
+    Halt            = 26
+    Print           = 27
+    Input           = 28
+    PrintStr        = 29
+    Alloc           = 30
+    Free            = 31
+    LoadByte        = 32
+    StoreByte       = 33
+    LoadWord        = 34
+    StoreWord       = 35
+    StrLen          = 36
+    StrGet          = 37
+    StrCat          = 38
+    StrEq           = 39
+    IToStr          = 40
+    StrToI          = 41
+    FileOpen        = 42
+    FileRead        = 43
+    FileWrite       = 44
+    FileClose       = 45
+    FileWriteByte   = 46
+    ArrNew          = 47
+    ArrLen          = 48
+    ArrGet          = 49
+    ArrSet          = 50
+    ArrPush         = 51
+    Exit            = 52
+    LoadGlobal      = 53
+    StoreGlobal     = 54
+    GetArg          = 55
+    ArgCount        = 56
+    PatchPoint      = 57
+    VLoad           = 58
+    VStore          = 59
+    VAdd            = 60
+    VSub            = 61
+    VMul            = 62
+    VFma            = 63
+    VDiv            = 64
+    VMin            = 65
+    VMax            = 66
+    VReduce         = 67
+    VSplat          = 68
+    VPerm           = 69
+end
+
+# ═══════════════════════════════════════════════════════
+# Operand Types
+# ═══════════════════════════════════════════════════════
+
+enum OpndType
+    None    = 0
+    VReg    = 1
+    Imm     = 2
+    Label   = 3
+    StrRef  = 4
+    FuncIdx = 5
+end
+
+entity Operand
+    kind:       OpndType
+    vreg:       i32
+    imm:        i32
+    label:      i32
+    str_idx:    i32
+    func_idx:   i32
+end
+
+func opnd_none() -> Operand
+    out Operand { kind: OpndType::None, vreg: 0, imm: 0, label: 0, str_idx: 0, func_idx: 0 }
+end
+
+func opnd_vreg(v: i32) -> Operand
+    out Operand { kind: OpndType::VReg, vreg: v, imm: 0, label: 0, str_idx: 0, func_idx: 0 }
+end
+
+func opnd_imm(v: i32) -> Operand
+    out Operand { kind: OpndType::Imm, vreg: 0, imm: v, label: 0, str_idx: 0, func_idx: 0 }
+end
+
+func opnd_label(v: i32) -> Operand
+    out Operand { kind: OpndType::Label, vreg: 0, imm: 0, label: v, str_idx: 0, func_idx: 0 }
+end
+
+# ═══════════════════════════════════════════════════════
+# Instruction
+# ═══════════════════════════════════════════════════════
+
+entity QInstr
+    opcode:     QOp
+    dest:       Operand
+    src1:       Operand
+    src2:       Operand
+    patch_id:   i32
+end
+
+# ═══════════════════════════════════════════════════════
+# codegen_emit_fast — Register-Direct Code Generation
+# ═══════════════════════════════════════════════════════
+# This is the main code-generation dispatch.
+# Takes a list of Q-IR instructions and emits machine code.
+
+func emit_fast_x86(cb: CodeBuf, instrs: [QInstr], count: i32) -> CodeBuf
+    var ps = patch_new()
+
+    # Check if stack frame needed
+    var needs_frame = 0
+    var check = 0
+    while check < count
+        var op = instrs[check].opcode
+        if op == QOp::Call or op == QOp::CallFunc or op == QOp::Print
+            needs_frame = 1
+        end
+        check = check + 1
+    end
+
+    # Prologue
+    if needs_frame == 1
+        cb = x86_push(cb, 5)       # PUSH RBP
+        cb = x86_mov_rr(cb, 5, 4)  # MOV RBP, RSP
+    end
+
+    var i = 0
+    while i < count
+        var ins = instrs[i]
+        var rd  = 0
+        var rs1 = 0
+        var rs2 = 1
+
+        if ins.dest.kind == OpndType::VReg
+            rd = vreg_to_x86(ins.dest.vreg)
+        end
+        if ins.src1.kind == OpndType::VReg
+            rs1 = vreg_to_x86(ins.src1.vreg)
+        end
+        if ins.src2.kind == OpndType::VReg
+            rs2 = vreg_to_x86(ins.src2.vreg)
+        end
+
+        if ins.opcode == QOp::Nop
+            cb = x86_nop(cb)
+
+        eif ins.opcode == QOp::Load
+            if ins.src1.kind == OpndType::Imm
+                cb = x86_mov_reg_imm64(cb, rd, ins.src1.imm)
+            end
+
+        eif ins.opcode == QOp::Store or ins.opcode == QOp::Move
+            cb = x86_mov_rr(cb, rd, rs1)
+
+        eif ins.opcode == QOp::Add
+            if rd != rs1
+                cb = x86_mov_rr(cb, rd, rs1)
+            end
+            cb = x86_add_rr(cb, rd, rs2)
+
+        eif ins.opcode == QOp::Sub
+            if rd != rs1
+                cb = x86_mov_rr(cb, rd, rs1)
+            end
+            cb = x86_sub_rr(cb, rd, rs2)
+
+        eif ins.opcode == QOp::Mul
+            if rd != rs1
+                cb = x86_mov_rr(cb, rd, rs1)
+            end
+            cb = x86_imul_rr(cb, rd, rs2)
+
+        eif ins.opcode == QOp::Div
+            if rs1 != 0  # RAX
+                cb = x86_mov_rr(cb, 0, rs1)
+            end
+            cb = x86_cqo(cb)
+            cb = x86_idiv(cb, rs2)
+            if rd != 0
+                cb = x86_mov_rr(cb, rd, 0)
+            end
+
+        eif ins.opcode == QOp::Mod
+            if rs1 != 0
+                cb = x86_mov_rr(cb, 0, rs1)
+            end
+            cb = x86_cqo(cb)
+            cb = x86_idiv(cb, rs2)
+            if rd != 2  # RDX
+                cb = x86_mov_rr(cb, rd, 2)
+            end
+
+        eif ins.opcode == QOp::CmpEq
+            cb = x86_cmp_rr(cb, rs1, rs2)
+            cb = x86_xor_rr(cb, rd, rd)
+            cb = x86_sete(cb, rd)
+
+        eif ins.opcode == QOp::CmpGt
+            cb = x86_cmp_rr(cb, rs1, rs2)
+            cb = x86_xor_rr(cb, rd, rd)
+            cb = x86_setg(cb, rd)
+
+        eif ins.opcode == QOp::CmpLt
+            cb = x86_cmp_rr(cb, rs1, rs2)
+            cb = x86_xor_rr(cb, rd, rd)
+            cb = x86_setl(cb, rd)
+
+        eif ins.opcode == QOp::CmpGe
+            cb = x86_cmp_rr(cb, rs1, rs2)
+            cb = x86_xor_rr(cb, rd, rd)
+            cb = x86_setge(cb, rd)
+
+        eif ins.opcode == QOp::CmpLe
+            cb = x86_cmp_rr(cb, rs1, rs2)
+            cb = x86_xor_rr(cb, rd, rd)
+            cb = x86_setle(cb, rd)
+
+        eif ins.opcode == QOp::And
+            if rd != rs1
+                cb = x86_mov_rr(cb, rd, rs1)
+            end
+            cb = x86_and_rr(cb, rd, rs2)
+
+        eif ins.opcode == QOp::Or
+            if rd != rs1
+                cb = x86_mov_rr(cb, rd, rs1)
+            end
+            cb = x86_or_rr(cb, rd, rs2)
+
+        eif ins.opcode == QOp::Xor
+            if rd != rs1
+                cb = x86_mov_rr(cb, rd, rs1)
+            end
+            cb = x86_xor_rr(cb, rd, rs2)
+
+        eif ins.opcode == QOp::Shl
+            if rd != rs1
+                cb = x86_mov_rr(cb, rd, rs1)
+            end
+            if rs2 != 1  # RCX
+                cb = x86_mov_rr(cb, 1, rs2)
+            end
+            cb = x86_shl_cl(cb, rd)
+
+        eif ins.opcode == QOp::Shr
+            if rd != rs1
+                cb = x86_mov_rr(cb, rd, rs1)
+            end
+            if rs2 != 1  # RCX
+                cb = x86_mov_rr(cb, 1, rs2)
+            end
+            cb = x86_sar_cl(cb, rd)
+
+        eif ins.opcode == QOp::Label
+            ps = patch_add_label(ps, ins.patch_id, codebuf_offset(cb))
+
+        eif ins.opcode == QOp::Jump
+            if ins.src1.kind == OpndType::Label
+                ps = patch_add_fixup(ps, codebuf_offset(cb) + 1, ins.src1.label, 0)
+            end
+            cb = x86_jmp_rel32(cb, 0)
+
+        eif ins.opcode == QOp::JumpIf
+            if ins.src1.kind == OpndType::VReg
+                cb = x86_test_rr(cb, rs1)
+            end
+            if ins.src2.kind == OpndType::Label
+                ps = patch_add_fixup(ps, codebuf_offset(cb) + 2, ins.src2.label, 1)
+            end
+            cb = x86_jne_rel32(cb, 0)
+
+        eif ins.opcode == QOp::JumpIfNot
+            if ins.src1.kind == OpndType::VReg
+                cb = x86_test_rr(cb, rs1)
+            end
+            if ins.src2.kind == OpndType::Label
+                ps = patch_add_fixup(ps, codebuf_offset(cb) + 2, ins.src2.label, 1)
+            end
+            cb = x86_je_rel32(cb, 0)
+
+        eif ins.opcode == QOp::Call or ins.opcode == QOp::CallFunc
+            if ins.src1.kind == OpndType::Label
+                ps = patch_add_fixup(ps, codebuf_offset(cb) + 1, ins.src1.label, 0)
+            eif ins.src1.kind == OpndType::FuncIdx
+                ps = patch_add_fixup(ps, codebuf_offset(cb) + 1, ins.src1.func_idx, 0)
+            end
+            cb = x86_call_rel32(cb, 0)
+
+        eif ins.opcode == QOp::Ret
+            if ins.src1.kind == OpndType::VReg and rs1 != 0
+                cb = x86_mov_rr(cb, 0, rs1)
+            end
+            if needs_frame == 1
+                cb = x86_mov_rr(cb, 4, 5)  # MOV RSP, RBP
+                cb = x86_pop(cb, 5)         # POP RBP
+            end
+            cb = x86_ret(cb)
+
+        eif ins.opcode == QOp::Halt
+            cb = x86_xor_rr(cb, 0, 0)
+            cb = x86_ret(cb)
+
+        eif ins.opcode == QOp::PatchPoint
+            cb = x86_nop(cb)
+
+        # SIMD (AVX)
+        eif ins.opcode == QOp::VLoad
+            var xd = vreg_to_xmm(ins.dest.vreg)
+            var base = 0
+            if ins.src1.kind == OpndType::VReg
+                base = vreg_to_x86(ins.src1.vreg)
+            end
+            cb = avx_vmovaps_load(cb, xd, base)
+
+        eif ins.opcode == QOp::VStore
+            var xs = vreg_to_xmm(ins.src1.vreg)
+            var base = 0
+            if ins.dest.kind == OpndType::VReg
+                base = vreg_to_x86(ins.dest.vreg)
+            end
+            cb = avx_vmovaps_store(cb, base, xs)
+
+        eif ins.opcode == QOp::VAdd
+            cb = avx_vaddps(cb, vreg_to_xmm(ins.dest.vreg), vreg_to_xmm(ins.src1.vreg), vreg_to_xmm(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VSub
+            cb = avx_vsubps(cb, vreg_to_xmm(ins.dest.vreg), vreg_to_xmm(ins.src1.vreg), vreg_to_xmm(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VMul
+            cb = avx_vmulps(cb, vreg_to_xmm(ins.dest.vreg), vreg_to_xmm(ins.src1.vreg), vreg_to_xmm(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VFma
+            var d = vreg_to_xmm(ins.dest.vreg)
+            var s1 = vreg_to_xmm(ins.src1.vreg)
+            var s2 = vreg_to_xmm(ins.src2.vreg)
+            cb = avx_vmulps(cb, d, s1, s2)
+            cb = avx_vaddps(cb, d, d, d)
+
+        eif ins.opcode == QOp::VDiv
+            cb = avx_vdivps(cb, vreg_to_xmm(ins.dest.vreg), vreg_to_xmm(ins.src1.vreg), vreg_to_xmm(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VMin
+            cb = avx_vminps(cb, vreg_to_xmm(ins.dest.vreg), vreg_to_xmm(ins.src1.vreg), vreg_to_xmm(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VMax
+            cb = avx_vmaxps(cb, vreg_to_xmm(ins.dest.vreg), vreg_to_xmm(ins.src1.vreg), vreg_to_xmm(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VReduce
+            var d = vreg_to_xmm(ins.dest.vreg)
+            var s = vreg_to_xmm(ins.src1.vreg)
+            cb = avx_vhaddps(cb, d, s, s)
+            cb = avx_vhaddps(cb, d, d, d)
+
+        eif ins.opcode == QOp::VSplat
+            cb = avx_vbroadcastss(cb, vreg_to_xmm(ins.dest.vreg), vreg_to_xmm(ins.src1.vreg))
+
+        else
+            cb = x86_nop(cb)
+        end
+
+        i = i + 1
+    end
+
+    # Back-patch
+    cb = backpatch_x86(cb, ps)
+    out cb
+end
+
+func emit_fast_arm64(cb: CodeBuf, instrs: [QInstr], count: i32) -> CodeBuf
+    var ps = patch_new()
+
+    # Check if stack frame needed
+    var needs_frame = 0
+    var check = 0
+    while check < count
+        var op = instrs[check].opcode
+        if op == QOp::Call or op == QOp::CallFunc or op == QOp::Print
+            needs_frame = 1
+        end
+        check = check + 1
+    end
+
+    # Prologue
+    if needs_frame == 1
+        cb = arm64_stp_pre(cb, 29, 30, 31, -16)  # STP X29, X30, [SP, #-16]!
+    end
+
+    var i = 0
+    while i < count
+        var ins = instrs[i]
+        var rd  = 0
+        var rs1 = 0
+        var rs2 = 1
+
+        if ins.dest.kind == OpndType::VReg
+            rd = vreg_to_arm(ins.dest.vreg)
+        end
+        if ins.src1.kind == OpndType::VReg
+            rs1 = vreg_to_arm(ins.src1.vreg)
+        end
+        if ins.src2.kind == OpndType::VReg
+            rs2 = vreg_to_arm(ins.src2.vreg)
+        end
+
+        if ins.opcode == QOp::Nop
+            cb = arm64_nop(cb)
+
+        eif ins.opcode == QOp::Load
+            if ins.src1.kind == OpndType::Imm
+                cb = arm64_movz_imm64(cb, rd, ins.src1.imm)
+            end
+
+        eif ins.opcode == QOp::Store or ins.opcode == QOp::Move
+            cb = arm64_mov_rr(cb, rd, rs1)
+
+        eif ins.opcode == QOp::Add
+            cb = arm64_add_rrr(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::Sub
+            cb = arm64_sub_rrr(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::Mul
+            cb = arm64_mul_rrr(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::Div
+            cb = arm64_sdiv_rrr(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::Mod
+            # X16 = SDIV(rs1, rs2); rd = rs1 - X16 * rs2
+            cb = arm64_sdiv_rrr(cb, 16, rs1, rs2)
+            cb = arm64_mul_rrr(cb, 16, 16, rs2)
+            cb = arm64_sub_rrr(cb, rd, rs1, 16)
+
+        eif ins.opcode == QOp::CmpEq
+            cb = arm64_cmp_rr(cb, rs1, rs2)
+            cb = arm64_cset_eq(cb, rd)
+
+        eif ins.opcode == QOp::CmpGt
+            cb = arm64_cmp_rr(cb, rs1, rs2)
+            cb = arm64_cset_gt(cb, rd)
+
+        eif ins.opcode == QOp::CmpLt
+            cb = arm64_cmp_rr(cb, rs1, rs2)
+            cb = arm64_cset_lt(cb, rd)
+
+        eif ins.opcode == QOp::CmpGe
+            cb = arm64_cmp_rr(cb, rs1, rs2)
+            cb = arm64_cset_ge(cb, rd)
+
+        eif ins.opcode == QOp::CmpLe
+            cb = arm64_cmp_rr(cb, rs1, rs2)
+            cb = arm64_cset_le(cb, rd)
+
+        eif ins.opcode == QOp::And
+            cb = arm64_and_rrr(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::Or
+            cb = arm64_orr_rrr(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::Xor
+            cb = arm64_eor_rrr(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::Shl
+            cb = arm64_lsl_rrr(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::Shr
+            cb = arm64_asr_rrr(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::Label
+            ps = patch_add_label(ps, ins.patch_id, codebuf_offset(cb))
+
+        eif ins.opcode == QOp::Jump
+            if ins.src1.kind == OpndType::Label
+                ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src1.label, 0)
+            end
+            cb = arm64_b_imm26(cb, 0)
+
+        eif ins.opcode == QOp::JumpIf
+            if ins.src1.kind == OpndType::VReg
+                cb = arm64_cmp_imm0(cb, rs1)
+            end
+            if ins.src2.kind == OpndType::Label
+                ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src2.label, 1)
+            end
+            cb = arm64_bne_imm19(cb, 0)
+
+        eif ins.opcode == QOp::JumpIfNot
+            if ins.src1.kind == OpndType::VReg
+                cb = arm64_cmp_imm0(cb, rs1)
+            end
+            if ins.src2.kind == OpndType::Label
+                ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src2.label, 1)
+            end
+            cb = arm64_beq_imm19(cb, 0)
+
+        eif ins.opcode == QOp::Call or ins.opcode == QOp::CallFunc
+            if ins.src1.kind == OpndType::Label
+                ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src1.label, 0)
+            eif ins.src1.kind == OpndType::FuncIdx
+                ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src1.func_idx, 0)
+            end
+            cb = arm64_bl_imm26(cb, 0)
+
+        eif ins.opcode == QOp::Ret
+            if ins.src1.kind == OpndType::VReg and rs1 != 0
+                cb = arm64_mov_rr(cb, 0, rs1)
+            end
+            if needs_frame == 1
+                cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+            end
+            cb = arm64_ret(cb)
+
+        eif ins.opcode == QOp::Halt
+            cb = arm64_mov_imm16(cb, 0, 0)
+            cb = arm64_ret(cb)
+
+        eif ins.opcode == QOp::PatchPoint
+            cb = arm64_nop(cb)
+
+        # Memory
+        eif ins.opcode == QOp::LoadByte
+            cb = arm64_ldrb_reg(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::StoreByte
+            var val = 0
+            if ins.dest.kind == OpndType::VReg
+                val = vreg_to_arm(ins.dest.vreg)
+            end
+            cb = arm64_strb_reg(cb, val, rs1, rs2)
+
+        eif ins.opcode == QOp::LoadWord
+            cb = arm64_ldr_reg(cb, rd, rs1, rs2)
+
+        eif ins.opcode == QOp::StoreWord
+            var val = 0
+            if ins.dest.kind == OpndType::VReg
+                val = vreg_to_arm(ins.dest.vreg)
+            end
+            cb = arm64_str_reg(cb, val, rs1, rs2)
+
+        # SIMD (NEON)
+        eif ins.opcode == QOp::VLoad
+            cb = neon_ld1_4s(cb, vreg_to_neon(ins.dest.vreg), rs1)
+
+        eif ins.opcode == QOp::VStore
+            var base = 0
+            if ins.dest.kind == OpndType::VReg
+                base = vreg_to_arm(ins.dest.vreg)
+            end
+            cb = neon_st1_4s(cb, vreg_to_neon(ins.src1.vreg), base)
+
+        eif ins.opcode == QOp::VAdd
+            cb = neon_add_4s(cb, vreg_to_neon(ins.dest.vreg), vreg_to_neon(ins.src1.vreg), vreg_to_neon(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VSub
+            cb = neon_sub_4s(cb, vreg_to_neon(ins.dest.vreg), vreg_to_neon(ins.src1.vreg), vreg_to_neon(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VMul
+            cb = neon_mul_4s(cb, vreg_to_neon(ins.dest.vreg), vreg_to_neon(ins.src1.vreg), vreg_to_neon(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VFma
+            cb = neon_fmla_4s(cb, vreg_to_neon(ins.dest.vreg), vreg_to_neon(ins.src1.vreg), vreg_to_neon(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VDiv
+            cb = neon_fdiv_4s(cb, vreg_to_neon(ins.dest.vreg), vreg_to_neon(ins.src1.vreg), vreg_to_neon(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VMin
+            cb = neon_smin_4s(cb, vreg_to_neon(ins.dest.vreg), vreg_to_neon(ins.src1.vreg), vreg_to_neon(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VMax
+            cb = neon_smax_4s(cb, vreg_to_neon(ins.dest.vreg), vreg_to_neon(ins.src1.vreg), vreg_to_neon(ins.src2.vreg))
+
+        eif ins.opcode == QOp::VReduce
+            cb = neon_addv_4s(cb, vreg_to_neon(ins.dest.vreg), vreg_to_neon(ins.src1.vreg))
+
+        eif ins.opcode == QOp::VSplat
+            cb = neon_dup_4s_gpr(cb, vreg_to_neon(ins.dest.vreg), rs1)
+
+        eif ins.opcode == QOp::VPerm
+            cb = neon_tbl_16b(cb, vreg_to_neon(ins.dest.vreg), vreg_to_neon(ins.src1.vreg), vreg_to_neon(ins.src2.vreg))
+
+        else
+            cb = arm64_nop(cb)
+        end
+
+        i = i + 1
+    end
+
+    # Back-patch
+    cb = backpatch_arm64(cb, ps)
+    out cb
+end
+
+# ═══════════════════════════════════════════════════════
+# Top-Level Code Generation Entry Points
+# ═══════════════════════════════════════════════════════
+
+func codegen_emit(instrs: [QInstr], count: i32, arch: TargetArch) -> CodeBuf
+    var cb = codebuf_new(arch)
+    if arch == TargetArch::ARM64
+        cb = emit_fast_arm64(cb, instrs, count)
+    else
+        cb = emit_fast_x86(cb, instrs, count)
+    end
+    out cb
+end
+
+func codegen_emit_for_host(instrs: [QInstr], count: i32) -> CodeBuf
+    out codegen_emit(instrs, count, detect_arch())
+end
+
+# ═══════════════════════════════════════════════════════
+# Multi-Variant Code Generation
+# ═══════════════════════════════════════════════════════
+
+entity CodeVariant
+    patch_id:       i32
+    safe_code:      CodeBuf
+    fast_code:      CodeBuf
+end
+
+entity CodegenResult
+    arch:       TargetArch
+    variants:   [CodeVariant]
+    count:      i32
+end
+
+func codegen_result_new(arch: TargetArch) -> CodegenResult
+    out CodegenResult {
+        arch: arch,
+        variants: [],
+        count: 0
+    }
+end
+
+# ═══════════════════════════════════════════════════════
+# Hexdump Utility
+# ═══════════════════════════════════════════════════════
+
+func codebuf_hexdump(cb: CodeBuf) -> [i32]
+    # Returns a list of hex byte values for inspection
+    var result = []
+    var i = 0
+    while i < cb.len
+        result = result + [cb.data[i]]
+        i = i + 1
+    end
+    out result
+end
+
+export codebuf_new, codebuf_emit_byte, codebuf_emit_u32, codebuf_emit_u64
+export codebuf_emit_i32, codebuf_offset, codebuf_patch_i32, codebuf_hexdump
+export CodeBuf, TargetArch, QOp, QInstr, Operand, OpndType
+export opnd_none, opnd_vreg, opnd_imm, opnd_label
+export codegen_emit, codegen_emit_for_host, detect_arch
+export emit_fast_x86, emit_fast_arm64
+export backpatch, backpatch_x86, backpatch_arm64
+export PatchState, patch_new, patch_add_label, patch_add_fixup
+export CodeVariant, CodegenResult, codegen_result_new
+
+# x86 emitters
+export x86_add_rr, x86_sub_rr, x86_imul_rr, x86_mov_reg_imm64, x86_mov_reg_imm32
+export x86_mov_rr, x86_push, x86_pop, x86_ret, x86_nop, x86_jmp_rel32
+export x86_call_rel32, x86_cmp_rr, x86_sete, x86_setg, x86_setl, x86_setge, x86_setle
+export x86_je_rel32, x86_jne_rel32, x86_xor_rr, x86_and_rr, x86_or_rr
+export x86_shl_cl, x86_sar_cl, x86_idiv, x86_cqo, x86_syscall, x86_test_rr
+export rex_w, modrm
+
+# AVX emitters
+export avx_vaddps, avx_vsubps, avx_vmulps, avx_vdivps
+export avx_vminps, avx_vmaxps, avx_vmovaps_load, avx_vmovaps_store
+export avx_vbroadcastss, avx_vhaddps, x86_vex2
+
+# ARM64 emitters
+export arm64_add_rrr, arm64_sub_rrr, arm64_mul_rrr, arm64_sdiv_rrr
+export arm64_mov_imm16, arm64_movz_imm64, arm64_mov_rr
+export arm64_cmp_rr, arm64_cmp_imm0
+export arm64_cset_eq, arm64_cset_gt, arm64_cset_lt, arm64_cset_ge, arm64_cset_le
+export arm64_b_imm26, arm64_beq_imm19, arm64_bne_imm19, arm64_bl_imm26
+export arm64_ret, arm64_nop, arm64_stp_pre, arm64_ldp_post
+export arm64_str_pre, arm64_ldr_post, arm64_svc, arm64_blr_x16
+export arm64_and_rrr, arm64_orr_rrr, arm64_eor_rrr, arm64_lsl_rrr, arm64_asr_rrr
+export arm64_ldrb_reg, arm64_strb_reg, arm64_ldr_reg, arm64_str_reg
+
+# NEON emitters
+export neon_ld1_4s, neon_st1_4s, neon_add_4s, neon_sub_4s, neon_mul_4s
+export neon_fadd_4s, neon_fmul_4s, neon_fdiv_4s, neon_fmla_4s
+export neon_smin_4s, neon_smax_4s, neon_addv_4s, neon_dup_4s_gpr, neon_tbl_16b
+
+# Register mapping
+export vreg_to_x86, vreg_to_arm, vreg_to_neon, vreg_to_xmm
+export X86Reg, ArmReg

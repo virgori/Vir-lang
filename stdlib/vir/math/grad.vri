@@ -1,0 +1,423 @@
+/*
+ * vir/math/grad.vri — Reverse-Mode Automatic Differentiation
+ * ============================================================
+ * Tape-based reverse-mode AD (backpropagation) engine.
+ *
+ * Architecture:
+ *   1. Each Scalar wraps a value + a tape index
+ *   2. Forward pass records operations onto a Tape
+ *   3. backward() replays tape in reverse, accumulating gradients
+ *
+ * Supported ops: add, sub, mul, div, neg, pow, exp, log,
+ *                sqrt, sin, cos, tanh, relu, sigmoid
+ *
+ * Optimization strategy:
+ *   - Arena-style tape allocation: one contiguous buffer, no per-node alloc
+ *   - Gradient array = single alloc_zeroed, cache-line friendly
+ *   - Fan-out sharing: gradients accumulate (+=), correct for DAGs
+ *   - Dead-node pruning: skip zero-gradient nodes during backward
+ *
+ * Usage pattern:
+ *   var tape = tape_new(256)
+ *   var x = scalar(tape, 3.0)
+ *   var y = scalar(tape, 4.0)
+ *   var z = ad_mul(tape, ad_add(tape, x, y), x)  # z = (x+y)*x
+ *   backward(tape, z)
+ *   var dz_dx = grad(tape, x)   # ∂z/∂x = 2x + y = 10
+ *   var dz_dy = grad(tape, y)   # ∂z/∂y = x = 3
+ *   tape_free(&tape)
+ */
+
+import "vir/core/types" use all
+import "vir/mem/alloc" use alloc, alloc_zeroed, free, realloc
+import "vir/math/basic" use abs_f, sqrt, exp, log, sin, cos, pow
+
+# ═══════════════════════════════════════════════════════
+# Op Codes
+# ═══════════════════════════════════════════════════════
+
+const OP_CONST:   i32 = 0
+const OP_ADD:     i32 = 1
+const OP_SUB:     i32 = 2
+const OP_MUL:     i32 = 3
+const OP_DIV:     i32 = 4
+const OP_NEG:     i32 = 5
+const OP_POW:     i32 = 6
+const OP_EXP:     i32 = 7
+const OP_LOG:     i32 = 8
+const OP_SQRT:    i32 = 9
+const OP_SIN:     i32 = 10
+const OP_COS:     i32 = 11
+const OP_TANH:    i32 = 12
+const OP_RELU:    i32 = 13
+const OP_SIGMOID: i32 = 14
+
+# Sentinel: no parent
+const NO_PARENT: i32 = -1
+
+# ═══════════════════════════════════════════════════════
+# Tape Node
+# ═══════════════════════════════════════════════════════
+
+entity TapeNode
+    op:    i32      # OP_* constant
+    val:   f64      # computed value (forward pass)
+    lhs:   i32      # left parent index  (or NO_PARENT)
+    rhs:   i32      # right parent index (or NO_PARENT)
+end
+
+# ═══════════════════════════════════════════════════════
+# Tape (computation graph)
+# ═══════════════════════════════════════════════════════
+
+entity Tape
+    nodes: ptr      # ptr to TapeNode[cap]
+    grads: ptr      # ptr to f64[cap]  — gradient accumulator
+    len:   usize    # number of recorded nodes
+    cap:   usize    # allocated capacity
+end
+
+func tape_new(initial_cap: usize) -> Tape
+    var cap = initial_cap
+    if cap < 64 cap = 64 end
+    var nodes = alloc_zeroed(cap * size_of<TapeNode>())
+    var grads = alloc_zeroed(cap * size_of<f64>())
+    out Tape { nodes: nodes, grads: grads, len: 0, cap: cap }
+end
+
+func tape_free(t: &Tape)
+    if t.nodes != null free(t.nodes) end
+    if t.grads != null free(t.grads) end
+    t.nodes = null
+    t.grads = null
+    t.len = 0
+    t.cap = 0
+end
+
+func tape_reset(t: &Tape)
+    # Reuse allocated memory, just reset length and zero grads.
+    t.len = 0
+    var i: usize = 0
+    when i < t.cap loop
+        native_store<f64>(t.grads, i, 0.0)
+        i = i + 1
+    end
+end
+
+func _tape_grow(t: &Tape)
+    var new_cap = t.cap * 2
+    t.nodes = realloc(t.nodes, new_cap * size_of<TapeNode>())
+    t.grads = realloc(t.grads, new_cap * size_of<f64>())
+    # Zero new gradient slots
+    var i = t.cap
+    when i < new_cap loop
+        native_store<f64>(t.grads, i, 0.0)
+        i = i + 1
+    end
+    t.cap = new_cap
+end
+
+func _tape_push(t: &Tape, op: i32, val: f64, lhs: i32, rhs: i32) -> i32
+    if t.len >= t.cap _tape_grow(t) end
+    var idx = t.len
+    var node = TapeNode { op: op, val: val, lhs: lhs, rhs: rhs }
+    native_store<TapeNode>(t.nodes, idx, node)
+    native_store<f64>(t.grads, idx, 0.0)
+    t.len = t.len + 1
+    out to_i32(idx)
+end
+
+# ═══════════════════════════════════════════════════════
+# Scalar Handle
+# ═══════════════════════════════════════════════════════
+
+entity Scalar
+    idx: i32        # index into Tape.nodes
+end
+
+func scalar(t: &Tape, val: f64) -> Scalar
+    # Create a leaf variable (input parameter).
+    var idx = _tape_push(t, OP_CONST, val, NO_PARENT, NO_PARENT)
+    out Scalar { idx: idx }
+end
+
+func scalar_val(t: Tape, s: Scalar) -> f64
+    out native_load<TapeNode>(t.nodes, to_usize(s.idx)).val
+end
+
+func grad(t: Tape, s: Scalar) -> f64
+    out native_load<f64>(t.grads, to_usize(s.idx))
+end
+
+# ═══════════════════════════════════════════════════════
+# Forward Operations — record on tape
+# ═══════════════════════════════════════════════════════
+
+func ad_add(t: &Tape, a: Scalar, b: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var vb = scalar_val(*t, b)
+    var idx = _tape_push(t, OP_ADD, va + vb, a.idx, b.idx)
+    out Scalar { idx: idx }
+end
+
+func ad_sub(t: &Tape, a: Scalar, b: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var vb = scalar_val(*t, b)
+    var idx = _tape_push(t, OP_SUB, va - vb, a.idx, b.idx)
+    out Scalar { idx: idx }
+end
+
+func ad_mul(t: &Tape, a: Scalar, b: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var vb = scalar_val(*t, b)
+    var idx = _tape_push(t, OP_MUL, va * vb, a.idx, b.idx)
+    out Scalar { idx: idx }
+end
+
+func ad_div(t: &Tape, a: Scalar, b: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var vb = scalar_val(*t, b)
+    var idx = _tape_push(t, OP_DIV, va / vb, a.idx, b.idx)
+    out Scalar { idx: idx }
+end
+
+func ad_neg(t: &Tape, a: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var idx = _tape_push(t, OP_NEG, -va, a.idx, NO_PARENT)
+    out Scalar { idx: idx }
+end
+
+func ad_pow(t: &Tape, a: Scalar, b: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var vb = scalar_val(*t, b)
+    var idx = _tape_push(t, OP_POW, pow(va, vb), a.idx, b.idx)
+    out Scalar { idx: idx }
+end
+
+func ad_exp(t: &Tape, a: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var idx = _tape_push(t, OP_EXP, exp(va), a.idx, NO_PARENT)
+    out Scalar { idx: idx }
+end
+
+func ad_log(t: &Tape, a: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var idx = _tape_push(t, OP_LOG, log(va), a.idx, NO_PARENT)
+    out Scalar { idx: idx }
+end
+
+func ad_sqrt(t: &Tape, a: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var idx = _tape_push(t, OP_SQRT, sqrt(va), a.idx, NO_PARENT)
+    out Scalar { idx: idx }
+end
+
+func ad_sin(t: &Tape, a: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var idx = _tape_push(t, OP_SIN, sin(va), a.idx, NO_PARENT)
+    out Scalar { idx: idx }
+end
+
+func ad_cos(t: &Tape, a: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var idx = _tape_push(t, OP_COS, cos(va), a.idx, NO_PARENT)
+    out Scalar { idx: idx }
+end
+
+func ad_tanh(t: &Tape, a: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var e2x = exp(2.0 * va)
+    var idx = _tape_push(t, OP_TANH, (e2x - 1.0) / (e2x + 1.0), a.idx, NO_PARENT)
+    out Scalar { idx: idx }
+end
+
+func ad_relu(t: &Tape, a: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var val: f64 = 0.0
+    if va > 0.0 val = va end
+    var idx = _tape_push(t, OP_RELU, val, a.idx, NO_PARENT)
+    out Scalar { idx: idx }
+end
+
+func ad_sigmoid(t: &Tape, a: Scalar) -> Scalar
+    var va = scalar_val(*t, a)
+    var s = 1.0 / (1.0 + exp(-va))
+    var idx = _tape_push(t, OP_SIGMOID, s, a.idx, NO_PARENT)
+    out Scalar { idx: idx }
+end
+
+# ═══════════════════════════════════════════════════════
+# Backward Pass — Reverse-Mode AD
+# ═══════════════════════════════════════════════════════
+
+func backward(t: &Tape, output: Scalar)
+    # Seed the output gradient with 1.0
+    native_store<f64>(t.grads, to_usize(output.idx), 1.0)
+
+    # Walk tape in reverse order
+    var i = to_i64(t.len)
+    when i > 0 loop
+        i = i - 1
+        var idx = to_usize(i)
+        var g = native_load<f64>(t.grads, idx)
+
+        # Skip zero gradients (dead-node pruning)
+        if abs_f(g) < 1e-30 skip end
+
+        var node = native_load<TapeNode>(t.nodes, idx)
+
+        if node.op == OP_ADD
+            # d(a+b)/da = 1, d(a+b)/db = 1
+            _accum_grad(t, node.lhs, g)
+            _accum_grad(t, node.rhs, g)
+        end
+
+        if node.op == OP_SUB
+            _accum_grad(t, node.lhs, g)
+            _accum_grad(t, node.rhs, -g)
+        end
+
+        if node.op == OP_MUL
+            var va = _node_val(t, node.lhs)
+            var vb = _node_val(t, node.rhs)
+            _accum_grad(t, node.lhs, g * vb)
+            _accum_grad(t, node.rhs, g * va)
+        end
+
+        if node.op == OP_DIV
+            var va = _node_val(t, node.lhs)
+            var vb = _node_val(t, node.rhs)
+            _accum_grad(t, node.lhs, g / vb)
+            _accum_grad(t, node.rhs, -g * va / (vb * vb))
+        end
+
+        if node.op == OP_NEG
+            _accum_grad(t, node.lhs, -g)
+        end
+
+        if node.op == OP_POW
+            # d(a^b)/da = b * a^(b-1)
+            # d(a^b)/db = a^b * ln(a)
+            var va = _node_val(t, node.lhs)
+            var vb = _node_val(t, node.rhs)
+            _accum_grad(t, node.lhs, g * vb * pow(va, vb - 1.0))
+            _accum_grad(t, node.rhs, g * node.val * log(va))
+        end
+
+        if node.op == OP_EXP
+            _accum_grad(t, node.lhs, g * node.val)
+        end
+
+        if node.op == OP_LOG
+            var va = _node_val(t, node.lhs)
+            _accum_grad(t, node.lhs, g / va)
+        end
+
+        if node.op == OP_SQRT
+            _accum_grad(t, node.lhs, g / (2.0 * node.val))
+        end
+
+        if node.op == OP_SIN
+            var va = _node_val(t, node.lhs)
+            _accum_grad(t, node.lhs, g * cos(va))
+        end
+
+        if node.op == OP_COS
+            var va = _node_val(t, node.lhs)
+            _accum_grad(t, node.lhs, -g * sin(va))
+        end
+
+        if node.op == OP_TANH
+            # d/dx tanh(x) = 1 - tanh²(x)
+            _accum_grad(t, node.lhs, g * (1.0 - node.val * node.val))
+        end
+
+        if node.op == OP_RELU
+            var va = _node_val(t, node.lhs)
+            if va > 0.0
+                _accum_grad(t, node.lhs, g)
+            end
+        end
+
+        if node.op == OP_SIGMOID
+            # d/dx σ(x) = σ(x)(1 - σ(x))
+            _accum_grad(t, node.lhs, g * node.val * (1.0 - node.val))
+        end
+    end
+end
+
+func _accum_grad(t: &Tape, idx: i32, dg: f64)
+    if idx == NO_PARENT out end
+    var ui = to_usize(idx)
+    native_store<f64>(t.grads, ui, native_load<f64>(t.grads, ui) + dg)
+end
+
+func _node_val(t: &Tape, idx: i32) -> f64
+    out native_load<TapeNode>(t.nodes, to_usize(idx)).val
+end
+
+# ═══════════════════════════════════════════════════════
+# Higher-Level Convenience
+# ═══════════════════════════════════════════════════════
+
+func ad_mse_loss(t: &Tape, pred: Scalar, target: Scalar) -> Scalar
+    # Mean squared error: (pred - target)²
+    var diff = ad_sub(t, pred, target)
+    out ad_mul(t, diff, diff)
+end
+
+func ad_cross_entropy(t: &Tape, pred: Scalar, target: Scalar) -> Scalar
+    # Binary cross-entropy: -[target * log(pred) + (1 - target) * log(1 - pred)]
+    var one = scalar(t, 1.0)
+    var term1 = ad_mul(t, target, ad_log(t, pred))
+    var term2 = ad_mul(t, ad_sub(t, one, target), ad_log(t, ad_sub(t, one, pred)))
+    out ad_neg(t, ad_add(t, term1, term2))
+end
+
+func ad_softplus(t: &Tape, a: Scalar) -> Scalar
+    # softplus(x) = log(1 + exp(x))
+    var one = scalar(t, 1.0)
+    out ad_log(t, ad_add(t, one, ad_exp(t, a)))
+end
+
+func ad_swish(t: &Tape, a: Scalar) -> Scalar
+    # swish(x) = x * sigmoid(x)
+    out ad_mul(t, a, ad_sigmoid(t, a))
+end
+
+# ═══════════════════════════════════════════════════════
+# Gradient Utilities
+# ═══════════════════════════════════════════════════════
+
+func numerical_grad(t: &Tape, f: func(&Tape, Scalar) -> Scalar, x_val: f64, h: f64) -> f64
+    # Central difference: [f(x+h) - f(x-h)] / 2h
+    # Useful for verifying AD correctness.
+    tape_reset(t)
+    var xp = scalar(t, x_val + h)
+    var yp = f(t, xp)
+
+    tape_reset(t)
+    var xm = scalar(t, x_val - h)
+    var ym = f(t, xm)
+
+    out (scalar_val(*t, yp) - scalar_val(*t, ym)) / (2.0 * h)
+end
+
+func zero_grads(t: &Tape)
+    # Zero all gradient accumulators without resetting the tape.
+    var i: usize = 0
+    when i < t.len loop
+        native_store<f64>(t.grads, i, 0.0)
+        i = i + 1
+    end
+end
+
+export Tape, TapeNode, Scalar
+export tape_new, tape_free, tape_reset, zero_grads
+export scalar, scalar_val, grad
+export ad_add, ad_sub, ad_mul, ad_div, ad_neg
+export ad_pow, ad_exp, ad_log, ad_sqrt
+export ad_sin, ad_cos, ad_tanh
+export ad_relu, ad_sigmoid
+export ad_mse_loss, ad_cross_entropy, ad_softplus, ad_swish
+export backward, numerical_grad
