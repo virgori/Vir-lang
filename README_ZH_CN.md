@@ -120,10 +120,10 @@ func @__main__():
 ```
 全部编译为相同的 Q-IR → 相同的机器码。
 
-### 编译 `.vir` 文件
+### 编译 `.vri` 文件
 
 ```bash
-python -m src.runtime.lifecycle.lifecycle examples/hello.vir --dump-ir
+python -m src.runtime.lifecycle.lifecycle examples/hello.vri --dump-ir
 ```
 
 ### 演示脚本
@@ -175,7 +175,7 @@ Vir/
 ├── config/
 │   └── sublib_mapping.json   # [遗留] JSON 映射表
 ├── tests/                # 单元测试 & 集成测试
-├── examples/             # 示例 .vir + 演示脚本
+├── examples/             # 示例 .vri + 演示脚本
 └── docs/                 # 架构文档
 ```
 

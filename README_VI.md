@@ -120,10 +120,10 @@ func @__main__():
 ```
 Tất cả đều biên dịch ra cùng một Q-IR → cùng một mã máy.
 
-### Biên dịch file `.vir`
+### Biên dịch file `.vri`
 
 ```bash
-python -m src.runtime.lifecycle.lifecycle examples/hello.vir --dump-ir
+python -m src.runtime.lifecycle.lifecycle examples/hello.vri --dump-ir
 ```
 
 ### Demo script
@@ -175,7 +175,7 @@ Vir/
 ├── config/
 │   └── sublib_mapping.json   # [Di sản] Bảng ánh xạ JSON
 ├── tests/                # Unit & integration tests
-├── examples/             # Ví dụ .vir + demo scripts
+├── examples/             # Ví dụ .vri + demo scripts
 └── docs/                 # Tài liệu kiến trúc
 ```
 
