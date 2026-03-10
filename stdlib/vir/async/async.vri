@@ -1,0 +1,223 @@
+/*
+ * vir/async/async.vri — Async Runtime (Event Loop + Futures)
+ * ===========================================================
+ * Inspired by Python: asyncio
+ * Inspired by Rust: Future, async/await, tokio concepts
+ *
+ * Phase C — cooperative multitasking
+ */
+
+import "vir/core/types" use all
+import "vir/core/option" use Option, Some, None
+import "vir/core/result" use Result, Ok, Err
+import "vir/str/string" use String
+import "vir/collections/vec" use Vec, vec_new, vec_push, vec_len
+import "vir/collections/deque" use Deque, deque_new, deque_push_back, deque_pop_front
+import "vir/time/time" use Duration, Instant
+
+# ═══════════════════════════════════════════════════════
+# Poll & Future traits
+# ═══════════════════════════════════════════════════════
+
+enum Poll<T>
+    Ready(T)
+    Pending
+end
+
+# Waker: notify the runtime a future is ready to be polled again
+entity Waker
+    _task_id: u64
+    _runtime: ptr
+end
+
+func ngoài native_waker_wake(runtime: ptr, task_id: u64)
+
+func waker_wake(w: Waker)
+    native_waker_wake(w._runtime, w._task_id)
+end
+
+# ═══════════════════════════════════════════════════════
+# Task
+# ═══════════════════════════════════════════════════════
+
+enum TaskState
+    Ready     = 0
+    Running   = 1
+    Waiting   = 2
+    Completed = 3
+end
+
+entity Task
+    id:      u64
+    state:   TaskState
+    _poll:   func(waker: Waker) -> Poll<void>   # type-erased future
+end
+
+# ═══════════════════════════════════════════════════════
+# Event Loop
+# ═══════════════════════════════════════════════════════
+
+entity EventLoop
+    _tasks:     Vec<Task>
+    _ready_q:   Deque<u64>
+    _next_id:   u64
+    _running:   bool
+end
+
+func ngoài native_epoll_create() -> ptr
+func ngoài native_epoll_wait(ep: ptr, timeout_ms: i64) -> i32
+func ngoài native_epoll_add_fd(ep: ptr, fd: i32, events: u32) -> i32
+
+func event_loop_new() -> EventLoop
+    out EventLoop {
+        _tasks = vec_new<Task>(),
+        _ready_q = deque_new<u64>(),
+        _next_id = 1,
+        _running = false
+    }
+end
+
+func spawn_task(loop_: &EventLoop, poll_fn: func(w: Waker) -> Poll<void>) -> u64
+    var id = loop_._next_id
+    loop_._next_id = loop_._next_id + 1
+    
+    var task = Task {
+        id = id,
+        state = TaskState.Ready,
+        _poll = poll_fn
+    }
+    vec_push<Task>(&loop_._tasks, task)
+    deque_push_back<u64>(&loop_._ready_q, id)
+    out id
+end
+
+func run_until_complete(loop_: &EventLoop)
+    loop_._running = true
+    
+    lặp_khi loop_._running
+        var maybe_id = deque_pop_front<u64>(&loop_._ready_q)
+        chọn maybe_id
+            case None
+                # Không còn task sẵn sàng -> kiểm tra còn task nào chưa xong
+                var has_pending = false
+                var i: usize = 0
+                lặp_khi i < vec_len<Task>(loop_._tasks)
+                    var t = vec_get<Task>(loop_._tasks, i)
+                    if t.state != TaskState.Completed
+                        has_pending = true
+                        thoát
+                    end
+                    i = i + 1
+                end
+                if !has_pending loop_._running = false end
+                # Nếu còn pending -> yield/sleep rồi skip
+                if has_pending
+                    native_thread_sleep_ms(1)
+                end
+            case Some(task_id)
+                _run_task(loop_, task_id)
+        end
+    end
+end
+
+func _run_task(loop_: &EventLoop, task_id: u64)
+    var idx = _find_task(loop_, task_id)
+    if idx < 0 out end
+    
+    var task = vec_get<Task>(loop_._tasks, idx)
+    task.state = TaskState.Running
+    
+    var waker = Waker { _task_id = task_id, _runtime = ptr_null() }
+    var result = task._poll(waker)
+    
+    chọn result
+        case Poll.Ready(_)
+            task.state = TaskState.Completed
+        case Poll.Pending
+            task.state = TaskState.Waiting
+    end
+    
+    vec_set<Task>(&loop_._tasks, idx, task)
+end
+
+func _find_task(loop_: &EventLoop, id: u64) -> i32
+    var i: usize = 0
+    lặp_khi i < vec_len<Task>(loop_._tasks)
+        if vec_get<Task>(loop_._tasks, i).id == id
+            out i
+        end
+        i = i + 1
+    end
+    out -1
+end
+
+func wake_task(loop_: &EventLoop, task_id: u64)
+    deque_push_back<u64>(&loop_._ready_q, task_id)
+end
+
+# ═══════════════════════════════════════════════════════
+# Async Utilities
+# ═══════════════════════════════════════════════════════
+
+# sleep_async: out pending lần đầu, ready lần hai
+func sleep_async(ms: u64) -> func(w: Waker) -> Poll<void>
+    # Simplified: real impl needs timer registration
+    var started = false
+    out func(w: Waker) -> Poll<void>
+        if !started
+            started = true
+            native_thread_sleep_ms(ms)
+            out Poll.Ready(())
+        end
+        out Poll.Ready(())
+    end
+end
+
+# yield_now: let other tasks run
+func yield_now() -> func(w: Waker) -> Poll<void>
+    var yielded = false
+    out func(w: Waker) -> Poll<void>
+        if !yielded
+            yielded = true
+            waker_wake(w)
+            out Poll.Pending
+        end
+        out Poll.Ready(())
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Semaphore (async-aware)
+# ═══════════════════════════════════════════════════════
+
+entity Semaphore
+    _permits:  i64
+    _waiters:  Deque<Waker>
+end
+
+func semaphore_new(permits: i64) -> Semaphore
+    out Semaphore {
+        _permits = permits,
+        _waiters = deque_new<Waker>()
+    }
+end
+
+func semaphore_acquire(sem: &Semaphore) -> func(w: Waker) -> Poll<void>
+    out func(w: Waker) -> Poll<void>
+        if sem._permits > 0
+            sem._permits = sem._permits - 1
+            out Poll.Ready(())
+        end
+        deque_push_back<Waker>(&sem._waiters, w)
+        out Poll.Pending
+    end
+end
+
+func semaphore_release(sem: &Semaphore)
+    sem._permits = sem._permits + 1
+    var maybe_w = deque_pop_front<Waker>(&sem._waiters)
+    chọn maybe_w
+        case Some(w) waker_wake(w)
+        case None {}
+    end
+end

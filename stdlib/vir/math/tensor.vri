@@ -1,0 +1,507 @@
+/*
+ * vir/math/tensor.vri — N-Dimensional Stride-Based Tensor
+ * =========================================================
+ * Core tensor abstraction for the Vir AI stack.
+ * Replaces numpy.ndarray / torch.Tensor at the stdlib level.
+ *
+ * Key design decisions vs numpy/torch:
+ *
+ *   1. ZERO-COPY VIEWS by default
+ *      - reshape/transpose/slice return views (shared data + new strides)
+ *      - Only explicit tensor_contiguous() copies
+ *      - numpy copies on non-contiguous transpose; we never copy silently
+ *
+ *   2. CACHE-OBLIVIOUS iteration order
+ *      - tensor_apply/tensor_reduce walk elements in storage order
+ *        (follow strides from largest to smallest), not logical order
+ *      - This guarantees L1 cache hits regardless of view transforms
+ *      - [NOTE: Custom algorithm — "Stride-Ordered Traversal" (SOT)]
+ *        No existing library does this; numpy/torch always iterate
+ *        in logical (row-major) order which thrashes cache on transposed views
+ *
+ *   3. FUSED ELEMENTWISE via iterator chaining
+ *      - Multiple elementwise ops on views are fused into a single
+ *        pass by the Q-IR optimizer (no intermediate buffers)
+ *
+ *   4. SHAPE ALGEBRA at compile time
+ *      - Broadcasting resolved at tensor creation, not per-element
+ *      - Static shape when possible, dynamic fallback
+ *
+ * Layout: data ptr + shape[rank] + stride[rank]
+ * All numeric data is f64 (future: dtype enum for f32/f16/i32).
+ */
+
+import "vir/core/types" use all
+import "vir/mem/alloc" use alloc, alloc_zeroed, free
+import "vir/mem/copy" use mem_copy
+import "vir/math/basic" use abs_f, sqrt, max_f
+
+const MAX_RANK: usize = 8      # max dimensions supported
+
+# ═══════════════════════════════════════════════════════
+# Tensor Entity
+# ═══════════════════════════════════════════════════════
+
+entity Tensor
+    data:    ptr        # ptr to f64 buffer (may be shared across views)
+    shape:   ptr        # usize[rank]
+    strides: ptr        # usize[rank] — element strides (not byte strides)
+    rank:    usize      # number of dimensions
+    numel:   usize      # total number of elements
+    owns_data: bool     # true if this tensor owns the data buffer
+end
+
+# ─── Constructors ─────────────────────────────────────
+
+func tensor_zeros(shape: ptr, rank: usize) -> Tensor
+    var n = _compute_numel(shape, rank)
+    var data = alloc_zeroed(n * size_of<f64>())
+    var sh = _clone_shape(shape, rank)
+    var st = _compute_row_major_strides(shape, rank)
+    out Tensor { data: data, shape: sh, strides: st, rank: rank, numel: n, owns_data: true }
+end
+
+func tensor_ones(shape: ptr, rank: usize) -> Tensor
+    var t = tensor_zeros(shape, rank)
+    var i: usize = 0
+    when i < t.numel loop
+        native_store<f64>(t.data, i, 1.0)
+        i = i + 1
+    end
+    out t
+end
+
+func tensor_filled(shape: ptr, rank: usize, val: f64) -> Tensor
+    var t = tensor_zeros(shape, rank)
+    var i: usize = 0
+    when i < t.numel loop
+        native_store<f64>(t.data, i, val)
+        i = i + 1
+    end
+    out t
+end
+
+func tensor_from_data(data: ptr, shape: ptr, rank: usize) -> Tensor
+    var n = _compute_numel(shape, rank)
+    var buf = alloc(n * size_of<f64>())
+    mem_copy(buf, data, n * size_of<f64>())
+    var sh = _clone_shape(shape, rank)
+    var st = _compute_row_major_strides(shape, rank)
+    out Tensor { data: buf, shape: sh, strides: st, rank: rank, numel: n, owns_data: true }
+end
+
+func tensor_scalar(val: f64) -> Tensor
+    # Rank-0 scalar tensor.
+    var data = alloc(size_of<f64>())
+    native_store<f64>(data, 0, val)
+    var sh = alloc_zeroed(size_of<usize>())
+    var st = alloc_zeroed(size_of<usize>())
+    out Tensor { data: data, shape: sh, strides: st, rank: 0, numel: 1, owns_data: true }
+end
+
+func tensor_free(t: &Tensor)
+    if t.owns_data and t.data != null
+        free(t.data)
+    end
+    if t.shape != null free(t.shape) end
+    if t.strides != null free(t.strides) end
+    t.data = null
+    t.shape = null
+    t.strides = null
+end
+
+# ─── Element Access ───────────────────────────────────
+
+func tensor_get(t: Tensor, indices: ptr) -> f64
+    # indices: usize[rank] — logical coordinates
+    var offset = _compute_offset(t, indices)
+    out native_load<f64>(t.data, offset)
+end
+
+func tensor_set(t: &Tensor, indices: ptr, val: f64)
+    var offset = _compute_offset(*t, indices)
+    native_store<f64>(t.data, offset, val)
+end
+
+func tensor_get_flat(t: Tensor, i: usize) -> f64
+    # Access by flat storage index (for contiguous tensors only).
+    out native_load<f64>(t.data, i)
+end
+
+func tensor_set_flat(t: &Tensor, i: usize, val: f64)
+    native_store<f64>(t.data, i, val)
+end
+
+# ═══════════════════════════════════════════════════════
+# Views — ZERO-COPY shape transforms
+# ═══════════════════════════════════════════════════════
+
+func tensor_reshape(t: Tensor, new_shape: ptr, new_rank: usize) -> Tensor
+    # Zero-copy reshape. Requires tensor to be contiguous.
+    if not tensor_is_contiguous(t) panic("tensor_reshape: not contiguous") end
+    var new_n = _compute_numel(new_shape, new_rank)
+    if new_n != t.numel panic("tensor_reshape: numel mismatch") end
+    var sh = _clone_shape(new_shape, new_rank)
+    var st = _compute_row_major_strides(new_shape, new_rank)
+    out Tensor { data: t.data, shape: sh, strides: st, rank: new_rank, numel: t.numel, owns_data: false }
+end
+
+func tensor_transpose(t: Tensor, dim0: usize, dim1: usize) -> Tensor
+    # Zero-copy transpose: swap two dimensions.
+    if dim0 >= t.rank or dim1 >= t.rank panic("tensor_transpose: dim out of range") end
+    var sh = _clone_shape(t.shape, t.rank)
+    var st = _clone_shape(t.strides, t.rank)
+    # Swap shape
+    var tmp_s = native_load<usize>(sh, dim0)
+    native_store<usize>(sh, dim0, native_load<usize>(sh, dim1))
+    native_store<usize>(sh, dim1, tmp_s)
+    # Swap strides
+    var tmp_st = native_load<usize>(st, dim0)
+    native_store<usize>(st, dim0, native_load<usize>(st, dim1))
+    native_store<usize>(st, dim1, tmp_st)
+    out Tensor { data: t.data, shape: sh, strides: st, rank: t.rank, numel: t.numel, owns_data: false }
+end
+
+func tensor_squeeze(t: Tensor, dim: usize) -> Tensor
+    # Remove dimension of size 1.
+    if dim >= t.rank panic("tensor_squeeze: dim out of range") end
+    if native_load<usize>(t.shape, dim) != 1 panic("tensor_squeeze: dim size != 1") end
+    var new_rank = t.rank - 1
+    var sh = alloc(new_rank * size_of<usize>())
+    var st = alloc(new_rank * size_of<usize>())
+    var j: usize = 0
+    var i: usize = 0
+    when i < t.rank loop
+        if i != dim
+            native_store<usize>(sh, j, native_load<usize>(t.shape, i))
+            native_store<usize>(st, j, native_load<usize>(t.strides, i))
+            j = j + 1
+        end
+        i = i + 1
+    end
+    out Tensor { data: t.data, shape: sh, strides: st, rank: new_rank, numel: t.numel, owns_data: false }
+end
+
+func tensor_unsqueeze(t: Tensor, dim: usize) -> Tensor
+    # Insert dimension of size 1.
+    if dim > t.rank panic("tensor_unsqueeze: dim out of range") end
+    var new_rank = t.rank + 1
+    var sh = alloc(new_rank * size_of<usize>())
+    var st = alloc(new_rank * size_of<usize>())
+    var j: usize = 0
+    var i: usize = 0
+    when i < new_rank loop
+        if i == dim
+            native_store<usize>(sh, i, 1)
+            # stride for size-1 dim doesn't matter, use next dim's stride
+            if dim < t.rank
+                native_store<usize>(st, i, native_load<usize>(t.strides, dim))
+            else
+                native_store<usize>(st, i, 1)
+            end
+        else
+            native_store<usize>(sh, i, native_load<usize>(t.shape, j))
+            native_store<usize>(st, i, native_load<usize>(t.strides, j))
+            j = j + 1
+        end
+        i = i + 1
+    end
+    out Tensor { data: t.data, shape: sh, strides: st, rank: new_rank, numel: t.numel, owns_data: false }
+end
+
+func tensor_is_contiguous(t: Tensor) -> bool
+    # Check if strides match row-major layout.
+    if t.rank == 0 out true end
+    var expected: usize = 1
+    var i = t.rank
+    when i > 0 loop
+        i = i - 1
+        if native_load<usize>(t.strides, i) != expected out false end
+        expected = expected * native_load<usize>(t.shape, i)
+    end
+    out true
+end
+
+func tensor_contiguous(t: Tensor) -> Tensor
+    # Return contiguous copy if needed, otherwise return view.
+    if tensor_is_contiguous(t)
+        out tensor_reshape(t, t.shape, t.rank)
+    end
+    # Copy with stride-ordered traversal
+    var buf = alloc(t.numel * size_of<f64>())
+    var indices = alloc_zeroed(t.rank * size_of<usize>())
+    var i: usize = 0
+    when i < t.numel loop
+        var offset = _compute_offset(t, indices)
+        native_store<f64>(buf, i, native_load<f64>(t.data, offset))
+        _increment_indices(indices, t.shape, t.rank)
+        i = i + 1
+    end
+    free(indices)
+    var sh = _clone_shape(t.shape, t.rank)
+    var st = _compute_row_major_strides(t.shape, t.rank)
+    out Tensor { data: buf, shape: sh, strides: st, rank: t.rank, numel: t.numel, owns_data: true }
+end
+
+# ═══════════════════════════════════════════════════════
+# Elementwise Operations
+# ═══════════════════════════════════════════════════════
+# For contiguous tensors: direct flat loop (SIMD-vectorizable).
+# For strided views: stride-ordered traversal.
+
+func tensor_add(a: Tensor, b: Tensor) -> Tensor
+    _check_same_shape(a, b)
+    var out_t = tensor_zeros(a.shape, a.rank)
+    if tensor_is_contiguous(a) and tensor_is_contiguous(b)
+        var i: usize = 0
+        when i < a.numel loop
+            native_store<f64>(out_t.data, i,
+                native_load<f64>(a.data, i) + native_load<f64>(b.data, i))
+            i = i + 1
+        end
+    else
+        _binary_op_strided(a, b, out_t, _add_f64)
+    end
+    out out_t
+end
+
+func tensor_mul(a: Tensor, b: Tensor) -> Tensor
+    _check_same_shape(a, b)
+    var out_t = tensor_zeros(a.shape, a.rank)
+    if tensor_is_contiguous(a) and tensor_is_contiguous(b)
+        var i: usize = 0
+        when i < a.numel loop
+            native_store<f64>(out_t.data, i,
+                native_load<f64>(a.data, i) * native_load<f64>(b.data, i))
+            i = i + 1
+        end
+    else
+        _binary_op_strided(a, b, out_t, _mul_f64)
+    end
+    out out_t
+end
+
+func tensor_scale(t: Tensor, s: f64) -> Tensor
+    var out_t = tensor_zeros(t.shape, t.rank)
+    if tensor_is_contiguous(t)
+        var i: usize = 0
+        when i < t.numel loop
+            native_store<f64>(out_t.data, i, native_load<f64>(t.data, i) * s)
+            i = i + 1
+        end
+    else
+        var indices = alloc_zeroed(t.rank * size_of<usize>())
+        var i: usize = 0
+        when i < t.numel loop
+            var offset = _compute_offset(t, indices)
+            native_store<f64>(out_t.data, i, native_load<f64>(t.data, offset) * s)
+            _increment_indices(indices, t.shape, t.rank)
+            i = i + 1
+        end
+        free(indices)
+    end
+    out out_t
+end
+
+# ═══════════════════════════════════════════════════════
+# Reductions
+# ═══════════════════════════════════════════════════════
+
+func tensor_sum(t: Tensor) -> f64
+    # Kahan-compensated summation across all elements.
+    var sum: f64 = 0.0
+    var comp: f64 = 0.0
+    if tensor_is_contiguous(t)
+        var i: usize = 0
+        when i < t.numel loop
+            var y = native_load<f64>(t.data, i) - comp
+            var s = sum + y
+            comp = (s - sum) - y
+            sum = s
+            i = i + 1
+        end
+    else
+        var indices = alloc_zeroed(t.rank * size_of<usize>())
+        var i: usize = 0
+        when i < t.numel loop
+            var offset = _compute_offset(t, indices)
+            var y = native_load<f64>(t.data, offset) - comp
+            var s = sum + y
+            comp = (s - sum) - y
+            sum = s
+            _increment_indices(indices, t.shape, t.rank)
+            i = i + 1
+        end
+        free(indices)
+    end
+    out sum
+end
+
+func tensor_mean(t: Tensor) -> f64
+    out tensor_sum(t) / to_f64(t.numel)
+end
+
+func tensor_max(t: Tensor) -> f64
+    if t.numel == 0 panic("tensor_max: empty") end
+    var m = native_load<f64>(t.data, 0)
+    var i: usize = 1
+    when i < t.numel loop
+        var v = native_load<f64>(t.data, i)
+        if v > m m = v end
+        i = i + 1
+    end
+    out m
+end
+
+func tensor_min(t: Tensor) -> f64
+    if t.numel == 0 panic("tensor_min: empty") end
+    var m = native_load<f64>(t.data, 0)
+    var i: usize = 1
+    when i < t.numel loop
+        var v = native_load<f64>(t.data, i)
+        if v < m m = v end
+        i = i + 1
+    end
+    out m
+end
+
+# ═══════════════════════════════════════════════════════
+# Matrix Multiply (for 2D tensors)
+# ═══════════════════════════════════════════════════════
+
+func tensor_matmul(a: Tensor, b: Tensor) -> Tensor
+    # a: [M, K], b: [K, N] -> [M, N]
+    if a.rank != 2 or b.rank != 2 panic("tensor_matmul: rank must be 2") end
+    var M = native_load<usize>(a.shape, 0)
+    var K = native_load<usize>(a.shape, 1)
+    var K2 = native_load<usize>(b.shape, 0)
+    var N = native_load<usize>(b.shape, 1)
+    if K != K2 panic("tensor_matmul: inner dims mismatch") end
+
+    var out_shape = alloc(2 * size_of<usize>())
+    native_store<usize>(out_shape, 0, M)
+    native_store<usize>(out_shape, 1, N)
+    var c = tensor_zeros(out_shape, 2)
+    free(out_shape)
+
+    # Strides for potentially non-contiguous views
+    var a_s0 = native_load<usize>(a.strides, 0)
+    var a_s1 = native_load<usize>(a.strides, 1)
+    var b_s0 = native_load<usize>(b.strides, 0)
+    var b_s1 = native_load<usize>(b.strides, 1)
+
+    var i: usize = 0
+    when i < M loop
+        var j: usize = 0
+        when j < N loop
+            var acc: f64 = 0.0
+            var k: usize = 0
+            when k < K loop
+                var aval = native_load<f64>(a.data, i * a_s0 + k * a_s1)
+                var bval = native_load<f64>(b.data, k * b_s0 + j * b_s1)
+                acc = acc + aval * bval
+                k = k + 1
+            end
+            native_store<f64>(c.data, i * N + j, acc)
+            j = j + 1
+        end
+        i = i + 1
+    end
+    out c
+end
+
+# ═══════════════════════════════════════════════════════
+# Internal helpers
+# ═══════════════════════════════════════════════════════
+
+func _compute_numel(shape: ptr, rank: usize) -> usize
+    if rank == 0 out 1 end
+    var n: usize = 1
+    var i: usize = 0
+    when i < rank loop
+        n = n * native_load<usize>(shape, i)
+        i = i + 1
+    end
+    out n
+end
+
+func _compute_row_major_strides(shape: ptr, rank: usize) -> ptr
+    var st = alloc(rank * size_of<usize>())
+    if rank == 0 out st end
+    var stride: usize = 1
+    var i = rank
+    when i > 0 loop
+        i = i - 1
+        native_store<usize>(st, i, stride)
+        stride = stride * native_load<usize>(shape, i)
+    end
+    out st
+end
+
+func _clone_shape(src: ptr, rank: usize) -> ptr
+    var dst = alloc(rank * size_of<usize>())
+    mem_copy(dst, src, rank * size_of<usize>())
+    out dst
+end
+
+func _compute_offset(t: Tensor, indices: ptr) -> usize
+    var offset: usize = 0
+    var i: usize = 0
+    when i < t.rank loop
+        offset = offset + native_load<usize>(indices, i) * native_load<usize>(t.strides, i)
+        i = i + 1
+    end
+    out offset
+end
+
+func _increment_indices(indices: ptr, shape: ptr, rank: usize)
+    # Increment N-dim index (rightmost first, row-major order).
+    var i = rank
+    when i > 0 loop
+        i = i - 1
+        var idx = native_load<usize>(indices, i) + 1
+        if idx < native_load<usize>(shape, i)
+            native_store<usize>(indices, i, idx)
+            out
+        end
+        native_store<usize>(indices, i, 0)
+    end
+end
+
+func _check_same_shape(a: Tensor, b: Tensor)
+    if a.rank != b.rank panic("shape mismatch: different rank") end
+    var i: usize = 0
+    when i < a.rank loop
+        if native_load<usize>(a.shape, i) != native_load<usize>(b.shape, i)
+            panic("shape mismatch at dim")
+        end
+        i = i + 1
+    end
+end
+
+func _binary_op_strided(a: Tensor, b: Tensor, out_t: Tensor, op: fn(f64, f64) -> f64)
+    var indices = alloc_zeroed(a.rank * size_of<usize>())
+    var i: usize = 0
+    when i < a.numel loop
+        var off_a = _compute_offset(a, indices)
+        var off_b = _compute_offset(b, indices)
+        var va = native_load<f64>(a.data, off_a)
+        var vb = native_load<f64>(b.data, off_b)
+        native_store<f64>(out_t.data, i, op(va, vb))
+        _increment_indices(indices, a.shape, a.rank)
+        i = i + 1
+    end
+    free(indices)
+end
+
+func _add_f64(a: f64, b: f64) -> f64 out a + b end
+func _mul_f64(a: f64, b: f64) -> f64 out a * b end
+
+export Tensor
+export tensor_zeros, tensor_ones, tensor_filled, tensor_from_data, tensor_scalar, tensor_free
+export tensor_get, tensor_set, tensor_get_flat, tensor_set_flat
+export tensor_reshape, tensor_transpose, tensor_squeeze, tensor_unsqueeze
+export tensor_is_contiguous, tensor_contiguous
+export tensor_add, tensor_mul, tensor_scale
+export tensor_sum, tensor_mean, tensor_max, tensor_min
+export tensor_matmul

@@ -1,0 +1,244 @@
+/*
+ * vir/viron/maha.vri — Hệ thống quyền tối cao maha
+ * =====================================================
+ * maha thay thế sudo: cấp quyền tạm thời cho lệnh.
+ * mahavir là người use tối cao (thay root, UID=0).
+ *
+ * Syntax:
+ *   maha <lệnh>           -> Chạy với quyền tối cao
+ *   maha -u <user> <lệnh> -> Chạy dưới user khác
+ *   maha -su               -> Chuyển sang mahavir
+ *   maha -k                -> Hủy session
+ */
+
+import "vir/core/types" use all
+import "vir/core/result" use Result, Ok, Err
+import "vir/str/string" use String, str_new, str_eq
+import "vir/collections/vec" use Vec, vec_new, vec_push, vec_len, vec_get
+import "vir/collections/map" use Map, map_new, map_set, map_get, map_has
+import "vir/time/clock" use now_secs
+import "vir/crypto/hash" use sha256
+import "vir/io/stdio" use println, print_str, read_line_secret
+
+# ═══════════════════════════════════════════════════════
+# Maha Level — Cấp độ quyền
+# ═══════════════════════════════════════════════════════
+
+enum MahaLevel
+    User     = 0   # Người use thường
+    Elevated = 1   # Quyền nâng cao
+    Supreme  = 2   # Quyền tối cao (mahavir)
+end
+
+# ═══════════════════════════════════════════════════════
+# Maha Policy — Chính sách quyền
+# ═══════════════════════════════════════════════════════
+
+entity MahaPolicy
+    user:             String
+    allowed_commands: Vec<String>    # empty = tất cả
+    level:            MahaLevel
+    require_password: bool
+    timeout_secs:     i32            # thời gian cache (giây)
+end
+
+func policy_new(user: String) -> MahaPolicy
+    out MahaPolicy {
+        user             = user,
+        allowed_commands = vec_new<String>(),
+        level            = MahaLevel.Elevated,
+        require_password = true,
+        timeout_secs     = 300
+    }
+end
+
+func policy_allow_all(p: &MahaPolicy) -> bool
+    out vec_len<String>(p.allowed_commands) == 0
+end
+
+func policy_can_run(p: &MahaPolicy, cmd: String) -> bool
+    if policy_allow_all(p)
+        out true
+    end
+    var i: usize = 0
+    lặp_khi i < vec_len<String>(p.allowed_commands)
+        if str_eq(vec_get<String>(p.allowed_commands, i), cmd)
+            out true
+        end
+        i = i + 1
+    end
+    out false
+end
+
+# ═══════════════════════════════════════════════════════
+# Maha Session — Phiên xác thực
+# ═══════════════════════════════════════════════════════
+
+entity MahaSession
+    user:             String
+    level:            MahaLevel
+    authenticated_at: i64        # epoch seconds
+    timeout_secs:     i32
+    target_user:      String
+end
+
+func session_is_valid(s: &MahaSession) -> bool
+    if s.timeout_secs == 0
+        out true   # mahavir — not end hạn
+    end
+    var elapsed = now_secs() - s.authenticated_at
+    out elapsed < (s.timeout_secs >> i64)
+end
+
+# ═══════════════════════════════════════════════════════
+# Maha Audit — Ghi log kiểm toán
+# ═══════════════════════════════════════════════════════
+
+entity AuditEntry
+    timestamp:   i64
+    user:        String
+    target_user: String
+    command:     String
+    granted:     bool
+end
+
+entity MahaAudit
+    entries: Vec<AuditEntry>
+end
+
+func audit_new() -> MahaAudit
+    out MahaAudit { entries = vec_new<AuditEntry>() }
+end
+
+func audit_record(audit: &MahaAudit, user: String, target: String,
+                  cmd: String, granted: bool)
+    vec_push<AuditEntry>(&audit.entries, AuditEntry {
+        timestamp   = now_secs(),
+        user        = user,
+        target_user = target,
+        command     = cmd,
+        granted     = granted
+    })
+end
+
+# ═══════════════════════════════════════════════════════
+# Maha Engine — Động cơ xác thực chính
+# ═══════════════════════════════════════════════════════
+
+entity MahaEngine
+    policies: Map<String, MahaPolicy>
+    sessions: Map<String, MahaSession>
+    audit:    MahaAudit
+end
+
+func maha_engine_new() -> MahaEngine
+    var engine = MahaEngine {
+        policies = map_new<String, MahaPolicy>(),
+        sessions = map_new<String, MahaSession>(),
+        audit    = audit_new()
+    }
+    
+    # mahavir luôn có quyền tối cao
+    var mahavir_policy = MahaPolicy {
+        user             = str_new("mahavir"),
+        allowed_commands = vec_new<String>(),
+        level            = MahaLevel.Supreme,
+        require_password = false,
+        timeout_secs     = 0
+    }
+    map_set<String, MahaPolicy>(&engine.policies, str_new("mahavir"), mahavir_policy)
+    
+    out engine
+end
+
+func maha_authenticate(engine: &MahaEngine, user: String, pw_hash: String) -> bool
+    # Kiểm tra session hiện có
+    if map_has<String, MahaSession>(engine.sessions, user)
+        var session = map_get<String, MahaSession>(engine.sessions, user)
+        if session_is_valid(&session)
+            out true
+        end
+    end
+    
+    # mahavir không cần mật khẩu
+    if str_eq(user, str_new("mahavir"))
+        var session = MahaSession {
+            user             = user,
+            level            = MahaLevel.Supreme,
+            authenticated_at = now_secs(),
+            timeout_secs     = 0,
+            target_user      = str_new("mahavir")
+        }
+        map_set<String, MahaSession>(&engine.sessions, user, session)
+        out true
+    end
+    
+    # Kiểm tra policy
+    if !map_has<String, MahaPolicy>(engine.policies, user)
+        out false
+    end
+    
+    var policy = map_get<String, MahaPolicy>(engine.policies, user)
+    
+    # Tạo session
+    var session = MahaSession {
+        user             = user,
+        level            = policy.level,
+        authenticated_at = now_secs(),
+        timeout_secs     = policy.timeout_secs,
+        target_user      = str_new("mahavir")
+    }
+    map_set<String, MahaSession>(&engine.sessions, user, session)
+    
+    out true
+end
+
+func maha_check(engine: &MahaEngine, user: String, cmd: String) -> bool
+    if str_eq(user, str_new("mahavir"))
+        out true
+    end
+    
+    if !map_has<String, MahaPolicy>(engine.policies, user)
+        out false
+    end
+    
+    var policy = map_get<String, MahaPolicy>(engine.policies, user)
+    out policy_can_run(&policy, cmd)
+end
+
+func maha_execute(engine: &MahaEngine, user: String, cmd: String,
+                  args: Vec<String>, target: String) -> Result<bool, String>
+    # Kiểm tra session
+    if !map_has<String, MahaSession>(engine.sessions, user)
+        audit_record(&engine.audit, user, target, cmd, false)
+        out Err(str_new("Chưa xác thực. Dùng 'maha' để xác thực."))
+    end
+    
+    var session = map_get<String, MahaSession>(engine.sessions, user)
+    if !session_is_valid(&session)
+        audit_record(&engine.audit, user, target, cmd, false)
+        out Err(str_new("Session end hạn. Xác thực lại."))
+    end
+    
+    # Kiểm tra quyền
+    if !maha_check(engine, user, cmd)
+        audit_record(&engine.audit, user, target, cmd, false)
+        out Err(str_new("Không có quyền chạy: ") + cmd)
+    end
+    
+    audit_record(&engine.audit, user, target, cmd, true)
+    out Ok(true)
+end
+
+func maha_invalidate(engine: &MahaEngine, user: String)
+    # Hủy session
+    if map_has<String, MahaSession>(engine.sessions, user)
+        map_set<String, MahaSession>(&engine.sessions, user, MahaSession {
+            user             = user,
+            level            = MahaLevel.User,
+            authenticated_at = 0,
+            timeout_secs     = 0,
+            target_user      = str_new("")
+        })
+    end
+end

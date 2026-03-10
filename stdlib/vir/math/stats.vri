@@ -1,0 +1,338 @@
+/*
+ * vir/math/stats.vri — Statistical Functions
+ * =============================================
+ * Numerically stable statistics for the Vir AI stack.
+ * Replaces numpy.stats / scipy.stats / torch.var/std.
+ *
+ * Novel algorithms:
+ *
+ *   1. WELFORD ONLINE VARIANCE with Kahan compensation
+ *      Standard Welford: E[(x - μ)²] accumulated online.
+ *      Our variant layers Kahan summation on the M2 accumulator
+ *      to prevent catastrophic cancellation in long sequences.
+ *      [CUSTOM ALGORITHM — "Kahan-Welford" (KW)]
+ *
+ *   2. PARALLEL MERGE for distributed statistics
+ *      Two partial Welford states (n, mean, M2) can be merged in O(1).
+ *      Enables map-reduce style computation across tensor chunks.
+ *      [ALGORITHM: Chan et al. parallel Welford merge]
+ *
+ *   3. ONLINE COVARIANCE Matrix via West's algorithm
+ *      Extends Welford to multivariate. No full-data materialization.
+ *      [ALGORITHM: West 1979 updating formulas]
+ *
+ * All functions operate on flat f64 arrays for SIMD compatibility.
+ */
+
+import "vir/core/types" use all
+import "vir/mem/alloc" use alloc, alloc_zeroed, free
+import "vir/math/basic" use sqrt, abs_f, exp, log
+
+# ═══════════════════════════════════════════════════════
+# Basic Statistics
+# ═══════════════════════════════════════════════════════
+
+func stat_mean(x: ptr, n: usize) -> f64
+    # Kahan-compensated mean
+    var sum: f64 = 0.0
+    var comp: f64 = 0.0
+    var i: usize = 0
+    when i < n loop
+        var y = native_load<f64>(x, i) - comp
+        var s = sum + y
+        comp = (s - sum) - y
+        sum = s
+        i = i + 1
+    end
+    out sum / to_f64(n)
+end
+
+func stat_variance(x: ptr, n: usize) -> f64
+    # Kahan-Welford online variance (CUSTOM: KW algorithm)
+    out _welford(x, n).variance
+end
+
+func stat_stddev(x: ptr, n: usize) -> f64
+    out sqrt(stat_variance(x, n))
+end
+
+func stat_variance_mean(x: ptr, n: usize, out_mean: &f64, out_var: &f64)
+    # Returns both mean and variance in a single pass.
+    var w = _welford(x, n)
+    *out_mean = w.mean
+    *out_var = w.variance
+end
+
+# ═══════════════════════════════════════════════════════
+# Welford State Entity
+# ═══════════════════════════════════════════════════════
+
+entity WelfordState
+    n:        usize
+    mean:     f64
+    m2:       f64       # sum of squared deviations
+    variance: f64       # m2 / n (population variance)
+end
+
+func _welford(x: ptr, n: usize) -> WelfordState
+    var mean: f64 = 0.0
+    var m2: f64 = 0.0
+    var m2_comp: f64 = 0.0     # Kahan compensator for M2
+    var i: usize = 0
+    when i < n loop
+        var v = native_load<f64>(x, i)
+        var delta = v - mean
+        mean = mean + delta / to_f64(i + 1)
+        var delta2 = v - mean
+        # Kahan-compensated M2 accumulation
+        var term = delta * delta2
+        var y = term - m2_comp
+        var s = m2 + y
+        m2_comp = (s - m2) - y
+        m2 = s
+        i = i + 1
+    end
+    var variance: f64 = 0.0
+    if n > 0 variance = m2 / to_f64(n) end
+    out WelfordState { n: n, mean: mean, m2: m2, variance: variance }
+end
+
+# ─── Parallel Welford Merge ──────────────────────────
+
+func welford_merge(a: WelfordState, b: WelfordState) -> WelfordState
+    # Chan et al. parallel combine of two partial Welford states.
+    if a.n == 0 out b end
+    if b.n == 0 out a end
+    var n = a.n + b.n
+    var delta = b.mean - a.mean
+    var mean = a.mean + delta * to_f64(b.n) / to_f64(n)
+    var m2 = a.m2 + b.m2 + delta * delta * to_f64(a.n) * to_f64(b.n) / to_f64(n)
+    out WelfordState { n: n, mean: mean, m2: m2, variance: m2 / to_f64(n) }
+end
+
+# ═══════════════════════════════════════════════════════
+# Percentile / Median (selection-based, no full sort)
+# ═══════════════════════════════════════════════════════
+
+func stat_median(x: ptr, n: usize) -> f64
+    # QuickSelect-based median: expected O(n), no sort needed.
+    # We work on a copy to preserve original data.
+    var buf = alloc(n * size_of<f64>())
+    var i: usize = 0
+    when i < n loop
+        native_store<f64>(buf, i, native_load<f64>(x, i))
+        i = i + 1
+    end
+    var med: f64 = 0.0
+    if (n % 2) == 1
+        med = _quickselect(buf, 0, n - 1, n / 2)
+    else
+        var lo = _quickselect(buf, 0, n - 1, n / 2 - 1)
+        var hi = _quickselect(buf, 0, n - 1, n / 2)
+        med = (lo + hi) * 0.5
+    end
+    free(buf)
+    out med
+end
+
+func _quickselect(arr: ptr, lo: usize, hi: usize, k: usize) -> f64
+    if lo == hi out native_load<f64>(arr, lo) end
+    var pivot_idx = lo + (hi - lo) / 2
+    pivot_idx = _partition(arr, lo, hi, pivot_idx)
+    if k == pivot_idx
+        out native_load<f64>(arr, k)
+    eif k < pivot_idx
+        out _quickselect(arr, lo, pivot_idx - 1, k)
+    else
+        out _quickselect(arr, pivot_idx + 1, hi, k)
+    end
+end
+
+func _partition(arr: ptr, lo: usize, hi: usize, pivot_idx: usize) -> usize
+    var pivot = native_load<f64>(arr, pivot_idx)
+    # Move pivot to end
+    _swap_f64(arr, pivot_idx, hi)
+    var store = lo
+    var i = lo
+    when i < hi loop
+        if native_load<f64>(arr, i) < pivot
+            _swap_f64(arr, i, store)
+            store = store + 1
+        end
+        i = i + 1
+    end
+    _swap_f64(arr, store, hi)
+    out store
+end
+
+func _swap_f64(arr: ptr, a: usize, b: usize)
+    var tmp = native_load<f64>(arr, a)
+    native_store<f64>(arr, a, native_load<f64>(arr, b))
+    native_store<f64>(arr, b, tmp)
+end
+
+# ═══════════════════════════════════════════════════════
+# Covariance & Correlation
+# ═══════════════════════════════════════════════════════
+
+func stat_covariance(x: ptr, y: ptr, n: usize) -> f64
+    # Online covariance (West's algorithm): single pass
+    var mean_x: f64 = 0.0
+    var mean_y: f64 = 0.0
+    var c12: f64 = 0.0
+    var i: usize = 0
+    when i < n loop
+        var vx = native_load<f64>(x, i)
+        var vy = native_load<f64>(y, i)
+        var dx = vx - mean_x
+        mean_x = mean_x + dx / to_f64(i + 1)
+        var dy = vy - mean_y
+        mean_y = mean_y + dy / to_f64(i + 1)
+        # Update cross-moment with corrected means
+        var dy2 = vy - mean_y
+        c12 = c12 + dx * dy2
+        i = i + 1
+    end
+    if n < 2 out 0.0 end
+    out c12 / to_f64(n - 1)    # sample covariance
+end
+
+func stat_correlation(x: ptr, y: ptr, n: usize) -> f64
+    # Pearson correlation: cov(x,y) / (std(x) * std(y))
+    var mean_x: f64 = 0.0
+    var mean_y: f64 = 0.0
+    var m2x: f64 = 0.0
+    var m2y: f64 = 0.0
+    var c12: f64 = 0.0
+    var i: usize = 0
+    when i < n loop
+        var vx = native_load<f64>(x, i)
+        var vy = native_load<f64>(y, i)
+        var dx = vx - mean_x
+        mean_x = mean_x + dx / to_f64(i + 1)
+        var dx2 = vx - mean_x
+        m2x = m2x + dx * dx2
+        var dy = vy - mean_y
+        mean_y = mean_y + dy / to_f64(i + 1)
+        var dy2 = vy - mean_y
+        m2y = m2y + dy * dy2
+        c12 = c12 + dx * dy2
+        i = i + 1
+    end
+    var denom = sqrt(m2x * m2y)
+    if denom < 1.0e-30 out 0.0 end
+    out c12 / denom
+end
+
+func stat_covariance_matrix(data: ptr, n: usize, dim: usize, out: ptr)
+    # data: f64[n * dim] row-major (n observations, dim variables)
+    # out: f64[dim * dim] symmetric covariance matrix
+    # Online West algorithm extended to matrices.
+    var means = alloc_zeroed(dim * size_of<f64>())
+    var c = alloc_zeroed(dim * dim * size_of<f64>())   # cross-moment matrix
+    var i: usize = 0
+    when i < n loop
+        var row_off = i * dim
+        # Update means and cross-moments
+        var j: usize = 0
+        when j < dim loop
+            var vj = native_load<f64>(data, row_off + j)
+            var dj = vj - native_load<f64>(means, j)
+            native_store<f64>(means, j, native_load<f64>(means, j) + dj / to_f64(i + 1))
+            var k: usize = 0
+            when k <= j loop
+                var vk = native_load<f64>(data, row_off + k)
+                var dk_new = vk - native_load<f64>(means, k)
+                var old_c = native_load<f64>(c, j * dim + k)
+                native_store<f64>(c, j * dim + k, old_c + dj * dk_new)
+                k = k + 1
+            end
+            j = j + 1
+        end
+        i = i + 1
+    end
+    # Finalize: divide by (n-1) and copy symmetric
+    var j: usize = 0
+    when j < dim loop
+        var k: usize = 0
+        when k <= j loop
+            var val = native_load<f64>(c, j * dim + k) / to_f64(n - 1)
+            native_store<f64>(out, j * dim + k, val)
+            native_store<f64>(out, k * dim + j, val)
+            k = k + 1
+        end
+        j = j + 1
+    end
+    free(means)
+    free(c)
+end
+
+# ═══════════════════════════════════════════════════════
+# Histogram / Bin Counts
+# ═══════════════════════════════════════════════════════
+
+func stat_histogram(x: ptr, n: usize, bins: usize, min_val: f64, max_val: f64, counts: ptr)
+    # counts: usize[bins], caller must allocate and zero.
+    var range = max_val - min_val
+    if range <= 0.0 out end
+    var i: usize = 0
+    when i < n loop
+        var v = native_load<f64>(x, i)
+        if v >= min_val and v <= max_val
+            var idx = to_usize((v - min_val) / range * to_f64(bins))
+            if idx >= bins idx = bins - 1 end
+            var prev = native_load<usize>(counts, idx)
+            native_store<usize>(counts, idx, prev + 1)
+        end
+        i = i + 1
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Normalization helpers
+# ═══════════════════════════════════════════════════════
+
+func stat_zscore(x: ptr, out: ptr, n: usize)
+    # Standardize: z = (x - μ) / σ
+    var mean: f64 = 0.0
+    var var_val: f64 = 0.0
+    stat_variance_mean(x, n, &mean, &var_val)
+    var std = sqrt(var_val)
+    if std < 1.0e-30 std = 1.0e-30 end
+    var inv_std = 1.0 / std
+    var i: usize = 0
+    when i < n loop
+        native_store<f64>(out, i, (native_load<f64>(x, i) - mean) * inv_std)
+        i = i + 1
+    end
+end
+
+func stat_minmax_scale(x: ptr, out: ptr, n: usize)
+    # Scale to [0, 1]: (x - min) / (max - min)
+    if n == 0 out end
+    var mn = native_load<f64>(x, 0)
+    var mx = mn
+    var i: usize = 1
+    when i < n loop
+        var v = native_load<f64>(x, i)
+        if v < mn mn = v end
+        if v > mx mx = v end
+        i = i + 1
+    end
+    var range = mx - mn
+    if range < 1.0e-30 range = 1.0e-30 end
+    var inv_range = 1.0 / range
+    i = 0
+    when i < n loop
+        native_store<f64>(out, i, (native_load<f64>(x, i) - mn) * inv_range)
+        i = i + 1
+    end
+end
+
+export WelfordState
+export stat_mean, stat_variance, stat_stddev, stat_variance_mean
+export welford_merge
+export stat_median
+export stat_covariance, stat_correlation, stat_covariance_matrix
+export stat_histogram
+export stat_zscore, stat_minmax_scale

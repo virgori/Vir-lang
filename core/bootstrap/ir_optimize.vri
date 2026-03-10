@@ -1,0 +1,714 @@
+# ============================================================
+# Vir IR Optimization Pass  (ir_optimize.vri)
+# 
+# Provides:
+# 1. Dead Code Elimination (DCE)
+# 2. Constant Propagation  
+# 3. Strength Reduction
+# 4. Register Allocation (linear scan for hot variables)
+# 5. Peephole Optimizations on emitted ARM64 assembly
+#
+# Usage:
+#   include "ir_optimize.vri"
+#   # After parsing and before codegen:
+#   optimize_dce(prog)
+#   optimize_propagate(prog)
+# ============================================================
+
+# ---- Dead Code Elimination ----
+# Remove variables that are assigned but never read
+# Remove unreachable code after return statements
+
+var used_vars = []
+var used_count = 0
+
+func mark_used(name) then
+    var i = 0
+    while i < used_count then
+        if str_eq(used_vars[i], name) == 1 then
+            return 0
+        end
+        i = i + 1
+    end
+    push(used_vars, name)
+    used_count = used_count + 1
+    return 0
+end
+
+func is_used(name) then
+    var i = 0
+    while i < used_count then
+        if str_eq(used_vars[i], name) == 1 then
+            return 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# Collect all variable uses in an expression
+func collect_uses_expr(id) then
+    var t = nt(id)
+    if t == A_IDENT then
+        mark_used(ns(id))
+        return 0
+    end
+    if t == A_INDEX then
+        mark_used(ns(id))
+    end
+    if t == A_FIELD_ACCESS then
+        mark_used(ns(id))
+    end
+    var nch = nc(id)
+    var i = 0
+    while i < nch then
+        collect_uses_expr(ch(id, i))
+        i = i + 1
+    end
+    return 0
+end
+
+func collect_uses_stmt(id) then
+    var t = nt(id)
+    if t == A_ASSIGN then
+        collect_uses_expr(ch(id, 0))
+        return 0
+    end
+    if t == A_VAR then
+        collect_uses_expr(ch(id, 0))
+        return 0
+    end
+    if t == A_FIELD_ASSIGN then
+        mark_used(ns(id))
+        collect_uses_expr(ch(id, 1))
+        return 0
+    end
+    if t == A_IDX_ASSIGN then
+        mark_used(ns(id))
+        collect_uses_expr(ch(id, 0))
+        collect_uses_expr(ch(id, 1))
+        return 0
+    end
+    # For other statements, collect uses in all children
+    var nch = nc(id)
+    var i = 0
+    while i < nch then
+        var cid = ch(id, i)
+        var ct = nt(cid)
+        if ct == A_BLOCK then
+            collect_uses_block(cid)
+        else
+            collect_uses_expr(cid)
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func collect_uses_block(id) then
+    var nch = nc(id)
+    var i = 0
+    while i < nch then
+        collect_uses_stmt(ch(id, i))
+        i = i + 1
+    end
+    return 0
+end
+
+func collect_uses_func(id) then
+    var body = ch(id, 1)
+    collect_uses_block(body)
+    return 0
+end
+
+# Eliminate dead assignments in a block
+func eliminate_dead_block(id) then
+    var node = ast_pool[id]
+    var nch = node[N_NCHILD]
+    var i = 0
+    while i < nch then
+        var cid = node[N_CHILD0 + i]
+        var cnode = ast_pool[cid]
+        var ct = cnode[N_TYPE]
+        
+        # Remove dead variable assignments
+        if ct == A_VAR then
+            var vname = cnode[N_SVAL]
+            if is_used(vname) == 0 then
+                # Check if the initializer has side effects (function calls)
+                var val_id = cnode[N_CHILD0]
+                var vt = nt(val_id)
+                if vt != A_CALL then
+                    # Safe to remove - replace with no-op
+                    cnode[N_TYPE] = A_INT
+                    cnode[N_IVAL] = 0
+                    cnode[N_NCHILD] = 0
+                    ast_pool[cid] = cnode
+                end
+            end
+        end
+        
+        # Recurse into sub-blocks
+        if ct == A_IF then
+            eliminate_dead_block(ch(cid, 1))
+            if nc(cid) > 2 then
+                eliminate_dead_block(ch(cid, 2))
+            end
+        end
+        if ct == A_WHILE then
+            eliminate_dead_block(ch(cid, 1))
+        end
+        if ct == A_FOR then
+            eliminate_dead_block(ch(cid, 1))
+        end
+        
+        i = i + 1
+    end
+    return 0
+end
+
+# Remove unreachable code after return
+func eliminate_unreachable_block(id) then
+    var node = ast_pool[id]
+    var nch = node[N_NCHILD]
+    var i = 0
+    var found_return = 0
+    while i < nch then
+        if found_return == 1 then
+            # Code after return is dead - replace with no-op
+            var cid = node[N_CHILD0 + i]
+            var cnode = ast_pool[cid]
+            cnode[N_TYPE] = A_INT
+            cnode[N_IVAL] = 0 
+            cnode[N_NCHILD] = 0
+            ast_pool[cid] = cnode
+        else
+            var cid = node[N_CHILD0 + i]
+            if nt(cid) == A_RETURN then
+                found_return = 1
+            end
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func optimize_dce(prog_id) then
+    # First pass: collect all uses across the program
+    used_vars = []
+    used_count = 0
+    
+    var node = ast_pool[prog_id]
+    var nch = node[N_NCHILD]
+    var i = 0
+    while i < nch then
+        var cid = node[N_CHILD0 + i]
+        var ct = nt(cid)
+        if ct == A_FUNC then
+            collect_uses_func(cid)
+        else
+            collect_uses_stmt(cid)
+        end
+        i = i + 1
+    end
+    
+    # Second pass: eliminate dead code
+    i = 0
+    while i < nch then
+        var cid = node[N_CHILD0 + i]
+        if nt(cid) == A_FUNC then
+            var body = ch(cid, 1)
+            eliminate_dead_block(body)
+            eliminate_unreachable_block(body)
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# ---- Constant Propagation ----
+# Track variables assigned constant values and substitute
+
+var const_names = []
+var const_vals = []
+var const_count = 0
+
+func add_const(name, val) then
+    # Check if already tracked
+    var i = 0
+    while i < const_count then
+        if str_eq(const_names[i], name) == 1 then
+            const_vals[i] = val
+            return 0
+        end
+        i = i + 1
+    end
+    push(const_names, name)
+    push(const_vals, val)
+    const_count = const_count + 1
+    return 0
+end
+
+func find_const(name) then
+    var i = 0
+    while i < const_count then
+        if str_eq(const_names[i], name) == 1 then
+            return i
+        end
+        i = i + 1
+    end
+    return 0 - 1
+end
+
+func invalidate_const(name) then
+    var i = 0
+    while i < const_count then
+        if str_eq(const_names[i], name) == 1 then
+            const_vals[i] = 0 - 999999999
+            return 0
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func propagate_expr(id) then
+    var node = ast_pool[id]
+    var t = node[N_TYPE]
+    
+    # Substitute known constants
+    if t == A_IDENT then
+        var ci = find_const(node[N_SVAL])
+        if ci >= 0 then
+            var val = const_vals[ci]
+            if val != 0 - 999999999 then
+                node[N_TYPE] = A_INT
+                node[N_IVAL] = val
+                node[N_NCHILD] = 0
+                ast_pool[id] = node
+            end
+        end
+        return 0
+    end
+    
+    # Recurse into children
+    var nch = node[N_NCHILD]
+    var i = 0
+    while i < nch then
+        propagate_expr(node[N_CHILD0 + i])
+        i = i + 1
+    end
+    return 0
+end
+
+func propagate_block(id) then
+    var node = ast_pool[id]
+    var nch = node[N_NCHILD]
+    var i = 0
+    while i < nch then
+        var cid = node[N_CHILD0 + i]
+        var cnode = ast_pool[cid]
+        var ct = cnode[N_TYPE]
+        
+        if ct == A_VAR then
+            var val_id = cnode[N_CHILD0]
+            propagate_expr(val_id)
+            var val_node = ast_pool[val_id]
+            if val_node[N_TYPE] == A_INT then
+                add_const(cnode[N_SVAL], val_node[N_IVAL])
+            end
+        end
+        if ct == A_ASSIGN then
+            propagate_expr(cnode[N_CHILD0])
+            var val_node = ast_pool[cnode[N_CHILD0]]
+            if val_node[N_TYPE] == A_INT then
+                add_const(cnode[N_SVAL], val_node[N_IVAL])
+            else
+                invalidate_const(cnode[N_SVAL])
+            end
+        end
+        if ct == A_IF then
+            propagate_expr(ch(cid, 0))
+            propagate_block(ch(cid, 1))
+            if nc(cid) > 2 then
+                propagate_block(ch(cid, 2))
+            end
+        end
+        if ct == A_WHILE then
+            propagate_expr(ch(cid, 0))
+            propagate_block(ch(cid, 1))
+        end
+        if ct == A_RETURN then
+            propagate_expr(ch(cid, 0))
+        end
+        if ct == A_CALL then
+            var nargs = nc(cid)
+            var ai = 0
+            while ai < nargs then
+                propagate_expr(ch(cid, ai))
+                ai = ai + 1
+            end
+        end
+        
+        i = i + 1
+    end
+    return 0
+end
+
+func optimize_propagate(prog_id) then
+    var node = ast_pool[prog_id]
+    var nch = node[N_NCHILD]
+    var i = 0
+    while i < nch then
+        var cid = node[N_CHILD0 + i]
+        if nt(cid) == A_FUNC then
+            const_names = []
+            const_vals = []
+            const_count = 0
+            propagate_block(ch(cid, 1))
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# ---- Strength Reduction ----
+# Replace expensive operations with cheaper ones:
+# x * 2  → x << 1
+# x * 4  → x << 2
+# x * 8  → x << 3
+# x / 2  → x >> 1
+# x % 2  → x & 1
+
+func is_power_of_2(n) then
+    if n <= 0 then
+        return 0
+    end
+    if (n & (n - 1)) == 0 then
+        return 1
+    end
+    return 0
+end
+
+func log2_int(n) then
+    var r = 0
+    while n > 1 then
+        n = n >> 1
+        r = r + 1
+    end
+    return r
+end
+
+func reduce_strength_expr(id) then
+    var node = ast_pool[id]
+    var t = node[N_TYPE]
+    
+    # Recurse first
+    var nch = node[N_NCHILD]
+    var i = 0
+    while i < nch then
+        reduce_strength_expr(node[N_CHILD0 + i])
+        i = i + 1
+    end
+    
+    if t == A_BINOP then
+        var op = node[N_IVAL]
+        var right_id = node[N_CHILD0 + 1]
+        var right_node = ast_pool[right_id]
+        
+        if right_node[N_TYPE] == A_INT then
+            var rval = right_node[N_IVAL]
+            
+            # x * power_of_2 → x << log2(power_of_2)
+            if op == T_STAR then
+                if is_power_of_2(rval) == 1 then
+                    node[N_IVAL] = T_SHL
+                    right_node[N_IVAL] = log2_int(rval)
+                    ast_pool[right_id] = right_node
+                    ast_pool[id] = node
+                end
+            end
+            
+            # x / power_of_2 → x >> log2 (unsigned only, safe for positive)
+            if op == T_SLASH then
+                if is_power_of_2(rval) == 1 then
+                    if rval > 0 then
+                        node[N_IVAL] = T_SHR
+                        right_node[N_IVAL] = log2_int(rval)
+                        ast_pool[right_id] = right_node
+                        ast_pool[id] = node
+                    end
+                end
+            end
+            
+            # x % power_of_2 → x & (power_of_2 - 1)
+            if op == T_PERCENT then
+                if is_power_of_2(rval) == 1 then
+                    node[N_IVAL] = T_BIT_AND
+                    right_node[N_IVAL] = rval - 1
+                    ast_pool[right_id] = right_node
+                    ast_pool[id] = node
+                end
+            end
+        end
+    end
+    return 0
+end
+
+func optimize_strength(prog_id) then
+    var node = ast_pool[prog_id]
+    var nch = node[N_NCHILD]
+    var i = 0
+    while i < nch then
+        var cid = node[N_CHILD0 + i]
+        if nt(cid) == A_FUNC then
+            reduce_strength_block(ch(cid, 1))
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func reduce_strength_block(id) then
+    var node = ast_pool[id]
+    var nch = node[N_NCHILD]
+    var i = 0
+    while i < nch then
+        var cid = node[N_CHILD0 + i]
+        var ct = nt(cid)
+        if ct == A_BLOCK then
+            reduce_strength_block(cid)
+        end
+        # Reduce all expressions in this statement
+        var nc2 = nc(cid)
+        var j = 0
+        while j < nc2 then
+            reduce_strength_expr(ch(cid, j))
+            j = j + 1
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# ---- Peephole Optimization ----
+# Operates on collected assembly lines to eliminate redundant patterns
+
+var asm_lines = []
+var asm_line_count = 0
+
+func add_asm_line(line) then
+    push(asm_lines, line)
+    asm_line_count = asm_line_count + 1
+    return 0
+end
+
+func peephole_optimize() then
+    # Pattern: str x0, [sp, #-16]!  followed by  ldr x0, [sp], #16
+    # → eliminate both (no-op push/pop)
+    var i = 0
+    while i < asm_line_count - 1 then
+        var l1 = asm_lines[i]
+        var l2 = asm_lines[i + 1]
+        
+        if str_eq(l1, "    str x0, [sp, #-16]!") == 1 then
+            if str_eq(l2, "    ldr x0, [sp], #16") == 1 then
+                asm_lines[i] = ""
+                asm_lines[i + 1] = ""
+                i = i + 2
+            else
+                i = i + 1
+            end
+        else
+            i = i + 1
+        end
+    end
+    
+    # Pattern: mov x0, x0 → eliminate (redundant)
+    i = 0
+    while i < asm_line_count then
+        if str_eq(asm_lines[i], "    mov x0, x0") == 1 then
+            asm_lines[i] = ""
+        end
+        if str_eq(asm_lines[i], "    mov x1, x1") == 1 then
+            asm_lines[i] = ""
+        end
+        i = i + 1
+    end
+    
+    # Pattern: mov x0, #0  followed by  add x0, x0, x1 → mov x0, x1
+    i = 0
+    while i < asm_line_count - 1 then
+        var l1 = asm_lines[i]
+        var l2 = asm_lines[i + 1]
+        if str_eq(l1, "    mov x0, #0") == 1 then
+            if str_eq(l2, "    add x0, x0, x1") == 1 then
+                asm_lines[i] = ""
+                asm_lines[i + 1] = "    mov x0, x1"
+            end
+        end
+        i = i + 1
+    end
+    
+    return 0
+end
+
+func flush_asm_lines() then
+    var i = 0
+    while i < asm_line_count then
+        if len(asm_lines[i]) > 0 then
+            print_str(asm_lines[i])
+            print_str("\n")
+        end
+        i = i + 1
+    end
+    asm_lines = []
+    asm_line_count = 0
+    return 0
+end
+
+# ---- Register Allocation (Linear Scan) ----
+# Track which variables are "hot" (frequently accessed)
+# and assign them to callee-saved registers x19-x28
+
+var hot_vars = []
+var hot_regs = []
+var hot_count = 0
+var var_use_counts = []
+var var_use_names = []
+var var_use_n = 0
+
+func count_var_use(name) then
+    var i = 0
+    while i < var_use_n then
+        if str_eq(var_use_names[i], name) == 1 then
+            var_use_counts[i] = var_use_counts[i] + 1
+            return 0
+        end
+        i = i + 1
+    end
+    push(var_use_names, name)
+    push(var_use_counts, 1)
+    var_use_n = var_use_n + 1
+    return 0
+end
+
+func count_uses_expr(id) then
+    var t = nt(id)
+    if t == A_IDENT then
+        count_var_use(ns(id))
+    end
+    var nch = nc(id)
+    var i = 0
+    while i < nch then
+        count_uses_expr(ch(id, i))
+        i = i + 1
+    end
+    return 0
+end
+
+func count_uses_block(id) then
+    var nch = nc(id)
+    var i = 0
+    while i < nch then
+        var cid = ch(id, i)
+        var ct = nt(cid)
+        if ct == A_BLOCK then
+            count_uses_block(cid)
+        else
+            count_uses_expr(cid)
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+func allocate_registers(func_id) then
+    # Count variable uses in function body
+    var_use_names = []
+    var_use_counts = []
+    var_use_n = 0
+    hot_vars = []
+    hot_regs = []
+    hot_count = 0
+    
+    var body = ch(func_id, 1)
+    count_uses_block(body)
+    
+    # Find top N most-used variables (N = 8, for x19-x26)
+    var max_regs = 8
+    var assigned = 0
+    var next_reg = 19
+    
+    while assigned < max_regs then
+        if assigned >= var_use_n then
+            return 0
+        end
+        # Find max
+        var best = 0 - 1
+        var best_count = 0
+        var i = 0
+        while i < var_use_n then
+            if var_use_counts[i] > best_count then
+                # Check not already assigned
+                var already = 0
+                var j = 0
+                while j < hot_count then
+                    if str_eq(hot_vars[j], var_use_names[i]) == 1 then
+                        already = 1
+                    end
+                    j = j + 1
+                end
+                if already == 0 then
+                    best = i
+                    best_count = var_use_counts[i]
+                end
+            end
+            i = i + 1
+        end
+        if best < 0 then
+            return 0
+        end
+        if best_count < 3 then
+            return 0
+        end
+        push(hot_vars, var_use_names[best])
+        push(hot_regs, next_reg)
+        hot_count = hot_count + 1
+        next_reg = next_reg + 1
+        assigned = assigned + 1
+    end
+    return 0
+end
+
+func is_hot_var(name) then
+    var i = 0
+    while i < hot_count then
+        if str_eq(hot_vars[i], name) == 1 then
+            return hot_regs[i]
+        end
+        i = i + 1
+    end
+    return 0
+end
+
+# ---- Combined Optimization Pass ----
+
+func optimize_all(prog_id) then
+    # 1. Constant folding (existing in compiler.vri)
+    optimize(prog_id)
+    
+    # 2. Constant propagation
+    optimize_propagate(prog_id)
+    
+    # 3. Re-fold after propagation
+    optimize(prog_id)
+    
+    # 4. Strength reduction
+    optimize_strength(prog_id)
+    
+    # 5. Dead code elimination
+    optimize_dce(prog_id)
+    
+    return 0
+end
