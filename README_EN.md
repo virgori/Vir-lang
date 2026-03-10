@@ -120,10 +120,10 @@ func @__main__():
 ```
 All compile to the same Q-IR → same machine code.
 
-### Compile `.vir` files
+### Compile `.vri` files
 
 ```bash
-python -m src.runtime.lifecycle.lifecycle examples/hello.vir --dump-ir
+python -m src.runtime.lifecycle.lifecycle examples/hello.vri --dump-ir
 ```
 
 ### Demo script
@@ -175,7 +175,7 @@ Vir/
 ├── config/
 │   └── sublib_mapping.json   # [Legacy] JSON mapping table
 ├── tests/                # Unit & integration tests
-├── examples/             # Example .vir + demo scripts
+├── examples/             # Example .vri + demo scripts
 └── docs/                 # Architecture documentation
 ```
 

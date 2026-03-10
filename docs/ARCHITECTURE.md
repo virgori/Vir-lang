@@ -222,7 +222,7 @@ JIT Memory Layout:
 
 ```
             ┌─────────────┐
-            │  Source.vir  │  "Nếu máy rảnh, tính tổng A và B"
+            │  Source.vri  │  "Nếu máy rảnh, tính tổng A và B"
             └──────┬──────┘
                    ↓
          ┌─────────────────┐
@@ -589,23 +589,23 @@ Threshold = 3 (configurable)
 
 | Module | Source | Lines | Translated From |
 |--------|--------|-------|-----------------|
-| `lexer.vir` | `stdlib/vir/compiler/lexer.vir` | 905 | `core/src/lexer.c` (807L) |
-| `parser.vir` | `stdlib/vir/compiler/parser.vir` | 1,319 | `core/src/parser.c` (1,164L) |
-| `ir_optimizer.vir` | `stdlib/vir/compiler/ir_optimizer.vir` | 1,448 | `core/src/ir_lower.c` (1,804L) |
-| `codegen.vir` | `stdlib/vir/compiler/codegen.vir` | 1,663 | `core/src/codegen.c` (3,408L) |
+| `lexer.vri` | `stdlib/vir/compiler/lexer.vri` | 905 | `core/src/lexer.c` (807L) |
+| `parser.vri` | `stdlib/vir/compiler/parser.vri` | 1,319 | `core/src/parser.c` (1,164L) |
+| `ir_optimizer.vri` | `stdlib/vir/compiler/ir_optimizer.vri` | 1,448 | `core/src/ir_lower.c` (1,804L) |
+| `codegen.vri` | `stdlib/vir/compiler/codegen.vri` | 1,663 | `core/src/codegen.c` (3,408L) |
 
 ### 11.2. Compiler Pipeline (Vir-native)
 
 ```
 ┌──────────┐    ┌──────────────┐    ┌──────────────┐    ┌────────────────┐    ┌──────────────┐
-│ .vir src │───→│ lexer.vir    │───→│ parser.vir   │───→│ir_optimizer.vir│───→│ codegen.vir  │
+│ .vri src │───→│ lexer.vri    │───→│ parser.vri   │───→│ir_optimizer.vri│───→│ codegen.vri  │
 │ (UTF-8)  │    │ (tokenizer)  │    │ (AST builder)│    │ (Q-IR + alloc) │    │ (machine code)│
 └──────────┘    └──────────────┘    └──────────────┘    └────────────────┘    └──────────────┘
   English         TokType enum       AstNode tree        QModule/QFunction     CodeBuf bytes
   keywords        (90+ types)        (50+ node types)    (95+ opcodes)         (x86_64 + ARM64)
 ```
 
-### 11.3. lexer.vir — Tokenizer
+### 11.3. lexer.vri — Tokenizer
 
 - `TokType` enum: 90+ token types (keywords, operators, literals, delimiters)
 - `Token` entity: `type`, `start`, `length`, `line`
@@ -614,7 +614,7 @@ Threshold = 3 (configurable)
 - Keyword lookup table: 30+ English keywords → `TokType`
 - `tokenize(source) -> [Token]` entry point
 
-### 11.4. parser.vir — Recursive Descent Parser
+### 11.4. parser.vri — Recursive Descent Parser
 
 - `AstType` enum: 50+ node types (Program, FuncDef, VarDecl, If, Loop, While, For, Return, BinOp, Compare, Call, etc.)
 - `OpType` enum: arithmetic, comparison, logical operators
@@ -622,7 +622,7 @@ Threshold = 3 (configurable)
 - Precedence climbing for expressions (6 levels: or → and → compare → add → mul → unary)
 - `parse_program(tokens) -> AstNode` entry point
 
-### 11.5. ir_optimizer.vir — AST→Q-IR Lowering + Register Allocation
+### 11.5. ir_optimizer.vri — AST→Q-IR Lowering + Register Allocation
 
 - `QOp` enum: 95+ Q-IR opcodes (Load, Store, Move, Add, Sub, Mul, Div, Mod, CmpEq/Gt/Lt/Ge/Le/Ne, Jump/JumpIf/JumpIfNot, Call, Ret, Print, Input, And/Or/Xor/Shl/Shr/Not, FAdd/FSub/FMul/FDiv, VAdd/VSub/VMul/VDiv, Label, Nop, etc.)
 - `QOperand` / `QInstr` / `QFunction` / `QModule` entities
@@ -632,7 +632,7 @@ Threshold = 3 (configurable)
 - `regalloc_linear_scan(num_phys)` — linear-scan register allocator with spill
 - `tco_pass()` — tail-call optimization (Q_CALL+Q_RET → Q_JUMP+Q_NOP)
 
-### 11.6. codegen.vir — Machine Code Emitter
+### 11.6. codegen.vri — Machine Code Emitter
 
 - `TargetArch` enum: X86_64, ARM64 + `detect_arch()` for host auto-detection
 - `CodeBuf` entity: growable byte buffer with `emit_byte()`, `emit32()`, `emit64()`, `patch32()`
@@ -650,11 +650,11 @@ Complementary assembly-text emitters with optimization grading:
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `arm64.vir` | 510 | ARM64 assembly text generation (Grade S/A/B ranking) |
-| `x86_64.vir` | 463 | x86_64 assembly text generation |
-| `emitter.vir` | 262 | Generic emitter interface |
-| `binary.vir` | 490 | ELF/Mach-O binary format output |
-| `linker.vir` | 419 | Self-hosting linker |
+| `arm64.vri` | 510 | ARM64 assembly text generation (Grade S/A/B ranking) |
+| `x86_64.vri` | 463 | x86_64 assembly text generation |
+| `emitter.vri` | 262 | Generic emitter interface |
+| `binary.vri` | 490 | ELF/Mach-O binary format output |
+| `linker.vri` | 419 | Self-hosting linker |
 
 ---
 
@@ -675,7 +675,7 @@ Binary `vir` thuần C, **không cần Python runtime**.
 
 ```
 ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌─────────┐    ┌──────────┐
-│ .vir src │───→│ C Lexer  │───→│ C Parser │───→│ir_lower │───→│ VM / JIT │
+│ .vri src │───→│ C Lexer  │───→│ C Parser │───→│ir_lower │───→│ VM / JIT │
 │ (UTF-8)  │    │ (lexer.c)│    │(parser.c)│    │(ir_low.c)│   │          │
 └──────────┘    └──────────┘    └──────────┘    └─────────┘    └──────────┘
   Vietnamese      vir_token_t     ast_node_t      q_module_t     int64_t
