@@ -94,11 +94,27 @@ class Opcode(Enum):
     Q_FCVT_I2F = auto()      # Q_FCVT_I2F <fd>, <src>         ; int → float
     Q_FCVT_F2I = auto()      # Q_FCVT_F2I <dest>, <fsrc>      ; float → int (truncate)
 
+    # ── Phase 3: Generics / Traits / Closures ──────────────
+    Q_TYPE_META = auto()     # Q_TYPE_META <dest>, <type_id>  ; load type metadata
+    Q_MONOMORPH = auto()     # Q_MONOMORPH <func>, <types>    ; monomorphize generic func
+    Q_TAG_CHECK = auto()     # Q_TAG_CHECK <dest>, <src>, <tag> ; test enum variant tag
+    Q_EXTRACT = auto()       # Q_EXTRACT <dest>, <src>, <idx> ; extract enum payload field
+    Q_TAG_NEW = auto()       # Q_TAG_NEW <dest>, <tag>, <payload> ; construct tagged union
+    Q_VTABLE_CALL = auto()   # Q_VTABLE_CALL <dest>, <obj>, <method_idx> ; virtual dispatch
+    Q_CLOSURE_NEW = auto()   # Q_CLOSURE_NEW <dest>, <func>, <captures> ; create closure
+    Q_CLOSURE_CALL = auto()  # Q_CLOSURE_CALL <dest>, <closure>, <args>  ; invoke closure
+    Q_CAPTURE = auto()       # Q_CAPTURE <dest>, <closure>, <idx> ; read captured variable
+    Q_PROPAGATE = auto()     # Q_PROPAGATE <dest>, <src>      ; unwrap Result or early return
+
 
 @dataclass(frozen=True)
 class VReg:
     """Thanh ghi ảo – §2.2 Virtual Registers (R0, R1, …, Rn)."""
     index: int
+
+    @property
+    def name(self) -> str:
+        return f"R{self.index}"
 
     def __repr__(self) -> str:
         return f"R{self.index}"
@@ -144,6 +160,11 @@ class QInstruction:
     patch_id: str = ""      # Chỉ dùng cho Q_PATCH_POINT
     string_value: str = ""  # For Q_LOAD_STRING
 
+    @property
+    def operands(self) -> list:
+        """Backward-compatible list view of dest/src1/src2."""
+        return [op for op in (self.dest, self.src1, self.src2) if op is not None]
+
     def __repr__(self) -> str:
         parts = [self.opcode.name]
         for op in (self.dest, self.src1, self.src2):
@@ -160,6 +181,8 @@ class QFunction:
     name: str
     params: list[VReg] = field(default_factory=list)
     body: list[QInstruction] = field(default_factory=list)
+    generic_params: list[str] = field(default_factory=list)  # ["T", "U", ...]
+    type_constraints: dict[str, list[str]] = field(default_factory=dict)  # {"T": ["Display"]}
 
     def append(self, instr: QInstruction) -> None:
         self.body.append(instr)
@@ -178,6 +201,9 @@ class QModule:
     name: str = "main"
     functions: list[QFunction] = field(default_factory=list)
     strings: list[str] = field(default_factory=list)
+    traits: dict[str, list[str]] = field(default_factory=dict)  # trait_name → [method_names]
+    impls: list[tuple[str, str, dict[str, str]]] = field(default_factory=list)  # (trait, type, {method: func})
+    enums: dict[str, list[tuple[str, list[str]]]] = field(default_factory=dict)  # enum_name → [(variant, [field_types])]
 
     def add_function(self, func: QFunction) -> None:
         self.functions.append(func)

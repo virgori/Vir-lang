@@ -1028,7 +1028,99 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt)
     case AST_MODULE:
     case AST_EXPORT:
     case AST_INCLUDE:
+    case AST_TYPE_DECL:
         return 0;
+
+    /* ═══════════════════════════════════════════════════
+     * TASK A1: Pattern Match Decision Tree
+     * ═══════════════════════════════════════════════════
+     *
+     * AST_CASE children[0] = subject expression
+     * AST_CASE children[1..n] = AST_PATTERN_MATCH arms
+     *   arm->name = pattern literal ("_" for wildcard)
+     *   arm->int_val: -1 = wildcard, -2 = string, -3 = named, else integer
+     *   arm->children[0] = body statement
+     *
+     * Strategy: Linear decision chain (CMP_EQ + JUMP_IF for each arm).
+     * Wildcard arm "_" → unconditional jump (default case).
+     */
+    case AST_CASE: {
+        if (stmt->child_count < 2) return -1;
+
+        /* Lower subject expression once into a vreg */
+        int subject = lower_expr(ctx, stmt->children[0]);
+        if (subject < 0) return -1;
+
+        uint32_t end_label = fresh_label(ctx);
+
+        /* Allocate arm labels */
+        uint32_t arm_count = stmt->child_count - 1;
+        uint32_t arm_labels[AST_MAX_CHILDREN];
+        for (uint32_t i = 0; i < arm_count; i++)
+            arm_labels[i] = fresh_label(ctx);
+
+        /* Phase 1: Emit comparison chain */
+        int has_wildcard = 0;
+        uint32_t wildcard_arm_idx = 0;
+
+        for (uint32_t i = 0; i < arm_count; i++) {
+            const ast_node_t *arm = stmt->children[i + 1];
+            if (!arm) continue;
+
+            if (strcmp(arm->name, "_") == 0) {
+                /* Wildcard — unconditional jump (emit last) */
+                has_wildcard = 1;
+                wildcard_arm_idx = i;
+                continue;
+            }
+
+            /* Emit: CMP_EQ subject, pattern_val → tmp */
+            uint32_t pat_r = fresh_vreg(ctx);
+            emit(ctx, q_instr(Q_LOAD, q_vreg(pat_r),
+                              q_imm(arm->int_val), q_none()));
+            uint32_t cmp_r = fresh_vreg(ctx);
+            emit(ctx, q_instr(Q_CMP_EQ, q_vreg(cmp_r),
+                              q_vreg((uint32_t)subject), q_vreg(pat_r)));
+            emit(ctx, q_instr(Q_JUMP_IF, q_none(),
+                              q_vreg(cmp_r), q_label(arm_labels[i])));
+        }
+
+        /* Jump to wildcard arm if present, otherwise to end */
+        if (has_wildcard) {
+            emit(ctx, q_instr(Q_JUMP, q_none(),
+                              q_label(arm_labels[wildcard_arm_idx]), q_none()));
+        } else {
+            emit(ctx, q_instr(Q_JUMP, q_none(),
+                              q_label(end_label), q_none()));
+        }
+
+        /* Phase 2: Emit arm bodies */
+        for (uint32_t i = 0; i < arm_count; i++) {
+            const ast_node_t *arm = stmt->children[i + 1];
+            if (!arm) continue;
+
+            /* Label for this arm */
+            q_instruction_t lbl = q_instr(Q_LABEL, q_none(), q_none(), q_none());
+            lbl.patch_id = arm_labels[i];
+            emit(ctx, lbl);
+
+            /* Lower body */
+            if (arm->child_count > 0) {
+                lower_stmt(ctx, arm->children[0]);
+            }
+
+            /* Jump to end after arm body */
+            emit(ctx, q_instr(Q_JUMP, q_none(),
+                              q_label(end_label), q_none()));
+        }
+
+        /* End label */
+        q_instruction_t end_lbl = q_instr(Q_LABEL, q_none(), q_none(), q_none());
+        end_lbl.patch_id = end_label;
+        emit(ctx, end_lbl);
+
+        return 0;
+    }
 
     default: {
         /* Try as expression statement */
@@ -1130,6 +1222,7 @@ int ast_is_metadata(ast_type_t type)
     case AST_IMPORT:
     case AST_EXPORT:
     case AST_INCLUDE:
+    case AST_TYPE_DECL:
         return 1;
     default:
         return 0;

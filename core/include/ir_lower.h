@@ -93,6 +93,7 @@ typedef enum {
     AST_CAST,           /* expr >> Type */
     AST_EXIST_CHECK,    /* expr? */
     AST_NAMED_ARG,      /* param=value in call */
+    AST_TYPE_DECL,      /* type i8; (v1.2 type alias)  */
 } ast_type_t;
 
 /* Binary / comparison operators */

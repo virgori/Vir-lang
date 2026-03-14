@@ -126,6 +126,7 @@ static const kw_single_t kw_singles[] = {
     {"export",    TOK_EXPORT},
     {"as",        TOK_AS},
     {"include",   TOK_INCLUDE},
+    {"type",      TOK_TYPE_KW},
     {NULL,        TOK_EOF}
 };
 
@@ -818,6 +819,7 @@ const char *lexer_token_name(vir_tok_t type) {
         [TOK_EXPORT]    = "EXPORT",
         [TOK_AS]        = "AS",
         [TOK_INCLUDE]   = "INCLUDE",
+        [TOK_TYPE_KW]   = "TYPE",
         [TOK_IN]        = "IN",
         [TOK_TRUE]      = "TRUE",
         [TOK_FALSE]     = "FALSE",

@@ -1,0 +1,385 @@
+##
+ * vir/net/redis.vri — Redis Client Protocol (RESP)
+ * ==================================================
+ * Inspired by Rust: redis-rs crate
+ * Inspired by Python: redis-py
+ * Inspired by Go: go-redis/redis
+ *
+ * Phase C — Tier 2: Redis RESP protocol encoder/decoder.
+ * Supports: Simple strings, Errors, Integers, Bulk strings,
+ * Arrays. Builds command buffers for TCP transport.
+ ##
+
+include types;
+include option;
+import Option, Some, None, is_some, is_none, unwrap from option;
+include vec;
+import Vec, vec_new, vec_push, vec_get, vec_set, vec_len from vec;
+include builder;
+import StringBuilder, sb_new, sb_append, sb_append_byte, sb_append_i64,
+       sb_build, sb_free from builder;
+
+# ═══════════════════════════════════════════════════════
+# RESP Value types
+# ═══════════════════════════════════════════════════════
+
+const RESP_SIMPLE   = 0;   # +OK\r\n
+const RESP_ERROR    = 1;   # -ERR message\r\n
+const RESP_INTEGER  = 2;   # :42\r\n
+const RESP_BULK     = 3;   # $6\r\nfoobar\r\n
+const RESP_ARRAY    = 4;   # *2\r\n...
+const RESP_NIL      = 5;   # $-1\r\n or *-1\r\n
+
+entity RespValue:
+    kind:      int;
+    str_val:   string;
+    int_val:   int;
+    arr_val:   Vec;        # Vec<RespValue>
+end
+
+# ─── Constructors ───────────────────────────────────
+
+func resp_simple:
+    in(s: string)
+    out RespValue { kind: RESP_SIMPLE, str_val: s, int_val: 0, arr_val: vec_new() };
+end
+
+func resp_error:
+    in(s: string)
+    out RespValue { kind: RESP_ERROR, str_val: s, int_val: 0, arr_val: vec_new() };
+end
+
+func resp_integer:
+    in(v: int)
+    out RespValue { kind: RESP_INTEGER, str_val: "", int_val: v, arr_val: vec_new() };
+end
+
+func resp_bulk:
+    in(s: string)
+    out RespValue { kind: RESP_BULK, str_val: s, int_val: 0, arr_val: vec_new() };
+end
+
+func resp_array:
+    in()
+    out RespValue { kind: RESP_ARRAY, str_val: "", int_val: 0, arr_val: vec_new() };
+end
+
+func resp_nil:
+    in()
+    out RespValue { kind: RESP_NIL, str_val: "", int_val: 0, arr_val: vec_new() };
+end
+
+func resp_array_push:
+    in(v: RespValue; item: RespValue)
+    vec_push(v.arr_val, item);
+end
+
+# ─── Queries ────────────────────────────────────────
+
+func resp_is_nil:     in(v: RespValue) out v.kind == RESP_NIL;     end
+func resp_is_error:   in(v: RespValue) out v.kind == RESP_ERROR;   end
+func resp_is_integer: in(v: RespValue) out v.kind == RESP_INTEGER; end
+func resp_is_bulk:    in(v: RespValue) out v.kind == RESP_BULK;    end
+func resp_is_array:   in(v: RespValue) out v.kind == RESP_ARRAY;   end
+
+func resp_as_str:     in(v: RespValue) out v.str_val;              end
+func resp_as_int:     in(v: RespValue) out v.int_val;              end
+func resp_arr_len:    in(v: RespValue) out vec_len(v.arr_val);     end
+func resp_arr_get:    in(v: RespValue; i: int) out vec_get(v.arr_val, i); end
+
+# ═══════════════════════════════════════════════════════
+# RESP Encoder — Serialize to wire format
+# ═══════════════════════════════════════════════════════
+
+func resp_encode:
+    in(v: RespValue)
+    sb = sb_new();
+    _resp_encode_value(sb, v);
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;
+end
+
+func _resp_encode_value:
+    in(sb: StringBuilder; v: RespValue)
+    if v.kind == RESP_SIMPLE:
+        sb_append_byte(sb, 43);     # '+'
+        sb_append(sb, v.str_val);
+        sb_append_byte(sb, 13);     # \r
+        sb_append_byte(sb, 10);     # \n
+    eif v.kind == RESP_ERROR:
+        sb_append_byte(sb, 45);     # '-'
+        sb_append(sb, v.str_val);
+        sb_append_byte(sb, 13);
+        sb_append_byte(sb, 10);
+    eif v.kind == RESP_INTEGER:
+        sb_append_byte(sb, 58);     # ':'
+        sb_append_i64(sb, v.int_val);
+        sb_append_byte(sb, 13);
+        sb_append_byte(sb, 10);
+    eif v.kind == RESP_BULK:
+        sb_append_byte(sb, 36);     # '$'
+        sb_append_i64(sb, str_len(v.str_val));
+        sb_append_byte(sb, 13);
+        sb_append_byte(sb, 10);
+        sb_append(sb, v.str_val);
+        sb_append_byte(sb, 13);
+        sb_append_byte(sb, 10);
+    eif v.kind == RESP_ARRAY:
+        sb_append_byte(sb, 42);     # '*'
+        n = vec_len(v.arr_val);
+        sb_append_i64(sb, n);
+        sb_append_byte(sb, 13);
+        sb_append_byte(sb, 10);
+        i = 0;
+        when i < n loop
+            _resp_encode_value(sb, vec_get(v.arr_val, i));
+            i = i + 1;
+        end
+    eif v.kind == RESP_NIL:
+        sb_append(sb, "$-1");
+        sb_append_byte(sb, 13);
+        sb_append_byte(sb, 10);
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# RESP Decoder — Parse from wire format
+# ═══════════════════════════════════════════════════════
+
+entity RespReader:
+    data: string;
+    pos:  int;
+end
+
+func _resp_read_byte:
+    in(r: RespReader)
+    ch = str_byte_at(r.data, r.pos);
+    r.pos = r.pos + 1;
+    out ch;
+end
+
+func _resp_read_line:
+    in(r: RespReader)
+    sb = sb_new();
+    done = false;
+    when not done and r.pos < str_len(r.data) loop
+        ch = str_byte_at(r.data, r.pos);
+        if ch == 13:
+            r.pos = r.pos + 2;    # skip \r\n
+            done = true;
+        else:
+            sb_append_byte(sb, ch);
+            r.pos = r.pos + 1;
+        end
+    end
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;
+end
+
+func _resp_read_int_line:
+    in(r: RespReader)
+    line = _resp_read_line(r);
+    # Parse integer from string
+    neg = false;
+    start = 0;
+    if str_len(line) > 0 and str_byte_at(line, 0) == 45:
+        neg = true;
+        start = 1;
+    end
+    val = 0;
+    i = start;
+    when i < str_len(line) loop
+        val = val * 10 + str_byte_at(line, i) - 48;
+        i = i + 1;
+    end
+    if neg:
+        val = 0 - val;
+    end
+    out val;
+end
+
+func _resp_read_exact:
+    in(r: RespReader; n: int)
+    sb = sb_new();
+    i = 0;
+    when i < n loop
+        sb_append_byte(sb, str_byte_at(r.data, r.pos));
+        r.pos = r.pos + 1;
+        i = i + 1;
+    end
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;
+end
+
+func resp_decode:
+    in(data: string)
+    r = RespReader { data: data, pos: 0 };
+    out _resp_decode_value(r);
+end
+
+func _resp_decode_value:
+    in(r: RespReader)
+    type_byte = _resp_read_byte(r);
+
+    if type_byte == 43:       # '+'  Simple string
+        out resp_simple(_resp_read_line(r));
+    end
+
+    if type_byte == 45:       # '-'  Error
+        out resp_error(_resp_read_line(r));
+    end
+
+    if type_byte == 58:       # ':'  Integer
+        out resp_integer(_resp_read_int_line(r));
+    end
+
+    if type_byte == 36:       # '$'  Bulk string
+        n = _resp_read_int_line(r);
+        if n < 0 out resp_nil() end:
+        s = _resp_read_exact(r, n);
+        r.pos = r.pos + 2;   # skip trailing \r\n
+        out resp_bulk(s);
+    end
+
+    if type_byte == 42:       # '*'  Array
+        n = _resp_read_int_line(r);
+        if n < 0 out resp_nil() end:
+        arr = resp_array();
+        i = 0;
+        when i < n loop
+            resp_array_push(arr, _resp_decode_value(r));
+            i = i + 1;
+        end
+        out arr;
+    end
+
+    out resp_nil();
+end
+
+# ═══════════════════════════════════════════════════════
+# Command builders (convenience)
+# ═══════════════════════════════════════════════════════
+
+func _cmd_1:
+    in(cmd: string)
+    arr = resp_array();
+    resp_array_push(arr, resp_bulk(cmd));
+    out resp_encode(arr);
+end
+
+func _cmd_2:
+    in(cmd: string; arg1: string)
+    arr = resp_array();
+    resp_array_push(arr, resp_bulk(cmd));
+    resp_array_push(arr, resp_bulk(arg1));
+    out resp_encode(arr);
+end
+
+func _cmd_3:
+    in(cmd: string; arg1: string; arg2: string)
+    arr = resp_array();
+    resp_array_push(arr, resp_bulk(cmd));
+    resp_array_push(arr, resp_bulk(arg1));
+    resp_array_push(arr, resp_bulk(arg2));
+    out resp_encode(arr);
+end
+
+# ─── Key-Value commands ─────────────────────────────
+
+func redis_cmd_get:   in(key: string) out _cmd_2("GET", key);   end
+func redis_cmd_set:   in(key: string; value: string) out _cmd_3("SET", key, value); end
+func redis_cmd_del:   in(key: string) out _cmd_2("DEL", key);   end
+func redis_cmd_exists:in(key: string) out _cmd_2("EXISTS", key);end
+func redis_cmd_incr:  in(key: string) out _cmd_2("INCR", key);  end
+func redis_cmd_decr:  in(key: string) out _cmd_2("DECR", key);  end
+
+# ─── Hash commands ──────────────────────────────────
+
+func redis_cmd_hget:
+    in(key: string; field: string)
+    out _cmd_3("HGET", key, field);
+end
+
+func redis_cmd_hset:
+    in(key: string; field: string; value: string)
+    arr = resp_array();
+    resp_array_push(arr, resp_bulk("HSET"));
+    resp_array_push(arr, resp_bulk(key));
+    resp_array_push(arr, resp_bulk(field));
+    resp_array_push(arr, resp_bulk(value));
+    out resp_encode(arr);
+end
+
+func redis_cmd_hgetall:
+    in(key: string)
+    out _cmd_2("HGETALL", key);
+end
+
+# ─── List commands ──────────────────────────────────
+
+func redis_cmd_lpush:
+    in(key: string; value: string)
+    out _cmd_3("LPUSH", key, value);
+end
+
+func redis_cmd_rpush:
+    in(key: string; value: string)
+    out _cmd_3("RPUSH", key, value);
+end
+
+func redis_cmd_lpop:  in(key: string) out _cmd_2("LPOP", key);  end
+func redis_cmd_rpop:  in(key: string) out _cmd_2("RPOP", key);  end
+func redis_cmd_llen:  in(key: string) out _cmd_2("LLEN", key);  end
+
+# ─── Set commands ───────────────────────────────────
+
+func redis_cmd_sadd:
+    in(key: string; member: string)
+    out _cmd_3("SADD", key, member);
+end
+
+func redis_cmd_smembers:
+    in(key: string)
+    out _cmd_2("SMEMBERS", key);
+end
+
+func redis_cmd_sismember:
+    in(key: string; member: string)
+    out _cmd_3("SISMEMBER", key, member);
+end
+
+# ─── Expiry & TTL ──────────────────────────────────
+
+func redis_cmd_expire:
+    in(key: string; seconds: string)
+    out _cmd_3("EXPIRE", key, seconds);
+end
+
+func redis_cmd_ttl:
+    in(key: string)
+    out _cmd_2("TTL", key);
+end
+
+# ─── Control commands ──────────────────────────────
+
+func redis_cmd_ping:  in() out _cmd_1("PING");  end
+func redis_cmd_quit:  in() out _cmd_1("QUIT");  end
+func redis_cmd_info:  in() out _cmd_1("INFO");  end
+
+# ─── Pipeline: batch multiple commands ──────────────
+
+func redis_pipeline:
+    in(commands: Vec)
+    sb = sb_new();
+    i = 0;
+    when i < vec_len(commands) loop
+        sb_append(sb, vec_get(commands, i));
+        i = i + 1;
+    end
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;
+end

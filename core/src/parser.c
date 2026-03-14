@@ -1,12 +1,14 @@
 /*
- * parser.c – Vir Recursive-Descent Parser
- * =========================================
+ * parser.c – Vir Recursive-Descent Parser (v1.2)
+ * ================================================
  * Produces ast_node_t trees from a token stream (vir_token_t[]).
  *
- * Grammar (keyword-delimited blocks):
+ * v1.2 Grammar (keyword-delimited blocks):
  *
  *   program     → (func_def | statement)* EOF
- *   func_def    → FUNC IDENT '(' params ')' THEN block END
+ *   func_def    → FUNC IDENT ':' [in_params] block END
+ *   in_params   → IN '(' param (';' param)* ')'
+ *   param       → IDENT [':' TYPE]
  *   params      → (IDENT (',' IDENT)*)?
  *   block       → statement*
  *   statement   → var_decl | const_decl | if_stmt | loop_stmt
@@ -14,10 +16,11 @@
  *               | assign_or_expr | NEWLINE
  *   var_decl    → VAR IDENT '=' expr
  *   const_decl  → CONST IDENT '=' expr
- *   if_stmt     → IF expr THEN block (ELIF expr THEN block)* (ELSE block)? END
- *   loop_stmt   → LOOP expr THEN block END
- *   while_stmt  → WHILE expr THEN block END
- *   return_stmt → RETURN expr?
+ *   if_stmt     → IF expr ':'|THEN block (EIF expr ':'|THEN block)* (ELSE block)? END
+ *   loop_stmt   → LOOP [expr] block END
+ *   while_stmt  → WHILE expr THEN block END (legacy)
+ *   when_stmt   → WHEN expr LOOP block END (v1.2)
+ *   return_stmt → RETURN|OUT expr?
  *   print_stmt  → PRINT expr
  *   assign_or_expr → IDENT '=' expr  |  expr
  *   expr        → or_expr
@@ -92,16 +95,33 @@ static void skip_newlines(vir_parser_t *p)
 static int is_stmt_start(vir_tok_t t)
 {
     return t == TOK_VAR || t == TOK_CONST || t == TOK_IF ||
-           t == TOK_LOOP || t == TOK_WHILE || t == TOK_FOR ||
+           t == TOK_LOOP || t == TOK_WHILE || t == TOK_WHEN ||
+           t == TOK_FOR ||
            t == TOK_RETURN || t == TOK_OUT || t == TOK_PRINT || t == TOK_INPUT ||
            t == TOK_IDENT || t == TOK_INT || t == TOK_FLOAT ||
            t == TOK_STRING || t == TOK_LPAREN || t == TOK_MINUS ||
            t == TOK_NOT || t == TOK_CHECK_CPU || t == TOK_PATCH ||
            t == TOK_FUNC || t == TOK_BREAK || t == TOK_CONTINUE ||
+           t == TOK_SKIP ||
            t == TOK_TRUE || t == TOK_FALSE || t == TOK_LBRACKET ||
            t == TOK_ENUM || t == TOK_RECORD || t == TOK_ENTITY ||
            t == TOK_IMPORT || t == TOK_FROM || t == TOK_MODULE ||
            t == TOK_EXPORT || t == TOK_INCLUDE;
+}
+
+/* ═══════════════════════════════════════════════════════
+ * v1.2 Block Opener: accept ':' or 'then'
+ * ═══════════════════════════════════════════════════════ */
+
+static int expect_block_open(vir_parser_t *p, const char *context)
+{
+    /* v1.2 uses ':' to open blocks, legacy uses 'then' */
+    if (match(p, TOK_COLON)) return 1;
+    if (match(p, TOK_THEN))  return 1;
+    char msg[128];
+    snprintf(msg, sizeof(msg), "expected ':' or 'then' after %s", context);
+    parse_error(p, msg);
+    return 0;
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -620,13 +640,13 @@ static ast_node_t *parse_var_decl(vir_parser_t *p, ast_type_t type)
 
 static ast_node_t *parse_if_stmt(vir_parser_t *p)
 {
-    /* IF expr THEN block (ELIF expr THEN block)* (ELSE block)? END */
+    /* IF expr ':'|THEN block (EIF|ELIF expr ':'|THEN block)* (ELSE block)? END */
     uint32_t line = peek(p)->line;
 
     ast_node_t *cond = parse_expr(p);
     if (!cond) return NULL;
 
-    expect(p, TOK_THEN, "expected 'thì'/'then' after condition");
+    expect_block_open(p, "if condition");
 
     ast_node_t *then_block = parse_block(p);
 
@@ -650,8 +670,9 @@ static ast_node_t *parse_if_stmt(vir_parser_t *p)
     /* Handle ELSE */
     if (match(p, TOK_ELSE)) {
         skip_newlines(p);
-        /* Check if ELSE is followed by THEN (optional) */
+        /* Check if ELSE is followed by block opener (optional) */
         match(p, TOK_THEN);
+        match(p, TOK_COLON);
         ast_node_t *else_block = parse_block(p);
         ast_add_child(if_node, else_block);
     }
@@ -662,13 +683,33 @@ static ast_node_t *parse_if_stmt(vir_parser_t *p)
 
 static ast_node_t *parse_loop_stmt(vir_parser_t *p)
 {
-    /* LOOP expr THEN block END */
+    /* v1.2: LOOP block END  (infinite loop, no count)
+     * legacy: LOOP expr THEN block END  (counted loop) */
     uint32_t line = peek(p)->line;
 
+    /* Check if next token is block opener → infinite loop (v1.2) */
+    if (check(p, TOK_NEWLINE) || check(p, TOK_COLON)) {
+        /* Infinite loop: use a large count or special flag */
+        match(p, TOK_COLON);  /* optional ':' */
+        skip_newlines(p);
+        ast_node_t *body = parse_block(p);
+        expect(p, TOK_END, "expected 'end' after loop block");
+        /* Emit as while(true) */
+        ast_node_t *cond = ast_new(AST_LITERAL_INT);
+        cond->int_val = 1;
+        cond->line = line;
+        ast_node_t *n = ast_new(AST_WHILE);
+        n->line = line;
+        ast_add_child(n, cond);
+        ast_add_child(n, body);
+        return n;
+    }
+
+    /* Legacy: counted loop */
     ast_node_t *count = parse_expr(p);
     if (!count) return NULL;
 
-    expect(p, TOK_THEN, "expected 'thì'/'then' after loop count");
+    expect_block_open(p, "loop count");
 
     ast_node_t *body = parse_block(p);
 
@@ -683,18 +724,46 @@ static ast_node_t *parse_loop_stmt(vir_parser_t *p)
 
 static ast_node_t *parse_while_stmt(vir_parser_t *p)
 {
-    /* WHILE expr THEN block END */
+    /* WHILE expr ':'|THEN block END (legacy, still supported) */
     uint32_t line = peek(p)->line;
 
     ast_node_t *cond = parse_expr(p);
     if (!cond) return NULL;
 
-    expect(p, TOK_THEN, "expected 'thì'/'then' after while condition");
+    expect_block_open(p, "while condition");
 
     ast_node_t *body = parse_block(p);
 
     expect(p, TOK_END, "expected 'hết'/'end' after while block");
 
+    ast_node_t *n = ast_new(AST_WHILE);
+    n->line = line;
+    ast_add_child(n, cond);
+    ast_add_child(n, body);
+    return n;
+}
+
+/* ═══════════════════════════════════════════════════════
+ * When-Loop (v1.2 conditional loop)
+ * ═══════════════════════════════════════════════════════
+ * Syntax:  when COND loop BLOCK end
+ * Equivalent to: while COND then BLOCK end
+ */
+
+static ast_node_t *parse_when_loop_stmt(vir_parser_t *p)
+{
+    uint32_t line = peek(p)->line;
+
+    ast_node_t *cond = parse_expr(p);
+    if (!cond) return NULL;
+
+    expect(p, TOK_LOOP, "expected 'loop' after when condition");
+
+    ast_node_t *body = parse_block(p);
+
+    expect(p, TOK_END, "expected 'end' after when...loop block");
+
+    /* Lower to AST_WHILE — same semantics */
     ast_node_t *n = ast_new(AST_WHILE);
     n->line = line;
     ast_add_child(n, cond);
@@ -710,10 +779,12 @@ static ast_node_t *parse_return_stmt(vir_parser_t *p)
 
     /* Optional return value */
     if (!check(p, TOK_NEWLINE) && !check(p, TOK_END) &&
-        !check(p, TOK_EOF) && !check(p, TOK_ELSE)) {
+        !check(p, TOK_EOF) && !check(p, TOK_ELSE) &&
+        !check(p, TOK_SEMICOLON)) {
         ast_node_t *val = parse_expr(p);
         if (val) ast_add_child(n, val);
     }
+    match(p, TOK_SEMICOLON);  /* optional ';' */
     return n;
 }
 
@@ -730,7 +801,9 @@ static ast_node_t *parse_print_stmt(vir_parser_t *p)
 
 static ast_node_t *parse_func_def(vir_parser_t *p)
 {
-    /* FUNC IDENT '(' params ')' THEN block END */
+    /* v1.2:   FUNC IDENT ':' [in(params)] block END
+     * legacy: FUNC IDENT '(' params ')' THEN block END
+     * Both forms supported for backwards compatibility. */
     const vir_token_t *name_tok = expect(p, TOK_IDENT, "expected function name");
     if (!name_tok) return NULL;
 
@@ -738,6 +811,48 @@ static ast_node_t *parse_func_def(vir_parser_t *p)
     strncpy(fn->name, name_tok->str.buf, AST_NAME_LEN - 1);
     fn->line = name_tok->line;
 
+    if (check(p, TOK_COLON)) {
+        /* ─── v1.2 syntax: func name: [in(a:int; b:int)] block end ─── */
+        advance(p);  /* consume ':' */
+        skip_newlines(p);
+
+        /* Optional in(...) parameter block */
+        if (check(p, TOK_IN)) {
+            advance(p);  /* consume 'in' */
+            expect(p, TOK_LPAREN, "expected '(' after 'in'");
+
+            /* Parse params: name[:type] separated by ';' or ',' */
+            if (!check(p, TOK_RPAREN)) {
+                for (;;) {
+                    const vir_token_t *param_tok = expect(p, TOK_IDENT, "expected parameter name");
+                    if (!param_tok) break;
+                    ast_node_t *param = ast_new(AST_IDENTIFIER);
+                    strncpy(param->name, param_tok->str.buf, AST_NAME_LEN - 1);
+                    param->line = param_tok->line;
+                    /* Optional type hint: ':' TYPE */
+                    if (match(p, TOK_COLON)) {
+                        const vir_token_t *type_tok = expect(p, TOK_IDENT, "expected type name");
+                        if (type_tok) {
+                            strncpy(param->name2, type_tok->str.buf, AST_NAME_LEN - 1);
+                        }
+                    }
+                    ast_add_child(fn, param);
+                    /* v1.2 uses ';' separator, also accept ',' */
+                    if (!match(p, TOK_SEMICOLON) && !match(p, TOK_COMMA)) break;
+                }
+            }
+            expect(p, TOK_RPAREN, "expected ')' after parameters");
+            skip_newlines(p);
+        }
+
+        ast_node_t *body = parse_block(p);
+        ast_add_child(fn, body);
+
+        expect(p, TOK_END, "expected 'end' to close function");
+        return fn;
+    }
+
+    /* ─── Legacy syntax: func name(params) then block end ─── */
     expect(p, TOK_LPAREN, "expected '(' after function name");
 
     /* Parse parameters → stored as IDENTIFIER children */
@@ -759,7 +874,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p)
     }
 
     expect(p, TOK_RPAREN, "expected ')' after parameters");
-    expect(p, TOK_THEN, "expected 'thì'/'then' after function signature");
+    expect_block_open(p, "function signature");
 
     ast_node_t *body = parse_block(p);
     ast_add_child(fn, body);  /* Last child = body block */
@@ -799,7 +914,7 @@ static ast_node_t *parse_for_range_stmt(vir_parser_t *p)
     ast_node_t *end_expr = parse_expr(p);
     if (!end_expr) { ast_free(start); return NULL; }
 
-    expect(p, TOK_THEN, "expected 'thì'/'then' after for range");
+    expect_block_open(p, "for range");
 
     ast_node_t *body = parse_block(p);
 
@@ -833,7 +948,8 @@ static ast_node_t *parse_enum_def(vir_parser_t *p)
     const vir_token_t *name_tok = expect(p, TOK_IDENT, "expected enum name");
     if (!name_tok) return NULL;
 
-    expect(p, TOK_THEN, "expected 'thì'/'then' after enum name");
+    /* Accept ':' or 'then' */
+    expect_block_open(p, "enum name");
     skip_newlines(p);
 
     ast_node_t *en = ast_new(AST_ENUM_DEF);
@@ -887,8 +1003,8 @@ static ast_node_t *parse_record_def(vir_parser_t *p)
     const vir_token_t *name_tok = expect(p, TOK_IDENT, "expected record name");
     if (!name_tok) return NULL;
 
-    /* 'then' is optional — required for 'record', omitted for 'entity' */
-    match(p, TOK_THEN);
+    /* Accept ':' or 'then' as block opener (optional for entity) */
+    if (!match(p, TOK_COLON)) match(p, TOK_THEN);
     skip_newlines(p);
 
     ast_node_t *rec = ast_new(AST_RECORD_DEF);
@@ -918,6 +1034,94 @@ static ast_node_t *parse_record_def(vir_parser_t *p)
 
     expect(p, TOK_END, "expected 'hết'/'end' after record definition");
     return rec;
+}
+
+/* ═══════════════════════════════════════════════════════
+ * TASK A1: Pattern Match (case expr :~ ... end)
+ * ═══════════════════════════════════════════════════════
+ *
+ * Syntax:
+ *   case EXPR :~
+ *       PATTERN1: BODY1;
+ *       PATTERN2: BODY2;
+ *       _:        DEFAULT_BODY;
+ *   end
+ *
+ * AST:
+ *   AST_CASE
+ *     children[0] = subject expr
+ *     children[1..n] = AST_PATTERN_MATCH arms
+ *       Each arm: name = pattern literal ("_" for wildcard)
+ *                 int_val = pattern int value (if integer literal)
+ *                 children[0] = body statement/block
+ */
+static ast_node_t *parse_case_stmt(vir_parser_t *p)
+{
+    /* TOK_CASE already consumed.  Parse subject expression. */
+    ast_node_t *subject = parse_expr(p);
+    if (!subject) { parse_error(p, "expected expression after 'case'"); return NULL; }
+
+    /* Expect :~ token */
+    if (!expect(p, TOK_PATTERN, "expected ':~' after case expression")) {
+        ast_free(subject);
+        return NULL;
+    }
+
+    ast_node_t *node = ast_new(AST_CASE);
+    node->line = subject->line;
+    ast_add_child(node, subject);  /* children[0] = subject */
+
+    skip_newlines(p);
+
+    /* Parse arms until 'end' */
+    while (!check(p, TOK_END) && !check(p, TOK_EOF)) {
+        ast_node_t *arm = ast_new(AST_PATTERN_MATCH);
+
+        const vir_token_t *pat = peek(p);
+
+        if (pat->type == TOK_IDENT && strcmp(pat->str.buf, "_") == 0) {
+            /* Wildcard arm */
+            strncpy(arm->name, "_", AST_NAME_LEN - 1);
+            arm->int_val = -1;  /* sentinel: wildcard */
+            advance(p);
+        } else if (pat->type == TOK_INT) {
+            /* Integer literal pattern */
+            arm->int_val = pat->int_val;
+            snprintf(arm->name, AST_NAME_LEN, "%lld", (long long)pat->int_val);
+            advance(p);
+        } else if (pat->type == TOK_STRING) {
+            /* String literal pattern */
+            strncpy(arm->name, pat->str.buf, AST_NAME_LEN - 1);
+            arm->int_val = -2;  /* sentinel: string pattern */
+            advance(p);
+        } else if (pat->type == TOK_IDENT) {
+            /* Named pattern (enum variant or variable) */
+            strncpy(arm->name, pat->str.buf, AST_NAME_LEN - 1);
+            arm->int_val = -3;  /* sentinel: named pattern */
+            advance(p);
+        } else {
+            parse_error(p, "expected pattern in case arm");
+            ast_free(arm);
+            break;
+        }
+
+        arm->line = pat->line;
+
+        /* Expect ':' separator */
+        expect(p, TOK_COLON, "expected ':' after pattern");
+
+        /* Parse body — single statement or expression */
+        ast_node_t *body = parse_statement(p);
+        if (body) ast_add_child(arm, body);
+
+        match(p, TOK_SEMICOLON);  /* optional ';' */
+        skip_newlines(p);
+
+        ast_add_child(node, arm);
+    }
+
+    expect(p, TOK_END, "expected 'end'/'hết' after case block");
+    return node;
 }
 
 static ast_node_t *parse_statement(vir_parser_t *p)
@@ -950,6 +1154,10 @@ static ast_node_t *parse_statement(vir_parser_t *p)
         advance(p);
         return parse_while_stmt(p);
 
+    case TOK_WHEN:
+        advance(p);
+        return parse_when_loop_stmt(p);
+
     case TOK_FOR:
         advance(p);
         return parse_for_range_stmt(p);
@@ -957,6 +1165,10 @@ static ast_node_t *parse_statement(vir_parser_t *p)
     case TOK_ENUM:
         advance(p);
         return parse_enum_def(p);
+
+    case TOK_CASE:
+        advance(p);
+        return parse_case_stmt(p);
 
     case TOK_RECORD:
     case TOK_ENTITY:
@@ -976,12 +1188,15 @@ static ast_node_t *parse_statement(vir_parser_t *p)
         advance(p);
         ast_node_t *n = ast_new(AST_BREAK);
         n->line = t->line;
+        match(p, TOK_SEMICOLON);  /* optional ';' */
         return n;
     }
-    case TOK_CONTINUE: {
+    case TOK_CONTINUE:
+    case TOK_SKIP: {
         advance(p);
         ast_node_t *n = ast_new(AST_CONTINUE);
         n->line = t->line;
+        match(p, TOK_SEMICOLON);  /* optional ';' */
         return n;
     }
 
@@ -1048,6 +1263,18 @@ static ast_node_t *parse_statement(vir_parser_t *p)
         ast_node_t *n = ast_new(AST_INCLUDE);
         strncpy(n->name, file->str.buf, AST_NAME_LEN - 1);
         n->line = t->line;
+        return n;
+    }
+
+    case TOK_TYPE_KW: {
+        /* type <name> ; */
+        advance(p);
+        const vir_token_t *name = expect(p, TOK_IDENT, "expected type name after 'type'");
+        if (!name) return NULL;
+        ast_node_t *n = ast_new(AST_TYPE_DECL);
+        strncpy(n->name, name->str.buf, AST_NAME_LEN - 1);
+        n->line = t->line;
+        match(p, TOK_SEMICOLON);
         return n;
     }
 

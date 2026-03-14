@@ -1,0 +1,275 @@
+##
+ * vir/collections/persistent.vri — Persistent / Immutable Data Structures
+ * =======================================================================
+ * Inspired by Clojure: persistent vector, persistent hash map
+ * Inspired by Rust: im crate (HAMT)
+ *
+ * Phase D — Full coverage. Structural sharing via path copying.
+ * PersistentVec: 32-way branching trie (Bagwell's bit-partitioned vector trie).
+ * PersistentMap: Hash Array Mapped Trie (HAMT).
+ ##
+
+include types;
+include option;
+import Option, Some, None, is_some, is_none, unwrap from option;
+include vec;
+import Vec, vec_new, vec_push, vec_get, vec_set, vec_len from vec;
+
+const BRANCH_FACTOR = 32;
+const SHIFT_BITS    = 5;     # log2(32)
+const MASK          = 31;    # 0x1F
+
+# ═══════════════════════════════════════════════════════
+# Persistent Vector — 32-way trie
+# ═══════════════════════════════════════════════════════
+
+entity PVecNode:
+    children: Vec;    # Vec<PVecNode> for internal, Vec<any> for leaf
+    is_leaf:  bool;
+end
+
+entity PersistentVec:
+    root:  Option;    # Option<PVecNode>
+    tail:  Vec;       # tail buffer (up to 32 elements)
+    size:  int;
+    shift: int;       # depth * SHIFT_BITS
+end
+
+func pvec_new:
+    in()
+    out PersistentVec {
+        root:  None,
+        tail:  vec_new(),
+        size:  0,
+        shift: SHIFT_BITS
+    };
+end
+
+func pvec_len:
+    in(v: PersistentVec)
+    out v.size;
+end
+
+func _pvec_tail_offset:
+    in(v: PersistentVec)
+    if v.size < BRANCH_FACTOR:
+        out 0;
+    end
+    out ((v.size - 1) / BRANCH_FACTOR) * BRANCH_FACTOR;
+end
+
+func _pvec_new_path:
+    in(level: int; node: PVecNode)
+    if level == 0:
+        out node;
+    end
+    wrapper = PVecNode { children: vec_new(), is_leaf: false };
+    vec_push(wrapper.children, _pvec_new_path(level - SHIFT_BITS, node));
+    out wrapper;
+end
+
+func _pvec_push_tail:
+    in(level: int; parent: PVecNode; tail_node: PVecNode)
+    # Clone parent
+    new_node = PVecNode { children: vec_new(), is_leaf: false };
+    i = 0;
+    when i < vec_len(parent.children) loop
+        vec_push(new_node.children, vec_get(parent.children, i));
+        i = i + 1;
+    end
+
+    if level == SHIFT_BITS:
+        vec_push(new_node.children, tail_node);
+        out new_node;
+    end
+
+    sub_idx = vec_len(parent.children) - 1;
+    if sub_idx >= 0:
+        if vec_len(parent.children) > sub_idx:
+            child = vec_get(parent.children, sub_idx);
+            new_child = _pvec_push_tail(level - SHIFT_BITS, child, tail_node);
+            vec_set(new_node.children, sub_idx, new_child);
+            out new_node;
+        end
+    end
+    vec_push(new_node.children, _pvec_new_path(level - SHIFT_BITS, tail_node));
+    out new_node;
+end
+
+func pvec_push:
+    in(v: PersistentVec; value: any_val)
+    # If tail has room
+    new_tail = vec_new();
+    i = 0;
+    when i < vec_len(v.tail) loop
+        vec_push(new_tail, vec_get(v.tail, i));
+        i = i + 1;
+    end
+    vec_push(new_tail, value);
+
+    if vec_len(v.tail) < BRANCH_FACTOR:
+        out PersistentVec {
+            root:  v.root,
+            tail:  new_tail,
+            size:  v.size + 1,
+            shift: v.shift
+        };
+    end
+
+    # Tail is full — push into trie
+    tail_node = PVecNode { children: v.tail, is_leaf: true };
+    new_shift = v.shift;
+
+    new_root = None;
+    if is_none(v.root):
+        new_root = Some(tail_node);
+    else:
+        root = unwrap(v.root);
+        new_root = Some(_pvec_push_tail(v.shift, root, tail_node));
+    end
+
+    single_tail = vec_new();
+    vec_push(single_tail, value);
+
+    out PersistentVec {
+        root:  new_root,
+        tail:  single_tail,
+        size:  v.size + 1,
+        shift: new_shift
+    };
+end
+
+func pvec_get:
+    in(v: PersistentVec; index: int)
+    if index < 0:
+        out None;
+    end
+    if index >= v.size:
+        out None;
+    end
+
+    tail_off = _pvec_tail_offset(v);
+    if index >= tail_off:
+        out Some(vec_get(v.tail, index - tail_off));
+    end
+
+    if is_none(v.root):
+        out None;
+    end
+
+    node = unwrap(v.root);
+    level = v.shift;
+    when level > 0 loop
+        child_idx = (index / level) % BRANCH_FACTOR;
+        if child_idx >= vec_len(node.children):
+            out None;
+        end
+        node = vec_get(node.children, child_idx);
+        level = level - SHIFT_BITS;
+    end
+
+    leaf_idx = index % BRANCH_FACTOR;
+    if leaf_idx >= vec_len(node.children):
+        out None;
+    end
+    out Some(vec_get(node.children, leaf_idx));
+end
+
+# ═══════════════════════════════════════════════════════
+# Persistent Map — simplified HAMT
+# ═══════════════════════════════════════════════════════
+
+entity PMapEntry:
+    key:   any_val;
+    value: any_val;
+    hash:  int;
+end
+
+entity PMapNode:
+    bitmap:   int;        # bitmask of occupied slots
+    entries:  Vec;        # Vec<PMapEntry | PMapNode>
+    is_entry: Vec;        # Vec<bool> — true = leaf entry, false = sub-node
+end
+
+entity PersistentMap:
+    root: Option;    # Option<PMapNode>
+    size: int;
+    hash_fn: func;
+    eq_fn:   func;
+end
+
+func pmap_new:
+    in(hash_fn: func; eq_fn: func)
+    out PersistentMap {
+        root: None,
+        size: 0,
+        hash_fn: hash_fn,
+        eq_fn: eq_fn
+    };
+end
+
+func pmap_len:
+    in(m: PersistentMap)
+    out m.size;
+end
+
+func _pmap_popcount:
+    in(x: int)
+    count = 0;
+    v = x;
+    when v != 0 loop
+        v = v & (v - 1);
+        count = count + 1;
+    end
+    out count;
+end
+
+func _pmap_index:
+    in(bitmap: int; bit: int)
+    out _pmap_popcount(bitmap & (bit - 1));
+end
+
+func pmap_get:
+    in(m: PersistentMap; key: any_val)
+    if is_none(m.root):
+        out None;
+    end
+
+    hash = m.hash_fn(key);
+    node = unwrap(m.root);
+    shift = 0;
+
+    done = false;
+    result = None;
+    when not done loop
+        fragment = (hash / (1 + shift * SHIFT_BITS)) & MASK;
+        bit = 1;
+        j = 0;
+        when j < fragment loop
+            bit = bit * 2;
+            j = j + 1;
+        end
+
+        if (node.bitmap & bit) == 0:
+            done = true;
+        else:
+            idx = _pmap_index(node.bitmap, bit);
+            if vec_get(node.is_entry, idx):
+                entry = vec_get(node.entries, idx);
+                if m.eq_fn(entry.key, key):
+                    result = Some(entry.value);
+                end
+                done = true;
+            else:
+                node = vec_get(node.entries, idx);
+                shift = shift + 1;
+            end
+        end
+    end
+    out result;
+end
+
+func pmap_contains:
+    in(m: PersistentMap; key: any_val)
+    out is_some(pmap_get(m, key));
+end

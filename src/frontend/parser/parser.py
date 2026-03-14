@@ -110,13 +110,14 @@ class HasDeclNode(ASTNode):
 
 @dataclass
 class FuncDefNode(ASTNode):
-    """func <name>: in(<params>) ... out <expr>; end"""
+    """func <name><T>: in(<params>) ... out <expr>; end"""
     name: str = ""
     params: list[str] = field(default_factory=list)
     body: list[ASTNode] = field(default_factory=list)
     param_types: list[Optional[str]] = field(default_factory=list)
     return_type: Optional[str] = None
     is_async: bool = False
+    generic_params: list = field(default_factory=list)  # list[GenericParam]
 
 
 @dataclass
@@ -135,9 +136,10 @@ class OutNode(ASTNode):
 
 @dataclass
 class EntityDefNode(ASTNode):
-    """entity <name>: field:type; ... end"""
+    """entity <name><T>: field:type; ... end"""
     name: str = ""
     fields: list[tuple[str, str]] = field(default_factory=list)
+    generic_params: list = field(default_factory=list)  # list[GenericParam]
 
 
 @dataclass
@@ -213,10 +215,75 @@ class CaseNode(ASTNode):
 
 @dataclass
 class TryErrorNode(ASTNode):
-    """out <expr> try <fallback> error <ErrorName> end"""
+    """try ... fallback ... error <ErrorName> ... end"""
+    try_body: list[ASTNode] = field(default_factory=list)
+    fallback_body: list[ASTNode] = field(default_factory=list)
+    error_handlers: list[tuple[str, list[ASTNode]]] = field(default_factory=list)
     expr: Optional[ASTNode] = None
     fallback: Optional[ASTNode] = None
     error_name: str = ""
+
+
+# ── Phase 3: Generics / Traits / Enum / Closures ─────────
+
+@dataclass
+class GenericParam(ASTNode):
+    """Type parameter: T, T: Display, T: Display + Clone"""
+    name: str = ""
+    bounds: list[str] = field(default_factory=list)
+
+
+@dataclass
+class GenericType(ASTNode):
+    """Generic type reference: Vec<i64>, Map<str, i64>"""
+    base_name: str = ""
+    type_args: list[str] = field(default_factory=list)
+
+
+@dataclass
+class EnumDefNode(ASTNode):
+    """enum Option<T>: Some(T); None; end"""
+    name: str = ""
+    generic_params: list[GenericParam] = field(default_factory=list)
+    variants: list[tuple[str, list[str]]] = field(default_factory=list)
+
+
+@dataclass
+class TraitDefNode(ASTNode):
+    """trait Display: func to_string(self) -> str; end"""
+    name: str = ""
+    generic_params: list[GenericParam] = field(default_factory=list)
+    methods: list[FuncDefNode] = field(default_factory=list)
+
+
+@dataclass
+class ImplNode(ASTNode):
+    """impl Display for Vec<i64>: ... end"""
+    trait_name: str = ""
+    target_type: str = ""
+    generic_params: list[GenericParam] = field(default_factory=list)
+    methods: list[FuncDefNode] = field(default_factory=list)
+
+
+@dataclass
+class MatchNode(ASTNode):
+    """match expr: pattern => body; ... end"""
+    expr: Optional[ASTNode] = None
+    arms: list[tuple[ASTNode, list[ASTNode]]] = field(default_factory=list)
+    else_body: list[ASTNode] = field(default_factory=list)
+
+
+@dataclass
+class ClosureNode(ASTNode):
+    """|params| body"""
+    params: list[str] = field(default_factory=list)
+    body: list[ASTNode] = field(default_factory=list)
+
+
+@dataclass
+class PropagateNode(ASTNode):
+    """expr? — unwrap Result/Option or early return"""
+    expr: Optional[ASTNode] = None
 
 
 # ── Data structures ───────────────────────────────────────
@@ -571,6 +638,14 @@ class Parser:
                 return self._parse_out()
             case TokenKind.RETURN:
                 return self._parse_out()    # legacy compat
+
+            # ── Phase 3: generics / traits / enum / match ──
+            case TokenKind.ENUM_DEF:
+                return self._parse_enum()
+            case TokenKind.TRAIT_DEF:
+                return self._parse_trait()
+            case TokenKind.IMPL_BLOCK:
+                return self._parse_impl()
 
             # ── error handling ─────────────────────────────
             case TokenKind.TRY:
@@ -1408,4 +1483,220 @@ class Parser:
             node.name = p.raw_text
         node.value = self._parse_expr()
         self._skip_semi()
+        return node
+
+    # ══════════════════════════════════════════════════════
+    # Phase 3: Generics, Traits, Enum, Match, Closures
+    # ══════════════════════════════════════════════════════
+
+    def _parse_generic_params(self) -> list[GenericParam]:
+        """Parse <T, U: Display + Clone> if present."""
+        p = self._peek()
+        if not (p and p.kind == TokenKind.CMP_LT):
+            return []
+        self._advance()  # <
+        params: list[GenericParam] = []
+        while not self._at_end():
+            p = self._peek()
+            if p and p.kind == TokenKind.CMP_GT:
+                self._advance()  # >
+                break
+            if p and p.kind == TokenKind.COMMA:
+                self._advance()
+                continue
+            if p and p.kind == TokenKind.IDENTIFIER:
+                self._advance()
+                gp = GenericParam(name=p.raw_text)
+                # Check for bounds: T: Display + Clone
+                p2 = self._peek()
+                if p2 and p2.kind == TokenKind.COLON:
+                    self._advance()
+                    while not self._at_end():
+                        pb = self._peek()
+                        if pb and pb.kind == TokenKind.IDENTIFIER:
+                            self._advance()
+                            gp.bounds.append(pb.raw_text)
+                        else:
+                            break
+                        # + for additional bounds
+                        pplus = self._peek()
+                        if pplus and pplus.kind == TokenKind.OP_ADD:
+                            self._advance()
+                        else:
+                            break
+                params.append(gp)
+            else:
+                self._advance()
+        return params
+
+    def _parse_enum(self) -> EnumDefNode:
+        """enum <Name><T>: Variant1(Type); Variant2; end"""
+        tok = self._advance()  # ENUM_DEF
+        node = EnumDefNode(token=tok)
+        p = self._peek()
+        if p and p.kind == TokenKind.IDENTIFIER:
+            self._advance()
+            node.name = p.raw_text
+        node.generic_params = self._parse_generic_params()
+        self._skip_colon()
+
+        while not self._at_end():
+            p = self._peek()
+            if p and p.kind == TokenKind.END:
+                self._advance()
+                break
+            if p and p.kind == TokenKind.IDENTIFIER:
+                self._advance()
+                variant_name = p.raw_text
+                variant_types: list[str] = []
+                # Check for (Type1, Type2)
+                p2 = self._peek()
+                if p2 and p2.kind == TokenKind.OPEN_PAREN:
+                    self._advance()
+                    while not self._at_end():
+                        pt = self._peek()
+                        if pt and pt.kind == TokenKind.CLOSE_PAREN:
+                            self._advance()
+                            break
+                        if pt and pt.kind == TokenKind.COMMA:
+                            self._advance()
+                            continue
+                        if pt and pt.kind == TokenKind.IDENTIFIER:
+                            self._advance()
+                            variant_types.append(pt.raw_text)
+                        else:
+                            self._advance()
+                node.variants.append((variant_name, variant_types))
+                self._skip_semi()
+            else:
+                self._advance()
+        return node
+
+    def _parse_trait(self) -> TraitDefNode:
+        """trait <Name><T>: method_signature; ... end"""
+        tok = self._advance()  # TRAIT_DEF
+        node = TraitDefNode(token=tok)
+        p = self._peek()
+        if p and p.kind == TokenKind.IDENTIFIER:
+            self._advance()
+            node.name = p.raw_text
+        node.generic_params = self._parse_generic_params()
+        self._skip_colon()
+
+        while not self._at_end():
+            p = self._peek()
+            if p and p.kind == TokenKind.END:
+                self._advance()
+                break
+            if p and p.kind == TokenKind.FUNC_DEF:
+                func = self._parse_func_def()
+                node.methods.append(func)
+            else:
+                self._advance()
+        return node
+
+    def _parse_impl(self) -> ImplNode:
+        """impl <Trait> for <Type><T>: ... end"""
+        tok = self._advance()  # IMPL_BLOCK
+        node = ImplNode(token=tok)
+
+        p = self._peek()
+        if p and p.kind == TokenKind.IDENTIFIER:
+            self._advance()
+            node.trait_name = p.raw_text
+
+        # Expect 'for' (identifier with raw_text "for")
+        p = self._peek()
+        if p and p.kind == TokenKind.IDENTIFIER and p.raw_text == "for":
+            self._advance()
+
+        p = self._peek()
+        if p and p.kind == TokenKind.IDENTIFIER:
+            self._advance()
+            node.target_type = p.raw_text
+
+        node.generic_params = self._parse_generic_params()
+        self._skip_colon()
+
+        while not self._at_end():
+            p = self._peek()
+            if p and p.kind == TokenKind.END:
+                self._advance()
+                break
+            if p and p.kind == TokenKind.FUNC_DEF:
+                func = self._parse_func_def()
+                node.methods.append(func)
+            else:
+                self._advance()
+        return node
+
+    def _parse_match(self) -> MatchNode:
+        """match <expr>: pattern => body; ... else ... end"""
+        tok = self._advance()  # MATCH (or via case dispatch)
+        node = MatchNode(token=tok)
+        node.expr = self._parse_expr()
+        self._skip_colon()
+
+        while not self._at_end():
+            p = self._peek()
+            if p and p.kind == TokenKind.END:
+                self._advance()
+                break
+            if p and p.kind == TokenKind.ELSE:
+                self._advance()
+                while not self._at_end():
+                    p2 = self._peek()
+                    if p2 and p2.kind == TokenKind.END:
+                        break
+                    s = self._parse_statement()
+                    if s:
+                        node.else_body.append(s)
+                    else:
+                        break
+                self._skip_end()
+                break
+            # pattern => body;
+            pattern = self._parse_expr()
+            p2 = self._peek()
+            if p2 and p2.kind == TokenKind.DOUBLE_ARROW:
+                self._advance()
+            arm_body: list[ASTNode] = []
+            while not self._at_end():
+                p3 = self._peek()
+                if p3 and p3.kind == TokenKind.SEMICOLON:
+                    self._advance()
+                    break
+                if p3 and p3.kind in (TokenKind.END, TokenKind.ELSE):
+                    break
+                s = self._parse_statement()
+                if s:
+                    arm_body.append(s)
+                else:
+                    break
+            if pattern:
+                node.arms.append((pattern, arm_body))
+        return node
+
+    def _parse_closure(self) -> ClosureNode:
+        """Parse |param1, param2| body expression."""
+        tok = self._advance()  # PIPE |
+        node = ClosureNode(token=tok)
+        # Params until next |
+        while not self._at_end():
+            p = self._peek()
+            if p and p.kind == TokenKind.PIPE:
+                self._advance()
+                break
+            if p and p.kind == TokenKind.COMMA:
+                self._advance()
+                continue
+            if p and p.kind == TokenKind.IDENTIFIER:
+                self._advance()
+                node.params.append(p.raw_text)
+            else:
+                break
+        # Body: single expression or block
+        stmt = self._parse_statement()
+        if stmt:
+            node.body.append(stmt)
         return node

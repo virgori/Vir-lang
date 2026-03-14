@@ -2292,6 +2292,107 @@ static void avx_emit_vbroadcastss(codebuf_t *cb, uint8_t dst, uint8_t src)
 }
 
 /* ═══════════════════════════════════════════════════════
+ * x86_64 AVX-512 (EVEX) Instruction Emitters — FIX A5
+ * ═══════════════════════════════════════════════════════
+ * EVEX-encoded 512-bit instructions for ZMM0-ZMM31.
+ * 4-byte EVEX prefix: 62h [P0] [P1] [P2] opcode modrm ...
+ *
+ *  P0 = R:X:B:R':0:0:m:m   (m=01 for 0F map)
+ *  P1 = W:vvvv:1:pp         (pp=00 no prefix)
+ *  P2 = z:L'L:b:V':aaa      (L'L=10 for 512-bit)
+ */
+
+/* Helper: emit a 4-byte EVEX prefix for 512-bit reg-reg ops (0F map). */
+static void x86_emit_evex_512(codebuf_t *cb, uint8_t dst, uint8_t src1, uint8_t src2)
+{
+    /* P0: R=!dst[3], X=!src2[4], B=!src2[3], R'=!dst[4], mm=01 */
+    uint8_t p0 = 0x01;                          /* mm = 01 (0F map) */
+    if (!(dst  & 0x08)) p0 |= 0x80;  /* R  */
+    else p0 &= ~0x80;
+    if (!(src2 & 0x10)) p0 |= 0x40;  /* X  */
+    else p0 &= ~0x40;
+    if (!(src2 & 0x08)) p0 |= 0x20;  /* B  */
+    else p0 &= ~0x20;
+    if (!(dst  & 0x10)) p0 |= 0x10;  /* R' */
+    else p0 &= ~0x10;
+
+    /* P1: W=0, vvvv=~src1[3:0], 1, pp=00 */
+    uint8_t p1 = 0x04 | ((~src1 & 0x0F) << 3);  /* bit2=1 fixed */
+
+    /* P2: z=0, L'L=10 (512-bit), b=0, V'=~src1[4], aaa=000 */
+    uint8_t p2 = 0x40;  /* L'L = 10 → 512-bit */
+    if (!(src1 & 0x10)) p2 |= 0x08;  /* V' */
+
+    codebuf_emit_byte(cb, 0x62);
+    codebuf_emit_byte(cb, p0);
+    codebuf_emit_byte(cb, p1);
+    codebuf_emit_byte(cb, p2);
+}
+
+/* Helper: emit EVEX prefix for 512-bit memory ops (base reg, no VSIB). */
+static void x86_emit_evex_512_mem(codebuf_t *cb, uint8_t zmm, x86_reg_t base)
+{
+    uint8_t p0 = 0x01;
+    if (!(zmm  & 0x08)) p0 |= 0x80;
+    if (!(base & 0x10)) p0 |= 0x40;  /* X (index, not used) */
+    if (!(base & 0x08)) p0 |= 0x20;  /* B */
+    if (!(zmm  & 0x10)) p0 |= 0x10;  /* R' */
+
+    uint8_t p1 = 0x7C;  /* W=0, vvvv=1111 (unused), 1, pp=00 */
+    uint8_t p2 = 0x48;  /* z=0, L'L=10, b=0, V'=1, aaa=000 */
+
+    codebuf_emit_byte(cb, 0x62);
+    codebuf_emit_byte(cb, p0);
+    codebuf_emit_byte(cb, p1);
+    codebuf_emit_byte(cb, p2);
+}
+
+/* VMOVAPS ZMMd, [base+disp32] — aligned 512-bit load (spill reload) */
+static void evex_emit_vmovaps_load(codebuf_t *cb, uint8_t zmm_dst, x86_reg_t base, int32_t disp)
+{
+    x86_emit_evex_512_mem(cb, zmm_dst, base);
+    codebuf_emit_byte(cb, 0x28);  /* VMOVAPS load */
+    /* ModRM: [base+disp32] → mod=10, reg=zmm_dst[2:0], rm=base[2:0] */
+    codebuf_emit_byte(cb, 0x80 | ((zmm_dst & 7) << 3) | (base & 7));
+    if ((base & 7) == 4) codebuf_emit_byte(cb, 0x24);  /* SIB for RSP-based */
+    codebuf_emit_i32(cb, disp);
+}
+
+/* VMOVAPS [base+disp32], ZMMs — aligned 512-bit store (spill store) */
+static void evex_emit_vmovaps_store(codebuf_t *cb, x86_reg_t base, int32_t disp, uint8_t zmm_src)
+{
+    x86_emit_evex_512_mem(cb, zmm_src, base);
+    codebuf_emit_byte(cb, 0x29);  /* VMOVAPS store */
+    codebuf_emit_byte(cb, 0x80 | ((zmm_src & 7) << 3) | (base & 7));
+    if ((base & 7) == 4) codebuf_emit_byte(cb, 0x24);
+    codebuf_emit_i32(cb, disp);
+}
+
+/* VADDPS ZMMd, ZMMs1, ZMMs2 — 16×f32 add */
+static void evex_emit_vaddps(codebuf_t *cb, uint8_t dst, uint8_t src1, uint8_t src2)
+{
+    x86_emit_evex_512(cb, dst, src1, src2);
+    codebuf_emit_byte(cb, 0x58);
+    codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (src2 & 7));
+}
+
+/* VMULPS ZMMd, ZMMs1, ZMMs2 — 16×f32 mul */
+static void evex_emit_vmulps(codebuf_t *cb, uint8_t dst, uint8_t src1, uint8_t src2)
+{
+    x86_emit_evex_512(cb, dst, src1, src2);
+    codebuf_emit_byte(cb, 0x59);
+    codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (src2 & 7));
+}
+
+/* VSUBPS ZMMd, ZMMs1, ZMMs2 — 16×f32 sub */
+static void evex_emit_vsubps(codebuf_t *cb, uint8_t dst, uint8_t src1, uint8_t src2)
+{
+    x86_emit_evex_512(cb, dst, src1, src2);
+    codebuf_emit_byte(cb, 0x5C);
+    codebuf_emit_byte(cb, 0xC0 | ((dst & 7) << 3) | (src2 & 7));
+}
+
+/* ═══════════════════════════════════════════════════════
  * Virtual register → SIMD register mapping
  * ═══════════════════════════════════════════════════════ */
 
@@ -2304,8 +2405,9 @@ static uint8_t vreg_to_neon(uint32_t vreg)
 
 static uint8_t vreg_to_xmm(uint32_t vreg)
 {
-    /* Map virtual regs to XMM0-XMM7 (AVX 128-bit) */
-    if (vreg < 8) return (uint8_t)vreg;
+    /* FIX A5: Map virtual regs to XMM/YMM/ZMM 0-31
+     * Caller decides 128/256/512 via instruction encoding (VEX vs EVEX). */
+    if (vreg < 32) return (uint8_t)vreg;
     return 0;
 }
 

@@ -110,6 +110,12 @@ class PhysReg:
     # XMM0-XMM7  (XMM8-XMM15 available but rarely pressure-needed)
     X86_VEC = list(range(8))
 
+    # ── x86_64 Extended Vector Pools ───────────────────────
+    # AVX2: YMM0-YMM15 (256-bit), 16 registers
+    X86_VEC_AVX2 = list(range(16))
+    # AVX-512: ZMM0-ZMM31 (512-bit), 32 registers
+    X86_VEC_AVX512 = list(range(32))
+
 
 # ═══════════════════════════════════════════════════════════
 # Allocation Result
@@ -132,6 +138,11 @@ class RegAllocResult:
     callee_saved_gprs: list[int] = field(default_factory=list)
     # Callee-saved VEC regs actually allocated
     callee_saved_vecs: list[int] = field(default_factory=list)
+    # Spill slot sizes (bytes) — GP and VEC may differ.
+    gp_spill_size: int = 8     # 8 bytes per GP slot (int64)
+    vec_spill_size: int = 16   # 16 (XMM), 32 (YMM), or 64 (ZMM) bytes
+    # Required stack frame alignment (bytes).
+    stack_alignment: int = 16  # 16 (SSE), 32 (AVX), 64 (AVX-512)
 
     def is_spilled(self, vreg_index: int) -> bool:
         return vreg_index in self.spilled
@@ -174,17 +185,41 @@ class LinearScanAllocator:
       5. Produce allocation map + spill set
     """
 
-    def __init__(self, arch: str = "arm64") -> None:
+    def __init__(self, arch: str = "arm64", vec_backend: str = "sse") -> None:
+        """
+        Parameters
+        ----------
+        arch : "arm64" | "x86_64"
+        vec_backend : "sse" | "avx2" | "avx512" | "neon"
+            Determines vector register pool size, spill slot width,
+            and stack alignment.  Defaults to smallest (SSE/NEON).
+        """
         self.arch = arch
+        self.vec_backend = vec_backend
+
         if arch == "arm64":
             self.gp_pool = list(PhysReg.ARM64_GP)
             self.gp_callee_saved_pool = list(PhysReg.ARM64_GP_CALLEE_SAVED)
             self.vec_pool = list(PhysReg.ARM64_VEC)
             self.vec_callee_saved_pool = list(PhysReg.ARM64_VEC_CALLEE_SAVED)
+            self._vec_spill_size = 16   # NEON 128-bit
+            self._stack_alignment = 16
         else:
             self.gp_pool = list(PhysReg.X86_GP)
-            self.gp_callee_saved_pool = []  # x86_64: handled separately
-            self.vec_pool = list(PhysReg.X86_VEC)
+            self.gp_callee_saved_pool = []
+            # FIX A5: Scale vector pool + spill size per vec_backend
+            if vec_backend == "avx512":
+                self.vec_pool = list(PhysReg.X86_VEC_AVX512)  # ZMM0-ZMM31
+                self._vec_spill_size = 64   # 512-bit
+                self._stack_alignment = 64
+            elif vec_backend == "avx2":
+                self.vec_pool = list(PhysReg.X86_VEC_AVX2)    # YMM0-YMM15
+                self._vec_spill_size = 32   # 256-bit
+                self._stack_alignment = 32
+            else:  # sse
+                self.vec_pool = list(PhysReg.X86_VEC)          # XMM0-XMM7
+                self._vec_spill_size = 16   # 128-bit
+                self._stack_alignment = 16
             self.vec_callee_saved_pool = []
 
     # ── Public API ─────────────────────────────────────────
@@ -200,6 +235,10 @@ class LinearScanAllocator:
         vec_intervals = [iv for iv in intervals if iv.is_vector]
 
         result = RegAllocResult()
+        # FIX A5: propagate spill sizes from selected vec_backend
+        result.gp_spill_size = 8
+        result.vec_spill_size = self._vec_spill_size
+        result.stack_alignment = self._stack_alignment
 
         # Allocate GP registers
         self._linear_scan(gp_intervals, self.gp_pool, result, is_vec=False)

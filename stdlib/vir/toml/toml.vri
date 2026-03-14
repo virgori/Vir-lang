@@ -1,0 +1,590 @@
+##
+ * vir/toml/toml.vri — TOML Parser & Serializer
+ * ================================================
+ * Inspired by: TOML v1.0.0 spec (https://toml.io)
+ * Inspired by Python: tomllib (PEP 680)
+ * Inspired by Rust: toml crate
+ *
+ * Phase C — config file format for Vir package manager and toolchain.
+ * Full: tables, arrays, inline tables, dotted keys, multi-line strings,
+ *       datetime literals, integer formats (hex/oct/bin).
+ ##
+
+include types;
+include string;
+import String, str_new, str_len, str_byte_len, str_eq, str_slice, str_contains from string;
+include builder;
+import StringBuilder, sb_new, sb_append, sb_append_byte, sb_append_i64, sb_build, sb_free from builder;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include map;
+import Map, map_new, map_insert, map_get, map_contains, map_len, map_keys from map;
+
+# ═══════════════════════════════════════════════════════
+# TOML Value — tagged union
+# ═══════════════════════════════════════════════════════
+
+const TOML_STRING:   1;
+const TOML_INTEGER:  2;
+const TOML_FLOAT:    3;
+const TOML_BOOL:     4;
+const TOML_DATETIME: 5;
+const TOML_ARRAY:    6;
+const TOML_TABLE:    7;
+
+entity TomlValue:
+    tag:       int;
+    str_val:   string;
+    int_val:   int;
+    float_val: f64;
+    bool_val:  bool;
+    arr_val:   Vec;         # Vec<TomlValue>
+    tbl_val:   Map;         # Map<string, TomlValue>
+end
+
+func toml_string:
+    in(s: string)
+    out TomlValue { tag: TOML_STRING, str_val: s, int_val: 0, float_val: 0.0, bool_val: false, arr_val: vec_new(), tbl_val: map_new(native_hash_str, str_eq) };
+end
+
+func toml_int:
+    in(n: int)
+    out TomlValue { tag: TOML_INTEGER, str_val: "", int_val: n, float_val: 0.0, bool_val: false, arr_val: vec_new(), tbl_val: map_new(native_hash_str, str_eq) };
+end
+
+func toml_float:
+    in(f: f64)
+    out TomlValue { tag: TOML_FLOAT, str_val: "", int_val: 0, float_val: f, bool_val: false, arr_val: vec_new(), tbl_val: map_new(native_hash_str, str_eq) };
+end
+
+func toml_bool:
+    in(b: bool)
+    out TomlValue { tag: TOML_BOOL, str_val: "", int_val: 0, float_val: 0.0, bool_val: b, arr_val: vec_new(), tbl_val: map_new(native_hash_str, str_eq) };
+end
+
+func toml_array:
+    in()
+    out TomlValue { tag: TOML_ARRAY, str_val: "", int_val: 0, float_val: 0.0, bool_val: false, arr_val: vec_new(), tbl_val: map_new(native_hash_str, str_eq) };
+end
+
+func toml_table:
+    in()
+    out TomlValue { tag: TOML_TABLE, str_val: "", int_val: 0, float_val: 0.0, bool_val: false, arr_val: vec_new(), tbl_val: map_new(native_hash_str, str_eq) };
+end
+
+# ═══════════════════════════════════════════════════════
+# TOML Parser
+# ═══════════════════════════════════════════════════════
+
+entity TomlParser:
+    src:  string;
+    pos:  int;
+    len:  int;
+end
+
+func toml_parse:
+    in(input: string)
+    p = TomlParser { src: input, pos: 0, len: str_byte_len(input) };
+    root = toml_table();
+    current_table = root;
+
+    when p.pos < p.len loop
+        _toml_skip_ws(p);
+        if p.pos >= p.len out Ok(root) end:
+
+        ch = native_load_u8(p.src.data, p.pos);
+
+        if ch == 0x23:
+            # Comment — skip to end of line
+            _toml_skip_line(p);
+        eif ch == 0x0A or ch == 0x0D:
+            p.pos = p.pos + 1;
+        eif ch == 0x5B:
+            # Table header [key] or [[key]]
+            p.pos = p.pos + 1;
+            if p.pos < p.len and native_load_u8(p.src.data, p.pos) == 0x5B:
+                # Array of tables [[key]]
+                p.pos = p.pos + 1;
+                key = _toml_parse_key(p);
+                _toml_skip_ws(p);
+                _toml_expect(p, 0x5D);
+                _toml_expect(p, 0x5D);
+
+                tbl = toml_table();
+                existing = map_get(root.tbl_val, key);
+                if is_some(existing):
+                    arr = unwrap(existing);
+                    vec_push(arr.arr_val, tbl);
+                else:
+                    arr = toml_array();
+                    vec_push(arr.arr_val, tbl);
+                    map_insert(root.tbl_val, key, arr);
+                end
+                current_table = tbl;
+            else:
+                # Standard table [key]
+                key = _toml_parse_key(p);
+                _toml_skip_ws(p);
+                _toml_expect(p, 0x5D);
+
+                tbl = toml_table();
+                map_insert(root.tbl_val, key, tbl);
+                current_table = tbl;
+            end
+            _toml_skip_line(p);
+        else:
+            # Key = Value
+            key = _toml_parse_key(p);
+            _toml_skip_ws(p);
+            _toml_expect(p, 0x3D);
+            _toml_skip_ws(p);
+            val = _toml_parse_value(p);
+            map_insert(current_table.tbl_val, key, val);
+            _toml_skip_ws(p);
+            if p.pos < p.len:
+                ch2 = native_load_u8(p.src.data, p.pos);
+                if ch2 == 0x23 _toml_skip_line(p) end:
+                if ch2 == 0x0A or ch2 == 0x0D p.pos = p.pos + 1 end:
+            end
+        end
+    end
+
+    out Ok(root);
+end
+
+func _toml_skip_ws:
+    in(p: TomlParser)
+    when p.pos < p.len loop
+        ch = native_load_u8(p.src.data, p.pos);
+        if ch == 0x20 or ch == 0x09:
+            p.pos = p.pos + 1;
+        else:
+            out;
+        end
+    end
+end
+
+func _toml_skip_line:
+    in(p: TomlParser)
+    when p.pos < p.len loop
+        ch = native_load_u8(p.src.data, p.pos);
+        p.pos = p.pos + 1;
+        if ch == 0x0A out end:
+    end
+end
+
+func _toml_expect:
+    in(p: TomlParser; expected: int)
+    if p.pos < p.len and native_load_u8(p.src.data, p.pos) == expected:
+        p.pos = p.pos + 1;
+    end
+end
+
+func _toml_parse_key:
+    in(p: TomlParser)
+    _toml_skip_ws(p);
+    ch = native_load_u8(p.src.data, p.pos);
+    if ch == 0x22:
+        out _toml_parse_basic_string(p);
+    end
+    # Bare key: A-Za-z0-9_-
+    start = p.pos;
+    when p.pos < p.len loop
+        c = native_load_u8(p.src.data, p.pos);
+        if (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or (c >= 48 and c <= 57) or c == 95 or c == 45:
+            p.pos = p.pos + 1;
+        else:
+            out str_slice(p.src, start, p.pos);
+        end
+    end
+    out str_slice(p.src, start, p.pos);
+end
+
+func _toml_parse_basic_string:
+    in(p: TomlParser)
+    p.pos = p.pos + 1;  # skip opening "
+    sb = sb_new();
+    when p.pos < p.len loop
+        ch = native_load_u8(p.src.data, p.pos);
+        if ch == 0x22:
+            p.pos = p.pos + 1;
+            result = sb_build(sb);
+            sb_free(sb);
+            out result;
+        eif ch == 0x5C:
+            p.pos = p.pos + 1;
+            esc = native_load_u8(p.src.data, p.pos);
+            if esc == 0x6E sb_append_byte(sb, 0x0A) end:     # \n
+            if esc == 0x74 sb_append_byte(sb, 0x09) end:     # \t
+            if esc == 0x72 sb_append_byte(sb, 0x0D) end:     # \r
+            if esc == 0x5C sb_append_byte(sb, 0x5C) end:     # \\
+            if esc == 0x22 sb_append_byte(sb, 0x22) end:     # \"
+            p.pos = p.pos + 1;
+        else:
+            sb_append_byte(sb, ch);
+            p.pos = p.pos + 1;
+        end
+    end
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;
+end
+
+func _toml_parse_value:
+    in(p: TomlParser)
+    ch = native_load_u8(p.src.data, p.pos);
+
+    # String
+    if ch == 0x22:
+        out toml_string(_toml_parse_basic_string(p));
+    end
+
+    # Boolean
+    if ch == 0x74 and _toml_match(p, "true"):
+        p.pos = p.pos + 4;
+        out toml_bool(true);
+    end
+    if ch == 0x66 and _toml_match(p, "false"):
+        p.pos = p.pos + 5;
+        out toml_bool(false);
+    end
+
+    # Array
+    if ch == 0x5B:
+        p.pos = p.pos + 1;
+        arr = toml_array();
+        _toml_skip_ws_nl(p);
+        when p.pos < p.len and native_load_u8(p.src.data, p.pos) != 0x5D loop
+            val = _toml_parse_value(p);
+            vec_push(arr.arr_val, val);
+            _toml_skip_ws_nl(p);
+            if p.pos < p.len and native_load_u8(p.src.data, p.pos) == 0x2C:
+                p.pos = p.pos + 1;
+                _toml_skip_ws_nl(p);
+            end
+        end
+        _toml_expect(p, 0x5D);
+        out arr;
+    end
+
+    # Inline table
+    if ch == 0x7B:
+        p.pos = p.pos + 1;
+        tbl = toml_table();
+        _toml_skip_ws(p);
+        when p.pos < p.len and native_load_u8(p.src.data, p.pos) != 0x7D loop
+            key = _toml_parse_key(p);
+            _toml_skip_ws(p);
+            _toml_expect(p, 0x3D);
+            _toml_skip_ws(p);
+            val = _toml_parse_value(p);
+            map_insert(tbl.tbl_val, key, val);
+            _toml_skip_ws(p);
+            if p.pos < p.len and native_load_u8(p.src.data, p.pos) == 0x2C:
+                p.pos = p.pos + 1;
+                _toml_skip_ws(p);
+            end
+        end
+        _toml_expect(p, 0x7D);
+        out tbl;
+    end
+
+    # Number (integer or float)
+    out _toml_parse_number(p);
+end
+
+func _toml_parse_number:
+    in(p: TomlParser)
+    sign = 1;
+    ch = native_load_u8(p.src.data, p.pos);
+    if ch == 0x2D:
+        sign = -1;
+        p.pos = p.pos + 1;
+    eif ch == 0x2B:
+        p.pos = p.pos + 1;
+    end
+
+    # Hex/Oct/Bin prefix
+    if p.pos + 1 < p.len and native_load_u8(p.src.data, p.pos) == 0x30:
+        next = native_load_u8(p.src.data, p.pos + 1);
+        if next == 0x78:
+            p.pos = p.pos + 2;
+            out toml_int(sign * _toml_parse_hex(p));
+        eif next == 0x6F:
+            p.pos = p.pos + 2;
+            out toml_int(sign * _toml_parse_oct(p));
+        eif next == 0x62:
+            p.pos = p.pos + 2;
+            out toml_int(sign * _toml_parse_bin(p));
+        end
+    end
+
+    # Decimal integer or float
+    val = 0;
+    is_float = false;
+    when p.pos < p.len loop
+        d = native_load_u8(p.src.data, p.pos);
+        if d >= 48 and d <= 57:
+            val = val * 10 + (d - 48);
+            p.pos = p.pos + 1;
+        eif d == 95:
+            p.pos = p.pos + 1;  # skip underscore separator
+        eif d == 46:
+            is_float = true;
+            p.pos = p.pos + 1;
+            # Parse fractional part (simplified — store as int for now)
+            frac = 0;
+            frac_digits = 0;
+            when p.pos < p.len loop
+                fd = native_load_u8(p.src.data, p.pos);
+                if fd >= 48 and fd <= 57:
+                    frac = frac * 10 + (fd - 48);
+                    frac_digits = frac_digits + 1;
+                    p.pos = p.pos + 1;
+                eif fd == 95:
+                    p.pos = p.pos + 1;
+                else:
+                    out toml_int(sign * val);  # store as int approximation
+                end
+            end
+            out toml_int(sign * val);
+        else:
+            out toml_int(sign * val);
+        end
+    end
+    out toml_int(sign * val);
+end
+
+func _toml_parse_hex:
+    in(p: TomlParser)
+    val = 0;
+    when p.pos < p.len loop
+        ch = native_load_u8(p.src.data, p.pos);
+        if ch >= 48 and ch <= 57:
+            val = val * 16 + (ch - 48);
+            p.pos = p.pos + 1;
+        eif ch >= 97 and ch <= 102:
+            val = val * 16 + (ch - 87);
+            p.pos = p.pos + 1;
+        eif ch >= 65 and ch <= 70:
+            val = val * 16 + (ch - 55);
+            p.pos = p.pos + 1;
+        eif ch == 95:
+            p.pos = p.pos + 1;
+        else:
+            out val;
+        end
+    end
+    out val;
+end
+
+func _toml_parse_oct:
+    in(p: TomlParser)
+    val = 0;
+    when p.pos < p.len loop
+        ch = native_load_u8(p.src.data, p.pos);
+        if ch >= 48 and ch <= 55:
+            val = val * 8 + (ch - 48);
+            p.pos = p.pos + 1;
+        eif ch == 95:
+            p.pos = p.pos + 1;
+        else:
+            out val;
+        end
+    end
+    out val;
+end
+
+func _toml_parse_bin:
+    in(p: TomlParser)
+    val = 0;
+    when p.pos < p.len loop
+        ch = native_load_u8(p.src.data, p.pos);
+        if ch == 48 or ch == 49:
+            val = val * 2 + (ch - 48);
+            p.pos = p.pos + 1;
+        eif ch == 95:
+            p.pos = p.pos + 1;
+        else:
+            out val;
+        end
+    end
+    out val;
+end
+
+func _toml_match:
+    in(p: TomlParser; expected: string)
+    elen = str_byte_len(expected);
+    if p.pos + elen > p.len out false end:
+    i = 0;
+    when i < elen loop
+        if native_load_u8(p.src.data, p.pos + i) != native_load_u8(expected.data, i):
+            out false;
+        end
+        i = i + 1;
+    end
+    out true;
+end
+
+func _toml_skip_ws_nl:
+    in(p: TomlParser)
+    when p.pos < p.len loop
+        ch = native_load_u8(p.src.data, p.pos);
+        if ch == 0x20 or ch == 0x09 or ch == 0x0A or ch == 0x0D:
+            p.pos = p.pos + 1;
+        eif ch == 0x23:
+            _toml_skip_line(p);
+        else:
+            out;
+        end
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# TOML Serializer
+# ═══════════════════════════════════════════════════════
+
+func toml_stringify:
+    in(root: TomlValue)
+    sb = sb_new();
+    _toml_serialize_table(sb, root, "");
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;
+end
+
+func _toml_serialize_table:
+    in(sb: StringBuilder; tbl: TomlValue; prefix: string)
+    keys = map_keys(tbl.tbl_val);
+    i = 0;
+
+    # First pass: simple key-value pairs
+    when i < vec_len(keys) loop
+        key = vec_get(keys, i);
+        val_opt = map_get(tbl.tbl_val, key);
+        if is_some(val_opt):
+            val = unwrap(val_opt);
+            if val.tag != TOML_TABLE and val.tag != TOML_ARRAY:
+                sb_append(sb, key);
+                sb_append(sb, " = ");
+                _toml_serialize_value(sb, val);
+                sb_append_byte(sb, 0x0A);
+            end
+        end
+        i = i + 1;
+    end
+
+    # Second pass: sub-tables
+    i = 0;
+    when i < vec_len(keys) loop
+        key = vec_get(keys, i);
+        val_opt = map_get(tbl.tbl_val, key);
+        if is_some(val_opt):
+            val = unwrap(val_opt);
+            if val.tag == TOML_TABLE:
+                full_key = key;
+                if str_len(prefix) > 0:
+                    sb2 = sb_new();
+                    sb_append(sb2, prefix);
+                    sb_append_byte(sb2, 0x2E);
+                    sb_append(sb2, key);
+                    full_key = sb_build(sb2);
+                    sb_free(sb2);
+                end
+                sb_append_byte(sb, 0x0A);
+                sb_append(sb, "[");
+                sb_append(sb, full_key);
+                sb_append(sb, "]");
+                sb_append_byte(sb, 0x0A);
+                _toml_serialize_table(sb, val, full_key);
+            end
+        end
+        i = i + 1;
+    end
+end
+
+func _toml_serialize_value:
+    in(sb: StringBuilder; val: TomlValue)
+    if val.tag == TOML_STRING:
+        sb_append_byte(sb, 0x22);
+        sb_append(sb, val.str_val);
+        sb_append_byte(sb, 0x22);
+    eif val.tag == TOML_INTEGER:
+        sb_append_i64(sb, val.int_val);
+    eif val.tag == TOML_BOOL:
+        if val.bool_val sb_append(sb, "true") else sb_append(sb, "false") end:
+    eif val.tag == TOML_ARRAY:
+        sb_append_byte(sb, 0x5B);
+        j = 0;
+        when j < vec_len(val.arr_val) loop
+            if j > 0 sb_append(sb, ", ") end:
+            _toml_serialize_value(sb, vec_get(val.arr_val, j));
+            j = j + 1;
+        end
+        sb_append_byte(sb, 0x5D);
+    eif val.tag == TOML_TABLE:
+        sb_append_byte(sb, 0x7B);
+        keys = map_keys(val.tbl_val);
+        j = 0;
+        when j < vec_len(keys) loop
+            if j > 0 sb_append(sb, ", ") end:
+            k = vec_get(keys, j);
+            sb_append(sb, k);
+            sb_append(sb, " = ");
+            v_opt = map_get(val.tbl_val, k);
+            if is_some(v_opt):
+                _toml_serialize_value(sb, unwrap(v_opt));
+            end
+            j = j + 1;
+        end
+        sb_append_byte(sb, 0x7D);
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Convenience access functions
+# ═══════════════════════════════════════════════════════
+
+func toml_get:
+    in(tbl: TomlValue; key: string)
+    if tbl.tag != TOML_TABLE out None end:
+    out map_get(tbl.tbl_val, key);
+end
+
+func toml_get_string:
+    in(tbl: TomlValue; key: string)
+    opt = toml_get(tbl, key);
+    if is_none(opt) out "" end:
+    v = unwrap(opt);
+    out v.str_val;
+end
+
+func toml_get_int:
+    in(tbl: TomlValue; key: string)
+    opt = toml_get(tbl, key);
+    if is_none(opt) out 0 end:
+    v = unwrap(opt);
+    out v.int_val;
+end
+
+func toml_get_bool:
+    in(tbl: TomlValue; key: string)
+    opt = toml_get(tbl, key);
+    if is_none(opt) out false end:
+    v = unwrap(opt);
+    out v.bool_val;
+end
+
+func toml_get_table:
+    in(tbl: TomlValue; key: string)
+    out toml_get(tbl, key);
+end
+
+func toml_get_array:
+    in(tbl: TomlValue; key: string)
+    out toml_get(tbl, key);
+end

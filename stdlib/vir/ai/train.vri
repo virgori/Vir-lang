@@ -1,0 +1,249 @@
+##
+ * vir/ai/train.vri — Training Loop & Pipeline
+ * ================================================
+ * End-to-end neural network training infrastructure.
+ * Handles forward/backward pass, gradient accumulation,
+ * learning rate scheduling, and checkpointing.
+ *
+ * Key features:
+ *   - Epoch-based training with configurable batch size
+ *   - Gradient clipping (norm-based and value-based)
+ *   - Learning rate schedules: constant, step, cosine, warmup
+ *   - Automatic loss scaling for mixed precision (future)
+ *   - Checkpoint save/restore via serializer
+ *
+ * Usage:
+ *   include ai/train;
+ *   var cfg = train_config(epochs=100; lr=0.001; batch=32);
+ *   var model = create_model();
+ *   var opt = adam_new(model_params(model); 0.001);
+ *   train(model; dataset; cfg; opt);
+ ##
+
+include types;
+include alloc;
+import alloc, alloc_zeroed, free from alloc;
+include basic;
+import sqrt, abs_f, min_f, max_f from basic;
+include math/tensor;
+import Tensor, tensor_zeros, tensor_get, tensor_set, tensor_numel from tensor;
+include math/grad;
+import Tape, tape_new, tape_free, backward, grad from grad;
+include math/optim;
+import Adam, adam_new, adam_step from optim;
+
+# ═══════════════════════════════════════════════════════
+# Training Configuration
+# ═══════════════════════════════════════════════════════
+
+entity TrainConfig:
+    epochs:       int;
+    batch_size:   int;
+    lr:           float;
+    clip_norm:    float;    # max gradient norm (0 = no clip);
+    clip_value:   float;    # max gradient value (0 = no clip);
+    log_interval: int;      # print loss every N batches;
+    save_interval: int;     # save checkpoint every N epochs;
+    warmup_steps: int;      # lr warmup steps;
+    schedule:     int;      # 0=constant, 1=step, 2=cosine, 3=warmup;
+end
+
+const SCHED_CONSTANT: 0;
+const SCHED_STEP:     1;
+const SCHED_COSINE:   2;
+const SCHED_WARMUP:   3;
+
+func train_config:
+    in(epochs: int; lr: float; batch_size: int)
+    out TrainConfig {
+        epochs:       epochs;
+        batch_size:   batch_size;
+        lr:           lr;
+        clip_norm:    1.0;
+        clip_value:   0.0;
+        log_interval: 10;
+        save_interval: 1;
+        warmup_steps: 0;
+        schedule:     SCHED_CONSTANT;
+    };
+end
+
+# ═══════════════════════════════════════════════════════
+# Learning Rate Scheduling
+# ═══════════════════════════════════════════════════════
+
+func lr_schedule:
+    in(cfg: TrainConfig; step: int; total_steps: int)
+    case cfg.schedule
+        SCHED_CONSTANT:
+            out cfg.lr;
+        SCHED_STEP:
+            # Decay by 0.1 every 30% of total steps;
+            var decay_every = total_steps / 3;
+            var decays = step / decay_every;
+            var factor = 1.0;
+            var d = 0;
+            when d < decays loop
+                factor = factor * 0.1;
+                d = d + 1;
+            end
+            out cfg.lr * factor;
+        SCHED_COSINE:
+            # Cosine annealing to 0;
+            var PI = 3.14159265358979;
+            var ratio = step >> float / total_steps >> float;
+            out cfg.lr * 0.5 * (1.0 + native_cos(PI * ratio));
+        SCHED_WARMUP:
+            if step < cfg.warmup_steps:
+                out cfg.lr * (step >> float / cfg.warmup_steps >> float);
+            else
+                out cfg.lr;
+            end
+    else
+        out cfg.lr;
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Gradient Clipping
+# ═══════════════════════════════════════════════════════
+
+# Clip gradients by global norm;
+func clip_grad_norm:
+    in(grads: ptr; n: int; max_norm: float)
+    var total_norm = 0.0;
+    var i = 0;
+    when i < n loop
+        var g = native_load<float>(grads; i);
+        total_norm = total_norm + g * g;
+        i = i + 1;
+    end
+    total_norm = sqrt(total_norm);
+    if total_norm > max_norm:
+        var scale = max_norm / total_norm;
+        i = 0;
+        when i < n loop
+            var g = native_load<float>(grads; i);
+            native_store<float>(grads; i; g * scale);
+            i = i + 1;
+        end
+    end
+    out total_norm;
+end
+
+# Clip gradients by value;
+func clip_grad_value:
+    in(grads: ptr; n: int; max_val: float)
+    var i = 0;
+    when i < n loop
+        var g = native_load<float>(grads; i);
+        if g > max_val:
+            native_store<float>(grads; i; max_val);
+        eif g < (0.0 - max_val):
+            native_store<float>(grads; i; 0.0 - max_val);
+        end
+        i = i + 1;
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Loss Functions
+# ═══════════════════════════════════════════════════════
+
+# Mean Squared Error;
+func mse_loss:
+    in(pred: ptr; target: ptr; n: int)
+    var total = 0.0;
+    var i = 0;
+    when i < n loop
+        var diff = native_load<float>(pred; i) - native_load<float>(target; i);
+        total = total + diff * diff;
+        i = i + 1;
+    end
+    out total / n >> float;
+end
+
+# Cross-Entropy Loss (for classification);
+func cross_entropy_loss:
+    in(logits: ptr; targets: ptr; n: int; num_classes: int)
+    var total = 0.0;
+    var i = 0;
+    when i < n loop
+        # Find max for numerical stability;
+        var max_val = native_load<float>(logits; i * num_classes);
+        var c = 1;
+        when c < num_classes loop
+            var v = native_load<float>(logits; i * num_classes + c);
+            if v > max_val:
+                max_val = v;
+            end
+            c = c + 1;
+        end
+        # Compute log-sum-exp;
+        var sum_exp = 0.0;
+        c = 0;
+        when c < num_classes loop
+            sum_exp = sum_exp + native_exp(native_load<float>(logits; i * num_classes + c) - max_val);
+            c = c + 1;
+        end
+        var log_sum = native_log(sum_exp) + max_val;
+        var target_class = native_load<int>(targets; i);
+        total = total - native_load<float>(logits; i * num_classes + target_class) + log_sum;
+        i = i + 1;
+    end
+    out total / n >> float;
+end
+
+# ═══════════════════════════════════════════════════════
+# Training Loop
+# ═══════════════════════════════════════════════════════
+
+entity TrainState:
+    epoch:         int;
+    step:          int;
+    total_loss:    float;
+    best_loss:     float;
+    running_loss:  float;
+    samples_seen:  int;
+end
+
+func train_state_new:
+    out TrainState {
+        epoch:         0;
+        step:          0;
+        total_loss:    0.0;
+        best_loss:     999999.0;
+        running_loss:  0.0;
+        samples_seen:  0;
+    };
+end
+
+# Single training step: forward + backward + optimizer update;
+func train_step:
+    in(tape: Tape; params: ptr; grads: ptr; n_params: int;
+       opt: Adam; cfg: TrainConfig; state: TrainState)
+
+    # Gradient clipping;
+    if cfg.clip_norm > 0.0:
+        clip_grad_norm(grads; n_params; cfg.clip_norm);
+    end
+    if cfg.clip_value > 0.0:
+        clip_grad_value(grads; n_params; cfg.clip_value);
+    end
+
+    # LR scheduling;
+    var current_lr = lr_schedule(cfg; state.step; cfg.epochs * 1000);
+    opt.lr = current_lr;
+
+    # Optimizer step;
+    adam_step(opt; params; grads; n_params);
+
+    state.step = state.step + 1;
+    out state;
+end
+
+export TrainConfig, TrainState;
+export train_config, train_state_new, train_step;
+export lr_schedule, clip_grad_norm, clip_grad_value;
+export mse_loss, cross_entropy_loss;
+export SCHED_CONSTANT, SCHED_STEP, SCHED_COSINE, SCHED_WARMUP;

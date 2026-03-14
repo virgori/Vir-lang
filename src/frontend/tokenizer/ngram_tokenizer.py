@@ -83,6 +83,7 @@ class NGramTokenizer:
     # ── Public API ─────────────────────────────────────────
     def tokenize(self, source: str) -> list[Token]:
         """Tokenize source text → list of Tokens using the loaded adapter."""
+        source = self._strip_comments(source)
         normalized = self._normalize(source)
         words = normalized.split()
         tokens: list[Token] = []
@@ -157,6 +158,15 @@ class NGramTokenizer:
         return tokens
 
     # ── Internals ──────────────────────────────────────────
+    @staticmethod
+    def _strip_comments(text: str) -> str:
+        """Strip block comments (## ... ##) and single-line comments (# ...)."""
+        # Block comments: ## ... ## (may span multiple lines)
+        text = re.sub(r'##.*?##', '', text, flags=re.DOTALL)
+        # Single-line comments: # to end of line
+        text = re.sub(r'#[^\n]*', '', text)
+        return text
+
     @staticmethod
     def _normalize(text: str) -> str:
         """Normalize: lower, strip punctuation, compress whitespace."""

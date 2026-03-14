@@ -1,8 +1,8 @@
 # Vir Standard Library — Lộ trình & Đặc tả Toàn diện
 
-> **Ngày tạo:** 7/3/2026  
-> **Cập nhật:** 8/3/2026  
-> **Dựa trên:** C23 Standard Library + Python 3.14 Standard Library  
+> **Ngày tạo:** 7/3/2026
+> **Cập nhật:** 8/3/2026
+> **Dựa trên:** C23 Standard Library + Python 3.14 Standard Library
 > **Mục tiêu:** Xây dựng stdlib tối thiểu → đầy đủ → hệ sinh thái cho ngôn ngữ Vir
 
 ---
@@ -180,7 +180,7 @@ stdlib/vir/
 ```
 Phase A: Bootstrap        Phase B: Usable           Phase C: Production       Phase D: Ecosystem
 (ngôn ngữ sống được)     (viết app thật được)      (deploy được)            (hệ sinh thái đầy đủ)
-                                                    
+
 ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐    ┌──────────────────┐
 │ vir/core         │    │ vir/vec          │    │ vir/thread       │    │ vir/ast          │
 │ vir/mem          │    │ vir/map          │    │ vir/atomic       │    │ vir/token         │
@@ -375,7 +375,7 @@ Phase A: Bootstrap        Phase B: Usable           Phase C: Production       Ph
 
 ### 3.1. `vir/core` — Kiểu nguyên thủy & nền tảng
 
-**Học từ C23:** `<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`, `<stdbool.h>`, `<stdarg.h>`  
+**Học từ C23:** `<stddef.h>`, `<stdint.h>`, `<limits.h>`, `<float.h>`, `<stdbool.h>`, `<stdarg.h>`
 **Học từ Python:** builtins (`int`, `float`, `bool`, `None`, `type`), `enum`, `dataclasses`
 
 ```
@@ -394,55 +394,55 @@ vir/core/
 **API tối thiểu:**
 ```
 # types.vri
-kiểu i8    # -128 .. 127
-kiểu i16   # -32768 .. 32767
-kiểu i32   # -2^31 .. 2^31-1
-kiểu i64   # -2^63 .. 2^63-1 (mặc định "số")
-kiểu u8    # 0 .. 255
-kiểu u16   # 0 .. 65535
-kiểu u32   # 0 .. 2^32-1
-kiểu u64   # 0 .. 2^64-1
-kiểu f32   # IEEE 754 single
-kiểu f64   # IEEE 754 double (mặc định "thực")
-kiểu bool  # đúng / sai
-kiểu byte  # alias cho u8
+type i8  # -128 .. 127
+type i16  # -32768 .. 32767
+type i32  # -2^31 .. 2^31-1
+type i64  # -2^63 .. 2^63-1 (mặc định "số")
+type u8  # 0 .. 255
+type u16  # 0 .. 65535
+type u32  # 0 .. 2^32-1
+type u64  # 0 .. 2^64-1
+type f32  # IEEE 754 single
+type f64  # IEEE 754 double (mặc định "thực")
+type bool  # đúng / sai
+type byte  # alias cho u8
 
 # option.vri
-liệt_kê Option thì
+enum Option
   Some(giá_trị)
   None
-hết
+end
 
-hàm is_some(opt: Option) → bool
-hàm is_none(opt: Option) → bool
-hàm unwrap(opt: Option) → giá_trị  # panic nếu None
-hàm unwrap_or(opt: Option, mặc_định) → giá_trị
+func is_some(opt: Option) -> bool
+func is_none(opt: Option) -> bool
+func unwrap(opt: Option) -> giá_trị  # panic nếu None
+func unwrap_or(opt: Option, mặc_định) -> giá_trị
 
 # result.vri
-liệt_kê Result thì
+enum Result
   Ok(giá_trị)
   Err(lỗi)
-hết
+end
 
-hàm is_ok(r: Result) → bool
-hàm is_err(r: Result) → bool
-hàm unwrap(r: Result) → giá_trị  # panic nếu Err
-hàm map(r: Result, f: hàm) → Result
+func is_ok(r: Result) -> bool
+func is_err(r: Result) -> bool
+func unwrap(r: Result) -> giá_trị  # panic nếu Err
+func map(r: Result, f: func) -> Result
 
 # ops.vri (từ C23 <stdckdint.h>)
-hàm add_checked(a: i64, b: i64) → Result<i64, OverflowError>
-hàm sub_checked(a: i64, b: i64) → Result<i64, OverflowError>
-hàm mul_checked(a: i64, b: i64) → Result<i64, OverflowError>
+func add_checked(a: i64, b: i64) -> Result<i64, OverflowError>
+func sub_checked(a: i64, b: i64) -> Result<i64, OverflowError>
+func mul_checked(a: i64, b: i64) -> Result<i64, OverflowError>
 
 # bits.vri (từ C23 <stdbit.h>)
-hàm count_ones(x: u64) → u32       # popcount
-hàm count_zeros(x: u64) → u32
-hàm leading_zeros(x: u64) → u32    # clz
-hàm trailing_zeros(x: u64) → u32   # ctz
-hàm rotate_left(x: u64, n: u32) → u64
-hàm rotate_right(x: u64, n: u32) → u64
-hàm byte_swap(x: u64) → u64        # endian swap
-hàm bit_width(x: u64) → u32        # floor(log2(x)) + 1
+func count_ones(x: u64) -> u32  # popcount
+func count_zeros(x: u64) -> u32
+func leading_zeros(x: u64) -> u32  # clz
+func trailing_zeros(x: u64) -> u32  # ctz
+func rotate_left(x: u64, n: u32) -> u64
+func rotate_right(x: u64, n: u32) -> u64
+func byte_swap(x: u64) -> u64  # endian swap
+func bit_width(x: u64) -> u32  # floor(log2(x)) + 1
 ```
 
 **Tự dùng cho compiler:** enum TokenKind, struct Token, Result cho parser errors.
@@ -451,7 +451,7 @@ hàm bit_width(x: u64) → u32        # floor(log2(x)) + 1
 
 ### 3.2. `vir/mem` — Quản lý bộ nhớ
 
-**Học từ C23:** `<stdlib.h>` (malloc/free/realloc), `<string.h>` (memcpy/memset/memmove)  
+**Học từ C23:** `<stdlib.h>` (malloc/free/realloc), `<string.h>` (memcpy/memset/memmove)
 **Học từ Python:** `gc`, `tracemalloc`, `copy`
 
 ```
@@ -466,49 +466,49 @@ vir/mem/
 **API tối thiểu:**
 ```
 # alloc.vri
-hàm alloc(size: u64) → ptr           # malloc
-hàm alloc_zeroed(size: u64) → ptr    # calloc
-hàm realloc(p: ptr, new_size: u64) → ptr
-hàm free(p: ptr)
-hàm size_of<T>() → u64
+func alloc(size: u64) -> ptr  # malloc
+func alloc_zeroed(size: u64) -> ptr  # calloc
+func realloc(p: ptr, new_size: u64) -> ptr
+func free(p: ptr)
+func size_of<T>() -> u64
 
 # slice.vri
-bản_ghi Slice thì
+entity Slice
   data: ptr
   len: u64
-hết
-hàm slice_get(s: Slice, i: u64) → byte
-hàm slice_set(s: Slice, i: u64, val: byte)
-hàm slice_sub(s: Slice, from: u64, to: u64) → Slice
+end
+func slice_get(s: Slice, i: u64) -> byte
+func slice_set(s: Slice, i: u64, val: byte)
+func slice_sub(s: Slice, from: u64, to: u64) -> Slice
 
 # buffer.vri
-bản_ghi Buffer thì
+entity Buffer
   data: ptr
   len: u64
   cap: u64
-hết
-hàm buffer_new(cap: u64) → Buffer
-hàm buffer_push(b: Buffer, byte: u8)
-hàm buffer_write(b: Buffer, data: Slice)
-hàm buffer_as_slice(b: Buffer) → Slice
-hàm buffer_free(b: Buffer)
+end
+func buffer_new(cap: u64) -> Buffer
+func buffer_push(b: Buffer, byte: u8)
+func buffer_write(b: Buffer, data: Slice)
+func buffer_as_slice(b: Buffer) -> Slice
+func buffer_free(b: Buffer)
 
 # arena.vri
-bản_ghi Arena thì
+entity Arena
   base: ptr
   offset: u64
   cap: u64
-hết
-hàm arena_new(size: u64) → Arena
-hàm arena_alloc(a: Arena, size: u64) → ptr   # bump pointer, O(1)
-hàm arena_reset(a: Arena)                      # free tất cả cùng lúc
-hàm arena_free(a: Arena)
+end
+func arena_new(size: u64) -> Arena
+func arena_alloc(a: Arena, size: u64) -> ptr  # bump pointer, O(1)
+func arena_reset(a: Arena)  # free tất cả cùng lúc
+func arena_free(a: Arena)
 
 # copy.vri
-hàm mem_copy(dst: ptr, src: ptr, n: u64)
-hàm mem_set(dst: ptr, val: u8, n: u64)
-hàm mem_move(dst: ptr, src: ptr, n: u64)
-hàm mem_cmp(a: ptr, b: ptr, n: u64) → i32
+func mem_copy(dst: ptr, src: ptr, n: u64)
+func mem_set(dst: ptr, val: u8, n: u64)
+func mem_move(dst: ptr, src: ptr, n: u64)
+func mem_cmp(a: ptr, b: ptr, n: u64) -> i32
 ```
 
 **Tự dùng cho compiler:** Arena cho AST nodes, Buffer cho machine code emit.
@@ -517,7 +517,7 @@ hàm mem_cmp(a: ptr, b: ptr, n: u64) → i32
 
 ### 3.3. `vir/str` — Chuỗi & Unicode
 
-**Học từ C23:** `<string.h>`, `<ctype.h>`, `<wchar.h>`, `<uchar.h>`  
+**Học từ C23:** `<string.h>`, `<ctype.h>`, `<wchar.h>`, `<uchar.h>`
 **Học từ Python:** `str` type, `unicodedata`, `codecs`
 
 ```
@@ -533,52 +533,52 @@ vir/str/
 **API tối thiểu:**
 ```
 # string.vri
-bản_ghi String thì
+entity String
   data: ptr          # UTF-8 bytes
   byte_len: u64      # byte length
   char_len: u64      # codepoint count (cached)
-hết
+end
 
-hàm str_new(literal: chuỗi) → String
-hàm str_len(s: String) → u64                     # codepoint count
-hàm str_byte_len(s: String) → u64                # byte count
-hàm str_char_at(s: String, i: u64) → u32         # codepoint
-hàm str_slice(s: String, from: u64, to: u64) → String
-hàm str_concat(a: String, b: String) → String
-hàm str_eq(a: String, b: String) → bool
-hàm str_cmp(a: String, b: String) → i32          # lexicographic
-hàm str_contains(haystack: String, needle: String) → bool
-hàm str_starts_with(s: String, prefix: String) → bool
-hàm str_ends_with(s: String, suffix: String) → bool
-hàm str_find(s: String, needle: String) → Option<u64>
-hàm str_split(s: String, delim: String) → Vec<String>
-hàm str_join(parts: Vec<String>, sep: String) → String
-hàm str_trim(s: String) → String
-hàm str_to_upper(s: String) → String
-hàm str_to_lower(s: String) → String
-hàm str_replace(s: String, old: String, new: String) → String
+func str_new(literal: chuỗi) -> String
+func str_len(s: String) -> u64  # codepoint count
+func str_byte_len(s: String) -> u64  # byte count
+func str_char_at(s: String, i: u64) -> u32  # codepoint
+func str_slice(s: String, from: u64, to: u64) -> String
+func str_concat(a: String, b: String) -> String
+func str_eq(a: String, b: String) -> bool
+func str_cmp(a: String, b: String) -> i32  # lexicographic
+func str_contains(haystack: String, needle: String) -> bool
+func str_starts_with(s: String, prefix: String) -> bool
+func str_ends_with(s: String, suffix: String) -> bool
+func str_find(s: String, needle: String) -> Option<u64>
+func str_split(s: String, delim: String) -> Vec<String>
+func str_join(parts: Vec<String>, sep: String) -> String
+func str_trim(s: String) -> String
+func str_to_upper(s: String) -> String
+func str_to_lower(s: String) -> String
+func str_replace(s: String, old: String, new: String) -> String
 
 # builder.vri
-bản_ghi StringBuilder thì
+entity StringBuilder
   buf: Buffer
-hết
-hàm sb_new() → StringBuilder
-hàm sb_append(sb: StringBuilder, s: String)
-hàm sb_append_char(sb: StringBuilder, c: u32)
-hàm sb_append_i64(sb: StringBuilder, n: i64)
-hàm sb_build(sb: StringBuilder) → String
-hàm sb_free(sb: StringBuilder)
+end
+func sb_new() -> StringBuilder
+func sb_append(sb: StringBuilder, s: String)
+func sb_append_char(sb: StringBuilder, c: u32)
+func sb_append_i64(sb: StringBuilder, n: i64)
+func sb_build(sb: StringBuilder) -> String
+func sb_free(sb: StringBuilder)
 
 # char.vri
-hàm is_digit(c: u32) → bool
-hàm is_alpha(c: u32) → bool
-hàm is_alnum(c: u32) → bool
-hàm is_space(c: u32) → bool
-hàm is_upper(c: u32) → bool
-hàm is_lower(c: u32) → bool
-hàm to_upper(c: u32) → u32
-hàm to_lower(c: u32) → u32
-hàm is_ascii(c: u32) → bool
+func is_digit(c: u32) -> bool
+func is_alpha(c: u32) -> bool
+func is_alnum(c: u32) -> bool
+func is_space(c: u32) -> bool
+func is_upper(c: u32) -> bool
+func is_lower(c: u32) -> bool
+func to_upper(c: u32) -> u32
+func to_lower(c: u32) -> u32
+func is_ascii(c: u32) -> bool
 ```
 
 **Tự dùng cho compiler:** Lexer cần string ops, StringBuilder cho error messages.
@@ -587,7 +587,7 @@ hàm is_ascii(c: u32) → bool
 
 ### 3.4. `vir/io` — Nhập xuất
 
-**Học từ C23:** `<stdio.h>`  
+**Học từ C23:** `<stdio.h>`
 **Học từ Python:** `io` module, `print()`, `open()`, `sys.stdin/stdout/stderr`
 
 ```
@@ -602,50 +602,50 @@ vir/io/
 **API tối thiểu:**
 ```
 # traits.vri
-giao_diện Reader thì
-  hàm read(buf: Slice) → Result<u64, IoError>
-hết
+trait Reader
+  func read(buf: Slice) -> Result<u64, IoError>
+end
 
-giao_diện Writer thì
-  hàm write(data: Slice) → Result<u64, IoError>
-  hàm flush() → Result<(), IoError>
-hết
+trait Writer
+  func write(data: Slice) -> Result<u64, IoError>
+  func flush() -> Result<(), IoError>
+end
 
 # stdio.vri
-hàm print(s: String)                      # write to stdout, no newline
-hàm println(s: String)                    # write to stdout + newline
-hàm eprint(s: String)                     # write to stderr
-hàm eprintln(s: String)                   # write to stderr + newline
-hàm read_line() → Result<String, IoError> # read line from stdin
+func print(s: String)  # write to stdout, no newline
+func println(s: String)  # write to stdout + newline
+func eprint(s: String)  # write to stderr
+func eprintln(s: String)  # write to stderr + newline
+func read_line() -> Result<String, IoError>  # read line from stdin
 
 # file.vri
-bản_ghi File thì
+entity File
   fd: i64
   path: String
   mode: FileMode
-hết
+end
 
-liệt_kê FileMode thì
+enum FileMode
   Read = 1
   Write = 2
   Append = 4
   ReadWrite = 3
-hết
+end
 
-hàm file_open(path: String, mode: FileMode) → Result<File, IoError>
-hàm file_read(f: File, buf: Slice) → Result<u64, IoError>
-hàm file_read_all(f: File) → Result<String, IoError>
-hàm file_write(f: File, data: Slice) → Result<u64, IoError>
-hàm file_write_str(f: File, s: String) → Result<u64, IoError>
-hàm file_close(f: File) → Result<(), IoError>
-hàm file_seek(f: File, offset: i64, whence: SeekFrom) → Result<u64, IoError>
-hàm file_size(f: File) → Result<u64, IoError>
+func file_open(path: String, mode: FileMode) -> Result<File, IoError>
+func file_read(f: File, buf: Slice) -> Result<u64, IoError>
+func file_read_all(f: File) -> Result<String, IoError>
+func file_write(f: File, data: Slice) -> Result<u64, IoError>
+func file_write_str(f: File, s: String) -> Result<u64, IoError>
+func file_close(f: File) -> Result<(), IoError>
+func file_seek(f: File, offset: i64, whence: SeekFrom) -> Result<u64, IoError>
+func file_size(f: File) -> Result<u64, IoError>
 
 # format.vri
-hàm format(template: String, args: ...) → String
-hàm format_int(n: i64, base: u32) → String    # base = 2, 8, 10, 16
-hàm format_float(f: f64, precision: u32) → String
-hàm format_hex(n: u64) → String
+func format(template: String, args: ...) -> String
+func format_int(n: i64, base: u32) -> String  # base = 2, 8, 10, 16
+func format_float(f: f64, precision: u32) -> String
+func format_hex(n: u64) -> String
 ```
 
 **Tự dùng cho compiler:** Đọc source file, ghi binary output, in error messages.
@@ -663,22 +663,22 @@ vir/path/
 
 **API tối thiểu:**
 ```
-bản_ghi Path thì
+entity Path
   raw: String
-hết
+end
 
-hàm path_new(s: String) → Path
-hàm path_join(base: Path, child: String) → Path
-hàm path_parent(p: Path) → Option<Path>
-hàm path_filename(p: Path) → Option<String>
-hàm path_stem(p: Path) → Option<String>        # filename without extension
-hàm path_extension(p: Path) → Option<String>
-hàm path_is_absolute(p: Path) → bool
-hàm path_normalize(p: Path) → Path
-hàm path_exists(p: Path) → bool
-hàm path_is_file(p: Path) → bool
-hàm path_is_dir(p: Path) → bool
-hàm path_to_string(p: Path) → String
+func path_new(s: String) -> Path
+func path_join(base: Path, child: String) -> Path
+func path_parent(p: Path) -> Option<Path>
+func path_filename(p: Path) -> Option<String>
+func path_stem(p: Path) -> Option<String>  # filename without extension
+func path_extension(p: Path) -> Option<String>
+func path_is_absolute(p: Path) -> bool
+func path_normalize(p: Path) -> Path
+func path_exists(p: Path) -> bool
+func path_is_file(p: Path) -> bool
+func path_is_dir(p: Path) -> bool
+func path_to_string(p: Path) -> String
 ```
 
 **Tự dùng cho compiler:** Module resolver, source file lookup.
@@ -687,7 +687,7 @@ hàm path_to_string(p: Path) → String
 
 ### 3.6. `vir/math` — Toán học
 
-**Học từ C23:** `<math.h>`, `<tgmath.h>`, `<stdbit.h>`, `<stdckdint.h>`  
+**Học từ C23:** `<math.h>`, `<tgmath.h>`, `<stdbit.h>`, `<stdckdint.h>`
 **Học từ Python:** `math`
 
 ```
@@ -701,43 +701,43 @@ vir/math/
 **API tối thiểu:**
 ```
 # const.vri
-hằng PI  = 3.14159265358979323846
-hằng E   = 2.71828182845904523536
-hằng TAU = 6.28318530717958647692
-hằng INF = +∞
-hằng NAN = NaN
+const PI = 3.14159265358979323846
+const E = 2.71828182845904523536
+const TAU = 6.28318530717958647692
+const INF = +∞
+const NAN = NaN
 
 # basic.vri
-hàm abs(x: i64) → i64
-hàm abs_f(x: f64) → f64
-hàm min(a: i64, b: i64) → i64
-hàm max(a: i64, b: i64) → i64
-hàm clamp(x: i64, lo: i64, hi: i64) → i64
+func abs(x: i64) -> i64
+func abs_f(x: f64) -> f64
+func min(a: i64, b: i64) -> i64
+func max(a: i64, b: i64) -> i64
+func clamp(x: i64, lo: i64, hi: i64) -> i64
 
 # float.vri
-hàm sqrt(x: f64) → f64
-hàm pow(base: f64, exp: f64) → f64
-hàm sin(x: f64) → f64
-hàm cos(x: f64) → f64
-hàm tan(x: f64) → f64
-hàm asin(x: f64) → f64
-hàm acos(x: f64) → f64
-hàm atan(x: f64) → f64
-hàm atan2(y: f64, x: f64) → f64
-hàm exp(x: f64) → f64
-hàm log(x: f64) → f64
-hàm log2(x: f64) → f64
-hàm log10(x: f64) → f64
-hàm ceil(x: f64) → f64
-hàm floor(x: f64) → f64
-hàm round(x: f64) → f64
-hàm is_nan(x: f64) → bool
-hàm is_inf(x: f64) → bool
+func sqrt(x: f64) -> f64
+func pow(base: f64, exp: f64) -> f64
+func sin(x: f64) -> f64
+func cos(x: f64) -> f64
+func tan(x: f64) -> f64
+func asin(x: f64) -> f64
+func acos(x: f64) -> f64
+func atan(x: f64) -> f64
+func atan2(y: f64, x: f64) -> f64
+func exp(x: f64) -> f64
+func log(x: f64) -> f64
+func log2(x: f64) -> f64
+func log10(x: f64) -> f64
+func ceil(x: f64) -> f64
+func floor(x: f64) -> f64
+func round(x: f64) -> f64
+func is_nan(x: f64) -> bool
+func is_inf(x: f64) -> bool
 
 # integer.vri
-hàm gcd(a: i64, b: i64) → i64
-hàm lcm(a: i64, b: i64) → i64
-hàm pow_int(base: i64, exp: u32) → i64
+func gcd(a: i64, b: i64) -> i64
+func lcm(a: i64, b: i64) -> i64
+func pow_int(base: i64, exp: u32) -> i64
 ```
 
 **Tự dùng cho compiler:** Ít dùng trực tiếp nhưng cần cho standard library foundation.
@@ -746,7 +746,7 @@ hàm pow_int(base: i64, exp: u32) → i64
 
 ### 3.7. `vir/time` — Thời gian
 
-**Học từ C23:** `<time.h>`  
+**Học từ C23:** `<time.h>`
 **Học từ Python:** `time`, `datetime`
 
 ```
@@ -760,26 +760,26 @@ vir/time/
 **API tối thiểu:**
 ```
 # instant.vri
-bản_ghi Instant thì
+entity Instant
   nanos: u64    # nanoseconds since epoch (monotonic)
-hết
-hàm now() → Instant
-hàm elapsed(start: Instant) → Duration
+end
+func now() -> Instant
+func elapsed(start: Instant) -> Duration
 
 # duration.vri
-bản_ghi Duration thì
+entity Duration
   secs: u64
   nanos: u32
-hết
-hàm duration_from_secs(s: u64) → Duration
-hàm duration_from_millis(ms: u64) → Duration
-hàm duration_from_nanos(ns: u64) → Duration
-hàm duration_to_millis(d: Duration) → u64
-hàm duration_add(a: Duration, b: Duration) → Duration
+end
+func duration_from_secs(s: u64) -> Duration
+func duration_from_millis(ms: u64) -> Duration
+func duration_from_nanos(ns: u64) -> Duration
+func duration_to_millis(d: Duration) -> u64
+func duration_add(a: Duration, b: Duration) -> Duration
 
 # clock.vri
-hàm sleep(d: Duration)
-hàm sleep_ms(ms: u64)
+func sleep(d: Duration)
+func sleep_ms(ms: u64)
 ```
 
 **Tự dùng cho compiler:** Benchmark compile time, JIT timing.
@@ -788,7 +788,7 @@ hàm sleep_ms(ms: u64)
 
 ### 3.8. `vir/env` — Môi trường & nền tảng
 
-**Học từ C23:** `<signal.h>`, `<stdlib.h>` (getenv, exit)  
+**Học từ C23:** `<signal.h>`, `<stdlib.h>` (getenv, exit)
 **Học từ Python:** `os`, `sys`, `platform`, `signal`
 
 ```
@@ -802,31 +802,31 @@ vir/env/
 **API tối thiểu:**
 ```
 # vars.vri
-hàm get_env(key: String) → Option<String>
-hàm set_env(key: String, val: String)
-hàm env_vars() → Vec<(String, String)>
+func get_env(key: String) -> Option<String>
+func set_env(key: String, val: String)
+func env_vars() -> Vec<(String, String)>
 
 # platform.vri
-liệt_kê OS thì
+enum OS
   MacOS
   Linux
   Windows
   Unknown
-hết
+end
 
-liệt_kê Arch thì
+enum Arch
   ARM64
   X86_64
   Unknown
-hết
+end
 
-hàm current_os() → OS
-hàm current_arch() → Arch
+func current_os() -> OS
+func current_arch() -> Arch
 
 # exit.vri
-hàm exit(code: i32)            # terminate process
-hàm panic(msg: String)         # print + abort
-hàm abort()                     # immediate abort
+func exit(code: i32)  # terminate process
+func panic(msg: String)  # print + abort
+func abort()  # immediate abort
 ```
 
 **Tự dùng cho compiler:** Platform detection cho codegen, env vars cho config.
@@ -835,7 +835,7 @@ hàm abort()                     # immediate abort
 
 ### 3.9. `vir/collections` — Cấu trúc dữ liệu cơ bản
 
-**Học từ C23:** — (C23 không có collections)  
+**Học từ C23:** — (C23 không có collections)
 **Học từ Python:** `list`, `collections.deque`, `heapq`, `array`
 
 ```
@@ -848,30 +848,30 @@ vir/collections/
 
 **API tối thiểu (Vec):**
 ```
-bản_ghi Vec thì
+entity Vec
   data: ptr
   len: u64
   cap: u64
   elem_size: u64
-hết
+end
 
-hàm vec_new() → Vec
-hàm vec_with_cap(cap: u64) → Vec
-hàm vec_push(v: Vec, item)
-hàm vec_pop(v: Vec) → Option
-hàm vec_get(v: Vec, i: u64) → Option
-hàm vec_set(v: Vec, i: u64, item)
-hàm vec_len(v: Vec) → u64
-hàm vec_cap(v: Vec) → u64
-hàm vec_is_empty(v: Vec) → bool
-hàm vec_clear(v: Vec)
-hàm vec_insert(v: Vec, i: u64, item)
-hàm vec_remove(v: Vec, i: u64) → Option
-hàm vec_contains(v: Vec, item) → bool
-hàm vec_reverse(v: Vec)
-hàm vec_sort(v: Vec, cmp: hàm)
-hàm vec_iter(v: Vec) → Iterator
-hàm vec_free(v: Vec)
+func vec_new() -> Vec
+func vec_with_cap(cap: u64) -> Vec
+func vec_push(v: Vec, item)
+func vec_pop(v: Vec) -> Option
+func vec_get(v: Vec, i: u64) -> Option
+func vec_set(v: Vec, i: u64, item)
+func vec_len(v: Vec) -> u64
+func vec_cap(v: Vec) -> u64
+func vec_is_empty(v: Vec) -> bool
+func vec_clear(v: Vec)
+func vec_insert(v: Vec, i: u64, item)
+func vec_remove(v: Vec, i: u64) -> Option
+func vec_contains(v: Vec, item) -> bool
+func vec_reverse(v: Vec)
+func vec_sort(v: Vec, cmp: func)
+func vec_iter(v: Vec) -> Iterator
+func vec_free(v: Vec)
 ```
 
 **Tự dùng cho compiler:** Token list, instruction list, symbol table.
@@ -880,7 +880,7 @@ hàm vec_free(v: Vec)
 
 ### 3.10. `vir/error` — Xử lý lỗi
 
-**Học từ C23:** `<errno.h>`, `<setjmp.h>`  
+**Học từ C23:** `<errno.h>`, `<setjmp.h>`
 **Học từ Python:** `Exception` hierarchy, `traceback`
 
 ```
@@ -892,34 +892,34 @@ vir/error/
 
 **API tối thiểu:**
 ```
-giao_diện Error thì
-  hàm message() → String
-  hàm code() → i32
-hết
+trait Error
+  func message() -> String
+  func code() -> i32
+end
 
-bản_ghi IoError thực_hiện Error thì
+entity IoError  # implements Error
   kind: IoErrorKind
   msg: String
-hết
+end
 
-liệt_kê IoErrorKind thì
+enum IoErrorKind
   NotFound = 1
   PermissionDenied = 2
   AlreadyExists = 3
   InvalidInput = 4
   TimedOut = 5
   Other = 99
-hết
+end
 
-bản_ghi ParseError thực_hiện Error thì
+entity ParseError  # implements Error
   line: u64
   col: u64
   msg: String
-hết
+end
 
-bản_ghi OverflowError thực_hiện Error thì
+entity OverflowError  # implements Error
   msg: String
-hết
+end
 ```
 
 **Tự dùng cho compiler:** Parse errors, file I/O errors, codegen errors.
@@ -938,35 +938,35 @@ vir/cli/
 
 **API tối thiểu:**
 ```
-bản_ghi ArgParser thì
+entity ArgParser
   name: String
   description: String
   args: Vec<ArgDef>
-hết
+end
 
-bản_ghi ArgDef thì
+entity ArgDef
   name: String
   short: String          # "-v"
   long: String           # "--verbose"
   help: String
   required: bool
   default: Option<String>
-hết
+end
 
-bản_ghi ParsedArgs thì
+entity ParsedArgs
   positional: Vec<String>
   flags: Map<String, String>
-hết
+end
 
-hàm arg_parser_new(name: String, desc: String) → ArgParser
-hàm arg_add(p: ArgParser, def: ArgDef)
-hàm arg_parse(p: ArgParser, argv: Vec<String>) → Result<ParsedArgs, String>
-hàm arg_get(parsed: ParsedArgs, name: String) → Option<String>
-hàm arg_has(parsed: ParsedArgs, name: String) → bool
+func arg_parser_new(name: String, desc: String) -> ArgParser
+func arg_add(p: ArgParser, def: ArgDef)
+func arg_parse(p: ArgParser, argv: Vec<String>) -> Result<ParsedArgs, String>
+func arg_get(parsed: ParsedArgs, name: String) -> Option<String>
+func arg_has(parsed: ParsedArgs, name: String) -> bool
 
 # shlex
-hàm shlex_split(s: String) → Vec<String>
-hàm shlex_quote(s: String) → String
+func shlex_split(s: String) -> Vec<String>
+func shlex_quote(s: String) -> String
 ```
 
 **Tự dùng cho compiler:** `vir` CLI (`vir run file.vri --dump-ir --dump-asm`).
@@ -975,7 +975,7 @@ hàm shlex_quote(s: String) → String
 
 ### 3.12. `vir/debug` — Debug & Diagnostics
 
-**Học từ C23:** `<assert.h>`  
+**Học từ C23:** `<assert.h>`
 **Học từ Python:** `traceback`, `faulthandler`, `pdb`
 
 ```
@@ -988,21 +988,21 @@ vir/debug/
 **API tối thiểu:**
 ```
 # assert.vri
-hàm assert(cond: bool, msg: String)
-hàm assert_eq(a, b, msg: String)
-hàm assert_ne(a, b, msg: String)
-hàm debug_assert(cond: bool, msg: String)    # chỉ active khi debug build
-hàm unreachable(msg: String)                  # always panic
+func assert(cond: bool, msg: String)
+func assert_eq(a, b, msg: String)
+func assert_ne(a, b, msg: String)
+func debug_assert(cond: bool, msg: String)  # chỉ active khi debug build
+func unreachable(msg: String)  # always panic
 
 # trace.vri
-bản_ghi StackFrame thì
+entity StackFrame
   func_name: String
   file: String
   line: u64
-hết
+end
 
-hàm capture_trace() → Vec<StackFrame>
-hàm print_trace()
+func capture_trace() -> Vec<StackFrame>
+func print_trace()
 ```
 
 **Tự dùng cho compiler:** Assert invariants, capture trace khi codegen fails.
@@ -1014,180 +1014,180 @@ hàm print_trace()
 ### 4.1. `vir/map` — HashMap
 
 ```
-bản_ghi Map thì ... hết
+entity Map  ...  end
 
-hàm map_new() → Map
-hàm map_insert(m: Map, key, value) → Option        # trả về old value
-hàm map_get(m: Map, key) → Option
-hàm map_remove(m: Map, key) → Option
-hàm map_contains(m: Map, key) → bool
-hàm map_len(m: Map) → u64
-hàm map_keys(m: Map) → Vec
-hàm map_values(m: Map) → Vec
-hàm map_entries(m: Map) → Vec<(key, value)>
-hàm map_iter(m: Map) → Iterator
-hàm map_free(m: Map)
+func map_new() -> Map
+func map_insert(m: Map, key, value) -> Option  # trả về old value
+func map_get(m: Map, key) -> Option
+func map_remove(m: Map, key) -> Option
+func map_contains(m: Map, key) -> bool
+func map_len(m: Map) -> u64
+func map_keys(m: Map) -> Vec
+func map_values(m: Map) -> Vec
+func map_entries(m: Map) -> Vec<(key, value)>
+func map_iter(m: Map) -> Iterator
+func map_free(m: Map)
 ```
 
 ### 4.2. `vir/set` — HashSet
 
 ```
-hàm set_new() → Set
-hàm set_insert(s: Set, item) → bool
-hàm set_remove(s: Set, item) → bool
-hàm set_contains(s: Set, item) → bool
-hàm set_union(a: Set, b: Set) → Set
-hàm set_intersection(a: Set, b: Set) → Set
-hàm set_difference(a: Set, b: Set) → Set
+func set_new() -> Set
+func set_insert(s: Set, item) -> bool
+func set_remove(s: Set, item) -> bool
+func set_contains(s: Set, item) -> bool
+func set_union(a: Set, b: Set) -> Set
+func set_intersection(a: Set, b: Set) -> Set
+func set_difference(a: Set, b: Set) -> Set
 ```
 
 ### 4.3. `vir/json` — JSON
 
 ```
-liệt_kê JsonValue thì
+enum JsonValue
   Null
   Bool(bool)
   Number(f64)
   Str(String)
   Array(Vec<JsonValue>)
   Object(Map<String, JsonValue>)
-hết
+end
 
-hàm json_parse(s: String) → Result<JsonValue, ParseError>
-hàm json_stringify(v: JsonValue) → String
-hàm json_stringify_pretty(v: JsonValue, indent: u32) → String
+func json_parse(s: String) -> Result<JsonValue, ParseError>
+func json_stringify(v: JsonValue) -> String
+func json_stringify_pretty(v: JsonValue, indent: u32) -> String
 ```
 
 ### 4.4. `vir/regex` — Regular Expressions
 
 ```
-bản_ghi Regex thì ... hết
-bản_ghi Match thì start: u64; end: u64; text: String hết
+entity Regex  ...  end
+entity Match  start: u64; end: u64; text: String  end
 
-hàm regex_new(pattern: String) → Result<Regex, ParseError>
-hàm regex_is_match(r: Regex, text: String) → bool
-hàm regex_find(r: Regex, text: String) → Option<Match>
-hàm regex_find_all(r: Regex, text: String) → Vec<Match>
-hàm regex_replace(r: Regex, text: String, repl: String) → String
-hàm regex_split(r: Regex, text: String) → Vec<String>
+func regex_new(pattern: String) -> Result<Regex, ParseError>
+func regex_is_match(r: Regex, text: String) -> bool
+func regex_find(r: Regex, text: String) -> Option<Match>
+func regex_find_all(r: Regex, text: String) -> Vec<Match>
+func regex_replace(r: Regex, text: String, repl: String) -> String
+func regex_split(r: Regex, text: String) -> Vec<String>
 ```
 
 ### 4.5. `vir/fs` — Filesystem
 
 ```
-hàm fs_read(path: Path) → Result<String, IoError>
-hàm fs_read_bytes(path: Path) → Result<Buffer, IoError>
-hàm fs_write(path: Path, content: String) → Result<(), IoError>
-hàm fs_write_bytes(path: Path, data: Slice) → Result<(), IoError>
-hàm fs_append(path: Path, content: String) → Result<(), IoError>
-hàm fs_remove(path: Path) → Result<(), IoError>
-hàm fs_rename(old: Path, new: Path) → Result<(), IoError>
-hàm fs_copy(src: Path, dst: Path) → Result<(), IoError>
-hàm fs_create_dir(path: Path) → Result<(), IoError>
-hàm fs_create_dir_all(path: Path) → Result<(), IoError>
-hàm fs_remove_dir(path: Path) → Result<(), IoError>
-hàm fs_list_dir(path: Path) → Result<Vec<DirEntry>, IoError>
-hàm fs_metadata(path: Path) → Result<Metadata, IoError>
-hàm fs_temp_file() → Result<File, IoError>
-hàm fs_temp_dir() → Path
-hàm fs_glob(pattern: String) → Vec<Path>
+func fs_read(path: Path) -> Result<String, IoError>
+func fs_read_bytes(path: Path) -> Result<Buffer, IoError>
+func fs_write(path: Path, content: String) -> Result<(), IoError>
+func fs_write_bytes(path: Path, data: Slice) -> Result<(), IoError>
+func fs_append(path: Path, content: String) -> Result<(), IoError>
+func fs_remove(path: Path) -> Result<(), IoError>
+func fs_rename(old: Path, new: Path) -> Result<(), IoError>
+func fs_copy(src: Path, dst: Path) -> Result<(), IoError>
+func fs_create_dir(path: Path) -> Result<(), IoError>
+func fs_create_dir_all(path: Path) -> Result<(), IoError>
+func fs_remove_dir(path: Path) -> Result<(), IoError>
+func fs_list_dir(path: Path) -> Result<Vec<DirEntry>, IoError>
+func fs_metadata(path: Path) -> Result<Metadata, IoError>
+func fs_temp_file() -> Result<File, IoError>
+func fs_temp_dir() -> Path
+func fs_glob(pattern: String) -> Vec<Path>
 ```
 
 ### 4.6. `vir/process` — Process Control
 
 ```
-bản_ghi Command thì
+entity Command
   program: String
   args: Vec<String>
   env: Map<String, String>
   cwd: Option<Path>
-hết
+end
 
-bản_ghi Output thì
+entity Output
   status: i32
   stdout: String
   stderr: String
-hết
+end
 
-hàm cmd_new(program: String) → Command
-hàm cmd_arg(c: Command, arg: String) → Command
-hàm cmd_env(c: Command, key: String, val: String) → Command
-hàm cmd_cwd(c: Command, dir: Path) → Command
-hàm cmd_run(c: Command) → Result<Output, IoError>
-hàm cmd_spawn(c: Command) → Result<Process, IoError>
-hàm process_wait(p: Process) → Result<i32, IoError>
-hàm process_kill(p: Process) → Result<(), IoError>
-hàm current_pid() → u64
+func cmd_new(program: String) -> Command
+func cmd_arg(c: Command, arg: String) -> Command
+func cmd_env(c: Command, key: String, val: String) -> Command
+func cmd_cwd(c: Command, dir: Path) -> Command
+func cmd_run(c: Command) -> Result<Output, IoError>
+func cmd_spawn(c: Command) -> Result<Process, IoError>
+func process_wait(p: Process) -> Result<i32, IoError>
+func process_kill(p: Process) -> Result<(), IoError>
+func current_pid() -> u64
 ```
 
 ### 4.7. `vir/log` — Logging
 
 ```
-liệt_kê LogLevel thì
+enum LogLevel
   Trace = 0
   Debug = 1
   Info = 2
   Warn = 3
   Error = 4
-hết
+end
 
-hàm log_init(level: LogLevel)
-hàm log_trace(msg: String)
-hàm log_debug(msg: String)
-hàm log_info(msg: String)
-hàm log_warn(msg: String)
-hàm log_error(msg: String)
+func log_init(level: LogLevel)
+func log_trace(msg: String)
+func log_debug(msg: String)
+func log_info(msg: String)
+func log_warn(msg: String)
+func log_error(msg: String)
 ```
 
 ### 4.8. `vir/test` — Testing Framework
 
 ```
-hàm test_assert(cond: bool, msg: String)
-hàm test_assert_eq(a, b)
-hàm test_assert_ne(a, b)
-hàm test_assert_err(r: Result)
-hàm test_assert_ok(r: Result)
-hàm test_fail(msg: String)
-hàm test_skip(reason: String)
+func test_assert(cond: bool, msg: String)
+func test_assert_eq(a, b)
+func test_assert_ne(a, b)
+func test_assert_err(r: Result)
+func test_assert_ok(r: Result)
+func test_fail(msg: String)
+func test_skip(reason: String)
 
 # Test runner
-hàm test_run_all() → TestResult
+func test_run_all() -> TestResult
 ```
 
 ### 4.9. `vir/fmt` — Formatting
 
 ```
-hàm fmt(template: String, args: ...) → String     # "Hello {0}, you are {1}" 
-hàm fmt_pad_left(s: String, width: u64, fill: u32) → String
-hàm fmt_pad_right(s: String, width: u64, fill: u32) → String
-hàm fmt_hex(n: u64) → String
-hàm fmt_bin(n: u64) → String
-hàm fmt_oct(n: u64) → String
+func fmt(template: String, args: ...) -> String  # "Hello {0}, you are {1}"
+func fmt_pad_left(s: String, width: u64, fill: u32) -> String
+func fmt_pad_right(s: String, width: u64, fill: u32) -> String
+func fmt_hex(n: u64) -> String
+func fmt_bin(n: u64) -> String
+func fmt_oct(n: u64) -> String
 ```
 
 ### 4.10. `vir/sort` — Sorting & Searching
 
 ```
-hàm sort(v: Vec, cmp: hàm)              # in-place, stable sort
-hàm sort_by_key(v: Vec, key: hàm)
-hàm binary_search(v: Vec, target) → Option<u64>
-hàm binary_search_by(v: Vec, cmp: hàm) → Option<u64>
-hàm is_sorted(v: Vec, cmp: hàm) → bool
+func sort(v: Vec, cmp: func)  # in-place, stable sort
+func sort_by_key(v: Vec, key: func)
+func binary_search(v: Vec, target) -> Option<u64>
+func binary_search_by(v: Vec, cmp: func) -> Option<u64>
+func is_sorted(v: Vec, cmp: func) -> bool
 ```
 
 ### 4.11. `vir/rand` — Random
 
 ```
-bản_ghi Rng thì seed: u64 hết
+entity Rng  seed: u64  end
 
-hàm rng_new() → Rng                          # seeded from OS
-hàm rng_seed(seed: u64) → Rng
-hàm rand_u64(rng: Rng) → u64
-hàm rand_i64(rng: Rng, lo: i64, hi: i64) → i64
-hàm rand_f64(rng: Rng) → f64                 # [0.0, 1.0)
-hàm rand_bool(rng: Rng) → bool
-hàm rand_shuffle(rng: Rng, v: Vec)
-hàm rand_choice(rng: Rng, v: Vec) → Option
+func rng_new() -> Rng  # seeded from OS
+func rng_seed(seed: u64) -> Rng
+func rand_u64(rng: Rng) -> u64
+func rand_i64(rng: Rng, lo: i64, hi: i64) -> i64
+func rand_f64(rng: Rng) -> f64  # [0.0, 1.0)
+func rand_bool(rng: Rng) -> bool
+func rand_shuffle(rng: Rng, v: Vec)
+func rand_choice(rng: Rng, v: Vec) -> Option
 ```
 
 ---
@@ -1292,7 +1292,7 @@ Phase B:                                                    │
  ⑩  vir/mem/copy         → memcpy/memset
  ⑪  vir/str/string       → immutable UTF-8 string
  ⑫  vir/str/char         → character classification
- ⑬  vir/str/builder      → mutable string builder  
+ ⑬  vir/str/builder      → mutable string builder
  ⑭  vir/str/search       → find, contains, split
  ⑮  vir/collections/vec  → dynamic array
  ⑯  vir/io/traits        → Reader/Writer interfaces
@@ -1397,3 +1397,4 @@ Bảng mapping stdlib modules sang compiler components cần dùng:
 | CLI (main.vri) | core, str, io, cli, env, path, error |
 
 **Kết luận:** Phase A stdlib đủ để viết lại 80% compiler. Chỉ Signer cần chờ Phase C (crypto).
+

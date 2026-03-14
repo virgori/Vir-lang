@@ -19,7 +19,7 @@ ifeq ($(UNAME_S),Darwin)
   PLATFORM := macos
   SHARED_EXT := dylib
   SHARED_FLAG := -dynamiclib -install_name @rpath/libvir_core.dylib
-  EXTRA_LDFLAGS := -lpthread
+  EXTRA_LDFLAGS := -lpthread -lobjc
 else ifeq ($(UNAME_S),Linux)
   PLATFORM := linux
   SHARED_EXT := so
@@ -84,7 +84,18 @@ C_SRCS := src/q_ir.c \
           src/lexer.c \
           src/parser.c \
           src/cpu_caps.c \
-          src/vir.c
+          src/task.c \
+          src/vir.c \
+          src/huge_alloc.c \
+          src/numa_alloc.c \
+          src/slab_alloc.c \
+          src/simd_dispatch.c \
+          src/amx_accel.c \
+          src/atomic.c \
+          src/gpu_cuda.c \
+          src/ptx_gen.c \
+          src/simd_index.c \
+          src/gpu_metal.c
 
 # ── Object files ──────────────────────────────────────────
 BUILD_DIR := build

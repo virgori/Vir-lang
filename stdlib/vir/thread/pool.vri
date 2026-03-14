@@ -1,0 +1,185 @@
+##
+ * vir/thread/pool.vri — Thread Pool (Work-stealing)
+ * ==================================================
+ * Inspired by Rust: rayon, tokio thread pool
+ * Inspired by Java: ExecutorService, ForkJoinPool
+ *
+ * Phase C — fixed-size thread pool with task queue.
+ * Threads wait on CondVar, wake on task submit.
+ ##
+
+include types;
+include option;
+import Option, Some, None from option;
+include vec;
+import Vec, vec_new, vec_push, vec_pop, vec_len from vec;
+include thread;
+import Mutex, CondVar, AtomicI64,
+       mutex_new, mutex_lock, mutex_unlock,
+       condvar_new, condvar_wait, condvar_signal, condvar_broadcast,
+       atomic_new, atomic_load, atomic_store, atomic_add,
+       thread_spawn, thread_join from thread;
+
+# ═══════════════════════════════════════════════════════
+# Task — a unit of work: func pointer + context
+# ═══════════════════════════════════════════════════════
+
+entity Task:
+    work_fn:  func(ctx: int);
+    context:  int;
+end
+
+# ═══════════════════════════════════════════════════════
+# Thread Pool
+# ═══════════════════════════════════════════════════════
+
+entity ThreadPool:
+    workers:        Vec;         # Vec of worker thread handles
+    task_queue:     Vec;         # Vec of Task
+    mtx:            Mutex;
+    cv:             CondVar;
+    shutdown:       AtomicI64;   # 0 = running, 1 = shutting down
+    active_tasks:   AtomicI64;
+    total_tasks:    AtomicI64;
+    num_workers:    int;
+end
+
+func thread_pool_new:
+    in(num: int)
+    pool = ThreadPool {
+        workers: vec_new(),
+        task_queue: vec_new(),
+        mtx: mutex_new(),
+        cv: condvar_new(),
+        shutdown: atomic_new(0),
+        active_tasks: atomic_new(0),
+        total_tasks: atomic_new(0),
+        num_workers: num
+    };
+
+    # Spawn worker threads
+    i = 0;
+    when i < num loop
+        handle = thread_spawn(_worker_loop, pool);
+        vec_push(pool.workers, handle);
+        i = i + 1;
+    end
+
+    out pool;
+end
+
+# ─── Worker loop ─────────────────────────────────────
+
+func _worker_loop:
+    in(pool: ThreadPool)
+    running = true;
+    when running loop
+        mutex_lock(pool.mtx);
+
+        # Wait while queue is empty and not shutting down
+        has_work = false;
+        when not has_work loop
+            if vec_len(pool.task_queue) > 0:
+                has_work = true;
+            eif atomic_load(pool.shutdown) == 1:
+                has_work = true;  # wake up to exit
+            else:
+                condvar_wait(pool.cv, pool.mtx);
+            end
+        end
+
+        if vec_len(pool.task_queue) == 0 and atomic_load(pool.shutdown) == 1:
+            mutex_unlock(pool.mtx);
+            running = false;
+        else:
+            if vec_len(pool.task_queue) > 0:
+                task = vec_pop(pool.task_queue);
+                mutex_unlock(pool.mtx);
+
+                atomic_add(pool.active_tasks, 1);
+                task.work_fn(task.context);
+                atomic_add(pool.active_tasks, -1);
+                atomic_add(pool.total_tasks, 1);
+            else:
+                mutex_unlock(pool.mtx);
+            end
+        end
+    end
+end
+
+# ─── Submit a task ───────────────────────────────────
+
+func thread_pool_submit:
+    in(pool: ThreadPool; fn: func(ctx: int); ctx: int)
+    task = Task { work_fn: fn, context: ctx };
+    mutex_lock(pool.mtx);
+    vec_push(pool.task_queue, task);
+    mutex_unlock(pool.mtx);
+    condvar_signal(pool.cv);
+end
+
+# ─── Shutdown — finish pending, then stop ────────────
+
+func thread_pool_shutdown:
+    in(pool: ThreadPool)
+    atomic_store(pool.shutdown, 1);
+    condvar_broadcast(pool.cv);
+
+    # Join all workers
+    i = 0;
+    when i < vec_len(pool.workers) loop
+        handle = vec_get(pool.workers, i);
+        thread_join(handle);
+        i = i + 1;
+    end
+end
+
+# ─── Shutdown now — discard pending tasks ────────────
+
+func thread_pool_shutdown_now:
+    in(pool: ThreadPool)
+    mutex_lock(pool.mtx);
+    # Clear task queue
+    pool.task_queue = vec_new();
+    mutex_unlock(pool.mtx);
+
+    atomic_store(pool.shutdown, 1);
+    condvar_broadcast(pool.cv);
+
+    i = 0;
+    when i < vec_len(pool.workers) loop
+        handle = vec_get(pool.workers, i);
+        thread_join(handle);
+        i = i + 1;
+    end
+end
+
+# ─── Stats ───────────────────────────────────────────
+
+func thread_pool_active:
+    in(pool: ThreadPool)
+    out atomic_load(pool.active_tasks);
+end
+
+func thread_pool_pending:
+    in(pool: ThreadPool)
+    mutex_lock(pool.mtx);
+    n = vec_len(pool.task_queue);
+    mutex_unlock(pool.mtx);
+    out n;
+end
+
+func thread_pool_completed:
+    in(pool: ThreadPool)
+    out atomic_load(pool.total_tasks);
+end
+
+func thread_pool_is_shutdown:
+    in(pool: ThreadPool)
+    out atomic_load(pool.shutdown) == 1;
+end
+
+func thread_pool_worker_count:
+    in(pool: ThreadPool)
+    out pool.num_workers;
+end

@@ -81,6 +81,9 @@ typedef enum {
     TOK_TRY,            /* try (v1.2)                   */
     TOK_ERROR_KW,       /* error (v1.2 keyword)         */
 
+    /* ── Type alias (v1.2) ────────────────────────────── */
+    TOK_TYPE_KW,        /* type (v1.2 type alias decl)  */
+
     /* ── Data structures ───────────────────────────────── */
     TOK_MAP_KW,         /* map keyword (v1.2)           */
 

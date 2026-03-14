@@ -1,0 +1,463 @@
+##
+ * vir/net/websocket.vri — WebSocket Protocol (RFC 6455)
+ * ======================================================
+ * Inspired by Rust: tungstenite, tokio-tungstenite
+ * Inspired by Go: gorilla/websocket
+ * Inspired by Python: websockets
+ *
+ * Phase C — Tier 2: WebSocket client/server framing.
+ * Handles handshake, text/binary/ping/pong/close frames.
+ * Uses existing TCP + crypto modules.
+ ##
+
+include types;
+include vec;
+import Vec, vec_new, vec_push, vec_get, vec_set, vec_len from vec;
+include option;
+import Option, Some, None from option;
+include builder;
+import StringBuilder, sb_new, sb_append, sb_append_byte, sb_append_i64, sb_append_cstr, sb_build, sb_free from builder;
+
+# ═══════════════════════════════════════════════════════
+# WebSocket opcodes
+# ═══════════════════════════════════════════════════════
+
+const WS_OP_CONTINUATION: 0;
+const WS_OP_TEXT:          1;
+const WS_OP_BINARY:        2;
+const WS_OP_CLOSE:         8;
+const WS_OP_PING:          9;
+const WS_OP_PONG:          10;
+
+# Close status codes
+const WS_CLOSE_NORMAL:     1000;
+const WS_CLOSE_GOING_AWAY: 1001;
+const WS_CLOSE_PROTOCOL:   1002;
+const WS_CLOSE_UNSUPPORTED: 1003;
+const WS_CLOSE_ABNORMAL:   1006;
+
+# Connection states
+const WS_STATE_CONNECTING: 0;
+const WS_STATE_OPEN:       1;
+const WS_STATE_CLOSING:    2;
+const WS_STATE_CLOSED:     3;
+
+# Max frame payload
+const WS_MAX_PAYLOAD: 16777216;   # 16 MB
+
+# ═══════════════════════════════════════════════════════
+# WebSocket Frame
+# ═══════════════════════════════════════════════════════
+
+entity WsFrame:
+    fin:      bool;
+    opcode:   int;
+    masked:   bool;
+    mask_key: Vec;      # 4 bytes (empty if not masked)
+    payload:  Vec;      # raw payload bytes
+end
+
+func ws_frame_text:
+    in(text: string)
+    payload = vec_new();
+    i = 0;
+    when i < str_len(text) loop
+        vec_push(payload, str_byte_at(text, i));
+        i = i + 1;
+    end
+    out WsFrame {
+        fin: true,
+        opcode: WS_OP_TEXT,
+        masked: false,
+        mask_key: vec_new(),
+        payload: payload
+    };
+end
+
+func ws_frame_binary:
+    in(data: Vec)
+    out WsFrame {
+        fin: true,
+        opcode: WS_OP_BINARY,
+        masked: false,
+        mask_key: vec_new(),
+        payload: data
+    };
+end
+
+func ws_frame_ping:
+    in()
+    out WsFrame {
+        fin: true,
+        opcode: WS_OP_PING,
+        masked: false,
+        mask_key: vec_new(),
+        payload: vec_new()
+    };
+end
+
+func ws_frame_pong:
+    in(ping_payload: Vec)
+    out WsFrame {
+        fin: true,
+        opcode: WS_OP_PONG,
+        masked: false,
+        mask_key: vec_new(),
+        payload: ping_payload
+    };
+end
+
+func ws_frame_close:
+    in(code: int)
+    payload = vec_new();
+    vec_push(payload, (code / 256) % 256);
+    vec_push(payload, code % 256);
+    out WsFrame {
+        fin: true,
+        opcode: WS_OP_CLOSE,
+        masked: false,
+        mask_key: vec_new(),
+        payload: payload
+    };
+end
+
+# ═══════════════════════════════════════════════════════
+# Frame serialization — encode frame to wire bytes
+# ═══════════════════════════════════════════════════════
+
+func ws_encode_frame:
+    in(frame: WsFrame)
+    result = vec_new();
+    payload_len = vec_len(frame.payload);
+
+    # Byte 0: FIN + opcode
+    b0 = frame.opcode;
+    if frame.fin:
+        b0 = b0 + 128;     # FIN bit
+    end
+    vec_push(result, b0);
+
+    # Byte 1: MASK bit + payload length
+    mask_bit = 0;
+    if frame.masked:
+        mask_bit = 128;
+    end
+
+    if payload_len < 126:
+        vec_push(result, mask_bit + payload_len);
+    eif payload_len < 65536:
+        vec_push(result, mask_bit + 126);
+        vec_push(result, (payload_len / 256) % 256);
+        vec_push(result, payload_len % 256);
+    else:
+        vec_push(result, mask_bit + 127);
+        # 8-byte extended length (big-endian)
+        vec_push(result, 0);
+        vec_push(result, 0);
+        vec_push(result, 0);
+        vec_push(result, 0);
+        vec_push(result, (payload_len / 16777216) % 256);
+        vec_push(result, (payload_len / 65536) % 256);
+        vec_push(result, (payload_len / 256) % 256);
+        vec_push(result, payload_len % 256);
+    end
+
+    # Mask key (if masked)
+    if frame.masked:
+        i = 0;
+        when i < 4 loop
+            vec_push(result, vec_get(frame.mask_key, i));
+            i = i + 1;
+        end
+    end
+
+    # Payload (masked if needed)
+    i = 0;
+    when i < payload_len loop
+        b = vec_get(frame.payload, i);
+        if frame.masked:
+            mk = vec_get(frame.mask_key, i % 4);
+            b = _ws_xor_byte(b, mk);
+        end
+        vec_push(result, b);
+        i = i + 1;
+    end
+
+    out result;
+end
+
+func _ws_xor_byte:
+    in(a: int; b: int)
+    result = 0;
+    power = 1;
+    bit = 0;
+    when bit < 8 loop
+        ba = (a / power) % 2;
+        bb = (b / power) % 2;
+        if ba != bb:
+            result = result + power;
+        end
+        power = power * 2;
+        bit = bit + 1;
+    end
+    out result;
+end
+
+# ═══════════════════════════════════════════════════════
+# Frame parsing — decode frame from wire bytes
+# ═══════════════════════════════════════════════════════
+
+entity WsParseResult:
+    frame:          WsFrame;
+    bytes_consumed: int;
+    valid:          bool;
+end
+
+func ws_decode_frame:
+    in(data: Vec)
+    invalid = WsParseResult {
+        frame: WsFrame { fin: false, opcode: 0, masked: false, mask_key: vec_new(), payload: vec_new() },
+        bytes_consumed: 0,
+        valid: false
+    };
+
+    if vec_len(data) < 2:
+        out invalid;
+    end
+
+    pos = 0;
+
+    # Byte 0
+    b0 = vec_get(data, pos);
+    pos = pos + 1;
+    fin = b0 >= 128;
+    opcode = b0 % 16;
+
+    # Byte 1
+    b1 = vec_get(data, pos);
+    pos = pos + 1;
+    masked = b1 >= 128;
+    payload_len = b1 % 128;
+
+    # Extended payload length
+    if payload_len == 126:
+        if vec_len(data) < pos + 2:
+            out invalid;
+        end
+        payload_len = vec_get(data, pos) * 256 + vec_get(data, pos + 1);
+        pos = pos + 2;
+    eif payload_len == 127:
+        if vec_len(data) < pos + 8:
+            out invalid;
+        end
+        payload_len = vec_get(data, pos + 4) * 16777216
+                    + vec_get(data, pos + 5) * 65536
+                    + vec_get(data, pos + 6) * 256
+                    + vec_get(data, pos + 7);
+        pos = pos + 8;
+    end
+
+    if payload_len > WS_MAX_PAYLOAD:
+        out invalid;
+    end
+
+    # Mask key
+    mask_key = vec_new();
+    if masked:
+        if vec_len(data) < pos + 4:
+            out invalid;
+        end
+        i = 0;
+        when i < 4 loop
+            vec_push(mask_key, vec_get(data, pos));
+            pos = pos + 1;
+            i = i + 1;
+        end
+    end
+
+    # Payload
+    if vec_len(data) < pos + payload_len:
+        out invalid;
+    end
+
+    payload = vec_new();
+    i = 0;
+    when i < payload_len loop
+        b = vec_get(data, pos + i);
+        if masked:
+            mk = vec_get(mask_key, i % 4);
+            b = _ws_xor_byte(b, mk);
+        end
+        vec_push(payload, b);
+        i = i + 1;
+    end
+    pos = pos + payload_len;
+
+    frame = WsFrame {
+        fin: fin,
+        opcode: opcode,
+        masked: masked,
+        mask_key: mask_key,
+        payload: payload
+    };
+
+    out WsParseResult {
+        frame: frame,
+        bytes_consumed: pos,
+        valid: true
+    };
+end
+
+# ═══════════════════════════════════════════════════════
+# WebSocket Connection (logical state machine)
+# ═══════════════════════════════════════════════════════
+
+entity WsConnection:
+    state:          int;
+    is_server:      bool;
+    recv_buffer:    Vec;     # accumulated fragments
+    recv_opcode:    int;     # opcode of first fragment
+end
+
+func ws_connection_new:
+    in(is_server: bool)
+    out WsConnection {
+        state: WS_STATE_CONNECTING,
+        is_server: is_server,
+        recv_buffer: vec_new(),
+        recv_opcode: -1
+    };
+end
+
+func ws_open:
+    in(conn: WsConnection)
+    conn.state = WS_STATE_OPEN;
+end
+
+func ws_is_open:
+    in(conn: WsConnection)
+    out conn.state == WS_STATE_OPEN;
+end
+
+# ─── Process an incoming frame ──────────────────────
+
+entity WsMessage:
+    opcode:  int;
+    payload: Vec;
+end
+
+func ws_process_frame:
+    in(conn: WsConnection; frame: WsFrame)
+
+    if frame.opcode == WS_OP_PING:
+        out Some(WsMessage { opcode: WS_OP_PING, payload: frame.payload });
+    end
+
+    if frame.opcode == WS_OP_PONG:
+        out Some(WsMessage { opcode: WS_OP_PONG, payload: frame.payload });
+    end
+
+    if frame.opcode == WS_OP_CLOSE:
+        conn.state = WS_STATE_CLOSED;
+        out Some(WsMessage { opcode: WS_OP_CLOSE, payload: frame.payload });
+    end
+
+    # Text or binary
+    if frame.opcode == WS_OP_TEXT or frame.opcode == WS_OP_BINARY:
+        if frame.fin:
+            out Some(WsMessage { opcode: frame.opcode, payload: frame.payload });
+        else:
+            # Start of fragmented message
+            conn.recv_opcode = frame.opcode;
+            conn.recv_buffer = frame.payload;
+            out None;
+        end
+    end
+
+    if frame.opcode == WS_OP_CONTINUATION:
+        # Append to buffer
+        i = 0;
+        when i < vec_len(frame.payload) loop
+            vec_push(conn.recv_buffer, vec_get(frame.payload, i));
+            i = i + 1;
+        end
+        if frame.fin:
+            msg = WsMessage { opcode: conn.recv_opcode, payload: conn.recv_buffer };
+            conn.recv_buffer = vec_new();
+            conn.recv_opcode = -1;
+            out Some(msg);
+        end
+        out None;
+    end
+
+    out None;
+end
+
+# ─── Extract text from message ──────────────────────
+
+func ws_message_text:
+    in(msg: WsMessage)
+    sb = sb_new();
+    i = 0;
+    when i < vec_len(msg.payload) loop
+        sb_append_byte(sb, vec_get(msg.payload, i));
+        i = i + 1;
+    end
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;
+end
+
+func ws_message_is_text:
+    in(msg: WsMessage)
+    out msg.opcode == WS_OP_TEXT;
+end
+
+func ws_message_is_binary:
+    in(msg: WsMessage)
+    out msg.opcode == WS_OP_BINARY;
+end
+
+func ws_message_is_close:
+    in(msg: WsMessage)
+    out msg.opcode == WS_OP_CLOSE;
+end
+
+# ═══════════════════════════════════════════════════════
+# WebSocket Handshake — build HTTP upgrade request/response
+# ═══════════════════════════════════════════════════════
+
+func ws_client_handshake:
+    in(host: string; path: string; ws_key: string)
+    sb = sb_new();
+    sb_append_cstr(sb, "GET ");
+    sb_append(sb, path);
+    sb_append_cstr(sb, " HTTP/1.1\r\nHost: ");
+    sb_append(sb, host);
+    sb_append_cstr(sb, "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ");
+    sb_append(sb, ws_key);
+    sb_append_cstr(sb, "\r\nSec-WebSocket-Version: 13\r\n\r\n");
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;
+end
+
+func ws_server_handshake:
+    in(accept_key: string)
+    sb = sb_new();
+    sb_append_cstr(sb, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ");
+    sb_append(sb, accept_key);
+    sb_append_cstr(sb, "\r\n\r\n");
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;
+end
+
+# ─── Apply mask to frame (clients must mask) ────────
+
+func ws_mask_frame:
+    in(frame: WsFrame; mask: Vec)
+    frame.masked = true;
+    frame.mask_key = mask;
+    out frame;
+end

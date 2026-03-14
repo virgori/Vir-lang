@@ -1,0 +1,160 @@
+// PTX Kernel: Tiled GEMM (C = A × B)
+// Target: sm_70+ (Volta and newer)
+// Tile: 32×32 with 32-deep K accumulation via shared memory
+// Block: (32, 32, 1)  Grid: (ceil(N/32), ceil(M/32), 1)
+
+.version 7.8
+.target sm_70
+.address_size 64
+
+.visible .entry vir_gemm_f32(
+    .param .u64 param_A,      // M × K row-major
+    .param .u64 param_B,      // K × N row-major
+    .param .u64 param_C,      // M × N row-major
+    .param .u32 param_M,
+    .param .u32 param_N,
+    .param .u32 param_K
+) {
+    .reg .u32   %tx, %ty, %bx, %by;
+    .reg .u32   %row, %col, %m, %n, %k, %k_tile, %k_iter;
+    .reg .u64   %addr_a, %addr_b, %addr_c, %base_a, %base_b, %base_c;
+    .reg .u64   %off;
+    .reg .f32   %acc, %a_val, %b_val;
+    .reg .pred  %p_row, %p_col, %p_k, %p_tile;
+
+    .shared .align 16 .f32 sA[1024];  // 32 × 32
+    .shared .align 16 .f32 sB[1024];  // 32 × 32
+
+    // Thread indices
+    mov.u32     %tx, %tid.x;
+    mov.u32     %ty, %tid.y;
+    mov.u32     %bx, %ctaid.x;
+    mov.u32     %by, %ctaid.y;
+
+    // Global row, col
+    mul.lo.u32  %row, %by, 32;
+    add.u32     %row, %row, %ty;
+    mul.lo.u32  %col, %bx, 32;
+    add.u32     %col, %col, %tx;
+
+    ld.param.u32 %m, [param_M];
+    ld.param.u32 %n, [param_N];
+    ld.param.u32 %k, [param_K];
+
+    // Init accumulator
+    mov.f32     %acc, 0f00000000;
+
+    // K-tile loop
+    mov.u32     %k_tile, 0;
+$L_tile_loop:
+    setp.ge.u32 %p_tile, %k_tile, %k;
+    @%p_tile bra $L_tile_done;
+
+    // Load tile of A into sA: A[row, k_tile + tx]
+    add.u32     %k_iter, %k_tile, %tx;
+    setp.lt.u32 %p_row, %row, %m;
+    setp.lt.u32 %p_k, %k_iter, %k;
+    and.pred    %p_row, %p_row, %p_k;
+    @!%p_row mov.f32 %a_val, 0f00000000;
+    @%p_row {
+        ld.param.u64 %base_a, [param_A];
+        cvt.u64.u32  %off, %row;
+        cvt.u64.u32  %addr_a, %k;
+        mul.lo.u64   %off, %off, %addr_a;
+        cvt.u64.u32  %addr_a, %k_iter;
+        add.u64      %off, %off, %addr_a;
+        shl.b64      %off, %off, 2;
+        add.u64      %addr_a, %base_a, %off;
+        ld.global.f32 %a_val, [%addr_a];
+    }
+    // sA[ty * 32 + tx]
+    mul.lo.u32  %k_iter, %ty, 32;
+    add.u32     %k_iter, %k_iter, %tx;
+    cvt.u64.u32 %off, %k_iter;
+    shl.b64     %off, %off, 2;
+    mov.u64     %addr_a, sA;
+    add.u64     %addr_a, %addr_a, %off;
+    st.shared.f32 [%addr_a], %a_val;
+
+    // Load tile of B into sB: B[k_tile + ty, col]
+    add.u32     %k_iter, %k_tile, %ty;
+    setp.lt.u32 %p_col, %col, %n;
+    setp.lt.u32 %p_k, %k_iter, %k;
+    and.pred    %p_col, %p_col, %p_k;
+    @!%p_col mov.f32 %b_val, 0f00000000;
+    @%p_col {
+        ld.param.u64 %base_b, [param_B];
+        cvt.u64.u32  %off, %k_iter;
+        cvt.u64.u32  %addr_b, %n;
+        mul.lo.u64   %off, %off, %addr_b;
+        cvt.u64.u32  %addr_b, %col;
+        add.u64      %off, %off, %addr_b;
+        shl.b64      %off, %off, 2;
+        add.u64      %addr_b, %base_b, %off;
+        ld.global.f32 %b_val, [%addr_b];
+    }
+    mul.lo.u32  %k_iter, %ty, 32;
+    add.u32     %k_iter, %k_iter, %tx;
+    cvt.u64.u32 %off, %k_iter;
+    shl.b64     %off, %off, 2;
+    mov.u64     %addr_b, sB;
+    add.u64     %addr_b, %addr_b, %off;
+    st.shared.f32 [%addr_b], %b_val;
+
+    bar.sync    0;
+
+    // Accumulate: acc += sA[ty][i] * sB[i][tx]  for i in 0..31
+    .reg .u32 %i;
+    mov.u32   %i, 0;
+$L_inner:
+    setp.ge.u32 %p_k, %i, 32;
+    @%p_k bra   $L_inner_done;
+
+    // sA[ty * 32 + i]
+    mul.lo.u32  %k_iter, %ty, 32;
+    add.u32     %k_iter, %k_iter, %i;
+    cvt.u64.u32 %off, %k_iter;
+    shl.b64     %off, %off, 2;
+    mov.u64     %addr_a, sA;
+    add.u64     %addr_a, %addr_a, %off;
+    ld.shared.f32 %a_val, [%addr_a];
+
+    // sB[i * 32 + tx]
+    mul.lo.u32  %k_iter, %i, 32;
+    add.u32     %k_iter, %k_iter, %tx;
+    cvt.u64.u32 %off, %k_iter;
+    shl.b64     %off, %off, 2;
+    mov.u64     %addr_b, sB;
+    add.u64     %addr_b, %addr_b, %off;
+    ld.shared.f32 %b_val, [%addr_b];
+
+    fma.rn.f32  %acc, %a_val, %b_val, %acc;
+
+    add.u32     %i, %i, 1;
+    bra         $L_inner;
+$L_inner_done:
+
+    bar.sync    0;
+    add.u32     %k_tile, %k_tile, 32;
+    bra         $L_tile_loop;
+
+$L_tile_done:
+    // Store C[row, col]
+    setp.lt.u32 %p_row, %row, %m;
+    setp.lt.u32 %p_col, %col, %n;
+    and.pred    %p_row, %p_row, %p_col;
+    @!%p_row bra $L_exit;
+
+    ld.param.u64 %base_c, [param_C];
+    cvt.u64.u32  %off, %row;
+    cvt.u64.u32  %addr_c, %n;
+    mul.lo.u64   %off, %off, %addr_c;
+    cvt.u64.u32  %addr_c, %col;
+    add.u64      %off, %off, %addr_c;
+    shl.b64      %off, %off, 2;
+    add.u64      %addr_c, %base_c, %off;
+    st.global.f32 [%addr_c], %acc;
+
+$L_exit:
+    ret;
+}
