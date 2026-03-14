@@ -76,8 +76,9 @@ cp "${VIR_ROOT}/core/lib/libvir_core.a"  "${BUILD_DIR}/usr/local/lib/" 2>/dev/nu
 # CLI binary
 cp "${VIR_ROOT}/core/build/vir" "${BUILD_DIR}/usr/local/bin/vir-native" 2>/dev/null || true
 
-# Python package
-cp -r "${VIR_ROOT}/src" "${BUILD_DIR}/usr/local/lib/python3/dist-packages/vir_src"
+# Python package (keep original module name 'src' for import compatibility)
+cp -r "${VIR_ROOT}/src" "${BUILD_DIR}/usr/local/lib/python3/dist-packages/src"
+cp -r "${VIR_ROOT}/stdlib" "${BUILD_DIR}/usr/local/lib/python3/dist-packages/stdlib" 2>/dev/null || true
 
 # Stdlib
 cp -r "${VIR_ROOT}/stdlib" "${BUILD_DIR}/usr/local/share/vir/stdlib/" 2>/dev/null || true
