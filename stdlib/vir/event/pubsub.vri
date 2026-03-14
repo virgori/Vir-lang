@@ -1,0 +1,207 @@
+##
+ * vir/event/pubsub.vri — Publish/Subscribe Event System
+ * =======================================================
+ * Inspired by Python: blinker, pyee
+ * Inspired by Rust: tokio broadcast
+ * Inspired by Node.js: EventEmitter
+ *
+ * In-process typed pub/sub: named topics, multiple subscribers,
+ * synchronous and async dispatch, wildcard patterns.
+ ##
+
+include types;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include string;
+import String, str_new, str_eq, str_starts_with from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get, vec_remove from vec;
+include thread;
+import Mutex, mutex_new, mutex_lock, mutex_unlock from thread;
+
+# ═══════════════════════════════════════════════════════
+# Event & Subscription
+# ═══════════════════════════════════════════════════════
+
+entity Event:
+    topic:     string;
+    payload:   ptr;
+    payload_sz: int;
+    timestamp: int;     # epoch ms
+end
+
+entity Subscription:
+    id:       int;
+    topic:    string;
+    callback: func(Event);
+    once:     bool;          # fire only once then auto-unsubscribe
+end
+
+entity EventBus:
+    subs:      Vec<Subscription>;
+    next_id:   int;
+    _lock:     Mutex;
+end
+
+# ═══════════════════════════════════════════════════════
+# Bus Creation
+# ═══════════════════════════════════════════════════════
+
+func event_bus_new:
+    out EventBus {
+        subs = vec_new<Subscription>(),
+        next_id = 1,
+        _lock = mutex_new()
+    };
+end
+
+# ═══════════════════════════════════════════════════════
+# Subscribe
+# ═══════════════════════════════════════════════════════
+
+## Subscribe to a topic. Returns subscription ID.
+func event_subscribe:
+    in(bus: EventBus; topic: string; callback: func(Event))
+    mutex_lock(bus._lock);
+    id = bus.next_id;
+    bus.next_id = bus.next_id + 1;
+    vec_push<Subscription>(&bus.subs, Subscription {
+        id = id, topic = topic, callback = callback, once = false
+    });
+    mutex_unlock(bus._lock);
+    out id;
+end
+
+## Subscribe to a topic, auto-unsubscribe after first event.
+func event_subscribe_once:
+    in(bus: EventBus; topic: string; callback: func(Event))
+    mutex_lock(bus._lock);
+    id = bus.next_id;
+    bus.next_id = bus.next_id + 1;
+    vec_push<Subscription>(&bus.subs, Subscription {
+        id = id, topic = topic, callback = callback, once = true
+    });
+    mutex_unlock(bus._lock);
+    out id;
+end
+
+## Unsubscribe by ID.
+func event_unsubscribe:
+    in(bus: EventBus; sub_id: int)
+    mutex_lock(bus._lock);
+    i = 0;
+    when i < vec_len<Subscription>(bus.subs) loop
+        sub = vec_get<Subscription>(bus.subs, i);
+        if sub.id == sub_id:
+            vec_remove<Subscription>(&bus.subs, i);
+            mutex_unlock(bus._lock);
+            out;
+        end
+        i = i + 1;
+    end
+    mutex_unlock(bus._lock);
+end
+
+# ═══════════════════════════════════════════════════════
+# Publish
+# ═══════════════════════════════════════════════════════
+
+## Publish an event to all matching subscribers (synchronous).
+func event_publish:
+    in(bus: EventBus; topic: string; payload: ptr; payload_sz: int)
+    evt = Event {
+        topic = topic, payload = payload,
+        payload_sz = payload_sz, timestamp = native_time_ms()
+    };
+
+    mutex_lock(bus._lock);
+    # Collect callbacks & mark once-subs for removal
+    to_remove = vec_new<int>();
+    callbacks = vec_new<func(Event)>();
+
+    i = 0;
+    when i < vec_len<Subscription>(bus.subs) loop
+        sub = vec_get<Subscription>(bus.subs, i);
+        if _topic_matches(sub.topic, topic):
+            vec_push<func(Event)>(&callbacks, sub.callback);
+            if sub.once:
+                vec_push<int>(&to_remove, i);
+            end
+        end
+        i = i + 1;
+    end
+
+    # Remove once-subs (reverse order)
+    j = vec_len<int>(to_remove) - 1;
+    when j >= 0 loop
+        idx = vec_get<int>(to_remove, j);
+        vec_remove<Subscription>(&bus.subs, idx);
+        j = j - 1;
+    end
+    mutex_unlock(bus._lock);
+
+    # Invoke callbacks outside lock
+    k = 0;
+    when k < vec_len<func(Event)>(callbacks) loop
+        cb = vec_get<func(Event)>(callbacks, k);
+        cb(evt);
+        k = k + 1;
+    end
+end
+
+## Publish with a string payload (convenience).
+func event_publish_str:
+    in(bus: EventBus; topic: string; message: string)
+    event_publish(bus, topic, str_ptr(message), str_byte_len(message));
+end
+
+# ═══════════════════════════════════════════════════════
+# Topic Matching (supports wildcard *)
+# ═══════════════════════════════════════════════════════
+
+func _topic_matches:
+    in(pattern: string; topic: string)
+    if str_eq(pattern, str_new("*")) out true end:
+    if str_eq(pattern, topic) out true end:
+    # Prefix wildcard: "user.*" matches "user.login", "user.signup"
+    plen = str_byte_len(pattern);
+    if plen > 1:
+        last = native_load_u8(ptr_add(str_ptr(pattern), plen - 1));
+        if last == 0x2A:  # '*'
+            prefix = str_substr(pattern, 0, plen - 1);
+            out str_starts_with(topic, prefix);
+        end
+    end
+    out false;
+end
+
+# ═══════════════════════════════════════════════════════
+# Helpers
+# ═══════════════════════════════════════════════════════
+
+## Get subscriber count for a topic.
+func event_subscriber_count:
+    in(bus: EventBus; topic: string)
+    count = 0;
+    i = 0;
+    when i < vec_len<Subscription>(bus.subs) loop
+        sub = vec_get<Subscription>(bus.subs, i);
+        if _topic_matches(sub.topic, topic):
+            count = count + 1;
+        end
+        i = i + 1;
+    end
+    out count;
+end
+
+## Remove all subscribers.
+func event_clear_all:
+    in(bus: EventBus)
+    mutex_lock(bus._lock);
+    bus.subs = vec_new<Subscription>();
+    mutex_unlock(bus._lock);
+end
+
+extern func native_time_ms() -> int

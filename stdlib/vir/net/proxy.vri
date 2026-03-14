@@ -1,0 +1,205 @@
+##
+ * vir/net/proxy.vri — SOCKS5 & HTTP Proxy Client
+ * ==================================================
+ * Inspired by Python: PySocks, urllib.request.ProxyHandler
+ * Inspired by Rust: reqwest proxy, tokio-socks
+ * Inspired by C: libcurl proxy support
+ *
+ * SOCKS5 (RFC 1928) and HTTP CONNECT tunnel support.
+ ##
+
+include types;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include string;
+import String, str_new, str_byte_len, str_ptr, str_concat from string;
+include net;
+import TcpStream, tcp_connect, tcp_write, tcp_read from net;
+
+# ═══════════════════════════════════════════════════════
+# Proxy Types
+# ═══════════════════════════════════════════════════════
+
+enum ProxyType:
+    Socks5     = 0;
+    HttpConnect = 1;
+end
+
+entity ProxyConfig:
+    proxy_type: ProxyType;
+    host:       string;
+    port:       int;
+    username:   Option<string>;
+    password:   Option<string>;
+end
+
+func proxy_socks5:
+    in(host: string; port: int)
+    out ProxyConfig {
+        proxy_type = ProxyType.Socks5,
+        host = host, port = port,
+        username = None, password = None
+    };
+end
+
+func proxy_http:
+    in(host: string; port: int)
+    out ProxyConfig {
+        proxy_type = ProxyType.HttpConnect,
+        host = host, port = port,
+        username = None, password = None
+    };
+end
+
+func proxy_set_auth:
+    in(cfg: ProxyConfig; user: string; pass: string)
+    cfg.username = Some(user);
+    cfg.password = Some(pass);
+end
+
+# ═══════════════════════════════════════════════════════
+# SOCKS5 Implementation (RFC 1928)
+# ═══════════════════════════════════════════════════════
+
+## Connect to a target through a SOCKS5 proxy.
+func socks5_connect:
+    in(proxy: ProxyConfig; target_host: string; target_port: int)
+    # Connect to proxy
+    stream_r = tcp_connect(proxy.host, proxy.port);
+    if is_err(stream_r):
+        out Err(str_new("SOCKS5: proxy connection failed"));
+    end
+    stream = unwrap_ok(stream_r);
+
+    # Greeting: VER=5, NMETHODS, METHODS
+    has_auth = is_some(proxy.username);
+    var greeting: [int; 4];
+    greeting[0] = 0x05;   # SOCKS version 5
+    if has_auth:
+        greeting[1] = 2;  # 2 methods
+        greeting[2] = 0x00;  # NO AUTH
+        greeting[3] = 0x02;  # USERNAME/PASSWORD
+        tcp_write(stream, &greeting, 4);
+    else
+        greeting[1] = 1;
+        greeting[2] = 0x00;
+        tcp_write(stream, &greeting, 3);
+    end
+
+    # Read server choice
+    var choice: [int; 2];
+    n = tcp_read(stream, &choice, 2);
+    if n < 2 | choice[0] != 0x05:
+        out Err(str_new("SOCKS5: invalid server greeting"));
+    end
+
+    # Handle auth if required
+    if choice[1] == 0x02:
+        if !has_auth:
+            out Err(str_new("SOCKS5: auth required but not configured"));
+        end
+        user = unwrap(proxy.username);
+        pass = unwrap(proxy.password);
+        ulen = str_byte_len(user);
+        plen = str_byte_len(pass);
+
+        var auth_pkt: [int; 515];
+        auth_pkt[0] = 0x01;  # auth version
+        auth_pkt[1] = ulen;
+        mem_copy(ptr_add(&auth_pkt, 2), str_ptr(user), ulen);
+        auth_pkt[2 + ulen] = plen;
+        mem_copy(ptr_add(&auth_pkt, 3 + ulen), str_ptr(pass), plen);
+        tcp_write(stream, &auth_pkt, 3 + ulen + plen);
+
+        var auth_resp: [int; 2];
+        tcp_read(stream, &auth_resp, 2);
+        if auth_resp[1] != 0x00:
+            out Err(str_new("SOCKS5: authentication failed"));
+        end
+    elif choice[1] != 0x00:
+        out Err(str_new("SOCKS5: no acceptable auth method"));
+    end
+
+    # CONNECT request
+    var req: [int; 263];
+    req[0] = 0x05;   # VER
+    req[1] = 0x01;   # CMD: CONNECT
+    req[2] = 0x00;   # RSV
+    req[3] = 0x03;   # ATYP: DOMAINNAME
+
+    hlen = str_byte_len(target_host);
+    req[4] = hlen;
+    mem_copy(ptr_add(&req, 5), str_ptr(target_host), hlen);
+    req[5 + hlen] = (target_port >> 8) & 0xFF;
+    req[6 + hlen] = target_port & 0xFF;
+    tcp_write(stream, &req, 7 + hlen);
+
+    # Read CONNECT response
+    var resp: [int; 10];
+    tcp_read(stream, &resp, 10);
+    if resp[1] != 0x00:
+        out Err(str_new("SOCKS5: connect request failed"));
+    end
+
+    out Ok(stream);
+end
+
+# ═══════════════════════════════════════════════════════
+# HTTP CONNECT Tunnel
+# ═══════════════════════════════════════════════════════
+
+## Connect to a target through an HTTP CONNECT proxy.
+func http_proxy_connect:
+    in(proxy: ProxyConfig; target_host: string; target_port: int)
+    stream_r = tcp_connect(proxy.host, proxy.port);
+    if is_err(stream_r):
+        out Err(str_new("HTTP proxy: connection failed"));
+    end
+    stream = unwrap_ok(stream_r);
+
+    # CONNECT request
+    target = str_concat(target_host, str_concat(str_new(":"), i64_to_str(target_port)));
+    req = str_concat(str_new("CONNECT "), str_concat(target,
+        str_new(" HTTP/1.1\r\nHost: ")));
+    req = str_concat(req, str_concat(target, str_new("\r\n")));
+
+    # Auth header if configured
+    if is_some(proxy.username):
+        user = unwrap(proxy.username);
+        pass = if is_some(proxy.password): unwrap(proxy.password); else str_new(""); end;
+        creds = str_concat(user, str_concat(str_new(":"), pass));
+        encoded = base64_encode(creds);
+        req = str_concat(req, str_concat(str_new("Proxy-Authorization: Basic "),
+              str_concat(encoded, str_new("\r\n"))));
+    end
+
+    req = str_concat(req, str_new("\r\n"));
+    tcp_write(stream, str_ptr(req), str_byte_len(req));
+
+    # Read response
+    var buf: [int; 1024];
+    n = tcp_read(stream, &buf, 1024);
+    resp = str_from_bytes(&buf, n);
+    # Check for "200" in response line
+    if !str_contains(resp, str_new("200")):
+        out Err(str_new("HTTP proxy: CONNECT rejected"));
+    end
+
+    out Ok(stream);
+end
+
+# ═══════════════════════════════════════════════════════
+# Unified API
+# ═══════════════════════════════════════════════════════
+
+## Connect through proxy (auto-selects SOCKS5 or HTTP CONNECT).
+func proxy_connect:
+    in(proxy: ProxyConfig; target_host: string; target_port: int)
+    if proxy.proxy_type == ProxyType.Socks5:
+        out socks5_connect(proxy, target_host, target_port);
+    else
+        out http_proxy_connect(proxy, target_host, target_port);
+    end
+end

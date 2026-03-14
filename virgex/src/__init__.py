@@ -25,6 +25,7 @@ from .matcher import (  # noqa: F401
     search,
     to_regex,
 )
+from .nfa import compile_nfa, nfa_fullmatch, nfa_search, nfa_findall  # noqa: F401
 from .errors import VPSError, VPSLexError, VPSParseError, VPSCompileError  # noqa: F401
 
 __all__ = [
@@ -35,6 +36,10 @@ __all__ = [
     "VPSParseError",
     "VPSCompileError",
     "compile",
+    "compile_nfa",
+    "nfa_fullmatch",
+    "nfa_search",
+    "nfa_findall",
     "fullmatch",
     "match",
     "search",

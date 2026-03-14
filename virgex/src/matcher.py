@@ -1,4 +1,9 @@
-"""VPS Matcher — high-level API for compiling and matching VPS patterns."""
+"""VPS Matcher — high-level API for compiling and matching VPS patterns.
+
+Supports two engines:
+  - 'regex' (default): Compiles VPS → Python regex via re module
+  - 'nfa': Thompson NFA simulation — guaranteed O(n*m), no backtracking
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,7 @@ from dataclasses import dataclass
 from .compiler import Compiler
 from .lexer import Lexer
 from .parser import Parser
+from .nfa import compile_nfa, nfa_fullmatch, nfa_search, nfa_findall
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,15 +28,31 @@ class VPSMatch:
 
 
 class Virgex:
-    """Compiled VPS pattern — analogous to ``re.Pattern``."""
+    """Compiled VPS pattern — analogous to ``re.Pattern``.
 
-    def __init__(self, source: str) -> None:
+    Parameters
+    ----------
+    source : str
+        The VPS pattern string.
+    engine : str
+        'regex' (default) or 'nfa' (Thompson NFA, no backtracking).
+    """
+
+    def __init__(self, source: str, *, engine: str = "regex") -> None:
         self.source = source
+        self._engine = engine
         tokens = Lexer(source).tokenize()
         ast = Parser(tokens).parse()
-        regex_str = Compiler().compile(ast)
-        self._regex = re.compile(regex_str)
-        self._regex_str = regex_str
+
+        if engine == "nfa":
+            self._nfa = compile_nfa(ast)
+            self._regex = None
+            self._regex_str = "(NFA engine)"
+        else:
+            regex_str = Compiler().compile(ast)
+            self._regex = re.compile(regex_str)
+            self._regex_str = regex_str
+            self._nfa = None
 
     @property
     def regex(self) -> str:
@@ -38,28 +60,47 @@ class Virgex:
         return self._regex_str
 
     def fullmatch(self, text: str) -> VPSMatch | None:
+        if self._nfa is not None:
+            if nfa_fullmatch(self._nfa, text):
+                return VPSMatch(start=0, end=len(text), text=text)
+            return None
         m = self._regex.fullmatch(text)
         if m is None:
             return None
         return VPSMatch(start=m.start(), end=m.end(), text=m.group())
 
     def match(self, text: str) -> VPSMatch | None:
+        if self._nfa is not None:
+            result = nfa_search(self._nfa, text)
+            if result is not None and result[0] == 0:
+                s, e = result
+                return VPSMatch(start=s, end=e, text=text[s:e])
+            return None
         m = self._regex.match(text)
         if m is None:
             return None
         return VPSMatch(start=m.start(), end=m.end(), text=m.group())
 
     def search(self, text: str) -> VPSMatch | None:
+        if self._nfa is not None:
+            result = nfa_search(self._nfa, text)
+            if result is not None:
+                s, e = result
+                return VPSMatch(start=s, end=e, text=text[s:e])
+            return None
         m = self._regex.search(text)
         if m is None:
             return None
         return VPSMatch(start=m.start(), end=m.end(), text=m.group())
 
     def findall(self, text: str) -> list[str]:
+        if self._nfa is not None:
+            spans = nfa_findall(self._nfa, text)
+            return [text[s:e] for s, e in spans]
         return self._regex.findall(text)
 
     def __repr__(self) -> str:
-        return f"Virgex({self.source!r}) → /{self._regex_str}/"
+        return f"Virgex({self.source!r}, engine={self._engine!r})"
 
 
 # ── Module-level convenience functions ────────────────

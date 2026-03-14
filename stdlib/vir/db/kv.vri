@@ -1,0 +1,340 @@
+##
+ * vir/db/kv.vri — Key-Value Store
+ * ==================================
+ * Inspired by Python: shelve, dbm
+ * Inspired by Rust: sled
+ * Inspired by C: LevelDB, LMDB
+ *
+ * File-backed key-value store with string keys and byte values.
+ * Uses a simple append-only log with in-memory hash index.
+ ##
+
+include types;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include string;
+import String, str_new, str_eq, str_byte_len, str_ptr from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include map;
+import HashMap, hashmap_new, hashmap_get, hashmap_set,
+       hashmap_remove, hashmap_contains, hashmap_keys from map;
+include io;
+import File, file_open, file_close, file_write, file_read_all,
+       file_seek, file_flush, FileMode from io;
+include thread;
+import Mutex, mutex_new, mutex_lock, mutex_unlock from thread;
+
+# ═══════════════════════════════════════════════════════
+# KV Store
+# ═══════════════════════════════════════════════════════
+
+entity KvStore:
+    _file:    File;
+    _index:   HashMap<string, Vec<int>>;  # key -> serialized value
+    _lock:    Mutex;
+    path:     string;
+    count:    int;
+end
+
+# ═══════════════════════════════════════════════════════
+# Open / Close
+# ═══════════════════════════════════════════════════════
+
+## Open or create a KV store file.
+func kv_open:
+    in(path: string)
+    f_r = file_open(path, FileMode.ReadWrite);
+    if is_err(f_r):
+        # Try creating new
+        f_r = file_open(path, FileMode.Create);
+        if is_err(f_r):
+            out Err(str_new("kv: cannot open store"));
+        end
+    end
+    f = unwrap_ok(f_r);
+
+    index = hashmap_new<string, Vec<int>>();
+
+    # Load existing data
+    existing = file_read_all(f);
+    _kv_load_index(existing, &index);
+
+    count = vec_len<string>(hashmap_keys(index));
+    out Ok(KvStore {
+        _file = f, _index = index,
+        _lock = mutex_new(), path = path,
+        count = count
+    });
+end
+
+## Close the KV store.
+func kv_close:
+    in(store: KvStore)
+    file_flush(store._file);
+    file_close(store._file);
+end
+
+# ═══════════════════════════════════════════════════════
+# Core Operations
+# ═══════════════════════════════════════════════════════
+
+## Get value by key.
+func kv_get:
+    in(store: KvStore; key: string)
+    mutex_lock(store._lock);
+    if hashmap_contains(store._index, key):
+        val = hashmap_get(store._index, key);
+        mutex_unlock(store._lock);
+        out Some(val);
+    end
+    mutex_unlock(store._lock);
+    out None;
+end
+
+## Get value as string.
+func kv_get_str:
+    in(store: KvStore; key: string)
+    r = kv_get(store, key);
+    if is_none(r):
+        out None;
+    end
+    bytes = unwrap(r);
+    out Some(_bytes_to_string(bytes));
+end
+
+## Set a key to a byte array value.
+func kv_set:
+    in(store: KvStore; key: string; value: Vec<int>)
+    mutex_lock(store._lock);
+    is_new = !hashmap_contains(store._index, key);
+    hashmap_set(&store._index, key, value);
+    if is_new:
+        store.count = store.count + 1;
+    end
+    # Append to file
+    _kv_write_entry(store._file, key, value);
+    file_flush(store._file);
+    mutex_unlock(store._lock);
+end
+
+## Set a key to a string value.
+func kv_set_str:
+    in(store: KvStore; key: string; value: string)
+    kv_set(store, key, _string_to_bytes(value));
+end
+
+## Delete a key.
+func kv_delete:
+    in(store: KvStore; key: string)
+    mutex_lock(store._lock);
+    if hashmap_contains(store._index, key):
+        hashmap_remove(&store._index, key);
+        store.count = store.count - 1;
+        # Write tombstone
+        _kv_write_tombstone(store._file, key);
+        file_flush(store._file);
+    end
+    mutex_unlock(store._lock);
+end
+
+## Check if key exists.
+func kv_contains:
+    in(store: KvStore; key: string)
+    out hashmap_contains(store._index, key);
+end
+
+## Get all keys.
+func kv_keys:
+    in(store: KvStore)
+    out hashmap_keys(store._index);
+end
+
+## Number of entries.
+func kv_len:
+    in(store: KvStore)
+    out store.count;
+end
+
+# ═══════════════════════════════════════════════════════
+# Batch Operations
+# ═══════════════════════════════════════════════════════
+
+entity KvBatch:
+    ops: Vec<KvOp>;
+end
+
+entity KvOp:
+    key:    string;
+    value:  Vec<int>;
+    delete: bool;
+end
+
+func kv_batch_new:
+    out KvBatch { ops = vec_new<KvOp>() };
+end
+
+func kv_batch_set:
+    in(batch: KvBatch; key: string; value: Vec<int>)
+    vec_push<KvOp>(&batch.ops, KvOp { key = key, value = value, delete = false });
+end
+
+func kv_batch_delete:
+    in(batch: KvBatch; key: string)
+    vec_push<KvOp>(&batch.ops, KvOp { key = key, value = vec_new<int>(), delete = true });
+end
+
+## Execute all operations in a batch atomically.
+func kv_batch_commit:
+    in(store: KvStore; batch: KvBatch)
+    mutex_lock(store._lock);
+    i = 0;
+    when i < vec_len<KvOp>(batch.ops) loop
+        op = vec_get<KvOp>(batch.ops, i);
+        if op.delete:
+            if hashmap_contains(store._index, op.key):
+                hashmap_remove(&store._index, op.key);
+                store.count = store.count - 1;
+                _kv_write_tombstone(store._file, op.key);
+            end
+        else
+            is_new = !hashmap_contains(store._index, op.key);
+            hashmap_set(&store._index, op.key, op.value);
+            if is_new: store.count = store.count + 1 end:
+            _kv_write_entry(store._file, op.key, op.value);
+        end
+        i = i + 1;
+    end
+    file_flush(store._file);
+    mutex_unlock(store._lock);
+end
+
+# ═══════════════════════════════════════════════════════
+# Compaction
+# ═══════════════════════════════════════════════════════
+
+## Rewrite the store file removing tombstones and old values.
+func kv_compact:
+    in(store: KvStore)
+    mutex_lock(store._lock);
+    # Rebuild by writing current index
+    file_seek(store._file, 0);
+    keys = hashmap_keys(store._index);
+    i = 0;
+    when i < vec_len<string>(keys) loop
+        k = vec_get<string>(keys, i);
+        v = hashmap_get(store._index, k);
+        _kv_write_entry(store._file, k, v);
+        i = i + 1;
+    end
+    file_flush(store._file);
+    mutex_unlock(store._lock);
+end
+
+# ═══════════════════════════════════════════════════════
+# Internal wire format
+# Format per entry: [1-byte op][4-byte key_len][key][4-byte val_len][value]
+# op: 0x01 = SET, 0xFF = DELETE (tombstone)
+# ═══════════════════════════════════════════════════════
+
+func _kv_write_entry:
+    in(f: File; key: string; value: Vec<int>)
+    hdr = vec_new<int>();
+    vec_push<int>(&hdr, 0x01);  # SET
+    klen = str_byte_len(key);
+    vec_push<int>(&hdr, (klen >> 24) & 0xFF);
+    vec_push<int>(&hdr, (klen >> 16) & 0xFF);
+    vec_push<int>(&hdr, (klen >> 8) & 0xFF);
+    vec_push<int>(&hdr, klen & 0xFF);
+    file_write(f, hdr);
+    file_write(f, _string_to_bytes(key));
+    vlen = vec_len<int>(value);
+    lenbuf = vec_new<int>();
+    vec_push<int>(&lenbuf, (vlen >> 24) & 0xFF);
+    vec_push<int>(&lenbuf, (vlen >> 16) & 0xFF);
+    vec_push<int>(&lenbuf, (vlen >> 8) & 0xFF);
+    vec_push<int>(&lenbuf, vlen & 0xFF);
+    file_write(f, lenbuf);
+    file_write(f, value);
+end
+
+func _kv_write_tombstone:
+    in(f: File; key: string)
+    hdr = vec_new<int>();
+    vec_push<int>(&hdr, 0xFF);  # DELETE
+    klen = str_byte_len(key);
+    vec_push<int>(&hdr, (klen >> 24) & 0xFF);
+    vec_push<int>(&hdr, (klen >> 16) & 0xFF);
+    vec_push<int>(&hdr, (klen >> 8) & 0xFF);
+    vec_push<int>(&hdr, klen & 0xFF);
+    file_write(f, hdr);
+    file_write(f, _string_to_bytes(key));
+end
+
+func _kv_load_index:
+    in(data: Vec<int>; index: ptr)
+    pos = 0;
+    dlen = vec_len<int>(data);
+    when pos < dlen loop
+        op = vec_get<int>(data, pos);
+        pos = pos + 1;
+        if pos + 4 > dlen break end:
+        klen = (vec_get<int>(data, pos) << 24) | (vec_get<int>(data, pos+1) << 16)
+             | (vec_get<int>(data, pos+2) << 8) | vec_get<int>(data, pos+3);
+        pos = pos + 4;
+        if pos + klen > dlen break end:
+        key = _bytes_to_string_range(data, pos, klen);
+        pos = pos + klen;
+
+        if op == 0x01:
+            if pos + 4 > dlen break end:
+            vlen = (vec_get<int>(data, pos) << 24) | (vec_get<int>(data, pos+1) << 16)
+                 | (vec_get<int>(data, pos+2) << 8) | vec_get<int>(data, pos+3);
+            pos = pos + 4;
+            if pos + vlen > dlen break end:
+            val = vec_new<int>();
+            i = 0;
+            when i < vlen loop
+                vec_push<int>(&val, vec_get<int>(data, pos + i));
+                i = i + 1;
+            end
+            pos = pos + vlen;
+            hashmap_set(index, key, val);
+        elif op == 0xFF:
+            hashmap_remove(index, key);
+        else
+            break;
+        end
+    end
+end
+
+func _string_to_bytes:
+    in(s: string)
+    bytes = vec_new<int>();
+    slen = str_byte_len(s);
+    i = 0;
+    when i < slen loop
+        vec_push<int>(&bytes, native_load_u8(ptr_add(str_ptr(s), i)));
+        i = i + 1;
+    end
+    out bytes;
+end
+
+func _bytes_to_string:
+    in(bytes: Vec<int>)
+    out _bytes_to_string_range(bytes, 0, vec_len<int>(bytes));
+end
+
+func _bytes_to_string_range:
+    in(bytes: Vec<int>; start: int; len: int)
+    buf = native_alloc(len + 1);
+    i = 0;
+    when i < len loop
+        native_store_u8(ptr_add(buf, i), vec_get<int>(bytes, start + i));
+        i = i + 1;
+    end
+    native_store_u8(ptr_add(buf, len), 0);
+    out native_make_string(buf, len);
+end

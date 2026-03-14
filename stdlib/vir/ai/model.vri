@@ -1,0 +1,210 @@
+##
+ * vir/ai/model.vri — Model Serialization & Checkpoint
+ * =====================================================
+ * Save/load model weights in a compact binary format.
+ * Handles versioning, endianness, and integrity checks.
+ *
+ * File format (.virm):
+ *   [4 bytes] magic: "VIRM"
+ *   [4 bytes] version: u32
+ *   [4 bytes] n_params: u32
+ *   [4 bytes] checksum: u32 (CRC32)
+ *   [8*n]    params: f64[n_params]
+ *
+ * Features:
+ *   - CRC32 integrity verification
+ *   - Version-tagged for forward compatibility
+ *   - Streaming write (no intermediate buffer needed)
+ ##
+
+include types;
+include alloc;
+import alloc, free from alloc;
+include fs;
+import file_open, file_read, file_write, file_close from fs;
+
+# ═══════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════
+
+const MAGIC_VIRM:    0x4D524956;  # "VIRM" in little-endian;
+const MODEL_VERSION: 1;
+
+# ═══════════════════════════════════════════════════════
+# Model Entity
+# ═══════════════════════════════════════════════════════
+
+entity Model:
+    params:    ptr;      # flat f64 array of all parameters;
+    n_params:  int;      # total parameter count;
+    n_layers:  int;      # number of layers;
+    layer_sizes: ptr;    # int array: params per layer;
+end
+
+func model_new:
+    in(n_params: int; n_layers: int)
+    var params = alloc(n_params * 8);
+    var layer_sizes = alloc(n_layers * 4);
+    out Model {
+        params:      params;
+        n_params:    n_params;
+        n_layers:    n_layers;
+        layer_sizes: layer_sizes;
+    };
+end
+
+func model_free:
+    in(m: Model)
+    free(m.params);
+    free(m.layer_sizes);
+end
+
+# ═══════════════════════════════════════════════════════
+# CRC32 (for integrity check)
+# ═══════════════════════════════════════════════════════
+
+func crc32:
+    in(data: ptr; len: int)
+    var crc = 0xFFFFFFFF;
+    var i = 0;
+    when i < len loop
+        var byte = native_load<byte>(data; i);
+        crc = crc xor byte;
+        var bit = 0;
+        when bit < 8 loop
+            if (crc & 1) == 1:
+                crc = (crc shr 1) xor 0xEDB88320;
+            else
+                crc = crc shr 1;
+            end
+            bit = bit + 1;
+        end
+        i = i + 1;
+    end
+    out crc xor 0xFFFFFFFF;
+end
+
+# ═══════════════════════════════════════════════════════
+# Save / Load
+# ═══════════════════════════════════════════════════════
+
+# Save model parameters to .virm file;
+func model_save:
+    in(model: Model; path: string)
+    var f = file_open(path; "wb") try none error SaveError end
+
+    # Write header;
+    var header = alloc(16);
+    native_store<int>(header; 0; MAGIC_VIRM);
+    native_store<int>(header; 1; MODEL_VERSION);
+    native_store<int>(header; 2; model.n_params);
+
+    # Compute checksum;
+    var checksum = crc32(model.params; model.n_params * 8);
+    native_store<int>(header; 3; checksum);
+
+    file_write(f; header; 16);
+    free(header);
+
+    # Write parameters;
+    file_write(f; model.params; model.n_params * 8);
+    file_close(f);
+    out true;
+end
+
+# Load model parameters from .virm file;
+func model_load:
+    in(path: string)
+    var f = file_open(path; "rb") try none error LoadError end
+
+    # Read header;
+    var header = alloc(16);
+    file_read(f; header; 16);
+
+    var magic = native_load<int>(header; 0);
+    if magic != MAGIC_VIRM:
+        free(header);
+        file_close(f);
+        out none try none error FormatError end
+    end
+
+    var version = native_load<int>(header; 1);
+    var n_params = native_load<int>(header; 2);
+    var stored_checksum = native_load<int>(header; 3);
+    free(header);
+
+    # Read parameters;
+    var params = alloc(n_params * 8);
+    file_read(f; params; n_params * 8);
+    file_close(f);
+
+    # Verify checksum;
+    var computed = crc32(params; n_params * 8);
+    if computed != stored_checksum:
+        free(params);
+        out none try none error ChecksumError end
+    end
+
+    out Model {
+        params:      params;
+        n_params:    n_params;
+        n_layers:    0;
+        layer_sizes: none;
+    };
+end
+
+# ═══════════════════════════════════════════════════════
+# Checkpoint (model + optimizer state)
+# ═══════════════════════════════════════════════════════
+
+entity Checkpoint:
+    model:  Model;
+    epoch:  int;
+    step:   int;
+    loss:   float;
+end
+
+func checkpoint_save:
+    in(ckpt: Checkpoint; path: string)
+    # Save model weights;
+    model_save(ckpt.model; path);
+    # Save metadata as sidecar (.meta);
+    var meta_path = path + ".meta";
+    var mf = file_open(meta_path; "wb") try none error SaveError end
+    var meta = alloc(24);
+    native_store<int>(meta; 0; ckpt.epoch);
+    native_store<int>(meta; 1; ckpt.step);
+    native_store<float>(meta; 2; ckpt.loss);
+    file_write(mf; meta; 24);
+    free(meta);
+    file_close(mf);
+    out true;
+end
+
+func checkpoint_load:
+    in(path: string)
+    var model = model_load(path) try none error LoadError end
+
+    # Load metadata;
+    var meta_path = path + ".meta";
+    var mf = file_open(meta_path; "rb") try none error MetaError end
+    var meta = alloc(24);
+    file_read(mf; meta; 24);
+    var epoch = native_load<int>(meta; 0);
+    var step = native_load<int>(meta; 1);
+    var loss = native_load<float>(meta; 2);
+    free(meta);
+    file_close(mf);
+
+    out Checkpoint {
+        model: model;
+        epoch: epoch;
+        step:  step;
+        loss:  loss;
+    };
+end
+
+export Model, Checkpoint;
+export model_new, model_free, model_save, model_load;
+export checkpoint_save, checkpoint_load;
+export crc32;

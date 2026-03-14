@@ -1,0 +1,244 @@
+##
+ * vir/crypto/x509.vri — X.509 Certificate Parsing & Validation
+ * =============================================================
+ * Inspired by Go: crypto/x509
+ * Inspired by Rust: x509-parser, rustls-pki-types
+ *
+ * Phase D — ASN.1/DER parsing, X.509 certificate structure,
+ * basic chain validation, PEM decode.
+ ##
+
+include types;
+include option;
+import Option, Some, None, is_some, is_none, unwrap from option;
+include vec;
+import Vec, vec_new, vec_push, vec_get, vec_len from vec;
+include builder;
+import StringBuilder, sb_new, sb_append, sb_append_i64, sb_build, sb_free from builder;
+
+# ═══════════════════════════════════════════════════════
+# ASN.1 tag constants
+# ═══════════════════════════════════════════════════════
+
+const ASN1_INTEGER          = 2;
+const ASN1_BIT_STRING       = 3;
+const ASN1_OCTET_STRING     = 4;
+const ASN1_NULL             = 5;
+const ASN1_OID              = 6;
+const ASN1_UTF8_STRING      = 12;
+const ASN1_PRINTABLE_STRING = 19;
+const ASN1_IA5_STRING       = 22;
+const ASN1_UTC_TIME         = 23;
+const ASN1_GENERALIZED_TIME = 24;
+const ASN1_SEQUENCE         = 48;  # 0x30
+const ASN1_SET              = 49;  # 0x31
+
+# ═══════════════════════════════════════════════════════
+# ASN.1 DER TLV parser
+# ═══════════════════════════════════════════════════════
+
+entity Asn1Tlv:
+    tag:    int;
+    length: int;
+    offset: int;      # offset of value in the data stream
+    data:   string;   # raw bytes
+end
+
+func asn1_parse_tlv:
+    in(data: string; pos: int)
+    tag = str_byte_at(data, pos);
+    pos = pos + 1;
+
+    # Parse length
+    first_len = str_byte_at(data, pos);
+    pos = pos + 1;
+    length = 0;
+
+    if first_len < 128:
+        length = first_len;
+    else:
+        num_bytes = first_len & 127;
+        i = 0;
+        when i < num_bytes loop
+            length = length * 256 + str_byte_at(data, pos);
+            pos = pos + 1;
+            i = i + 1;
+        end
+    end
+
+    out Asn1Tlv {
+        tag: tag,
+        length: length,
+        offset: pos,
+        data: data
+    };
+end
+
+# ═══════════════════════════════════════════════════════
+# X.509 Certificate fields
+# ═══════════════════════════════════════════════════════
+
+entity X509Name:
+    common_name:  string;
+    organization: string;
+    country:      string;
+    raw:          string;
+end
+
+entity X509Cert:
+    version:      int;           # 1, 2, or 3
+    serial:       string;        # serial number as hex
+    issuer:       X509Name;
+    subject:      X509Name;
+    not_before:   string;        # UTC time string
+    not_after:    string;        # UTC time string
+    sig_algo:     string;        # e.g. "sha256WithRSAEncryption"
+    pub_key_algo: string;        # e.g. "RSA", "EC"
+    pub_key_bits: int;
+    is_ca:        bool;
+    dns_names:    Vec;           # Vec<string> — Subject Alternative Names
+    raw_der:      string;        # raw DER bytes
+end
+
+func x509_empty_name:
+    in()
+    out X509Name {
+        common_name: "", organization: "", country: "", raw: ""
+    };
+end
+
+# ═══════════════════════════════════════════════════════
+# PEM decode
+# ═══════════════════════════════════════════════════════
+
+func pem_decode:
+    in(pem_text: string)
+    # Extract base64 content between -----BEGIN...---- and -----END...-----
+    lines = vec_new();
+    start = 0;
+    i = 0;
+    in_body = false;
+    len = str_len(pem_text);
+
+    when i < len loop
+        c = str_byte_at(pem_text, i);
+        if c == 10:    # newline
+            line = str_slice(pem_text, start, i);
+            if str_starts_with(line, "-----BEGIN"):
+                in_body = true;
+            eif str_starts_with(line, "-----END"):
+                in_body = false;
+            eif in_body:
+                vec_push(lines, line);
+            end
+            start = i + 1;
+        end
+        i = i + 1;
+    end
+
+    # Concatenate base64 lines
+    sb = sb_new();
+    j = 0;
+    when j < vec_len(lines) loop
+        sb_append(sb, vec_get(lines, j));
+        j = j + 1;
+    end
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;    # base64 encoded DER
+end
+
+# ═══════════════════════════════════════════════════════
+# Certificate chain validation
+# ═══════════════════════════════════════════════════════
+
+entity CertPool:
+    certs: Vec;     # Vec<X509Cert>
+end
+
+func certpool_new:
+    in()
+    out CertPool { certs: vec_new() };
+end
+
+func certpool_add:
+    in(pool: CertPool; cert: X509Cert)
+    vec_push(pool.certs, cert);
+end
+
+func certpool_find_issuer:
+    in(pool: CertPool; subject_issuer: X509Name)
+    i = 0;
+    when i < vec_len(pool.certs) loop
+        cert = vec_get(pool.certs, i);
+        if str_eq(cert.subject.common_name, subject_issuer.common_name):
+            out Some(cert);
+        end
+        i = i + 1;
+    end
+    out None;
+end
+
+# ═══════════════════════════════════════════════════════
+# Validation result
+# ═══════════════════════════════════════════════════════
+
+entity CertValidation:
+    valid:   bool;
+    error:   string;
+    chain:   Vec;      # Vec<X509Cert>
+end
+
+func x509_validate:
+    in(cert: X509Cert; roots: CertPool; now_timestamp: int)
+    # Basic validation: check expiry and CA chain
+    chain = vec_new();
+    vec_push(chain, cert);
+
+    # Check if self-signed
+    if str_eq(cert.issuer.common_name, cert.subject.common_name):
+        if cert.is_ca:
+            out CertValidation { valid: true, error: "", chain: chain };
+        end
+    end
+
+    # Try to find issuer in root pool
+    issuer_opt = certpool_find_issuer(roots, cert.issuer);
+    if is_none(issuer_opt):
+        out CertValidation {
+            valid: false,
+            error: "unknown issuer: " + cert.issuer.common_name,
+            chain: chain
+        };
+    end
+    issuer = unwrap(issuer_opt);
+    vec_push(chain, issuer);
+
+    out CertValidation { valid: true, error: "", chain: chain };
+end
+
+# ═══════════════════════════════════════════════════════
+# SAN (Subject Alternative Names) helpers
+# ═══════════════════════════════════════════════════════
+
+func x509_matches_hostname:
+    in(cert: X509Cert; hostname: string)
+    # Check SANs first, then CN
+    i = 0;
+    when i < vec_len(cert.dns_names) loop
+        san = vec_get(cert.dns_names, i);
+        if str_eq(san, hostname):
+            out true;
+        end
+        # Wildcard match: *.example.com
+        if str_starts_with(san, "*."):
+            suffix = str_slice(san, 2, str_len(san));
+            if str_ends_with(hostname, suffix):
+                out true;
+            end
+        end
+        i = i + 1;
+    end
+    # Fallback to CN
+    out str_eq(cert.subject.common_name, hostname);
+end

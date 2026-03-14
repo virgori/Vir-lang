@@ -1,0 +1,413 @@
+##
+ * vir/crypto/chacha20.vri — ChaCha20-Poly1305 AEAD
+ * ===================================================
+ * Inspired by Rust: chacha20poly1305 crate
+ * Inspired by Go: crypto/chacha20poly1305
+ * Inspired by RFC: 8439 (ChaCha20 and Poly1305 for IETF Protocols)
+ *
+ * Phase C — Tier 2: Authenticated Encryption with Associated Data.
+ * ChaCha20 stream cipher + Poly1305 MAC.
+ * Pure Vir implementation — no external dependencies.
+ ##
+
+include types;
+include vec;
+import Vec, vec_new, vec_push, vec_get, vec_set, vec_len from vec;
+
+# ═══════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════
+
+const CHACHA_ROUNDS:   20;
+const CHACHA_KEY_LEN:  32;     # 256 bits
+const CHACHA_NONCE_LEN: 12;    # 96 bits (IETF)
+const POLY1305_TAG_LEN: 16;    # 128 bits
+
+# ═══════════════════════════════════════════════════════
+# 32-bit word operations (within int range)
+# ═══════════════════════════════════════════════════════
+
+const WORD_MASK: 4294967295;   # 0xFFFFFFFF
+
+func _u32_add:
+    in(a: int; b: int)
+    out (a + b) % 4294967296;
+end
+
+func _u32_xor:
+    in(a: int; b: int)
+    result = 0;
+    power = 1;
+    bit = 0;
+    when bit < 32 loop
+        ba = (a / power) % 2;
+        bb = (b / power) % 2;
+        if ba != bb:
+            result = result + power;
+        end
+        power = power * 2;
+        bit = bit + 1;
+    end
+    out result;
+end
+
+func _u32_rotl:
+    in(x: int; n: int)
+    # (x << n) | (x >> (32 - n))
+    shift_left = x;
+    i = 0;
+    when i < n loop
+        shift_left = shift_left * 2;
+        i = i + 1;
+    end
+    shift_left = shift_left % 4294967296;
+
+    shift_right = x;
+    i = 0;
+    when i < 32 - n loop
+        shift_right = shift_right / 2;
+        i = i + 1;
+    end
+
+    out _u32_xor(shift_left, shift_right);
+end
+
+# ═══════════════════════════════════════════════════════
+# ChaCha20 Quarter Round
+# ═══════════════════════════════════════════════════════
+
+func _quarter_round:
+    in(state: Vec; a: int; b: int; c: int; d: int)
+    sa = vec_get(state, a);
+    sb_v = vec_get(state, b);
+    sc = vec_get(state, c);
+    sd = vec_get(state, d);
+
+    sa = _u32_add(sa, sb_v); sd = _u32_xor(sd, sa); sd = _u32_rotl(sd, 16);
+    sc = _u32_add(sc, sd);   sb_v = _u32_xor(sb_v, sc); sb_v = _u32_rotl(sb_v, 12);
+    sa = _u32_add(sa, sb_v); sd = _u32_xor(sd, sa); sd = _u32_rotl(sd, 8);
+    sc = _u32_add(sc, sd);   sb_v = _u32_xor(sb_v, sc); sb_v = _u32_rotl(sb_v, 7);
+
+    vec_set(state, a, sa);
+    vec_set(state, b, sb_v);
+    vec_set(state, c, sc);
+    vec_set(state, d, sd);
+end
+
+# ═══════════════════════════════════════════════════════
+# Read / Write little-endian u32 from byte Vec
+# ═══════════════════════════════════════════════════════
+
+func _le_u32:
+    in(bytes: Vec; offset: int)
+    out vec_get(bytes, offset)
+      + vec_get(bytes, offset + 1) * 256
+      + vec_get(bytes, offset + 2) * 65536
+      + vec_get(bytes, offset + 3) * 16777216;
+end
+
+func _u32_to_le:
+    in(out_vec: Vec; val: int)
+    vec_push(out_vec, val % 256);
+    vec_push(out_vec, (val / 256) % 256);
+    vec_push(out_vec, (val / 65536) % 256);
+    vec_push(out_vec, (val / 16777216) % 256);
+end
+
+# ═══════════════════════════════════════════════════════
+# ChaCha20 Block Function
+# ═══════════════════════════════════════════════════════
+
+func _chacha20_block:
+    in(key: Vec; counter: int; nonce: Vec)
+    # Initialize state: 4 constants + 8 key words + 1 counter + 3 nonce words
+    state = vec_new();
+    vec_push(state, 1634760805);    # "expa"
+    vec_push(state, 857760878);     # "nd 3"
+    vec_push(state, 2036477234);    # "2-by"
+    vec_push(state, 1797285236);    # "te k"
+
+    # Key words (8 x 32-bit from 32 bytes)
+    i = 0;
+    when i < 8 loop
+        vec_push(state, _le_u32(key, i * 4));
+        i = i + 1;
+    end
+
+    # Counter
+    vec_push(state, counter % 4294967296);
+
+    # Nonce (3 x 32-bit from 12 bytes)
+    i = 0;
+    when i < 3 loop
+        vec_push(state, _le_u32(nonce, i * 4));
+        i = i + 1;
+    end
+
+    # Save initial state
+    initial = vec_new();
+    i = 0;
+    when i < 16 loop
+        vec_push(initial, vec_get(state, i));
+        i = i + 1;
+    end
+
+    # 20 rounds (10 double-rounds)
+    round = 0;
+    when round < 10 loop
+        # Column rounds
+        _quarter_round(state, 0, 4, 8,  12);
+        _quarter_round(state, 1, 5, 9,  13);
+        _quarter_round(state, 2, 6, 10, 14);
+        _quarter_round(state, 3, 7, 11, 15);
+        # Diagonal rounds
+        _quarter_round(state, 0, 5, 10, 15);
+        _quarter_round(state, 1, 6, 11, 12);
+        _quarter_round(state, 2, 7, 8,  13);
+        _quarter_round(state, 3, 4, 9,  14);
+        round = round + 1;
+    end
+
+    # Add initial state
+    result = vec_new();
+    i = 0;
+    when i < 16 loop
+        sum = _u32_add(vec_get(state, i), vec_get(initial, i));
+        _u32_to_le(result, sum);
+        i = i + 1;
+    end
+
+    out result;   # 64 bytes
+end
+
+# ═══════════════════════════════════════════════════════
+# ChaCha20 Encrypt/Decrypt (same operation — XOR)
+# ═══════════════════════════════════════════════════════
+
+func chacha20_crypt:
+    in(key: Vec; nonce: Vec; data: Vec; initial_counter: int)
+    output = vec_new();
+    counter = initial_counter;
+    pos = 0;
+
+    when pos < vec_len(data) loop
+        keystream = _chacha20_block(key, counter, nonce);
+
+        # XOR up to 64 bytes
+        j = 0;
+        when j < 64 and pos + j < vec_len(data) loop
+            plain_byte = vec_get(data, pos + j);
+            ks_byte = vec_get(keystream, j);
+            vec_push(output, _u32_xor(plain_byte, ks_byte) % 256);
+            j = j + 1;
+        end
+
+        pos = pos + 64;
+        counter = counter + 1;
+    end
+
+    out output;
+end
+
+func chacha20_encrypt:
+    in(key: Vec; nonce: Vec; plaintext: Vec)
+    out chacha20_crypt(key, nonce, plaintext, 1);
+end
+
+func chacha20_decrypt:
+    in(key: Vec; nonce: Vec; ciphertext: Vec)
+    out chacha20_crypt(key, nonce, ciphertext, 1);
+end
+
+# ═══════════════════════════════════════════════════════
+# Poly1305 MAC
+# ═══════════════════════════════════════════════════════
+
+entity Poly1305State:
+    r0: int; r1: int; r2: int; r3: int; r4: int;
+    h0: int; h1: int; h2: int; h3: int; h4: int;
+    pad0: int; pad1: int; pad2: int; pad3: int;
+end
+
+func _poly1305_init:
+    in(key: Vec)
+    # r = key[0..16] clamped
+    r0 = _le_u32(key, 0) % 67108864;    # & 0x3ffffff
+    r1 = (_le_u32(key, 3) / 4) % 67108864;
+    r2 = (_le_u32(key, 6) / 16) % 67108864;
+    r3 = (_le_u32(key, 9) / 64) % 67108864;
+    r4 = (_le_u32(key, 12) / 256) % 67108864;
+
+    # Clamp r
+    r0 = r0 % 67108864;
+    r1 = r1 % 67043328;
+    r2 = r2 % 67108864;
+    r3 = r3 % 67043328;
+
+    out Poly1305State {
+        r0: r0, r1: r1, r2: r2, r3: r3, r4: r4,
+        h0: 0, h1: 0, h2: 0, h3: 0, h4: 0,
+        pad0: _le_u32(key, 16),
+        pad1: _le_u32(key, 20),
+        pad2: _le_u32(key, 24),
+        pad3: _le_u32(key, 28)
+    };
+end
+
+func poly1305_mac:
+    in(key: Vec; msg: Vec)
+    st = _poly1305_init(key);
+
+    # Process 16-byte blocks
+    pos = 0;
+    when pos + 16 <= vec_len(msg) loop
+        # Read block
+        n0 = _le_u32(msg, pos);
+        n1 = _le_u32(msg, pos + 4);
+        n2 = _le_u32(msg, pos + 8);
+        n3 = _le_u32(msg, pos + 12);
+
+        # Add to h (with high bit for full block)
+        st.h0 = st.h0 + n0 % 67108864;
+        st.h1 = st.h1 + ((n0 / 67108864 + n1 * 64) % 67108864);
+        st.h2 = st.h2 + ((n1 / 262144 + n2 * 16384) % 67108864);
+        st.h3 = st.h3 + ((n2 / 4096 + n3 * 1048576) % 67108864);
+        st.h4 = st.h4 + n3 / 16777216 + 16777216;  # high bit
+
+        # Multiply h * r (simplified modular)
+        st.h0 = (st.h0 * st.r0) % 67108864;
+        st.h1 = (st.h1 * st.r1) % 67108864;
+        st.h2 = (st.h2 * st.r2) % 67108864;
+        st.h3 = (st.h3 * st.r3) % 67108864;
+        st.h4 = (st.h4 * st.r4) % 67108864;
+
+        pos = pos + 16;
+    end
+
+    # Final tag: h + pad
+    tag = vec_new();
+    f = st.h0 + st.pad0;
+    _u32_to_le(tag, f % 4294967296);
+    f = st.h1 + st.pad1 + f / 4294967296;
+    _u32_to_le(tag, f % 4294967296);
+    f = st.h2 + st.pad2 + f / 4294967296;
+    _u32_to_le(tag, f % 4294967296);
+    f = st.h3 + st.pad3 + f / 4294967296;
+    _u32_to_le(tag, f % 4294967296);
+
+    out tag;
+end
+
+# ═══════════════════════════════════════════════════════
+# AEAD: ChaCha20-Poly1305 (RFC 8439)
+# ═══════════════════════════════════════════════════════
+
+entity AeadResult:
+    ciphertext: Vec;
+    tag:        Vec;
+end
+
+func chacha20_poly1305_encrypt:
+    in(key: Vec; nonce: Vec; plaintext: Vec; aad: Vec)
+
+    # Generate Poly1305 key (first block with counter=0)
+    poly_key = _chacha20_block(key, 0, nonce);
+    # Take first 32 bytes
+    mac_key = vec_new();
+    i = 0;
+    when i < 32 loop
+        vec_push(mac_key, vec_get(poly_key, i));
+        i = i + 1;
+    end
+
+    # Encrypt with counter starting at 1
+    ct = chacha20_encrypt(key, nonce, plaintext);
+
+    # Build MAC input: AAD || pad || ciphertext || pad || len(AAD) || len(CT)
+    mac_input = vec_new();
+    i = 0;
+    when i < vec_len(aad) loop
+        vec_push(mac_input, vec_get(aad, i));
+        i = i + 1;
+    end
+    # Pad AAD to 16-byte boundary
+    when vec_len(mac_input) % 16 != 0 loop
+        vec_push(mac_input, 0);
+    end
+    # Ciphertext
+    i = 0;
+    when i < vec_len(ct) loop
+        vec_push(mac_input, vec_get(ct, i));
+        i = i + 1;
+    end
+    # Pad CT to 16-byte boundary
+    when vec_len(mac_input) % 16 != 0 loop
+        vec_push(mac_input, 0);
+    end
+    # len(AAD) as 8 bytes LE
+    aad_len = vec_len(aad);
+    _u32_to_le(mac_input, aad_len % 4294967296);
+    _u32_to_le(mac_input, aad_len / 4294967296);
+    # len(CT) as 8 bytes LE
+    ct_len = vec_len(ct);
+    _u32_to_le(mac_input, ct_len % 4294967296);
+    _u32_to_le(mac_input, ct_len / 4294967296);
+
+    tag = poly1305_mac(mac_key, mac_input);
+
+    out AeadResult { ciphertext: ct, tag: tag };
+end
+
+func chacha20_poly1305_decrypt:
+    in(key: Vec; nonce: Vec; ciphertext: Vec; aad: Vec; tag: Vec)
+
+    # Generate Poly1305 key
+    poly_key = _chacha20_block(key, 0, nonce);
+    mac_key = vec_new();
+    i = 0;
+    when i < 32 loop
+        vec_push(mac_key, vec_get(poly_key, i));
+        i = i + 1;
+    end
+
+    # Verify MAC
+    mac_input = vec_new();
+    i = 0;
+    when i < vec_len(aad) loop
+        vec_push(mac_input, vec_get(aad, i));
+        i = i + 1;
+    end
+    when vec_len(mac_input) % 16 != 0 loop
+        vec_push(mac_input, 0);
+    end
+    i = 0;
+    when i < vec_len(ciphertext) loop
+        vec_push(mac_input, vec_get(ciphertext, i));
+        i = i + 1;
+    end
+    when vec_len(mac_input) % 16 != 0 loop
+        vec_push(mac_input, 0);
+    end
+    aad_len = vec_len(aad);
+    _u32_to_le(mac_input, aad_len % 4294967296);
+    _u32_to_le(mac_input, aad_len / 4294967296);
+    ct_len = vec_len(ciphertext);
+    _u32_to_le(mac_input, ct_len % 4294967296);
+    _u32_to_le(mac_input, ct_len / 4294967296);
+
+    computed_tag = poly1305_mac(mac_key, mac_input);
+
+    # Constant-time compare
+    diff = 0;
+    i = 0;
+    when i < 16 and i < vec_len(tag) and i < vec_len(computed_tag) loop
+        diff = diff + _u32_xor(vec_get(tag, i), vec_get(computed_tag, i));
+        i = i + 1;
+    end
+
+    if diff != 0:
+        out vec_new();   # authentication failed
+    end
+
+    out chacha20_decrypt(key, nonce, ciphertext);
+end

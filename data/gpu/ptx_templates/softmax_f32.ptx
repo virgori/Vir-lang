@@ -1,0 +1,176 @@
+// PTX Kernel: Softmax (per-row)
+// Target: sm_70+
+// For each row: subtract max (numerical stability), exp, sum, normalize
+// Block: (256, 1, 1)  Grid: (M, 1, 1)  — one block per row, shared-mem reduction
+
+.version 7.8
+.target sm_70
+.address_size 64
+
+.visible .entry vir_softmax_f32(
+    .param .u64 param_A,      // M × N row-major input
+    .param .u64 param_C,      // M × N row-major output
+    .param .u32 param_N       // columns per row
+) {
+    .reg .u32   %tx, %row, %n, %i, %stride;
+    .reg .u64   %base_a, %base_c, %off, %addr;
+    .reg .f32   %val, %max_val, %sum, %neg_inf, %exp_val;
+    .reg .pred  %p;
+
+    .shared .align 16 .f32 smem[256];
+
+    mov.u32     %tx, %tid.x;
+    mov.u32     %row, %ctaid.x;
+    ld.param.u32 %n, [param_N];
+
+    // base_a = A + row * N * 4
+    ld.param.u64 %base_a, [param_A];
+    cvt.u64.u32  %off, %row;
+    cvt.u64.u32  %addr, %n;
+    mul.lo.u64   %off, %off, %addr;
+    shl.b64      %off, %off, 2;
+    add.u64      %base_a, %base_a, %off;
+
+    ld.param.u64 %base_c, [param_C];
+    cvt.u64.u32  %off, %row;
+    cvt.u64.u32  %addr, %n;
+    mul.lo.u64   %off, %off, %addr;
+    shl.b64      %off, %off, 2;
+    add.u64      %base_c, %base_c, %off;
+
+    // Phase 1: Find row max (thread-local max via grid-stride)
+    mov.f32     %neg_inf, 0fFF800000;  // -inf
+    mov.f32     %max_val, %neg_inf;
+    mov.u32     %i, %tx;
+$L_max_loop:
+    setp.ge.u32 %p, %i, %n;
+    @%p bra     $L_max_done;
+    cvt.u64.u32 %off, %i;
+    shl.b64     %off, %off, 2;
+    add.u64     %addr, %base_a, %off;
+    ld.global.f32 %val, [%addr];
+    max.f32     %max_val, %max_val, %val;
+    add.u32     %i, %i, 256;
+    bra         $L_max_loop;
+$L_max_done:
+
+    // Shared-memory max reduction
+    cvt.u64.u32 %off, %tx;
+    shl.b64     %off, %off, 2;
+    mov.u64     %addr, smem;
+    add.u64     %addr, %addr, %off;
+    st.shared.f32 [%addr], %max_val;
+    bar.sync    0;
+
+    mov.u32     %stride, 128;
+$L_red_max:
+    setp.ge.u32 %p, %tx, %stride;
+    @%p bra     $L_red_max_skip;
+    cvt.u64.u32 %off, %tx;
+    add.u32     %i, %tx, %stride;
+    cvt.u64.u32 %addr, %i;
+    shl.b64     %off, %off, 2;
+    shl.b64     %addr, %addr, 2;
+    mov.u64     %base_a, smem;  // reuse reg
+    ld.shared.f32 %val, [%base_a + %off];
+    ld.shared.f32 %exp_val, [%base_a + %addr];
+    max.f32     %val, %val, %exp_val;
+    st.shared.f32 [%base_a + %off], %val;
+$L_red_max_skip:
+    bar.sync    0;
+    shr.u32     %stride, %stride, 1;
+    setp.gt.u32 %p, %stride, 0;
+    @%p bra     $L_red_max;
+
+    // Broadcast max
+    mov.u64     %addr, smem;
+    ld.shared.f32 %max_val, [%addr];
+    bar.sync    0;
+
+    // Reload base_a
+    ld.param.u64 %base_a, [param_A];
+    cvt.u64.u32  %off, %row;
+    ld.param.u32 %n, [param_N];
+    cvt.u64.u32  %addr, %n;
+    mul.lo.u64   %off, %off, %addr;
+    shl.b64      %off, %off, 2;
+    add.u64      %base_a, %base_a, %off;
+
+    // Phase 2: exp(x - max) and partial sum
+    mov.f32     %sum, 0f00000000;
+    mov.u32     %i, %tx;
+$L_exp_loop:
+    setp.ge.u32 %p, %i, %n;
+    @%p bra     $L_exp_done;
+    cvt.u64.u32 %off, %i;
+    shl.b64     %off, %off, 2;
+    add.u64     %addr, %base_a, %off;
+    ld.global.f32 %val, [%addr];
+    sub.f32     %val, %val, %max_val;
+    ex2.approx.f32 %exp_val, %val;  // approximate exp via exp2
+    add.f32     %sum, %sum, %exp_val;
+    // Store intermediate exp result
+    add.u64     %addr, %base_c, %off;
+    st.global.f32 [%addr], %exp_val;
+    add.u32     %i, %i, 256;
+    bra         $L_exp_loop;
+$L_exp_done:
+
+    // Reduction for sum
+    cvt.u64.u32 %off, %tx;
+    shl.b64     %off, %off, 2;
+    mov.u64     %addr, smem;
+    add.u64     %addr, %addr, %off;
+    st.shared.f32 [%addr], %sum;
+    bar.sync    0;
+
+    mov.u32     %stride, 128;
+$L_red_sum:
+    setp.ge.u32 %p, %tx, %stride;
+    @%p bra     $L_red_sum_skip;
+    cvt.u64.u32 %off, %tx;
+    add.u32     %i, %tx, %stride;
+    cvt.u64.u32 %addr, %i;
+    shl.b64     %off, %off, 2;
+    shl.b64     %addr, %addr, 2;
+    mov.u64     %base_a, smem;
+    ld.shared.f32 %val, [%base_a + %off];
+    ld.shared.f32 %exp_val, [%base_a + %addr];
+    add.f32     %val, %val, %exp_val;
+    st.shared.f32 [%base_a + %off], %val;
+$L_red_sum_skip:
+    bar.sync    0;
+    shr.u32     %stride, %stride, 1;
+    setp.gt.u32 %p, %stride, 0;
+    @%p bra     $L_red_sum;
+
+    mov.u64     %addr, smem;
+    ld.shared.f32 %sum, [%addr];
+    rcp.approx.f32 %sum, %sum;  // 1/sum
+    bar.sync    0;
+
+    // Phase 3: Normalize
+    ld.param.u64 %base_c, [param_C];
+    cvt.u64.u32  %off, %row;
+    ld.param.u32 %n, [param_N];
+    cvt.u64.u32  %addr, %n;
+    mul.lo.u64   %off, %off, %addr;
+    shl.b64      %off, %off, 2;
+    add.u64      %base_c, %base_c, %off;
+
+    mov.u32     %i, %tx;
+$L_norm_loop:
+    setp.ge.u32 %p, %i, %n;
+    @%p bra     $L_exit;
+    cvt.u64.u32 %off, %i;
+    shl.b64     %off, %off, 2;
+    add.u64     %addr, %base_c, %off;
+    ld.global.f32 %val, [%addr];
+    mul.f32     %val, %val, %sum;
+    st.global.f32 [%addr], %val;
+    add.u32     %i, %i, 256;
+    bra         $L_norm_loop;
+
+$L_exit:
+    ret;
+}

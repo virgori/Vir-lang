@@ -1,0 +1,219 @@
+##
+ * vir/compress/brotli.vri — Brotli Compression (Simplified)
+ * ===========================================================
+ * Inspired by: RFC 7932 (Brotli)
+ *
+ * Brotli-compatible stream framing, static dictionary stubs,
+ * prefix code tables, meta-block encoding.
+ * (Full Brotli requires ANS + context modeling — this provides
+ *  the protocol layer and simplified LZ77+Huffman path.)
+ ##
+
+include types;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include str;
+import StringBuilder, sb_new, sb_append_byte, sb_build, sb_free from str;
+
+# ═══════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════
+
+const BROTLI_MIN_WINDOW  = 10;   # 2^10 = 1KB
+const BROTLI_MAX_WINDOW  = 24;   # 2^24 = 16MB
+const BROTLI_MAX_DISTANCE = 16777216;
+
+# Quality levels
+const BROTLI_QUALITY_FAST   = 1;
+const BROTLI_QUALITY_DEFAULT = 6;
+const BROTLI_QUALITY_BEST   = 11;
+
+# ═══════════════════════════════════════════════════════
+# Bit writer
+# ═══════════════════════════════════════════════════════
+
+entity BitWriter:
+    buffer:  int;
+    bits:    int;      # bits in buffer
+    output:  StringBuilder;
+end
+
+func bw_new:
+    in()
+    out BitWriter { buffer: 0, bits: 0, output: sb_new() };
+end
+
+func bw_write_bits:
+    in(bw: BitWriter; value: int; nbits: int)
+    bw.buffer = bw.buffer + (value * _pow2(bw.bits));
+    bw.bits = bw.bits + nbits;
+    when bw.bits >= 8 loop
+        sb_append_byte(bw.output, bw.buffer % 256);
+        bw.buffer = bw.buffer / 256;
+        bw.bits = bw.bits - 8;
+    end
+end
+
+func bw_flush:
+    in(bw: BitWriter)
+    if bw.bits > 0:
+        sb_append_byte(bw.output, bw.buffer % 256);
+        bw.buffer = 0;
+        bw.bits = 0;
+    end
+    out sb_build(bw.output);
+end
+
+func _pow2:
+    in(n: int)
+    result = 1;
+    i = 0;
+    when i < n loop
+        result = result * 2;
+        i = i + 1;
+    end
+    out result;
+end
+
+# ═══════════════════════════════════════════════════════
+# Stream header
+# ═══════════════════════════════════════════════════════
+
+func brotli_write_header:
+    in(bw: BitWriter; window_bits: int)
+    # Window size encoding (WBITS)
+    if window_bits == 16:
+        bw_write_bits(bw, 0, 1);   # WBITS=16
+    else:
+        bw_write_bits(bw, 1, 1);
+        # encode WBITS-10 in 3 bits for 10..17
+        wcode = window_bits - 10;
+        bw_write_bits(bw, wcode, 3);
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Meta-block header
+# ═══════════════════════════════════════════════════════
+
+func brotli_write_metablock_header:
+    in(bw: BitWriter; size: int; is_last: bool; is_uncompressed: bool)
+    # ISLAST
+    if is_last:
+        bw_write_bits(bw, 1, 1);
+    else:
+        bw_write_bits(bw, 0, 1);
+    end
+    # MLEN (meta-block length) — nibble count encoding
+    if size == 0 && is_last:
+        bw_write_bits(bw, 1, 1);  # ISEMPTY
+    else:
+        if is_last:
+            bw_write_bits(bw, 0, 1);  # ISEMPTY=0
+        end
+        # MNIBBLES: number of 4-bit nibbles to represent (size-1)
+        mlen = size - 1;
+        nibbles = 1;
+        tmp = mlen / 16;
+        when tmp > 0 loop
+            nibbles = nibbles + 1;
+            tmp = tmp / 16;
+        end
+        bw_write_bits(bw, nibbles - 4, 2);  # MNIBBLES-4 in 2 bits
+        # Write MLEN nibbles
+        i = 0;
+        when i < nibbles loop
+            bw_write_bits(bw, (mlen / _pow2(i * 4)) % 16, 4);
+            i = i + 1;
+        end
+        # ISUNCOMPRESSED
+        if is_last == false:
+            if is_uncompressed:
+                bw_write_bits(bw, 1, 1);
+            else:
+                bw_write_bits(bw, 0, 1);
+            end
+        end
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Uncompressed meta-block (store mode)
+# ═══════════════════════════════════════════════════════
+
+func brotli_store:
+    in(data: string)
+    bw = bw_new();
+    n = str_len(data);
+    wbits = 16;
+    if n > 65536:
+        wbits = 22;
+    end
+    brotli_write_header(bw, wbits);
+    brotli_write_metablock_header(bw, n, true, true);
+    # Flush to byte boundary
+    bw_flush(bw);
+    # Re-create for byte-aligned output
+    sb = sb_new();
+    header = bw_flush(bw);
+    k = 0;
+    when k < str_len(header) loop
+        sb_append_byte(sb, str_byte_at(header, k));
+        k = k + 1;
+    end
+    # Uncompressed data
+    i = 0;
+    when i < n loop
+        sb_append_byte(sb, str_byte_at(data, i));
+        i = i + 1;
+    end
+    out sb_build(sb);
+end
+
+# ═══════════════════════════════════════════════════════
+# Simple prefix code (fixed Huffman for literals)
+# ═══════════════════════════════════════════════════════
+
+entity BrotliCode:
+    symbol: int;
+    bits:   int;
+    code:   int;
+end
+
+func brotli_simple_code:
+    in(num_symbols: int)
+    # Generate simple prefix codes (1-4 symbols)
+    codes = vec_new();
+    if num_symbols == 1:
+        vec_push(codes, BrotliCode { symbol: 0, bits: 0, code: 0 });
+    eif num_symbols == 2:
+        vec_push(codes, BrotliCode { symbol: 0, bits: 1, code: 0 });
+        vec_push(codes, BrotliCode { symbol: 1, bits: 1, code: 1 });
+    eif num_symbols == 3:
+        vec_push(codes, BrotliCode { symbol: 0, bits: 1, code: 0 });
+        vec_push(codes, BrotliCode { symbol: 1, bits: 2, code: 2 });
+        vec_push(codes, BrotliCode { symbol: 2, bits: 2, code: 3 });
+    eif num_symbols == 4:
+        vec_push(codes, BrotliCode { symbol: 0, bits: 2, code: 0 });
+        vec_push(codes, BrotliCode { symbol: 1, bits: 2, code: 1 });
+        vec_push(codes, BrotliCode { symbol: 2, bits: 2, code: 2 });
+        vec_push(codes, BrotliCode { symbol: 3, bits: 2, code: 3 });
+    end
+    out codes;
+end
+
+# ═══════════════════════════════════════════════════════
+# Static dictionary entry (stub)
+# ═══════════════════════════════════════════════════════
+
+entity BrotliDictEntry:
+    word:   string;
+    length: int;
+end
+
+func brotli_dict_lookup:
+    in(data: string; pos: int; min_len: int)
+    # Stub — full Brotli has a 122K static dictionary
+    # Returns None if no match
+    out None;
+end

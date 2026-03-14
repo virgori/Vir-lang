@@ -1,0 +1,301 @@
+##
+ * vir/iot/coap.vri — CoAP (Constrained Application Protocol)
+ * =============================================================
+ * Inspired by RFC 7252
+ * Inspired by Python: aiocoap
+ * Inspired by C: libcoap
+ *
+ * Lightweight RESTful protocol for constrained IoT devices.
+ * Runs over UDP, supports confirmable/non-confirmable messages,
+ * observe subscriptions, and block-wise transfer.
+ ##
+
+include types;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include string;
+import String, str_new, str_byte_len, str_ptr from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include net;
+import UdpSocket, udp_bind, udp_send_to, udp_recv_from, SocketAddr from net;
+
+# ═══════════════════════════════════════════════════════
+# CoAP Message Types & Codes
+# ═══════════════════════════════════════════════════════
+
+enum CoapType:
+    Confirmable    = 0;
+    NonConfirmable = 1;
+    Acknowledgement = 2;
+    Reset          = 3;
+end
+
+# Method codes (request)
+const COAP_GET:    1;
+const COAP_POST:   2;
+const COAP_PUT:    3;
+const COAP_DELETE: 4;
+
+# Response codes (class.detail)
+const COAP_CREATED:  0x41;  # 2.01
+const COAP_DELETED:  0x42;  # 2.02
+const COAP_VALID:    0x43;  # 2.03
+const COAP_CHANGED:  0x44;  # 2.04
+const COAP_CONTENT:  0x45;  # 2.05
+const COAP_BAD_REQ:  0x80;  # 4.00
+const COAP_NOT_FOUND: 0x84; # 4.04
+
+# Content-Format option values
+const COAP_FMT_TEXT:  0;     # text/plain
+const COAP_FMT_LINK:  40;   # application/link-format
+const COAP_FMT_XML:   41;
+const COAP_FMT_OCTET: 42;
+const COAP_FMT_JSON:  50;
+const COAP_FMT_CBOR:  60;
+
+# ═══════════════════════════════════════════════════════
+# CoAP Message
+# ═══════════════════════════════════════════════════════
+
+entity CoapOption:
+    number: int;
+    value:  Vec<int>;    # raw bytes
+end
+
+entity CoapMessage:
+    version:    int;          # always 1
+    msg_type:   CoapType;
+    code:       int;          # method or response code
+    message_id: int;          # 16-bit
+    token:      Vec<int>;     # 0-8 bytes
+    options:    Vec<CoapOption>;
+    payload:    Vec<int>;     # raw bytes
+end
+
+func coap_message_new:
+    in(msg_type: CoapType; code: int; message_id: int)
+    out CoapMessage {
+        version = 1, msg_type = msg_type, code = code,
+        message_id = message_id, token = vec_new<int>(),
+        options = vec_new<CoapOption>(), payload = vec_new<int>()
+    };
+end
+
+func coap_set_payload_str:
+    in(msg: CoapMessage; s: string)
+    msg.payload = vec_new<int>();
+    i = 0;
+    slen = str_byte_len(s);
+    when i < slen loop
+        vec_push<int>(&msg.payload, native_load_u8(ptr_add(str_ptr(s), i)));
+        i = i + 1;
+    end
+end
+
+func coap_add_option:
+    in(msg: CoapMessage; number: int; value: Vec<int>)
+    vec_push<CoapOption>(&msg.options, CoapOption { number = number, value = value });
+end
+
+## Add Uri-Path option (number 11).
+func coap_set_uri_path:
+    in(msg: CoapMessage; path: string)
+    val = vec_new<int>();
+    i = 0;
+    plen = str_byte_len(path);
+    when i < plen loop
+        vec_push<int>(&val, native_load_u8(ptr_add(str_ptr(path), i)));
+        i = i + 1;
+    end
+    coap_add_option(msg, 11, val);
+end
+
+# ═══════════════════════════════════════════════════════
+# Encode / Decode
+# ═══════════════════════════════════════════════════════
+
+## Encode a CoAP message to bytes.
+func coap_encode:
+    in(msg: CoapMessage)
+    buf = vec_new<int>();
+    tkl = vec_len<int>(msg.token);
+
+    # Byte 0: Ver(2) | Type(2) | TKL(4)
+    b0 = ((msg.version & 0x03) << 6) | ((msg.msg_type & 0x03) << 4) | (tkl & 0x0F);
+    vec_push<int>(&buf, b0);
+
+    # Byte 1: Code
+    vec_push<int>(&buf, msg.code & 0xFF);
+
+    # Bytes 2-3: Message ID
+    vec_push<int>(&buf, (msg.message_id >> 8) & 0xFF);
+    vec_push<int>(&buf, msg.message_id & 0xFF);
+
+    # Token
+    i = 0;
+    when i < tkl loop
+        vec_push<int>(&buf, vec_get<int>(msg.token, i));
+        i = i + 1;
+    end
+
+    # Options (must be sorted by number — caller responsibility)
+    prev_opt = 0;
+    j = 0;
+    when j < vec_len<CoapOption>(msg.options) loop
+        opt = vec_get<CoapOption>(msg.options, j);
+        delta = opt.number - prev_opt;
+        olen = vec_len<int>(opt.value);
+
+        # Option header byte
+        d4 = if delta < 13: delta; else 13; end;
+        l4 = if olen < 13: olen; else 13; end;
+        vec_push<int>(&buf, (d4 << 4) | l4);
+
+        if delta >= 13:
+            vec_push<int>(&buf, delta - 13);
+        end
+        if olen >= 13:
+            vec_push<int>(&buf, olen - 13);
+        end
+
+        # Option value
+        k = 0;
+        when k < olen loop
+            vec_push<int>(&buf, vec_get<int>(opt.value, k));
+            k = k + 1;
+        end
+
+        prev_opt = opt.number;
+        j = j + 1;
+    end
+
+    # Payload marker + payload
+    if vec_len<int>(msg.payload) > 0:
+        vec_push<int>(&buf, 0xFF);
+        k = 0;
+        when k < vec_len<int>(msg.payload) loop
+            vec_push<int>(&buf, vec_get<int>(msg.payload, k));
+            k = k + 1;
+        end
+    end
+
+    out buf;
+end
+
+# ═══════════════════════════════════════════════════════
+# CoAP Client
+# ═══════════════════════════════════════════════════════
+
+entity CoapClient:
+    socket:     UdpSocket;
+    server:     SocketAddr;
+    _next_mid:  int;
+end
+
+## Create a CoAP client targeting a server address.
+func coap_client:
+    in(server: SocketAddr)
+    sock_r = udp_bind(str_new("0.0.0.0"), 0);
+    if is_err(sock_r):
+        out Err(str_new("CoAP: failed to bind UDP socket"));
+    end
+    out Ok(CoapClient {
+        socket = unwrap_ok(sock_r),
+        server = server,
+        _next_mid = 1
+    });
+end
+
+## Send a GET request.
+func coap_get:
+    in(client: CoapClient; path: string)
+    msg = coap_message_new(CoapType.Confirmable, COAP_GET, client._next_mid);
+    client._next_mid = client._next_mid + 1;
+    coap_set_uri_path(msg, path);
+    data = coap_encode(msg);
+    udp_send_to(client.socket, client.server, data);
+    out _coap_recv_response(client);
+end
+
+## Send a POST request with payload.
+func coap_post:
+    in(client: CoapClient; path: string; payload: string)
+    msg = coap_message_new(CoapType.Confirmable, COAP_POST, client._next_mid);
+    client._next_mid = client._next_mid + 1;
+    coap_set_uri_path(msg, path);
+    coap_set_payload_str(msg, payload);
+    data = coap_encode(msg);
+    udp_send_to(client.socket, client.server, data);
+    out _coap_recv_response(client);
+end
+
+## Send a PUT request with payload.
+func coap_put:
+    in(client: CoapClient; path: string; payload: string)
+    msg = coap_message_new(CoapType.Confirmable, COAP_PUT, client._next_mid);
+    client._next_mid = client._next_mid + 1;
+    coap_set_uri_path(msg, path);
+    coap_set_payload_str(msg, payload);
+    data = coap_encode(msg);
+    udp_send_to(client.socket, client.server, data);
+    out _coap_recv_response(client);
+end
+
+## Send a DELETE request.
+func coap_delete:
+    in(client: CoapClient; path: string)
+    msg = coap_message_new(CoapType.Confirmable, COAP_DELETE, client._next_mid);
+    client._next_mid = client._next_mid + 1;
+    coap_set_uri_path(msg, path);
+    data = coap_encode(msg);
+    udp_send_to(client.socket, client.server, data);
+    out _coap_recv_response(client);
+end
+
+func _coap_recv_response:
+    in(client: CoapClient)
+    var buf: [int; 1280];   # CoAP minimum MTU
+    n = udp_recv_from(client.socket, &buf, 1280);
+    if n < 4:
+        out Err(str_new("CoAP: invalid response"));
+    end
+    # Parse minimal header
+    code = buf[1];
+    mid = (buf[2] << 8) | buf[3];
+    tkl = buf[0] & 0x0F;
+    # Find payload after 0xFF marker
+    payload = vec_new<int>();
+    i = 4 + tkl;
+    # Skip options
+    when i < n loop
+        if buf[i] == 0xFF:
+            i = i + 1;
+            when i < n loop
+                vec_push<int>(&payload, buf[i]);
+                i = i + 1;
+            end
+            break;
+        end
+        # Skip option
+        delta = (buf[i] >> 4) & 0x0F;
+        olen = buf[i] & 0x0F;
+        i = i + 1;
+        if delta == 13 i = i + 1 end:
+        if olen == 13:
+            olen = (buf[i]) + 13;
+            i = i + 1;
+        end
+        i = i + olen;
+    end
+    out Ok(CoapMessage {
+        version = 1,
+        msg_type = CoapType.Acknowledgement,
+        code = code, message_id = mid,
+        token = vec_new<int>(),
+        options = vec_new<CoapOption>(),
+        payload = payload
+    });
+end

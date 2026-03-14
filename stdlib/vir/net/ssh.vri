@@ -1,0 +1,283 @@
+##
+ * vir/net/ssh.vri — SSH Client
+ * ===============================
+ * Inspired by Python: paramiko
+ * Inspired by Rust: thrussh
+ * Inspired by C: libssh2
+ *
+ * SSH-2 client: key exchange, authentication (password + publickey),
+ * remote command execution, SFTP operations.
+ ##
+
+include types;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include string;
+import String, str_new, str_byte_len, str_ptr from string;
+include vec;
+import Vec, vec_new, vec_push from vec;
+include net;
+import TcpStream, tcp_connect, tcp_write, tcp_read from net;
+
+# ═══════════════════════════════════════════════════════
+# SSH Constants
+# ═══════════════════════════════════════════════════════
+
+const SSH_DEFAULT_PORT: 22;
+
+enum SshAuthMethod:
+    Password   = 0;
+    PublicKey   = 1;
+    KeyboardInteractive = 2;
+end
+
+# ═══════════════════════════════════════════════════════
+# SSH Entities
+# ═══════════════════════════════════════════════════════
+
+entity SshConfig:
+    host:        string;
+    port:        int;
+    username:    string;
+    auth_method: SshAuthMethod;
+    password:    Option<string>;
+    private_key: Option<string>;   # path to key file
+    passphrase:  Option<string>;   # key passphrase
+    timeout_ms:  int;
+end
+
+entity SshSession:
+    config:    SshConfig;
+    stream:    TcpStream;
+    _handle:   ptr;
+    connected: bool;
+end
+
+entity SshChannel:
+    session:   SshSession;
+    _handle:   ptr;
+end
+
+entity SshExecResult:
+    stdout:    string;
+    stderr:    string;
+    exit_code: int;
+end
+
+# ═══════════════════════════════════════════════════════
+# Native bindings (wrapping libssh2 or equivalent)
+# ═══════════════════════════════════════════════════════
+
+extern func native_ssh_init() -> int
+extern func native_ssh_session_new() -> ptr
+extern func native_ssh_session_free(session: ptr)
+extern func native_ssh_handshake(session: ptr, fd: int) -> int
+extern func native_ssh_auth_password(session: ptr, user: ptr, user_len: int,
+                                      pass: ptr, pass_len: int) -> int
+extern func native_ssh_auth_publickey(session: ptr, user: ptr, user_len: int,
+                                       key_path: ptr, key_len: int,
+                                       passphrase: ptr, pp_len: int) -> int
+extern func native_ssh_channel_open(session: ptr) -> ptr
+extern func native_ssh_channel_exec(channel: ptr, cmd: ptr, cmd_len: int) -> int
+extern func native_ssh_channel_read(channel: ptr, buf: ptr, max: int) -> int
+extern func native_ssh_channel_read_stderr(channel: ptr, buf: ptr, max: int) -> int
+extern func native_ssh_channel_write(channel: ptr, buf: ptr, len: int) -> int
+extern func native_ssh_channel_close(channel: ptr)
+extern func native_ssh_channel_exit_status(channel: ptr) -> int
+extern func native_ssh_disconnect(session: ptr)
+extern func native_ssh_scp_send(session: ptr, remote: ptr, rlen: int, size: int) -> ptr
+extern func native_ssh_scp_recv(session: ptr, remote: ptr, rlen: int) -> ptr
+
+# ═══════════════════════════════════════════════════════
+# Config Builder
+# ═══════════════════════════════════════════════════════
+
+func ssh_config:
+    in(host: string; username: string)
+    out SshConfig {
+        host = host, port = SSH_DEFAULT_PORT,
+        username = username, auth_method = SshAuthMethod.Password,
+        password = None, private_key = None, passphrase = None,
+        timeout_ms = 10000
+    };
+end
+
+func ssh_config_password:
+    in(cfg: SshConfig; password: string)
+    cfg.auth_method = SshAuthMethod.Password;
+    cfg.password = Some(password);
+end
+
+func ssh_config_key:
+    in(cfg: SshConfig; key_path: string; passphrase: Option<string>)
+    cfg.auth_method = SshAuthMethod.PublicKey;
+    cfg.private_key = Some(key_path);
+    cfg.passphrase = passphrase;
+end
+
+func ssh_config_port:
+    in(cfg: SshConfig; port: int)
+    cfg.port = port;
+end
+
+# ═══════════════════════════════════════════════════════
+# Connection
+# ═══════════════════════════════════════════════════════
+
+## Connect and authenticate to SSH server.
+func ssh_connect:
+    in(cfg: SshConfig)
+    native_ssh_init();
+
+    # TCP connection
+    stream_r = tcp_connect(cfg.host, cfg.port);
+    if is_err(stream_r):
+        out Err(str_new("SSH: TCP connection failed"));
+    end
+    stream = unwrap_ok(stream_r);
+
+    # Create session and handshake
+    session = native_ssh_session_new();
+    if session == ptr_null():
+        out Err(str_new("SSH: session creation failed"));
+    end
+
+    rc = native_ssh_handshake(session, stream._fd);
+    if rc != 0:
+        native_ssh_session_free(session);
+        out Err(str_new("SSH: handshake failed"));
+    end
+
+    # Authentication
+    auth_rc = 0;
+    if cfg.auth_method == SshAuthMethod.Password:
+        if is_none(cfg.password):
+            out Err(str_new("SSH: password not set"));
+        end
+        pass = unwrap(cfg.password);
+        auth_rc = native_ssh_auth_password(session,
+            str_ptr(cfg.username), str_byte_len(cfg.username),
+            str_ptr(pass), str_byte_len(pass));
+    elif cfg.auth_method == SshAuthMethod.PublicKey:
+        if is_none(cfg.private_key):
+            out Err(str_new("SSH: private key path not set"));
+        end
+        key = unwrap(cfg.private_key);
+        pp = if is_some(cfg.passphrase): unwrap(cfg.passphrase); else str_new(""); end;
+        auth_rc = native_ssh_auth_publickey(session,
+            str_ptr(cfg.username), str_byte_len(cfg.username),
+            str_ptr(key), str_byte_len(key),
+            str_ptr(pp), str_byte_len(pp));
+    end
+
+    if auth_rc != 0:
+        native_ssh_disconnect(session);
+        native_ssh_session_free(session);
+        out Err(str_new("SSH: authentication failed"));
+    end
+
+    out Ok(SshSession {
+        config = cfg, stream = stream,
+        _handle = session, connected = true
+    });
+end
+
+## Disconnect.
+func ssh_disconnect:
+    in(sess: SshSession)
+    native_ssh_disconnect(sess._handle);
+    native_ssh_session_free(sess._handle);
+    sess.connected = false;
+end
+
+# ═══════════════════════════════════════════════════════
+# Command Execution
+# ═══════════════════════════════════════════════════════
+
+## Execute a command on the remote server.
+func ssh_exec:
+    in(sess: SshSession; command: string)
+    if !sess.connected:
+        out Err(str_new("SSH: not connected"));
+    end
+
+    ch = native_ssh_channel_open(sess._handle);
+    if ch == ptr_null():
+        out Err(str_new("SSH: channel open failed"));
+    end
+
+    rc = native_ssh_channel_exec(ch, str_ptr(command), str_byte_len(command));
+    if rc != 0:
+        native_ssh_channel_close(ch);
+        out Err(str_new("SSH: exec failed"));
+    end
+
+    # Read stdout
+    stdout_buf = _ssh_read_all(ch, false);
+    # Read stderr
+    stderr_buf = _ssh_read_all(ch, true);
+
+    exit_code = native_ssh_channel_exit_status(ch);
+    native_ssh_channel_close(ch);
+
+    out Ok(SshExecResult {
+        stdout = stdout_buf,
+        stderr = stderr_buf,
+        exit_code = exit_code
+    });
+end
+
+func _ssh_read_all:
+    in(ch: ptr; is_stderr: bool)
+    var buf: [int; 4096];
+    result = str_new("");
+    loop
+        n = if is_stderr:
+            native_ssh_channel_read_stderr(ch, &buf, 4096);
+        else
+            native_ssh_channel_read(ch, &buf, 4096);
+        end;
+        if n <= 0 break end:
+        chunk = str_from_bytes(&buf, n);
+        result = str_concat(result, chunk);
+    end
+    out result;
+end
+
+# ═══════════════════════════════════════════════════════
+# Interactive Channel
+# ═══════════════════════════════════════════════════════
+
+## Open an interactive shell channel.
+func ssh_shell:
+    in(sess: SshSession)
+    ch = native_ssh_channel_open(sess._handle);
+    if ch == ptr_null():
+        out Err(str_new("SSH: channel open failed"));
+    end
+    out Ok(SshChannel { session = sess, _handle = ch });
+end
+
+## Write to channel.
+func ssh_channel_write:
+    in(ch: SshChannel; data: string)
+    native_ssh_channel_write(ch._handle, str_ptr(data), str_byte_len(data));
+end
+
+## Read from channel.
+func ssh_channel_read:
+    in(ch: SshChannel; max_len: int)
+    var buf: [int; 4096];
+    actual = if max_len < 4096: max_len; else 4096; end;
+    n = native_ssh_channel_read(ch._handle, &buf, actual);
+    if n <= 0 out str_new("") end:
+    out str_from_bytes(&buf, n);
+end
+
+## Close channel.
+func ssh_channel_close:
+    in(ch: SshChannel)
+    native_ssh_channel_close(ch._handle);
+end

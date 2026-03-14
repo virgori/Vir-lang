@@ -15,10 +15,7 @@
 #include <string.h>
 #include <pthread.h>
 
-/* External ASM routines */
-#if defined(__aarch64__) || defined(__arm64__)
-extern void vir_asm_flush_icache(void *addr, uint64_t size);
-#endif
+/* External ASM routines — now served by bridge_flush_icache() on all platforms */
 
 /* ARM64 B imm26 range: ±128 MB (26-bit signed × 4) */
 #define ARM64_B_MAX_RANGE  ((int64_t)0x7FFFFFF * 4)   /* +134217724 */
@@ -101,14 +98,15 @@ int jit_region_make_writable(jit_region_t *region)
 
 int jit_region_make_executable(jit_region_t *region)
 {
+#if defined(__APPLE__) && defined(__aarch64__)
+    bridge_jit_write_protect(1);
+#endif
     int rc = bridge_mprotect(region->base, region->size,
                              BRIDGE_PROT_READ | BRIDGE_PROT_EXEC);
     if (rc == 0) region->has_exec = 1;
 
-#if defined(__APPLE__) && defined(__aarch64__)
-    bridge_jit_write_protect(1);
-    vir_asm_flush_icache(region->base, region->used);
-#endif
+    /* Flush I-cache on all architectures (critical for ARM64/RISC-V) */
+    bridge_flush_icache(region->base, region->used);
 
     return rc;
 }

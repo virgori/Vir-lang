@@ -6,6 +6,7 @@
  */
 
 #include "vm.h"
+#include "task.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -680,6 +681,31 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     /* ── Label (no-op at runtime) ──────────────────────── */
     case Q_LABEL:
         break;
+
+    /* ── Green Thread / Task opcodes (A2) ──────────────── */
+    case Q_TASK_SPAWN: {
+        /* dest = task_spawn(src1 = function index)
+         * For now, we use a stub: the "function" is identified by
+         * its index in the module.  We create a task that, when
+         * scheduled, will call vm_exec_function on that function.
+         * Full integration requires passing the VM + module into
+         * the task; for Phase 1 we store the task_id in dest. */
+        uint32_t fn_idx = (uint32_t)operand_value(vm, &instr->src1);
+        /* Create a lightweight task stub — entry_fn will be wired
+         * when the scheduler is properly integrated with the VM.
+         * For now, record the request in dest as task_id. */
+        uint32_t tid = task_create(NULL, (void *)(uintptr_t)fn_idx);
+        set_dest(vm, &instr->dest, (int64_t)tid);
+        break;
+    }
+    case Q_TASK_YIELD:
+        task_yield();
+        break;
+    case Q_TASK_WAIT: {
+        uint32_t tid = (uint32_t)operand_value(vm, &instr->src1);
+        task_wait(tid);
+        break;
+    }
 
     case Q_HALT:
         return VM_HALT;

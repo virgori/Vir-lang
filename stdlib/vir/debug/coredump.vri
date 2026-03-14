@@ -1,0 +1,264 @@
+##
+ * vir/debug/coredump.vri — Core Dump Analysis
+ * ===============================================
+ * Utility for reading and analyzing core dump files.
+ * Parses Mach-O core (macOS) and ELF core (Linux) headers,
+ * extracts thread states, memory regions, and register info.
+ ##
+
+include types;
+include option;
+import Option, Some, None from option;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include string_builder;
+import StringBuilder, sb_new, sb_append, sb_build from string_builder;
+
+# ═══════════════════════════════════════════════════════
+# Core dump format types
+# ═══════════════════════════════════════════════════════
+
+const CORE_ELF    = 1;
+const CORE_MACHO  = 2;
+
+# ═══════════════════════════════════════════════════════
+# Memory region from core
+# ═══════════════════════════════════════════════════════
+
+entity MemRegion:
+    start_addr:  int;
+    end_addr:    int;
+    size:        int;
+    permissions: int;     # rwx flags
+    file_offset: int;     # offset in core file
+end
+
+const PERM_READ    = 4;
+const PERM_WRITE   = 2;
+const PERM_EXECUTE = 1;
+
+func region_is_readable:
+    in(r: MemRegion)
+    out (r.permissions & PERM_READ) != 0;
+end
+
+func region_is_writable:
+    in(r: MemRegion)
+    out (r.permissions & PERM_WRITE) != 0;
+end
+
+func region_is_executable:
+    in(r: MemRegion)
+    out (r.permissions & PERM_EXECUTE) != 0;
+end
+
+# ═══════════════════════════════════════════════════════
+# Register state (ARM64)
+# ═══════════════════════════════════════════════════════
+
+entity RegisterState:
+    x:   [int; 31];    # x0-x30
+    sp:  int;
+    pc:  int;
+    cpsr: int;          # flags
+end
+
+func regs_get_fp:
+    in(regs: RegisterState)
+    out regs.x[29];
+end
+
+func regs_get_lr:
+    in(regs: RegisterState)
+    out regs.x[30];
+end
+
+# ═══════════════════════════════════════════════════════
+# Thread info
+# ═══════════════════════════════════════════════════════
+
+entity ThreadInfo:
+    thread_id:   int;
+    name:        string;
+    regs:        RegisterState;
+    is_crashed:  bool;
+    signal:      int;          # signal that caused crash
+end
+
+# ═══════════════════════════════════════════════════════
+# Core dump
+# ═══════════════════════════════════════════════════════
+
+entity CoreDump:
+    format:       int;          # CORE_ELF or CORE_MACHO
+    regions:      Vec;          # Vec<MemRegion>
+    threads:      Vec;          # Vec<ThreadInfo>
+    exec_path:    string;       # original executable
+end
+
+func coredump_new:
+    in(format: int)
+    out CoreDump {
+        format: format,
+        regions: vec_new(),
+        threads: vec_new(),
+        exec_path: ""
+    };
+end
+
+# ═══════════════════════════════════════════════════════
+# ELF core parsing helpers
+# ═══════════════════════════════════════════════════════
+
+const ELF_MAGIC = 0x7F454C46;   # \x7fELF
+const PT_LOAD   = 1;
+const PT_NOTE   = 4;
+
+entity ElfPhdr:
+    p_type:    int;
+    p_flags:   int;
+    p_offset:  int;
+    p_vaddr:   int;
+    p_filesz:  int;
+    p_memsz:   int;
+end
+
+func _parse_elf_phdr:
+    in(data: Vec; offset: int)
+    # Read little-endian 32/64 bit fields
+    p_type = _read_u32_le(data, offset);
+    p_flags = _read_u32_le(data, offset + 4);
+    p_offset = _read_u64_le(data, offset + 8);
+    p_vaddr = _read_u64_le(data, offset + 16);
+    p_filesz = _read_u64_le(data, offset + 32);
+    p_memsz = _read_u64_le(data, offset + 40);
+    out ElfPhdr {
+        p_type: p_type, p_flags: p_flags,
+        p_offset: p_offset, p_vaddr: p_vaddr,
+        p_filesz: p_filesz, p_memsz: p_memsz
+    };
+end
+
+func _read_u32_le:
+    in(data: Vec; off: int)
+    b0 = vec_get(data, off);
+    b1 = vec_get(data, off + 1);
+    b2 = vec_get(data, off + 2);
+    b3 = vec_get(data, off + 3);
+    out b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+end
+
+func _read_u64_le:
+    in(data: Vec; off: int)
+    lo = _read_u32_le(data, off);
+    hi = _read_u32_le(data, off + 4);
+    out lo | (hi << 32);
+end
+
+# ═══════════════════════════════════════════════════════
+# Mach-O core parsing helpers
+# ═══════════════════════════════════════════════════════
+
+const MACHO_MAGIC_64 = 0xFEEDFACF;
+const LC_SEGMENT_64  = 0x19;
+const LC_THREAD      = 0x04;
+
+entity MachOSegment:
+    segname:   string;
+    vmaddr:    int;
+    vmsize:    int;
+    fileoff:   int;
+    filesize:  int;
+    maxprot:   int;
+    initprot:  int;
+end
+
+# ═══════════════════════════════════════════════════════
+# Analysis utilities
+# ═══════════════════════════════════════════════════════
+
+func core_find_region:
+    in(cd: CoreDump; addr: int)
+    i = 0;
+    when i < vec_len(cd.regions) loop
+        r = vec_get(cd.regions, i);
+        if addr >= r.start_addr && addr < r.end_addr:
+            out Some(r);
+        end
+        i = i + 1;
+    end
+    out None;
+end
+
+func core_crashed_thread:
+    in(cd: CoreDump)
+    i = 0;
+    when i < vec_len(cd.threads) loop
+        t = vec_get(cd.threads, i);
+        if t.is_crashed:
+            out Some(t);
+        end
+        i = i + 1;
+    end
+    out None;
+end
+
+# ═══════════════════════════════════════════════════════
+# Report generation
+# ═══════════════════════════════════════════════════════
+
+func core_report:
+    in(cd: CoreDump)
+    sb = sb_new();
+    sb_append(sb, "=== Core Dump Report ===\n");
+    sb_append(sb, "Format: ");
+    if cd.format == CORE_ELF:
+        sb_append(sb, "ELF");
+    else:
+        sb_append(sb, "Mach-O");
+    end
+    sb_append(sb, "\nExecutable: ");
+    sb_append(sb, cd.exec_path);
+    sb_append(sb, "\n\nMemory Regions: ");
+    sb_append(sb, int_to_str(vec_len(cd.regions)));
+    sb_append(sb, "\n");
+
+    i = 0;
+    when i < vec_len(cd.regions) loop
+        r = vec_get(cd.regions, i);
+        sb_append(sb, "  0x");
+        sb_append(sb, int_to_hex(r.start_addr));
+        sb_append(sb, " - 0x");
+        sb_append(sb, int_to_hex(r.end_addr));
+        sb_append(sb, "  [");
+        if region_is_readable(r): sb_append(sb, "r"); else: sb_append(sb, "-"); end
+        if region_is_writable(r): sb_append(sb, "w"); else: sb_append(sb, "-"); end
+        if region_is_executable(r): sb_append(sb, "x"); else: sb_append(sb, "-"); end
+        sb_append(sb, "]\n");
+        i = i + 1;
+    end
+
+    sb_append(sb, "\nThreads: ");
+    sb_append(sb, int_to_str(vec_len(cd.threads)));
+    sb_append(sb, "\n");
+
+    i = 0;
+    when i < vec_len(cd.threads) loop
+        t = vec_get(cd.threads, i);
+        sb_append(sb, "  Thread ");
+        sb_append(sb, int_to_str(t.thread_id));
+        if t.is_crashed:
+            sb_append(sb, " [CRASHED signal=");
+            sb_append(sb, int_to_str(t.signal));
+            sb_append(sb, "]");
+        end
+        sb_append(sb, " PC=0x");
+        sb_append(sb, int_to_hex(t.regs.pc));
+        sb_append(sb, " SP=0x");
+        sb_append(sb, int_to_hex(t.regs.sp));
+        sb_append(sb, "\n");
+        i = i + 1;
+    end
+
+    out sb_build(sb);
+end

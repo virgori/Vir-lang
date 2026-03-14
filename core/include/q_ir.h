@@ -12,6 +12,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "vir_platform.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -114,6 +115,11 @@ typedef enum {
 
     /* Self-patching  (Spec §2.1 – Q_PATCH_POINT) */
     Q_PATCH_POINT   = 0xF0,   /* "Lỗ hổng" cho Backend vá mã */
+
+    /* Task / Green Thread (A2) */
+    Q_TASK_SPAWN    = 0xF1,   /* dest = task_spawn(src1=fn_idx) */
+    Q_TASK_YIELD    = 0xF2,   /* yield_now()                    */
+    Q_TASK_WAIT     = 0xF3,   /* task_wait(src1=task_id)        */
 
     /* Pseudo */
     Q_LABEL         = 0xFE,

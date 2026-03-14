@@ -153,6 +153,17 @@ class TokenKind(enum.Enum):
     # ── Error handling ─────────────────────────────────────
     TRY             = "try"
     ERROR           = "error"
+    FALLBACK        = "fallback"
+
+    # ── Phase 3: Type system ───────────────────────────────
+    ENUM_DEF        = "enum_def"      # enum
+    TRAIT_DEF       = "trait_def"     # trait
+    IMPL_BLOCK      = "impl_block"    # impl
+    WHERE           = "where"         # where clause
+    PIPE            = "pipe"          # | (closure param)
+    DOUBLE_ARROW    = "double_arrow"  # => (match arm)
+    TYPE_PARAM_OPEN = "type_param_open"   # <  (generic)
+    TYPE_PARAM_CLOSE= "type_param_close"  # >  (generic)
 
     # ── System / runtime ───────────────────────────────────
     CHECK_CPU       = "check_cpu"
@@ -176,6 +187,7 @@ class TokenKind(enum.Enum):
     SEMICOLON       = "semicolon"     # ;
     ARROW           = "arrow"         # ->
     HASH            = "hash"          # # (comment marker)
+    BLOCK_COMMENT   = "block_comment" # ## ... ## (block comment)
 
     # ── Literals (produced by tokenizer, not mapped) ───────
     NUMBER          = "number"
@@ -196,6 +208,8 @@ class TokenKind(enum.Enum):
     BIT_OR          = "bit_or"        # legacy
     ASSIGN_ADD      = "assign_add"    # legacy
     ASSIGN_SUB      = "assign_sub"    # legacy
+    STRUCT          = "struct"        # legacy → use ENTITY_DEF
+    RECORD          = "record"        # legacy → use ENTITY_DEF
 
 
 # ═══════════════════════════════════════════════════════════
@@ -336,6 +350,22 @@ class KeywordRegistry:
                     "control_flow", 0, 0, "Try fallback"),
             Keyword(TokenKind.ERROR,       "error",      (),
                     "control_flow", 0, 0, "Error type"),
+            Keyword(TokenKind.FALLBACK,    "fallback",   (),
+                    "control_flow", 0, 0, "Fallback block in try"),
+
+            # ── Phase 3: Type system ──────────────────────
+            Keyword(TokenKind.ENUM_DEF,    "enum",       ("liệt_kê",),
+                    "definition", 0, 0, "Define an enum type"),
+            Keyword(TokenKind.TRAIT_DEF,   "trait",      ("đặc_tính",),
+                    "definition", 0, 0, "Define a trait/interface"),
+            Keyword(TokenKind.IMPL_BLOCK,  "impl",       ("triển_khai",),
+                    "definition", 0, 0, "Implement a trait for a type"),
+            Keyword(TokenKind.WHERE,       "where",      (),
+                    "definition", 0, 0, "Generic constraint clause"),
+            Keyword(TokenKind.PIPE,        "|",          (),
+                    "definition", 0, 0, "Closure parameter delimiter"),
+            Keyword(TokenKind.DOUBLE_ARROW,"=>",         ("→",),
+                    "control_flow", 0, 0, "Match arm arrow"),
 
             # ── Arithmetic (v1.2 precedence) ───────────────
             # Precedence (high → low): () → ?. . → ! - → ^

@@ -1,0 +1,448 @@
+##
+ * vir/compress/zstd.vri — LZ77 Compression (Vir-LZ format)
+ * ================================================
+ * Inspired by Rust: zstd crate (binding to libzstd)
+ * Inspired by C: facebook/zstd library
+ *
+ * Phase C — LZ77-based compression.
+ * NOTE: This is a Vir-native LZ77 format, NOT Zstandard-compatible.
+ * Use native_zstd_compress/decompress for real Zstandard interop.
+ * The Vir-LZ format uses simple token encoding without entropy coding
+ * (no FSE/Huffman), trading compression ratio for simplicity.
+ *
+ * NOTE: Uses Vec for all dynamic buffers (no dynamic array sizes).
+ ##
+
+include types;
+include vec;
+import Vec, vec_new, vec_push, vec_pop, vec_get, vec_set, vec_len from vec;
+include option;
+import Option, Some, None from option;
+
+# ═══════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════
+
+const VIR_LZ_MAGIC: 0x56495231;     # "VIR1" — Vir-native LZ77 format magic
+const WINDOW_LOG_MIN: 10;
+const WINDOW_LOG_MAX: 22;        # 4 MB window for this impl
+const MIN_MATCH_LEN: 3;
+const MAX_MATCH_LEN: 131074;     # 128K + 2
+const HASH_LOG: 14;              # 16384 entry hash table
+
+# Compression levels
+const ZSTD_LEVEL_FAST: 1;
+const ZSTD_LEVEL_DEFAULT: 3;
+const ZSTD_LEVEL_BEST: 9;
+
+# ═══════════════════════════════════════════════════════
+# Match — an LZ77 match result
+# ═══════════════════════════════════════════════════════
+
+entity LzMatch:
+    offset:   int;   # distance back
+    length:   int;   # match length
+    literal:  int;   # literal byte before match (-1 if none)
+end
+
+# ═══════════════════════════════════════════════════════
+# Compression context
+# ═══════════════════════════════════════════════════════
+
+entity ZstdCompCtx:
+    level:      int;
+    window_log: int;
+    hash_table: Vec;   # Vec of int (positions), size = 1 << HASH_LOG
+    input:      ptr;   # input data pointer
+    input_len:  int;
+end
+
+func zstd_compress_ctx_new:
+    in(level: int)
+    ht = vec_new();
+    table_size = 1;
+    shift = 0;
+    when shift < HASH_LOG loop
+        table_size = table_size * 2;
+        shift = shift + 1;
+    end
+    i = 0;
+    when i < table_size loop
+        vec_push(ht, -1);
+        i = i + 1;
+    end
+
+    wlog = WINDOW_LOG_MIN;
+    if level >= ZSTD_LEVEL_DEFAULT:
+        wlog = 17;
+    end
+    if level >= ZSTD_LEVEL_BEST:
+        wlog = WINDOW_LOG_MAX;
+    end
+
+    out ZstdCompCtx {
+        level: level,
+        window_log: wlog,
+        hash_table: ht,
+        input: 0,
+        input_len: 0
+    };
+end
+
+# ─── Hash function for 3-byte sequences ─────────────
+
+func _zstd_hash3:
+    in(b0: int; b1: int; b2: int)
+    h = b0 * 2654435761;
+    h = h + b1 * 2246822519;
+    h = h + b2 * 3266489917;
+    # Mask to HASH_LOG bits
+    mask = 1;
+    s = 0;
+    when s < HASH_LOG loop
+        mask = mask * 2;
+        s = s + 1;
+    end
+    mask = mask - 1;
+    # Ensure positive
+    if h < 0:
+        h = 0 - h;
+    end
+    out h % (mask + 1);
+end
+
+# ═══════════════════════════════════════════════════════
+# LZ77 matching — find matches in data
+# ═══════════════════════════════════════════════════════
+
+func _zstd_find_match:
+    in(data: ptr; pos: int; data_len: int; hash_table: Vec)
+    if pos + 2 >= data_len out None end:
+
+    b0 = native_load_u8(data, pos);
+    b1 = native_load_u8(data, pos + 1);
+    b2 = native_load_u8(data, pos + 2);
+    h = _zstd_hash3(b0, b1, b2);
+
+    prev = vec_get(hash_table, h);
+    vec_set(hash_table, h, pos);
+
+    if prev < 0 out None end:
+    if pos - prev > 65535 out None end:   # max offset
+
+    # Verify match
+    if native_load_u8(data, prev) != b0 out None end:
+    if native_load_u8(data, prev + 1) != b1 out None end:
+    if native_load_u8(data, prev + 2) != b2 out None end:
+
+    # Extend match
+    match_len = 3;
+    done = false;
+    when prev + match_len < pos and pos + match_len < data_len and done == false loop
+        if native_load_u8(data, prev + match_len) == native_load_u8(data, pos + match_len):
+            match_len = match_len + 1;
+        else:
+            done = true;
+        end
+    end
+
+    if match_len > MAX_MATCH_LEN:
+        match_len = MAX_MATCH_LEN;
+    end
+
+    out Some(LzMatch {
+        offset: pos - prev,
+        length: match_len,
+        literal: -1
+    });
+end
+
+# ═══════════════════════════════════════════════════════
+# Compress — main entry point
+# ═══════════════════════════════════════════════════════
+
+func zstd_compress:
+    in(data: ptr; data_len: int; level: int)
+    ctx = zstd_compress_ctx_new(level);
+    output = vec_new();
+
+    # Write magic number (little-endian 4 bytes) — Vir-LZ format
+    vec_push(output, VIR_LZ_MAGIC % 256);
+    vec_push(output, (VIR_LZ_MAGIC / 256) % 256);
+    vec_push(output, (VIR_LZ_MAGIC / 65536) % 256);
+    vec_push(output, (VIR_LZ_MAGIC / 16777216) % 256);
+
+    # Write frame header: content size (4 bytes LE)
+    vec_push(output, data_len % 256);
+    vec_push(output, (data_len / 256) % 256);
+    vec_push(output, (data_len / 65536) % 256);
+    vec_push(output, (data_len / 16777216) % 256);
+
+    # LZ77 parse
+    pos = 0;
+    lit_start = 0;
+
+    when pos < data_len loop
+        m = _zstd_find_match(data, pos, data_len, ctx.hash_table);
+
+        if is_some(m):
+            match = unwrap(m);
+            # Encode literals before the match
+            lit_count = pos - lit_start;
+            _zstd_encode_sequence(output, data, lit_start, lit_count, match.offset, match.length);
+            pos = pos + match.length;
+            lit_start = pos;
+        else:
+            pos = pos + 1;
+        end
+    end
+
+    # Remaining literals
+    if lit_start < data_len:
+        rem = data_len - lit_start;
+        _zstd_encode_literals(output, data, lit_start, rem);
+    end
+
+    # End marker
+    vec_push(output, 0);
+
+    out output;
+end
+
+# ─── Encode a sequence (literals + match) ────────────
+
+func _zstd_encode_sequence:
+    in(out_vec: Vec; data: ptr; lit_pos: int; lit_len: int; offset: int; match_len: int)
+
+    # Token byte: upper 4 bits = lit_len, lower 4 bits = match_len - 3
+    ll = lit_len;
+    if ll > 15:
+        ll = 15;
+    end
+    ml = match_len - MIN_MATCH_LEN;
+    if ml > 15:
+        ml = 15;
+    end
+    token = ll * 16 + ml;
+    vec_push(out_vec, token);
+
+    # Extra literal length bytes
+    if lit_len >= 15:
+        extra = lit_len - 15;
+        when extra >= 255 loop
+            vec_push(out_vec, 255);
+            extra = extra - 255;
+        end
+        vec_push(out_vec, extra);
+    end
+
+    # Literal bytes
+    i = 0;
+    when i < lit_len loop
+        vec_push(out_vec, native_load_u8(data, lit_pos + i));
+        i = i + 1;
+    end
+
+    # Offset (2 bytes LE)
+    vec_push(out_vec, offset % 256);
+    vec_push(out_vec, (offset / 256) % 256);
+
+    # Extra match length bytes
+    if match_len - MIN_MATCH_LEN >= 15:
+        extra = match_len - MIN_MATCH_LEN - 15;
+        when extra >= 255 loop
+            vec_push(out_vec, 255);
+            extra = extra - 255;
+        end
+        vec_push(out_vec, extra);
+    end
+end
+
+# ─── Encode trailing literals ────────────────────────
+
+func _zstd_encode_literals:
+    in(out_vec: Vec; data: ptr; start: int; count: int)
+
+    ll = count;
+    if ll > 15:
+        ll = 15;
+    end
+    token = ll * 16;   # no match
+    vec_push(out_vec, token);
+
+    if count >= 15:
+        extra = count - 15;
+        when extra >= 255 loop
+            vec_push(out_vec, 255);
+            extra = extra - 255;
+        end
+        vec_push(out_vec, extra);
+    end
+
+    i = 0;
+    when i < count loop
+        vec_push(out_vec, native_load_u8(data, start + i));
+        i = i + 1;
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Decompress
+# ═══════════════════════════════════════════════════════
+
+func zstd_decompress:
+    in(compressed: Vec)
+    output = vec_new();
+
+    # Verify magic number
+    if vec_len(compressed) < 8:
+        out output;   # invalid
+    end
+
+    magic = vec_get(compressed, 0)
+          + vec_get(compressed, 1) * 256
+          + vec_get(compressed, 2) * 65536
+          + vec_get(compressed, 3) * 16777216;
+    if magic != ZSTD_MAGIC:
+        out output;
+    end
+
+    content_size = vec_get(compressed, 4)
+                 + vec_get(compressed, 5) * 256
+                 + vec_get(compressed, 6) * 65536
+                 + vec_get(compressed, 7) * 16777216;
+
+    pos = 8;   # after header
+
+    done = false;
+    when not done and pos < vec_len(compressed) loop
+        token = vec_get(compressed, pos);
+        pos = pos + 1;
+
+        if token == 0:
+            done = true;
+        else:
+            lit_len = token / 16;
+            match_len_raw = token % 16;
+
+            # Read extra literal length
+            if lit_len == 15:
+                extra_done = false;
+                when not extra_done loop
+                    if pos >= vec_len(compressed):
+                        extra_done = true;
+                    else:
+                        b = vec_get(compressed, pos);
+                        pos = pos + 1;
+                        lit_len = lit_len + b;
+                        if b < 255:
+                            extra_done = true;
+                        end
+                    end
+                end
+            end
+
+            # Copy literals
+            i = 0;
+            when i < lit_len and pos < vec_len(compressed) loop
+                vec_push(output, vec_get(compressed, pos));
+                pos = pos + 1;
+                i = i + 1;
+            end
+
+            # Read offset + match if present
+            if match_len_raw > 0 or token % 16 > 0:
+                if pos + 1 < vec_len(compressed):
+                    offset = vec_get(compressed, pos) + vec_get(compressed, pos + 1) * 256;
+                    pos = pos + 2;
+
+                    match_len = match_len_raw + MIN_MATCH_LEN;
+
+                    # Read extra match length
+                    if match_len_raw == 15:
+                        extra_done2 = false;
+                        when not extra_done2 loop
+                            if pos >= vec_len(compressed):
+                                extra_done2 = true;
+                            else:
+                                b = vec_get(compressed, pos);
+                                pos = pos + 1;
+                                match_len = match_len + b;
+                                if b < 255:
+                                    extra_done2 = true;
+                                end
+                            end
+                        end
+                    end
+
+                    # Copy from output buffer
+                    src = vec_len(output) - offset;
+                    j = 0;
+                    when j < match_len loop
+                        vec_push(output, vec_get(output, src + j));
+                        j = j + 1;
+                    end
+                end
+            end
+        end
+    end
+
+    out output;
+end
+
+# ═══════════════════════════════════════════════════════
+# Convenience — compress level wrappers
+# ═══════════════════════════════════════════════════════
+
+func zstd_compress_fast:
+    in(data: ptr; len: int)
+    out zstd_compress(data, len, ZSTD_LEVEL_FAST);
+end
+
+func zstd_compress_default:
+    in(data: ptr; len: int)
+    out zstd_compress(data, len, ZSTD_LEVEL_DEFAULT);
+end
+
+func zstd_compress_best:
+    in(data: ptr; len: int)
+    out zstd_compress(data, len, ZSTD_LEVEL_BEST);
+end
+
+# ═══════════════════════════════════════════════════════
+# Real Zstandard FFI (RFC 8878 compatible)
+# ═══════════════════════════════════════════════════════
+# For true Zstandard interop, use these extern functions
+# which bind to libzstd (facebook/zstd).
+
+extern func native_zstd_compress(src: ptr; src_len: int; dst: ptr; dst_cap: int; level: int) -> int;
+extern func native_zstd_decompress(src: ptr; src_len: int; dst: ptr; dst_cap: int) -> int;
+extern func native_zstd_compress_bound(src_len: int) -> int;
+extern func native_zstd_content_size(src: ptr; src_len: int) -> int;
+
+func zstd_real_compress:
+    in(data: ptr; len: int; level: int)
+    bound = native_zstd_compress_bound(len);
+    output = vec_with_cap(bound);
+    written = native_zstd_compress(data, len, output.data, bound, level);
+    if written <= 0:
+        out vec_new();
+    end
+    output.len = written;
+    out output;
+end
+
+func zstd_real_decompress:
+    in(data: ptr; len: int)
+    content_size = native_zstd_content_size(data, len);
+    if content_size <= 0:
+        content_size = len * 4;
+    end
+    output = vec_with_cap(content_size);
+    written = native_zstd_decompress(data, len, output.data, content_size);
+    if written <= 0:
+        out vec_new();
+    end
+    output.len = written;
+    out output;
+end

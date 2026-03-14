@@ -1,0 +1,350 @@
+##
+ * vir/iot/mqtt.vri — MQTT 3.1.1 Client
+ * ========================================
+ * Inspired by Python: paho-mqtt
+ * Inspired by Rust: rumqttc
+ * Inspired by C: mosquitto
+ *
+ * MQTT (Message Queuing Telemetry Transport) for IoT messaging.
+ * Supports QoS 0/1/2, subscriptions, will messages, keep-alive.
+ ##
+
+include types;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include string;
+import String, str_new, str_concat, str_byte_len, str_ptr from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include net;
+import TcpStream, tcp_connect, tcp_write, tcp_read from net;
+
+# ═══════════════════════════════════════════════════════
+# QoS Levels
+# ═══════════════════════════════════════════════════════
+
+enum QoS:
+    AtMostOnce  = 0;    # Fire and forget
+    AtLeastOnce = 1;    # Acknowledged delivery
+    ExactlyOnce = 2;    # Four-part handshake
+end
+
+# ═══════════════════════════════════════════════════════
+# MQTT Packet Types
+# ═══════════════════════════════════════════════════════
+
+const CONNECT:     0x10;
+const CONNACK:     0x20;
+const PUBLISH:     0x30;
+const PUBACK:      0x40;
+const PUBREC:      0x50;
+const PUBREL:      0x60;
+const PUBCOMP:     0x70;
+const SUBSCRIBE:   0x80;
+const SUBACK:      0x90;
+const UNSUBSCRIBE: 0xA0;
+const UNSUBACK:    0xB0;
+const PINGREQ:     0xC0;
+const PINGRESP:    0xD0;
+const DISCONNECT:  0xE0;
+
+# ═══════════════════════════════════════════════════════
+# Connection & Message entities
+# ═══════════════════════════════════════════════════════
+
+entity MqttWill:
+    topic:   string;
+    payload: string;
+    qos:     QoS;
+    retain:  bool;
+end
+
+entity MqttConfig:
+    host:           string;
+    port:           int;
+    client_id:      string;
+    username:       Option<string>;
+    password:       Option<string>;
+    keep_alive:     int;            # seconds
+    clean_session:  bool;
+    will:           Option<MqttWill>;
+end
+
+entity MqttClient:
+    config:      MqttConfig;
+    stream:      TcpStream;
+    connected:   bool;
+    packet_id:   int;
+    _on_message: Option<func(string, string, QoS)>;
+end
+
+entity MqttMessage:
+    topic:   string;
+    payload: string;
+    qos:     QoS;
+    retain:  bool;
+end
+
+# ═══════════════════════════════════════════════════════
+# Config builder
+# ═══════════════════════════════════════════════════════
+
+func mqtt_config:
+    in(host: string; port: int; client_id: string)
+    out MqttConfig {
+        host = host, port = port, client_id = client_id,
+        username = None, password = None,
+        keep_alive = 60, clean_session = true, will = None
+    };
+end
+
+func mqtt_config_auth:
+    in(cfg: MqttConfig; user: string; pass: string)
+    cfg.username = Some(user);
+    cfg.password = Some(pass);
+end
+
+func mqtt_config_will:
+    in(cfg: MqttConfig; topic: string; payload: string; qos: QoS)
+    cfg.will = Some(MqttWill {
+        topic = topic, payload = payload, qos = qos, retain = false
+    });
+end
+
+# ═══════════════════════════════════════════════════════
+# Encoding helpers
+# ═══════════════════════════════════════════════════════
+
+func _mqtt_encode_remaining_length:
+    in(buf: ptr; length: int)
+    i = 0;
+    x = length;
+    loop
+        encoded_byte = x & 0x7F;
+        x = x >> 7;
+        if x > 0:
+            encoded_byte = encoded_byte | 0x80;
+        end
+        native_store_u8(ptr_add(buf, i), encoded_byte);
+        i = i + 1;
+        if x == 0 break end:
+    end
+    out i;
+end
+
+func _mqtt_encode_utf8_string:
+    in(buf: ptr; s: string)
+    slen = str_byte_len(s);
+    native_store_u8(buf, (slen >> 8) & 0xFF);
+    native_store_u8(ptr_add(buf, 1), slen & 0xFF);
+    mem_copy(ptr_add(buf, 2), str_ptr(s), slen);
+    out 2 + slen;
+end
+
+# ═══════════════════════════════════════════════════════
+# CONNECT Packet
+# ═══════════════════════════════════════════════════════
+
+func _mqtt_build_connect:
+    in(cfg: MqttConfig)
+    var pkt: [int; 512];
+    pos = 0;
+
+    # Variable header: Protocol Name "MQTT"
+    pkt[pos] = 0; pos = pos + 1;    # length MSB
+    pkt[pos] = 4; pos = pos + 1;    # length LSB
+    pkt[pos] = 0x4D; pos = pos + 1; # M
+    pkt[pos] = 0x51; pos = pos + 1; # Q
+    pkt[pos] = 0x54; pos = pos + 1; # T
+    pkt[pos] = 0x54; pos = pos + 1; # T
+
+    # Protocol Level (4 = MQTT 3.1.1)
+    pkt[pos] = 4; pos = pos + 1;
+
+    # Connect Flags
+    flags = 0x02;  # Clean Session
+    if is_some(cfg.username):
+        flags = flags | 0x80;
+    end
+    if is_some(cfg.password):
+        flags = flags | 0x40;
+    end
+    if is_some(cfg.will):
+        flags = flags | 0x04;
+    end
+    pkt[pos] = flags; pos = pos + 1;
+
+    # Keep Alive
+    pkt[pos] = (cfg.keep_alive >> 8) & 0xFF; pos = pos + 1;
+    pkt[pos] = cfg.keep_alive & 0xFF;        pos = pos + 1;
+
+    # Payload: Client ID
+    pos = pos + _mqtt_encode_utf8_string(ptr_add(&pkt, pos), cfg.client_id);
+
+    # Will Topic + Message
+    if is_some(cfg.will):
+        w = unwrap(cfg.will);
+        pos = pos + _mqtt_encode_utf8_string(ptr_add(&pkt, pos), w.topic);
+        pos = pos + _mqtt_encode_utf8_string(ptr_add(&pkt, pos), w.payload);
+    end
+
+    # Username
+    if is_some(cfg.username):
+        pos = pos + _mqtt_encode_utf8_string(ptr_add(&pkt, pos), unwrap(cfg.username));
+    end
+
+    # Password
+    if is_some(cfg.password):
+        pos = pos + _mqtt_encode_utf8_string(ptr_add(&pkt, pos), unwrap(cfg.password));
+    end
+
+    out _mqtt_frame(CONNECT, &pkt, pos);
+end
+
+func _mqtt_frame:
+    in(pkt_type: int; payload: ptr; payload_len: int)
+    var frame: [int; 520];
+    frame[0] = pkt_type;
+    rl_len = _mqtt_encode_remaining_length(ptr_add(&frame, 1), payload_len);
+    mem_copy(ptr_add(&frame, 1 + rl_len), payload, payload_len);
+    out _mqtt_buf_copy(&frame, 1 + rl_len + payload_len);
+end
+
+# ═══════════════════════════════════════════════════════
+# Client API
+# ═══════════════════════════════════════════════════════
+
+## Connect to MQTT broker.
+func mqtt_connect:
+    in(cfg: MqttConfig)
+    stream_r = tcp_connect(cfg.host, cfg.port);
+    if is_err(stream_r):
+        out Err(str_new("MQTT: TCP connection failed"));
+    end
+    stream = unwrap_ok(stream_r);
+
+    # Send CONNECT packet
+    pkt = _mqtt_build_connect(cfg);
+    tcp_write(stream, pkt.data, pkt.len);
+
+    # Read CONNACK
+    var resp: [int; 4];
+    n = tcp_read(stream, &resp, 4);
+    if n < 4 | resp[0] != CONNACK:
+        out Err(str_new("MQTT: CONNACK not received"));
+    end
+    if resp[3] != 0:
+        out Err(str_new("MQTT: connection refused"));
+    end
+
+    out Ok(MqttClient {
+        config = cfg, stream = stream, connected = true,
+        packet_id = 1, _on_message = None
+    });
+end
+
+## Publish a message to a topic.
+func mqtt_publish:
+    in(client: MqttClient; topic: string; payload: string; qos: QoS; retain: bool)
+    if !client.connected:
+        out Err(str_new("MQTT: not connected"));
+    end
+
+    var pkt: [int; 4096];
+    pos = 0;
+
+    # Topic
+    pos = pos + _mqtt_encode_utf8_string(&pkt, topic);
+
+    # Packet ID (for QoS > 0)
+    if qos != QoS.AtMostOnce:
+        pkt[pos] = (client.packet_id >> 8) & 0xFF; pos = pos + 1;
+        pkt[pos] = client.packet_id & 0xFF;         pos = pos + 1;
+        client.packet_id = client.packet_id + 1;
+    end
+
+    # Payload
+    plen = str_byte_len(payload);
+    mem_copy(ptr_add(&pkt, pos), str_ptr(payload), plen);
+    pos = pos + plen;
+
+    # Fixed header flags
+    hdr = PUBLISH;
+    if retain hdr = hdr | 0x01 end:
+    if qos == QoS.AtLeastOnce  hdr = hdr | 0x02 end:
+    if qos == QoS.ExactlyOnce  hdr = hdr | 0x04 end:
+
+    frame = _mqtt_frame(hdr, &pkt, pos);
+    tcp_write(client.stream, frame.data, frame.len);
+    out Ok(());
+end
+
+## Subscribe to one or more topics.
+func mqtt_subscribe:
+    in(client: MqttClient; topic: string; qos: QoS)
+    if !client.connected:
+        out Err(str_new("MQTT: not connected"));
+    end
+
+    var pkt: [int; 256];
+    pos = 0;
+
+    # Packet ID
+    pkt[pos] = (client.packet_id >> 8) & 0xFF; pos = pos + 1;
+    pkt[pos] = client.packet_id & 0xFF;         pos = pos + 1;
+    client.packet_id = client.packet_id + 1;
+
+    # Topic Filter + QoS
+    pos = pos + _mqtt_encode_utf8_string(ptr_add(&pkt, pos), topic);
+    if qos == QoS.AtMostOnce:     pkt[pos] = 0;
+    elif qos == QoS.AtLeastOnce:  pkt[pos] = 1;
+    else                           pkt[pos] = 2;
+    end
+    pos = pos + 1;
+
+    frame = _mqtt_frame(SUBSCRIBE | 0x02, &pkt, pos);
+    tcp_write(client.stream, frame.data, frame.len);
+    out Ok(());
+end
+
+## Unsubscribe from a topic.
+func mqtt_unsubscribe:
+    in(client: MqttClient; topic: string)
+    var pkt: [int; 256];
+    pos = 0;
+    pkt[pos] = (client.packet_id >> 8) & 0xFF; pos = pos + 1;
+    pkt[pos] = client.packet_id & 0xFF;         pos = pos + 1;
+    client.packet_id = client.packet_id + 1;
+    pos = pos + _mqtt_encode_utf8_string(ptr_add(&pkt, pos), topic);
+
+    frame = _mqtt_frame(UNSUBSCRIBE | 0x02, &pkt, pos);
+    tcp_write(client.stream, frame.data, frame.len);
+    out Ok(());
+end
+
+## Send PINGREQ to keep connection alive.
+func mqtt_ping:
+    in(client: MqttClient)
+    var pkt: [int; 2];
+    pkt[0] = PINGREQ;
+    pkt[1] = 0;
+    tcp_write(client.stream, &pkt, 2);
+end
+
+## Set callback for incoming messages.
+func mqtt_on_message:
+    in(client: MqttClient; cb: func(string, string, QoS))
+    client._on_message = Some(cb);
+end
+
+## Disconnect gracefully.
+func mqtt_disconnect:
+    in(client: MqttClient)
+    var pkt: [int; 2];
+    pkt[0] = DISCONNECT;
+    pkt[1] = 0;
+    tcp_write(client.stream, &pkt, 2);
+    client.connected = false;
+end
