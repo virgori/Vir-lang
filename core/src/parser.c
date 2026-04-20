@@ -478,6 +478,23 @@ static ast_node_t *parse_unary(vir_parser_t *p)
         strncpy(fa->name, field->str.buf, AST_NAME_LEN - 1);
         fa->line = field->line;
         ast_add_child(fa, left);
+        /* §11 UFCS: if a '(' follows a plain dot access, rewrite
+         *   receiver.fn(args...)  →  AST_CALL fn(receiver, args...)
+         * This covers §11.1 (UFCS), §11.3 (chaining), §11.4 (method on
+         * entity).  Safe-access '?.' is left as pure field access. */
+        if (!is_safe && check(p, TOK_LPAREN)) {
+            advance(p);  /* consume '(' */
+            fa->type = AST_CALL;
+            if (!check(p, TOK_RPAREN)) {
+                ast_node_t *arg = parse_expr(p);
+                if (arg) ast_add_child(fa, arg);
+                while (match(p, TOK_COMMA)) {
+                    arg = parse_expr(p);
+                    if (arg) ast_add_child(fa, arg);
+                }
+            }
+            expect(p, TOK_RPAREN, "expected ')' after UFCS arguments");
+        }
         left = fa;
     }
     return left;
