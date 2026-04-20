@@ -139,6 +139,12 @@ typedef enum {
     TOK_LOCK,           /* lock (atomic prefix)         */
     TOK_ATOMIC_BANG,    /* !! (atomic postfix)          */
 
+    /* ── Compound assignment ──────────────────────────── */
+    TOK_PLUS_ASSIGN,    /* +=                            */
+    TOK_MINUS_ASSIGN,   /* -=                            */
+    TOK_STAR_ASSIGN,    /* *=                            */
+    TOK_SLASH_ASSIGN,   /* /=                            */
+
     /* ── Delimiters ────────────────────────────────────── */
     TOK_LPAREN,         /* (                            */
     TOK_RPAREN,         /* )                            */
