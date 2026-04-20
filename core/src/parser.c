@@ -437,7 +437,22 @@ static ast_node_t *parse_unary(vir_parser_t *p)
     ast_node_t *left = parse_primary(p);
     if (!left) return NULL;
     while (check(p, TOK_DOT) || check(p, TOK_SAFE_ACCESS) ||
-           check(p, TOK_EXIST) || check(p, TOK_ATOMIC_BANG)) {
+           check(p, TOK_EXIST) || check(p, TOK_ATOMIC_BANG) ||
+           check(p, TOK_BIT_NOT)) {
+        if (check(p, TOK_BIT_NOT)) {
+            /* §24.2 swizzle: v~xyz / v~rgba.  Postfix only — bitwise NOT
+             * is prefix-only.  Disambiguated by being in postfix position. */
+            const vir_token_t *tilde = advance(p);
+            const vir_token_t *chans = expect(p, TOK_IDENT,
+                "expected channel name after '~' (e.g. xyz, rgba)");
+            if (!chans) break;
+            ast_node_t *sw = ast_new(AST_SWIZZLE);
+            strncpy(sw->name, chans->str.buf, AST_NAME_LEN - 1);
+            sw->line = tilde->line;
+            ast_add_child(sw, left);
+            left = sw;
+            continue;
+        }
         if (check(p, TOK_EXIST)) {
             const vir_token_t *q = advance(p);
             ast_node_t *ex = ast_new(AST_EXIST_CHECK);
