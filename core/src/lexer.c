@@ -386,6 +386,13 @@ static int lex_number(vir_lexer_t *lex, vir_token_t *tok)
             if (is_float) break;  /* second dot = stop */
             /* Check for '..' range operator — don't consume as decimal */
             if (lex_peek_at(lex, 1) == '.') break;
+            /* §11 UFCS: `10.foo()` — don't swallow '.' if followed by an
+             * identifier-start character (letter or '_').  This lets
+             * integer literals participate in method call chains. */
+            {
+                int nx = lex_peek_at(lex, 1);
+                if (isalpha(nx) || nx == '_') break;
+            }
             is_float = 1;
         }
         buf[n++] = (char)lex_advance(lex);
