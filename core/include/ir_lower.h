@@ -94,6 +94,9 @@ typedef enum {
     AST_EXIST_CHECK,    /* expr? */
     AST_NAMED_ARG,      /* param=value in call */
     AST_TYPE_DECL,      /* type i8; (v1.2 type alias)  */
+    AST_ATOMIC_LOAD,    /* lock expr / expr!! (read)    */
+    AST_ATOMIC_STORE,   /* lock x = v / x!! = v         */
+    AST_ATOMIC_RMW,     /* lock x += 1 / x!! += 1       */
 } ast_type_t;
 
 /* Binary / comparison operators */
@@ -109,6 +112,9 @@ typedef enum {
     OP_PATTERN,         /* :~ pattern match */
     OP_CAST,            /* >> type cast */
     OP_NOT,             /* ! logical not */
+    /* §26.2 AI operators */
+    OP_MATMUL,          /* ** matrix multiply */
+    OP_FMA,             /* >< fused multiply-add */
 } ast_op_t;
 
 /* Built-in function IDs (for AST_BUILTIN_CALL) */

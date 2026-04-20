@@ -133,6 +133,12 @@ typedef enum {
     TOK_PATTERN,        /* :~ (pattern match)           */
     TOK_HASH,           /* # (comment marker)           */
 
+    /* ── AI / advanced operators (§26.2, §24.4) ──────── */
+    TOK_MATMUL,         /* ** (matrix multiply)         */
+    TOK_FMA,            /* >< (fused multiply-add)      */
+    TOK_LOCK,           /* lock (atomic prefix)         */
+    TOK_ATOMIC_BANG,    /* !! (atomic postfix)          */
+
     /* ── Delimiters ────────────────────────────────────── */
     TOK_LPAREN,         /* (                            */
     TOK_RPAREN,         /* )                            */

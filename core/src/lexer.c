@@ -127,6 +127,7 @@ static const kw_single_t kw_singles[] = {
     {"as",        TOK_AS},
     {"include",   TOK_INCLUDE},
     {"type",      TOK_TYPE_KW},
+    {"lock",      TOK_LOCK},
     {NULL,        TOK_EOF}
 };
 
@@ -651,6 +652,27 @@ int lexer_tokenize(vir_lexer_t *lex)
             lex_push_token(lex, tok);
             continue;
         }
+        /* §26.2: ** matmul */
+        if (c == '*' && c2 == '*') {
+            vir_token_t tok = { TOK_MATMUL, lex->line, lex->col, {0} };
+            lex_advance(lex); lex_advance(lex);
+            lex_push_token(lex, tok);
+            continue;
+        }
+        /* §26.2: >< fused multiply-add */
+        if (c == '>' && c2 == '<') {
+            vir_token_t tok = { TOK_FMA, lex->line, lex->col, {0} };
+            lex_advance(lex); lex_advance(lex);
+            lex_push_token(lex, tok);
+            continue;
+        }
+        /* §24.4: !! atomic postfix */
+        if (c == '!' && c2 == '!') {
+            vir_token_t tok = { TOK_ATOMIC_BANG, lex->line, lex->col, {0} };
+            lex_advance(lex); lex_advance(lex);
+            lex_push_token(lex, tok);
+            continue;
+        }
         if (c == '.' && c2 == '.') {
             vir_token_t tok = { TOK_DOTDOT, lex->line, lex->col, {0} };
             lex_advance(lex); lex_advance(lex);
@@ -800,6 +822,10 @@ const char *lexer_token_name(vir_tok_t type) {
         [TOK_CAST]      = "CAST",
         [TOK_PATTERN]   = "PATTERN",
         [TOK_HASH]      = "HASH",
+        [TOK_MATMUL]    = "MATMUL",
+        [TOK_FMA]       = "FMA",
+        [TOK_LOCK]      = "LOCK",
+        [TOK_ATOMIC_BANG] = "ATOMIC_BANG",
         [TOK_LPAREN]    = "LPAREN",
         [TOK_RPAREN]    = "RPAREN",
         [TOK_LBRACKET]  = "LBRACKET",
