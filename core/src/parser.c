@@ -1292,6 +1292,32 @@ static ast_node_t *parse_statement(vir_parser_t *p)
         advance(p);
         return parse_print_stmt(p);
 
+    case TOK_LOCK: {
+        /* §24.4: `lock IDENT = value` atomic store,
+         *        `lock IDENT` alone = atomic load expression stmt */
+        advance(p);
+        const vir_token_t *id = expect(p, TOK_IDENT, "expected variable after 'lock'");
+        if (!id) return NULL;
+        if (check(p, TOK_ASSIGN)) {
+            advance(p);  /* consume '=' */
+            ast_node_t *st = ast_new(AST_ATOMIC_STORE);
+            strncpy(st->name, id->str.buf, AST_NAME_LEN - 1);
+            st->line = t->line;
+            ast_node_t *val = parse_expr(p);
+            if (val) ast_add_child(st, val);
+            return st;
+        }
+        /* Bare `lock x` statement → atomic load (no-op as stmt; kept for
+         * consistency with expression-form `lock x`) */
+        ast_node_t *idn = ast_new(AST_IDENTIFIER);
+        strncpy(idn->name, id->str.buf, AST_NAME_LEN - 1);
+        idn->line = id->line;
+        ast_node_t *al = ast_new(AST_ATOMIC_LOAD);
+        al->line = t->line;
+        ast_add_child(al, idn);
+        return al;
+    }
+
     case TOK_BREAK: {
         advance(p);
         ast_node_t *n = ast_new(AST_BREAK);
@@ -1410,6 +1436,27 @@ static ast_node_t *parse_statement(vir_parser_t *p)
             ast_node_t *val = parse_expr(p);
             if (val) ast_add_child(assign, val);
             return assign;
+        }
+        /* §24.4: x!! = value (atomic store postfix form) */
+        if (check(p, TOK_ATOMIC_BANG)) {
+            advance(p);  /* consume '!!' */
+            if (check(p, TOK_ASSIGN)) {
+                advance(p);  /* consume '=' */
+                ast_node_t *st = ast_new(AST_ATOMIC_STORE);
+                strncpy(st->name, t->str.buf, AST_NAME_LEN - 1);
+                st->line = t->line;
+                ast_node_t *val = parse_expr(p);
+                if (val) ast_add_child(st, val);
+                return st;
+            }
+            /* Bare `x!!` as expression statement → atomic load */
+            ast_node_t *id = ast_new(AST_IDENTIFIER);
+            strncpy(id->name, t->str.buf, AST_NAME_LEN - 1);
+            id->line = t->line;
+            ast_node_t *al = ast_new(AST_ATOMIC_LOAD);
+            al->line = t->line;
+            ast_add_child(al, id);
+            return al;
         }
         if (check(p, TOK_DOT)) {
             /* Field assign: IDENT '.' FIELD_NAME '=' expr */

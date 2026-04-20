@@ -859,6 +859,32 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt)
         return 0;
     }
 
+    /* §24.4 Atomic store (lock x = v / x!! = v): same as assign for now.
+     * Future: emit STLR (ARM64) / XCHG (x86) for release semantics. */
+    case AST_ATOMIC_STORE: {
+        if (stmt->child_count < 1) return -1;
+        uint32_t idx;
+        int scope = sym_lookup_both(ctx, stmt->name, &idx);
+        if (scope < 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "atomic store to undefined: %s", stmt->name);
+            lower_error(ctx, buf);
+            return -1;
+        }
+        int val = lower_expr(ctx, stmt->children[0]);
+        if (val < 0) return -1;
+        if (scope == 1) {
+            emit(ctx, q_instr(Q_STORE_GLOBAL, q_none(),
+                              q_imm(idx), q_vreg((uint32_t)val)));
+        } else {
+            if ((uint32_t)val != idx) {
+                emit(ctx, q_instr(Q_MOVE, q_vreg(idx),
+                                  q_vreg((uint32_t)val), q_none()));
+            }
+        }
+        return 0;
+    }
+
     case AST_INDEX_ASSIGN: {
         /* arr[idx] = val */
         if (stmt->child_count < 2) return -1;
