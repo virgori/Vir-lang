@@ -799,6 +799,16 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr)
         return lower_expr(ctx, expr->children[0]);
     }
 
+    /* §24.2 Swizzle (v~xyz / v~rgba): scalar passthrough.
+     * Real implementation needs vector type and would emit shuffle/blend. */
+    case AST_SWIZZLE: {
+        if (expr->child_count < 1) {
+            lower_error(ctx, "swizzle without operand");
+            return -1;
+        }
+        return lower_expr(ctx, expr->children[0]);
+    }
+
     default: {
         lower_error(ctx, "unsupported expression type");
         return -1;

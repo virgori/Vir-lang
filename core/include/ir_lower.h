@@ -97,6 +97,7 @@ typedef enum {
     AST_ATOMIC_LOAD,    /* lock expr / expr!! (read)    */
     AST_ATOMIC_STORE,   /* lock x = v / x!! = v         */
     AST_ATOMIC_RMW,     /* lock x += 1 / x!! += 1       */
+    AST_SWIZZLE,        /* v~xyz / v~rgba (§24.2)       */
 } ast_type_t;
 
 /* Binary / comparison operators */
