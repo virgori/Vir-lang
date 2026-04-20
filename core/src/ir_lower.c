@@ -209,6 +209,16 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr)
         uint32_t idx;
         int scope = sym_lookup_both(ctx, expr->name, &idx);
         if (scope < 0) {
+            /* §6.6 / §11.4 bước 2: identifier may refer to a function.
+             * Materialise the function index as an i64 so it can be stored
+             * in a field / passed as argument / later called indirectly. */
+            int fidx = find_func_index(ctx, expr->name);
+            if (fidx >= 0) {
+                uint32_t rd = fresh_vreg(ctx);
+                emit(ctx, q_instr(Q_LOAD, q_vreg(rd),
+                                  q_imm((int64_t)fidx), q_none()));
+                return (int)rd;
+            }
             char buf[128];
             snprintf(buf, sizeof(buf), "undefined variable: %s", expr->name);
             lower_error(ctx, buf);
@@ -373,8 +383,50 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr)
         /* Function call: evaluate args, put in R0..Rn, call, result in R0 */
         int fidx = find_func_index(ctx, expr->name);
         if (fidx < 0) {
-            /* Function not yet defined - will be forward declared */
-            /* For now, record a placeholder; we'll fix up later or error */
+            /* §11.4 bước 2 — Callable field fallback.
+             * UFCS rewrite produced AST_CALL with children[0] = receiver.
+             * If no free function `name` exists but some record type has a
+             * field named `name`, treat this as `receiver.name(args)` where
+             * `receiver.name` holds a function index (callable field). */
+            if (expr->child_count >= 1) {
+                int field_off = -1;
+                for (uint32_t i = 0; i < ctx->record_type_count && field_off < 0; i++) {
+                    field_off = record_field_offset(&ctx->record_types[i],
+                                                    expr->name);
+                }
+                if (field_off >= 0) {
+                    /* Lower receiver and load function index from field. */
+                    int base = lower_expr(ctx, expr->children[0]);
+                    if (base < 0) return -1;
+                    uint32_t off_r  = fresh_vreg(ctx);
+                    uint32_t fn_r   = fresh_vreg(ctx);
+                    emit(ctx, q_instr(Q_LOAD, q_vreg(off_r),
+                                      q_imm((int64_t)field_off), q_none()));
+                    emit(ctx, q_instr(Q_LOAD_WORD, q_vreg(fn_r),
+                                      q_vreg((uint32_t)base), q_vreg(off_r)));
+
+                    /* Args are children[1..n] (receiver is NOT passed). */
+                    uint32_t nargs = expr->child_count - 1;
+                    int arg_vregs[Q_MAX_PARAMS] = {0};
+                    for (uint32_t i = 0; i < nargs && i < Q_MAX_PARAMS; i++) {
+                        int av = lower_expr(ctx, expr->children[i + 1]);
+                        if (av < 0) return -1;
+                        arg_vregs[i] = av;
+                    }
+                    for (uint32_t i = 0; i < nargs && i < Q_MAX_PARAMS; i++) {
+                        emit(ctx, q_instr(Q_MOVE, q_vreg(i),
+                                          q_vreg((uint32_t)arg_vregs[i]),
+                                          q_none()));
+                    }
+                    emit(ctx, q_instr(Q_CALL_INDIRECT, q_none(),
+                                      q_vreg(fn_r), q_none()));
+                    uint32_t rd = fresh_vreg(ctx);
+                    emit(ctx, q_instr(Q_MOVE, q_vreg(rd),
+                                      q_vreg(0), q_none()));
+                    return (int)rd;
+                }
+            }
+            /* Truly undefined. */
             char buf[128];
             snprintf(buf, sizeof(buf), "undefined function: %s", expr->name);
             lower_error(ctx, buf);
@@ -763,23 +815,78 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr)
     }
 
     /* §8.9 Pattern match: expr :~ pattern
-     *   - pattern is Ident (type name): currently always true (placeholder
-     *     until runtime type tags exist)
-     *   - pattern is literal int/str: equality test
-     *   - otherwise: equality test on evaluated expression
+     *   - pattern is Ident matching a known type name: compile-time check
+     *     against the LHS AST shape (literal int/float/str/array/record).
+     *   - pattern is Ident matching a declared record/enum type name:
+     *     evaluates to 1 if LHS is that record/enum, 0 otherwise (best
+     *     effort, compile-time).
+     *   - pattern is Ident referring to a variable: equality test on the
+     *     identifier's value.
+     *   - pattern is literal int/float/str: equality test.
+     *   - otherwise: equality test on evaluated expression.
      */
     case AST_PATTERN_MATCH: {
         if (expr->child_count < 2) {
             lower_error(ctx, "pattern match needs value and pattern");
             return -1;
         }
+        const ast_node_t *lhs_ast = expr->children[0];
         const ast_node_t *pat = expr->children[1];
         if (pat && pat->type == AST_IDENTIFIER) {
-            /* Type name pattern (e.g. `x :~ int`): placeholder → always 1.
-             * A real implementation would check a runtime type tag. */
-            uint32_t rd = fresh_vreg(ctx);
-            emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(1), q_none()));
-            return (int)rd;
+            const char *tn = pat->name;
+            /* First: if the identifier is a declared variable, treat this as
+             * value equality rather than type check.  Variables shadow type
+             * names (spec §10.5). */
+            uint32_t dummy;
+            int is_var = (sym_lookup_both(ctx, tn, &dummy) >= 0);
+            if (!is_var) {
+                /* Type-name pattern: compile-time check based on LHS shape. */
+                int match = -1;  /* -1 = unknown, 0/1 = determined */
+                int lhs_kind = lhs_ast ? (int)lhs_ast->type : -1;
+
+                /* Recognised primitive type names */
+                int is_int_t   = (strcmp(tn, "int")    == 0 ||
+                                  strcmp(tn, "i8")     == 0 ||
+                                  strcmp(tn, "i16")    == 0 ||
+                                  strcmp(tn, "i32")    == 0 ||
+                                  strcmp(tn, "i64")    == 0 ||
+                                  strcmp(tn, "u8")     == 0 ||
+                                  strcmp(tn, "u16")    == 0 ||
+                                  strcmp(tn, "u32")    == 0 ||
+                                  strcmp(tn, "u64")    == 0);
+                int is_float_t = (strcmp(tn, "float")  == 0 ||
+                                  strcmp(tn, "f32")    == 0 ||
+                                  strcmp(tn, "f64")    == 0);
+                int is_str_t   = (strcmp(tn, "string") == 0 ||
+                                  strcmp(tn, "str")    == 0);
+                int is_bool_t  = (strcmp(tn, "bool")   == 0);
+                int is_array_t = (strcmp(tn, "array")  == 0);
+
+                if (lhs_kind == AST_LITERAL_INT) {
+                    match = (is_int_t || is_bool_t) ? 1 : 0;
+                } else if (lhs_kind == AST_LITERAL_FLOAT) {
+                    match = is_float_t ? 1 : 0;
+                } else if (lhs_kind == AST_LITERAL_STR) {
+                    match = is_str_t ? 1 : 0;
+                } else if (lhs_kind == AST_ARRAY_LITERAL) {
+                    match = is_array_t ? 1 : 0;
+                } else if (lhs_kind == AST_RECORD_LITERAL && lhs_ast) {
+                    match = (strcmp(lhs_ast->name, tn) == 0) ? 1 : 0;
+                } else if (is_int_t || is_float_t || is_str_t ||
+                           is_bool_t || is_array_t) {
+                    /* Recognised primitive but LHS shape unknown: we can't
+                     * prove — stay conservative and return 0. */
+                    match = 0;
+                }
+
+                /* Still lower LHS for side effects (e.g. call expressions). */
+                (void)lower_expr(ctx, lhs_ast);
+                uint32_t rd = fresh_vreg(ctx);
+                emit(ctx, q_instr(Q_LOAD, q_vreg(rd),
+                                  q_imm(match > 0 ? 1 : 0), q_none()));
+                return (int)rd;
+            }
+            /* Fall through: identifier is a variable → value equality. */
         }
         int lhs = lower_expr(ctx, expr->children[0]);
         int rhs = lower_expr(ctx, expr->children[1]);
