@@ -147,7 +147,7 @@
 | 5.4 | Entity paren syntax `Point(x: 10, y: 20)` | §7.1 | ✅ | `check_entity_literal_paren()` + EntityLiteral lowering |
 | 5.5 | `method` trong entity (implicit `this`) | §7.2 | ✅ | **15/04** — Parser parse `method` block bên trong entity, tự thêm `this` param. IR đăng ký + lower method như func. `test_method.vri` PASS (11,16,16) |
 | 5.6 | `packed entity` (no-padding layout) | §7.3 | ⚠️ | Lexer `PackedKw = 161`, parser tạo `PackedDef`, nhưng không có logic packed layout riêng |
-| 5.7 | Callable field (`btn.on_click()`) | §11.4 | ❌ | UFCS bước 2 (callable field) chưa triển khai |
+| 5.7 | Callable field (`btn.on_click()`) | §11.4 | ✅ | **21/04** — Q_CALL_INDIRECT + AST_CALL callable-field fallback (commit 09b66f7) |
 
 ---
 
@@ -187,7 +187,7 @@
 | 8.6 | Bit: `and`, `or`, `xor`, `shl`, `shr` | §10.4 | ✅ | **14/04 update** — right-shift alias `shrrr` được map về `shr`; `test_adv_005_shift.vri` và `test_adv_097_bit_manip.vri` PASS |
 | 8.7 | Truy cập an toàn `?.` | §10.5 | ✅ | **20/04** — AST_SAFE_ACCESS lower hoàn chỉnh (commit a423f80). Không rewrite thành AST_CALL ngay cả khi có `()` theo sau |
 | 8.8 | Kiểm tra tồn tại `?` | §10.5 | ✅ | **20/04** — AST_EXIST_CHECK: `expr == 0 XOR 1` (commit a423f80) |
-| 8.9 | So khớp mẫu `:~` | §10.5 | ⚠️ | **20/04** — Literal eq qua Q_CMP_EQ; type-name ident → placeholder (always 1). Đủ cho simple match (commit a423f80) |
+| 8.9 | So khớp mẫu `:~` | §10.5 | ✅ | **21/04** — Compile-time LHS-shape check: literal int/float/string/array/record vs type name → 0/1 tại thời điểm lower (commit 09b66f7). Identifier biến vẫn fall-through Q_CMP_EQ |
 | 8.10 | Ép kiểu `>>` | §10.5 | ✅ | `Cast = 87` trong parser. **13/04**: C core lexer giờ context-sensitive — `>> digit/(/-` → SHR, otherwise → Cast |
 | 8.11 | Chuyển đổi kiểu `as` | §10.5 | ✅ | **20/04** — Passthrough lower (int/float cùng VM repr) (commit a423f80) |
 | 8.12 | Matmul `**` | §26.2 | ✅ | **20/04** — Q_TENSOR_MUL runtime dispatch: array operands → element-wise mul, scalar → `a*b` (commit ea98aa0). Verified: `[2,3,4,5]**[10,20,30,40] = [20,60,120,200]` |
@@ -205,8 +205,8 @@
 | 9.2 | `this` keyword | §11.2 | ✅ | `this` là plain identifier trong parser. Verified: `func square: in(this:int) out this*this end; print 7.square() → 49` |
 | 9.3 | UFCS chaining `a.b().c()` | §11.3 | ✅ | **20/04 C core** — Postfix loop + AST_CALL retype cho phép chaining liên tục. Verified: `10.inc().double().inc() = 23`, `4.square().incr(1) = 17`. Lexer fix kèm theo: `lex_number` không nuốt `.` khi ký tự tiếp theo là letter/`_` để `10.inc()` lex đúng thành INT DOT IDENT |
 | 9.4 | UFCS trên Entity | §11.4 | ✅ | Hoạt động với `this: SomeType` param (miễn là entity literal syntax đã có; §5.4 hoàn chỉnh) |
-| 9.5 | Callable field (field con trỏ hàm) | §11.4 bước 2 | ❌ | Không có resolver callable field. Cần Q_LOAD_FUNC_ADDR / Q_CALL_INDIRECT opcode |
-| 9.6 | Field vs Function resolution (4 bước) | §11.4 | ⚠️ | **20/04** — Có bước 1 (method via UFCS), bước 3 (free function via UFCS), bước 4 (field access fallback nếu không có `()`). Thiếu bước 2 (callable field) |
+| 9.5 | Callable field (field con trỏ hàm) | §11.4 bước 2 | ✅ | **21/04** — Q_CALL_INDIRECT = 0xF4 opcode; AST_IDENTIFIER fallback → Q_LOAD imm=fidx; AST_CALL fallback dò record field → load fn addr + Q_CALL_INDIRECT (không ngầm truyền `this`) (commit 09b66f7) |
+| 9.6 | Field vs Function resolution (4 bước) | §11.4 | ✅ | **21/04** — Đủ 4 bước: (1) method via UFCS, (2) callable field via Q_CALL_INDIRECT, (3) free function via UFCS, (4) field access fallback (commit 09b66f7) |
 
 ---
 
@@ -427,12 +427,14 @@
 
 | Trạng thái | Số lượng | Tỷ lệ |
 |-----------|---------|--------|
-| ✅ Đã triển khai | 79 | 54% |
-| ⚠️ Một phần | 24 | 16% |
-| ❌ Chưa triển khai | 43 | 29% |
+| ✅ Đã triển khai | 83 | 57% |
+| ⚠️ Một phần | 22 | 15% |
+| ❌ Chưa triển khai | 41 | 28% |
 | **Tổng** | **146** | **100%** |
 
 *Cập nhật 20/04/2026: §8.4, §8.7, §8.8, §8.11, §8.12, §8.13, §8.14, §8.15 chuyển từ ⚠️/❌ → ✅ (commit `a423f80` + `ea98aa0` triển khai toàn bộ §10/§24/§26.2 operators trong C core). §9 UFCS đã xác minh hoạt động (§9.1/9.3 hiện là real UFCS rewrite, không phải stub).*
+
+*Cập nhật 21/04/2026: §5.7, §9.5, §9.6 chuyển ❌/⚠️ → ✅ (callable field qua Q_CALL_INDIRECT=0xF4). §8.9 `:~` chuyển ⚠️ → ✅ (compile-time LHS-shape type check). Commit 09b66f7. Stats: ✅ 79→83 (+4), ⚠️ 24→22 (-2), ❌ 43→41 (-2).*
 
 ---
 
