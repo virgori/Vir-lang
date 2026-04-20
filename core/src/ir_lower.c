@@ -285,10 +285,11 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr)
         case OP_XOR: op = Q_XOR; break;
         case OP_SHL: op = Q_SHL; break;
         case OP_SHR: op = Q_SHR; break;
-        /* §26.2 AI operators: scalar fallback.
-         * Future: detect tensor operands and emit VMUL/VFMA for SIMD. */
-        case OP_MATMUL: op = Q_MUL; break;  /* a ** b → a * b for scalars */
-        case OP_FMA:    op = Q_MUL; break;  /* a >< b → a * b for scalars */
+        /* §26.2 AI operators: runtime-dispatched via Q_TENSOR_MUL/FMA.
+         * If both operands are array handles → element-wise loop in VM;
+         * else → scalar multiply fallback. */
+        case OP_MATMUL: op = Q_TENSOR_MUL; break;  /* a ** b */
+        case OP_FMA:    op = Q_TENSOR_FMA; break;  /* a >< b */
         default:
             lower_error(ctx, "unsupported binop");
             return -1;
@@ -789,24 +790,46 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr)
         return (int)rd;
     }
 
-    /* §24.4 Atomic load (lock expr / expr!!): passthrough for now.
-     * Real implementation would emit LDAR (ARM64) / MOV+mfence (x86). */
+    /* §24.4 Atomic load (lock expr / expr!!): real seq_cst load via
+     * Q_ATOMIC_LOAD_GLOBAL when operand is a global identifier.
+     * Otherwise fall through to regular expression evaluation. */
     case AST_ATOMIC_LOAD: {
         if (expr->child_count < 1) {
             lower_error(ctx, "atomic load without operand");
             return -1;
         }
-        return lower_expr(ctx, expr->children[0]);
+        const ast_node_t *inner = expr->children[0];
+        if (inner && inner->type == AST_IDENTIFIER) {
+            uint32_t idx;
+            int scope = sym_lookup_both(ctx, inner->name, &idx);
+            if (scope == 1) {
+                uint32_t rd = fresh_vreg(ctx);
+                emit(ctx, q_instr(Q_ATOMIC_LOAD_GLOBAL, q_vreg(rd),
+                                  q_imm(idx), q_none()));
+                return (int)rd;
+            }
+        }
+        return lower_expr(ctx, inner);
     }
 
-    /* §24.2 Swizzle (v~xyz / v~rgba): scalar passthrough.
-     * Real implementation needs vector type and would emit shuffle/blend. */
+    /* §24.2 Swizzle (v~xyz / v~rgba): emit Q_SWIZZLE with channel string
+     * in string table.  VM dispatches at runtime: array → reordered array,
+     * scalar → passthrough. */
     case AST_SWIZZLE: {
         if (expr->child_count < 1) {
             lower_error(ctx, "swizzle without operand");
             return -1;
         }
-        return lower_expr(ctx, expr->children[0]);
+        int v = lower_expr(ctx, expr->children[0]);
+        if (v < 0) return -1;
+        uint32_t chans_idx = q_module_add_string(&ctx->module, expr->name);
+        uint32_t rd = fresh_vreg(ctx);
+        q_operand_t chans_op;
+        chans_op.type = OPERAND_STR;
+        chans_op.str_idx = chans_idx;
+        emit(ctx, q_instr(Q_SWIZZLE, q_vreg(rd),
+                          q_vreg((uint32_t)v), chans_op));
+        return (int)rd;
     }
 
     default: {
@@ -869,8 +892,13 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt)
         return 0;
     }
 
-    /* §24.4 Atomic store (lock x = v / x!! = v): same as assign for now.
-     * Future: emit STLR (ARM64) / XCHG (x86) for release semantics. */
+    /* §24.4 Atomic store (lock x = v / x!! = v): real seq_cst store on
+     * globals via Q_ATOMIC_STORE_GLOBAL.  Locals have no cross-thread
+     * aliasing so regular move is safe.
+     *
+     * Peephole for RMW (lock x += v → AST_ATOMIC_STORE(x, x OP_ADD v)):
+     *   - If child is BINOP with self-reference on left, emit atomic
+     *     fetch_add/sub for real atomicity on globals. */
     case AST_ATOMIC_STORE: {
         if (stmt->child_count < 1) return -1;
         uint32_t idx;
@@ -881,10 +909,28 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt)
             lower_error(ctx, buf);
             return -1;
         }
+        /* Detect RMW pattern: child = BINOP(OP_ADD/SUB, IDENT(name), rhs) */
+        const ast_node_t *child = stmt->children[0];
+        if (scope == 1 && child && child->type == AST_BINOP &&
+            child->child_count >= 2 &&
+            (child->op == OP_ADD || child->op == OP_SUB)) {
+            const ast_node_t *lhs = child->children[0];
+            if (lhs && lhs->type == AST_IDENTIFIER &&
+                strcmp(lhs->name, stmt->name) == 0) {
+                int rhs_v = lower_expr(ctx, child->children[1]);
+                if (rhs_v < 0) return -1;
+                uint32_t rd = fresh_vreg(ctx);
+                q_opcode_t aop = (child->op == OP_ADD)
+                    ? Q_ATOMIC_ADD_GLOBAL : Q_ATOMIC_SUB_GLOBAL;
+                emit(ctx, q_instr(aop, q_vreg(rd),
+                                  q_imm(idx), q_vreg((uint32_t)rhs_v)));
+                return 0;
+            }
+        }
         int val = lower_expr(ctx, stmt->children[0]);
         if (val < 0) return -1;
         if (scope == 1) {
-            emit(ctx, q_instr(Q_STORE_GLOBAL, q_none(),
+            emit(ctx, q_instr(Q_ATOMIC_STORE_GLOBAL, q_none(),
                               q_imm(idx), q_vreg((uint32_t)val)));
         } else {
             if ((uint32_t)val != idx) {

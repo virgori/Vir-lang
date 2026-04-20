@@ -99,6 +99,20 @@ typedef enum {
     Q_LOAD_GLOBAL   = 0xA7,   /* dest = globals[src1]          */
     Q_STORE_GLOBAL  = 0xA8,   /* globals[src1] = src2          */
 
+    /* §24.4 Atomic global accesses (seq_cst).
+     * Backed by vir_atomic_{load,store,add}_i64 primitives. */
+    Q_ATOMIC_LOAD_GLOBAL  = 0xA9, /* dest = atomic_load(globals[src1])  */
+    Q_ATOMIC_STORE_GLOBAL = 0xAA, /* atomic_store(globals[src1], src2)  */
+    Q_ATOMIC_ADD_GLOBAL   = 0xAB, /* dest = atomic_fetch_add(globals[src1], src2) */
+    Q_ATOMIC_SUB_GLOBAL   = 0xAC, /* dest = atomic_fetch_sub(globals[src1], src2) */
+
+    /* §26.2 / §24.2 Tensor + swizzle (runtime dispatch on array handle).
+     * If operands are array handles → element-wise over arrays.
+     * Otherwise → scalar fallback (Q_MUL). */
+    Q_TENSOR_MUL    = 0xAD,   /* dest = src1 ** src2  (a*b elementwise) */
+    Q_TENSOR_FMA    = 0xAE,   /* dest = src1 >< src2  (a*b elementwise) */
+    Q_SWIZZLE       = 0xAF,   /* dest = swizzle(src1, channels=src2)    */
+
     /* SIMD / Vector operations (128-bit NEON / AVX) */
     Q_VLOAD         = 0xB0,   /* dest = vec_load(src1)         */
     Q_VSTORE        = 0xB1,   /* vec_store(dest, src1)         */

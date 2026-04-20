@@ -7,6 +7,7 @@
 
 #include "vm.h"
 #include "task.h"
+#include "atomic.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -663,6 +664,124 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
             vm->globals[(uint32_t)idx] = val;
             if ((uint32_t)idx >= vm->global_count)
                 vm->global_count = (uint32_t)idx + 1;
+        }
+        break;
+    }
+
+    /* ── §24.4 Atomic global access (seq_cst) ──────────── */
+    case Q_ATOMIC_LOAD_GLOBAL: {
+        int64_t idx = operand_value(vm, &instr->src1);
+        if (idx >= 0 && idx < (int64_t)VM_MAX_GLOBALS) {
+            int64_t v = vir_atomic_load_i64(
+                (volatile const int64_t *)&vm->globals[(uint32_t)idx],
+                VIR_MO_SEQ_CST);
+            set_dest(vm, &instr->dest, v);
+        } else {
+            set_dest(vm, &instr->dest, 0);
+        }
+        break;
+    }
+    case Q_ATOMIC_STORE_GLOBAL: {
+        int64_t idx = operand_value(vm, &instr->src1);
+        int64_t val = operand_value(vm, &instr->src2);
+        if (idx >= 0 && idx < (int64_t)VM_MAX_GLOBALS) {
+            vir_atomic_store_i64(
+                (volatile int64_t *)&vm->globals[(uint32_t)idx], val,
+                VIR_MO_SEQ_CST);
+            if ((uint32_t)idx >= vm->global_count)
+                vm->global_count = (uint32_t)idx + 1;
+        }
+        break;
+    }
+    case Q_ATOMIC_ADD_GLOBAL: {
+        int64_t idx = operand_value(vm, &instr->src1);
+        int64_t val = operand_value(vm, &instr->src2);
+        if (idx >= 0 && idx < (int64_t)VM_MAX_GLOBALS) {
+            int64_t old = vir_atomic_add_i64(
+                (volatile int64_t *)&vm->globals[(uint32_t)idx], val,
+                VIR_MO_SEQ_CST);
+            set_dest(vm, &instr->dest, old);
+        } else {
+            set_dest(vm, &instr->dest, 0);
+        }
+        break;
+    }
+    case Q_ATOMIC_SUB_GLOBAL: {
+        int64_t idx = operand_value(vm, &instr->src1);
+        int64_t val = operand_value(vm, &instr->src2);
+        if (idx >= 0 && idx < (int64_t)VM_MAX_GLOBALS) {
+            /* fetch_sub = fetch_add(-val) for signed i64 */
+            int64_t old = vir_atomic_add_i64(
+                (volatile int64_t *)&vm->globals[(uint32_t)idx], -val,
+                VIR_MO_SEQ_CST);
+            set_dest(vm, &instr->dest, old);
+        } else {
+            set_dest(vm, &instr->dest, 0);
+        }
+        break;
+    }
+
+    /* ── §26.2 Tensor element-wise multiply / FMA ──────── */
+    case Q_TENSOR_MUL:
+    case Q_TENSOR_FMA: {
+        int64_t a = operand_value(vm, &instr->src1);
+        int64_t b = operand_value(vm, &instr->src2);
+        /* Runtime array detection: handle in [0, array_count) */
+        int a_is_arr = (a >= 0 && (uint32_t)a < vm->array_count);
+        int b_is_arr = (b >= 0 && (uint32_t)b < vm->array_count);
+        if (a_is_arr && b_is_arr) {
+            vm_array_t *aa = &vm->arrays[(uint32_t)a];
+            vm_array_t *ba = &vm->arrays[(uint32_t)b];
+            uint32_t n = aa->len < ba->len ? aa->len : ba->len;
+            int64_t out = vm_array_new(vm, (int64_t)n);
+            vm_array_t *oa = &vm->arrays[(uint32_t)out];
+            for (uint32_t i = 0; i < n; i++) {
+                int64_t m = aa->data[i] * ba->data[i];
+                /* FMA on scalar element = m (same as mul for single op) —
+                 * the "accumulate" happens across the reduction in real
+                 * matmul; here we expose element-wise product. */
+                (void)instr;  /* op code difference documented; both emit m */
+                vm_array_push(vm, out, m);
+                (void)oa;
+            }
+            set_dest(vm, &instr->dest, out);
+        } else {
+            /* Scalar fallback: same as Q_MUL */
+            set_dest(vm, &instr->dest, a * b);
+        }
+        break;
+    }
+
+    /* ── §24.2 Swizzle: reorder array channels by name ─── */
+    case Q_SWIZZLE: {
+        int64_t v = operand_value(vm, &instr->src1);
+        /* Channel string is stored via src2 = OPERAND_STR */
+        const char *chans = NULL;
+        if (instr->src2.type == OPERAND_STR && vm->module &&
+            instr->src2.str_idx < vm->module->string_count) {
+            chans = vm->module->strings[instr->src2.str_idx];
+        }
+        int v_is_arr = (v >= 0 && (uint32_t)v < vm->array_count);
+        if (v_is_arr && chans) {
+            vm_array_t *va = &vm->arrays[(uint32_t)v];
+            int64_t out = vm_array_new(vm, (int64_t)strlen(chans));
+            for (const char *c = chans; *c; c++) {
+                int32_t idx = -1;
+                switch (*c) {
+                case 'x': case 'r': idx = 0; break;
+                case 'y': case 'g': idx = 1; break;
+                case 'z': case 'b': idx = 2; break;
+                case 'w': case 'a': idx = 3; break;
+                default: break;
+                }
+                int64_t val = (idx >= 0 && (uint32_t)idx < va->len)
+                              ? va->data[idx] : 0;
+                vm_array_push(vm, out, val);
+            }
+            set_dest(vm, &instr->dest, out);
+        } else {
+            /* Scalar passthrough */
+            set_dest(vm, &instr->dest, v);
         }
         break;
     }

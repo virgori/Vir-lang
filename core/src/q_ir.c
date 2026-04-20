@@ -313,6 +313,13 @@ const char* q_opcode_name(q_opcode_t op)
         case Q_CALL_FUNC:    return "Q_CALL_FUNC";
         case Q_LOAD_GLOBAL:  return "Q_LOAD_GLOBAL";
         case Q_STORE_GLOBAL: return "Q_STORE_GLOBAL";
+        case Q_ATOMIC_LOAD_GLOBAL:  return "Q_ATOMIC_LOAD_GLOBAL";
+        case Q_ATOMIC_STORE_GLOBAL: return "Q_ATOMIC_STORE_GLOBAL";
+        case Q_ATOMIC_ADD_GLOBAL:   return "Q_ATOMIC_ADD_GLOBAL";
+        case Q_ATOMIC_SUB_GLOBAL:   return "Q_ATOMIC_SUB_GLOBAL";
+        case Q_TENSOR_MUL:   return "Q_TENSOR_MUL";
+        case Q_TENSOR_FMA:   return "Q_TENSOR_FMA";
+        case Q_SWIZZLE:      return "Q_SWIZZLE";
         case Q_PATCH_POINT:  return "Q_PATCH_POINT";
         case Q_LABEL:        return "Q_LABEL";
         case Q_HALT:         return "Q_HALT";
