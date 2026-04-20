@@ -204,6 +204,42 @@ int vm_resolve_labels(vm_state_t *vm, const q_function_t *func)
  * Single-step execution
  * ═══════════════════════════════════════════════════════ */
 
+/* Shared dispatch used by both Q_CALL_FUNC and Q_CALL_INDIRECT.
+ * Saves caller registers, copies R0..R(n-1) into callee param vregs,
+ * and switches ip/current_func. */
+static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
+{
+    if (fidx >= vm->module->func_count) return VM_ERR_BAD_JUMP;
+    const q_function_t *callee = &vm->module->functions[fidx];
+
+    if (vm->func_depth >= VM_MAX_CALL_DEPTH) return VM_ERR_STACK_OF;
+    vm->func_stack[vm->func_depth].func = vm->current_func;
+    vm->func_stack[vm->func_depth].ip   = vm->ip + 1;
+
+    uint32_t nregs = vm->reg_count;
+    vm->func_stack[vm->func_depth].saved_reg_count = nregs;
+    vm->func_stack[vm->func_depth].saved_regs = NULL;
+    if (nregs > 0) {
+        vm->func_stack[vm->func_depth].saved_regs =
+            (int64_t *)malloc(sizeof(int64_t) * nregs);
+        if (!vm->func_stack[vm->func_depth].saved_regs) {
+            vm->func_stack[vm->func_depth].saved_reg_count = 0;
+            return VM_ERR_STACK_OF;
+        }
+        for (uint32_t ri = 0; ri < nregs; ri++)
+            vm->func_stack[vm->func_depth].saved_regs[ri] = vm->regs[ri];
+    }
+    vm->func_depth++;
+
+    for (uint32_t pi = 0; pi < callee->param_count && pi < Q_MAX_PARAMS; pi++)
+        vm->regs[callee->param_vregs[pi]] = vm->regs[pi];
+
+    vm->current_func = callee;
+    vm->ip = 0;
+    vm_resolve_labels(vm, callee);
+    return VM_OK;
+}
+
 vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
 {
     int64_t a, b, result;
@@ -397,41 +433,15 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
             fidx = (uint32_t)instr->src1.imm;
         else
             return VM_ERR_BAD_JUMP;
-        if (fidx >= vm->module->func_count) return VM_ERR_BAD_JUMP;
-        const q_function_t *callee = &vm->module->functions[fidx];
-        
-        /* Save current function context and registers */
-        if (vm->func_depth >= VM_MAX_CALL_DEPTH) return VM_ERR_STACK_OF;
-        vm->func_stack[vm->func_depth].func = vm->current_func;
-        vm->func_stack[vm->func_depth].ip = vm->ip + 1; /* return to next instr */
-        /* Save all currently used registers */
-        uint32_t nregs = vm->reg_count;
-        vm->func_stack[vm->func_depth].saved_reg_count = nregs;
-        vm->func_stack[vm->func_depth].saved_regs = NULL;
-        if (nregs > 0) {
-            vm->func_stack[vm->func_depth].saved_regs =
-                (int64_t *)malloc(sizeof(int64_t) * nregs);
-            if (!vm->func_stack[vm->func_depth].saved_regs) {
-                vm->func_stack[vm->func_depth].saved_reg_count = 0;
-                return VM_ERR_STACK_OF;
-            }
-            for (uint32_t ri = 0; ri < nregs; ri++) {
-                vm->func_stack[vm->func_depth].saved_regs[ri] = vm->regs[ri];
-            }
-        }
-        vm->func_depth++;
-        
-        /* Set up param vregs: arguments are in R0..R(n-1) already
-         * Copy them into callee's param vregs  */
-        for (uint32_t pi = 0; pi < callee->param_count && pi < Q_MAX_PARAMS; pi++) {
-            vm->regs[callee->param_vregs[pi]] = vm->regs[pi];
-        }
-        
-        /* Switch to callee */
-        vm->current_func = callee;
-        vm->ip = 0;
-        vm_resolve_labels(vm, callee);
-        return VM_OK;
+        return vm_dispatch_call(vm, fidx);
+    }
+
+    case Q_CALL_INDIRECT: {
+        /* §11.4 callable field: fidx comes from a vreg. */
+        if (!vm->module) return VM_ERR_BAD_JUMP;
+        if (instr->src1.type != OPERAND_VREG) return VM_ERR_BAD_JUMP;
+        uint32_t fidx = (uint32_t)vm->regs[instr->src1.vreg];
+        return vm_dispatch_call(vm, fidx);
     }
 
     /* ── I/O ───────────────────────────────────────────── */

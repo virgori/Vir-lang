@@ -311,6 +311,7 @@ const char* q_opcode_name(q_opcode_t op)
         case Q_GET_ARG:      return "Q_GET_ARG";
         case Q_ARG_COUNT:    return "Q_ARG_COUNT";
         case Q_CALL_FUNC:    return "Q_CALL_FUNC";
+        case Q_CALL_INDIRECT: return "Q_CALL_INDIRECT";
         case Q_LOAD_GLOBAL:  return "Q_LOAD_GLOBAL";
         case Q_STORE_GLOBAL: return "Q_STORE_GLOBAL";
         case Q_ATOMIC_LOAD_GLOBAL:  return "Q_ATOMIC_LOAD_GLOBAL";

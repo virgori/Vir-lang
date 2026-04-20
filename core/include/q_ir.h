@@ -135,6 +135,10 @@ typedef enum {
     Q_TASK_YIELD    = 0xF2,   /* yield_now()                    */
     Q_TASK_WAIT     = 0xF3,   /* task_wait(src1=task_id)        */
 
+    /* §11.4 Callable field: call function whose index is held in src1 (vreg).
+     * Args are already in R0..R(argc-1) just like Q_CALL_FUNC. */
+    Q_CALL_INDIRECT = 0xF4,   /* call_indirect(src1=vreg_holding_fidx) */
+
     /* Pseudo */
     Q_LABEL         = 0xFE,
     Q_HALT          = 0xFF
