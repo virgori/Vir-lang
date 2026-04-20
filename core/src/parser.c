@@ -1294,6 +1294,7 @@ static ast_node_t *parse_statement(vir_parser_t *p)
 
     case TOK_LOCK: {
         /* §24.4: `lock IDENT = value` atomic store,
+         *        `lock IDENT op= value` atomic RMW (op ∈ + - * /),
          *        `lock IDENT` alone = atomic load expression stmt */
         advance(p);
         const vir_token_t *id = expect(p, TOK_IDENT, "expected variable after 'lock'");
@@ -1305,6 +1306,32 @@ static ast_node_t *parse_statement(vir_parser_t *p)
             st->line = t->line;
             ast_node_t *val = parse_expr(p);
             if (val) ast_add_child(st, val);
+            return st;
+        }
+        if (check(p, TOK_PLUS_ASSIGN) || check(p, TOK_MINUS_ASSIGN) ||
+            check(p, TOK_STAR_ASSIGN) || check(p, TOK_SLASH_ASSIGN)) {
+            const vir_token_t *op_tok = advance(p);
+            ast_op_t op;
+            switch (op_tok->type) {
+            case TOK_PLUS_ASSIGN:  op = OP_ADD; break;
+            case TOK_MINUS_ASSIGN: op = OP_SUB; break;
+            case TOK_STAR_ASSIGN:  op = OP_MUL; break;
+            default:               op = OP_DIV; break;
+            }
+            ast_node_t *rhs = parse_expr(p);
+            if (!rhs) return NULL;
+            ast_node_t *idn = ast_new(AST_IDENTIFIER);
+            strncpy(idn->name, id->str.buf, AST_NAME_LEN - 1);
+            idn->line = id->line;
+            ast_node_t *bin = ast_new(AST_BINOP);
+            bin->op = op;
+            bin->line = op_tok->line;
+            ast_add_child(bin, idn);
+            ast_add_child(bin, rhs);
+            ast_node_t *st = ast_new(AST_ATOMIC_STORE);
+            strncpy(st->name, id->str.buf, AST_NAME_LEN - 1);
+            st->line = t->line;
+            ast_add_child(st, bin);
             return st;
         }
         /* Bare `lock x` statement → atomic load (no-op as stmt; kept for
@@ -1437,7 +1464,34 @@ static ast_node_t *parse_statement(vir_parser_t *p)
             if (val) ast_add_child(assign, val);
             return assign;
         }
-        /* §24.4: x!! = value (atomic store postfix form) */
+        /* Compound assignment: x op= value  →  x = x op value */
+        if (check(p, TOK_PLUS_ASSIGN) || check(p, TOK_MINUS_ASSIGN) ||
+            check(p, TOK_STAR_ASSIGN) || check(p, TOK_SLASH_ASSIGN)) {
+            const vir_token_t *op_tok = advance(p);
+            ast_op_t op;
+            switch (op_tok->type) {
+            case TOK_PLUS_ASSIGN:  op = OP_ADD; break;
+            case TOK_MINUS_ASSIGN: op = OP_SUB; break;
+            case TOK_STAR_ASSIGN:  op = OP_MUL; break;
+            default:               op = OP_DIV; break;  /* SLASH_ASSIGN */
+            }
+            ast_node_t *rhs = parse_expr(p);
+            if (!rhs) return NULL;
+            ast_node_t *id = ast_new(AST_IDENTIFIER);
+            strncpy(id->name, t->str.buf, AST_NAME_LEN - 1);
+            id->line = t->line;
+            ast_node_t *bin = ast_new(AST_BINOP);
+            bin->op = op;
+            bin->line = op_tok->line;
+            ast_add_child(bin, id);
+            ast_add_child(bin, rhs);
+            ast_node_t *assign = ast_new(AST_ASSIGN);
+            strncpy(assign->name, t->str.buf, AST_NAME_LEN - 1);
+            assign->line = t->line;
+            ast_add_child(assign, bin);
+            return assign;
+        }
+        /* §24.4: x!! = value (atomic store postfix form) and x!! op= value (RMW) */
         if (check(p, TOK_ATOMIC_BANG)) {
             advance(p);  /* consume '!!' */
             if (check(p, TOK_ASSIGN)) {
@@ -1447,6 +1501,33 @@ static ast_node_t *parse_statement(vir_parser_t *p)
                 st->line = t->line;
                 ast_node_t *val = parse_expr(p);
                 if (val) ast_add_child(st, val);
+                return st;
+            }
+            /* §24.4 RMW: x!! op= value  →  AST_ATOMIC_STORE(x, x op value) */
+            if (check(p, TOK_PLUS_ASSIGN) || check(p, TOK_MINUS_ASSIGN) ||
+                check(p, TOK_STAR_ASSIGN) || check(p, TOK_SLASH_ASSIGN)) {
+                const vir_token_t *op_tok = advance(p);
+                ast_op_t op;
+                switch (op_tok->type) {
+                case TOK_PLUS_ASSIGN:  op = OP_ADD; break;
+                case TOK_MINUS_ASSIGN: op = OP_SUB; break;
+                case TOK_STAR_ASSIGN:  op = OP_MUL; break;
+                default:               op = OP_DIV; break;
+                }
+                ast_node_t *rhs = parse_expr(p);
+                if (!rhs) return NULL;
+                ast_node_t *id = ast_new(AST_IDENTIFIER);
+                strncpy(id->name, t->str.buf, AST_NAME_LEN - 1);
+                id->line = t->line;
+                ast_node_t *bin = ast_new(AST_BINOP);
+                bin->op = op;
+                bin->line = op_tok->line;
+                ast_add_child(bin, id);
+                ast_add_child(bin, rhs);
+                ast_node_t *st = ast_new(AST_ATOMIC_STORE);
+                strncpy(st->name, t->str.buf, AST_NAME_LEN - 1);
+                st->line = t->line;
+                ast_add_child(st, bin);
                 return st;
             }
             /* Bare `x!!` as expression statement → atomic load */

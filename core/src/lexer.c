@@ -673,6 +673,31 @@ int lexer_tokenize(vir_lexer_t *lex)
             lex_push_token(lex, tok);
             continue;
         }
+        /* Compound assignment: += -= *= /= */
+        if (c == '+' && c2 == '=') {
+            vir_token_t tok = { TOK_PLUS_ASSIGN, lex->line, lex->col, {0} };
+            lex_advance(lex); lex_advance(lex);
+            lex_push_token(lex, tok);
+            continue;
+        }
+        if (c == '-' && c2 == '=') {
+            vir_token_t tok = { TOK_MINUS_ASSIGN, lex->line, lex->col, {0} };
+            lex_advance(lex); lex_advance(lex);
+            lex_push_token(lex, tok);
+            continue;
+        }
+        if (c == '*' && c2 == '=') {
+            vir_token_t tok = { TOK_STAR_ASSIGN, lex->line, lex->col, {0} };
+            lex_advance(lex); lex_advance(lex);
+            lex_push_token(lex, tok);
+            continue;
+        }
+        if (c == '/' && c2 == '=') {
+            vir_token_t tok = { TOK_SLASH_ASSIGN, lex->line, lex->col, {0} };
+            lex_advance(lex); lex_advance(lex);
+            lex_push_token(lex, tok);
+            continue;
+        }
         if (c == '.' && c2 == '.') {
             vir_token_t tok = { TOK_DOTDOT, lex->line, lex->col, {0} };
             lex_advance(lex); lex_advance(lex);
@@ -826,6 +851,10 @@ const char *lexer_token_name(vir_tok_t type) {
         [TOK_FMA]       = "FMA",
         [TOK_LOCK]      = "LOCK",
         [TOK_ATOMIC_BANG] = "ATOMIC_BANG",
+        [TOK_PLUS_ASSIGN]  = "PLUS_ASSIGN",
+        [TOK_MINUS_ASSIGN] = "MINUS_ASSIGN",
+        [TOK_STAR_ASSIGN]  = "STAR_ASSIGN",
+        [TOK_SLASH_ASSIGN] = "SLASH_ASSIGN",
         [TOK_LPAREN]    = "LPAREN",
         [TOK_RPAREN]    = "RPAREN",
         [TOK_LBRACKET]  = "LBRACKET",
