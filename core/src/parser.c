@@ -423,14 +423,43 @@ static ast_node_t *parse_unary(vir_parser_t *p)
         ast_add_child(n, zero);
         return n;
     }
+    /* §24.4: `lock expr` atomic read prefix */
+    if (check(p, TOK_LOCK)) {
+        const vir_token_t *t = advance(p);
+        ast_node_t *operand = parse_unary(p);
+        if (!operand) return NULL;
+        ast_node_t *n = ast_new(AST_ATOMIC_LOAD);
+        n->line = t->line;
+        ast_add_child(n, operand);
+        return n;
+    }
     /* Postfix: field access via '.' on the result of primary */
     ast_node_t *left = parse_primary(p);
     if (!left) return NULL;
-    while (check(p, TOK_DOT)) {
-        advance(p);  /* consume '.' */
+    while (check(p, TOK_DOT) || check(p, TOK_SAFE_ACCESS) ||
+           check(p, TOK_EXIST) || check(p, TOK_ATOMIC_BANG)) {
+        if (check(p, TOK_EXIST)) {
+            const vir_token_t *q = advance(p);
+            ast_node_t *ex = ast_new(AST_EXIST_CHECK);
+            ex->line = q->line;
+            ast_add_child(ex, left);
+            left = ex;
+            continue;
+        }
+        if (check(p, TOK_ATOMIC_BANG)) {
+            /* §24.4: expr!! atomic read postfix */
+            const vir_token_t *q = advance(p);
+            ast_node_t *al = ast_new(AST_ATOMIC_LOAD);
+            al->line = q->line;
+            ast_add_child(al, left);
+            left = al;
+            continue;
+        }
+        int is_safe = check(p, TOK_SAFE_ACCESS);
+        advance(p);  /* consume '.' or '?.' */
         const vir_token_t *field = expect(p, TOK_IDENT, "expected field name after '.'");
         if (!field) break;
-        ast_node_t *fa = ast_new(AST_FIELD_ACCESS);
+        ast_node_t *fa = ast_new(is_safe ? AST_SAFE_ACCESS : AST_FIELD_ACCESS);
         strncpy(fa->name, field->str.buf, AST_NAME_LEN - 1);
         fa->line = field->line;
         ast_add_child(fa, left);
@@ -439,9 +468,53 @@ static ast_node_t *parse_unary(vir_parser_t *p)
     return left;
 }
 
-static ast_node_t *parse_mult(vir_parser_t *p)
+static ast_node_t *parse_power(vir_parser_t *p)
 {
     ast_node_t *left = parse_unary(p);
+    if (!left) return NULL;
+
+    /* Right-associative: 2 ^ 3 ^ 2 = 2 ^ (3 ^ 2) */
+    if (check(p, TOK_POWER)) {
+        const vir_token_t *op_tok = advance(p);
+        ast_node_t *right = parse_power(p);
+        if (!right) { ast_free(left); return NULL; }
+
+        ast_node_t *bin = ast_new(AST_BINOP);
+        bin->op = OP_POW;
+        bin->line = op_tok->line;
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        return bin;
+    }
+    return left;
+}
+
+static ast_node_t *parse_matmul(vir_parser_t *p)
+{
+    /* §26.2: ** matmul and >< FMA, level 22 (higher than *), left-assoc */
+    ast_node_t *left = parse_power(p);
+    if (!left) return NULL;
+
+    while (check(p, TOK_MATMUL) || check(p, TOK_FMA)) {
+        const vir_token_t *op_tok = advance(p);
+        ast_op_t op = (op_tok->type == TOK_MATMUL) ? OP_MATMUL : OP_FMA;
+
+        ast_node_t *right = parse_power(p);
+        if (!right) { ast_free(left); return NULL; }
+
+        ast_node_t *bin = ast_new(AST_BINOP);
+        bin->op = op;
+        bin->line = op_tok->line;
+        ast_add_child(bin, left);
+        ast_add_child(bin, right);
+        left = bin;
+    }
+    return left;
+}
+
+static ast_node_t *parse_mult(vir_parser_t *p)
+{
+    ast_node_t *left = parse_matmul(p);
     if (!left) return NULL;
 
     while (check(p, TOK_STAR) || check(p, TOK_SLASH) || check(p, TOK_PERCENT)) {
@@ -454,7 +527,7 @@ static ast_node_t *parse_mult(vir_parser_t *p)
         default:          op = OP_MUL; break;
         }
 
-        ast_node_t *right = parse_unary(p);
+        ast_node_t *right = parse_matmul(p);
         if (!right) { ast_free(left); return NULL; }
 
         ast_node_t *bin = ast_new(AST_BINOP);
@@ -521,26 +594,61 @@ static ast_node_t *parse_bitwise(vir_parser_t *p)
     return left;
 }
 
-static ast_node_t *parse_compare(vir_parser_t *p)
+static ast_node_t *parse_cast(vir_parser_t *p)
 {
     ast_node_t *left = parse_bitwise(p);
     if (!left) return NULL;
 
+    while (check(p, TOK_CAST) || check(p, TOK_AS) || check(p, TOK_PATTERN)) {
+        const vir_token_t *op_tok = advance(p);
+        if (op_tok->type == TOK_PATTERN) {
+            /* §8.9 pattern match: expr :~ pattern
+             *   - pattern is Ident: type-check (always 1 for now - placeholder)
+             *   - pattern is literal int: equality test
+             *   - pattern is literal string: equality test */
+            ast_node_t *pattern = parse_bitwise(p);
+            if (!pattern) { ast_free(left); return NULL; }
+            ast_node_t *pm = ast_new(AST_PATTERN_MATCH);
+            pm->line = op_tok->line;
+            ast_add_child(pm, left);
+            ast_add_child(pm, pattern);
+            left = pm;
+            continue;
+        }
+        const vir_token_t *type_tok = expect(p, TOK_IDENT, "expected type name after cast");
+        if (!type_tok) { ast_free(left); return NULL; }
+        ast_node_t *cast = ast_new(AST_CAST);
+        cast->line = op_tok->line;
+        strncpy(cast->name, type_tok->str.buf, AST_NAME_LEN - 1);
+        ast_add_child(cast, left);
+        left = cast;
+    }
+    return left;
+}
+
+static ast_node_t *parse_compare(vir_parser_t *p)
+{
+    ast_node_t *left = parse_cast(p);
+    if (!left) return NULL;
+
     if (check(p, TOK_EQ) || check(p, TOK_NE) || check(p, TOK_GT) ||
-        check(p, TOK_LT) || check(p, TOK_GE) || check(p, TOK_LE)) {
+        check(p, TOK_LT) || check(p, TOK_GE) || check(p, TOK_LE) ||
+        check(p, TOK_SAFE_EQ) || check(p, TOK_SAFE_NE)) {
         const vir_token_t *op_tok = advance(p);
         ast_op_t op;
         switch (op_tok->type) {
-        case TOK_EQ: op = OP_EQ; break;
-        case TOK_NE: op = OP_NE; break;
-        case TOK_GT: op = OP_GT; break;
-        case TOK_LT: op = OP_LT; break;
-        case TOK_GE: op = OP_GE; break;
-        case TOK_LE: op = OP_LE; break;
-        default:     op = OP_EQ; break;
+        case TOK_EQ:      op = OP_EQ; break;
+        case TOK_NE:      op = OP_NE; break;
+        case TOK_GT:      op = OP_GT; break;
+        case TOK_LT:      op = OP_LT; break;
+        case TOK_GE:      op = OP_GE; break;
+        case TOK_LE:      op = OP_LE; break;
+        case TOK_SAFE_EQ: op = OP_SAFE_EQ; break;
+        case TOK_SAFE_NE: op = OP_SAFE_NE; break;
+        default:          op = OP_EQ; break;
         }
 
-        ast_node_t *right = parse_addition(p);
+        ast_node_t *right = parse_cast(p);
         if (!right) { ast_free(left); return NULL; }
 
         ast_node_t *cmp = ast_new(AST_COMPARE);

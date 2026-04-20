@@ -233,6 +233,45 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr)
         int rhs = lower_expr(ctx, expr->children[1]);
         if (lhs < 0 || rhs < 0) return -1;
 
+        /* OP_POW (8.2): synthesize via repeated multiplication loop
+         *     rd = 1; i = 0
+         * loop:
+         *     if i >= rhs goto end
+         *     rd = rd * lhs
+         *     i = i + 1
+         *     goto loop
+         * end:
+         */
+        if (expr->op == OP_POW) {
+            uint32_t rd   = fresh_vreg(ctx);
+            uint32_t one  = fresh_vreg(ctx);
+            uint32_t ic   = fresh_vreg(ctx);
+            uint32_t cond = fresh_vreg(ctx);
+            uint32_t loop_label = fresh_label(ctx);
+            uint32_t end_label  = fresh_label(ctx);
+
+            emit(ctx, q_instr(Q_LOAD, q_vreg(one), q_imm(1), q_none()));
+            emit(ctx, q_instr(Q_LOAD, q_vreg(rd),  q_imm(1), q_none()));
+            emit(ctx, q_instr(Q_LOAD, q_vreg(ic),  q_imm(0), q_none()));
+
+            q_instruction_t lbl = q_instr(Q_LABEL, q_none(), q_none(), q_none());
+            lbl.patch_id = loop_label;
+            emit(ctx, lbl);
+
+            emit(ctx, q_instr(Q_CMP_LT, q_vreg(cond), q_vreg(ic),
+                              q_vreg((uint32_t)rhs)));
+            emit(ctx, q_instr(Q_JUMP_IF_NOT, q_none(),
+                              q_vreg(cond), q_label(end_label)));
+            emit(ctx, q_instr(Q_MUL, q_vreg(rd), q_vreg(rd),
+                              q_vreg((uint32_t)lhs)));
+            emit(ctx, q_instr(Q_ADD, q_vreg(ic), q_vreg(ic), q_vreg(one)));
+            emit(ctx, q_instr(Q_JUMP, q_none(), q_label(loop_label), q_none()));
+
+            lbl.patch_id = end_label;
+            emit(ctx, lbl);
+            return (int)rd;
+        }
+
         uint32_t rd = fresh_vreg(ctx);
         q_opcode_t op;
         switch (expr->op) {
@@ -246,6 +285,10 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr)
         case OP_XOR: op = Q_XOR; break;
         case OP_SHL: op = Q_SHL; break;
         case OP_SHR: op = Q_SHR; break;
+        /* §26.2 AI operators: scalar fallback.
+         * Future: detect tensor operands and emit VMUL/VFMA for SIMD. */
+        case OP_MATMUL: op = Q_MUL; break;  /* a ** b → a * b for scalars */
+        case OP_FMA:    op = Q_MUL; break;  /* a >< b → a * b for scalars */
         default:
             lower_error(ctx, "unsupported binop");
             return -1;
@@ -281,6 +324,41 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr)
         case OP_LT: op = Q_CMP_LT; break;
         case OP_GE: op = Q_CMP_GE; break;
         case OP_LE: op = Q_CMP_LE; break;
+        /* 8.4 Safe equality: both operands must be non-nil (truthy) AND equal */
+        case OP_SAFE_EQ: {
+            uint32_t eq  = fresh_vreg(ctx);
+            uint32_t zero = fresh_vreg(ctx);
+            uint32_t la  = fresh_vreg(ctx);
+            uint32_t lb  = fresh_vreg(ctx);
+            uint32_t t1  = fresh_vreg(ctx);
+            emit(ctx, q_instr(Q_CMP_EQ, q_vreg(eq), q_vreg((uint32_t)lhs),
+                              q_vreg((uint32_t)rhs)));
+            emit(ctx, q_instr(Q_LOAD, q_vreg(zero), q_imm(0), q_none()));
+            emit(ctx, q_instr(Q_CMP_GT, q_vreg(la), q_vreg((uint32_t)lhs), q_vreg(zero)));
+            emit(ctx, q_instr(Q_CMP_GT, q_vreg(lb), q_vreg((uint32_t)rhs), q_vreg(zero)));
+            emit(ctx, q_instr(Q_AND, q_vreg(t1), q_vreg(la), q_vreg(lb)));
+            emit(ctx, q_instr(Q_AND, q_vreg(rd), q_vreg(t1), q_vreg(eq)));
+            return (int)rd;
+        }
+        case OP_SAFE_NE: {
+            uint32_t eq  = fresh_vreg(ctx);
+            uint32_t zero = fresh_vreg(ctx);
+            uint32_t la  = fresh_vreg(ctx);
+            uint32_t lb  = fresh_vreg(ctx);
+            uint32_t one = fresh_vreg(ctx);
+            uint32_t neq = fresh_vreg(ctx);
+            uint32_t t1  = fresh_vreg(ctx);
+            emit(ctx, q_instr(Q_CMP_EQ, q_vreg(eq), q_vreg((uint32_t)lhs),
+                              q_vreg((uint32_t)rhs)));
+            emit(ctx, q_instr(Q_LOAD, q_vreg(one), q_imm(1), q_none()));
+            emit(ctx, q_instr(Q_XOR, q_vreg(neq), q_vreg(eq), q_vreg(one)));
+            emit(ctx, q_instr(Q_LOAD, q_vreg(zero), q_imm(0), q_none()));
+            emit(ctx, q_instr(Q_CMP_GT, q_vreg(la), q_vreg((uint32_t)lhs), q_vreg(zero)));
+            emit(ctx, q_instr(Q_CMP_GT, q_vreg(lb), q_vreg((uint32_t)rhs), q_vreg(zero)));
+            emit(ctx, q_instr(Q_AND, q_vreg(t1), q_vreg(la), q_vreg(lb)));
+            emit(ctx, q_instr(Q_AND, q_vreg(rd), q_vreg(t1), q_vreg(neq)));
+            return (int)rd;
+        }
         default:
             lower_error(ctx, "unsupported comparison");
             return -1;
@@ -607,6 +685,118 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr)
         emit(ctx, q_instr(Q_LOAD_WORD, q_vreg(rd),
                           q_vreg((uint32_t)base), q_vreg(off_r)));
         return (int)rd;
+    }
+
+    /* 8.7 Safe access: base?.field → if base==0 then 0 else base.field */
+    case AST_SAFE_ACCESS: {
+        if (expr->child_count < 1) {
+            lower_error(ctx, "safe access without target");
+            return -1;
+        }
+        int base = lower_expr(ctx, expr->children[0]);
+        if (base < 0) return -1;
+
+        int offset = -1;
+        for (uint32_t i = 0; i < ctx->record_type_count && offset < 0; i++) {
+            offset = record_field_offset(&ctx->record_types[i], expr->name);
+        }
+        if (offset < 0) {
+            char buf[128];
+            snprintf(buf, sizeof(buf), "unknown field: %s", expr->name);
+            lower_error(ctx, buf);
+            return -1;
+        }
+
+        uint32_t rd     = fresh_vreg(ctx);
+        uint32_t zero   = fresh_vreg(ctx);
+        uint32_t cond   = fresh_vreg(ctx);
+        uint32_t off_r  = fresh_vreg(ctx);
+        uint32_t nil_l  = fresh_label(ctx);
+        uint32_t end_l  = fresh_label(ctx);
+
+        emit(ctx, q_instr(Q_LOAD, q_vreg(zero), q_imm(0), q_none()));
+        emit(ctx, q_instr(Q_CMP_EQ, q_vreg(cond), q_vreg((uint32_t)base), q_vreg(zero)));
+        emit(ctx, q_instr(Q_JUMP_IF, q_none(), q_vreg(cond), q_label(nil_l)));
+
+        emit(ctx, q_instr(Q_LOAD, q_vreg(off_r), q_imm((int64_t)offset), q_none()));
+        emit(ctx, q_instr(Q_LOAD_WORD, q_vreg(rd),
+                          q_vreg((uint32_t)base), q_vreg(off_r)));
+        emit(ctx, q_instr(Q_JUMP, q_none(), q_label(end_l), q_none()));
+
+        q_instruction_t lbl = q_instr(Q_LABEL, q_none(), q_none(), q_none());
+        lbl.patch_id = nil_l;
+        emit(ctx, lbl);
+        emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+
+        lbl.patch_id = end_l;
+        emit(ctx, lbl);
+        return (int)rd;
+    }
+
+    /* 8.8 Existence: expr? → 1 if expr != 0 else 0 */
+    case AST_EXIST_CHECK: {
+        if (expr->child_count < 1) {
+            lower_error(ctx, "exist check without target");
+            return -1;
+        }
+        int v = lower_expr(ctx, expr->children[0]);
+        if (v < 0) return -1;
+        uint32_t zero = fresh_vreg(ctx);
+        uint32_t eq   = fresh_vreg(ctx);
+        uint32_t one  = fresh_vreg(ctx);
+        uint32_t rd   = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_LOAD, q_vreg(zero), q_imm(0), q_none()));
+        emit(ctx, q_instr(Q_CMP_EQ, q_vreg(eq), q_vreg((uint32_t)v), q_vreg(zero)));
+        emit(ctx, q_instr(Q_LOAD, q_vreg(one), q_imm(1), q_none()));
+        emit(ctx, q_instr(Q_XOR, q_vreg(rd), q_vreg(eq), q_vreg(one)));
+        return (int)rd;
+    }
+
+    /* 8.10/8.11 Cast: for now pass through unchanged (int/float same repr) */
+    case AST_CAST: {
+        if (expr->child_count < 1) {
+            lower_error(ctx, "cast without operand");
+            return -1;
+        }
+        return lower_expr(ctx, expr->children[0]);
+    }
+
+    /* §8.9 Pattern match: expr :~ pattern
+     *   - pattern is Ident (type name): currently always true (placeholder
+     *     until runtime type tags exist)
+     *   - pattern is literal int/str: equality test
+     *   - otherwise: equality test on evaluated expression
+     */
+    case AST_PATTERN_MATCH: {
+        if (expr->child_count < 2) {
+            lower_error(ctx, "pattern match needs value and pattern");
+            return -1;
+        }
+        const ast_node_t *pat = expr->children[1];
+        if (pat && pat->type == AST_IDENTIFIER) {
+            /* Type name pattern (e.g. `x :~ int`): placeholder → always 1.
+             * A real implementation would check a runtime type tag. */
+            uint32_t rd = fresh_vreg(ctx);
+            emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(1), q_none()));
+            return (int)rd;
+        }
+        int lhs = lower_expr(ctx, expr->children[0]);
+        int rhs = lower_expr(ctx, expr->children[1]);
+        if (lhs < 0 || rhs < 0) return -1;
+        uint32_t rd = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_CMP_EQ, q_vreg(rd), q_vreg((uint32_t)lhs),
+                          q_vreg((uint32_t)rhs)));
+        return (int)rd;
+    }
+
+    /* §24.4 Atomic load (lock expr / expr!!): passthrough for now.
+     * Real implementation would emit LDAR (ARM64) / MOV+mfence (x86). */
+    case AST_ATOMIC_LOAD: {
+        if (expr->child_count < 1) {
+            lower_error(ctx, "atomic load without operand");
+            return -1;
+        }
+        return lower_expr(ctx, expr->children[0]);
     }
 
     default: {
