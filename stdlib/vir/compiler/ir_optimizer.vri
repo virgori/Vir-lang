@@ -80,6 +80,13 @@ enum QOp:
     StoreGlobal     = 93;
     GetArg          = 94;
     ArgCount        = 95;
+    # §13 Error handling
+    TryBegin        = 192;   # 0xC0
+    TryEnd          = 193;   # 0xC1
+    ThrowOp         = 194;   # 0xC2
+    ErxLoad         = 195;   # 0xC3
+    ResumeRetry     = 196;   # 0xC4
+    ResumeRevert    = 197;   # 0xC5
     # §19 / §4.5 / §22 — Phase 7.3 parity with C core q_ir.h
     ArrCap          = 149;   # 0x95
     ArrCompact      = 150;   # 0x96
@@ -254,8 +261,21 @@ end
 # ═══════════════════════════════════════════════════════
 
 entity SymEntry:
-    name:       string;
-    vreg:       int;
+    name:               string;
+    vreg:               int;
+    is_move_type:       int;    # array/string/entity — needs drop
+    is_moved:           int;    # value already moved out
+    borrow_shared_count: int;   # active shared borrows (&)
+    borrow_mut_count:   int;    # active mutable borrows (&mut)
+    borrow_kind:        int;    # 0=none, 1=shared, 2=mut
+    borrow_of_name:     string; # name of the variable being borrowed
+end
+
+# §4.8 NLL: transient borrow record for stmt-level tracking
+entity BorrowRecord:
+    target:     string;   # name of borrowed variable
+    kind:       int;      # 1=shared, 2=mut
+    claimed:    int;      # 1=consumed by a binder
 end
 
 entity SymTable:
@@ -279,7 +299,7 @@ func sym_define:
         end
         i = i + 1;
     end
-    vec_push(st.entries, SymEntry { name: name, vreg: vreg });
+    vec_push(st.entries, SymEntry { name: name, vreg: vreg, is_move_type: 0, is_moved: 0, borrow_shared_count: 0, borrow_mut_count: 0, borrow_kind: 0, borrow_of_name: str_new("") });
     out st;
 end
 
@@ -394,6 +414,8 @@ entity LowerCtx:
     error_count:        int;
     last_error:         string;
     patch_counter:      int;
+    # §4.8 NLL borrow checker state
+    stmt_borrows:       Vec<BorrowRecord>;
 end
 
 func lower_ctx_new:
@@ -413,7 +435,8 @@ func lower_ctx_new:
         loop_end_labels:    vec_new<int>(),;
         error_count:        0,;
         last_error:         str_new(""),;
-        patch_counter:      0;
+        patch_counter:      0,;
+        stmt_borrows:       vec_new<BorrowRecord>();
     };
 end
 
@@ -477,6 +500,144 @@ end
 
 
 # ═══════════════════════════════════════════════════════
+# §4.8 Borrow Checker (NLL) — Ownership helpers
+# ═══════════════════════════════════════════════════════
+
+# Look up a symbol entry by name (returns found flag + entry index in table)
+func sym_lookup_entry:
+    in(st:SymTable; name:string)
+    i = 0;
+    when i < vec_len(st.entries) loop
+        entry = vec_get(st.entries, i);
+        if str_eq(entry.name, name):
+            out (true, i);
+        end
+        i = i + 1;
+    end
+    out (false, -1);
+end
+
+# Check if an AST expression produces a move-typed value (heap alloc)
+func ast_produces_move_type:
+    in(expr:AstNode)
+    if expr.node_type == AstType::ArrayLiteral:
+        out true;
+    end
+    if expr.node_type == AstType::LiteralStr:
+        out true;
+    end
+    if expr.node_type == AstType::EntityLiteral:
+        out true;
+    end
+    out false;
+end
+
+# Release a borrow held by a symbol entry, decrementing target's counter
+func ownership_release_borrow:
+    in(ctx:LowerCtx; table_name:string)
+    # Find the borrower entry
+    var (found, bidx) = sym_lookup_entry(ctx.symbols, table_name);
+    if not found:
+        out ctx;
+    end
+    borrower = vec_get(ctx.symbols.entries, bidx);
+    if borrower.borrow_kind == 0:
+        out ctx;
+    end
+    # Find the target being borrowed and decrement its counter
+    var (tfound, tidx) = sym_lookup_entry(ctx.symbols, borrower.borrow_of_name);
+    if tfound:
+        target = vec_get(ctx.symbols.entries, tidx);
+        if borrower.borrow_kind == 1 and target.borrow_shared_count > 0:
+            target.borrow_shared_count = target.borrow_shared_count - 1;
+            vec_set(ctx.symbols.entries, tidx, target);
+        end
+        if borrower.borrow_kind == 2 and target.borrow_mut_count > 0:
+            target.borrow_mut_count = target.borrow_mut_count - 1;
+            vec_set(ctx.symbols.entries, tidx, target);
+        end
+    end
+    # Clear the borrower's borrow state
+    borrower.borrow_kind = 0;
+    borrower.borrow_of_name = str_new("");
+    vec_set(ctx.symbols.entries, bidx, borrower);
+    out ctx;
+end
+
+# Release all unclaimed stmt borrows at end of statement
+func ownership_release_unclaimed:
+    in(ctx:LowerCtx)
+    i = 0;
+    when i < vec_len(ctx.stmt_borrows) loop
+        rec = vec_get(ctx.stmt_borrows, i);
+        if rec.claimed == 0:
+            var (tfound, tidx) = sym_lookup_entry(ctx.symbols, rec.target);
+            if tfound:
+                target = vec_get(ctx.symbols.entries, tidx);
+                if rec.kind == 1 and target.borrow_shared_count > 0:
+                    target.borrow_shared_count = target.borrow_shared_count - 1;
+                    vec_set(ctx.symbols.entries, tidx, target);
+                end
+                if rec.kind == 2 and target.borrow_mut_count > 0:
+                    target.borrow_mut_count = target.borrow_mut_count - 1;
+                    vec_set(ctx.symbols.entries, tidx, target);
+                end
+            end
+        end
+        i = i + 1;
+    end
+    ctx.stmt_borrows = vec_new<BorrowRecord>();
+    out ctx;
+end
+
+# Claim the most recent matching stmt borrow for a binder (var/assign)
+func ownership_claim_stmt_borrow:
+    in(ctx:LowerCtx; borrower_name:string; target_name:string; kind:int)
+    i = vec_len(ctx.stmt_borrows) - 1;
+    when i >= 0 loop
+        rec = vec_get(ctx.stmt_borrows, i);
+        if rec.claimed == 0 and rec.kind == kind and str_eq(rec.target, target_name):
+            rec.claimed = 1;
+            vec_set(ctx.stmt_borrows, i, rec);
+            # Set borrower's back-link
+            var (found, bidx) = sym_lookup_entry(ctx.symbols, borrower_name);
+            if found:
+                borrower = vec_get(ctx.symbols.entries, bidx);
+                borrower.borrow_kind = kind;
+                borrower.borrow_of_name = target_name;
+                vec_set(ctx.symbols.entries, bidx, borrower);
+            end
+            out ctx;
+        end
+        i = i - 1;
+    end
+    out ctx;
+end
+
+# If src is a bare identifier of a move-type var, mark it as moved
+func ownership_mark_moved_if_id:
+    in(ctx:LowerCtx; src:AstNode)
+    # AddrOf (&x) does NOT consume
+    if src.node_type == AstType::AddrOf:
+        out ctx;
+    end
+    if src.node_type != AstType::Identifier:
+        out ctx;
+    end
+    var (found, eidx) = sym_lookup_entry(ctx.symbols, src.name);
+    if not found:
+        out ctx;
+    end
+    entry = vec_get(ctx.symbols.entries, eidx);
+    if entry.is_move_type == 1:
+        entry.is_moved = 1;
+        vec_set(ctx.symbols.entries, eidx, entry);
+    end
+    out ctx;
+end
+
+
+# ═══════════════════════════════════════════════════════
 # Expression Lowering
 # ═══════════════════════════════════════════════════════
 
@@ -508,12 +669,77 @@ func lower_expr:
             ctx = lower_error(ctx, str_concat(str_new("undefined variable: "), expr.name));
             out (ctx, -1);
         end
+        # §4.8: reject read of a moved value
+        if scope == 0:
+            var (efound, eidx) = sym_lookup_entry(ctx.symbols, expr.name);
+            if efound:
+                ent = vec_get(ctx.symbols.entries, eidx);
+                if ent.is_moved == 1:
+                    ctx = lower_error(ctx, str_concat(str_new("use of moved value: '"), str_concat(expr.name, str_new("'"))));
+                    out (ctx, -1);
+                end
+            end
+        end
         if scope == 1:
             var (ctx2, rd) = fresh_vreg(ctx);
             ctx2 = emit(ctx2, q_instr(QOp::LoadGlobal, q_vreg(rd), q_imm(idx >> int), q_none()));
             out (ctx2, rd >> int);
         end
         out (ctx, idx >> int);
+    end
+
+    # §4.8 AddrOf: &x (shared) / &mut x — borrow conflict check
+    if expr.node_type == AstType::AddrOf:
+        if vec_len(expr.children) < 1:
+            ctx = lower_error(ctx, str_new("borrow without operand"));
+            out (ctx, -1);
+        end
+        is_mut = expr.int_val;
+        tgt = vec_get(expr.children, 0);
+        if tgt.node_type == AstType::Identifier:
+            var (efound, eidx) = sym_lookup_entry(ctx.symbols, tgt.name);
+            if efound:
+                ent = vec_get(ctx.symbols.entries, eidx);
+                if ent.is_moved == 1:
+                    ctx = lower_error(ctx, str_concat(str_new("borrow of moved value: '"), str_concat(tgt.name, str_new("'"))));
+                    out (ctx, -1);
+                end
+                if is_mut != 0:
+                    if ent.borrow_shared_count > 0:
+                        ctx = lower_error(ctx, str_concat(str_new("cannot borrow '"), str_concat(tgt.name, str_new("' as mutable: already borrowed as shared"))));
+                        out (ctx, -1);
+                    end
+                    if ent.borrow_mut_count > 0:
+                        ctx = lower_error(ctx, str_concat(str_new("cannot borrow '"), str_concat(tgt.name, str_new("' as mutable more than once"))));
+                        out (ctx, -1);
+                    end
+                    ent.borrow_mut_count = ent.borrow_mut_count + 1;
+                else
+                    if ent.borrow_mut_count > 0:
+                        ctx = lower_error(ctx, str_concat(str_new("cannot borrow '"), str_concat(tgt.name, str_new("' as shared: already borrowed as mutable"))));
+                        out (ctx, -1);
+                    end
+                    ent.borrow_shared_count = ent.borrow_shared_count + 1;
+                end
+                vec_set(ctx.symbols.entries, eidx, ent);
+                # Record transient borrow for stmt-level tracking
+                borrow_kind = 1;
+                if is_mut != 0:
+                    borrow_kind = 2;
+                end
+                vec_push(ctx.stmt_borrows, BorrowRecord { target: tgt.name, kind: borrow_kind, claimed: 0 });
+            end
+            # Materialise value like a plain read
+            var (scope2, idx2) = sym_lookup_both(ctx, tgt.name);
+            if scope2 == 1:
+                var (ctx2, rd) = fresh_vreg(ctx);
+                ctx2 = emit(ctx2, q_instr(QOp::LoadGlobal, q_vreg(rd), q_imm(idx2 >> int), q_none()));
+                out (ctx2, rd >> int);
+            end
+            out (ctx, idx2 >> int);
+        end
+        # Non-identifier borrow (e.g. &obj.field) — pass through
+        out lower_expr(ctx, tgt);
     end
 
     if expr.node_type == AstType::BinOp:
@@ -830,7 +1056,8 @@ func lower_stmt:
         var (ctx2, r) = fresh_vreg(ctx);
         ctx2.symbols = sym_define(ctx2.symbols, stmt.name, r);
         if vec_len(stmt.children) > 0:
-            var (ctx3, val) = lower_expr(ctx2, vec_get(stmt.children, 0));
+            init = vec_get(stmt.children, 0);
+            var (ctx3, val) = lower_expr(ctx2, init);
             if val >= 0 and (val as u32) != r:
                 ctx3 = emit(ctx3, q_instr(QOp::Move, q_vreg(r), q_vreg(val >> int), q_none()));
             end
@@ -849,8 +1076,44 @@ func lower_stmt:
                 var (ctx4, mr) = fresh_vreg(ctx3);
                 ctx4 = emit(ctx4, q_instr(QOp::Load, q_vreg(mr), q_imm(mask), q_none()));
                 ctx4 = emit(ctx4, q_instr(QOp::And, q_vreg(r), q_vreg(r), q_vreg(mr)));
+                # §4.8: mark move type + claim borrow
+                if ast_produces_move_type(init):
+                    var (ef, ei) = sym_lookup_entry(ctx4.symbols, stmt.name);
+                    if ef:
+                        e2 = vec_get(ctx4.symbols.entries, ei);
+                        e2.is_move_type = 1;
+                        vec_set(ctx4.symbols.entries, ei, e2);
+                    end
+                end
+                ctx4 = ownership_mark_moved_if_id(ctx4, init);
+                if init.node_type == AstType::AddrOf and vec_len(init.children) > 0:
+                    bk = 1;
+                    if init.int_val != 0:
+                        bk = 2;
+                    end
+                    ctx4 = ownership_claim_stmt_borrow(ctx4, stmt.name, vec_get(init.children, 0).name, bk);
+                end
+                ctx4 = ownership_release_unclaimed(ctx4);
                 out ctx4;
             end
+            # §4.8: mark move type + claim borrow (no mask path)
+            if ast_produces_move_type(init):
+                var (ef, ei) = sym_lookup_entry(ctx3.symbols, stmt.name);
+                if ef:
+                    e2 = vec_get(ctx3.symbols.entries, ei);
+                    e2.is_move_type = 1;
+                    vec_set(ctx3.symbols.entries, ei, e2);
+                end
+            end
+            ctx3 = ownership_mark_moved_if_id(ctx3, init);
+            if init.node_type == AstType::AddrOf and vec_len(init.children) > 0:
+                bk = 1;
+                if init.int_val != 0:
+                    bk = 2;
+                end
+                ctx3 = ownership_claim_stmt_borrow(ctx3, stmt.name, vec_get(init.children, 0).name, bk);
+            end
+            ctx3 = ownership_release_unclaimed(ctx3);
             out ctx3;
         else
             ctx2 = emit(ctx2, q_instr(QOp::Load, q_vreg(r), q_imm(0), q_none()));
@@ -863,7 +1126,8 @@ func lower_stmt:
         if scope < 0:
             out lower_error(ctx, str_concat(str_new("assign to undefined: "), stmt.name));
         end
-        var (ctx2, val) = lower_expr(ctx, vec_get(stmt.children, 0));
+        rhs = vec_get(stmt.children, 0);
+        var (ctx2, val) = lower_expr(ctx, rhs);
         if val < 0:
             out ctx2;
         end
@@ -874,6 +1138,35 @@ func lower_stmt:
                 ctx2 = emit(ctx2, q_instr(QOp::Move, q_vreg(idx), q_vreg(val >> int), q_none()));
             end
         end
+        # §4.8: release old borrow on LHS, track move, claim new borrow
+        ctx2 = ownership_release_borrow(ctx2, stmt.name);
+        if rhs.node_type != AstType::AddrOf:
+            ctx2 = ownership_mark_moved_if_id(ctx2, rhs);
+            if ast_produces_move_type(rhs):
+                var (ef, ei) = sym_lookup_entry(ctx2.symbols, stmt.name);
+                if ef:
+                    e2 = vec_get(ctx2.symbols.entries, ei);
+                    e2.is_move_type = 1;
+                    vec_set(ctx2.symbols.entries, ei, e2);
+                end
+            end
+        else
+            if vec_len(rhs.children) > 0:
+                bk = 1;
+                if rhs.int_val != 0:
+                    bk = 2;
+                end
+                ctx2 = ownership_claim_stmt_borrow(ctx2, stmt.name, vec_get(rhs.children, 0).name, bk);
+            end
+        end
+        # Resurrect LHS (no longer moved)
+        var (ef2, ei2) = sym_lookup_entry(ctx2.symbols, stmt.name);
+        if ef2:
+            e3 = vec_get(ctx2.symbols.entries, ei2);
+            e3.is_moved = 0;
+            vec_set(ctx2.symbols.entries, ei2, e3);
+        end
+        ctx2 = ownership_release_unclaimed(ctx2);
         out ctx2;
     end
 
@@ -1178,6 +1471,18 @@ func lower_stmt:
         out ctx_b;
     end
 
+    # §13 throw EXPR — trigger error panic
+    if stmt.node_type == AstType::ThrowStmt:
+        if vec_len(stmt.children) > 0:
+            var (ctx2, code_v) = lower_expr(ctx, vec_get(stmt.children, 0));
+            if code_v >= 0:
+                ctx2 = emit(ctx2, q_instr(QOp::ThrowOp, q_none(), q_vreg(code_v >> int), q_none()));
+            end
+            out ctx2;
+        end
+        out ctx;
+    end
+
     # §22 cancel EXPR — mark task cancelled
     if stmt.node_type == AstType::CancelStmt:
         if vec_len(stmt.children) > 0:
@@ -1229,8 +1534,26 @@ func lower_func_def:
     saved_syms = ctx.symbols;
     ctx.symbols = sym_new();
 
+    # Find body, ensure, and revert blocks
+    body_idx = -1;
+    ensure_node_idx = -1;
+    revert_node_idx = -1;
+    idx = vec_len(func_def.children) - 1;
+    when idx >= 0 and body_idx < 0 loop
+        ct = vec_get(func_def.children, idx).node_type;
+        if ct == AstType::EnsureBlock:
+            ensure_node_idx = idx;
+        else:
+            if ct == AstType::RevertBlock:
+                revert_node_idx = idx;
+            else:
+                body_idx = idx;
+            end
+        end
+        idx = idx - 1;
+    end
+
     # Register parameters
-    body_idx = vec_len(func_def.children) - 1;
     i = 0;
     when i < body_idx loop
         param = vec_get(func_def.children, i);
@@ -1247,9 +1570,56 @@ func lower_func_def:
         i = i + 1;
     end
 
+    has_epilogue = ensure_node_idx >= 0 or revert_node_idx >= 0;
+    revert_L = -1;
+    ensure_L = -1;
+
+    if has_epilogue:
+        var (ctx4, rl) = fresh_label(ctx);
+        var (ctx5, el) = fresh_label(ctx4);
+        revert_L = rl;
+        ensure_L = el;
+        ctx = ctx5;
+        ctx = emit(ctx, q_instr(QOp::TryBegin, q_label(revert_L), q_none(), q_none()));
+    end
+
     # Lower body
-    if vec_len(func_def.children) > 0:
+    if body_idx >= 0:
         ctx = lower_stmt(ctx, vec_get(func_def.children, body_idx));
+    end
+
+    if has_epilogue:
+        ctx = emit(ctx, q_instr(QOp::TryEnd, q_none(), q_none(), q_none()));
+        ctx = emit(ctx, q_instr(QOp::Jump, q_none(), q_label(ensure_L), q_none()));
+
+        rlbl = q_instr(QOp::Label, q_none(), q_none(), q_none());
+        rlbl.patch_id = revert_L;
+        ctx = emit(ctx, rlbl);
+
+        if revert_node_idx >= 0:
+            rev_node = vec_get(func_def.children, revert_node_idx);
+            if vec_len(rev_node.children) > 0:
+                ctx = lower_stmt(ctx, vec_get(rev_node.children, 0));
+            end
+        end
+        if ensure_node_idx >= 0:
+            ens_node = vec_get(func_def.children, ensure_node_idx);
+            if vec_len(ens_node.children) > 0:
+                ctx = lower_stmt(ctx, vec_get(ens_node.children, 0));
+            end
+        end
+        ctx = emit(ctx, q_instr(QOp::ResumeRevert, q_none(), q_none(), q_none()));
+
+        elbl = q_instr(QOp::Label, q_none(), q_none(), q_none());
+        elbl.patch_id = ensure_L;
+        ctx = emit(ctx, elbl);
+
+        if ensure_node_idx >= 0:
+            ens_node2 = vec_get(func_def.children, ensure_node_idx);
+            if vec_len(ens_node2.children) > 0:
+                ctx = lower_stmt(ctx, vec_get(ens_node2.children, 0));
+            end
+        end
     end
 
     # Restore scope
