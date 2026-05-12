@@ -1,0 +1,507 @@
+##
+ * vir/codegen/binary.vri — Binary Object Format Emitter
+ * ======================================================
+ * Step 3: Cut the umbilical cord — emit Mach-O/ELF objects directly
+ *
+ * This module constructs binary object files in memory,
+ * bypassing the need for an external assembler (as) or linker (ld).
+ *
+ * Mach-O 64-bit format (macOS ARM64 & x86-64):
+ *   Header -> Load Commands -> Segments -> Sections -> Relocations -> SymTab
+ *
+ * ELF 64-bit format (Linux):
+ *   ELF Header -> Section Headers -> .text -> .data -> .symtab -> .strtab
+ ##
+
+include types;
+include result;
+import Result, Ok, Err from result;
+include string;
+import String, str_new, str_concat, str_len from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+
+
+# ═══════════════════════════════════════════════════════
+# Target Format
+# ═══════════════════════════════════════════════════════
+
+enum ObjFormat:
+    MachO64  = 0;
+    ELF64    = 1;
+end.
+
+enum Arch:
+    ARM64    = 0;
+    X86_64   = 1;
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Raw byte buffer
+# ═══════════════════════════════════════════════════════
+
+entity ByteBuffer:
+    data:   Vec<int>;
+    pos:    int;
+end.
+
+func buf_new:
+    out ByteBuffer { data: vec_new(), pos: 0 };
+end.
+
+func buf_write_u8:
+    in(buf:ByteBuffer; val:int)
+    vec_push(buf.data, val);
+    buf.pos = buf.pos + 1;
+    out buf;
+end.
+
+func buf_write_u16_le:
+    in(buf:ByteBuffer; val:int)
+    buf = buf_write_u8(buf, (val & 0xFF) >> int);
+    buf = buf_write_u8(buf, ((val >> 8) & 0xFF) >> int);
+    out buf;
+end.
+
+func buf_write_u32_le:
+    in(buf:ByteBuffer; val:int)
+    buf = buf_write_u8(buf, (val & 0xFF) >> int);
+    buf = buf_write_u8(buf, ((val >> 8) & 0xFF) >> int);
+    buf = buf_write_u8(buf, ((val >> 16) & 0xFF) >> int);
+    buf = buf_write_u8(buf, ((val >> 24) & 0xFF) >> int);
+    out buf;
+end.
+
+func buf_write_u64_le:
+    in(buf:ByteBuffer; val:int)
+    buf = buf_write_u32_le(buf, (val & 0xFFFFFFFF) >> int);
+    buf = buf_write_u32_le(buf, ((val >> 32) & 0xFFFFFFFF) >> int);
+    out buf;
+end.
+
+func buf_write_zeros:
+    in(buf:ByteBuffer; count:int)
+    i = 0;
+    when i < count loop
+        buf = buf_write_u8(buf, 0);
+        i = i + 1;
+    end
+    out buf;
+end.
+
+func buf_write_bytes:
+    in(buf:ByteBuffer; bytes:Vec<int>)
+    i = 0;
+    when i < vec_len(bytes) loop
+        buf = buf_write_u8(buf, vec_get(bytes, i));
+        i = i + 1;
+    end
+    out buf;
+end.
+
+func buf_write_string_padded:
+    in(buf:ByteBuffer; s:string; pad_to:int)
+    slen = str_len(s);
+    i = 0;
+    when i < slen and i < pad_to loop
+        buf = buf_write_u8(buf, str_byte_at(s, i));
+        i = i + 1;
+    end
+    # Pad with zeros
+    when i < pad_to loop
+        buf = buf_write_u8(buf, 0);
+        i = i + 1;
+    end
+    out buf;
+end.
+
+func buf_align:
+    in(buf:ByteBuffer; alignment:int)
+    when (buf.pos % alignment as i64) != 0 loop
+        buf = buf_write_u8(buf, 0);
+    end
+    out buf;
+end.
+
+func buf_size:
+    in(buf:ByteBuffer)
+    out buf.pos;
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Symbol Table Entry
+# ═══════════════════════════════════════════════════════
+
+enum SymbolType:
+    Function   = 0;
+    Data       = 1;
+    External   = 2;
+end.
+
+entity Symbol:
+    name:       string;
+    sym_type:   SymbolType;
+    section:    int        # section index (1-based);
+    offset:     int        # offset within section;
+    size:       int;
+    is_global:  bool;
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Relocation Entry
+# ═══════════════════════════════════════════════════════
+
+enum RelocType:
+    Branch26       = 0   # ARM64: B/BL (26-bit offset);
+    Page21         = 1   # ARM64: ADRP (21-bit page);
+    PageOff12      = 2   # ARM64: ADD/LDR (12-bit page offset);
+    PLT32          = 3   # x86-64: PLT call;
+    PC32           = 4   # x86-64: RIP-relative;
+    GOTLoad        = 5   # GOT entry load;
+end.
+
+entity Relocation:
+    offset:     int;
+    sym_idx:    int;
+    reloc_type: RelocType;
+    addend:     int;
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Section
+# ═══════════════════════════════════════════════════════
+
+entity Section:
+    name:       string;
+    seg_name:   string       # Mach-O segment name;
+    data:       ByteBuffer;
+    alignment:  int;
+    relocs:     Vec<Relocation>;
+end.
+
+func section_text:
+    out Section {;
+        name: str_new("__text"),;
+        seg_name: str_new("__TEXT"),;
+        data: buf_new(),;
+        alignment: 4,;
+        relocs: vec_new();
+    };
+end.
+
+func section_data:
+    out Section {;
+        name: str_new("__data"),;
+        seg_name: str_new("__DATA"),;
+        data: buf_new(),;
+        alignment: 8,;
+        relocs: vec_new();
+    };
+end.
+
+func section_const:
+    out Section {;
+        name: str_new("__const"),;
+        seg_name: str_new("__TEXT"),;
+        data: buf_new(),;
+        alignment: 16,;
+        relocs: vec_new();
+    };
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Mach-O Constants
+# ═══════════════════════════════════════════════════════
+
+# Magic numbers
+const MH_MAGIC_64: 0xFEEDFACF;
+const MH_OBJECT: 1     # relocatable object file;
+
+# CPU types
+const CPU_TYPE_ARM64: 0x0100000C   # CPU_TYPE_ARM | CPU_ARCH_ABI64;
+const CPU_TYPE_X86_64: 0x01000007   # CPU_TYPE_X86 | CPU_ARCH_ABI64;
+const CPU_SUBTYPE_ALL: 0;
+
+# Load command types
+const LC_SEGMENT_64: 0x19;
+const LC_SYMTAB: 0x02;
+const LC_BUILD_VERSION: 0x32;
+
+# Section types
+const S_REGULAR: 0x00;
+const S_ATTR_PURE_INSTRUCTIONS: 0x80000000;
+const S_ATTR_SOME_INSTRUCTIONS: 0x00000400;
+
+
+# ═══════════════════════════════════════════════════════
+# Mach-O Object Builder
+# ═══════════════════════════════════════════════════════
+
+entity MachOBuilder:
+    arch:       Arch;
+    sections:   Vec<Section>;
+    symbols:    Vec<Symbol>;
+    strtab:     ByteBuffer;
+end.
+
+func macho_new:
+    in(arch:Arch)
+    builder = MachOBuilder {;
+        arch: arch,;
+        sections: vec_new(),;
+        symbols: vec_new(),;
+        strtab: buf_new();
+    };
+    # strtab starts with a null byte
+    builder.strtab = buf_write_u8(builder.strtab, 0);
+    out builder;
+end.
+
+func macho_add_section:
+    in(builder:MachOBuilder; sec:Section)
+    vec_push(builder.sections, sec);
+    out builder;
+end.
+
+func macho_add_symbol:
+    in(builder:MachOBuilder; sym:Symbol)
+    vec_push(builder.symbols, sym);
+    out builder;
+end.
+
+func macho_strtab_add:
+    in(builder:MachOBuilder; name:string)
+    offset = buf_size(builder.strtab) >> int;
+    # Write string bytes + null terminator
+    i = 0;
+    when i < str_len(name) loop
+        builder.strtab = buf_write_u8(builder.strtab, str_byte_at(name, i));
+        i = i + 1;
+    end
+    builder.strtab = buf_write_u8(builder.strtab, 0);
+    out (builder, offset);
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Emit Mach-O Header
+# ═══════════════════════════════════════════════════════
+
+func macho_emit_header:
+    in(buf:ByteBuffer; arch:Arch; ncmds:int; sizeofcmds:int)
+    # Mach-O 64-bit header = 32 bytes
+    buf = buf_write_u32_le(buf, MH_MAGIC_64);
+
+    if arch == Arch::ARM64:
+        buf = buf_write_u32_le(buf, CPU_TYPE_ARM64);
+    else
+        buf = buf_write_u32_le(buf, CPU_TYPE_X86_64);
+    end
+
+    buf = buf_write_u32_le(buf, CPU_SUBTYPE_ALL)   # cpusubtype;
+    buf = buf_write_u32_le(buf, MH_OBJECT)         # filetype;
+    buf = buf_write_u32_le(buf, ncmds)             # ncmds;
+    buf = buf_write_u32_le(buf, sizeofcmds)        # sizeofcmds;
+    buf = buf_write_u32_le(buf, 0)                 # flags;
+    buf = buf_write_u32_le(buf, 0)                 # reserved (64-bit);
+    out buf;
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Emit LC_SEGMENT_64
+# ═══════════════════════════════════════════════════════
+
+func macho_emit_segment_cmd:
+    in(buf:ByteBuffer; seg_name:string; nsects:int; sect_data_offset:int; sect_data_size: int)
+    # LC_SEGMENT_64 = 72 bytes + 80 bytes per section
+    cmdsize = 72 + nsects * 80 >> int;
+
+    buf = buf_write_u32_le(buf, LC_SEGMENT_64);
+    buf = buf_write_u32_le(buf, cmdsize);
+    buf = buf_write_string_padded(buf, seg_name, 16)      # segname[16];
+    buf = buf_write_u64_le(buf, 0)                        # vmaddr;
+    buf = buf_write_u64_le(buf, sect_data_size >> int)  # vmsize;
+    buf = buf_write_u64_le(buf, sect_data_offset >> int) # fileoff;
+    buf = buf_write_u64_le(buf, sect_data_size >> int)   # filesize;
+    buf = buf_write_u32_le(buf, 7)                        # maxprot (rwx);
+    buf = buf_write_u32_le(buf, 7)                        # initprot (rwx);
+    buf = buf_write_u32_le(buf, nsects);
+    buf = buf_write_u32_le(buf, 0)                        # flags;
+
+    out buf;
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Emit Section Header (within LC_SEGMENT_64)
+# ═══════════════════════════════════════════════════════
+
+func macho_emit_section_hdr:
+    in(buf:ByteBuffer; sec:Section; file_offset:int; reloc_offset:int)
+    # Section header = 80 bytes
+    buf = buf_write_string_padded(buf, sec.name, 16)      # sectname[16];
+    buf = buf_write_string_padded(buf, sec.seg_name, 16)  # segname[16];
+    buf = buf_write_u64_le(buf, 0)                        # addr;
+    buf = buf_write_u64_le(buf, buf_size(sec.data) >> int)  # size;
+    buf = buf_write_u32_le(buf, file_offset >> int)        # offset;
+    buf = buf_write_u32_le(buf, sec.alignment >> int)      # align (2^n);
+    buf = buf_write_u32_le(buf, reloc_offset >> int)       # reloff;
+    buf = buf_write_u32_le(buf, vec_len(sec.relocs) >> int) # nreloc;
+    buf = buf_write_u32_le(buf, S_REGULAR)                 # flags;
+    buf = buf_write_u32_le(buf, 0)                         # reserved1;
+    buf = buf_write_u32_le(buf, 0)                         # reserved2;
+    buf = buf_write_u32_le(buf, 0)                         # reserved3 (64-bit);
+
+    out buf;
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Emit LC_SYMTAB
+# ═══════════════════════════════════════════════════════
+
+func macho_emit_symtab_cmd:
+    in(buf:ByteBuffer; symoff:int; nsyms:int; stroff:int; strsize:int)
+    buf = buf_write_u32_le(buf, LC_SYMTAB);
+    buf = buf_write_u32_le(buf, 24)        # cmdsize;
+    buf = buf_write_u32_le(buf, symoff);
+    buf = buf_write_u32_le(buf, nsyms);
+    buf = buf_write_u32_le(buf, stroff);
+    buf = buf_write_u32_le(buf, strsize);
+    out buf;
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Build Complete Object File
+# ═══════════════════════════════════════════════════════
+
+func macho_build:
+    in(builder:MachOBuilder)
+    out = buf_new();
+
+    nsections = vec_len(builder.sections) >> int;
+    if nsections == 0:
+        out Err(str_new("No sections to emit"));
+    end
+
+    # Calculate layout
+    header_size = 32 >> int;
+    segment_cmd_size = (72 + nsections * 80) >> int;
+    symtab_cmd_size = 24 >> int;
+    total_cmd_size = segment_cmd_size + symtab_cmd_size;
+    data_offset = header_size + total_cmd_size;
+
+    # Calculate total section data size
+    total_data_size = 0;
+    i = 0;
+    when i < nsections as i32 loop
+        total_data_size = total_data_size + buf_size(vec_get(builder.sections, i).data);
+        i = i + 1;
+    end
+
+    # Emit header (2 load commands: LC_SEGMENT_64, LC_SYMTAB)
+    out = macho_emit_header(out, builder.arch, 2, total_cmd_size >> int);
+
+    # Emit LC_SEGMENT_64 command
+    out = macho_emit_segment_cmd(out, str_new(""), nsections,;
+                                  data_offset, total_data_size);
+
+    # Emit section headers
+    sec_offset = data_offset;
+    i = 0;
+    when i < nsections as i32 loop
+        sec = vec_get(builder.sections, i);
+        out = macho_emit_section_hdr(out, sec, sec_offset, 0);
+        sec_offset = sec_offset + buf_size(sec.data);
+        i = i + 1;
+    end
+
+    # Emit LC_SYMTAB command
+    symoff = (data_offset + total_data_size) >> int;
+    nsyms = vec_len(builder.symbols) >> int;
+    stroff = symoff + nsyms * 16   # nlist_64 = 16 bytes each;
+    strsize = buf_size(builder.strtab) >> int;
+    out = macho_emit_symtab_cmd(out, symoff, nsyms, stroff, strsize);
+
+    # Emit section data
+    i = 0;
+    when i < nsections as i32 loop
+        sec = vec_get(builder.sections, i);
+        out = buf_write_bytes(out, sec.data.data);
+        i = i + 1;
+    end
+
+    # Emit symbol table (nlist_64 entries)
+    i = 0;
+    when i < vec_len(builder.symbols) loop
+        sym = vec_get(builder.symbols, i);
+        var (builder2, str_idx) = macho_strtab_add(builder, sym.name);
+        builder = builder2;
+
+        out = buf_write_u32_le(out, str_idx >> int)     # n_strx;
+        if sym.is_global:
+            out = buf_write_u8(out, 0x0F)                       # n_type: N_EXT | N_SECT;
+        else
+            out = buf_write_u8(out, 0x0E)                       # n_type: N_SECT;
+        end
+        out = buf_write_u8(out, sym.section >> int)       # n_sect;
+        out = buf_write_u16_le(out, 0)                          # n_desc;
+        out = buf_write_u64_le(out, sym.offset >> int)   # n_value;
+
+        i = i + 1;
+    end
+
+    # Emit string table
+    out = buf_write_bytes(out, builder.strtab.data);
+
+    out Ok(out);
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# High-Level API
+# ═══════════════════════════════════════════════════════
+
+func emit_object_file:
+    in(code:Vec<int>; arch:Arch)
+    builder = macho_new(arch);
+
+    # Create __text section with the machine code
+    text = section_text();
+    text.data = buf_new();
+    text.data = buf_write_bytes(text.data, code);
+
+    builder = macho_add_section(builder, text);
+
+    out macho_build(builder);
+end.
+
+func emit_kernel_object:
+    in(kernel_name:string; code:Vec<int>; arch:Arch)
+    builder = macho_new(arch);
+
+    # Text section
+    text = section_text();
+    text.data = buf_new();
+    text.data = buf_write_bytes(text.data, code);
+    builder = macho_add_section(builder, text);
+
+    # Add kernel as global symbol
+    builder = macho_add_symbol(builder, Symbol {;
+        name: format("_vir_{}", kernel_name),;
+        sym_type: SymbolType::Function,;
+        section: 1,;
+        offset: 0,;
+        size: vec_len(code) >> int,;
+        is_global: true;
+    });
+
+    out macho_build(builder);
+end.

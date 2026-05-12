@@ -1,0 +1,620 @@
+##
+ * vir/test/compiler_vtest.vri — VTest smoke suite for Compiler / Optimizer / Pipeline
+ * ===================================================================================
+ * Compiler-focused vtest suite covering:
+ *   - Q-IR construction & basic lowering
+ *   - Optimizer passes (const fold, CSE, strength reduction, DCE, …)
+ *   - BCE / Escape Analysis analysis counters
+ *   - Full pipeline smoke (H→M→L)
+ *
+ * Thay thế dần các test tương ứng trong pytest (test_phase3, test_phase_i, …)
+ ##
+
+include types;
+include string;
+import String, str_new, str_eq from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get, vec_set from vec;
+include test;
+import TestSuite, TestResult from test;
+include vtest;
+import VTestRegistry,
+       vtest_suite_new, vtest_add,
+       vtest_registry_new, vtest_registry_add_suite, vtest_registry_run,
+       vtest_print_summary, vtest_exit_code,
+       vtest_pass, vtest_fail,
+       vtest_expect_true, vtest_expect_false,
+       vtest_expect_eq_i64, vtest_expect_ne_i64 from vtest;
+include ir_optimizer;
+import QOp, QModule, QFunction, QInstruction, Operand, OperandType,
+       OptStats, opt_stats_new, opt_stats_merge, opt_stats_total_changes,
+       optimize_function_stats,
+       opt_copy_propagate, opt_const_fold, opt_cse,
+       opt_strength_reduce, opt_licm, opt_bce, opt_escape_analysis,
+       opt_deterministic_free, opt_loop_unroll, opt_vectorize, opt_dce from ir_optimizer;
+
+
+# ═══════════════════════════════════════════════════════
+# Helpers — build minimal Q-IR fragments for testing
+# ═══════════════════════════════════════════════════════
+
+func _vreg:
+    in(id:int)
+    out Operand { op_type: OperandType::VReg, vreg: id, imm: 0, patch_id: 0 };
+end
+
+func _imm:
+    in(val:int)
+    out Operand { op_type: OperandType::Immediate, vreg: 0, imm: val, patch_id: 0 };
+end
+
+func _none_op:
+    out Operand { op_type: OperandType::None, vreg: 0, imm: 0, patch_id: 0 };
+end
+
+func _label_ref:
+    in(id:int)
+    out Operand { op_type: OperandType::LabelRef, vreg: id, imm: 0, patch_id: 0 };
+end
+
+func _instr:
+    in(op:int; dest:Operand; src1:Operand; src2:Operand)
+    out QInstruction { opcode: op, dest: dest, src1: src1, src2: src2, patch_id: 0 };
+end
+
+func _make_func:
+    in(name:string; body:Vec<QInstruction>)
+    out QFunction { name: name, body: body, param_count: 0, local_count: 8 };
+end
+
+func _make_module:
+    in(funcs:Vec<QFunction>)
+    out QModule { functions: funcs, name: str_new("test_mod") };
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — Constant Folding
+# ═══════════════════════════════════════════════════════
+
+func _test_const_fold_add:
+    # Load 10 → v0, Load 20 → v1, Add v0+v1 → v2  ⟹  v2 should fold to 30
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(10), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(20), _none_op()));
+    vec_push(body, _instr(QOp::Add,  _vreg(2), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(2), _none_op()));
+    f = _make_func(str_new("fold_add"), body);
+    var (f2, changes) = opt_const_fold(f);
+    # Constant folding should produce ≥1 change (the Add folded)
+    if changes > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — Common Subexpression Elimination
+# ═══════════════════════════════════════════════════════
+
+func _test_cse_duplicate_add:
+    # Add v0+v1 → v2, Add v0+v1 → v3  ⟹  second Add should be replaced by Move
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(5), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(7), _none_op()));
+    vec_push(body, _instr(QOp::Add,  _vreg(2), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Add,  _vreg(3), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(3), _none_op()));
+    f = _make_func(str_new("cse_dup"), body);
+    var (f2, changes) = opt_cse(f);
+    if changes > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+func _test_cse_different_operands_not_eliminated:
+    # Add v0+v1 → v3, Add v0+v2 → v4 (different src2) ⟹ both Adds should remain
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(5), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(7), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(2), _imm(9), _none_op()));
+    vec_push(body, _instr(QOp::Add,  _vreg(3), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Add,  _vreg(4), _vreg(0), _vreg(2)));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(4), _none_op()));
+    f = _make_func(str_new("cse_diff"), body);
+    var (f2, changes) = opt_cse(f);
+    out vtest_expect_eq_i64(changes, 0);
+end
+
+func _test_cse_invalidated_by_redef:
+    # Add v0+v1 → v2, redefine v0, Add v0+v1 → v3 ⟹ both Adds must stay
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(5), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(7), _none_op()));
+    vec_push(body, _instr(QOp::Add,  _vreg(2), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(99), _none_op()));  # redefine v0
+    vec_push(body, _instr(QOp::Add,  _vreg(3), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(3), _none_op()));
+    f = _make_func(str_new("cse_redef"), body);
+    var (f2, changes) = opt_cse(f);
+    out vtest_expect_eq_i64(changes, 0);
+end
+
+func _test_cse_invalidated_by_control_flow:
+    # Add v0+v1 → v2, Label, Add v0+v1 → v3 ⟹ both Adds must stay
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load,  _vreg(0), _imm(5), _none_op()));
+    vec_push(body, _instr(QOp::Load,  _vreg(1), _imm(7), _none_op()));
+    vec_push(body, _instr(QOp::Add,   _vreg(2), _vreg(0), _vreg(1)));
+    lbl = _instr(QOp::Label, _none_op(), _none_op(), _none_op());
+    lbl.patch_id = 1;
+    vec_push(body, lbl);
+    vec_push(body, _instr(QOp::Add,   _vreg(3), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Ret,   _none_op(), _vreg(3), _none_op()));
+    f = _make_func(str_new("cse_cf"), body);
+    var (f2, changes) = opt_cse(f);
+    out vtest_expect_eq_i64(changes, 0);
+end
+
+func _test_cse_commutative_add:
+    # Add v0+v1 → v2, Add v1+v0 → v3 ⟹ commutative CSE detects equivalence
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(5), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(7), _none_op()));
+    vec_push(body, _instr(QOp::Add,  _vreg(2), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Add,  _vreg(3), _vreg(1), _vreg(0)));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(3), _none_op()));
+    f = _make_func(str_new("cse_comm"), body);
+    var (f2, changes) = opt_cse(f);
+    if changes > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+func _test_sub_not_commutative:
+    # Sub v0-v1 → v2, Sub v1-v0 → v3 ⟹ NOT equivalent, both stay
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(10), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(3),  _none_op()));
+    vec_push(body, _instr(QOp::Sub,  _vreg(2), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Sub,  _vreg(3), _vreg(1), _vreg(0)));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(3), _none_op()));
+    f = _make_func(str_new("sub_nc"), body);
+    var (f2, changes) = opt_cse(f);
+    out vtest_expect_eq_i64(changes, 0);
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — Strength Reduction
+# ═══════════════════════════════════════════════════════
+
+func _test_strength_reduce_mul_pow2:
+    # Mul v0 * 8 → should become Shl v0, 3
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(42), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(8),  _none_op()));
+    vec_push(body, _instr(QOp::Mul,  _vreg(2), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(2), _none_op()));
+    f = _make_func(str_new("sr_mul8"), body);
+    var (f2, changes) = opt_strength_reduce(f);
+    if changes > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — Dead Code Elimination
+# ═══════════════════════════════════════════════════════
+
+func _test_dce_removes_unused:
+    # Load 99 → v5 (never used afterward) ⟹ DCE should remove it
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(1), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(5), _imm(99), _none_op()));  # dead
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(0), _none_op()));
+    f = _make_func(str_new("dce_dead"), body);
+    var (f2, removed) = opt_dce(f);
+    if removed > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — Copy Propagation
+# ═══════════════════════════════════════════════════════
+
+func _test_copy_prop_basic:
+    # Load 7 → v0, Move v0 → v1, Add v1+v1 → v2 ⟹ v1 replaced by v0 in Add
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(7),    _none_op()));
+    vec_push(body, _instr(QOp::Move, _vreg(1), _vreg(0),   _none_op()));
+    vec_push(body, _instr(QOp::Add,  _vreg(2), _vreg(1),   _vreg(1)));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(2), _none_op()));
+    f = _make_func(str_new("cp_basic"), body);
+    var (f2, changes) = opt_copy_propagate(f);
+    if changes > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — BCE Analysis (conservative)
+# ═══════════════════════════════════════════════════════
+
+func _test_bce_no_loops_zero:
+    # Straight-line code: no loops ⟹ safe_accesses == 0
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(1), _none_op()));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(0), _none_op()));
+    f = _make_func(str_new("bce_none"), body);
+    var (f2, safe) = opt_bce(f);
+    out vtest_expect_eq_i64(safe, 0);
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — Escape Analysis (conservative)
+# ═══════════════════════════════════════════════════════
+
+func _test_escape_no_alloc_zero:
+    # No Alloc instructions ⟹ promotable == 0
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(1), _none_op()));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(0), _none_op()));
+    f = _make_func(str_new("esc_none"), body);
+    var (f2, promotable) = opt_escape_analysis(f);
+    out vtest_expect_eq_i64(promotable, 0);
+end
+
+func _test_escape_local_alloc_promotable:
+    # Alloc → v0, use locally, never escape to Store/Ret/Call ⟹ promotable >= 1
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Alloc, _vreg(0), _imm(64), _none_op()));
+    vec_push(body, _instr(QOp::Load,  _vreg(1), _imm(42), _none_op()));
+    vec_push(body, _instr(QOp::Ret,   _none_op(), _vreg(1), _none_op()));
+    f = _make_func(str_new("esc_local"), body);
+    var (f2, promotable) = opt_escape_analysis(f);
+    if promotable > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — Deterministic Free Insertion
+# ═══════════════════════════════════════════════════════
+
+func _test_det_free_inserts:
+    # Alloc → v0, never freed ⟹ det_free pass inserts Free before Ret
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Alloc, _vreg(0), _imm(32), _none_op()));
+    vec_push(body, _instr(QOp::Load,  _vreg(1), _imm(1),  _none_op()));
+    vec_push(body, _instr(QOp::Ret,   _none_op(), _vreg(1), _none_op()));
+    f = _make_func(str_new("detfree"), body);
+    var (f2, inserted) = opt_deterministic_free(f);
+    if inserted > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — OptStats Entity
+# ═══════════════════════════════════════════════════════
+
+func _test_opt_stats_new_zero:
+    s = opt_stats_new();
+    out vtest_expect_eq_i64(opt_stats_total_changes(s), 0);
+end
+
+func _test_opt_stats_merge:
+    a = opt_stats_new();
+    a.const_fold = 3;
+    a.dce = 5;
+    b = opt_stats_new();
+    b.const_fold = 2;
+    b.bce_safe = 4;
+    merged = opt_stats_merge(a, b);
+    if merged.const_fold == 5 and merged.dce == 5 and merged.bce_safe == 4:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — Full Pipeline Smoke (optimize_function_stats)
+# ═══════════════════════════════════════════════════════
+
+func _test_full_pipeline_smoke:
+    # Build a small function and run the full 12-pass pipeline with stats
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(10), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(20), _none_op()));
+    vec_push(body, _instr(QOp::Add,  _vreg(2), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Load, _vreg(3), _imm(99), _none_op()));  # dead
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(2), _none_op()));
+    f = _make_func(str_new("pipeline_smoke"), body);
+    funcs = vec_new<QFunction>();
+    vec_push(funcs, f);
+    mod = _make_module(funcs);
+    var (f2, stats) = optimize_function_stats(f, mod);
+    # Expect at least const_fold or dce to fire
+    total = opt_stats_total_changes(stats);
+    if total > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — LICM (straight-line → no changes)
+# ═══════════════════════════════════════════════════════
+
+func _test_licm_no_loops_noop:
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(1), _none_op()));
+    vec_push(body, _instr(QOp::Ret,  _none_op(), _vreg(0), _none_op()));
+    f = _make_func(str_new("licm_noop"), body);
+    var (f2, changes) = opt_licm(f);
+    out vtest_expect_eq_i64(changes, 0);
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — BCE Real Transform (BoundsCheck Elimination)
+# ═══════════════════════════════════════════════════════
+
+func _test_bce_eliminates_in_canonical_loop:
+    # Canonical loop: for v0=0; v0<10; v0++
+    # BoundsCheck(v0, v1=10) inside loop → provably safe → eliminated
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(0), _none_op()));     # v0 = 0 (iv)
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(10), _none_op()));    # v1 = 10 (bound)
+    lbl = _instr(QOp::Label, _none_op(), _none_op(), _none_op());
+    lbl.patch_id = 10;
+    vec_push(body, lbl);                                                    # Label @10
+    vec_push(body, _instr(QOp::CmpLt, _vreg(2), _vreg(0), _vreg(1)));    # v2 = v0 < v1
+    vec_push(body, _instr(QOp::JumpIfNot, _none_op(), _vreg(2), _label_ref(20)));  # exit if not
+    vec_push(body, _instr(QOp::BoundsCheck, _none_op(), _vreg(0), _vreg(1)));      # check: i < 10
+    vec_push(body, _instr(QOp::Add, _vreg(0), _vreg(0), _imm(1)));       # v0++
+    vec_push(body, _instr(QOp::Jump, _none_op(), _label_ref(10), _none_op()));     # back edge @10
+    lbl2 = _instr(QOp::Label, _none_op(), _none_op(), _none_op());
+    lbl2.patch_id = 20;
+    vec_push(body, lbl2);                                                   # Label @20 (exit)
+    vec_push(body, _instr(QOp::Ret, _none_op(), _vreg(0), _none_op()));
+    f = _make_func(str_new("bce_elim"), body);
+    var (f2, eliminated) = opt_bce(f);
+    if eliminated > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+func _test_bce_preserves_outside_loop:
+    # BoundsCheck in straight-line code → no loop → cannot eliminate
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(5), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(10), _none_op()));
+    vec_push(body, _instr(QOp::BoundsCheck, _none_op(), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::Ret, _none_op(), _vreg(0), _none_op()));
+    f = _make_func(str_new("bce_keep"), body);
+    var (f2, eliminated) = opt_bce(f);
+    out vtest_expect_eq_i64(eliminated, 0);
+end
+
+func _test_bce_multiple_checks_in_loop:
+    # Two BoundsChecks on the IV inside one loop → both eliminated
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Load, _vreg(0), _imm(0), _none_op()));
+    vec_push(body, _instr(QOp::Load, _vreg(1), _imm(10), _none_op()));
+    lbl = _instr(QOp::Label, _none_op(), _none_op(), _none_op());
+    lbl.patch_id = 10;
+    vec_push(body, lbl);
+    vec_push(body, _instr(QOp::CmpLt, _vreg(2), _vreg(0), _vreg(1)));
+    vec_push(body, _instr(QOp::JumpIfNot, _none_op(), _vreg(2), _label_ref(20)));
+    vec_push(body, _instr(QOp::BoundsCheck, _none_op(), _vreg(0), _vreg(1)));  # check 1
+    vec_push(body, _instr(QOp::BoundsCheck, _none_op(), _vreg(0), _vreg(1)));  # check 2
+    vec_push(body, _instr(QOp::Add, _vreg(0), _vreg(0), _imm(1)));
+    vec_push(body, _instr(QOp::Jump, _none_op(), _label_ref(10), _none_op()));
+    lbl2 = _instr(QOp::Label, _none_op(), _none_op(), _none_op());
+    lbl2.patch_id = 20;
+    vec_push(body, lbl2);
+    vec_push(body, _instr(QOp::Ret, _none_op(), _vreg(0), _none_op()));
+    f = _make_func(str_new("bce_multi"), body);
+    var (f2, eliminated) = opt_bce(f);
+    out vtest_expect_eq_i64(eliminated, 2);
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — Escape Analysis Real Transform
+# ═══════════════════════════════════════════════════════
+
+func _test_escape_rewrites_alloc_to_stack_alloc:
+    # local Alloc, never escapes → rewritten to StackAlloc
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Alloc, _vreg(0), _imm(64), _none_op()));
+    vec_push(body, _instr(QOp::Load,  _vreg(1), _imm(42), _none_op()));
+    vec_push(body, _instr(QOp::Ret,   _none_op(), _vreg(1), _none_op()));
+    f = _make_func(str_new("esc_sa"), body);
+    var (f2, promoted) = opt_escape_analysis(f);
+    if promoted > 0:
+        # Verify first instruction became StackAlloc
+        first = vec_get(f2.body, 0);
+        if first.opcode == QOp::StackAlloc:
+            out vtest_pass();
+        end
+    end
+    out vtest_fail();
+end
+
+func _test_escape_not_promoted_via_ret:
+    # Alloc → v0, return v0 → escapes → NOT promoted
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Alloc, _vreg(0), _imm(64), _none_op()));
+    vec_push(body, _instr(QOp::Ret,   _none_op(), _vreg(0), _none_op()));
+    f = _make_func(str_new("esc_ret"), body);
+    var (f2, promoted) = opt_escape_analysis(f);
+    out vtest_expect_eq_i64(promoted, 0);
+end
+
+func _test_escape_not_promoted_via_call:
+    # Alloc → v0, pass to Call → escapes → NOT promoted
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Alloc, _vreg(0), _imm(64), _none_op()));
+    vec_push(body, _instr(QOp::Call,  _vreg(1), _vreg(0), _none_op()));
+    vec_push(body, _instr(QOp::Load,  _vreg(2), _imm(0), _none_op()));
+    vec_push(body, _instr(QOp::Ret,   _none_op(), _vreg(2), _none_op()));
+    f = _make_func(str_new("esc_call"), body);
+    var (f2, promoted) = opt_escape_analysis(f);
+    out vtest_expect_eq_i64(promoted, 0);
+end
+
+func _test_escape_free_becomes_nop:
+    # Alloc → v0, Free v0, Ret v1 → v0 promotable → Free becomes Nop
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Alloc, _vreg(0), _imm(64), _none_op()));
+    vec_push(body, _instr(QOp::Load,  _vreg(1), _imm(42), _none_op()));
+    vec_push(body, _instr(QOp::Free,  _none_op(), _vreg(0), _none_op()));
+    vec_push(body, _instr(QOp::Ret,   _none_op(), _vreg(1), _none_op()));
+    f = _make_func(str_new("esc_nop"), body);
+    var (f2, promoted) = opt_escape_analysis(f);
+    if promoted > 0:
+        # Verify Free (index 2) became Nop
+        freed = vec_get(f2.body, 2);
+        if freed.opcode == QOp::Nop:
+            out vtest_pass();
+        end
+    end
+    out vtest_fail();
+end
+
+func _test_escape_alias_escapes:
+    # Alloc → v0, Move v0 → v1, return v1 → v0 escapes via alias → NOT promoted
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Alloc, _vreg(0), _imm(64), _none_op()));
+    vec_push(body, _instr(QOp::Move,  _vreg(1), _vreg(0), _none_op()));
+    vec_push(body, _instr(QOp::Ret,   _none_op(), _vreg(1), _none_op()));
+    f = _make_func(str_new("esc_alias"), body);
+    var (f2, promoted) = opt_escape_analysis(f);
+    out vtest_expect_eq_i64(promoted, 0);
+end
+
+func _test_escape_two_allocs_one_escapes:
+    # Alloc → v0 (local), Alloc → v1 (escapes via Ret)
+    # Only v0 should be promoted
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Alloc, _vreg(0), _imm(32), _none_op()));
+    vec_push(body, _instr(QOp::Alloc, _vreg(1), _imm(64), _none_op()));
+    vec_push(body, _instr(QOp::Load,  _vreg(2), _imm(99), _none_op()));
+    vec_push(body, _instr(QOp::Ret,   _none_op(), _vreg(1), _none_op()));
+    f = _make_func(str_new("esc_two"), body);
+    var (f2, promoted) = opt_escape_analysis(f);
+    out vtest_expect_eq_i64(promoted, 1);
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tests — Pipeline with New Opcodes
+# ═══════════════════════════════════════════════════════
+
+func _test_pipeline_with_bounds_check_and_alloc:
+    # Full pipeline: function with BoundsCheck (outside loop) + Alloc (local)
+    # BoundsCheck should survive (no loop), Alloc should become StackAlloc
+    body = vec_new<QInstruction>();
+    vec_push(body, _instr(QOp::Alloc, _vreg(0), _imm(64), _none_op()));
+    vec_push(body, _instr(QOp::Load,  _vreg(1), _imm(3),  _none_op()));
+    vec_push(body, _instr(QOp::Load,  _vreg(2), _imm(10), _none_op()));
+    vec_push(body, _instr(QOp::BoundsCheck, _none_op(), _vreg(1), _vreg(2)));
+    vec_push(body, _instr(QOp::Load,  _vreg(3), _imm(42), _none_op()));
+    vec_push(body, _instr(QOp::Free,  _none_op(), _vreg(0), _none_op()));
+    vec_push(body, _instr(QOp::Ret,   _none_op(), _vreg(3), _none_op()));
+    f = _make_func(str_new("pipe_bc_alloc"), body);
+    funcs = vec_new<QFunction>();
+    vec_push(funcs, f);
+    mod = _make_module(funcs);
+    var (f2, stats) = optimize_function_stats(f, mod);
+    # escape_promo should fire (local Alloc → StackAlloc)
+    if stats.escape_promo > 0:
+        out vtest_pass();
+    end
+    out vtest_fail();
+end
+
+func _test_opcode_enum_bounds_check_value:
+    # Q_BOUNDS_CHECK = 248
+    out vtest_expect_eq_i64(QOp::BoundsCheck >> int, 248);
+end
+
+func _test_opcode_enum_stack_alloc_value:
+    # Q_STACK_ALLOC = 249
+    out vtest_expect_eq_i64(QOp::StackAlloc >> int, 249);
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Suite Builder & Runner
+# ═══════════════════════════════════════════════════════
+
+func vtest_compiler_optimizer_suite:
+    suite = vtest_suite_new(str_new("compiler/optimizer smoke"));
+    suite = vtest_add(suite, str_new("const fold add"),            _test_const_fold_add);
+    suite = vtest_add(suite, str_new("cse duplicate add"),         _test_cse_duplicate_add);
+    suite = vtest_add(suite, str_new("cse diff operands kept"),    _test_cse_different_operands_not_eliminated);
+    suite = vtest_add(suite, str_new("cse redef invalidates"),     _test_cse_invalidated_by_redef);
+    suite = vtest_add(suite, str_new("cse control flow inval"),    _test_cse_invalidated_by_control_flow);
+    suite = vtest_add(suite, str_new("cse commutative add"),       _test_cse_commutative_add);
+    suite = vtest_add(suite, str_new("sub not commutative"),       _test_sub_not_commutative);
+    suite = vtest_add(suite, str_new("strength reduce mul*8"),     _test_strength_reduce_mul_pow2);
+    suite = vtest_add(suite, str_new("dce removes unused"),        _test_dce_removes_unused);
+    suite = vtest_add(suite, str_new("copy prop basic"),           _test_copy_prop_basic);
+    suite = vtest_add(suite, str_new("bce no loops = 0"),          _test_bce_no_loops_zero);
+    suite = vtest_add(suite, str_new("escape no alloc = 0"),       _test_escape_no_alloc_zero);
+    suite = vtest_add(suite, str_new("escape local promotable"),   _test_escape_local_alloc_promotable);
+    suite = vtest_add(suite, str_new("det free inserts"),          _test_det_free_inserts);
+    suite = vtest_add(suite, str_new("opt stats new zero"),        _test_opt_stats_new_zero);
+    suite = vtest_add(suite, str_new("opt stats merge"),           _test_opt_stats_merge);
+    suite = vtest_add(suite, str_new("full pipeline smoke"),       _test_full_pipeline_smoke);
+    suite = vtest_add(suite, str_new("licm no loops noop"),        _test_licm_no_loops_noop);
+
+    # ── BCE Real Transform ──
+    suite = vtest_add(suite, str_new("bce elim in canon loop"),    _test_bce_eliminates_in_canonical_loop);
+    suite = vtest_add(suite, str_new("bce keeps outside loop"),    _test_bce_preserves_outside_loop);
+    suite = vtest_add(suite, str_new("bce multi checks in loop"),  _test_bce_multiple_checks_in_loop);
+
+    # ── Escape Analysis Real Transform ──
+    suite = vtest_add(suite, str_new("escape alloc→stackalloc"),   _test_escape_rewrites_alloc_to_stack_alloc);
+    suite = vtest_add(suite, str_new("escape not via ret"),        _test_escape_not_promoted_via_ret);
+    suite = vtest_add(suite, str_new("escape not via call"),       _test_escape_not_promoted_via_call);
+    suite = vtest_add(suite, str_new("escape free→nop"),           _test_escape_free_becomes_nop);
+    suite = vtest_add(suite, str_new("escape alias escapes"),      _test_escape_alias_escapes);
+    suite = vtest_add(suite, str_new("escape two allocs partial"), _test_escape_two_allocs_one_escapes);
+
+    # ── Pipeline + Opcode Values ──
+    suite = vtest_add(suite, str_new("pipeline bc+alloc"),         _test_pipeline_with_bounds_check_and_alloc);
+    suite = vtest_add(suite, str_new("opcode BoundsCheck=248"),    _test_opcode_enum_bounds_check_value);
+    suite = vtest_add(suite, str_new("opcode StackAlloc=249"),     _test_opcode_enum_stack_alloc_value);
+    out suite;
+end
+
+func vtest_compiler_smoke_run:
+    reg = vtest_registry_new();
+    reg = vtest_registry_add_suite(reg, vtest_compiler_optimizer_suite());
+    report = vtest_registry_run(reg);
+    vtest_print_summary(report);
+    out vtest_exit_code(report);
+end

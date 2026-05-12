@@ -87,6 +87,31 @@ typedef enum {
     Q_ARR_GET       = 0x92,   /* dest = arr[src2]              */
     Q_ARR_SET       = 0x93,   /* arr[src1][src2] = dest        */
     Q_ARR_PUSH      = 0x94,   /* arr_push(src1, src2)          */
+    Q_ARR_CAP       = 0x95,   /* dest = array_cap(src1)        */
+    Q_ARR_COMPACT   = 0x96,   /* dest = new_array(filter nonzero of src1) */
+
+    /* §4.7 Arena allocator API */
+    Q_ARENA_NEW     = 0x85,   /* dest = vir_arena_create(src1=size)        */
+    Q_ARENA_ALLOC   = 0x86,   /* dest = vir_arena_alloc(src1=aid, src2=sz) */
+    Q_ARENA_FREE    = 0x87,   /* vir_arena_destroy(src1=aid), dest = 0     */
+
+    /* §20 Dict operations.
+     * Variants _I / _S indicate int-key vs string-key at compile time
+     * (dict's internal key_type flag is locked on first insert). */
+    Q_DICT_NEW      = 0xD0,   /* dest = new_dict()                      */
+    Q_DICT_SET_I    = 0xD1,   /* dict[key]=val: dest=val,src1=d,src2=k  */
+    Q_DICT_SET_S    = 0xD2,
+    Q_DICT_GET_I    = 0xD3,
+    Q_DICT_GET_S    = 0xD4,
+    Q_DICT_HAS_I    = 0xD5,
+    Q_DICT_HAS_S    = 0xD6,
+    Q_DICT_DEL_I    = 0xD7,
+    Q_DICT_DEL_S    = 0xD8,
+    Q_DICT_LEN      = 0xD9,   /* dest = len(dict)                       */
+    Q_DICT_KEYS     = 0xDA,   /* dest = array of keys                   */
+    Q_DICT_VALUES   = 0xDB,   /* dest = array of values                 */
+    Q_HASH_I        = 0xDC,   /* dest = splitmix64(src1)                */
+    Q_HASH_S        = 0xDD,   /* dest = FNV-1a(src1 as char*)           */
 
     /* System */
     Q_EXIT          = 0xA0,   /* exit(src1)                    */
@@ -109,9 +134,34 @@ typedef enum {
     /* §26.2 / §24.2 Tensor + swizzle (runtime dispatch on array handle).
      * If operands are array handles → element-wise over arrays.
      * Otherwise → scalar fallback (Q_MUL). */
-    Q_TENSOR_MUL    = 0xAD,   /* dest = src1 ** src2  (a*b elementwise) */
+    Q_TENSOR_MUL    = 0xAD,   /* dest = src1 ** src2  (matmul when 2D, else elementwise) */
     Q_TENSOR_FMA    = 0xAE,   /* dest = src1 >< src2  (a*b elementwise) */
     Q_SWIZZLE       = 0xAF,   /* dest = swizzle(src1, channels=src2)    */
+
+    /* §26.1/§26.5/§25.1 Tensor / quantize / reactive notify */
+    Q_TENSOR_SHAPE  = 0xE0,   /* dest=array_vreg, src1=imm rows, src2=imm cols */
+    Q_QUANTIZE      = 0xE1,   /* dest = quantize(src1 array, src2 bits) */
+    Q_REACTIVE_NOTIFY = 0xE2, /* emit "[reactive] name = val"; src1=str_idx, src2=val */
+
+    /* §23 Port (inter-worker channel, ring-buffered) */
+    Q_PORT_NEW      = 0xE3,   /* dest = new_port(src1=cap)         */
+    Q_PORT_SEND     = 0xE4,   /* port_send(dest=port, src1=val)    */
+    Q_PORT_RECV     = 0xE5,   /* dest = port_recv(src1=port); -1 if empty */
+    Q_PORT_LEN      = 0xE6,   /* dest = port_len(src1=port)        */
+
+    /* §24 GPU/SIMD — expression-level array ops. All operate on
+     * `vm_array_t` handles (flux<T,N> is represented as a fixed-width
+     * array in the VM). */
+    Q_FLUX_DOT      = 0xE7,   /* dest = sum(a[i]*b[i]); src1=a, src2=b */
+    Q_FLUX_LEN      = 0xE8,   /* dest = isqrt(sum(v[i]*v[i])); src1=v  */
+    Q_FLUX_NORM     = 0xE9,   /* dest = new array: v[i]/len(v) (int)   */
+    Q_FLUX_SPLAT    = 0xEA,   /* dest = new array fill=src1 width=src2 */
+    Q_FLUX_LOAD     = 0xEB,   /* dest = load N ints from addr=src1 width=src2 */
+    Q_FLUX_STORE    = 0xEC,   /* store arr src2 to addr src1 (dest unused) */
+    Q_TENSOR_SUM    = 0xED,   /* dest = sum(src1 array)                */
+    Q_ATOMIC_FENCE  = 0xEE,   /* full memory fence (seq_cst no-op on 1 thread) */
+    Q_SWIZZLE_STORE = 0xEF,   /* write-mask: dest=target arr vreg, src1=rhs arr,
+                               * src2=OPERAND_STR channels (e.g. "xy")  */
 
     /* SIMD / Vector operations (128-bit NEON / AVX) */
     Q_VLOAD         = 0xB0,   /* dest = vec_load(src1)         */
@@ -134,10 +184,31 @@ typedef enum {
     Q_TASK_SPAWN    = 0xF1,   /* dest = task_spawn(src1=fn_idx) */
     Q_TASK_YIELD    = 0xF2,   /* yield_now()                    */
     Q_TASK_WAIT     = 0xF3,   /* task_wait(src1=task_id)        */
+    Q_TASK_CANCEL   = 0xF5,   /* task_cancel(src1=task_id); dest = ok flag */
+    Q_REF_BIND_CLEAR = 0xF6,  /* clear pending ref-arg bindings */
+    Q_REF_BIND_SET   = 0xF7,  /* dest=imm slot, src1=imm binding */
 
     /* §11.4 Callable field: call function whose index is held in src1 (vreg).
      * Args are already in R0..R(argc-1) just like Q_CALL_FUNC. */
     Q_CALL_INDIRECT = 0xF4,   /* call_indirect(src1=vreg_holding_fidx) */
+    Q_TAILCALL_FUNC = 0xF8,   /* tail call function by index        */
+
+    /* §13 Error handling (0xC0–0xCB) */
+    Q_TRY_BEGIN     = 0xC0,   /* push try frame, dst=revert label,
+                               * src1=imm (bit0 timeout, bit1 isolate),
+                               * src2=imm timeout_seconds               */
+    Q_TRY_END       = 0xC1,   /* pop top try frame (normal exit)       */
+    Q_THROW         = 0xC2,   /* erx=src1; jump to top frame revert_pc
+                               * or halt with exit=erx                  */
+    Q_ERX_LOAD      = 0xC3,   /* dst = erx                              */
+    Q_RESUME_RETRY  = 0xC4,   /* jump to top frame retry_pc              */
+    Q_RESUME_REVERT = 0xC5,   /* pop top frame, re-throw erx             */
+    Q_EMIT_LOG      = 0xC6,   /* print LOG_* log line, src1=str_idx
+                               * of level-qualified msg                 */
+    Q_ISOLATE_SAVE  = 0xC7,   /* save snapshot slot: dst=vreg holding
+                               * current value, src1=imm slot id        */
+    Q_ISOLATE_RESTORE = 0xC8, /* restore all snapshot slots for top
+                               * try frame (used by resume retry)       */
 
     /* Pseudo */
     Q_LABEL         = 0xFE,
@@ -180,6 +251,7 @@ typedef struct {
     q_operand_t  src2;
     uint32_t     patch_id;  /* Nonzero for Q_PATCH_POINT    */
     uint32_t     line;      /* Source line (debug info)      */
+    char         operand_type[16];  /* Type annotation: "int", "float", "string", "bool" */
 } q_instruction_t;
 
 /* ═══════════════════════════════════════════════════════
@@ -192,6 +264,8 @@ typedef struct {
     char             name[Q_MAX_FUNC_NAME];
     uint32_t         param_count;
     uint32_t         param_vregs[Q_MAX_PARAMS];
+    char             param_names[Q_MAX_PARAMS][Q_MAX_FUNC_NAME]; /* §6.4 named-arg reorder */
+    uint8_t          param_is_ref[Q_MAX_PARAMS];
     q_instruction_t *body;
     uint32_t         body_count;
     uint32_t         body_capacity;

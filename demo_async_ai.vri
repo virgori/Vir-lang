@@ -1,0 +1,171 @@
+# Demo: Async AI Pipeline in Vir 2.0
+# Bất đồng bộ xử lí AI với entity, UFCS, error handling, messaging
+
+include "std/io"
+import tensor from "vir/ai"
+import send, recv from "vir/async"
+
+# --- Entity: Mô hình AI ---
+entity Model:
+    has weights: Matrix<128, 64>
+    has bias: Vector<64>
+    has lr: float
+    has name: string
+end.
+
+# --- Enum: Trạng thái training ---
+enum TrainStatus:
+    Idle
+    Running
+    Done
+    Failed
+end.
+
+# --- Hằng số ---
+const MAX_EPOCHS = 10
+const LEARNING_RATE = 0.001
+const BATCH_SIZE = 32
+
+# --- Khởi tạo model ---
+func init_model(this: Model, n: string) -> Model:
+    this.name = n
+    this.lr = LEARNING_RATE
+    out this
+end.
+
+# --- Forward pass (SIMD) ---
+func forward(in x: Matrix<32, 128>, in model: Model) -> Matrix<32, 64>:
+    var logits: Matrix<32, 64> = matmul(x, model.weights)
+    var i = 0
+    loop do
+        if i >= BATCH_SIZE do break end do
+        logits[i] = simd_add(logits[i], model.bias)
+        i = i + 1
+    end
+    out logits
+end
+
+# --- Loss function ---
+func mse_loss(in pred: Matrix<32, 64>, in target: Matrix<32, 64>) -> float:
+    var diff: Matrix<32, 64> = simd_sub(pred, target)
+    var sq: Matrix<32, 64> = simd_mul(diff, diff)
+    var total: float = simd_reduce_sum(sq)
+    out total / 2048.0
+end.
+
+# --- Backward + update (mutate) ---
+func backward(ref model: Model, in grad: Matrix<128, 64>):
+    var scaled: Matrix<128, 64> = simd_mul(grad, model.lr)
+    model.weights = simd_sub(model.weights, scaled)
+end.
+
+# --- Async training task ---
+async func train_epoch(in model: Model, in data: Matrix<32, 128>, in target: Matrix<32, 64>, in epoch: int) -> float:
+    var pred = forward(data, model)
+    var loss = mse_loss(pred, target)
+
+    # Gradient (simplified)
+    var grad: Matrix<128, 64> = matmul(data, pred)
+    backward(model, grad)
+
+    emit "epoch_done", epoch, loss
+    out loss
+end.
+
+# --- Quantize model sau training ---
+func quantize_model(this: Model) -> Model:
+    quantize this.weights
+    quantize this.bias
+    out this
+end.
+
+# --- Async inference với timeout + error handling ---
+async func infer(in model: Model, in input: Matrix<1, 128>) -> Matrix<1, 64>:
+    var result: Matrix<1, 64>
+
+    ensure model.weights != none do
+        throw "Model weights not initialized"
+    end
+
+    try do
+        timeout 5000 do
+            result = matmul(input, model.weights)
+            result = simd_add(result, model.bias)
+        end
+    erx do
+        revert do
+            result = none
+        end
+        resume
+    end
+
+    out result
+end
+
+# --- Pipeline: train + infer bất đồng bộ ---
+async func run_pipeline():
+    var model = Model()
+    model = model.init_model("ViR-Net-64")
+
+    var data: Matrix<32, 128>
+    var target: Matrix<32, 64>
+    var status = TrainStatus.Idle
+
+    # Port gửi/nhận message giữa các task
+    var ch = port()
+
+    # Chạy 10 epoch song song
+    var tasks = []
+    var epoch = 0
+    loop do
+        if epoch >= MAX_EPOCHS do break end do
+        var t = task train_epoch(model, data, target, epoch)
+        tasks = tasks + [t]
+        epoch = epoch + 1
+    end
+
+    # Chờ tất cả task hoàn thành
+    status = TrainStatus.Running
+    var losses = []
+    for t in tasks do
+        var loss = await t
+        losses = losses + [loss]
+        send ch, loss
+    end
+    status = TrainStatus.Done
+
+    # Nhận kết quả từ channel; dùng ; chia statement
+    var total_loss: float = 0.0; var i = 0
+    loop do
+        if i >= MAX_EPOCHS do break end do
+        var l = recv ch
+        total_loss = total_loss + l; i = i + 1
+    end
+
+    var avg_loss = total_loss / 10.0
+    out "Training done: avg_loss = $avg_loss"
+
+    # Quantize + inference
+    model = model.quantize_model()
+
+    var test_input: Matrix<1, 128>
+    var prediction = await infer(model, test_input)
+
+    ensure prediction != none do
+        throw "Inference failed"
+    end
+
+    # UFCS chaining demo
+    var final = test_input
+        .forward(model)
+        .mse_loss(target)
+
+    out "Prediction complete. Final loss: $final"
+end
+
+# --- Entry point ---
+@entry
+func main():
+    var result = await run_pipeline()
+    out result
+end.

@@ -91,6 +91,10 @@ void task_wait(uint32_t target_id);
 /* Get result of a completed task.  Returns 0 if not found/not done. */
 int64_t task_get_result(uint32_t task_id);
 
+/* §22.7 Cancel a task by ID — marks TASK_COMPLETED with result=-1.
+ * Returns 0 on success, -1 if task not found or already completed. */
+int task_cancel(uint32_t task_id);
+
 /* Shut down scheduler, free all stacks. */
 void task_scheduler_destroy(void);
 

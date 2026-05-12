@@ -1,0 +1,344 @@
+##
+ * vir/jit/tiered.vri — Tiered Compilation Engine
+ * =================================================
+ * Multi-tier JIT compilation strategy for Vir.
+ *
+ * Tiers:
+ *   Tier 0 — Interpreter (vm.vri): always available, zero compile cost
+ *   Tier 1 — Baseline JIT: fast compilation, moderate speed
+ *   Tier 2 — Optimized JIT: full optimizer pipeline, recompile hot code
+ *
+ * Promotion:
+ *   exec_count reaches threshold → promote to next tier
+ *   Tier 0 → Tier 1 at TIER1_THRESHOLD (100 executions)
+ *   Tier 1 → Tier 2 at TIER2_THRESHOLD (10000 executions)
+ *
+ * Demotion:
+ *   Rollback failures → demote back to safe/lower tier
+ ##
+
+module vir.jit.tiered;
+
+include types;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get, vec_set from vec;
+include map;
+import Map, map_new, map_set, map_get from map;
+include string;
+import String, str_new from string;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include vir.jit.bridge;
+import JitBridge, JitBlock, jit_bridge_new, jit_bridge_free,
+       jit_emit_code, jit_emit_fast_variant,
+       jit_begin_patch, jit_end_patch, jit_finalise,
+       jit_patch_to_fast, jit_patch_to_safe,
+       jit_get_entry, jit_block_count from bridge;
+
+
+# ═══════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════
+
+const TIER1_THRESHOLD: 100;       # interpreter → baseline JIT
+const TIER2_THRESHOLD: 10000;     # baseline → optimized JIT
+const MAX_TIERED_FUNCS: 1024;
+
+
+# ═══════════════════════════════════════════════════════
+# Tier Level
+# ═══════════════════════════════════════════════════════
+
+enum TierLevel:
+    Interpreter = 0;
+    BaselineJIT = 1;
+    OptimizedJIT = 2;
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tiered Function Entry
+# ═══════════════════════════════════════════════════════
+
+entity TieredFunc:
+    func_id:        int;
+    name:           string;
+    tier:           TierLevel;
+    exec_count:     int;
+    block_idx:      int;        # JitBlock index for tier1 code (-1 = none)
+    opt_block_idx:  int;        # JitBlock index for tier2 code (-1 = none)
+    deopt_count:    int;        # number of times demoted
+end
+
+func tiered_func_new:
+    in(func_id: int; name: string) -> TieredFunc
+    out TieredFunc {
+        func_id:       func_id,
+        name:          name,
+        tier:          TierLevel::Interpreter,
+        exec_count:    0,
+        block_idx:     -1,
+        opt_block_idx: -1,
+        deopt_count:   0
+    };
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Tiered Engine
+# ═══════════════════════════════════════════════════════
+
+entity TieredEngine:
+    bridge:          JitBridge;
+    funcs:           Vec<TieredFunc>;
+    func_map:        Map<string, int>;     # name → index in funcs
+    tier1_threshold: int;
+    tier2_threshold: int;
+    total_promotes:  int;
+    total_demotes:   int;
+end
+
+func tiered_engine_new:
+    in(region_size: int) -> TieredEngine
+    out TieredEngine {
+        bridge:          jit_bridge_new(region_size),
+        funcs:           vec_new<TieredFunc>(),
+        func_map:        map_new<string, int>(),
+        tier1_threshold: TIER1_THRESHOLD,
+        tier2_threshold: TIER2_THRESHOLD,
+        total_promotes:  0,
+        total_demotes:   0
+    };
+end
+
+func tiered_engine_free:
+    in(te: TieredEngine)
+    jit_bridge_free(te.bridge);
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Function Registration
+# ═══════════════════════════════════════════════════════
+
+func tiered_register:
+    in(te: TieredEngine; func_id: int; name: string) -> TieredEngine
+    let idx = vec_len<TieredFunc>(te.funcs);
+    let tf = tiered_func_new(func_id, name);
+    te.funcs = vec_push<TieredFunc>(te.funcs, tf);
+    map_set(te.func_map, name, idx);
+    out te;
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Execution Counting & Tier Promotion
+# ═══════════════════════════════════════════════════════
+
+## Called on every function entry.  Returns the current tier level
+## and triggers promotion when thresholds are reached.
+func tiered_on_enter:
+    in(te: TieredEngine; func_idx: int) -> (TieredEngine, TierLevel)
+    if func_idx >= vec_len<TieredFunc>(te.funcs):
+        out (te, TierLevel::Interpreter);
+    end
+
+    let tf = vec_get<TieredFunc>(te.funcs, func_idx);
+    tf.exec_count = tf.exec_count + 1;
+
+    # Check promotion
+    if tf.tier == TierLevel::Interpreter and tf.exec_count >= te.tier1_threshold:
+        tf.tier = TierLevel::BaselineJIT;
+        te.total_promotes = te.total_promotes + 1;
+    eif tf.tier == TierLevel::BaselineJIT and tf.exec_count >= te.tier2_threshold:
+        tf.tier = TierLevel::OptimizedJIT;
+        te.total_promotes = te.total_promotes + 1;
+    end
+
+    vec_set<TieredFunc>(te.funcs, func_idx, tf);
+    out (te, tf.tier);
+end
+
+## Record that compiled code (tier1 baseline) was emitted for a function.
+func tiered_set_baseline:
+    in(te: TieredEngine; func_idx: int; block_idx: int) -> TieredEngine
+    if func_idx >= vec_len<TieredFunc>(te.funcs):
+        out te;
+    end
+    let tf = vec_get<TieredFunc>(te.funcs, func_idx);
+    tf.block_idx = block_idx;
+    if tf.tier == TierLevel::Interpreter:
+        tf.tier = TierLevel::BaselineJIT;
+    end
+    vec_set<TieredFunc>(te.funcs, func_idx, tf);
+    out te;
+end
+
+## Record that optimized code (tier2) was emitted for a function.
+func tiered_set_optimized:
+    in(te: TieredEngine; func_idx: int; opt_block_idx: int) -> TieredEngine
+    if func_idx >= vec_len<TieredFunc>(te.funcs):
+        out te;
+    end
+    let tf = vec_get<TieredFunc>(te.funcs, func_idx);
+    tf.opt_block_idx = opt_block_idx;
+    tf.tier = TierLevel::OptimizedJIT;
+    vec_set<TieredFunc>(te.funcs, func_idx, tf);
+    out te;
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Demotion (rollback/deopt)
+# ═══════════════════════════════════════════════════════
+
+func tiered_demote:
+    in(te: TieredEngine; func_idx: int) -> TieredEngine
+    if func_idx >= vec_len<TieredFunc>(te.funcs):
+        out te;
+    end
+    let tf = vec_get<TieredFunc>(te.funcs, func_idx);
+    tf.deopt_count = tf.deopt_count + 1;
+
+    # Demote one level
+    if tf.tier == TierLevel::OptimizedJIT:
+        tf.tier = TierLevel::BaselineJIT;
+        # Patch to safe (baseline) variant
+        if tf.block_idx >= 0:
+            jit_patch_to_safe(te.bridge, tf.block_idx);
+        end
+    eif tf.tier == TierLevel::BaselineJIT:
+        tf.tier = TierLevel::Interpreter;
+    end
+
+    te.total_demotes = te.total_demotes + 1;
+    vec_set<TieredFunc>(te.funcs, func_idx, tf);
+    out te;
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Query
+# ═══════════════════════════════════════════════════════
+
+func tiered_get_tier:
+    in(te: TieredEngine; func_idx: int) -> TierLevel
+    if func_idx >= vec_len<TieredFunc>(te.funcs):
+        out TierLevel::Interpreter;
+    end
+    let tf = vec_get<TieredFunc>(te.funcs, func_idx);
+    out tf.tier;
+end
+
+func tiered_get_exec_count:
+    in(te: TieredEngine; func_idx: int) -> int
+    if func_idx >= vec_len<TieredFunc>(te.funcs):
+        out 0;
+    end
+    let tf = vec_get<TieredFunc>(te.funcs, func_idx);
+    out tf.exec_count;
+end
+
+func tiered_should_compile:
+    in(te: TieredEngine; func_idx: int) -> bool
+    if func_idx >= vec_len<TieredFunc>(te.funcs):
+        out false;
+    end
+    let tf = vec_get<TieredFunc>(te.funcs, func_idx);
+    # Needs baseline compilation?
+    if tf.tier == TierLevel::BaselineJIT and tf.block_idx == -1:
+        out true;
+    end
+    # Needs optimized recompilation?
+    if tf.tier == TierLevel::OptimizedJIT and tf.opt_block_idx == -1:
+        out true;
+    end
+    out false;
+end
+
+func tiered_get_entry:
+    in(te: TieredEngine; func_idx: int) -> Result
+    if func_idx >= vec_len<TieredFunc>(te.funcs):
+        out Err(str_new("invalid func index"));
+    end
+    let tf = vec_get<TieredFunc>(te.funcs, func_idx);
+    if tf.tier == TierLevel::OptimizedJIT and tf.opt_block_idx >= 0:
+        out jit_get_entry(te.bridge, tf.opt_block_idx);
+    eif tf.tier == TierLevel::BaselineJIT and tf.block_idx >= 0:
+        out jit_get_entry(te.bridge, tf.block_idx);
+    end
+    out Err(str_new("function not yet compiled"));
+end
+
+func tiered_func_count:
+    in(te: TieredEngine) -> int
+    out vec_len<TieredFunc>(te.funcs);
+end
+
+func tiered_lookup:
+    in(te: TieredEngine; name: string) -> int
+    let found = map_get(te.func_map, name);
+    case found;
+        case Some(idx): out idx;
+        case None: out -1;
+    end
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Statistics
+# ═══════════════════════════════════════════════════════
+
+entity TieredStats:
+    total_funcs:     int;
+    tier0_count:     int;
+    tier1_count:     int;
+    tier2_count:     int;
+    total_promotes:  int;
+    total_demotes:   int;
+end
+
+func tiered_stats:
+    in(te: TieredEngine) -> TieredStats
+    let s = TieredStats {
+        total_funcs:    0,
+        tier0_count:    0,
+        tier1_count:    0,
+        tier2_count:    0,
+        total_promotes: te.total_promotes,
+        total_demotes:  te.total_demotes
+    };
+    let n = vec_len<TieredFunc>(te.funcs);
+    s.total_funcs = n;
+    let i = 0;
+    when i < n loop
+        let tf = vec_get<TieredFunc>(te.funcs, i);
+        if tf.tier == TierLevel::Interpreter:
+            s.tier0_count = s.tier0_count + 1;
+        eif tf.tier == TierLevel::BaselineJIT:
+            s.tier1_count = s.tier1_count + 1;
+        eif tf.tier == TierLevel::OptimizedJIT:
+            s.tier2_count = s.tier2_count + 1;
+        end
+        i = i + 1;
+    end
+    out s;
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Exports
+# ═══════════════════════════════════════════════════════
+
+export TierLevel, TieredFunc, TieredEngine, TieredStats;
+export tiered_engine_new, tiered_engine_free;
+export tiered_register, tiered_on_enter;
+export tiered_set_baseline, tiered_set_optimized;
+export tiered_demote;
+export tiered_get_tier, tiered_get_exec_count;
+export tiered_should_compile, tiered_get_entry;
+export tiered_func_count, tiered_lookup;
+export tiered_stats, tiered_func_new;
+export TIER1_THRESHOLD, TIER2_THRESHOLD;

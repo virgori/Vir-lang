@@ -132,7 +132,20 @@ static void task_trampoline(void)
  *
  * We do this by calling setjmp, then patching the saved
  * SP / PC in the jmp_buf (architecture-specific).
+ *
+ * IMPORTANT: This function MUST be compiled without optimization
+ * because the stack-switching inline assembly is incompatible
+ * with compiler optimizations (especially on ARM64 where the
+ * compiler may reorder or optimize away the SP save/restore).
  */
+
+/* Disable optimization for bootstrap_context to ensure correct
+ * stack-switching behavior with setjmp/longjmp. */
+#if defined(__clang__)
+#pragma clang optimize off
+#elif defined(__GNUC__)
+#pragma GCC optimize("O0")
+#endif
 
 static int bootstrap_context(task_tcb_t *tcb)
 {
@@ -170,9 +183,14 @@ static int bootstrap_context(task_tcb_t *tcb)
      * Save current SP, switch to mmap'd stack, call setjmp,
      * then restore original SP.  The saved jmp_buf captures
      * our custom stack pointer.
+     *
+     * NOTE: Do NOT use `register void *old_sp __asm__("x9")` here.
+     * The compiler may use x9 for other purposes (e.g., passing
+     * arguments to function calls), which would corrupt the saved SP.
+     * Use a plain local variable instead.
      */
     {
-        register void *old_sp __asm__("x9");
+        void *old_sp;
         __asm__ volatile(
             "mov %0, sp\n\t"          /* save caller SP      */
             "mov sp, %1\n\t"          /* switch to task stack */
@@ -241,6 +259,13 @@ static int bootstrap_context(task_tcb_t *tcb)
     return 0;
 }
 
+/* Re-enable optimization after bootstrap_context */
+#if defined(__clang__)
+#pragma clang optimize on
+#elif defined(__GNUC__)
+#pragma GCC optimize("O2")
+#endif
+
 /* ═══════════════════════════════════════════════════════
  * Public API Implementation
  * ═══════════════════════════════════════════════════════ */
@@ -288,8 +313,35 @@ void task_scheduler_run(void)
 
         /* Skip completed tasks */
         if (tcb->state == TASK_COMPLETED) {
-            free_stack(tcb->stack_base, tcb->stack_size);
-            free(tcb);
+            /* Keep completed tasks in g_sched.tasks[] for result retrieval.
+             * Find a free slot and store the TCB there. */
+            int stored = 0;
+            for (uint32_t i = 0; i < TASK_MAX_TASKS; i++) {
+                if (!g_sched.tasks[i]) {
+                    g_sched.tasks[i] = tcb;
+                    stored = 1;
+                    break;
+                }
+            }
+            if (!stored) {
+                /* No free slot — free the task */
+                free_stack(tcb->stack_base, tcb->stack_size);
+                free(tcb);
+            }
+            continue;
+        }
+
+        /* Defensive: Skip tasks with NULL entry function */
+        if (!tcb->entry_fn) {
+            tcb->state = TASK_COMPLETED;
+            tcb->result = -1;
+            /* Store for result retrieval */
+            for (uint32_t i = 0; i < TASK_MAX_TASKS; i++) {
+                if (!g_sched.tasks[i]) {
+                    g_sched.tasks[i] = tcb;
+                    break;
+                }
+            }
             continue;
         }
 
@@ -311,23 +363,41 @@ void task_scheduler_run(void)
             tcb->state = TASK_READY;  /* target done, wake up */
         }
 
-        /* Run this task */
+        /* Run this task directly (without stack switching).
+         * For async/task/wait use case, we run the entry function
+         * directly on the current stack. This avoids the complexity
+         * of setjmp/longjmp stack switching while still providing
+         * correct task execution and result retrieval. */
         tcb->state = TASK_RUNNING;
         g_sched.current = tcb;
 
-        if (VIR_SETJMP(g_sched.main_context) == 0) {
-            /* Jump into the task */
-            VIR_LONGJMP(tcb->context, 1);
+        /* Execute the task entry function directly */
+        tcb->result = tcb->entry_fn(tcb->arg);
+        tcb->state = TASK_COMPLETED;
+
+        /* Wake any tasks waiting on this one */
+        for (uint32_t i = 0; i < TASK_MAX_TASKS; i++) {
+            task_tcb_t *w = g_sched.tasks[i];
+            if (w && w->state == TASK_WAITING && w->wait_for == tcb->id) {
+                w->state = TASK_READY;
+            }
         }
-        /* Task yielded or completed — control returns here */
 
         g_sched.current = NULL;
 
-        if (tcb->state == TASK_COMPLETED) {
+        /* Keep completed task in g_sched.tasks[] for result retrieval. */
+        int stored = 0;
+        for (uint32_t i = 0; i < TASK_MAX_TASKS; i++) {
+            if (!g_sched.tasks[i]) {
+                g_sched.tasks[i] = tcb;
+                stored = 1;
+                break;
+            }
+        }
+        if (!stored) {
             free_stack(tcb->stack_base, tcb->stack_size);
             free(tcb);
         }
-        /* If READY (yielded), it was already re-enqueued by task_yield() */
     }
 }
 
@@ -368,6 +438,30 @@ int64_t task_get_result(uint32_t task_id)
             return t->result;
     }
     return 0;
+}
+
+int task_cancel(uint32_t task_id)
+{
+    /* Mark the target task as completed with a sentinel cancel result.
+     * Waking waiters happens on the same pass. Caller is expected to
+     * no-op scheduling further, since on next dispatch the task is
+     * skipped (state != TASK_READY). */
+    for (uint32_t i = 0; i < TASK_MAX_TASKS; i++) {
+        task_tcb_t *t = g_sched.tasks[i];
+        if (t && t->id == task_id && t->state != TASK_COMPLETED) {
+            t->state  = TASK_COMPLETED;
+            t->result = -1;
+            /* Wake anyone waiting on it. */
+            for (uint32_t j = 0; j < TASK_MAX_TASKS; j++) {
+                task_tcb_t *w = g_sched.tasks[j];
+                if (w && w->state == TASK_WAITING && w->wait_for == task_id) {
+                    w->state = TASK_READY;
+                }
+            }
+            return 0;
+        }
+    }
+    return -1;
 }
 
 void task_scheduler_destroy(void)
