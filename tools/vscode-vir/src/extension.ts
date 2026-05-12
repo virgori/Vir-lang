@@ -1,6 +1,9 @@
 import * as vscode from "vscode";
 import { registerSemanticTokens } from "./semanticTokens";
 import { restartVirLanguageClient, startVirLanguageClient, stopVirLanguageClient } from "./lspClient";
+import { registerSmartBar } from "./smartBar";
+import { registerBlockDiagnostics } from "./blockDiagnostics";
+import { registerBlockCommentValidation } from "./blockCommentValidation";
 
 const fallbackKeywords = [
   "entity",
@@ -147,6 +150,15 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   if (cfg.get<boolean>("semantic.enableEnhanced", true)) {
     registerSemanticTokens(context);
   }
+
+  // Register Smart Bar features
+  registerSmartBar(context);
+
+  // Register Block Diagnostics (detect mismatched begin/end)
+  registerBlockDiagnostics(context);
+
+  // Register Block Comment Validation (detect unclosed ## comments)
+  registerBlockCommentValidation(context);
 
   context.subscriptions.push(vscode.commands.registerCommand("vir.restartLanguageServer", async () => {
     await restartVirLanguageClient(context);

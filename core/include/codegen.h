@@ -216,6 +216,12 @@ int codegen_emit_full2(codebuf_t *cb, const q_instruction_t *instrs,
                        uint32_t count, target_arch_t arch,
                        const codegen_rt_t *rt);
 
+/* §15.3 WASM target — compile Q-IR module to WebAssembly MVP binary.
+ * Allocates *out_buf (caller must free) and sets *out_len.
+ * Returns 0 on success, nonzero on error. */
+int codegen_emit_wasm(const q_module_t *module,
+                      uint8_t **out_buf, size_t *out_len);
+
 #ifdef __cplusplus
 }
 #endif

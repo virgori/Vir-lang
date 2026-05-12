@@ -38,6 +38,9 @@ exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const semanticTokens_1 = require("./semanticTokens");
 const lspClient_1 = require("./lspClient");
+const smartBar_1 = require("./smartBar");
+const blockDiagnostics_1 = require("./blockDiagnostics");
+const blockCommentValidation_1 = require("./blockCommentValidation");
 const fallbackKeywords = [
     "entity",
     "func",
@@ -153,6 +156,12 @@ async function activate(context) {
     if (cfg.get("semantic.enableEnhanced", true)) {
         (0, semanticTokens_1.registerSemanticTokens)(context);
     }
+    // Register Smart Bar features
+    (0, smartBar_1.registerSmartBar)(context);
+    // Register Block Diagnostics (detect mismatched begin/end)
+    (0, blockDiagnostics_1.registerBlockDiagnostics)(context);
+    // Register Block Comment Validation (detect unclosed ## comments)
+    (0, blockCommentValidation_1.registerBlockCommentValidation)(context);
     context.subscriptions.push(vscode.commands.registerCommand("vir.restartLanguageServer", async () => {
         await (0, lspClient_1.restartVirLanguageClient)(context);
         vscode.window.showInformationMessage("Virgori language server restarted.");

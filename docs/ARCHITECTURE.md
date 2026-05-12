@@ -1,6 +1,6 @@
 # Vir – Architecture Specification
 
-> **Quizz-Core Engine v1.2** – English standard keywords • Self-hosting compiler • Self-patching JIT
+> **Virgori-Core Engine v1.2** – English standard keywords • Self-hosting compiler • Self-patching JIT
 >
 > **Updated:** 9/3/2026 – Phase 4 "The Purest Build" complete
 

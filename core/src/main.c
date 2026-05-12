@@ -22,15 +22,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 /* ── Read file into malloc'd buffer ────────────────── */
-static char *read_source(const char *path, size_t *out_len)
+static char *read_source_silent(const char *path, size_t *out_len)
 {
     FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "error: cannot open '%s'\n", path);
-        return NULL;
-    }
+    if (!f) return NULL;
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
@@ -44,24 +42,102 @@ static char *read_source(const char *path, size_t *out_len)
     return buf;
 }
 
+static char *read_source(const char *path, size_t *out_len)
+{
+    char *buf = read_source_silent(path, out_len);
+    if (!buf) fprintf(stderr, "error: cannot open '%s'\n", path);
+    return buf;
+}
+
 /* ── Include file reader callback ─────────────────── */
 typedef struct {
     char base_dir[512];      /* directory of the main source file */
 } include_ctx_t;
 
+/* Translate a module path like "vir.rt.syscall" or "vir::rt::syscall"
+ * into a relative filesystem path "vir/rt/syscall.vri".  If the input
+ * already ends with ".vri" or contains a '/', it is copied verbatim. */
+static void module_to_relpath(const char *name, char *out, size_t out_sz)
+{
+    size_t n = strlen(name);
+    int has_sep    = (strchr(name, '/') != NULL);
+    int has_suffix = (n >= 4 && strcmp(name + n - 4, ".vri") == 0);
+    if (has_sep || has_suffix) {
+        snprintf(out, out_sz, "%s", name);
+        return;
+    }
+    size_t w = 0;
+    for (size_t i = 0; i < n && w + 1 < out_sz; ) {
+        if (name[i] == '.') { out[w++] = '/'; i++; continue; }
+        if (name[i] == ':' && i + 1 < n && name[i+1] == ':') {
+            out[w++] = '/'; i += 2; continue;
+        }
+        out[w++] = name[i++];
+    }
+    if (w + 4 < out_sz) { memcpy(out + w, ".vri", 4); w += 4; }
+    out[w] = '\0';
+}
+
 static char *vir_include_reader(const char *filename, size_t *out_len,
                                 void *user_data)
 {
     include_ctx_t *ictx = (include_ctx_t *)user_data;
+    char relpath[600];
     char path[1024];
+    char *src;
 
-    /* Try relative to base directory first */
-    snprintf(path, sizeof(path), "%s/%s", ictx->base_dir, filename);
-    char *src = read_source(path, out_len);
-    if (src) return src;
+    module_to_relpath(filename, relpath, sizeof(relpath));
 
-    /* Try filename as-is (absolute or cwd-relative) */
-    return read_source(filename, out_len);
+    /* 1) <base_dir>/<relpath> */
+    snprintf(path, sizeof(path), "%s/%s", ictx->base_dir, relpath);
+    if ((src = read_source_silent(path, out_len))) return src;
+
+    /* 2) <base_dir>/../<relpath> — sibling folders via "include types" */
+    snprintf(path, sizeof(path), "%s/../%s", ictx->base_dir, relpath);
+    if ((src = read_source_silent(path, out_len))) return src;
+
+    /* 3) $VIR_STDLIB/<relpath> (plus common subdirs for bare names
+     *    like "types" / "syscall" / "string_rt"). */
+    const char *env = getenv("VIR_STDLIB");
+    if (env && *env) {
+        static const char *subs[] = {
+            "",                 /* env/<rel>           */
+            "vir",              /* env/vir/<rel>       */
+            "vir/core",         /* env/vir/core/<rel>  */
+            "vir/rt",           /* env/vir/rt/<rel>    */
+            "vir/str",          /* env/vir/str/<rel>   */
+            "vir/compiler",     /* env/vir/compiler/<rel> */
+            "vir/collections",
+            NULL
+        };
+        for (int si = 0; subs[si] != NULL; si++) {
+            if (subs[si][0] == '\0')
+                snprintf(path, sizeof(path), "%s/%s", env, relpath);
+            else
+                snprintf(path, sizeof(path), "%s/%s/%s", env, subs[si], relpath);
+            if ((src = read_source_silent(path, out_len))) return src;
+        }
+    }
+
+    /* 4) Walk upwards from base_dir trying `<walk>/<relpath>` and
+     *    `<walk>/stdlib/<relpath>` at each level. */
+    char walk[1024];
+    snprintf(walk, sizeof(walk), "%s", ictx->base_dir);
+    for (int depth = 0; depth < 10; depth++) {
+        snprintf(path, sizeof(path), "%s/%s", walk, relpath);
+        if ((src = read_source_silent(path, out_len))) return src;
+        snprintf(path, sizeof(path), "%s/stdlib/%s", walk, relpath);
+        if ((src = read_source_silent(path, out_len))) return src;
+        char *last = strrchr(walk, '/');
+        if (!last) break;
+        if (last == walk) { walk[1] = '\0'; }  /* "/" root */
+        else { *last = '\0'; }
+        if (walk[0] == '\0') break;
+    }
+
+    /* 5) Fallback: cwd-relative (either translated or verbatim). */
+    if ((src = read_source_silent(relpath, out_len))) return src;
+    return read_source(filename, out_len);  /* noisy: prints cannot-open */
 }
 
 /* Extract directory from a file path */
@@ -170,7 +246,7 @@ static int cmd_dump(const char *source, size_t len, const char *filepath)
 
     /* Apply TCO pass to all functions */
     for (uint32_t i = 0; i < ctx.module.func_count; i++) {
-        lower_tco_pass(&ctx.module.functions[i]);
+        lower_tco_pass(&ctx.module.functions[i], i);
     }
 
     char buf[16384];
@@ -213,7 +289,7 @@ static int cmd_run(const char *source, size_t len, int verbose,
 
     /* TCO pass */
     for (uint32_t i = 0; i < ctx.module.func_count; i++) {
-        lower_tco_pass(&ctx.module.functions[i]);
+        lower_tco_pass(&ctx.module.functions[i], i);
     }
 
     if (verbose) {
@@ -280,7 +356,7 @@ static int cmd_jit(const char *source, size_t len, int verbose,
 
     /* TCO pass */
     for (uint32_t i = 0; i < ctx.module.func_count; i++) {
-        lower_tco_pass(&ctx.module.functions[i]);
+        lower_tco_pass(&ctx.module.functions[i], i);
     }
 
     /* Detect target architecture */
@@ -383,15 +459,20 @@ static void usage(const char *prog)
         "  jit    <file>   JIT compile and execute\n"
         "  dump   <file>   Print Q-IR text\n"
         "  tokens <file>   Print token stream\n"
+        "  build  <file>   Emit object for --target (wasm32)\n"
         "  help            Show this message\n\n"
         "Options:\n"
-        "  -v              Verbose output\n",
+        "  -v              Verbose output\n"
+        "  --target=T      Compile target for 'build' (wasm32)\n",
         prog);
 }
 
 /* ── main ─────────────────────────────────────────── */
 int main(int argc, char **argv)
 {
+    /* §28 — Register all CJK and Vietnamese keyword aliases at startup */
+    vir_sublib_adapter_init();
+
     if (argc < 2) {
         usage(argv[0]);
         return 1;
@@ -408,11 +489,16 @@ int main(int argc, char **argv)
     /* Parse options */
     int verbose = 0;
     const char *filepath = NULL;
+    const char *target = NULL;          /* §15.3 — optional compile target */
     int prog_argc = 0;
     const char *prog_argv[64] = {0};
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0)
             verbose = 1;
+        else if (strncmp(argv[i], "--target=", 9) == 0)
+            target = argv[i] + 9;
+        else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc)
+            target = argv[++i];
         else if (!filepath)
             filepath = argv[i];
         else if (prog_argc < 64)
@@ -429,6 +515,63 @@ int main(int argc, char **argv)
     size_t src_len = 0;
     char *source = read_source(filepath, &src_len);
     if (!source) return 1;
+
+    /* §15.3 WASM target — compile source → Q-IR → WASM binary */
+    if (strcmp(cmd, "build") == 0 && target &&
+        (strcmp(target, "wasm32") == 0 || strcmp(target, "wasm") == 0)) {
+        const char *outpath = "out.wasm";
+
+        /* Step 1: Parse + lower to Q-IR */
+        ast_node_t *ast = frontend(source, src_len, verbose);
+        if (!ast) { free(source); return 1; }
+
+        lower_ctx_t ctx;
+        lower_init(&ctx, "main");
+        include_ctx_t ictx;
+        get_dir(filepath, ictx.base_dir, sizeof(ictx.base_dir));
+        ctx.include_reader    = vir_include_reader;
+        ctx.include_user_data = &ictx;
+
+        if (lower_resolve_includes(&ctx, ast) != 0 ||
+            lower_program(&ctx, ast) != 0) {
+            fprintf(stderr, "lower error: %s\n", ctx.last_error);
+            ast_free(ast); lower_destroy(&ctx); free(source);
+            return 1;
+        }
+        for (uint32_t i = 0; i < ctx.module.func_count; i++)
+            lower_tco_pass(&ctx.module.functions[i], i);
+
+        /* Step 2: Emit WASM binary via codegen */
+        uint8_t *wasm_buf = NULL;
+        size_t   wasm_len = 0;
+        int wasm_rc = codegen_emit_wasm(&ctx.module, &wasm_buf, &wasm_len);
+
+        ast_free(ast);
+        lower_destroy(&ctx);
+
+        if (wasm_rc != 0 || !wasm_buf) {
+            fprintf(stderr, "wasm codegen error\n");
+            free(source);
+            return 1;
+        }
+
+        /* Step 3: Write output */
+        FILE *f = fopen(outpath, "wb");
+        if (!f) {
+            fprintf(stderr, "error: cannot write %s\n", outpath);
+            free(wasm_buf); free(source);
+            return 1;
+        }
+        fwrite(wasm_buf, 1, wasm_len, f);
+        fclose(f);
+        free(wasm_buf);
+
+        if (verbose)
+            fprintf(stderr, "[vir] wrote wasm32 module → %s (%zu bytes)\n",
+                    outpath, wasm_len);
+        free(source);
+        return 0;
+    }
 
     int rc = 1;
     if (strcmp(cmd, "tokens") == 0)

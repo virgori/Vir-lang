@@ -12,9 +12,11 @@ from src.frontend.parser.parser import (
     BinOpNode,
     BreakNode,
     CallNode,
+    CaseNode,
     CheckCPUNode,
     CompareNode,
     ContinueNode,
+    EntityDefNode,
     ForNode,
     FuncDefNode,
     IdentifierRef,
@@ -28,6 +30,7 @@ from src.frontend.parser.parser import (
     ProgramNode,
     ReturnNode,
     StringLiteral,
+    TaskNode,
     VarDeclNode,
     WhileNode,
 )
@@ -53,6 +56,7 @@ class IRBuilder:
         self._label_counter = 0
         self._patch_counter = 0
         self._loop_stack: list[tuple[Label, Label]] = []  # (continue_label, break_label)
+        self._var_types: dict[str, str] = {}  # Track variable types for type inference
 
     # ── Helpers ────────────────────────────────────────────
     def _new_label(self, prefix: str = "L") -> Label:
@@ -86,6 +90,8 @@ class IRBuilder:
         match node:
             case FuncDefNode():
                 self._lower_func_def(node)
+            case EntityDefNode():
+                self._lower_entity_def(node)
             case VarDeclNode():
                 self._lower_var_decl(node)
             case AssignNode():
@@ -115,6 +121,9 @@ class IRBuilder:
                 self._lower_check_cpu(node)
             case PatchPointNode():
                 self._lower_patch_point(node)
+            case CaseNode():
+                self._ensure_func()
+                self._lower_case(node)
             case BinOpNode():
                 self._ensure_func()
                 self._lower_expr(node)
@@ -123,11 +132,16 @@ class IRBuilder:
 
     # ── Function ───────────────────────────────────────────
     def _lower_func_def(self, node: FuncDefNode) -> None:
+        # DEBUG: Print function info
+        print(f"DEBUG: _lower_func_def called for '{node.name}', is_async={node.is_async}")
+        
         func = QFunction(name=node.name or "__anon__")
         for p in node.params:
             vreg = self._alloc.alloc(p)
             func.params.append(vreg)
         self.module.add_function(func)
+        
+        print(f"DEBUG: Added function '{node.name}' to module, total functions: {len(self.module.functions)}")
 
         prev = self._current_func
         self._current_func = func
@@ -135,15 +149,37 @@ class IRBuilder:
             self._lower_statement(stmt)
         self._current_func = prev
 
+    # ── Entity Definition ──────────────────────────────────
+    def _lower_entity_def(self, node: EntityDefNode) -> None:
+        """
+        Register entity type layout in QModule.entity_types.
+        
+        Entity definitions are processed at the module level and their field
+        names are stored for later use by the backend. This allows entity
+        metadata to be available during code generation and execution.
+        
+        Args:
+            node: EntityDefNode containing entity name and field definitions
+        """
+        # Extract field names from the fields list (list of tuples: (name, type))
+        field_names = [field_name for field_name, _ in node.fields]
+        # Register the entity type layout in the module
+        self.module.entity_types[node.name] = field_names
+
     # ── Variable declaration ───────────────────────────────
     def _lower_var_decl(self, node: VarDeclNode) -> None:
         self._ensure_func()
         dest = self._alloc.alloc(node.name)
         if node.value:
+            # Track the type of this variable
+            var_type = self._infer_type(node.value)
+            self._var_types[node.name] = var_type
+            
             src = self._lower_expr(node.value)
             self._emit(QInstruction(Opcode.Q_MOVE, dest=dest, src1=src,
                                     comment=f"var {node.name}"))
         else:
+            self._var_types[node.name] = "int"
             self._emit(QInstruction(Opcode.Q_LOAD, dest=dest, src1=Immediate(0),
                                     comment=f"var {node.name} = 0"))
 
@@ -258,6 +294,12 @@ class IRBuilder:
         dest = self._alloc.lookup(node.name)
         if dest is None:
             dest = self._alloc.alloc(node.name)
+        
+        # Track the type of this variable
+        if node.value:
+            var_type = self._infer_type(node.value)
+            self._var_types[node.name] = var_type
+        
         self._emit(QInstruction(Opcode.Q_MOVE, dest=dest, src1=src,
                                 comment=f"{node.name} = ..."))
 
@@ -271,7 +313,47 @@ class IRBuilder:
     def _lower_print(self, node: PrintNode) -> None:
         self._ensure_func()
         src = self._lower_expr(node.expr) if node.expr else Immediate(0)
-        self._emit(QInstruction(Opcode.Q_PRINT, src1=src))
+        
+        # Determine operand type for proper printing
+        operand_type = self._infer_type(node.expr) if node.expr else "int"
+        
+        self._emit(QInstruction(Opcode.Q_PRINT, src1=src, operand_type=operand_type))
+
+    # ── Type Inference Helpers ─────────────────────────────
+    def _infer_type(self, node: ASTNode | None) -> str:
+        """Infer the type of an expression node."""
+        if node is None:
+            return "int"
+        
+        match node:
+            case StringLiteral():
+                return "string"
+            case NumberLiteral():
+                # Check if it's a float or int
+                if isinstance(node.value, float) or '.' in str(node.value):
+                    return "float"
+                return "int"
+            case IdentifierRef():
+                return self._lookup_var_type(node.name)
+            case BinOpNode():
+                # String concatenation with + operator
+                left_type = self._infer_type(node.left)
+                right_type = self._infer_type(node.right)
+                if left_type == "string" or right_type == "string":
+                    return "string"
+                # Arithmetic operations
+                if left_type == "float" or right_type == "float":
+                    return "float"
+                return "int"
+            case CallNode():
+                # Function calls - default to int unless we know better
+                return "int"
+            case _:
+                return "int"
+    
+    def _lookup_var_type(self, var_name: str) -> str:
+        """Look up the type of a variable."""
+        return self._var_types.get(var_name, "int")
 
     # ── Input ──────────────────────────────────────────────
     def _lower_input(self, node: InputNode) -> None:
@@ -294,6 +376,56 @@ class IRBuilder:
         pid = node.patch_id or self._new_patch_id()
         self._emit(QInstruction(Opcode.Q_PATCH_POINT, patch_id=pid,
                                 comment=f"target={node.target_hint}"))
+
+    # ── Case expression ────────────────────────────────────
+    def _lower_case(self, node: CaseNode) -> None:
+        """Lower case expression with proper continuation label.
+        
+        This implements the fix for the case-stops-execution bug by:
+        1. Generating a unique continuation label before processing branches
+        2. Emitting the continuation label AFTER all branch code and else clause
+        3. Making each case branch exit emit JUMP to continuation_label
+        4. Ensuring else clause also jumps to continuation label
+        """
+        self._ensure_func()
+        
+        # Generate continuation label (CRITICAL FIX)
+        continuation_label = self._new_label("CASE_END")
+        
+        # Evaluate discriminant expression
+        discriminant_reg = self._lower_expr(node.expr) if node.expr else Immediate(0)
+        
+        # Generate labels for each branch and else clause
+        branch_labels = [self._new_label(f"CASE_BRANCH_{i}") for i in range(len(node.branches))]
+        else_label = self._new_label("CASE_ELSE")
+        
+        # Emit comparison and conditional jumps for each branch
+        for i, (pattern, _) in enumerate(node.branches):
+            pattern_reg = self._lower_expr(pattern)
+            cmp_reg = self._alloc.alloc()
+            self._emit(QInstruction(Opcode.Q_CMP_EQ, dest=cmp_reg, 
+                                   src1=discriminant_reg, src2=pattern_reg))
+            self._emit(QInstruction(Opcode.Q_JUMP_IF, src1=cmp_reg, dest=branch_labels[i]))
+        
+        # If no branch matched, jump to else
+        self._emit(QInstruction(Opcode.Q_JUMP, dest=else_label))
+        
+        # Emit each branch's code
+        for i, (_, action) in enumerate(node.branches):
+            self._emit(QInstruction(Opcode.Q_LABEL, dest=branch_labels[i]))
+            self._lower_statement(action)
+            # CRITICAL FIX: Jump to continuation instead of falling through
+            self._emit(QInstruction(Opcode.Q_JUMP, dest=continuation_label))
+        
+        # Emit else clause
+        self._emit(QInstruction(Opcode.Q_LABEL, dest=else_label))
+        for stmt in node.else_body:
+            self._lower_statement(stmt)
+        # CRITICAL FIX: Jump to continuation after else
+        self._emit(QInstruction(Opcode.Q_JUMP, dest=continuation_label))
+        
+        # CRITICAL FIX: Emit continuation label
+        self._emit(QInstruction(Opcode.Q_LABEL, dest=continuation_label))
 
     # ── Function call ──────────────────────────────────────
     def _lower_call(self, node: CallNode) -> VReg:
@@ -331,11 +463,21 @@ class IRBuilder:
                 left = self._lower_expr(node.left)
                 right = self._lower_expr(node.right)
                 dest = self._alloc.alloc()
-                op_map = {"ADD": Opcode.Q_ADD, "SUB": Opcode.Q_SUB,
-                          "MUL": Opcode.Q_MUL, "DIV": Opcode.Q_DIV,
-                          "MOD": Opcode.Q_MOD}
-                opcode = op_map.get(node.op, Opcode.Q_ADD)
-                self._emit(QInstruction(opcode, dest=dest, src1=left, src2=right))
+                
+                # Check if this is string concatenation
+                left_type = self._infer_type(node.left)
+                right_type = self._infer_type(node.right)
+                
+                if node.op == "ADD" and (left_type == "string" or right_type == "string"):
+                    # String concatenation
+                    self._emit(QInstruction(Opcode.Q_STR_CAT, dest=dest, src1=left, src2=right))
+                else:
+                    # Arithmetic operations
+                    op_map = {"ADD": Opcode.Q_ADD, "SUB": Opcode.Q_SUB,
+                              "MUL": Opcode.Q_MUL, "DIV": Opcode.Q_DIV,
+                              "MOD": Opcode.Q_MOD}
+                    opcode = op_map.get(node.op, Opcode.Q_ADD)
+                    self._emit(QInstruction(opcode, dest=dest, src1=left, src2=right))
                 return dest
 
             case CompareNode():

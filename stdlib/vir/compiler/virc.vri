@@ -1,0 +1,442 @@
+##
+ * vir/compiler/virc.vri — Pure Vir Compiler Driver (Zero C/Python)
+ * =================================================================
+ * The self-hosting Vir compiler entry point. Uses ONLY the vir/rt/*
+ * modules (direct syscalls, mmap allocator, raw I/O). No Python,
+ * no C runtime, no libc, no external linker.
+ *
+ * Pipeline:
+ *   source.vri → lex → parse → lower → regalloc → codegen → Mach-O/ELF
+ *
+ * This is the file that gets compiled by the Python compiler (Stage 0),
+ * then the resulting binary compiles itself (Stage 1), completing bootstrap.
+ *
+ * Usage:
+ *   ./virc <input.vri> [-o output] [--target arm64|x86_64] [--format macho|elf]
+ ##
+
+module vir.compiler.virc;
+
+# ── Runtime layer (pure Vir, no C) ──
+include vir.rt.syscall;
+import sys_exit, sys_write, SYS_EXIT, SYS_WRITE from syscall;
+include vir.rt.alloc;
+import vir_alloc, vir_free, vir_realloc, heap_init from alloc;
+include vir.rt.string_rt;
+import rt_strlen, rt_strcmp, rt_streq, rt_strcat, rt_strdup,
+       rt_itoa, rt_atoi, StringBuilder, sb_new, sb_append,
+       sb_append_char, sb_append_int, sb_to_string, sb_free from string_rt;
+include vir.rt.io;
+import print_str, print_int, print_ln, print_newline, eprint_ln,
+       file_open_read, file_read_all, file_close,
+       write_file_bytes, read_file_str from io;
+include vir.rt.vec_rt;
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt,
+       vec_free_rt, bvec_new, bvec_push, bvec_push_u32_le,
+       bvec_push_u64_le, bvec_len, bvec_get, bvec_data_ptr,
+       bvec_free from vec_rt;
+include vir.rt.start;
+import rt_argc, rt_argv from start;
+# Note: vir.str.string removed — compiler modules use stdlib/vir/string.vri shim instead
+
+# ── Mach-O/ELF emitters — MUST be BEFORE compiler/main (which includes
+#    binary.vri) so that these definitions win under "first compiled wins" ──
+include vir.rt.macho;
+import MachOBuilder, macho_new, macho_write_to_file from macho;
+include vir.rt.elf;
+import ElfBuilder, elf_new, elf_write_to_file from elf;
+
+# ── Compiler modules (self-hosting, pure Vir) ──
+include vir.compiler.lexer;
+import Lexer, TokType, Token, lexer_new, tokenize from lexer;
+include vir.compiler.parser;
+import Parser, AstNode, AstType, parser_new, parse_program from parser;
+include vir.compiler.ir_optimizer;
+import LowerCtx, QModule, QOp, lower_ctx_new, lower_program, optimize_module from ir_optimizer;
+include vir.compiler.codegen;
+import TargetArch, CodeBuf, codebuf_new, codebuf_offset,
+       codebuf_emit_u32, codebuf_patch_u32, codebuf_get_data from codegen;
+include vir.compiler.codegen_wasm;
+import wasm_compile_module, wasm_write_module, QIRFunc from codegen_wasm;
+include vir.compiler.main;
+import codegen_emit_module, emit_macho_executable, emit_macho_with_entry, FuncLayout from main;
+
+
+# ═══════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════
+
+const VERSION: "virc 1.2.0 (self-hosted)";
+
+entity CompilerConfig:
+    input_path:     int;    # string pointer
+    output_path:    int;    # string pointer
+    target:         int;    # 0=ARM64, 1=x86_64
+    format:         int;    # 0=Mach-O, 1=ELF
+    verbose:        int;    # 0=quiet, 1=verbose
+end.
+
+func default_config:
+    out CompilerConfig {
+        input_path:  0,
+        output_path: 0,
+        target:      0,        # ARM64 (default on macOS)
+        format:      0,        # Mach-O (default on macOS)
+        verbose:     1
+    };
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# CLI Argument Parsing
+# ═══════════════════════════════════════════════════════
+
+func parse_args:
+    let argc = arg_count();
+    let cfg = default_config();
+
+    if argc < 1:
+        print_ln("virc: error: no input file");
+        print_ln("Usage: virc <input.vri> [-o output] [--target arm64|x86_64] [--format macho|elf]");
+        exit_prog(1);
+    end
+
+    # First positional argument is the input file
+    cfg.input_path = get_arg(0);
+
+    # Default output: a.out
+    cfg.output_path = "a.out";
+
+    let i = 1;
+    when i < argc loop
+        let arg = get_arg(i);
+
+        if rt_streq(arg, "-o"):
+            if i + 1 < argc:
+                i = i + 1;
+                cfg.output_path = get_arg(i);
+            else
+                print_ln("virc: error: -o requires an argument");
+                exit_prog(1);
+            end
+
+        eif rt_streq(arg, "--target"):
+            if i + 1 < argc:
+                i = i + 1;
+                let tgt = get_arg(i);
+                if rt_streq(tgt, "arm64") or rt_streq(tgt, "aarch64"):
+                    cfg.target = 0;
+                eif rt_streq(tgt, "x86_64") or rt_streq(tgt, "x86-64"):
+                    cfg.target = 1;
+                eif rt_streq(tgt, "wasm32") or rt_streq(tgt, "wasm"):
+                    cfg.target = 2;
+                else
+                    print_ln("virc: error: unknown target (use arm64, x86_64 or wasm32)");
+                    exit_prog(1);
+                end
+            end
+
+        eif rt_streq(arg, "--format"):
+            if i + 1 < argc:
+                i = i + 1;
+                let fmt = get_arg(i);
+                if rt_streq(fmt, "macho"):
+                    cfg.format = 0;
+                eif rt_streq(fmt, "elf"):
+                    cfg.format = 1;
+                else
+                    print_ln("virc: error: unknown format (use macho or elf)");
+                    exit_prog(1);
+                end
+            end
+
+        eif rt_streq(arg, "-q") or rt_streq(arg, "--quiet"):
+            cfg.verbose = 0;
+
+        eif rt_streq(arg, "-v") or rt_streq(arg, "--version"):
+            print_ln(VERSION);
+            exit_prog(0);
+
+        eif rt_streq(arg, "-h") or rt_streq(arg, "--help"):
+            print_ln("virc — Vir Self-Hosting Compiler");
+            print_ln("");
+            print_ln("Usage: virc <input.vri> [-o output] [options]");
+            print_ln("");
+            print_ln("Options:");
+            print_ln("  -o <file>           Output file (default: a.out)");
+            print_ln("  --target <arch>     arm64, x86_64 or wasm32 (default: arm64)");
+            print_ln("  --format <fmt>      macho, elf or wasm (default: macho)");
+            print_ln("  -q, --quiet         Suppress progress messages");
+            print_ln("  -v, --version       Print version");
+            print_ln("  -h, --help          Print this help");
+            exit_prog(0);
+        end
+
+        i = i + 1;
+    end
+
+    out cfg;
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Compiler Pipeline
+# ═══════════════════════════════════════════════════════
+
+func virc_compile:
+    in(cfg: CompilerConfig)
+
+    let verbose = cfg.verbose;
+
+    # ── Read source file ──
+    if verbose == 1:
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: reading ");
+        sb = sb_append(sb, cfg.input_path);
+        sb = sb_append(sb, "...");
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+    end
+
+    let source_raw = read_file_str(cfg.input_path);
+    if source_raw == 0:
+        print_ln("virc: error: cannot read input file");
+        exit_prog(1);
+    end
+
+    let src_len = rt_strlen(source_raw);
+    if verbose == 1:
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: ");
+        sb = sb_append_int(sb, src_len);
+        sb = sb_append(sb, " bytes source");
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+    end
+
+    # ── Step 1: Tokenize ──
+    if verbose == 1:
+        print_ln("virc: tokenizing...");
+    end
+
+    # Use lexer_new directly with raw string pointer
+    let lex = lexer_new(source_raw);
+    lex = tokenize(lex);
+
+    if rt_strlen(lex.error) > 0:
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: lex error: ");
+        sb = sb_append(sb, lex.error);
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+        exit_prog(1);
+    end
+
+    let tok_count = vec_len_rt(lex.tokens);
+    if verbose == 1:
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: ");
+        sb = sb_append_int(sb, tok_count);
+        sb = sb_append(sb, " tokens");
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+    end
+
+    # ── Step 2: Parse ──
+    if verbose == 1:
+        print_ln("virc: parsing...");
+    end
+
+    let parser = parser_new(lex.tokens);
+    var (parser2, ast) = parse_program(parser);
+
+    if verbose == 1:
+        let sb_ast = sb_new();
+        sb_ast = sb_append(sb_ast, "virc: ast children ");
+        sb_ast = sb_append_int(sb_ast, vec_len_rt(ast.children));
+        print_ln(sb_to_string(sb_ast));
+        sb_free(sb_ast);
+    end
+
+    # Report parse errors
+    if rt_strlen(parser2.error) > 0:
+        let sb_pe = sb_new();
+        sb_pe = sb_append(sb_pe, "virc: parse error (line ");
+        sb_pe = sb_append_int(sb_pe, parser2.error_line);
+        sb_pe = sb_append(sb_pe, "): ");
+        sb_pe = sb_append(sb_pe, parser2.error);
+        print_ln(sb_to_string(sb_pe));
+        sb_free(sb_pe);
+    end
+
+    # ── Step 3: Lower to Q-IR ──
+    if verbose == 1:
+        print_ln("virc: lowering to Q-IR...");
+    end
+
+    let ctx = lower_ctx_new("main");
+
+    ctx = lower_program(ctx, ast);
+
+    if ctx.error_count > 0:
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: lower errors=");
+        sb = sb_append_int(sb, ctx.error_count);
+        sb = sb_append(sb, " last_error=");
+        sb = sb_append(sb, ctx.last_error);
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+        # Don't exit — may still generate partial code
+    end
+
+    let func_count = vec_len_rt(ctx.module.functions);
+
+    if verbose == 1:
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: ");
+        sb = sb_append_int(sb, func_count);
+        sb = sb_append(sb, " functions");
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+    end
+
+    # ── Step 4: Optimization passes ──
+    if verbose == 1:
+        print_ln("virc: running optimization passes...");
+    end
+
+    let opt_result = optimize_module(ctx.module);
+    let opt_fused = opt_result.1;
+    let opt_bce = opt_result.2;
+    let opt_vec = opt_result.3;
+
+    if verbose == 1:
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: fusion=");
+        sb = sb_append_int(sb, opt_fused);
+        sb = sb_append(sb, " bce=");
+        sb = sb_append_int(sb, opt_bce);
+        sb = sb_append(sb, " autovec=");
+        sb = sb_append_int(sb, opt_vec);
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+    end
+
+    # ── Step 5: Code Generation ──
+    let target_arch = TargetArch::ARM64;
+    let target_name = "ARM64";
+    if cfg.target == 1:
+        target_arch = TargetArch::X86_64;
+        target_name = "x86_64";
+    eif cfg.target == 2:
+        target_arch = TargetArch::Wasm32;
+        target_name = "wasm32";
+    end
+
+    if verbose == 1:
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: generating ");
+        sb = sb_append(sb, target_name);
+        sb = sb_append(sb, " machine code...");
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+    end
+
+    let code = codegen_emit_module(ctx.module, target_arch);
+    let code_size = codebuf_offset(code);
+
+    if verbose == 1:
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: ");
+        sb = sb_append_int(sb, code_size);
+        sb = sb_append(sb, " bytes machine code");
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+    end
+
+    # ── Step 6: Extract machine code into byte vector ──
+    let code_bytes = bvec_new();
+    let ci = 0;
+    when ci < code_size loop
+        code_bytes = bvec_push(code_bytes, codebuf_get_data(code, ci));
+        ci = ci + 1;
+    end
+
+    # ── Step 7: Emit executable ──
+    if verbose == 1:
+        let fmt_name = "Mach-O";
+        if cfg.format == 1:
+            fmt_name = "ELF";
+        eif cfg.format == 2 or cfg.target == 2:
+            fmt_name = "WASM";
+        end
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: linking ");
+        sb = sb_append(sb, fmt_name);
+        sb = sb_append(sb, " ");
+        sb = sb_append(sb, target_name);
+        sb = sb_append(sb, " executable...");
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+    end
+
+    if cfg.target == 2 or cfg.format == 2:
+        # WASM output: build QIRFunc list from QModule, emit .wasm
+        let wasm_funcs = vec_new<QIRFunc>();
+        let wfi = 0;
+        let wfn = vec_len_rt(ctx.module.functions);
+        when wfi < wfn loop
+            let qf = vec_get_rt(ctx.module.functions, wfi);
+            wasm_funcs = vec_push<QIRFunc>(wasm_funcs, QIRFunc {
+                name: qf.name,
+                param_count: qf.param_count,
+                body: qf.body
+            });
+            wfi = wfi + 1;
+        end
+        wasm_write_module(wasm_funcs, cfg.output_path);
+    eif cfg.format == 0:
+        # Mach-O
+        let mb = macho_new(cfg.target);
+        mb.text_code = code_bytes;
+        mb.entry_offset = code.start_offset;
+        macho_write_to_file(mb, cfg.output_path);
+    else
+        # ELF
+        let eb = elf_new(cfg.target);
+        eb.text_code = code_bytes;
+        eb.entry_offset = code.start_offset;
+        elf_write_to_file(eb, cfg.output_path);
+    end
+
+    if verbose == 1:
+        let sb = sb_new();
+        sb = sb_append(sb, "virc: done! ");
+        sb = sb_append(sb, cfg.output_path);
+        sb = sb_append(sb, " (");
+        sb = sb_append_int(sb, code_size);
+        sb = sb_append(sb, " bytes code)");
+        print_ln(sb_to_string(sb));
+        sb_free(sb);
+    end
+
+    out 0;
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Entry Point (called from _start via rt/start.vri)
+# ═══════════════════════════════════════════════════════
+
+func main:
+    print_ln("====================================");
+    print_ln("  virc — Vir Self-Hosting Compiler");
+    print_ln("  v1.2.0 — Zero Python, Zero C");
+    print_ln("====================================");
+
+    let cfg = parse_args();
+    let result = virc_compile(cfg);
+    out result;
+end.
+
+export vir_main, virc_compile, parse_args, CompilerConfig;

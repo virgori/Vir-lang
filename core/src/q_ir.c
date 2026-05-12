@@ -203,6 +203,9 @@ void q_module_dump(const q_module_t *mod, char *buf, size_t buf_size)
         pos += snprintf(buf + pos, buf_size - pos, "\nfunc @%s(", func->name);
         for (uint32_t pi = 0; pi < func->param_count; pi++) {
             if (pi > 0) pos += snprintf(buf + pos, buf_size - pos, ", ");
+            if (func->param_is_ref[pi]) {
+                pos += snprintf(buf + pos, buf_size - pos, "ref ");
+            }
             pos += snprintf(buf + pos, buf_size - pos, "R%u", func->param_vregs[pi]);
         }
         pos += snprintf(buf + pos, buf_size - pos, "):\n");
@@ -304,6 +307,25 @@ const char* q_opcode_name(q_opcode_t op)
         case Q_ARR_GET:      return "Q_ARR_GET";
         case Q_ARR_SET:      return "Q_ARR_SET";
         case Q_ARR_PUSH:     return "Q_ARR_PUSH";
+        case Q_ARR_CAP:      return "Q_ARR_CAP";
+        case Q_ARR_COMPACT:  return "Q_ARR_COMPACT";
+        case Q_ARENA_NEW:    return "Q_ARENA_NEW";
+        case Q_ARENA_ALLOC:  return "Q_ARENA_ALLOC";
+        case Q_ARENA_FREE:   return "Q_ARENA_FREE";
+        case Q_DICT_NEW:     return "Q_DICT_NEW";
+        case Q_DICT_SET_I:   return "Q_DICT_SET_I";
+        case Q_DICT_SET_S:   return "Q_DICT_SET_S";
+        case Q_DICT_GET_I:   return "Q_DICT_GET_I";
+        case Q_DICT_GET_S:   return "Q_DICT_GET_S";
+        case Q_DICT_HAS_I:   return "Q_DICT_HAS_I";
+        case Q_DICT_HAS_S:   return "Q_DICT_HAS_S";
+        case Q_DICT_DEL_I:   return "Q_DICT_DEL_I";
+        case Q_DICT_DEL_S:   return "Q_DICT_DEL_S";
+        case Q_DICT_LEN:     return "Q_DICT_LEN";
+        case Q_DICT_KEYS:    return "Q_DICT_KEYS";
+        case Q_DICT_VALUES:  return "Q_DICT_VALUES";
+        case Q_HASH_I:       return "Q_HASH_I";
+        case Q_HASH_S:       return "Q_HASH_S";
         case Q_EXIT:         return "Q_EXIT";
         case Q_I_TO_STR:     return "Q_I_TO_STR";
         case Q_STR_TO_I:     return "Q_STR_TO_I";
@@ -321,7 +343,26 @@ const char* q_opcode_name(q_opcode_t op)
         case Q_TENSOR_MUL:   return "Q_TENSOR_MUL";
         case Q_TENSOR_FMA:   return "Q_TENSOR_FMA";
         case Q_SWIZZLE:      return "Q_SWIZZLE";
+        case Q_TENSOR_SHAPE: return "Q_TENSOR_SHAPE";
+        case Q_QUANTIZE:     return "Q_QUANTIZE";
+        case Q_REACTIVE_NOTIFY: return "Q_REACTIVE_NOTIFY";
+        case Q_PORT_NEW: return "Q_PORT_NEW";
+        case Q_PORT_SEND: return "Q_PORT_SEND";
+        case Q_PORT_RECV: return "Q_PORT_RECV";
+        case Q_PORT_LEN: return "Q_PORT_LEN";
+        case Q_FLUX_DOT: return "Q_FLUX_DOT";
+        case Q_FLUX_LEN: return "Q_FLUX_LEN";
+        case Q_FLUX_NORM: return "Q_FLUX_NORM";
+        case Q_FLUX_SPLAT: return "Q_FLUX_SPLAT";
+        case Q_FLUX_LOAD: return "Q_FLUX_LOAD";
+        case Q_FLUX_STORE: return "Q_FLUX_STORE";
+        case Q_TENSOR_SUM: return "Q_TENSOR_SUM";
+        case Q_ATOMIC_FENCE: return "Q_ATOMIC_FENCE";
+        case Q_SWIZZLE_STORE: return "Q_SWIZZLE_STORE";
         case Q_PATCH_POINT:  return "Q_PATCH_POINT";
+        case Q_TASK_CANCEL:  return "Q_TASK_CANCEL";
+        case Q_REF_BIND_CLEAR: return "Q_REF_BIND_CLEAR";
+        case Q_REF_BIND_SET: return "Q_REF_BIND_SET";
         case Q_LABEL:        return "Q_LABEL";
         case Q_HALT:         return "Q_HALT";
         default:             return "Q_???";

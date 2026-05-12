@@ -47,6 +47,12 @@ class Opcode(Enum):
     Q_PRINT = auto()
     Q_INPUT = auto()
 
+    # ── Task / Async (§22) ─────────────────────────────────
+    Q_TASK_SPAWN = auto()    # Q_TASK_SPAWN <dest>, <fn_idx> - spawn async task
+    Q_TASK_YIELD = auto()    # Q_TASK_YIELD - yield to scheduler
+    Q_TASK_WAIT = auto()     # Q_TASK_WAIT <dest>, <task_id> - wait for task result
+    Q_TASK_CANCEL = auto()   # Q_TASK_CANCEL <dest>, <task_id> - cancel task
+
     # ── Self-patching (spec §2.1) ──────────────────────────
     Q_PATCH_POINT = auto()   # Lỗ hổng cho tầng Backend tự vá mã
 
@@ -55,6 +61,8 @@ class Opcode(Enum):
 
     # ── String ─────────────────────────────────────────────
     Q_LOAD_STRING = auto()   # Q_LOAD_STRING <dest>, <string_idx>
+    Q_STR_CAT = auto()       # Q_STR_CAT <dest>, <src1>, <src2> - string concatenation
+    Q_STR_LEN = auto()       # Q_STR_LEN <dest>, <src1> - string length
 
     # ── No-op ──────────────────────────────────────────────
     Q_NOP = auto()
@@ -159,6 +167,7 @@ class QInstruction:
     comment: str = ""       # annotation tùy chọn
     patch_id: str = ""      # Chỉ dùng cho Q_PATCH_POINT
     string_value: str = ""  # For Q_LOAD_STRING
+    operand_type: str = ""  # Type annotation: "int", "float", "string", "bool"
 
     @property
     def operands(self) -> list:
@@ -201,6 +210,7 @@ class QModule:
     name: str = "main"
     functions: list[QFunction] = field(default_factory=list)
     strings: list[str] = field(default_factory=list)
+    entity_types: dict[str, list[str]] = field(default_factory=dict)  # entity_name → [field_names]
     traits: dict[str, list[str]] = field(default_factory=dict)  # trait_name → [method_names]
     impls: list[tuple[str, str, dict[str, str]]] = field(default_factory=list)  # (trait, type, {method: func})
     enums: dict[str, list[tuple[str, list[str]]]] = field(default_factory=dict)  # enum_name → [(variant, [field_types])]

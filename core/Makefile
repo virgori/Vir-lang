@@ -95,7 +95,10 @@ C_SRCS := src/q_ir.c \
           src/gpu_cuda.c \
           src/ptx_gen.c \
           src/simd_index.c \
-          src/gpu_metal.c
+          src/gpu_metal.c \
+          src/mem_manager.c \
+          src/sublib_adapter.c \
+          src/wasm_codegen.c
 
 # ── Object files ──────────────────────────────────────────
 BUILD_DIR := build
@@ -171,11 +174,55 @@ $(LIB_DIR):
 TEST_SRC := tests/test_native.c
 TEST_BIN := $(BUILD_DIR)/test_native
 
+# Volatile I/O segfault bug condition exploration test
+VOLATILE_IO_TEST_SRC := tests/test_volatile_io_segfault.c
+VOLATILE_IO_TEST_BIN := $(BUILD_DIR)/test_volatile_io_segfault
+
+# Volatile I/O preservation property test
+VOLATILE_IO_PRESERVATION_TEST_SRC := tests/test_volatile_io_preservation.c
+VOLATILE_IO_PRESERVATION_TEST_BIN := $(BUILD_DIR)/test_volatile_io_preservation
+
+# Reactive var bug condition exploration test
+REACTIVE_VAR_BUG_TEST_SRC := tests/test_reactive_var_bug.c
+REACTIVE_VAR_BUG_TEST_BIN := $(BUILD_DIR)/test_reactive_var_bug
+
+# Reactive var preservation property test
+REACTIVE_VAR_PRES_TEST_SRC := tests/test_reactive_var_preservation.c
+REACTIVE_VAR_PRES_TEST_BIN := $(BUILD_DIR)/test_reactive_var_preservation
+
 test: $(STATIC_PATH) $(TEST_BIN)
 	@echo "═══ Running native tests ═══"
 	./$(TEST_BIN)
 
+test-volatile-io: $(STATIC_PATH) $(VOLATILE_IO_TEST_BIN)
+	@echo "═══ Running volatile I/O segfault exploration test ═══"
+	./$(VOLATILE_IO_TEST_BIN); true
+
+test-volatile-io-preservation: $(STATIC_PATH) $(VOLATILE_IO_PRESERVATION_TEST_BIN)
+	@echo "═══ Running volatile I/O preservation property test ═══"
+	./$(VOLATILE_IO_PRESERVATION_TEST_BIN)
+
+test-reactive-var-bug: $(STATIC_PATH) $(REACTIVE_VAR_BUG_TEST_BIN)
+	@echo "═══ Running reactive var bug condition exploration test ═══"
+	cd .. && core/$(REACTIVE_VAR_BUG_TEST_BIN); true
+
+test-reactive-var-preservation: $(STATIC_PATH) $(REACTIVE_VAR_PRES_TEST_BIN)
+	@echo "═══ Running reactive var preservation property test ═══"
+	./$(REACTIVE_VAR_PRES_TEST_BIN)
+
 $(TEST_BIN): $(TEST_SRC) $(STATIC_PATH) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(STATIC_PATH) $(EXTRA_LDFLAGS)
+
+$(VOLATILE_IO_TEST_BIN): $(VOLATILE_IO_TEST_SRC) $(STATIC_PATH) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(STATIC_PATH) $(EXTRA_LDFLAGS)
+
+$(VOLATILE_IO_PRESERVATION_TEST_BIN): $(VOLATILE_IO_PRESERVATION_TEST_SRC) $(STATIC_PATH) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(STATIC_PATH) $(EXTRA_LDFLAGS)
+
+$(REACTIVE_VAR_BUG_TEST_BIN): $(REACTIVE_VAR_BUG_TEST_SRC) $(STATIC_PATH) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(STATIC_PATH) $(EXTRA_LDFLAGS)
+
+$(REACTIVE_VAR_PRES_TEST_BIN): $(REACTIVE_VAR_PRES_TEST_SRC) $(STATIC_PATH) | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $< $(STATIC_PATH) $(EXTRA_LDFLAGS)
 
 # ══════════════════════════════════════════════════════════

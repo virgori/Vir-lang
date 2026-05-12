@@ -1,0 +1,417 @@
+##
+ * vir/test/pgo_tiered_vtest.vri — VTest for PGO + Tiered Compilation + WASM Codegen
+ * ===================================================================================
+ * Tests the new JIT infrastructure: tiered compilation engine, PGO feedback loop,
+ * WASM code generation, and LEB128 encoding.
+ ##
+
+include types;
+include string;
+import String, str_new, str_eq from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include map;
+import Map, map_new, map_set from map;
+include test;
+import TestSuite, TestResult from test;
+include vtest;
+import VTestRegistry,
+       vtest_suite_new, vtest_add,
+       vtest_registry_new, vtest_registry_add_suite, vtest_registry_run,
+       vtest_print_summary, vtest_exit_code,
+       vtest_pass, vtest_fail,
+       vtest_expect_true, vtest_expect_false,
+       vtest_expect_eq_i64, vtest_expect_ne_i64 from vtest;
+include jit/tiered;
+import TierLevel, TieredFunc, TieredEngine, TieredStats,
+       tiered_engine_new, tiered_engine_free,
+       tiered_register, tiered_on_enter,
+       tiered_set_baseline, tiered_set_optimized,
+       tiered_demote, tiered_get_tier, tiered_get_exec_count,
+       tiered_should_compile, tiered_func_count, tiered_lookup,
+       tiered_stats, tiered_func_new,
+       TIER1_THRESHOLD, TIER2_THRESHOLD from jit/tiered;
+include jit/pgo;
+import HintKind, PGOHint, PGOProfile, PGOEntry, PGOHintSet,
+       pgo_hint_new, pgo_profile_new,
+       pgo_generate_hints, pgo_is_hot, pgo_is_cold, pgo_is_inline_candidate,
+       pgo_hint_count,
+       HOT_CALL_THRESHOLD, COLD_CALL_THRESHOLD from jit/pgo;
+include compiler/codegen_wasm;
+import wasm_uleb128, wasm_sleb128, wasm_encode_string,
+       WasmFunc, wasm_func_new, wf_emit, wf_emit_i64_const,
+       wf_emit_local_get, wf_emit_local_set, wf_encode_body,
+       OP_NOP, OP_I64_ADD, OP_LOCAL_GET, OP_END from compiler/codegen_wasm;
+include compiler/codegen;
+import TargetArch from compiler/codegen;
+
+
+# ═══════════════════════════════════════════════════════
+# Tiered Engine Tests
+# ═══════════════════════════════════════════════════════
+
+func _test_tiered_new:
+    let te = tiered_engine_new(0);
+    if tiered_func_count(te) == 0:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("tiered engine not empty on creation"));
+end
+
+func _test_tiered_register:
+    let te = tiered_engine_new(0);
+    te = tiered_register(te, 0, str_new("main"));
+    te = tiered_register(te, 1, str_new("helper"));
+    if tiered_func_count(te) == 2:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("expected 2 registered functions"));
+end
+
+func _test_tiered_initial_tier:
+    let te = tiered_engine_new(0);
+    te = tiered_register(te, 0, str_new("f"));
+    let tier = tiered_get_tier(te, 0);
+    if tier == TierLevel::Interpreter:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("initial tier should be Interpreter"));
+end
+
+func _test_tiered_exec_count:
+    let te = tiered_engine_new(0);
+    te = tiered_register(te, 0, str_new("f"));
+    let i = 0;
+    when i < 10 loop
+        var (te2, _) = tiered_on_enter(te, 0);
+        te = te2;
+        i = i + 1;
+    end
+    if tiered_get_exec_count(te, 0) == 10:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("exec count mismatch"));
+end
+
+func _test_tiered_promote_tier1:
+    let te = tiered_engine_new(0);
+    te = tiered_register(te, 0, str_new("hot_func"));
+    let i = 0;
+    when i < TIER1_THRESHOLD loop
+        var (te2, _) = tiered_on_enter(te, 0);
+        te = te2;
+        i = i + 1;
+    end
+    let tier = tiered_get_tier(te, 0);
+    if tier == TierLevel::BaselineJIT:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("should promote to BaselineJIT at threshold"));
+end
+
+func _test_tiered_promote_tier2:
+    let te = tiered_engine_new(0);
+    te = tiered_register(te, 0, str_new("very_hot"));
+    let i = 0;
+    when i < TIER2_THRESHOLD loop
+        var (te2, _) = tiered_on_enter(te, 0);
+        te = te2;
+        i = i + 1;
+    end
+    let tier = tiered_get_tier(te, 0);
+    if tier == TierLevel::OptimizedJIT:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("should promote to OptimizedJIT at tier2 threshold"));
+end
+
+func _test_tiered_demote:
+    let te = tiered_engine_new(0);
+    te = tiered_register(te, 0, str_new("demote_me"));
+    te = tiered_set_baseline(te, 0, 5);
+    te = tiered_set_optimized(te, 0, 10);
+    te = tiered_demote(te, 0);
+    let tier = tiered_get_tier(te, 0);
+    if tier == TierLevel::BaselineJIT:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("demote from Tier2 should go to Tier1"));
+end
+
+func _test_tiered_should_compile:
+    let te = tiered_engine_new(0);
+    te = tiered_register(te, 0, str_new("f"));
+    # Initially interpreter, should not compile
+    if tiered_should_compile(te, 0) == false:
+        # Promote to baseline by manually setting tier
+        te = tiered_set_baseline(te, 0, -1);
+        # Now block_idx is -1, should need compile
+        if tiered_should_compile(te, 0) == true:
+            out vtest_pass();
+        end
+    end
+    out vtest_fail(str_new("should_compile logic incorrect"));
+end
+
+func _test_tiered_lookup:
+    let te = tiered_engine_new(0);
+    te = tiered_register(te, 0, str_new("alpha"));
+    te = tiered_register(te, 1, str_new("beta"));
+    let idx = tiered_lookup(te, str_new("beta"));
+    if idx == 1:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("lookup returned wrong index"));
+end
+
+func _test_tiered_stats:
+    let te = tiered_engine_new(0);
+    te = tiered_register(te, 0, str_new("a"));
+    te = tiered_register(te, 1, str_new("b"));
+    te = tiered_set_baseline(te, 0, 1);
+    let s = tiered_stats(te);
+    if s.total_funcs == 2 and s.tier1_count == 1 and s.tier0_count == 1:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("tiered stats mismatch"));
+end
+
+
+# ═══════════════════════════════════════════════════════
+# PGO Tests
+# ═══════════════════════════════════════════════════════
+
+func _test_pgo_profile_new:
+    let p = pgo_profile_new();
+    if p.total_calls == 0 and p.total_time_ns == 0:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("pgo profile not zeroed"));
+end
+
+func _test_pgo_hint_new:
+    let h = pgo_hint_new(HintKind::HotFunction, str_new("main"), 500, 0);
+    if h.kind == HintKind::HotFunction and h.weight == 500:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("hint construction failed"));
+end
+
+func _test_pgo_generate_hints_hot:
+    let prof = pgo_profile_new();
+    prof.entries = vec_new<PGOEntry>();
+    prof.entries = vec_push<PGOEntry>(prof.entries, PGOEntry {
+        name: str_new("hot_fn"), calls: 200, total_ns: 5000,
+        self_ns: 3000, avg_ns: 25, is_hot: true, is_cold: false
+    });
+    prof.entries = vec_push<PGOEntry>(prof.entries, PGOEntry {
+        name: str_new("cold_fn"), calls: 1, total_ns: 10,
+        self_ns: 10, avg_ns: 10, is_hot: false, is_cold: true
+    });
+    let sizes = map_new<string, int>();
+    map_set(sizes, str_new("hot_fn"), 30);
+    let hs = pgo_generate_hints(prof, sizes);
+    if pgo_is_hot(hs, str_new("hot_fn")) and pgo_is_cold(hs, str_new("cold_fn")):
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("hot/cold classification failed"));
+end
+
+func _test_pgo_inline_candidate:
+    let prof = pgo_profile_new();
+    prof.entries = vec_new<PGOEntry>();
+    prof.entries = vec_push<PGOEntry>(prof.entries, PGOEntry {
+        name: str_new("small_hot"), calls: 500, total_ns: 1000,
+        self_ns: 500, avg_ns: 2, is_hot: true, is_cold: false
+    });
+    let sizes = map_new<string, int>();
+    map_set(sizes, str_new("small_hot"), 20);  # small body
+    let hs = pgo_generate_hints(prof, sizes);
+    if pgo_is_inline_candidate(hs, str_new("small_hot")):
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("small hot function should be inline candidate"));
+end
+
+func _test_pgo_cold_not_inline:
+    let prof = pgo_profile_new();
+    prof.entries = vec_new<PGOEntry>();
+    prof.entries = vec_push<PGOEntry>(prof.entries, PGOEntry {
+        name: str_new("cold_fn"), calls: 1, total_ns: 5,
+        self_ns: 5, avg_ns: 5, is_hot: false, is_cold: true
+    });
+    let sizes = map_new<string, int>();
+    map_set(sizes, str_new("cold_fn"), 10);
+    let hs = pgo_generate_hints(prof, sizes);
+    if pgo_is_inline_candidate(hs, str_new("cold_fn")) == false:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("cold function should not be inline candidate"));
+end
+
+func _test_pgo_hint_count:
+    let prof = pgo_profile_new();
+    prof.entries = vec_new<PGOEntry>();
+    prof.entries = vec_push<PGOEntry>(prof.entries, PGOEntry {
+        name: str_new("fn1"), calls: 300, total_ns: 10000,
+        self_ns: 5000, avg_ns: 33, is_hot: true, is_cold: false
+    });
+    let sizes = map_new<string, int>();
+    map_set(sizes, str_new("fn1"), 10);
+    let hs = pgo_generate_hints(prof, sizes);
+    # Should have: HotFunction + InlineCandidate + UnrollLoop = 3
+    if pgo_hint_count(hs) >= 2:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("expected at least 2 hints"));
+end
+
+
+# ═══════════════════════════════════════════════════════
+# WASM Codegen Tests
+# ═══════════════════════════════════════════════════════
+
+func _test_wasm_uleb128_zero:
+    let buf = vec_new<int>();
+    buf = wasm_uleb128(0, buf);
+    if vec_len<int>(buf) == 1 and vec_get<int>(buf, 0) == 0:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("uleb128(0) should be [0x00]"));
+end
+
+func _test_wasm_uleb128_small:
+    let buf = vec_new<int>();
+    buf = wasm_uleb128(127, buf);
+    if vec_len<int>(buf) == 1 and vec_get<int>(buf, 0) == 127:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("uleb128(127) should be [0x7F]"));
+end
+
+func _test_wasm_uleb128_multi:
+    let buf = vec_new<int>();
+    buf = wasm_uleb128(128, buf);
+    if vec_len<int>(buf) == 2 and vec_get<int>(buf, 0) == 0x80 and vec_get<int>(buf, 1) == 1:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("uleb128(128) should be [0x80, 0x01]"));
+end
+
+func _test_wasm_sleb128_positive:
+    let buf = vec_new<int>();
+    buf = wasm_sleb128(42, buf);
+    if vec_len<int>(buf) == 1 and vec_get<int>(buf, 0) == 42:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("sleb128(42) should be [42]"));
+end
+
+func _test_wasm_sleb128_negative:
+    let buf = vec_new<int>();
+    buf = wasm_sleb128(-1, buf);
+    if vec_len<int>(buf) == 1 and vec_get<int>(buf, 0) == 0x7F:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("sleb128(-1) should be [0x7F]"));
+end
+
+func _test_wasm_func_new:
+    let wf = wasm_func_new(str_new("test_fn"), 2);
+    if wf.param_count == 2 and wf.local_count == 0 and wf.has_result == true:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("wasm_func_new defaults wrong"));
+end
+
+func _test_wasm_func_emit_nop:
+    let wf = wasm_func_new(str_new("nop_fn"), 0);
+    wf = wf_emit(wf, OP_NOP);
+    if vec_len<int>(wf.body) == 1 and vec_get<int>(wf.body, 0) == OP_NOP:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("emit nop failed"));
+end
+
+func _test_wasm_func_emit_add:
+    let wf = wasm_func_new(str_new("add_fn"), 2);
+    wf = wf_emit_local_get(wf, 0);
+    wf = wf_emit_local_get(wf, 1);
+    wf = wf_emit(wf, OP_I64_ADD);
+    wf = wf_emit_local_set(wf, 2);
+    if vec_len<int>(wf.body) >= 4:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("wasm add emission too short"));
+end
+
+func _test_wasm_encode_body:
+    let wf = wasm_func_new(str_new("fn"), 0);
+    wf = wf_emit(wf, OP_NOP);
+    let encoded = wf_encode_body(wf);
+    # body should have: size prefix + locals decl (0) + nop + end
+    if vec_len<int>(encoded) >= 3:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("encoded body too short"));
+end
+
+func _test_wasm_targetarch:
+    if TargetArch::Wasm32 == 3:
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("Wasm32 should equal 3"));
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Suite Registration & Entry
+# ═══════════════════════════════════════════════════════
+
+func pgo_tiered_vtest_main:
+    let reg = vtest_registry_new();
+
+    # Tiered compilation tests
+    let ts_tiered = vtest_suite_new(str_new("tiered"));
+    vtest_add(ts_tiered, str_new("engine_new"),            _test_tiered_new);
+    vtest_add(ts_tiered, str_new("register"),              _test_tiered_register);
+    vtest_add(ts_tiered, str_new("initial_tier"),          _test_tiered_initial_tier);
+    vtest_add(ts_tiered, str_new("exec_count"),            _test_tiered_exec_count);
+    vtest_add(ts_tiered, str_new("promote_tier1"),         _test_tiered_promote_tier1);
+    vtest_add(ts_tiered, str_new("promote_tier2"),         _test_tiered_promote_tier2);
+    vtest_add(ts_tiered, str_new("demote"),                _test_tiered_demote);
+    vtest_add(ts_tiered, str_new("should_compile"),        _test_tiered_should_compile);
+    vtest_add(ts_tiered, str_new("lookup"),                _test_tiered_lookup);
+    vtest_add(ts_tiered, str_new("stats"),                 _test_tiered_stats);
+    vtest_registry_add_suite(reg, ts_tiered);
+
+    # PGO tests
+    let ts_pgo = vtest_suite_new(str_new("pgo"));
+    vtest_add(ts_pgo, str_new("profile_new"),              _test_pgo_profile_new);
+    vtest_add(ts_pgo, str_new("hint_new"),                 _test_pgo_hint_new);
+    vtest_add(ts_pgo, str_new("generate_hints_hot"),       _test_pgo_generate_hints_hot);
+    vtest_add(ts_pgo, str_new("inline_candidate"),         _test_pgo_inline_candidate);
+    vtest_add(ts_pgo, str_new("cold_not_inline"),          _test_pgo_cold_not_inline);
+    vtest_add(ts_pgo, str_new("hint_count"),               _test_pgo_hint_count);
+    vtest_registry_add_suite(reg, ts_pgo);
+
+    # WASM codegen tests
+    let ts_wasm = vtest_suite_new(str_new("wasm_codegen"));
+    vtest_add(ts_wasm, str_new("uleb128_zero"),            _test_wasm_uleb128_zero);
+    vtest_add(ts_wasm, str_new("uleb128_small"),           _test_wasm_uleb128_small);
+    vtest_add(ts_wasm, str_new("uleb128_multi"),           _test_wasm_uleb128_multi);
+    vtest_add(ts_wasm, str_new("sleb128_positive"),        _test_wasm_sleb128_positive);
+    vtest_add(ts_wasm, str_new("sleb128_negative"),        _test_wasm_sleb128_negative);
+    vtest_add(ts_wasm, str_new("func_new"),                _test_wasm_func_new);
+    vtest_add(ts_wasm, str_new("func_emit_nop"),           _test_wasm_func_emit_nop);
+    vtest_add(ts_wasm, str_new("func_emit_add"),           _test_wasm_func_emit_add);
+    vtest_add(ts_wasm, str_new("encode_body"),             _test_wasm_encode_body);
+    vtest_add(ts_wasm, str_new("targetarch_wasm32"),       _test_wasm_targetarch);
+    vtest_registry_add_suite(reg, ts_wasm);
+
+    vtest_registry_run(reg);
+    vtest_print_summary(reg);
+    out vtest_exit_code(reg);
+end
+
+export pgo_tiered_vtest_main;
