@@ -521,79 +521,186 @@ int vm_resolve_labels(vm_state_t *vm, const q_function_t *func)
 }
 
 /* ═══════════════════════════════════════════════════════
- * Single-step execution
+ * §Phase-9 Intrinsic Registry — handler implementations
+ * ═══════════════════════════════════════════════════════
+ * Each handler receives vir_intrinsic_ctx_t* with:
+ *   ctx->args  = &vm->regs[0]   (arg registers)
+ *   ctx->ret   = &vm->regs[dest] (return register)
+ *   ctx->vm    = the VM state
+ *
+ * Design rules (from spec):
+ *   - Handlers do NOT know about VM opcodes or bytecode
+ *   - VM does NOT know about OS ABI or syscall numbers
+ *   - Platform logic lives entirely inside the handler
  * ═══════════════════════════════════════════════════════ */
 
-/* §Phase-8: intercept bodyless/extern functions whose name matches
- * a known POSIX syscall shim.  Returns 1 when handled (result stored
- * in R0 and caller should treat as VM_OK), or 0 to fall through to
- * normal dispatch.  Enables `vir run` to execute the self-host
- * compiler which itself issues raw mmap/read/write via `extern
- * func syscallN`. */
+/* ── Syscall passthrough ────────────────────────────── */
+
+/* VIR_INTR_SYSCALL: R0=syscall_num, R1..R6=args
+ * Translates macOS BSD layer numbers (| 0x2000000). */
+static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
+    long sn = (long)ctx->args[0];
+    long s  = sn & 0x00FFFFFF;
+    int64_t r1 = ctx->args[1], r2 = ctx->args[2], r3 = ctx->args[3];
+    int64_t r4 = ctx->args[4], r5 = ctx->args[5];
+    int64_t result = -1;
+    switch (s) {
+    case 1:   exit((int)r1);                                                    break;
+    case 3:   result = read((int)r1, (void *)(uintptr_t)r2, (size_t)r3);      break;
+    case 4:   result = write((int)r1, (const void *)(uintptr_t)r2, (size_t)r3); break;
+    case 5:   result = open((const char *)(uintptr_t)r1, (int)r2, (mode_t)r3); break;
+    case 6:   result = close((int)r1);                                          break;
+    case 73:  result = munmap((void *)(uintptr_t)r1, (size_t)r2);             break;
+    case 197: {
+        void *p = mmap((void *)(uintptr_t)r1, (size_t)r2,
+                       (int)r3, (int)r4, (int)r5, 0);
+        result = (int64_t)(intptr_t)p;
+        break;
+    }
+    case 199: result = lseek((int)r1, (off_t)r2, (int)r3);                    break;
+    default:  result = -1;                                                      break;
+    }
+    *ctx->ret = result;
+}
+
+static void intr_sys_read(vir_intrinsic_ctx_t *ctx) {
+    *ctx->ret = (int64_t)read((int)ctx->args[0],
+                              (void *)(uintptr_t)ctx->args[1],
+                              (size_t)ctx->args[2]);
+}
+
+static void intr_sys_write(vir_intrinsic_ctx_t *ctx) {
+    *ctx->ret = (int64_t)write((int)ctx->args[0],
+                               (const void *)(uintptr_t)ctx->args[1],
+                               (size_t)ctx->args[2]);
+}
+
+static void intr_sys_open(vir_intrinsic_ctx_t *ctx) {
+    *ctx->ret = (int64_t)open((const char *)(uintptr_t)ctx->args[0],
+                              (int)ctx->args[1],
+                              (mode_t)ctx->args[2]);
+}
+
+static void intr_sys_close(vir_intrinsic_ctx_t *ctx) {
+    *ctx->ret = (int64_t)close((int)ctx->args[0]);
+}
+
+static void intr_sys_lseek(vir_intrinsic_ctx_t *ctx) {
+    *ctx->ret = (int64_t)lseek((int)ctx->args[0],
+                               (off_t)ctx->args[1],
+                               (int)ctx->args[2]);
+}
+
+static void intr_sys_mmap(vir_intrinsic_ctx_t *ctx) {
+    void *p = mmap((void *)(uintptr_t)ctx->args[0],
+                   (size_t)ctx->args[1],
+                   (int)ctx->args[2],
+                   (int)ctx->args[3],
+                   (int)ctx->args[4],
+                   (off_t)ctx->args[5]);
+    *ctx->ret = (int64_t)(intptr_t)p;
+}
+
+static void intr_sys_munmap(vir_intrinsic_ctx_t *ctx) {
+    *ctx->ret = (int64_t)munmap((void *)(uintptr_t)ctx->args[0],
+                                (size_t)ctx->args[1]);
+}
+
+static void intr_sys_exit(vir_intrinsic_ctx_t *ctx) {
+    exit((int)ctx->args[0]);
+}
+
+/* ── Memory ─────────────────────────────────────────── */
+
+static void intr_memcpy(vir_intrinsic_ctx_t *ctx) {
+    memcpy((void *)(uintptr_t)ctx->args[0],
+           (const void *)(uintptr_t)ctx->args[1],
+           (size_t)ctx->args[2]);
+    *ctx->ret = ctx->args[0];
+}
+
+static void intr_memset(vir_intrinsic_ctx_t *ctx) {
+    memset((void *)(uintptr_t)ctx->args[0],
+           (int)ctx->args[1],
+           (size_t)ctx->args[2]);
+    *ctx->ret = ctx->args[0];
+}
+
+/* ── Debug / Trap ───────────────────────────────────── */
+
+static void intr_trap(vir_intrinsic_ctx_t *ctx) {
+    (void)ctx;
+    abort();
+}
+
+/* ═══════════════════════════════════════════════════════
+ * §Phase-9 Intrinsic Table (VIR_INTR_* → handler)
+ * ═══════════════════════════════════════════════════════
+ * Order MUST match vir_intrinsic_id_t in vm.h exactly.
+ * Entries beyond VIR_INTR_COUNT are zero-initialized
+ * (NULL fn pointer → treated as no-op with result=0).
+ * ═══════════════════════════════════════════════════════ */
+vir_intr_desc_t vir_intr_table[VIR_MAX_INTRINSICS] = {
+    /* ID 0 */ { intr_syscall,   0, INTR_IMPURE,              "syscall"    },
+    /* ID 1 */ { intr_sys_read,  3, INTR_IMPURE,              "sys_read"   },
+    /* ID 2 */ { intr_sys_write, 3, INTR_IMPURE,              "sys_write"  },
+    /* ID 3 */ { intr_sys_open,  3, INTR_IMPURE,              "sys_open"   },
+    /* ID 4 */ { intr_sys_close, 1, INTR_IMPURE,              "sys_close"  },
+    /* ID 5 */ { intr_sys_lseek, 3, INTR_IMPURE,              "sys_lseek"  },
+    /* ID 6 */ { intr_sys_mmap,  6, INTR_IMPURE,              "sys_mmap"   },
+    /* ID 7 */ { intr_sys_munmap,2, INTR_IMPURE,              "sys_munmap" },
+    /* ID 8 */ { intr_sys_exit,  1, INTR_IMPURE | INTR_TRAP,  "sys_exit"   },
+    /* ID 9 */ { intr_memcpy,    3, INTR_IMPURE,              "memcpy"     },
+    /* ID10 */ { intr_memset,    3, INTR_IMPURE,              "memset"     },
+    /* ID11 */ { intr_trap,      0, INTR_IMPURE | INTR_TRAP,  "trap"       },
+    /* 12..VIR_MAX_INTRINSICS-1 = {NULL,0,0,NULL} (zero-init) */
+};
+
+/* ═══════════════════════════════════════════════════════
+ * §Phase-8 compat shim (legacy bodyless-shim intercept)
+ * ═══════════════════════════════════════════════════════
+ * Kept ONLY for extern functions that were compiled before
+ * Phase-9 and still arrive as Q_CALL_FUNC / Q_TAILCALL_FUNC
+ * to empty-body shims.  New code emits Q_INTRINSIC instead.
+ *
+ * When the compiler is fully upgraded to Phase-9 this
+ * function can be deleted.
+ * ═══════════════════════════════════════════════════════ */
 static int vm_try_syscall_intrinsic(vm_state_t *vm, const q_function_t *callee)
 {
     if (!callee || callee->body_count != 0) return 0;
     const char *n = callee->name;
-    int64_t r0 = vm->regs[0];
-    int64_t r1 = vm->regs[1];
-    int64_t r2 = vm->regs[2];
-    int64_t r3 = vm->regs[3];
-    int64_t r4 = vm->regs[4];
-    int64_t r5 = vm->regs[5];
-    int64_t result = 0;
 
-    /* Raw POSIX-style helpers (mmap/munmap/read/write/open/close/exit).
-     * The Vir-level `syscall1/2/3` shims strip the arch-specific number
-     * and dispatch directly here by name; pure mmap syscalls must also
-     * be reachable for allocator bring-up. */
-    if (strcmp(n, "sys_write") == 0) {
-        result = (int64_t)write((int)r0, (const void *)(uintptr_t)r1, (size_t)r2);
-    } else if (strcmp(n, "sys_read") == 0) {
-        result = (int64_t)read((int)r0, (void *)(uintptr_t)r1, (size_t)r2);
-    } else if (strcmp(n, "sys_open") == 0) {
-        result = (int64_t)open((const char *)(uintptr_t)r0, (int)r1, (mode_t)r2);
-    } else if (strcmp(n, "sys_close") == 0) {
-        result = (int64_t)close((int)r0);
-    } else if (strcmp(n, "sys_lseek") == 0) {
-        result = (int64_t)lseek((int)r0, (off_t)r1, (int)r2);
-    } else if (strcmp(n, "sys_exit") == 0) {
-        exit((int)r0);
-    } else if (strcmp(n, "sys_mmap") == 0) {
-        void *p = mmap((void *)(uintptr_t)r0, (size_t)r1,
-                       (int)r2, (int)r3, (int)r4, (off_t)r5);
-        result = (int64_t)(intptr_t)p;
-    } else if (strcmp(n, "sys_munmap") == 0) {
-        result = (int64_t)munmap((void *)(uintptr_t)r0, (size_t)r1);
-    } else if (strcmp(n, "syscall1") == 0 ||
-               strcmp(n, "syscall2") == 0 ||
-               strcmp(n, "syscall3") == 0 ||
-               strcmp(n, "syscall6") == 0) {
-        /* Raw syscall passthrough: r0 = number, r1..r6 = args.
-         * We translate a handful of macOS-style BSD numbers (| 0x2000000).
-         * Anything unknown returns -1 so callers fall back gracefully. */
-        long sn = (long)r0;
-        long s = sn & 0x00FFFFFF;
-        switch (s) {
-        case 1:   exit((int)r1); break;
-        case 3:   result = read((int)r1, (void *)(uintptr_t)r2, (size_t)r3); break;
-        case 4:   result = write((int)r1, (const void *)(uintptr_t)r2, (size_t)r3); break;
-        case 5:   result = open((const char *)(uintptr_t)r1, (int)r2, (mode_t)r3); break;
-        case 6:   result = close((int)r1); break;
-        case 197: {
-            void *p = mmap((void *)(uintptr_t)r1, (size_t)r2,
-                           (int)r3, (int)r4, (int)r5, 0);
-            result = (int64_t)(intptr_t)p;
-            break;
-        }
-        case 73:  result = munmap((void *)(uintptr_t)r1, (size_t)r2); break;
-        default:  result = -1; break;
-        }
-    } else {
-        return 0;
-    }
-    vm->regs[0] = result;
+    /* Map function name → VIR_INTR_* ID, then delegate to table */
+    vir_intrinsic_id_t id;
+    if      (strcmp(n, "sys_write")  == 0) id = VIR_INTR_SYS_WRITE;
+    else if (strcmp(n, "sys_read")   == 0) id = VIR_INTR_SYS_READ;
+    else if (strcmp(n, "sys_open")   == 0) id = VIR_INTR_SYS_OPEN;
+    else if (strcmp(n, "sys_close")  == 0) id = VIR_INTR_SYS_CLOSE;
+    else if (strcmp(n, "sys_lseek")  == 0) id = VIR_INTR_SYS_LSEEK;
+    else if (strcmp(n, "sys_exit")   == 0) id = VIR_INTR_SYS_EXIT;
+    else if (strcmp(n, "sys_mmap")   == 0) id = VIR_INTR_SYS_MMAP;
+    else if (strcmp(n, "sys_munmap") == 0) id = VIR_INTR_SYS_MUNMAP;
+    else if (strcmp(n, "syscall1")   == 0 ||
+             strcmp(n, "syscall2")   == 0 ||
+             strcmp(n, "syscall3")   == 0 ||
+             strcmp(n, "syscall6")   == 0)  id = VIR_INTR_SYSCALL;
+    else return 0;
+
+    /* Dispatch via table — same path as Q_INTRINSIC */
+    int64_t ret_val = 0;
+    vir_intrinsic_ctx_t ctx = {
+        .args = &vm->regs[0],
+        .argc = (int)vir_intr_table[id].argc,
+        .ret  = &ret_val,
+        .vm   = vm,
+    };
+    vir_intr_table[id].fn(&ctx);
+    vm->regs[0] = ret_val;
     return 1;
 }
+
+
 
 /* Shared dispatch used by both Q_CALL_FUNC and Q_CALL_INDIRECT.
  * Saves caller registers, copies R0..R(n-1) into callee param vregs,
@@ -647,6 +754,29 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
 {
     if (fidx >= vm->module->func_count) return VM_ERR_BAD_JUMP;
     const q_function_t *callee = &vm->module->functions[fidx];
+
+    /* §Phase-8: route empty-body shims to POSIX syscall intrinsics
+     * before pushing a frame. If handled, since it's a tail call,
+     * we simulate a return from the current function frame. */
+    if (vm_try_syscall_intrinsic(vm, callee)) {
+        /* Intrinsic executed and set R0. Now simulate a return from the caller. */
+        if (vm->func_depth > 0) {
+            vm->func_depth--;
+            /* Restore saved registers but keep R0 */
+            int64_t ret_val = vm->regs[0];
+            uint32_t nregs = vm->func_stack[vm->func_depth].saved_reg_count;
+            for (uint32_t ri = 0; ri < nregs; ri++) {
+                vm->regs[ri] = vm->func_stack[vm->func_depth].saved_regs[ri];
+            }
+            vm->regs[0] = ret_val;
+            vm->ip = vm->func_stack[vm->func_depth].ip;
+            vm->current_func = vm->func_stack[vm->func_depth].func;
+        } else {
+            /* Tailcall from top-level function */
+            vm->ip = vm->current_func->body_count; /* Force exit loop */
+        }
+        return VM_OK;
+    }
 
     /* For tail call, we reuse the current frame.
      * Update parameter vregs for the callee. */
@@ -1716,6 +1846,31 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_LABEL:
         break;
 
+    /* ── §Phase-9 Intrinsic Registry ───────────────────── */
+    case Q_INTRINSIC: {
+        /* src1 = intrinsic_id (OPERAND_IMM)
+         * src2 = argc         (OPERAND_IMM, informational)
+         * dest = return vreg  */
+        uint32_t id   = (uint32_t)instr->src1.imm;
+        uint32_t argc = (instr->src2.type == OPERAND_IMM)
+                        ? (uint32_t)instr->src2.imm : 0;
+        if (id < VIR_MAX_INTRINSICS && vir_intr_table[id].fn) {
+            int64_t ret_val = 0;
+            vir_intrinsic_ctx_t ctx = {
+                .args = &vm->regs[0],
+                .argc = (int)argc,
+                .ret  = &ret_val,
+                .vm   = vm,
+            };
+            vir_intr_table[id].fn(&ctx);
+            set_dest(vm, &instr->dest, ret_val);
+        }
+        /* NULL fn pointer → no-op, result = 0 */
+        break;
+    }
+
+
+
     /* ── Green Thread / Task opcodes (A2) ──────────────── */
     case Q_TASK_SPAWN: {
         /* dest = task_spawn(src1 = function index)
@@ -1900,8 +2055,15 @@ vm_status_t vm_exec_function(vm_state_t *vm, const q_function_t *func)
     while (vm->current_func) {
         const q_function_t *f = vm->current_func;
         if (vm->ip >= f->body_count) {
-            /* Fell off end of function - implicit return 0 */
-            vm->regs[0] = 0;
+            /* If this is an empty function, it might be a syscall intrinsic */
+            int handled = 0;
+            if (f->body_count == 0) {
+                handled = vm_try_syscall_intrinsic(vm, f);
+            }
+            if (!handled) {
+                /* Fell off end of function - implicit return 0 */
+                vm->regs[0] = 0;
+            }
             if (vm->func_depth > 0) {
                 vm->func_depth--;
                 int64_t ref_bindings[Q_MAX_PARAMS] = {0};

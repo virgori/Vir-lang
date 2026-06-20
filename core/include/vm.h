@@ -45,6 +45,73 @@ typedef int64_t (*vm_patch_handler_t)(uint32_t patch_id, int64_t *regs,
                                       uint32_t reg_count, void *userdata);
 
 /* ═══════════════════════════════════════════════════════
+ * §Phase-9 Intrinsic Registry
+ * ═══════════════════════════════════════════════════════
+ * Table-driven O(1) dispatch for all external effects.
+ * The VM layer knows nothing about language semantics or
+ * OS ABI — it only calls fn(ctx).
+ *
+ * Instruction format (Q_INTRINSIC):
+ *   dest = return vreg
+ *   src1 = OPERAND_IMM  intrinsic_id  (index into table)
+ *   src2 = OPERAND_IMM  argc          (args in R0..Rn)
+ */
+
+/* Intrinsic IDs — must match intrinsic_table[] order in vm.c */
+typedef enum {
+    /* Syscall passthrough (raw POSIX) */
+    VIR_INTR_SYSCALL        = 0,  /* R0=num, R1..R6=args         */
+    VIR_INTR_SYS_READ       = 1,  /* R0=fd, R1=buf, R2=len       */
+    VIR_INTR_SYS_WRITE      = 2,  /* R0=fd, R1=buf, R2=len       */
+    VIR_INTR_SYS_OPEN       = 3,  /* R0=path, R1=flags, R2=mode  */
+    VIR_INTR_SYS_CLOSE      = 4,  /* R0=fd                       */
+    VIR_INTR_SYS_LSEEK      = 5,  /* R0=fd, R1=offset, R2=whence */
+    VIR_INTR_SYS_MMAP       = 6,  /* R0..R5=mmap args            */
+    VIR_INTR_SYS_MUNMAP     = 7,  /* R0=addr, R1=len             */
+    VIR_INTR_SYS_EXIT       = 8,  /* R0=code                     */
+    /* Memory */
+    VIR_INTR_MEMCPY         = 9,  /* R0=dst, R1=src, R2=len      */
+    VIR_INTR_MEMSET         = 10, /* R0=dst, R1=val, R2=len      */
+    /* Debug / Trap */
+    VIR_INTR_TRAP           = 11, /* abort()                     */
+
+    VIR_INTR_COUNT          = 12  /* sentinel – size of table    */
+} vir_intrinsic_id_t;
+
+/* Execution context passed to every intrinsic handler */
+typedef struct vm_state vm_state_t;  /* forward declaration for vir_intrinsic_ctx_t */
+typedef struct {
+    int64_t        *args;   /* pointer to vm->regs[0]              */
+    int             argc;   /* number of arguments (informational) */
+    int64_t        *ret;    /* pointer to dest register            */
+    vm_state_t     *vm;     /* full VM state (escape hatch)        */
+} vir_intrinsic_ctx_t;
+
+
+typedef void (*vir_intrinsic_fn)(vir_intrinsic_ctx_t *ctx);
+
+/* Flags for vir_intr_desc_t.flags */
+#define INTR_PURE     0x01   /* No side effects – may be DCE'd     */
+#define INTR_IMPURE   0x02   /* Has side effects (I/O, memory)     */
+#define INTR_TRAP     0x04   /* Never returns (exit / abort)       */
+#define INTR_NOINLINE 0x08   /* Do not inline into caller          */
+
+typedef struct {
+    vir_intrinsic_fn fn;
+    uint8_t          argc;   /* expected arg count (0 = variadic)  */
+    uint8_t          flags;  /* INTR_* flags                       */
+    const char      *name;   /* human-readable name (debug/trace)  */
+} vir_intr_desc_t;
+
+#define VIR_MAX_INTRINSICS 1024
+
+/* Intrinsic registry – defined and populated in vm.c */
+extern vir_intr_desc_t vir_intr_table[VIR_MAX_INTRINSICS];
+
+
+
+
+/* ═══════════════════════════════════════════════════════
  * VM Array (dynamic int64 array for Q_ARR_* opcodes)
  * ═══════════════════════════════════════════════════════ */
 
@@ -107,7 +174,8 @@ typedef struct {
 #define VM_MAX_HEAP_BLOCKS 16384
 #define VM_MAX_STRINGS_RT  16384
 
-typedef struct {
+typedef struct vm_state {
+
     /* Virtual registers (§2.2 – unlimited, but capped at VREG_MAX) */
     int64_t         regs[VREG_MAX];
     uint32_t        reg_count;      /* Highest vreg used + 1 */

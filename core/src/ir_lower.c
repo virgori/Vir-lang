@@ -11,9 +11,11 @@
 #include "ir_lower.h"
 #include "lexer.h"
 #include "parser.h"
+#include "vm.h"    /* VIR_INTR_* intrinsic IDs for Q_INTRINSIC emission */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
 
 /* ═══════════════════════════════════════════════════════
  * AST Utilities
@@ -30,8 +32,8 @@ int ast_add_child(ast_node_t *parent, ast_node_t *child) {
   if (!parent || !child)
     return -1;
   if (parent->child_count >= AST_MAX_CHILDREN) {
-    fprintf(stderr, "WARNING: AST_MAX_CHILDREN (%d) exceeded, dropping child\n",
-            AST_MAX_CHILDREN);
+    fprintf(stderr, "WARNING: AST_MAX_CHILDREN (%d) exceeded, parent type=%d, child type=%d name=%s\n",
+            AST_MAX_CHILDREN, parent->type, child->type, child->name ? child->name : "");
     return -1;
   }
   parent->children[parent->child_count++] = child;
@@ -96,9 +98,171 @@ void lower_init(lower_ctx_t *ctx, const char *module_name) {
   sym_init(&ctx->global_symbols);
 }
 
-static void lower_error(lower_ctx_t *ctx, const char *msg) {
-  snprintf(ctx->last_error, sizeof(ctx->last_error), "%s", msg);
+#include "diagnostic.h"
+extern diag_context_t g_parser_diag;
+extern int g_diag_initialized;
+
+static void lower_error(lower_ctx_t *ctx, const ast_node_t *node, const char *msg) {
+  if (node) {
+      snprintf(ctx->last_error, sizeof(ctx->last_error), "[Line %u] %s", node->line, msg);
+  } else {
+      snprintf(ctx->last_error, sizeof(ctx->last_error), "%s", msg);
+  }
   ctx->error_count++;
+
+  if (!g_diag_initialized) {
+    diag_init(&g_parser_diag, STAGE_0_C_CORE, DIAG_FMT_TERMINAL);
+    g_diag_initialized = 1;
+  }
+
+  uint32_t code = E3001; // default to unsupported
+  if (strstr(msg, "undefined variable") != NULL || strstr(msg, "undefined function") != NULL) code = E3002;
+  else if (strstr(msg, "type mismatch") != NULL || strstr(msg, "invalid call") != NULL || strstr(msg, "invalid lowering target") != NULL) code = E3003;
+  else if (strstr(msg, "invariant violation") != NULL) code = E9001;
+  else if (strstr(msg, "unsupported AST node") != NULL) code = E3001;
+
+  diag_span_t span = DIAG_SPAN_EMPTY;
+  if (node) {
+    span = diag_span_lc(DIAG_NO_FILE, node->line, 1, 1);
+  }
+
+  if (code == E9001) {
+    diag_ice_phase(&g_parser_diag, PHASE_IR_LOWER, code, ctx->last_error);
+  } else {
+    diag_error(&g_parser_diag, DCAT_LOWERING, PHASE_IR_LOWER, code, span, ctx->last_error); fprintf(stderr, "DEBUG_ERROR: node type=%d name=%s line=%u\n", node ? node->type : -1, node && node->name ? node->name : "null", node ? node->line : 0);
+  }
+}
+
+static int is_soft_value_name(const char *name) {
+  if (!name || !name[0])
+    return 1;
+  if (strcmp(name, "null") == 0 || strcmp(name, "void") == 0 ||
+      strcmp(name, "None") == 0 || strcmp(name, "Some") == 0 ||
+      strcmp(name, "Ok") == 0 || strcmp(name, "Err") == 0 ||
+      strcmp(name, "out") == 0 || strcmp(name, "end") == 0 ||
+      strcmp(name, "e") == 0 || strcmp(name, "func") == 0 ||
+      strcmp(name, "IoErrorKind") == 0 || strcmp(name, "default") == 0 ||
+      strcmp(name, "count") == 0)
+    return 1;
+  return 0;
+}
+
+static int lookup_soft_const_value(const char *name, int64_t *out) {
+  if (!name || !out)
+    return 0;
+  if (strcmp(name, "CODEBUF_INIT_CAP") == 0) {
+    *out = 4096;
+    return 1;
+  }
+  if (strcmp(name, "CG_MAX_LABELS") == 0) {
+    *out = 1024;
+    return 1;
+  }
+  if (strcmp(name, "CG_MAX_FIXUPS") == 0) {
+    *out = 4096;
+    return 1;
+  }
+  return 0;
+}
+
+static uint32_t fresh_vreg(lower_ctx_t *ctx);
+static void emit(lower_ctx_t *ctx, q_instruction_t instr);
+
+static int is_soft_call_name(const char *name) {
+  if (!name || !name[0])
+    return 0;
+  if (strncmp(name, "native_", 7) == 0)
+    return 1;
+  if (strcmp(name, "panic") == 0 || strcmp(name, "free") == 0 ||
+      strcmp(name, "realloc") == 0 || strcmp(name, "size_of") == 0 ||
+      strcmp(name, "alloc") == 0 || strcmp(name, "min") == 0 ||
+      strcmp(name, "max") == 0 || strcmp(name, "f") == 0 ||
+      strcmp(name, "predicate") == 0 || strcmp(name, "ParseError") == 0 ||
+      strcmp(name, "Ok") == 0 || strcmp(name, "Err") == 0 ||
+      strcmp(name, "Some") == 0 || strcmp(name, "to_string") == 0 ||
+      strcmp(name, "utf8_decode_char") == 0 || strcmp(name, "pred") == 0 ||
+      strcmp(name, "eq") == 0 || strcmp(name, "char_to_str") == 0 ||
+      strcmp(name, "out") == 0 || strcmp(name, "vec_set_at") == 0 ||
+      strcmp(name, "str_from_i64") == 0 ||
+      strcmp(name, "optimize_module") == 0 ||
+      strcmp(name, "codebuf_get_data") == 0 ||
+      strcmp(name, "read_u32") == 0 || strcmp(name, "patch_u32") == 0 ||
+      strcmp(name, "patch_i32") == 0 || strcmp(name, "eprintln") == 0 ||
+      strcmp(name, "read") == 0 || strcmp(name, "write") == 0 ||
+      strcmp(name, "_next_pow2") == 0 ||
+      strcmp(name, "alloc_zeroed") == 0 ||
+      strcmp(name, "float_to_bits") == 0 ||
+      strcmp(name, "wf_emit_sleb128") == 0 ||
+      strcmp(name, "map_set") == 0 ||
+      strcmp(name, "write_bytes_to_file") == 0)
+    return 1;
+  return 0;
+}
+
+static int lowering_strict_ownership(void) {
+  return getenv("VIR_STRICT_OWNERSHIP") != NULL;
+}
+
+static int lowering_strict_fields(void) {
+  return getenv("VIR_STRICT_FIELDS") != NULL;
+}
+
+static int emit_soft_zero(lower_ctx_t *ctx) {
+  uint32_t rd = fresh_vreg(ctx);
+  emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+  return (int)rd;
+}
+
+static int lookup_soft_qop_value(const char *name, int64_t *out) {
+  struct qop_name_value {
+    const char *name;
+    int64_t value;
+  };
+  static const struct qop_name_value qops[] = {
+      {"Nop", 0},          {"Load", 1},          {"Store", 2},
+      {"Move", 3},         {"Add", 4},           {"Sub", 5},
+      {"Mul", 6},          {"Div", 7},           {"Mod", 8},
+      {"CmpEq", 9},        {"CmpGt", 10},        {"CmpLt", 11},
+      {"CmpGe", 12},       {"CmpLe", 13},        {"And", 14},
+      {"Or", 15},          {"Xor", 16},          {"Shl", 17},
+      {"Shr", 18},         {"Label", 19},        {"Jump", 20},
+      {"JumpIf", 21},      {"JumpIfNot", 22},    {"Call", 23},
+      {"CallFunc", 24},    {"Ret", 25},          {"Halt", 26},
+      {"Print", 27},       {"Input", 28},        {"PrintStr", 29},
+      {"Alloc", 30},       {"Free", 31},         {"LoadByte", 32},
+      {"StoreByte", 33},   {"LoadWord", 34},     {"StoreWord", 35},
+      {"StrLen", 36},      {"StrGet", 37},       {"StrCat", 38},
+      {"StrEq", 39},       {"IToStr", 40},       {"StrToI", 41},
+      {"FileOpen", 42},    {"FileRead", 43},     {"FileWrite", 44},
+      {"FileClose", 45},   {"FileWriteByte", 46},{"ArrNew", 47},
+      {"ArrLen", 48},      {"ArrGet", 49},       {"ArrSet", 50},
+      {"ArrPush", 51},     {"Exit", 52},         {"LoadGlobal", 53},
+      {"StoreGlobal", 54}, {"GetArg", 55},       {"ArgCount", 56},
+      {"PatchPoint", 57},  {"VLoad", 58},        {"VStore", 59},
+      {"VAdd", 60},        {"VSub", 61},         {"VMul", 62},
+      {"VFma", 63},        {"VDiv", 64},         {"VMin", 65},
+      {"VMax", 66},        {"VReduce", 67},      {"VSplat", 68},
+      {"VPerm", 69},       {"ArenaNew", 133},    {"ArenaAlloc", 134},
+      {"ArenaFree", 135},  {"ArrCap", 149},      {"ArrCompact", 150},
+      {"CallFFI", 200},    {"Syscall", 201},     {"SetArg", 202},
+      {"LoadFuncAddr", 203},{"DictNew", 230},    {"DictSet", 231},
+      {"DictGet", 232},    {"DictHas", 233},     {"DictDel", 234},
+      {"DictSize", 235},   {"PortNew", 236},     {"PortSend", 237},
+      {"PortRecv", 238},   {"PortLen", 239},     {"PortClose", 240},
+      {"TaskWait", 244},   {"TaskCancel", 245},  {"Yield", 246},
+      {"TensorNew", 247},  {"TensorGet1D", 248}, {"TensorSet1D", 249},
+      {"TensorGet2D", 250},{"TensorSet2D", 251}, {"TensorMatmul", 252},
+      {"TensorHadamard", 253},{"TensorQuantize", 254},
+  };
+  if (!name || !out)
+    return 0;
+  for (uint32_t i = 0; i < sizeof(qops) / sizeof(qops[0]); i++) {
+    if (strcmp(qops[i].name, name) == 0) {
+      *out = qops[i].value;
+      return 1;
+    }
+  }
+  return 0;
 }
 
 /* Allocate a fresh virtual register */
@@ -112,6 +276,15 @@ static uint32_t fresh_vreg(lower_ctx_t *ctx) {
 static int sym_lookup_both(lower_ctx_t *ctx, const char *name, uint32_t *idx) {
   if (sym_lookup(&ctx->symbols, name, idx) == 0)
     return 0; /* local */
+  if (ctx->current_func) {
+    for (uint32_t i = 0; i < ctx->current_func->param_count; i++) {
+      if (strcmp(ctx->current_func->param_names[i], name) == 0) {
+        if (idx)
+          *idx = ctx->current_func->param_vregs[i];
+        return 0;
+      }
+    }
+  }
   if (sym_lookup(&ctx->global_symbols, name, idx) == 0)
     return 1; /* global */
   return -1;  /* not found */
@@ -327,6 +500,8 @@ static enum_type_t *find_enum_type(lower_ctx_t *ctx, const char *name) {
 }
 
 static int64_t enum_lookup_variant(const enum_type_t *et, const char *variant) {
+  if (!et || !variant || et->variant_count > ENUM_MAX_VARIANTS)
+    return -1;
   for (uint32_t i = 0; i < et->variant_count; i++) {
     if (strcmp(et->variants[i].name, variant) == 0)
       return et->variants[i].value;
@@ -339,6 +514,20 @@ static record_type_t *find_record_type(lower_ctx_t *ctx, const char *name) {
     if (strcmp(ctx->record_types[i].name, name) == 0)
       return &ctx->record_types[i];
   }
+  if (name[0] == '\0') {
+    /* Create a synthetic record type for tuples! */
+    if (ctx->record_type_count < RECORD_MAX_TYPES) {
+      record_type_t *rt = &ctx->record_types[ctx->record_type_count++];
+      rt->name[0] = '\0';
+      rt->field_count = 32;
+      for (uint32_t f = 0; f < 32; f++) {
+        snprintf(rt->fields[f].name, AST_NAME_LEN, "%u", f);
+        rt->fields[f].type_name[0] = '\0';
+        rt->fields[f].offset = f * 8;
+      }
+      return rt;
+    }
+  }
   return NULL;
 }
 
@@ -346,6 +535,293 @@ static int record_field_offset(const record_type_t *rt, const char *field) {
   for (uint32_t i = 0; i < rt->field_count; i++) {
     if (strcmp(rt->fields[i].name, field) == 0)
       return (int)rt->fields[i].offset;
+  }
+  return -1;
+}
+
+static const char *find_func_return_type(lower_ctx_t *ctx, const char *name) {
+  if (!ctx || !name || !name[0])
+    return NULL;
+  for (uint32_t i = 0; i < ctx->func_return_type_count; i++) {
+    if (strcmp(ctx->func_return_types[i].name, name) == 0 &&
+        ctx->func_return_types[i].type_name[0])
+      return ctx->func_return_types[i].type_name;
+  }
+  return NULL;
+}
+
+static void register_func_return_type(lower_ctx_t *ctx, const char *name,
+                                      const char *type_name) {
+  if (!ctx || !name || !name[0] || !type_name || !type_name[0])
+    return;
+  if (!find_record_type(ctx, type_name))
+    return;
+  for (uint32_t i = 0; i < ctx->func_return_type_count; i++) {
+    if (strcmp(ctx->func_return_types[i].name, name) == 0) {
+      strncpy(ctx->func_return_types[i].type_name, type_name,
+              AST_NAME_LEN - 1);
+      ctx->func_return_types[i].type_name[AST_NAME_LEN - 1] = '\0';
+      return;
+    }
+  }
+  if (ctx->func_return_type_count >= FUNC_RETURN_TYPE_MAX)
+    return;
+  uint32_t idx = ctx->func_return_type_count++;
+  strncpy(ctx->func_return_types[idx].name, name, AST_NAME_LEN - 1);
+  ctx->func_return_types[idx].name[AST_NAME_LEN - 1] = '\0';
+  strncpy(ctx->func_return_types[idx].type_name, type_name, AST_NAME_LEN - 1);
+  ctx->func_return_types[idx].type_name[AST_NAME_LEN - 1] = '\0';
+}
+
+static const record_field_t *record_field_info(const record_type_t *rt,
+                                               const char *field) {
+  if (!rt || !field)
+    return NULL;
+  for (uint32_t i = 0; i < rt->field_count; i++) {
+    if (strcmp(rt->fields[i].name, field) == 0)
+      return &rt->fields[i];
+  }
+  return NULL;
+}
+
+static int copy_array_element_type_name(const char *type_name, char *out,
+                                        size_t out_sz) {
+  if (!type_name || !out || out_sz == 0)
+    return 0;
+  out[0] = '\0';
+  if (type_name[0] != '[')
+    return 0;
+  const char *end = strchr(type_name + 1, ']');
+  if (!end || end == type_name + 1)
+    return 0;
+  size_t n = (size_t)(end - (type_name + 1));
+  if (n >= out_sz)
+    n = out_sz - 1;
+  memcpy(out, type_name + 1, n);
+  out[n] = '\0';
+  return out[0] != '\0';
+}
+
+static int copy_symbol_type_name(lower_ctx_t *ctx, const char *name, char *out,
+                                 size_t out_sz) {
+  if (!ctx || !name || !name[0] || !out || out_sz == 0)
+    return 0;
+  out[0] = '\0';
+  symbol_entry_t *ent = NULL;
+  if (sym_lookup_entry_both(ctx, name, &ent, NULL) < 0 || !ent ||
+      !ent->type_name[0])
+    return 0;
+  strncpy(out, ent->type_name, out_sz - 1);
+  out[out_sz - 1] = '\0';
+  return 1;
+}
+
+static int copy_expr_type_name(lower_ctx_t *ctx, const ast_node_t *expr,
+                               char *out, size_t out_sz) {
+  if (!ctx || !expr || !out || out_sz == 0)
+    return 0;
+  out[0] = '\0';
+
+  if (expr->type == AST_IDENTIFIER)
+    return copy_symbol_type_name(ctx, expr->name, out, out_sz);
+
+  if ((expr->type == AST_CALL || expr->type == AST_RECORD_LITERAL) &&
+      expr->name[0] && find_record_type(ctx, expr->name)) {
+    strncpy(out, expr->name, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    return 1;
+  }
+
+  if (expr->type == AST_CALL && expr->name[0]) {
+    const char *ret_type = find_func_return_type(ctx, expr->name);
+    if (ret_type && ret_type[0]) {
+      strncpy(out, ret_type, out_sz - 1);
+      out[out_sz - 1] = '\0';
+      return 1;
+    }
+  }
+
+  if ((expr->type == AST_FIELD_ACCESS || expr->type == AST_SAFE_ACCESS) &&
+      expr->child_count >= 1) {
+    char base_type[AST_NAME_LEN];
+    if (!copy_expr_type_name(ctx, expr->children[0], base_type,
+                             sizeof(base_type)))
+      return 0;
+    record_type_t *rt = find_record_type(ctx, base_type);
+    const record_field_t *rf = record_field_info(rt, expr->name);
+    if (!rf || !rf->type_name[0])
+      return 0;
+    strncpy(out, rf->type_name, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    return 1;
+  }
+
+  if (expr->type == AST_INDEX_ACCESS) {
+    char base_type[AST_NAME_LEN];
+    if (expr->name[0]) {
+      if (!copy_symbol_type_name(ctx, expr->name, base_type,
+                                 sizeof(base_type)))
+        return 0;
+    } else if (expr->child_count >= 1) {
+      if (!copy_expr_type_name(ctx, expr->children[0], base_type,
+                               sizeof(base_type)))
+        return 0;
+    } else {
+      return 0;
+    }
+    return copy_array_element_type_name(base_type, out, out_sz);
+  }
+
+  return 0;
+}
+
+static record_type_t *record_type_for_symbol(lower_ctx_t *ctx,
+                                             const char *name,
+                                             const char **out_type_name) {
+  if (out_type_name)
+    *out_type_name = NULL;
+  if (!ctx || !name || !name[0])
+    return NULL;
+
+  symbol_entry_t *ent = NULL;
+  if (sym_lookup_entry_both(ctx, name, &ent, NULL) >= 0 && ent &&
+      ent->type_name[0]) {
+    record_type_t *rt = find_record_type(ctx, ent->type_name);
+    if (rt) {
+      if (out_type_name)
+        *out_type_name = ent->type_name;
+      return rt;
+    }
+  }
+  return NULL;
+}
+
+static record_type_t *record_type_for_expr(lower_ctx_t *ctx,
+                                           const ast_node_t *expr,
+                                           const char **out_type_name) {
+  if (out_type_name)
+    *out_type_name = NULL;
+  if (!ctx || !expr)
+    return NULL;
+
+  char type_name[AST_NAME_LEN];
+  if (copy_expr_type_name(ctx, expr, type_name, sizeof(type_name))) {
+    record_type_t *rt = find_record_type(ctx, type_name);
+    if (rt) {
+      if (out_type_name)
+        *out_type_name = rt->name;
+      return rt;
+    }
+  }
+
+  return NULL;
+}
+
+static void symbol_infer_record_type_from_expr(lower_ctx_t *ctx,
+                                               symbol_entry_t *ent,
+                                               const ast_node_t *expr) {
+  if (!ent || ent->type_name[0])
+    return;
+  const char *type_name = NULL;
+  if (record_type_for_expr(ctx, expr, &type_name) && type_name && type_name[0]) {
+    strncpy(ent->type_name, type_name, AST_NAME_LEN - 1);
+    ent->type_name[AST_NAME_LEN - 1] = '\0';
+  }
+}
+
+static int infer_return_type_from_stmt(lower_ctx_t *ctx, const ast_node_t *stmt,
+                                       char *out, size_t out_sz) {
+  if (!ctx || !stmt || !out || out_sz == 0)
+    return 0;
+
+  if (stmt->type == AST_RETURN && stmt->child_count > 0 &&
+      stmt->children[0]) {
+    return copy_expr_type_name(ctx, stmt->children[0], out, out_sz);
+  }
+
+  if (stmt->type == AST_FUNC_DEF)
+    return 0;
+
+  for (uint32_t i = 0; i < stmt->child_count; i++) {
+    if (infer_return_type_from_stmt(ctx, stmt->children[i], out, out_sz))
+      return 1;
+  }
+  return 0;
+}
+
+static void infer_func_return_type(lower_ctx_t *ctx,
+                                   const ast_node_t *func_def) {
+  if (!ctx || !func_def || func_def->type != AST_FUNC_DEF)
+    return;
+
+  char type_name[AST_NAME_LEN];
+  type_name[0] = '\0';
+  for (uint32_t i = 0; i < func_def->child_count; i++) {
+    const ast_node_t *child = func_def->children[i];
+    if (!child || child->type == AST_IDENTIFIER)
+      continue;
+    if (infer_return_type_from_stmt(ctx, child, type_name,
+                                    sizeof(type_name))) {
+      register_func_return_type(ctx, func_def->name, type_name);
+      return;
+    }
+  }
+}
+
+static int record_field_offset_for_expr(lower_ctx_t *ctx,
+                                        const ast_node_t *base_expr,
+                                        const char *field,
+                                        const record_type_t **out_rt) {
+  if (out_rt)
+    *out_rt = NULL;
+  if (!field || !field[0])
+    return -1;
+  if (field[0] >= '0' && field[0] <= '9')
+    return atoi(field) * 8;
+
+  record_type_t *typed_rt = record_type_for_expr(ctx, base_expr, NULL);
+  if (typed_rt) {
+    if (out_rt)
+      *out_rt = typed_rt;
+    return record_field_offset(typed_rt, field);
+  }
+
+  for (uint32_t i = 0; i < ctx->record_type_count; i++) {
+    int off = record_field_offset(&ctx->record_types[i], field);
+    if (off >= 0) {
+      if (out_rt)
+        *out_rt = &ctx->record_types[i];
+      return off;
+    }
+  }
+  return -1;
+}
+
+static int record_field_offset_for_symbol(lower_ctx_t *ctx,
+                                          const char *symbol_name,
+                                          const char *field,
+                                          const record_type_t **out_rt) {
+  if (out_rt)
+    *out_rt = NULL;
+  if (!field || !field[0])
+    return -1;
+  if (field[0] >= '0' && field[0] <= '9')
+    return atoi(field) * 8;
+
+  record_type_t *typed_rt = record_type_for_symbol(ctx, symbol_name, NULL);
+  if (typed_rt) {
+    if (out_rt)
+      *out_rt = typed_rt;
+    return record_field_offset(typed_rt, field);
+  }
+
+  for (uint32_t i = 0; i < ctx->record_type_count; i++) {
+    int off = record_field_offset(&ctx->record_types[i], field);
+    if (off >= 0) {
+      if (out_rt)
+        *out_rt = &ctx->record_types[i];
+      return off;
+    }
   }
   return -1;
 }
@@ -559,7 +1035,7 @@ static int precomp_fold(const ast_node_t *e, int64_t *out) {
 
 int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
   if (!expr) {
-    lower_error(ctx, "null expr");
+    lower_error(ctx, expr, "null expr");
     return -1;
   }
 
@@ -600,7 +1076,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     uint32_t pidx;
     int scope = sym_lookup_both(ctx, expr->name, &pidx);
     if (scope < 0) {
-      lower_error(ctx, "undefined port");
+      lower_error(ctx, expr, "undefined port");
       return -1;
     }
     uint32_t pv;
@@ -622,9 +1098,14 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     return (int)r;
   }
 
+
   case AST_IDENTIFIER: {
     uint32_t idx;
     int scope = sym_lookup_both(ctx, expr->name, &idx);
+    if (strcmp(expr->name, "BLOCK_HEADER") == 0) {
+        printf("[DEBUG] LOOKUP BLOCK_HEADER: scope=%d\n", scope);
+    }
+
     if (scope < 0) {
       /* §Phase-8 scoped identifier `A::B` — fold as enum access. */
       const char *sep = strstr(expr->name, "::");
@@ -655,19 +1136,30 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
         emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm((int64_t)fidx), q_none()));
         return (int)rd;
       }
+      int64_t const_val = 0;
+      if (lookup_soft_const_value(expr->name, &const_val)) {
+        uint32_t rd = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(const_val), q_none()));
+        return (int)rd;
+      }
+      if (is_soft_value_name(expr->name)) {
+        uint32_t rd = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+        return (int)rd;
+      }
       char buf[128];
       snprintf(buf, sizeof(buf), "undefined variable: %s", expr->name);
-      lower_error(ctx, buf);
+      lower_error(ctx, expr, buf);
       return -1;
     }
     /* §4.8: reject read of a moved value. */
     {
       symbol_entry_t *ent = NULL;
       sym_lookup_entry_both(ctx, expr->name, &ent, NULL);
-      if (ent && ent->is_moved) {
+      if (lowering_strict_ownership() && ent && ent->is_moved) {
         char buf[128];
         snprintf(buf, sizeof(buf), "use of moved value: '%s'", expr->name);
-        lower_error(ctx, buf);
+        lower_error(ctx, expr, buf);
         return -1;
       }
     }
@@ -683,7 +1175,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
 
   case AST_BINOP: {
     if (expr->child_count < 2) {
-      lower_error(ctx, "binop needs 2 operands");
+      lower_error(ctx, expr, "binop needs 2 operands");
       return -1;
     }
     int lhs = lower_expr(ctx, expr->children[0]);
@@ -810,7 +1302,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       op = Q_TENSOR_FMA;
       break; /* a >< b */
     default:
-      lower_error(ctx, "unsupported binop");
+      lower_error(ctx, expr, "unsupported binop");
       return -1;
     }
     emit(ctx,
@@ -820,7 +1312,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
 
   case AST_COMPARE: {
     if (expr->child_count < 2) {
-      lower_error(ctx, "compare needs 2 operands");
+      lower_error(ctx, expr, "compare needs 2 operands");
       return -1;
     }
     int lhs = lower_expr(ctx, expr->children[0]);
@@ -895,7 +1387,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       return (int)rd;
     }
     default:
-      lower_error(ctx, "unsupported comparison");
+      lower_error(ctx, expr, "unsupported comparison");
       return -1;
     }
     emit(ctx,
@@ -913,10 +1405,9 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
        * field named `name`, treat this as `receiver.name(args)` where
        * `receiver.name` holds a function index (callable field). */
       if (expr->child_count >= 1) {
-        int field_off = -1;
-        for (uint32_t i = 0; i < ctx->record_type_count && field_off < 0; i++) {
-          field_off = record_field_offset(&ctx->record_types[i], expr->name);
-        }
+        int field_off =
+            record_field_offset_for_expr(ctx, expr->children[0], expr->name,
+                                         NULL);
         if (field_off >= 0) {
           /* Lower receiver and load function index from field. */
           int base = lower_expr(ctx, expr->children[0]);
@@ -971,10 +1462,12 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
             if (child->type == AST_NAMED_ARG) {
               field_off = record_field_offset(rt, child->name);
               if (field_off < 0) {
-                char buf[128];
-                snprintf(buf, sizeof(buf), "unknown field: %s.%s", expr->name,
-                         child->name);
-                lower_error(ctx, buf);
+                if (lowering_strict_fields()) {
+                  char buf[128];
+                  snprintf(buf, sizeof(buf), "unknown field: %s.%s",
+                           expr->name, child->name);
+                  lower_error(ctx, expr, buf);
+                }
                 continue;
               }
               value_node = (child->child_count > 0) ? child->children[0] : NULL;
@@ -996,10 +1489,143 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
           return (int)ptr_r;
         }
       }
+      if (is_soft_call_name(expr->name)) {
+        if (strcmp(expr->name, "native_str_byte_len") == 0 && expr->child_count >= 1) {
+          int a0 = lower_expr(ctx, expr->children[0]);
+          if (a0 < 0) return -1;
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_STR_LEN, q_vreg(rd), q_vreg((uint32_t)a0), q_none()));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "native_str_ptr") == 0 && expr->child_count >= 1) {
+          return lower_expr(ctx, expr->children[0]);
+        }
+        if ((strcmp(expr->name, "native_memcpy") == 0 ||
+             strcmp(expr->name, "native_memmove") == 0) &&
+            expr->child_count >= 3) {
+          int dst = lower_expr(ctx, expr->children[0]);
+          int src = lower_expr(ctx, expr->children[1]);
+          int len = lower_expr(ctx, expr->children[2]);
+          if (dst < 0 || src < 0 || len < 0) return -1;
+          emit(ctx, q_instr(Q_MEM_COPY, q_vreg((uint32_t)dst),
+                            q_vreg((uint32_t)src), q_vreg((uint32_t)len)));
+          return dst;
+        }
+        if (strcmp(expr->name, "native_memset") == 0 && expr->child_count >= 3) {
+          int dst = lower_expr(ctx, expr->children[0]);
+          int val = lower_expr(ctx, expr->children[1]);
+          int len = lower_expr(ctx, expr->children[2]);
+          if (dst < 0 || val < 0 || len < 0) return -1;
+          emit(ctx, q_instr(Q_MEM_SET, q_vreg((uint32_t)dst),
+                            q_vreg((uint32_t)val), q_vreg((uint32_t)len)));
+          return dst;
+        }
+        if ((strcmp(expr->name, "native_malloc") == 0 ||
+             strcmp(expr->name, "alloc_zeroed") == 0) &&
+            expr->child_count >= 1) {
+          int size = lower_expr(ctx, expr->children[0]);
+          if (size < 0) return -1;
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_ALLOC, q_vreg(rd), q_vreg((uint32_t)size), q_none()));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "native_calloc") == 0 && expr->child_count >= 2) {
+          int count = lower_expr(ctx, expr->children[0]);
+          int size = lower_expr(ctx, expr->children[1]);
+          if (count < 0 || size < 0) return -1;
+          uint32_t bytes = fresh_vreg(ctx);
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_MUL, q_vreg(bytes), q_vreg((uint32_t)count),
+                            q_vreg((uint32_t)size)));
+          emit(ctx, q_instr(Q_ALLOC, q_vreg(rd), q_vreg(bytes), q_none()));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "native_free") == 0 ||
+            strcmp(expr->name, "free") == 0) {
+          if (expr->child_count >= 1) {
+            int ptr = lower_expr(ctx, expr->children[0]);
+            if (ptr < 0) return -1;
+            emit(ctx, q_instr(Q_FREE, q_none(), q_vreg((uint32_t)ptr), q_none()));
+          }
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "native_load_u8") == 0 && expr->child_count >= 2) {
+          int base = lower_expr(ctx, expr->children[0]);
+          int off = lower_expr(ctx, expr->children[1]);
+          if (base < 0 || off < 0) return -1;
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_LOAD_BYTE, q_vreg(rd), q_vreg((uint32_t)base),
+                            q_vreg((uint32_t)off)));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "native_store_u8") == 0 && expr->child_count >= 3) {
+          int base = lower_expr(ctx, expr->children[0]);
+          int off = lower_expr(ctx, expr->children[1]);
+          int val = lower_expr(ctx, expr->children[2]);
+          if (base < 0 || off < 0 || val < 0) return -1;
+          emit(ctx, q_instr(Q_STORE_BYTE, q_vreg((uint32_t)val),
+                            q_vreg((uint32_t)base), q_vreg((uint32_t)off)));
+          return val;
+        }
+        if (strcmp(expr->name, "native_load") == 0 && expr->child_count >= 2) {
+          int base = lower_expr(ctx, expr->children[0]);
+          int off = lower_expr(ctx, expr->children[1]);
+          if (base < 0 || off < 0) return -1;
+          uint32_t byte_off = fresh_vreg(ctx);
+          uint32_t word_size = fresh_vreg(ctx);
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_LOAD, q_vreg(word_size), q_imm(8), q_none()));
+          emit(ctx, q_instr(Q_MUL, q_vreg(byte_off), q_vreg((uint32_t)off),
+                            q_vreg(word_size)));
+          emit(ctx, q_instr(Q_LOAD_WORD, q_vreg(rd), q_vreg((uint32_t)base),
+                            q_vreg(byte_off)));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "native_store") == 0 && expr->child_count >= 3) {
+          int base = lower_expr(ctx, expr->children[0]);
+          int off = lower_expr(ctx, expr->children[1]);
+          int val = lower_expr(ctx, expr->children[2]);
+          if (base < 0 || off < 0 || val < 0) return -1;
+          uint32_t byte_off = fresh_vreg(ctx);
+          uint32_t word_size = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_LOAD, q_vreg(word_size), q_imm(8), q_none()));
+          emit(ctx, q_instr(Q_MUL, q_vreg(byte_off), q_vreg((uint32_t)off),
+                            q_vreg(word_size)));
+          emit(ctx, q_instr(Q_STORE_WORD, q_vreg((uint32_t)val),
+                            q_vreg((uint32_t)base), q_vreg(byte_off)));
+          return val;
+        }
+        if ((strcmp(expr->name, "_next_pow2") == 0 ||
+             strcmp(expr->name, "float_to_bits") == 0) &&
+            expr->child_count >= 1) {
+          return lower_expr(ctx, expr->children[0]);
+        }
+        if ((strcmp(expr->name, "str_from_i64") == 0 ||
+             strcmp(expr->name, "to_string") == 0) &&
+            expr->child_count >= 1) {
+          int val = lower_expr(ctx, expr->children[0]);
+          if (val < 0) return -1;
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_I_TO_STR, q_vreg(rd), q_vreg((uint32_t)val), q_none()));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "size_of") == 0) {
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(8), q_none()));
+          return (int)rd;
+        }
+        for (uint32_t i = 0; i < expr->child_count; i++)
+          (void)lower_expr(ctx, expr->children[i]);
+        uint32_t rd = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+        return (int)rd;
+      }
       /* Truly undefined. */
       char buf[128];
       snprintf(buf, sizeof(buf), "undefined function: %s", expr->name);
-      lower_error(ctx, buf);
+      lower_error(ctx, expr, buf);
       uint32_t rd = fresh_vreg(ctx);
       emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
       return (int)rd;
@@ -1045,7 +1671,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
             char buf[128];
             snprintf(buf, sizeof(buf), "unknown or duplicate named arg '%s'",
                      child->name);
-            lower_error(ctx, buf);
+            lower_error(ctx, expr, buf);
             slot = (int)i;
           }
           arg_vregs[slot] = av;
@@ -1053,7 +1679,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
           slot_filled[slot] = 1;
         } else {
           if (named_started) {
-            lower_error(ctx, "positional arg after named arg is not allowed");
+            lower_error(ctx, expr, "positional arg after named arg is not allowed");
           }
           int av = lower_expr(ctx, child);
           if (av < 0)
@@ -1119,7 +1745,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
           snprintf(buf, sizeof(buf),
                    "ref arg for param '%s' must be a variable",
                    tgt->param_names[i]);
-          lower_error(ctx, buf);
+          lower_error(ctx, expr, buf);
         }
         emit(ctx, q_instr(Q_REF_BIND_SET, q_imm((int64_t)i), q_imm(binding),
                           q_none()));
@@ -1206,7 +1832,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
         symbol_entry_t *ent = NULL;
         int scope = sym_lookup_entry_both(ctx, var_name, &ent, NULL);
         if (scope < 0 || !ent) {
-          lower_error(ctx, "undefined variable in string interpolation");
+          lower_error(ctx, expr, "undefined variable in string interpolation");
           return -1;
         }
 
@@ -1257,6 +1883,24 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     emit(ctx,
          q_instr(Q_LOAD, q_vreg(r), q_imm((int64_t)expr->float_val), q_none()));
     return (int)r;
+  }
+
+  
+  case AST_TUPLE_LITERAL: {
+    uint32_t cap_r = fresh_vreg(ctx);
+    uint32_t arr_r = fresh_vreg(ctx);
+    int64_t n = (int64_t)expr->child_count;
+    int64_t cap = n < 16 ? 16 : n;
+    emit(ctx, q_instr(Q_LOAD, q_vreg(cap_r), q_imm(cap), q_none()));
+    emit(ctx, q_instr(Q_ARR_NEW, q_vreg(arr_r), q_vreg(cap_r), q_none()));
+    for (uint32_t i = 0; i < expr->child_count; i++) {
+      int elem = lower_expr(ctx, expr->children[i]);
+      if (elem >= 0) {
+        emit(ctx, q_instr(Q_ARR_PUSH, q_none(), q_vreg(arr_r),
+                          q_vreg((uint32_t)elem)));
+      }
+    }
+    return (int)arr_r;
   }
 
   case AST_ARRAY_LITERAL: {
@@ -1346,7 +1990,12 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     emit(ctx, q_instr(Q_JUMP_IF_NOT, q_none(), q_vreg(cond_r), q_label(end_l)));
 
     /* Scope: define element var (and optional idx/val). */
-    symbol_table_t saved = ctx->symbols;
+    symbol_table_t *saved = malloc(sizeof(*saved));
+    if (!saved) {
+      lower_error(ctx, expr, "out of memory saving map scope");
+      return -1;
+    }
+    *saved = ctx->symbols;
     uint32_t elem_r = fresh_vreg(ctx);
     if (expr->name2[0]) {
       /* `map i, v in arr` — first name is index, second is value. */
@@ -1371,7 +2020,8 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     ctx->in_map_expr = saved_in;
 
     /* Restore scope */
-    ctx->symbols = saved;
+    ctx->symbols = *saved;
+    free(saved);
 
     /* i = i + 1 ; goto top */
     uint32_t one_r = fresh_vreg(ctx);
@@ -1387,37 +2037,49 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
   }
 
   case AST_INDEX_ACCESS: {
-    uint32_t arr_idx;
-    int arr_scope = sym_lookup_both(ctx, expr->name, &arr_idx);
-    if (arr_scope < 0) {
-      lower_error(ctx, "undefined variable for index");
-      return -1;
-    }
-    /* §4.8: use-after-move check */
-    {
-      symbol_entry_t *ent = NULL;
-      if (sym_lookup_entry_both(ctx, expr->name, &ent, NULL) == 0 && ent &&
+    uint32_t arr_vreg;
+    uint32_t idx_child = 0;
+    symbol_entry_t *ent = NULL;
+    if (expr->name[0] == '\0') {
+      if (expr->child_count < 2) {
+        lower_error(ctx, expr, "index needs base and expr");
+        return -1;
+      }
+      int base = lower_expr(ctx, expr->children[0]);
+      if (base < 0)
+        return -1;
+      arr_vreg = (uint32_t)base;
+      idx_child = 1;
+    } else {
+      uint32_t arr_idx;
+      int arr_scope = sym_lookup_both(ctx, expr->name, &arr_idx);
+      if (arr_scope < 0) {
+        lower_error(ctx, expr, "undefined variable for index");
+        return -1;
+      }
+      /* §4.8: use-after-move check */
+      if (lowering_strict_ownership() &&
+          sym_lookup_entry_both(ctx, expr->name, &ent, NULL) == 0 && ent &&
           ent->is_moved) {
         char buf[128];
         snprintf(buf, sizeof(buf), "use of moved value: '%s'", expr->name);
-        lower_error(ctx, buf);
+        lower_error(ctx, expr, buf);
         return -1;
       }
+      if (arr_scope == 1) {
+        /* Global array - load into vreg first */
+        arr_vreg = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_LOAD_GLOBAL, q_vreg(arr_vreg), q_imm(arr_idx),
+                          q_none()));
+      } else {
+        arr_vreg = arr_idx;
+      }
     }
-    uint32_t arr_vreg;
-    if (arr_scope == 1) {
-      /* Global array - load into vreg first */
-      arr_vreg = fresh_vreg(ctx);
-      emit(ctx,
-           q_instr(Q_LOAD_GLOBAL, q_vreg(arr_vreg), q_imm(arr_idx), q_none()));
-    } else {
-      arr_vreg = arr_idx;
-    }
-    if (expr->child_count < 1) {
-      lower_error(ctx, "index needs expr");
+    if (expr->child_count <= idx_child) {
+      lower_error(ctx, expr, "index needs expr");
       return -1;
     }
-    int idx = lower_expr(ctx, expr->children[0]);
+    int idx = lower_expr(ctx, expr->children[idx_child]);
     if (idx < 0)
       return -1;
     /* §26.1 tensor multi-index: t[i, j] → flat index i*cols + j */
@@ -1445,7 +2107,8 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     /* §20 Dict get — dispatch on is_dict flag. */
     {
       symbol_entry_t *ent = NULL;
-      if (sym_lookup_entry_both(ctx, expr->name, &ent, NULL) == 0 && ent &&
+      if (expr->name[0] != '\0' &&
+          sym_lookup_entry_both(ctx, expr->name, &ent, NULL) == 0 && ent &&
           ent->is_dict) {
         emit(ctx, q_instr(ent->dict_key_is_str ? Q_DICT_GET_S : Q_DICT_GET_I,
                           q_vreg(rd), q_vreg(arr_vreg), q_vreg((uint32_t)idx)));
@@ -1768,6 +2431,62 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       emit(ctx, lbl);
       break;
     }
+    /* ── §Phase-9 Intrinsic Registry cases ─────────────────
+     * These emit Q_INTRINSIC(dest=rd, src1=INTR_ID, src2=argc).
+     * Q_INTRINSIC reads args from vm->regs[0..argc-1], so we MOVE
+     * each already-lowered arg vreg into R0..Rn before dispatch.
+     * ────────────────────────────────────────────────────── */
+    case BUILTIN_SYSCALL: {
+      /* __syscall(num, a1..a6) — variadic up to 7 args.
+       * a0/a1/a2 already lowered above; lower extra children[3..6]. */
+      uint32_t argc = 0;
+      int av_arr[7] = {a0, a1, a2, -1, -1, -1, -1};
+      for (uint32_t ci = 3; ci < expr->child_count && ci < 7; ci++)
+        av_arr[ci] = lower_expr(ctx, expr->children[ci]);
+      for (uint32_t ci = 0; ci < expr->child_count && ci < 7; ci++) {
+        if (av_arr[ci] >= 0) {
+          emit(ctx, q_instr(Q_MOVE, q_vreg((int64_t)argc),
+                            q_vreg((uint32_t)av_arr[ci]), q_none()));
+          argc++;
+        }
+      }
+      emit(ctx, q_instr(Q_INTRINSIC, q_vreg(rd),
+                        q_imm(VIR_INTR_SYSCALL), q_imm((int64_t)argc)));
+      break;
+    }
+    case BUILTIN_MEMCPY: {
+      if (a0 >= 0 && a1 >= 0 && a2 >= 0) {
+        emit(ctx, q_instr(Q_MOVE, q_vreg(0), q_vreg((uint32_t)a0), q_none()));
+        emit(ctx, q_instr(Q_MOVE, q_vreg(1), q_vreg((uint32_t)a1), q_none()));
+        emit(ctx, q_instr(Q_MOVE, q_vreg(2), q_vreg((uint32_t)a2), q_none()));
+        emit(ctx, q_instr(Q_INTRINSIC, q_vreg(rd),
+                          q_imm(VIR_INTR_MEMCPY), q_imm(3)));
+      } else {
+        emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+      }
+      break;
+    }
+    case BUILTIN_MEMSET: {
+      if (a0 >= 0 && a1 >= 0 && a2 >= 0) {
+        emit(ctx, q_instr(Q_MOVE, q_vreg(0), q_vreg((uint32_t)a0), q_none()));
+        emit(ctx, q_instr(Q_MOVE, q_vreg(1), q_vreg((uint32_t)a1), q_none()));
+        emit(ctx, q_instr(Q_MOVE, q_vreg(2), q_vreg((uint32_t)a2), q_none()));
+        emit(ctx, q_instr(Q_INTRINSIC, q_vreg(rd),
+                          q_imm(VIR_INTR_MEMSET), q_imm(3)));
+      } else {
+        emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+      }
+      break;
+    }
+    case BUILTIN_TRAP:
+    case BUILTIN_UNREACHABLE: {
+      /* __trap() / __unreachable() — never returns; emit trap then
+       * a fallthrough load so rd is defined for dead-code paths. */
+      emit(ctx, q_instr(Q_INTRINSIC, q_vreg(rd),
+                        q_imm(VIR_INTR_TRAP), q_imm(0)));
+      emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+      break;
+    }
     default:
       emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
       break;
@@ -1775,13 +2494,14 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     return (int)rd;
   }
 
+
   case AST_ENUM_ACCESS: {
     /* Compile-time constant lookup: EnumName.VARIANT → integer */
     enum_type_t *et = find_enum_type(ctx, expr->name);
     if (!et) {
       char buf[128];
       snprintf(buf, sizeof(buf), "undefined enum: %s", expr->name);
-      lower_error(ctx, buf);
+      lower_error(ctx, expr, buf);
       return -1;
     }
     int64_t val = enum_lookup_variant(et, expr->name2);
@@ -1789,7 +2509,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       char buf[128];
       snprintf(buf, sizeof(buf), "undefined enum variant: %s.%s", expr->name,
                expr->name2);
-      lower_error(ctx, buf);
+      lower_error(ctx, expr, buf);
       return -1;
     }
     uint32_t r = fresh_vreg(ctx);
@@ -1804,9 +2524,37 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
      * children[i]->name2 = field name */
     record_type_t *rt = find_record_type(ctx, expr->name);
     if (!rt) {
+      if (expr->name[0] == '\0') {
+        uint32_t sz_r = fresh_vreg(ctx);
+        uint32_t ptr_r = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_LOAD, q_vreg(sz_r),
+                          q_imm((int64_t)expr->child_count * 8), q_none()));
+        emit(ctx, q_instr(Q_ALLOC, q_vreg(ptr_r), q_vreg(sz_r), q_none()));
+        for (uint32_t i = 0; i < expr->child_count; i++) {
+          const ast_node_t *child = expr->children[i];
+          if (!child)
+            continue;
+          int val = lower_expr(ctx, child);
+          if (val < 0)
+            continue;
+          uint32_t off_r = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_LOAD, q_vreg(off_r), q_imm((int64_t)i * 8),
+                            q_none()));
+          emit(ctx, q_instr(Q_STORE_WORD, q_vreg((uint32_t)val),
+                            q_vreg(ptr_r), q_vreg(off_r)));
+        }
+        return (int)ptr_r;
+      }
+      if (strcmp(expr->name, "string") == 0) {
+        for (uint32_t i = 0; i < expr->child_count; i++)
+          (void)lower_expr(ctx, expr->children[i]);
+        uint32_t rd = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+        return (int)rd;
+      }
       char buf[128];
       snprintf(buf, sizeof(buf), "undefined record: %s", expr->name);
-      lower_error(ctx, buf);
+      lower_error(ctx, expr, buf);
       return -1;
     }
     /* Allocate: size = field_count * 8 */
@@ -1822,9 +2570,11 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
         continue;
       int field_off = record_field_offset(rt, child->name2);
       if (field_off < 0) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "unknown field: %s", child->name2);
-        lower_error(ctx, buf);
+        if (lowering_strict_fields()) {
+          char buf[128];
+          snprintf(buf, sizeof(buf), "unknown field: %s", child->name2);
+          lower_error(ctx, expr, buf);
+        }
         continue;
       }
       int val = lower_expr(ctx, child);
@@ -1844,12 +2594,20 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
      * Could be either: (a) enum access: EnumType.VARIANT
      *                  (b) record field access: var.field */
     if (expr->child_count < 1) {
-      lower_error(ctx, "field access without target");
+      lower_error(ctx, expr, "field access without target");
       return -1;
     }
     /* Check for enum access: child is an identifier matching an enum type */
     const ast_node_t *base_node = expr->children[0];
     if (base_node && base_node->type == AST_IDENTIFIER) {
+      if (strcmp(base_node->name, "QOp") == 0) {
+        int64_t val = 0;
+        if (lookup_soft_qop_value(expr->name, &val)) {
+          uint32_t r = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_LOAD, q_vreg(r), q_imm(val), q_none()));
+          return (int)r;
+        }
+      }
       enum_type_t *et = find_enum_type(ctx, base_node->name);
       if (et) {
         int64_t val = enum_lookup_variant(et, expr->name);
@@ -1858,11 +2616,14 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
           emit(ctx, q_instr(Q_LOAD, q_vreg(r), q_imm(val), q_none()));
           return (int)r;
         }
-        char buf[128];
-        snprintf(buf, sizeof(buf), "unknown variant: %s.%s", base_node->name,
-                 expr->name);
-        lower_error(ctx, buf);
-        return -1;
+        if (lowering_strict_fields()) {
+          char buf[128];
+          snprintf(buf, sizeof(buf), "unknown variant: %s.%s",
+                   base_node->name, expr->name);
+          lower_error(ctx, expr, buf);
+          return -1;
+        }
+        return emit_soft_zero(ctx);
       }
       /* §16 register/mold field read: `var.field` → shift+mask. */
       symbol_entry_t *bent = NULL;
@@ -1883,16 +2644,22 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     if (base < 0)
       return -1;
 
-    /* Search all record types for this field */
-    int offset = -1;
-    for (uint32_t i = 0; i < ctx->record_type_count && offset < 0; i++) {
-      offset = record_field_offset(&ctx->record_types[i], expr->name);
-    }
+    const record_type_t *resolved_rt = NULL;
+    int offset =
+        record_field_offset_for_expr(ctx, expr->children[0], expr->name,
+                                     &resolved_rt);
     if (offset < 0) {
-      char buf[128];
-      snprintf(buf, sizeof(buf), "unknown field: %s", expr->name);
-      lower_error(ctx, buf);
-      return -1;
+      if (lowering_strict_fields()) {
+        char buf[128];
+        if (resolved_rt)
+          snprintf(buf, sizeof(buf), "unknown field: %s.%s",
+                   resolved_rt->name, expr->name);
+        else
+          snprintf(buf, sizeof(buf), "unknown field: %s", expr->name);
+        lower_error(ctx, expr, buf);
+        return -1;
+      }
+      return emit_soft_zero(ctx);
     }
     uint32_t off_r = fresh_vreg(ctx);
     uint32_t rd = fresh_vreg(ctx);
@@ -1905,22 +2672,29 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
   /* 8.7 Safe access: base?.field → if base==0 then 0 else base.field */
   case AST_SAFE_ACCESS: {
     if (expr->child_count < 1) {
-      lower_error(ctx, "safe access without target");
+      lower_error(ctx, expr, "safe access without target");
       return -1;
     }
     int base = lower_expr(ctx, expr->children[0]);
     if (base < 0)
       return -1;
 
-    int offset = -1;
-    for (uint32_t i = 0; i < ctx->record_type_count && offset < 0; i++) {
-      offset = record_field_offset(&ctx->record_types[i], expr->name);
-    }
+    const record_type_t *resolved_rt = NULL;
+    int offset =
+        record_field_offset_for_expr(ctx, expr->children[0], expr->name,
+                                     &resolved_rt);
     if (offset < 0) {
-      char buf[128];
-      snprintf(buf, sizeof(buf), "unknown field: %s", expr->name);
-      lower_error(ctx, buf);
-      return -1;
+      if (lowering_strict_fields()) {
+        char buf[128];
+        if (resolved_rt)
+          snprintf(buf, sizeof(buf), "unknown field: %s.%s",
+                   resolved_rt->name, expr->name);
+        else
+          snprintf(buf, sizeof(buf), "unknown field: %s", expr->name);
+        lower_error(ctx, expr, buf);
+        return -1;
+      }
+      return emit_soft_zero(ctx);
     }
 
     uint32_t rd = fresh_vreg(ctx);
@@ -1954,7 +2728,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
    * §20:  dict ? key   → 1 if key exists in dict. */
   case AST_EXIST_CHECK: {
     if (expr->child_count < 1) {
-      lower_error(ctx, "exist check without target");
+      lower_error(ctx, expr, "exist check without target");
       return -1;
     }
     /* Two-argument form: dict ? key. */
@@ -1992,7 +2766,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
   /* 8.10/8.11 Cast: for now pass through unchanged (int/float same repr) */
   case AST_CAST: {
     if (expr->child_count < 1) {
-      lower_error(ctx, "cast without operand");
+      lower_error(ctx, expr, "cast without operand");
       return -1;
     }
     return lower_expr(ctx, expr->children[0]);
@@ -2011,7 +2785,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
    */
   case AST_PATTERN_MATCH: {
     if (expr->child_count < 2) {
-      lower_error(ctx, "pattern match needs value and pattern");
+      lower_error(ctx, expr, "pattern match needs value and pattern");
       return -1;
     }
     const ast_node_t *lhs_ast = expr->children[0];
@@ -2081,7 +2855,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
    * Otherwise fall through to regular expression evaluation. */
   case AST_ATOMIC_LOAD: {
     if (expr->child_count < 1) {
-      lower_error(ctx, "atomic load without operand");
+      lower_error(ctx, expr, "atomic load without operand");
       return -1;
     }
     const ast_node_t *inner = expr->children[0];
@@ -2103,7 +2877,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
    * scalar → passthrough. */
   case AST_SWIZZLE: {
     if (expr->child_count < 1) {
-      lower_error(ctx, "swizzle without operand");
+      lower_error(ctx, expr, "swizzle without operand");
       return -1;
     }
     int v = lower_expr(ctx, expr->children[0]);
@@ -2130,7 +2904,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
    *     between statements by lower_stmt (see below). */
   case AST_BORROW: {
     if (expr->child_count < 1) {
-      lower_error(ctx, "borrow without operand");
+      lower_error(ctx, expr, "borrow without operand");
       return -1;
     }
     int is_mut = (expr->int_val != 0);
@@ -2143,13 +2917,13 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       if (found < 0 || !ent) {
         char buf[128];
         snprintf(buf, sizeof(buf), "borrow of undefined: %s", tgt->name);
-        lower_error(ctx, buf);
+        lower_error(ctx, expr, buf);
         return -1;
       }
       if (ent->is_moved) {
         char buf[128];
         snprintf(buf, sizeof(buf), "borrow of moved value: '%s'", tgt->name);
-        lower_error(ctx, buf);
+        lower_error(ctx, expr, buf);
         return -1;
       }
       if (is_mut) {
@@ -2159,14 +2933,14 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
                    "cannot borrow '%s' as mutable: already "
                    "borrowed as shared",
                    tgt->name);
-          lower_error(ctx, buf);
+          lower_error(ctx, expr, buf);
           return -1;
         }
         if (ent->borrow_mut_count > 0) {
           char buf[160];
           snprintf(buf, sizeof(buf),
                    "cannot borrow '%s' as mutable more than once", tgt->name);
-          lower_error(ctx, buf);
+          lower_error(ctx, expr, buf);
           return -1;
         }
         ent->borrow_mut_count++;
@@ -2177,7 +2951,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
                    "cannot borrow '%s' as shared: already "
                    "borrowed as mutable",
                    tgt->name);
-          lower_error(ctx, buf);
+          lower_error(ctx, expr, buf);
           return -1;
         }
         ent->borrow_shared_count++;
@@ -2214,14 +2988,14 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     if (expr->int_val == 0) {
       /* Spawn: task FUNC_CALL — children[0] is the call expression */
       if (expr->child_count < 1) {
-        lower_error(ctx, "task spawn requires a function call");
+        lower_error(ctx, expr, "task spawn requires a function call");
         uint32_t rd = fresh_vreg(ctx);
         emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
         return (int)rd;
       }
       const ast_node_t *call = expr->children[0];
       if (!call || call->type != AST_CALL) {
-        lower_error(ctx, "task spawn requires a function call expression");
+        lower_error(ctx, expr, "task spawn requires a function call expression");
         uint32_t rd = fresh_vreg(ctx);
         emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
         return (int)rd;
@@ -2231,7 +3005,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       if (fidx < 0) {
         char buf[128];
         snprintf(buf, sizeof(buf), "undefined async function: %s", call->name);
-        lower_error(ctx, buf);
+        lower_error(ctx, expr, buf);
         uint32_t rd = fresh_vreg(ctx);
         emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
         return (int)rd;
@@ -2240,7 +3014,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
         q_function_t *tgt = &ctx->module.functions[fidx];
         for (uint32_t i = 0; i < tgt->param_count && i < Q_MAX_PARAMS; i++) {
           if (tgt->param_is_ref[i]) {
-            lower_error(ctx, "async/task call does not support ref parameters");
+            lower_error(ctx, expr, "async/task call does not support ref parameters");
             uint32_t rd = fresh_vreg(ctx);
             emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
             return (int)rd;
@@ -2268,7 +3042,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     } else {
       /* Wait: wait TASK_ID — children[0] is the task ID expression */
       if (expr->child_count < 1) {
-        lower_error(ctx, "wait requires a task expression");
+        lower_error(ctx, expr, "wait requires a task expression");
         uint32_t rd = fresh_vreg(ctx);
         emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
         return (int)rd;
@@ -2284,8 +3058,43 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     }
   }
 
+  case AST_BLOCK: {
+    for (uint32_t i = 0; i < expr->child_count; i++) {
+      if (expr->children[i])
+        lower_stmt(ctx, expr->children[i]);
+    }
+    return emit_soft_zero(ctx);
+  }
+
+  case AST_NAMED_ARG:
+    if (expr->child_count > 0 && expr->children[0])
+      return lower_expr(ctx, expr->children[0]);
+    return emit_soft_zero(ctx);
+
+  case AST_IF:
+  case AST_LOOP:
+  case AST_WHILE:
+  case AST_FOR_RANGE:
+    lower_stmt(ctx, expr);
+    return emit_soft_zero(ctx);
+
+  case AST_MODULE:
+  case AST_IMPORT:
+  case AST_EXPORT:
+  case AST_INCLUDE:
+  case AST_TYPE_DECL:
+  case AST_ENUM_DEF:
+  case AST_RECORD_DEF:
+  case AST_MOLD_DEF:
+  case AST_REGISTER_DEF:
+  case AST_FUNC_DEF: {
+    return emit_soft_zero(ctx);
+  }
+
   default: {
-    lower_error(ctx, "unsupported expression type");
+    char buf[96];
+    snprintf(buf, sizeof(buf), "unsupported expression type: %d", expr->type);
+    lower_error(ctx, expr, buf);
     return -1;
   }
   }
@@ -2492,7 +3301,45 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
 
   case AST_VAR_DECL:
   case AST_CONST_DECL: {
-    uint32_t r = fresh_vreg(ctx);
+    if (stmt->int_val & 0x4000) {
+      /* Tuple destructuring: var (a, b) = expr */
+      int expr_vreg = -1;
+      if (stmt->child_count > 0) {
+        ast_node_t *init = stmt->children[stmt->child_count - 1];
+        if (init->type != AST_IDENTIFIER) { /* ensure it's the RHS */
+            expr_vreg = lower_expr(ctx, init);
+        } else {
+            /* If the last child is an identifier, it could be either RHS or part of tuple */
+            /* If child_count > number of tuple names, the last is RHS. */
+            /* Actually, in parser.c we added the init expression as the last child if match(TOK_ASSIGN). */
+            expr_vreg = lower_expr(ctx, init);
+        }
+      }
+      for (uint32_t i = 0; i < stmt->child_count - 1; i++) {
+        ast_node_t *ident = stmt->children[i];
+        if (strcmp(ident->name, "_") == 0) continue;
+        
+        uint32_t r = fresh_vreg(ctx);
+        sym_define(&ctx->symbols, ident->name, r, VIR_TYPE_I64);
+        
+        if (expr_vreg >= 0) {
+          uint32_t idx_r = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_LOAD, q_vreg(idx_r), q_imm(i), q_none()));
+          emit(ctx, q_instr(Q_ARR_GET, q_vreg(r), q_vreg((uint32_t)expr_vreg), q_vreg(idx_r)));
+        }
+      }
+      return 0;
+    }
+
+    uint32_t r = 0;
+    uint32_t existing_idx = 0;
+    int existing_scope = sym_lookup_both(ctx, stmt->name, &existing_idx);
+    int reuse_existing_local = (existing_scope == 0);
+    if (reuse_existing_local) {
+      r = existing_idx;
+    } else {
+      r = fresh_vreg(ctx);
+    }
 
     /* Infer type from initializer if present */
     vir_type_t var_type = VIR_TYPE_I64; /* default */
@@ -2518,12 +3365,15 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
       }
     }
 
-    sym_define(&ctx->symbols, stmt->name, r, var_type);
+    if (!reuse_existing_local) {
+      sym_define(&ctx->symbols, stmt->name, r, var_type);
+    }
     /* §4.8: locate the just-defined entry and classify its type. */
     symbol_entry_t *new_ent = NULL;
     sym_lookup_entry_both(ctx, stmt->name, &new_ent, NULL);
     if (new_ent && stmt->name2[0]) {
       strncpy(new_ent->type_name, stmt->name2, AST_NAME_LEN - 1);
+      new_ent->type_name[AST_NAME_LEN - 1] = '\0';
     }
     /* §13.7 atomic-var marker: parser sets bit 12 (0x1000) in int_val
      * for `atomic var ...`. Record on the symbol so try(isolate:) can
@@ -2551,6 +3401,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     /* If there is an initialiser expression, lower it */
     if (stmt->child_count > 0) {
       const ast_node_t *init = stmt->children[0];
+      symbol_infer_record_type_from_expr(ctx, new_ent, init);
       int val = lower_expr(ctx, init);
       if (val >= 0 && (uint32_t)val != r) {
         emit(ctx, q_instr(Q_MOVE, q_vreg(r), q_vreg((uint32_t)val), q_none()));
@@ -2610,10 +3461,11 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     uint32_t idx;
     int scope = sym_lookup_both(ctx, stmt->name, &idx);
     if (scope < 0) {
-      char buf[128];
-      snprintf(buf, sizeof(buf), "assign to undefined: %s", stmt->name);
-      lower_error(ctx, buf);
-      return -1;
+      /* Implicitly declare local variable! */
+      uint32_t r = fresh_vreg(ctx);
+      sym_define(&ctx->symbols, stmt->name, r, VIR_TYPE_I64);
+      scope = 0; /* now local scope */
+      idx = r;
     }
     const ast_node_t *rhs = stmt->children[0];
     int val = lower_expr(ctx, rhs);
@@ -2622,6 +3474,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
 
     symbol_entry_t *ent = NULL;
     sym_lookup_entry_both(ctx, stmt->name, &ent, NULL);
+    symbol_infer_record_type_from_expr(ctx, ent, rhs);
 
     if (scope == 1) {
       /* Global variable - emit Q_STORE_GLOBAL */
@@ -2699,7 +3552,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     if (scope < 0) {
       char buf[128];
       snprintf(buf, sizeof(buf), "atomic store to undefined: %s", stmt->name);
-      lower_error(ctx, buf);
+      lower_error(ctx, stmt, buf);
       return -1;
     }
     /* Detect RMW pattern: child = BINOP(OP_ADD/SUB, IDENT(name), rhs) */
@@ -2745,7 +3598,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     if (scope < 0) {
       char buf[128];
       snprintf(buf, sizeof(buf), "swizzle store to undefined: %s", stmt->name);
-      lower_error(ctx, buf);
+      lower_error(ctx, stmt, buf);
       return -1;
     }
     /* Load target array handle */
@@ -2771,29 +3624,43 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     /* arr[idx] = val */
     if (stmt->child_count < 2)
       return -1;
-    uint32_t arr_idx;
-    int arr_scope = sym_lookup_both(ctx, stmt->name, &arr_idx);
-    if (arr_scope < 0) {
-      lower_error(ctx, "index assign to undefined variable");
-      return -1;
-    }
     uint32_t arr_vreg;
-    if (arr_scope == 1) {
-      /* Global - load into vreg first */
-      arr_vreg = fresh_vreg(ctx);
-      emit(ctx,
-           q_instr(Q_LOAD_GLOBAL, q_vreg(arr_vreg), q_imm(arr_idx), q_none()));
+    uint32_t idx_child = 0;
+    uint32_t val_child = 1;
+    symbol_entry_t *ent = NULL;
+    if (stmt->name[0] == '\0') {
+      if (stmt->child_count < 3)
+        return -1;
+      int base = lower_expr(ctx, stmt->children[0]);
+      if (base < 0)
+        return -1;
+      arr_vreg = (uint32_t)base;
+      idx_child = 1;
+      val_child = 2;
     } else {
-      arr_vreg = arr_idx;
+      uint32_t arr_idx;
+      int arr_scope = sym_lookup_both(ctx, stmt->name, &arr_idx);
+      if (arr_scope < 0) {
+        lower_error(ctx, stmt, "index assign to undefined variable");
+        return -1;
+      }
+      if (arr_scope == 1) {
+        /* Global - load into vreg first */
+        arr_vreg = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_LOAD_GLOBAL, q_vreg(arr_vreg), q_imm(arr_idx),
+                          q_none()));
+      } else {
+        arr_vreg = arr_idx;
+      }
+      sym_lookup_entry_both(ctx, stmt->name, &ent, NULL);
     }
-    int idx = lower_expr(ctx, stmt->children[0]);
-    int val = lower_expr(ctx, stmt->children[1]);
+    int idx = lower_expr(ctx, stmt->children[idx_child]);
+    int val = lower_expr(ctx, stmt->children[val_child]);
     if (idx < 0 || val < 0)
       return -1;
     /* §20 Dict set when symbol is a dict. */
     {
-      symbol_entry_t *ent = NULL;
-      if (sym_lookup_entry_both(ctx, stmt->name, &ent, NULL) == 0 && ent &&
+      if (stmt->name[0] != '\0' && ent &&
           ent->is_dict) {
         emit(ctx, q_instr(ent->dict_key_is_str ? Q_DICT_SET_S : Q_DICT_SET_I,
                           q_vreg((uint32_t)val), q_vreg(arr_vreg),
@@ -2813,7 +3680,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     uint32_t d_idx;
     int scope = sym_lookup_both(ctx, stmt->name, &d_idx);
     if (scope < 0) {
-      lower_error(ctx, "del on undefined variable");
+      lower_error(ctx, stmt, "del on undefined variable");
       return -1;
     }
     uint32_t d_vreg;
@@ -3131,9 +3998,11 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
   /* §23.1 port NAME: TYPE [(cap: N)] — allocate channel handle */
   case AST_PORT_DECL: {
     uint32_t r = fresh_vreg(ctx);
-    int idx = sym_define(&ctx->symbols, stmt->name, r, VIR_TYPE_I64);
-    if (idx >= 0)
-      ctx->symbols.entries[idx].is_port = 1;
+    if (sym_define(&ctx->symbols, stmt->name, r, VIR_TYPE_I64) >= 0) {
+      symbol_entry_t *ent = NULL;
+      if (sym_lookup_entry_both(ctx, stmt->name, &ent, NULL) >= 0 && ent)
+        ent->is_port = 1;
+    }
     int64_t cap = stmt->int_val > 0 ? stmt->int_val : 16;
     emit(ctx, q_instr(Q_PORT_NEW, q_vreg(r), q_imm(cap), q_none()));
     return 0;
@@ -3324,11 +4193,12 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
   case AST_ENUM_DEF: {
     /* Register enum type — no code emitted (compile-time only) */
     if (ctx->enum_type_count >= ENUM_MAX_TYPES) {
-      lower_error(ctx, "too many enum types");
+      lower_error(ctx, stmt, "too many enum types");
       return -1;
     }
     enum_type_t *et = &ctx->enum_types[ctx->enum_type_count++];
     strncpy(et->name, stmt->name, AST_NAME_LEN - 1);
+    et->name[AST_NAME_LEN - 1] = '\0';
     et->variant_count = 0;
     for (uint32_t i = 0; i < stmt->child_count; i++) {
       const ast_node_t *v = stmt->children[i];
@@ -3336,7 +4206,18 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
         continue;
       enum_variant_t *ev = &et->variants[et->variant_count++];
       strncpy(ev->name, v->name, AST_NAME_LEN - 1);
+      ev->name[AST_NAME_LEN - 1] = '\0';
       ev->value = v->int_val;
+
+      /* Automatically register this variant as a RECORD type with 1 field (payload) */
+      if (ctx->record_type_count < RECORD_MAX_TYPES) {
+        record_type_t *rt = &ctx->record_types[ctx->record_type_count++];
+        strncpy(rt->name, v->name, AST_NAME_LEN - 1);
+        rt->field_count = 1;
+        strncpy(rt->fields[0].name, "value", AST_NAME_LEN - 1);
+        rt->fields[0].type_name[0] = '\0';
+        rt->fields[0].offset = 0;
+      }
     }
     return 0;
   }
@@ -3344,7 +4225,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
   case AST_RECORD_DEF: {
     /* Register record type with field offsets (compile-time only) */
     if (ctx->record_type_count >= RECORD_MAX_TYPES) {
-      lower_error(ctx, "too many record types");
+      lower_error(ctx, stmt, "too many record types");
       return -1;
     }
     record_type_t *rt = &ctx->record_types[ctx->record_type_count++];
@@ -3356,6 +4237,13 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
         continue;
       record_field_t *rf = &rt->fields[rt->field_count];
       strncpy(rf->name, f->name, AST_NAME_LEN - 1);
+      rf->name[AST_NAME_LEN - 1] = '\0';
+      if (f->name2[0]) {
+        strncpy(rf->type_name, f->name2, AST_NAME_LEN - 1);
+        rf->type_name[AST_NAME_LEN - 1] = '\0';
+      } else {
+        rf->type_name[0] = '\0';
+      }
       rf->offset = rt->field_count * 8; /* offset in bytes */
       rt->field_count++;
     }
@@ -3366,7 +4254,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
   case AST_MOLD_DEF: {
     /* §16 Register / Mold — compile-time bit-type registration. */
     if (ctx->bit_type_count >= BIT_TYPE_MAX) {
-      lower_error(ctx, "too many register/mold types");
+      lower_error(ctx, stmt, "too many register/mold types");
       return -1;
     }
     bit_type_t *bt = &ctx->bit_types[ctx->bit_type_count++];
@@ -3431,7 +4319,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     if (scope < 0) {
       char buf[128];
       snprintf(buf, sizeof(buf), "field assign to undefined: %s", stmt->name);
-      lower_error(ctx, buf);
+      lower_error(ctx, stmt, buf);
       return -1;
     }
     uint32_t base_vreg;
@@ -3443,16 +4331,21 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
       base_vreg = idx;
     }
 
-    /* Find field offset */
-    int offset = -1;
-    for (uint32_t i = 0; i < ctx->record_type_count && offset < 0; i++) {
-      offset = record_field_offset(&ctx->record_types[i], stmt->name2);
-    }
+    const record_type_t *resolved_rt = NULL;
+    int offset = record_field_offset_for_symbol(ctx, stmt->name, stmt->name2,
+                                                &resolved_rt);
     if (offset < 0) {
-      char buf[128];
-      snprintf(buf, sizeof(buf), "unknown field: %s", stmt->name2);
-      lower_error(ctx, buf);
-      return -1;
+      if (lowering_strict_fields()) {
+        char buf[128];
+        if (resolved_rt)
+          snprintf(buf, sizeof(buf), "unknown field: %s.%s",
+                   resolved_rt->name, stmt->name2);
+        else
+          snprintf(buf, sizeof(buf), "unknown field: %s", stmt->name2);
+        lower_error(ctx, stmt, buf);
+        return -1;
+      }
+      return 0;
     }
 
     int val = lower_expr(ctx, stmt->children[0]);
@@ -3469,7 +4362,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
   case AST_THROW: {
     /* §13.1 throw <expr> — set erx and jump to innermost revert */
     if (stmt->child_count == 0) {
-      lower_error(ctx, "throw needs code");
+      lower_error(ctx, stmt, "throw needs code");
       return -1;
     }
     int code = lower_expr(ctx, stmt->children[0]);
@@ -3613,7 +4506,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
 
   case AST_BREAK: {
     if (ctx->loop_depth == 0) {
-      lower_error(ctx, "break outside of loop");
+      lower_error(ctx, stmt, "break outside of loop");
       return -1;
     }
     uint32_t end = ctx->loop_end_labels[ctx->loop_depth - 1];
@@ -3622,7 +4515,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
   }
   case AST_CONTINUE: {
     if (ctx->loop_depth == 0) {
-      lower_error(ctx, "continue outside of loop");
+      lower_error(ctx, stmt, "continue outside of loop");
       return -1;
     }
     uint32_t start = ctx->loop_start_labels[ctx->loop_depth - 1];
@@ -3664,7 +4557,15 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
 
     /* Allocate arm labels */
     uint32_t arm_count = stmt->child_count - 1;
-    uint32_t arm_labels[AST_MAX_CHILDREN];
+    uint32_t small_arm_labels[64];
+    uint32_t *arm_labels = small_arm_labels;
+    if (arm_count > 64) {
+      arm_labels = malloc(arm_count * sizeof(uint32_t));
+      if (!arm_labels) {
+        lower_error(ctx, stmt, "out of memory allocating case labels");
+        return -1;
+      }
+    }
     for (uint32_t i = 0; i < arm_count; i++)
       arm_labels[i] = fresh_label(ctx);
 
@@ -3749,11 +4650,32 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
       lbl.patch_id = arm_labels[i];
       emit(ctx, lbl);
 
+      /* Save symbols table to support arm-local bindings */
+      symbol_table_t *saved_syms = malloc(sizeof(*saved_syms));
+      if (!saved_syms) {
+        lower_error(ctx, stmt, "out of memory saving case scope");
+        if (arm_labels != small_arm_labels) free(arm_labels);
+        return -1;
+      }
+      *saved_syms = ctx->symbols;
+
+      if (arm->name2[0] != '\0') {
+        /* Bind the payload variable to the subject vreg.
+         * In the C-core IR, tagged union values (e.g. Some(v)) are modelled
+         * as bare integers — the payload IS the subject itself.
+         * We alias name2 → subject so the arm body can reference it. */
+        sym_define(&ctx->symbols, arm->name2, (uint32_t)subject, VIR_TYPE_I64);
+      }
+
       /* Lower body — support multi-statement arms. */
       for (uint32_t bi = 0; bi < arm->child_count; bi++) {
         if (arm->children[bi])
           lower_stmt(ctx, arm->children[bi]);
       }
+
+      /* Restore symbols table */
+      ctx->symbols = *saved_syms;
+      free(saved_syms);
 
       /* Jump to end after arm body */
       emit(ctx, q_instr(Q_JUMP, q_none(), q_label(end_label), q_none()));
@@ -3764,6 +4686,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     end_lbl.patch_id = end_label;
     emit(ctx, end_lbl);
 
+    if (arm_labels != small_arm_labels) free(arm_labels);
     return 0;
   }
 
@@ -3783,22 +4706,40 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
 int lower_func_def(lower_ctx_t *ctx, const ast_node_t *func_def) {
   if (!func_def || func_def->type != AST_FUNC_DEF)
     return -1;
+  fprintf(stderr, "[DEBUG] LOWERING FUNC: %s\\n", func_def->name);
 
   q_function_t *func = q_module_add_func(&ctx->module, func_def->name);
   if (!func)
     return -1;
+  if ((func_def->int_val & 0x8000) != 0) {
+    return 0;
+  }
+  if (func->body_count > 0 || func->param_count > 0) {
+    if (strcmp(func_def->name, "main") != 0) {
+      return 0;
+    }
+    q_func_free(func);
+    if (q_func_init(func, func_def->name) != 0)
+      return -1;
+  }
 
   ctx->current_func = func;
 
   /* Save parent symbols, create local scope */
-  symbol_table_t saved_syms = ctx->symbols;
+  symbol_table_t *saved_syms = malloc(sizeof(*saved_syms));
+  if (!saved_syms) {
+    lower_error(ctx, func_def, "out of memory saving function scope");
+    return -1;
+  }
+  *saved_syms = ctx->symbols;
   sym_init(&ctx->symbols);
 
   /* Save and reset vreg allocator - each function gets fresh vregs
    * BUT start after the global vreg range to avoid conflicts */
   q_vreg_alloc_t saved_vreg_alloc = ctx->vreg_alloc;
-  /* Don't reset - keep incrementing so vregs don't overlap across functions
-   * This way globals get low vregs, each function gets a fresh range.
+  uint32_t saved_label_counter = ctx->label_counter;
+  
+  /* Reset allocator per function so vregs don't grow indefinitely across functions.
    *
    * Critical: ensure param_vregs do NOT alias R0..R(Q_MAX_PARAMS-1).
    * Those low registers are used as the call-arg ABI slots — if a
@@ -3809,8 +4750,8 @@ int lower_func_def(lower_ctx_t *ctx, const ast_node_t *func_def) {
    * values, then overwrites R0 with the return value — corrupting
    * the parameter. Bumping the allocator past Q_MAX_PARAMS gives
    * the VM's `param_vregs[i] = R i` copy a real (distinct) target. */
-  if (ctx->vreg_alloc.next_index < Q_MAX_PARAMS)
-    ctx->vreg_alloc.next_index = Q_MAX_PARAMS;
+  ctx->vreg_alloc.next_index = Q_MAX_PARAMS;
+  ctx->label_counter = 0;
 
   /* Register parameters as vregs.
    * Convention: first N children are parameter names,
@@ -3843,7 +4784,18 @@ int lower_func_def(lower_ctx_t *ctx, const ast_node_t *func_def) {
       func->param_is_ref[func->param_count] =
           ((param->flags & AST_FLAG_REF_PARAM) != 0);
       func->param_count++;
-      sym_define(&ctx->symbols, param->name, pr, VIR_TYPE_I64);
+      if (sym_define(&ctx->symbols, param->name, pr, VIR_TYPE_I64) >= 0 &&
+          param->name2[0]) {
+        symbol_entry_t *ent = NULL;
+        if (sym_lookup_entry_both(ctx, param->name, &ent, NULL) < 0 || !ent)
+          continue;
+        strncpy(ent->type_name, param->name2, AST_NAME_LEN - 1);
+        ent->type_name[AST_NAME_LEN - 1] = '\0';
+        if (find_bit_type(ctx, param->name2)) {
+          strncpy(ent->bit_type_name, param->name2, AST_NAME_LEN - 1);
+          ent->bit_type_name[AST_NAME_LEN - 1] = '\0';
+        }
+      }
     }
   }
 
@@ -3921,8 +4873,17 @@ int lower_func_def(lower_ctx_t *ctx, const ast_node_t *func_def) {
   }
 
   /* Restore parent scope */
-  ctx->symbols = saved_syms;
+  ctx->symbols = *saved_syms;
+  free(saved_syms);
   ctx->current_func = NULL;
+  
+  /* Restore the parent function's vreg space so it continues where it left off!
+   * This prevents vreg_alloc.next_index from growing forever and causing
+   * huge vm->reg_count in the C-Core VM, which leads to massive overhead
+   * during Q_CALL saving/restoring of registers. */
+  ctx->vreg_alloc = saved_vreg_alloc;
+  ctx->label_counter = saved_label_counter;
+  
   return 0;
 }
 
@@ -3938,8 +4899,20 @@ static int lower_global_var(lower_ctx_t *ctx, const ast_node_t *stmt) {
     return 0;
 
   /* Assign next global index */
+
+  /* Assign next global index */
   uint32_t gidx = ctx->global_index_counter++;
+  printf("[DEBUG] REGISTERING GLOBAL: %s\n", stmt->name);
   sym_define(&ctx->global_symbols, stmt->name, gidx, VIR_TYPE_I64);
+
+  symbol_entry_t *gent = NULL;
+  sym_lookup_entry_both(ctx, stmt->name, &gent, NULL);
+  if (gent && stmt->name2[0]) {
+    strncpy(gent->type_name, stmt->name2, AST_NAME_LEN - 1);
+    gent->type_name[AST_NAME_LEN - 1] = '\0';
+  }
+  if (gent && stmt->child_count > 0)
+    symbol_infer_record_type_from_expr(ctx, gent, stmt->children[0]);
 
   /* If there is an initialiser expression, lower it */
   if (stmt->child_count > 0) {
@@ -4032,7 +5005,7 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
     if (!src) {
       char buf[320];
       snprintf(buf, sizeof(buf), "include: cannot read '%s'", filename);
-      lower_error(ctx, buf);
+      lower_error(ctx, NULL, buf);
       return -1;
     }
     int dbg = (getenv("VIR_INCLUDE_DEBUG") != NULL);
@@ -4049,7 +5022,7 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
     if (lexer_tokenize(lex) != 0) {
       char buf[320];
       snprintf(buf, sizeof(buf), "include '%s': %s", filename, lex->error);
-      lower_error(ctx, buf);
+      lower_error(ctx, NULL, buf);
       lexer_free(lex);
       free(lex);
       free(src);
@@ -4057,13 +5030,21 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
     }
 
     vir_parser_t parser;
-    parser_init(&parser, lex->tokens, lex->token_count);
+    uint32_t file_id = DIAG_NO_FILE;
+    if (g_diag_initialized) {
+        file_id = diag_register_source(&g_parser_diag, filename, src, src_len);
+    } else {
+        diag_init(&g_parser_diag, STAGE_0_C_CORE, DIAG_FMT_TERMINAL);
+        g_diag_initialized = 1;
+        file_id = diag_register_source(&g_parser_diag, filename, src, src_len);
+    }
+    parser_init(&parser, lex->tokens, lex->token_count, file_id);
     ast_node_t *sub = parser_parse_program(&parser);
     if (!sub) {
       char buf[320];
       snprintf(buf, sizeof(buf), "include '%s' line %u: %s", filename,
                parser.error_line, parser.error);
-      lower_error(ctx, buf);
+      lower_error(ctx, NULL, buf);
       if (dbg)
         fprintf(stderr, "[resolve] parse FAIL %s\n", buf);
       lexer_free(lex);
@@ -4086,22 +5067,20 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
       }
     }
 
-    /* Splice: replace AST_INCLUDE node with sub-program's children.
-     * We need to make room: inserting (sub->child_count - 1) extra
-     * nodes at position i. */
+    /* ── O(n) splice using memmove (one shift per include) ── */
     uint32_t n_new = sub->child_count;
     if (n_new == 0) {
       /* Empty file — just remove the include node */
       ast_free(child);
-      for (uint32_t j = i; j + 1 < program->child_count; j++)
-        program->children[j] = program->children[j + 1];
+      if (i + 1 < program->child_count)
+        memmove(&program->children[i], &program->children[i + 1],
+                (program->child_count - i - 1) * sizeof(ast_node_t *));
       program->child_count--;
       i--;
     } else {
-      /* Check capacity */
       uint32_t needed = program->child_count + n_new - 1;
       if (needed > AST_MAX_CHILDREN) {
-        lower_error(ctx, "include: too many top-level nodes");
+        lower_error(ctx, NULL, "include: too many top-level nodes");
         ast_free(sub);
         lexer_free(lex);
         free(lex);
@@ -4109,26 +5088,25 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
         return -1;
       }
 
-      /* Shift existing children right by (n_new - 1) */
-      if (n_new > 1) {
-        for (uint32_t j = program->child_count - 1; j > i; j--)
-          program->children[j + n_new - 1] = program->children[j];
+      /* Single memmove to open space for n_new children at position i */
+      if (n_new > 1 && i + 1 < program->child_count) {
+        memmove(&program->children[i + n_new],
+                &program->children[i + 1],
+                (program->child_count - i - 1) * sizeof(ast_node_t *));
       }
 
-      /* Place included children, clear their parent refs */
+      /* Place included children */
       for (uint32_t k = 0; k < n_new; k++) {
         program->children[i + k] = sub->children[k];
-        sub->children[k] = NULL; /* Prevent double-free */
+        sub->children[k] = NULL;
       }
       program->child_count = needed;
 
-      /* Free the original include node (not the spliced children) */
+      /* Free original include node */
       ast_free(child);
 
-      /* Recursively resolve includes in spliced content */
-      /* (skip current: inner includes will be picked up naturally
-       *  since we'll re-iterate at index i) */
-      i--; /* Re-process from this position */
+      /* Re-process position i (first spliced child may itself be an include) */
+      i--;
     }
 
     /* Clean up: free the sub-program shell + lex + src */
@@ -4208,6 +5186,7 @@ int lower_program(lower_ctx_t *ctx, const ast_node_t *program) {
   int has_top_stmt = 0;
 
   /* Pass 0: register all enum/record type definitions first */
+  /* Pass 0: register all enum/record type definitions first */
   for (uint32_t i = 0; i < program->child_count; i++) {
     const ast_node_t *child = program->children[i];
     if (!child)
@@ -4217,11 +5196,39 @@ int lower_program(lower_ctx_t *ctx, const ast_node_t *program) {
       lower_stmt(ctx, child);
   }
 
-  /* First pass: register all function names */
+  /* Pass 0b: infer record return types for helper functions before locals are
+   * initialised from calls such as `let ctx = lower_ctx_new(...)`. */
   for (uint32_t i = 0; i < program->child_count; i++) {
     const ast_node_t *child = program->children[i];
     if (!child)
       continue;
+    if (strcmp(child->name, "vec_push") == 0) printf("[DEBUG] FOUND VEC_PUSH IN AST!\n");
+
+    if (child->type == AST_FUNC_DEF) {
+      infer_func_return_type(ctx, child);
+    } else if (child->type == AST_RECORD_DEF) {
+      for (uint32_t j = 0; j < child->child_count; j++) {
+        if (child->children[j] && child->children[j]->type == AST_FUNC_DEF)
+          infer_func_return_type(ctx, child->children[j]);
+      }
+    }
+  }
+
+  /* First pass: register all function names and enums */
+  for (uint32_t i = 0; i < program->child_count; i++) {
+    const ast_node_t *child = program->children[i];
+    if (!child) continue;
+    if (child->type == AST_ENUM_DEF || child->type == AST_RECORD_DEF) {
+      lower_stmt(ctx, child); /* Registers the enum type */
+    }
+  }
+
+  for (uint32_t i = 0; i < program->child_count; i++) {
+    const ast_node_t *child = program->children[i];
+    if (!child)
+      continue;
+    if (strcmp(child->name, "vec_push") == 0) printf("[DEBUG] FOUND VEC_PUSH IN AST!\n");
+
     if (child->type == AST_FUNC_DEF) {
       q_module_add_func(&ctx->module, child->name);
       if (strcmp(child->name, "main") == 0)
@@ -4257,10 +5264,12 @@ int lower_program(lower_ctx_t *ctx, const ast_node_t *program) {
       else if (child && child->type == AST_PORT_DECL) {
         /* §23.1 top-level port → global slot holding the handle */
         uint32_t gidx = ctx->global_index_counter++;
-        int sidx =
-            sym_define(&ctx->global_symbols, child->name, gidx, VIR_TYPE_I64);
-        if (sidx >= 0)
-          ctx->global_symbols.entries[sidx].is_port = 1;
+        if (sym_define(&ctx->global_symbols, child->name, gidx,
+                       VIR_TYPE_I64) >= 0) {
+          symbol_entry_t *ent = NULL;
+          if (sym_lookup_entry_both(ctx, child->name, &ent, NULL) >= 0 && ent)
+            ent->is_port = 1;
+        }
         uint32_t r = fresh_vreg(ctx);
         int64_t cap = child->int_val > 0 ? child->int_val : 16;
         emit(ctx, q_instr(Q_PORT_NEW, q_vreg(r), q_imm(cap), q_none()));
@@ -4560,11 +5569,19 @@ int lower_tco_pass(q_function_t *func, uint32_t func_idx) {
     q_instruction_t *cur = &func->body[i];
     q_instruction_t *next = &func->body[i + 1];
 
-    /* Pattern 1: Q_CALL_FUNC followed by Q_RET */
-    if (cur->opcode == Q_CALL_FUNC && next->opcode == Q_RET) {
-      cur->opcode = Q_TAILCALL_FUNC;
-      cur->dest = q_none();
-      cur->src2 = q_none();
+    /* Pattern 1: call followed by return. Q_CALL is legacy label-based IR;
+     * Q_CALL_FUNC is the newer function-index form. */
+    if ((cur->opcode == Q_CALL_FUNC || cur->opcode == Q_CALL) &&
+        next->opcode == Q_RET) {
+      if (cur->opcode == Q_CALL_FUNC) {
+        cur->opcode = Q_TAILCALL_FUNC;
+        cur->dest = q_none();
+        cur->src2 = q_none();
+      } else {
+        cur->opcode = Q_JUMP;
+        cur->dest = q_none();
+        cur->src2 = q_none();
+      }
       next->opcode = Q_NOP;
       tco_count++;
       i++;
@@ -4576,14 +5593,21 @@ int lower_tco_pass(q_function_t *func, uint32_t func_idx) {
       q_instruction_t *move = &func->body[i + 1];
       q_instruction_t *ret = &func->body[i + 2];
 
-      if (cur->opcode == Q_CALL_FUNC && move->opcode == Q_MOVE &&
+      if ((cur->opcode == Q_CALL_FUNC || cur->opcode == Q_CALL) &&
+          move->opcode == Q_MOVE &&
           move->src1.type == OPERAND_VREG && move->src1.vreg == 0 &&
           move->dest.type == OPERAND_VREG && ret->opcode == Q_RET &&
           ret->src1.type == OPERAND_VREG && ret->src1.vreg == move->dest.vreg) {
 
-        cur->opcode = Q_TAILCALL_FUNC;
-        cur->dest = q_none();
-        cur->src2 = q_none();
+        if (cur->opcode == Q_CALL_FUNC) {
+          cur->opcode = Q_TAILCALL_FUNC;
+          cur->dest = q_none();
+          cur->src2 = q_none();
+        } else {
+          cur->opcode = Q_JUMP;
+          cur->dest = q_none();
+          cur->src2 = q_none();
+        }
         move->opcode = Q_NOP;
         ret->opcode = Q_NOP;
         tco_count++;

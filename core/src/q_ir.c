@@ -146,9 +146,17 @@ q_function_t* q_module_add_func(q_module_t *mod, const char *name)
         if (strcmp(mod->functions[i].name, name) == 0)
             return &mod->functions[i];
     }
-    if (mod->func_count >= Q_MAX_FUNCTIONS) return NULL;
+    if (mod->func_count >= Q_MAX_FUNCTIONS) {
+        fprintf(stderr, "[DEBUG] q_module_add_func failed: func_count %u >= Q_MAX_FUNCTIONS %u for name '%s'\n", mod->func_count, Q_MAX_FUNCTIONS, name);
+        return NULL;
+    }
     q_function_t *func = &mod->functions[mod->func_count];
-    if (q_func_init(func, name) != 0) return NULL;
+    if (q_func_init(func, name) != 0) {
+        fprintf(stderr, "[DEBUG] q_module_add_func failed: q_func_init failed for name '%s'\n", name);
+        return NULL;
+    }
+    if (strcmp(name, "vec_push") == 0) printf("[DEBUG] ADDING VEC_PUSH!\n");
+
     mod->func_count++;
     return func;
 }
@@ -293,6 +301,8 @@ const char* q_opcode_name(q_opcode_t op)
         case Q_STORE_BYTE:   return "Q_STORE_BYTE";
         case Q_LOAD_WORD:    return "Q_LOAD_WORD";
         case Q_STORE_WORD:   return "Q_STORE_WORD";
+        case Q_MEM_COPY:     return "Q_MEM_COPY";
+        case Q_MEM_SET:      return "Q_MEM_SET";
         case Q_STR_LEN:      return "Q_STR_LEN";
         case Q_STR_GET:      return "Q_STR_GET";
         case Q_STR_CAT:      return "Q_STR_CAT";
@@ -334,6 +344,7 @@ const char* q_opcode_name(q_opcode_t op)
         case Q_ARG_COUNT:    return "Q_ARG_COUNT";
         case Q_CALL_FUNC:    return "Q_CALL_FUNC";
         case Q_CALL_INDIRECT: return "Q_CALL_INDIRECT";
+        case Q_TAILCALL_FUNC: return "Q_TAILCALL_FUNC";
         case Q_LOAD_GLOBAL:  return "Q_LOAD_GLOBAL";
         case Q_STORE_GLOBAL: return "Q_STORE_GLOBAL";
         case Q_ATOMIC_LOAD_GLOBAL:  return "Q_ATOMIC_LOAD_GLOBAL";
@@ -363,8 +374,10 @@ const char* q_opcode_name(q_opcode_t op)
         case Q_TASK_CANCEL:  return "Q_TASK_CANCEL";
         case Q_REF_BIND_CLEAR: return "Q_REF_BIND_CLEAR";
         case Q_REF_BIND_SET: return "Q_REF_BIND_SET";
+        case Q_INTRINSIC:    return "Q_INTRINSIC";
         case Q_LABEL:        return "Q_LABEL";
         case Q_HALT:         return "Q_HALT";
+
         default:             return "Q_???";
     }
 }
