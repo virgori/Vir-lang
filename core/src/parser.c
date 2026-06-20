@@ -114,6 +114,11 @@ static int expect_block_open(vir_parser_t *p, const char *context) {
   }
   if (match(p, TOK_THEN))
     return 1;
+  /* Also accept a bare newline as an implicit block opener for legacy-style
+   * function bodies: `func f(x) -> T\n  body  end` */
+  if (check(p, TOK_NEWLINE)) {
+    return 1; /* Don't consume — skip_newlines inside parse_block will */
+  }
   char msg[128];
   snprintf(msg, sizeof(msg), "expected ':' or 'then' after %s", context);
   parse_error(p, msg);
@@ -222,6 +227,12 @@ static const builtin_map_t builtins[] = {
     /* §22.5 Cooperative yield */
     {"yield", BUILTIN_YIELD},
     {"nhường", BUILTIN_YIELD},
+    /* §Phase-9 Intrinsic Registry — Q_INTRINSIC table-driven dispatch */
+    {"__syscall",     BUILTIN_SYSCALL},
+    {"__memcpy",      BUILTIN_MEMCPY},
+    {"__memset",      BUILTIN_MEMSET},
+    {"__trap",        BUILTIN_TRAP},
+    {"__unreachable", BUILTIN_UNREACHABLE},
     {NULL, 0}};
 
 static int lookup_builtin(const char *name) {
@@ -236,6 +247,41 @@ static int lookup_builtin(const char *name) {
  * Forward Declarations
  * ═══════════════════════════════════════════════════════ */
 
+
+static inline int is_name_token(vir_tok_t t) {
+  if (t == TOK_IDENT) return 1;
+  /* Exclude operators and delimiters explicitly */
+  if (t >= TOK_PLUS && t <= TOK_MOD) return 0;
+  if (t >= TOK_EQ && t <= TOK_SAFE_NE) return 0;
+  if (t == TOK_ASSIGN) return 0;
+  if (t >= TOK_AND && t <= TOK_NOT) return 0;
+  if (t >= TOK_BIT_AND && t <= TOK_BIT_NOT) return 0;
+  if (t >= TOK_SAFE_ACCESS && t <= TOK_HASH) return 0;
+  if (t >= TOK_MATMUL && t <= TOK_ATOMIC_BANG && t != TOK_LOCK) return 0;
+  if (t >= TOK_PLUS_ASSIGN && t <= TOK_SLASH_ASSIGN) return 0;
+  if (t >= TOK_LPAREN && t <= TOK_ARROW) return 0;
+  
+  /* Everything else in the keyword range is acceptable as a name */
+  return (t >= TOK_FUNC && t <= TOK_NONE_LIT);
+}
+
+static const vir_token_t *expect_name(vir_parser_t *p, const char *msg) {
+  const vir_token_t *t = peek(p);
+  if (is_name_token(t->type)) {
+    return advance(p);
+  }
+  parse_error(p, msg);
+  return NULL;
+}
+
+static const vir_token_t *expect_func_name(vir_parser_t *p) {
+  const vir_token_t *t = peek(p);
+  if (is_name_token(t->type)) {
+    return advance(p);
+  }
+  parse_error(p, "expected function name");
+  return NULL;
+}
 static ast_node_t *parse_expr(vir_parser_t *p);
 static ast_node_t *parse_statement(vir_parser_t *p);
 static ast_node_t *parse_block(vir_parser_t *p);
@@ -259,9 +305,9 @@ static int check_record_literal(vir_parser_t *p) {
     if (next < p->token_count && (p->tokens[next].type == TOK_SEMICOLON ||
                                   p->tokens[next].type == TOK_NEWLINE))
       return 1;
-    /* IDENT : pattern: Name { field: val ... } */
+    /* IDENT : or IDENT = pattern: Name { field: val ... } */
     if (next + 1 < p->token_count && p->tokens[next].type == TOK_IDENT &&
-        p->tokens[next + 1].type == TOK_COLON)
+        (p->tokens[next + 1].type == TOK_COLON || p->tokens[next + 1].type == TOK_ASSIGN))
       return 1;
   }
   return 0;
@@ -348,7 +394,7 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
   /* §20.2 Map expression: `map x [,idx] in iter: body end` */
   if (t->type == TOK_MAP_KW) {
     advance(p);
-    const vir_token_t *v1 = expect(p, TOK_IDENT, "expected map variable");
+    const vir_token_t *v1 = expect_name(p, "expected map variable");
     if (!v1)
       return NULL;
     ast_node_t *m = ast_new(AST_MAP_EXPR);
@@ -356,7 +402,7 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
     m->line = t->line;
     if (match(p, TOK_COMMA)) {
       const vir_token_t *v2 =
-          expect(p, TOK_IDENT, "expected second map variable");
+          expect_name(p, "expected second map variable");
       if (v2)
         strncpy(m->name2, v2->str.buf, AST_NAME_LEN - 1);
     }
@@ -474,33 +520,31 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
         return id;
       }
     }
-    /* Check for record literal: IDENT '{' field: val, ... '}' */
-    if (check(p, TOK_LBRACE) && check_record_literal(p)) {
-      advance(p); /* consume '{' */
-      skip_newlines(p);
-      match(p, TOK_SEMICOLON); /* skip optional semicolon after '{' */
-      skip_newlines(p);
-      ast_node_t *rl = ast_new(AST_RECORD_LITERAL);
-      strncpy(rl->name, t->str.buf, AST_NAME_LEN - 1);
-      rl->line = t->line;
-      while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
-        /* Parse field_name : expr */
-        const vir_token_t *fname = expect(p, TOK_IDENT, "expected field name");
-        if (!fname)
+
+    /* Generic instantiation: f<T>(...) */
+    if (check(p, TOK_LT)) {
+      uint32_t save = p->pos;
+      advance(p);
+      int depth = 1;
+      int ok = 1;
+      while (depth > 0 && !check(p, TOK_EOF)) {
+        if (check(p, TOK_LT)) depth++;
+        else if (check(p, TOK_GT)) depth--;
+        else if (check(p, TOK_CAST)) depth -= 2; /* >> counts as two > */
+        else if (!is_name_token(peek(p)->type) && !check(p, TOK_COMMA)) {
+          ok = 0;
           break;
-        expect(p, TOK_COLON, "expected ':' after field name");
-        ast_node_t *val = parse_expr(p);
-        if (val) {
-          /* Store field name in the value node's name2 */
-          strncpy(val->name2, fname->str.buf, AST_NAME_LEN - 1);
-          ast_add_child(rl, val);
         }
-        match(p, TOK_COMMA);
-        skip_newlines(p);
+        advance(p);
       }
-      expect(p, TOK_RBRACE, "expected '}' after record literal");
-      return rl;
+      if (ok && (check(p, TOK_LPAREN) || check(p, TOK_LBRACE))) {
+        /* Valid generic instantiation, token is now at '(' or '{' */
+      } else {
+        /* Not a generic call, rewind to parse as operator later */
+        p->pos = save;
+      }
     }
+
     /* Check if it's a builtin function call or regular function call */
     if (check(p, TOK_LPAREN)) {
       int bid = lookup_builtin(t->str.buf);
@@ -580,6 +624,43 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
       expect(p, TOK_RBRACKET, "expected ']' after index");
       return access;
     }
+
+    /* Check for record literal: IDENT '{' field: val, ... '}' */
+    if (check(p, TOK_LBRACE) && check_record_literal(p)) {
+      advance(p); /* consume '{' */
+      skip_newlines(p);
+      match(p, TOK_SEMICOLON); /* skip optional semicolon after '{' */
+      skip_newlines(p);
+      ast_node_t *rl = ast_new(AST_RECORD_LITERAL);
+      strncpy(rl->name, t->str.buf, AST_NAME_LEN - 1);
+      rl->line = t->line;
+      while (!check(p, TOK_RBRACE) && !check(p, TOK_EOF)) {
+        /* Parse field_name : expr */
+        const vir_token_t *fname = expect_name(p, "expected field name");
+        if (!fname)
+          break;
+        if (check(p, TOK_COLON) || check(p, TOK_ASSIGN)) {
+          advance(p);
+        } else {
+          parse_error(p, "expected ':' or '=' after field name");
+        }
+        ast_node_t *val = parse_expr(p);
+        if (val) {
+          /* Store field name in the value node's name2 */
+          strncpy(val->name2, fname->str.buf, AST_NAME_LEN - 1);
+          ast_add_child(rl, val);
+        }
+        /* Accept both ',' and ';' as field separator (v2.0 compat) */
+        while (match(p, TOK_COMMA) || match(p, TOK_SEMICOLON) || match(p, TOK_NEWLINE)) {
+          /* consume separator */
+        }
+      }
+      /* Also allow trailing ';' before '}' */
+      while (match(p, TOK_SEMICOLON) || match(p, TOK_COMMA) || match(p, TOK_NEWLINE)) {}
+      expect(p, TOK_RBRACE, "expected '}' after record literal");
+      return rl;
+    }
+
     /* Plain identifier */
     ast_node_t *n = ast_new(AST_IDENTIFIER);
     strncpy(n->name, t->str.buf, AST_NAME_LEN - 1);
@@ -595,6 +676,18 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
   case TOK_LPAREN: {
     advance(p);
     ast_node_t *inner = parse_expr(p);
+    /* Check for tuple: (a, b, c) */
+    if (check(p, TOK_COMMA)) {
+      ast_node_t *tup = ast_new(AST_TUPLE_LITERAL);
+      if (inner) ast_add_child(tup, inner);
+      while (match(p, TOK_COMMA)) {
+        if (check(p, TOK_RPAREN)) break; /* trailing comma */
+        ast_node_t *elem = parse_expr(p);
+        if (elem) ast_add_child(tup, elem);
+      }
+      expect(p, TOK_RPAREN, "expected ')' to close tuple");
+      return tup;
+    }
     expect(p, TOK_RPAREN, "expected ')'");
     return inner;
   }
@@ -672,6 +765,16 @@ static ast_node_t *parse_unary(vir_parser_t *p) {
       return NULL;
     ast_node_t *n = ast_new(AST_BORROW);
     n->int_val = is_mut; /* 0 = shared, 1 = mutable */
+    n->line = t->line;
+    ast_add_child(n, operand);
+    return n;
+  }
+  if (check(p, TOK_STAR)) {
+    const vir_token_t *t = advance(p);
+    ast_node_t *operand = parse_unary(p);
+    if (!operand)
+      return NULL;
+    ast_node_t *n = ast_new(AST_ATOMIC_LOAD); // Use AST_ATOMIC_LOAD temporarily if DEREF is missing
     n->line = t->line;
     ast_add_child(n, operand);
     return n;
@@ -768,7 +871,22 @@ static ast_node_t *parse_unary(vir_parser_t *p) {
     return NULL;
   while (check(p, TOK_DOT) || check(p, TOK_SAFE_ACCESS) ||
          check(p, TOK_EXIST) || check(p, TOK_ATOMIC_BANG) ||
-         check(p, TOK_BIT_NOT)) {
+         check(p, TOK_BIT_NOT) || check(p, TOK_LBRACKET)) {
+    if (check(p, TOK_LBRACKET)) {
+      const vir_token_t *lbr = advance(p);
+      ast_node_t *idx = parse_expr(p);
+      ast_node_t *access = ast_new(AST_INDEX_ACCESS);
+      access->line = lbr->line;
+      ast_add_child(access, left);
+      ast_add_child(access, idx);
+      while (check(p, TOK_COMMA)) {
+        advance(p);
+        ast_add_child(access, parse_expr(p));
+      }
+      expect(p, TOK_RBRACKET, "expected ']'");
+      left = access;
+      continue;
+    }
     if (check(p, TOK_BIT_NOT)) {
       /* §24.2 swizzle: v~xyz / v~rgba.  Postfix only — bitwise NOT
        * is prefix-only.  Disambiguated by being in postfix position. */
@@ -810,8 +928,19 @@ static ast_node_t *parse_unary(vir_parser_t *p) {
     }
     int is_safe = check(p, TOK_SAFE_ACCESS);
     advance(p); /* consume '.' or '?.' */
+    
+    if (check(p, TOK_INT)) {
+      const vir_token_t *idx_tok = advance(p);
+      ast_node_t *fa = ast_new(is_safe ? AST_SAFE_ACCESS : AST_FIELD_ACCESS);
+      snprintf(fa->name, AST_NAME_LEN - 1, "%lld", (long long)idx_tok->int_val);
+      fa->line = idx_tok->line;
+      ast_add_child(fa, left);
+      left = fa;
+      continue;
+    }
+    
     const vir_token_t *field =
-        expect(p, TOK_IDENT, "expected field name after '.'");
+        expect_name(p, "expected field name after '.'");
     if (!field)
       break;
     ast_node_t *fa = ast_new(is_safe ? AST_SAFE_ACCESS : AST_FIELD_ACCESS);
@@ -1034,7 +1163,7 @@ static ast_node_t *parse_cast(vir_parser_t *p) {
       continue;
     }
     const vir_token_t *type_tok =
-        expect(p, TOK_IDENT, "expected type name after cast");
+        expect_name(p, "expected type name after cast");
     if (!type_tok) {
       ast_free(left);
       return NULL;
@@ -1186,7 +1315,31 @@ static ast_node_t *parse_block(vir_parser_t *p) {
  * Used by parse_var_decl both for the first clause and the additional
  * clauses chained after `;` in a §5.3 group. */
 static ast_node_t *parse_var_decl_single(vir_parser_t *p, ast_type_t type) {
-  const vir_token_t *name_tok = expect(p, TOK_IDENT, "expected variable name");
+  if (match(p, TOK_LPAREN)) {
+    ast_node_t *decl = ast_new(type);
+    decl->int_val |= 0x4000; /* bit 14 = is_tuple_destruct */
+    
+    while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) {
+      const vir_token_t *name_tok = expect_name(p, "expected tuple variable name");
+      if (!name_tok) break;
+      
+      ast_node_t *ident = ast_new(AST_IDENTIFIER);
+      strncpy(ident->name, name_tok->str.buf, AST_NAME_LEN - 1);
+      ident->line = name_tok->line;
+      ast_add_child(decl, ident);
+      
+      if (!match(p, TOK_COMMA)) break;
+    }
+    expect(p, TOK_RPAREN, "expected ')' to close tuple assignment");
+    
+    if (match(p, TOK_ASSIGN)) {
+      ast_node_t *init = parse_expr(p);
+      if (init) ast_add_child(decl, init);
+    }
+    return decl;
+  }
+
+  const vir_token_t *name_tok = expect_name(p, "expected variable name");
   if (!name_tok)
     return NULL;
 
@@ -1510,7 +1663,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
   /* v1.2:   FUNC IDENT ':' [in(params)] block END
    * legacy: FUNC IDENT '(' params ')' THEN block END
    * Both forms supported for backwards compatibility. */
-  const vir_token_t *name_tok = expect(p, TOK_IDENT, "expected function name");
+  const vir_token_t *name_tok = expect_func_name(p);
   if (!name_tok)
     return NULL;
 
@@ -1563,7 +1716,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
             is_ref_param = 1;
           }
           const vir_token_t *param_tok =
-              expect(p, TOK_IDENT, "expected parameter name");
+              expect_name(p, "expected parameter name");
           if (!param_tok)
             break;
           ast_node_t *param = ast_new(AST_IDENTIFIER);
@@ -1571,12 +1724,22 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
           param->line = param_tok->line;
           if (is_ref_param)
             param->flags |= AST_FLAG_REF_PARAM;
-          /* Optional type hint: ':' TYPE */
+          /* Optional type hint: ':' TYPE[<T>] */
           if (match(p, TOK_COLON)) {
             const vir_token_t *type_tok =
-                expect(p, TOK_IDENT, "expected type name");
+                expect_name(p, "expected type name");
             if (type_tok) {
               strncpy(param->name2, type_tok->str.buf, AST_NAME_LEN - 1);
+            }
+            /* Skip generic type params: Vec<KeywordEntry>, etc. */
+            if (match(p, TOK_LT)) {
+              int depth = 1;
+              while (depth > 0 && !check(p, TOK_EOF)) {
+                if (check(p, TOK_LT)) depth++;
+                else if (check(p, TOK_GT)) depth--;
+                else if (check(p, TOK_CAST)) depth -= 2;
+                advance(p);
+              }
             }
           }
           ast_add_child(fn, param);
@@ -1602,6 +1765,20 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
         }
       }
       expect(p, TOK_RPAREN, "expected ')' after parameters");
+      if (match(p, TOK_ARROW)) {
+        if (check(p, TOK_IDENT)) {
+          const vir_token_t *rt = advance(p);
+          if (match(p, TOK_LT)) {
+            int depth = 1;
+            while (depth > 0 && !check(p, TOK_EOF)) {
+              if (check(p, TOK_LT)) depth++;
+              else if (check(p, TOK_GT)) depth--;
+              else if (check(p, TOK_CAST)) depth -= 2;
+              advance(p);
+            }
+          }
+        }
+      }
       skip_newlines(p);
     }
 
@@ -1627,7 +1804,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
         is_ref_param = 1;
       }
       const vir_token_t *param_tok =
-          expect(p, TOK_IDENT, "expected parameter name");
+          expect_name(p, "expected parameter name");
       if (!param_tok)
         break;
       ast_node_t *param = ast_new(AST_IDENTIFIER);
@@ -1643,9 +1820,15 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
           strncpy(param->name2, tt->str.buf, AST_NAME_LEN - 1);
         }
         /* Consume any remaining type-decoration tokens until
-         * separator/closing-paren. */
-        while (!check(p, TOK_COMMA) && !check(p, TOK_SEMICOLON) &&
-               !check(p, TOK_RPAREN) && !check(p, TOK_EOF)) {
+         * separator/closing-paren, accounting for nested generic brackets `< >`. */
+        int angle_depth = 0;
+        while (!check(p, TOK_EOF)) {
+          if (check(p, TOK_LT)) angle_depth++;
+          else if (check(p, TOK_GT)) angle_depth--;
+          
+          if (angle_depth == 0 && (check(p, TOK_COMMA) || check(p, TOK_SEMICOLON) || check(p, TOK_RPAREN))) {
+            break;
+          }
           advance(p);
         }
       }
@@ -1708,7 +1891,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
 static ast_node_t *parse_for_range_stmt(vir_parser_t *p) {
   uint32_t line = peek(p)->line;
 
-  const vir_token_t *var_tok = expect(p, TOK_IDENT, "expected loop variable");
+  const vir_token_t *var_tok = expect_name(p, "expected loop variable");
   if (!var_tok)
     return NULL;
 
@@ -1722,7 +1905,7 @@ static ast_node_t *parse_for_range_stmt(vir_parser_t *p) {
   if (check(p, TOK_COMMA)) {
     advance(p);
     const vir_token_t *v2_tok =
-        expect(p, TOK_IDENT, "expected value variable after ','");
+        expect_name(p, "expected value variable after ','");
     if (!v2_tok)
       return NULL;
     char kname[AST_NAME_LEN], vname[AST_NAME_LEN];
@@ -1837,14 +2020,25 @@ static ast_node_t *parse_for_range_stmt(vir_parser_t *p) {
   if (!start)
     return NULL;
 
-  if (!expect(p, TOK_DOTDOT, "expected '..' in range"))
-    return NULL;
+  ast_node_t *end_expr = NULL;
 
-  /* Parse end expression */
-  ast_node_t *end_expr = parse_expr(p);
-  if (!end_expr) {
+  if (start->type == AST_BINOP && start->op == OP_PATTERN) {
+    /* 0..n was parsed as a single binary op by parse_expr! */
+    ast_node_t *real_start = start->children[0];
+    end_expr = start->children[1];
+    start->child_count = 0; /* Unlink children so we can free the binary op node */
     ast_free(start);
-    return NULL;
+    start = real_start;
+  } else {
+    if (!expect(p, TOK_DOTDOT, "expected '..' in range"))
+      return NULL;
+
+    /* Parse end expression */
+    end_expr = parse_expr(p);
+    if (!end_expr) {
+      ast_free(start);
+      return NULL;
+    }
   }
 
   expect_block_open(p, "for range");
@@ -1877,9 +2071,23 @@ static ast_node_t *parse_for_range_stmt(vir_parser_t *p) {
 static ast_node_t *parse_enum_def(vir_parser_t *p) {
   uint32_t line = peek(p)->line;
 
-  const vir_token_t *name_tok = expect(p, TOK_IDENT, "expected enum name");
+  const vir_token_t *name_tok = expect_name(p, "expected enum name");
   if (!name_tok)
     return NULL;
+
+  /* §16: Optional generic clause `<T>` or `<T, U>` after enum name. */
+  if (match(p, TOK_LT)) {
+    int depth = 1;
+    while (depth > 0 && !check(p, TOK_EOF)) {
+      if (check(p, TOK_LT))
+        depth++;
+      else if (check(p, TOK_GT))
+        depth--;
+      advance(p);
+      if (depth == 0)
+        break;
+    }
+  }
 
   /* Accept ':' or 'then' */
   expect_block_open(p, "enum name");
@@ -1893,7 +2101,7 @@ static ast_node_t *parse_enum_def(vir_parser_t *p) {
 
   while (!check(p, TOK_END) && !check(p, TOK_EOF)) {
     const vir_token_t *vname =
-        expect(p, TOK_IDENT, "expected enum variant name");
+        expect_name(p, "expected enum variant name");
     if (!vname)
       break;
 
@@ -1956,9 +2164,23 @@ static ast_node_t *parse_enum_def(vir_parser_t *p) {
 static ast_node_t *parse_record_def(vir_parser_t *p) {
   uint32_t line = peek(p)->line;
 
-  const vir_token_t *name_tok = expect(p, TOK_IDENT, "expected record name");
+  const vir_token_t *name_tok = expect_name(p, "expected record name");
   if (!name_tok)
     return NULL;
+
+  /* §16: Optional generic clause `<T>` or `<T, U>` after record name. */
+  if (match(p, TOK_LT)) {
+    int depth = 1;
+    while (depth > 0 && !check(p, TOK_EOF)) {
+      if (check(p, TOK_LT))
+        depth++;
+      else if (check(p, TOK_GT))
+        depth--;
+      advance(p);
+      if (depth == 0)
+        break;
+    }
+  }
 
   /* Accept ':' or 'then' as block opener (optional for entity) */
   if (!match(p, TOK_COLON))
@@ -1972,7 +2194,7 @@ static ast_node_t *parse_record_def(vir_parser_t *p) {
   while (!check(p, TOK_END) && !check(p, TOK_EOF)) {
     if (match(p, TOK_METHOD)) {
       /* §11.4: method name(params) block end */
-      const vir_token_t *mname = expect(p, TOK_IDENT, "expected method name");
+      const vir_token_t *mname = expect_name(p, "expected method name");
       if (!mname)
         break;
 
@@ -1991,7 +2213,7 @@ static ast_node_t *parse_record_def(vir_parser_t *p) {
         if (!check(p, TOK_RPAREN)) {
           do {
             const vir_token_t *pname =
-                expect(p, TOK_IDENT, "expected param name");
+                expect_name(p, "expected param name");
             if (!pname)
               break;
             ast_node_t *param = ast_new(AST_IDENTIFIER);
@@ -2035,7 +2257,7 @@ static ast_node_t *parse_record_def(vir_parser_t *p) {
       continue;
     }
 
-    const vir_token_t *fname = expect(p, TOK_IDENT, "expected field name");
+    const vir_token_t *fname = expect_name(p, "expected field name");
     if (!fname)
       break;
 
@@ -2044,7 +2266,7 @@ static ast_node_t *parse_record_def(vir_parser_t *p) {
     field->line = fname->line;
 
     /* Optional type hint: field_name: type
-     * Skip complex types like [i32], Vec<Token>, etc. until newline */
+     * Skip complex types like [i32], Vec<T>, etc. until newline */
     if (match(p, TOK_COLON)) {
       while (!check(p, TOK_NEWLINE) && !check(p, TOK_END) &&
              !check(p, TOK_EOF)) {
@@ -2098,7 +2320,7 @@ static int base_width_from_ident(const char *s) {
 static ast_node_t *parse_register_def(vir_parser_t *p) {
   uint32_t line = peek(p)->line;
 
-  const vir_token_t *name_tok = expect(p, TOK_IDENT, "expected register name");
+  const vir_token_t *name_tok = expect_name(p, "expected register name");
   if (!name_tok)
     return NULL;
 
@@ -2120,7 +2342,7 @@ static ast_node_t *parse_register_def(vir_parser_t *p) {
   skip_newlines(p);
 
   while (!check(p, TOK_END) && !check(p, TOK_EOF)) {
-    const vir_token_t *fname = expect(p, TOK_IDENT, "expected field name");
+    const vir_token_t *fname = expect_name(p, "expected field name");
     if (!fname)
       break;
     ast_node_t *field = ast_new(AST_IDENTIFIER);
@@ -2162,7 +2384,7 @@ static ast_node_t *parse_register_def(vir_parser_t *p) {
 static ast_node_t *parse_mold_def(vir_parser_t *p) {
   uint32_t line = peek(p)->line;
 
-  const vir_token_t *name_tok = expect(p, TOK_IDENT, "expected mold name");
+  const vir_token_t *name_tok = expect_name(p, "expected mold name");
   if (!name_tok)
     return NULL;
 
@@ -2186,7 +2408,7 @@ static ast_node_t *parse_mold_def(vir_parser_t *p) {
    * are assigned sequentially from LSB. */
   uint32_t next_lo = 0;
   while (!check(p, TOK_END) && !check(p, TOK_EOF)) {
-    const vir_token_t *fname = expect(p, TOK_IDENT, "expected mold field name");
+    const vir_token_t *fname = expect_name(p, "expected mold field name");
     if (!fname)
       break;
     ast_node_t *field = ast_new(AST_IDENTIFIER);
@@ -2241,9 +2463,13 @@ static ast_node_t *parse_case_stmt(vir_parser_t *p) {
     return NULL;
   }
 
-  /* Expect :~ token (optional in §21 simple form) */
-  if (check(p, TOK_PATTERN))
+  /* Expect :~ token (optional in §21 simple form) or block opener */
+  if (check(p, TOK_PATTERN)) {
     advance(p);
+    if (check(p, TOK_COLON)) advance(p);
+  } else {
+    expect_block_open(p, "case subject");
+  }
 
   ast_node_t *node = ast_new(AST_CASE);
   node->line = subject->line;
@@ -2254,6 +2480,9 @@ static ast_node_t *parse_case_stmt(vir_parser_t *p) {
   /* Parse arms until 'end' */
   while (!check(p, TOK_END) && !check(p, TOK_EOF)) {
     ast_node_t *arm = ast_new(AST_PATTERN_MATCH);
+
+    /* Vir v2.0 case arms start with `case` */
+    match(p, TOK_CASE);
 
     const vir_token_t *pat = peek(p);
 
@@ -2282,15 +2511,26 @@ static ast_node_t *parse_case_stmt(vir_parser_t *p) {
       arm->int_val = -3; /* sentinel: named pattern */
       advance(p);
       if (match(p, TOK_LPAREN)) {
-        int depth = 1;
-        while (depth > 0 && !check(p, TOK_EOF)) {
-          if (check(p, TOK_LPAREN))
-            depth++;
-          else if (check(p, TOK_RPAREN))
-            depth--;
-          advance(p);
-          if (depth == 0)
-            break;
+        /* Capture first binding identifier into name2, e.g. Some(v) -> name2="v" */
+        if (peek(p)->type == TOK_IDENT) {
+          const vir_token_t *bind = advance(p);
+          strncpy(arm->name2, bind->str.buf, AST_NAME_LEN - 1);
+          /* Skip any remaining tokens until matching ')' */
+          while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF))
+            advance(p);
+          match(p, TOK_RPAREN);
+        } else {
+          /* No binding — just consume until ')' */
+          int depth = 1;
+          while (depth > 0 && !check(p, TOK_EOF)) {
+            if (check(p, TOK_LPAREN))
+              depth++;
+            else if (check(p, TOK_RPAREN))
+              depth--;
+            advance(p);
+            if (depth == 0)
+              break;
+          }
         }
       }
     } else {
@@ -2312,22 +2552,37 @@ static ast_node_t *parse_case_stmt(vir_parser_t *p) {
        * Cheap heuristic: TOK_INT/TOK_STRING/TOK_ELSE or IDENT('_')
        * followed by ':' indicates another arm. */
       int starts_new_arm = 0;
-      if (check(p, TOK_ELSE))
+      if (check(p, TOK_CASE) || check(p, TOK_ELSE))
         starts_new_arm = 1;
       else if ((check(p, TOK_INT) || check(p, TOK_STRING)) &&
                p->pos + 1 < p->token_count &&
                p->tokens[p->pos + 1].type == TOK_COLON) {
         starts_new_arm = 1;
-      } else if (check(p, TOK_IDENT) && p->pos + 1 < p->token_count &&
-                 p->tokens[p->pos + 1].type == TOK_COLON &&
-                 strcmp(peek(p)->str.buf, "_") == 0) {
-        starts_new_arm = 1;
+      } else if (check(p, TOK_IDENT)) {
+        if (p->pos + 1 < p->token_count && p->tokens[p->pos + 1].type == TOK_COLON) {
+          starts_new_arm = 1;
+        } else if (p->pos + 1 < p->token_count && p->tokens[p->pos + 1].type == TOK_LPAREN) {
+          int nxt = p->pos + 2;
+          int d = 1;
+          while (nxt < p->token_count && d > 0) {
+            if (p->tokens[nxt].type == TOK_LPAREN) d++;
+            else if (p->tokens[nxt].type == TOK_RPAREN) d--;
+            nxt++;
+          }
+          if (nxt < p->token_count && p->tokens[nxt].type == TOK_COLON) {
+            starts_new_arm = 1;
+          }
+        }
       }
       if (starts_new_arm)
         break;
       ast_node_t *body = parse_statement(p);
-      if (body)
+      if (body) {
         ast_add_child(arm, body);
+      } else {
+        if (p->error[0] != '\0') break;
+        if (!check(p, TOK_EOF)) advance(p);
+      }
       /* Inter-stmt separators */
       while (check(p, TOK_SEMICOLON) || check(p, TOK_COMMA))
         advance(p);
@@ -2344,6 +2599,38 @@ static ast_node_t *parse_case_stmt(vir_parser_t *p) {
   return node;
 }
 
+static int parse_module_path(vir_parser_t *p, char *out_name) {
+  size_t pos = 0;
+  out_name[0] = '\0';
+  while (is_name_token(peek(p)->type)) {
+    const vir_token_t *seg = advance(p);
+    size_t n_seg = strlen(seg->str.buf);
+    if (pos + n_seg + 2 >= AST_NAME_LEN)
+      break;
+    memcpy(out_name + pos, seg->str.buf, n_seg);
+    pos += n_seg;
+    if (check(p, TOK_COLON)) {
+      const vir_token_t *nxt =
+          (p->pos + 1 < p->token_count) ? &p->tokens[p->pos + 1] : NULL;
+      if (nxt && nxt->type == TOK_COLON) {
+        advance(p);
+        advance(p);
+        out_name[pos++] = ':';
+        out_name[pos++] = ':';
+      } else {
+        break;
+      }
+    } else if (check(p, TOK_DOT)) {
+      advance(p);
+      out_name[pos++] = '.';
+    } else {
+      break;
+    }
+  }
+  out_name[pos] = '\0';
+  return pos > 0;
+}
+
 static ast_node_t *parse_statement(vir_parser_t *p) {
   skip_newlines(p);
   const vir_token_t *t = peek(p);
@@ -2354,7 +2641,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
   if (t->type == TOK_AT) {
     advance(p);
     const vir_token_t *at_name =
-        expect(p, TOK_IDENT, "expected attribute name after '@'");
+        expect_name(p, "expected attribute name after '@'");
     if (!at_name)
       return NULL;
     int is_entry = (strcmp(at_name->str.buf, "entry") == 0);
@@ -2500,7 +2787,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
         advance(p); /* 'extern' */
         advance(p); /* 'func' */
         const vir_token_t *nm =
-            expect(p, TOK_IDENT, "expected name after 'extern func'");
+            expect_name(p, "expected name after 'extern func'");
         ast_node_t *f = ast_new(AST_FUNC_DEF);
         if (nm)
           strncpy(f->name, nm->str.buf, AST_NAME_LEN - 1);
@@ -2645,7 +2932,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
         if (match(p, TOK_LPAREN)) {
           while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) {
             const vir_token_t *k =
-                expect(p, TOK_IDENT, "expected option in port(...)");
+                expect_name(p, "expected option in port(...)");
             if (!k)
               break;
             if (!expect(p, TOK_COLON, "expected ':' after port option"))
@@ -2690,7 +2977,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
         sb->line = t->line;
         while (!check(p, TOK_END) && !check(p, TOK_EOF)) {
           skip_newlines(p);
-          if (check(p, TOK_END) || check(p, TOK_EOF))
+          if (!is_name_token(peek(p)->type))
             break;
           /* case recv X from P: body */
           if (check(p, TOK_CASE))
@@ -2700,7 +2987,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
             advance(p);
           }
           const vir_token_t *bind =
-              expect(p, TOK_IDENT, "expected bind var in select case");
+              expect_name(p, "expected bind var in select case");
           if (!bind)
             break;
           /* 'from' keyword (tokenised as TOK_FROM by lexer) */
@@ -2709,7 +2996,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
             advance(p);
           }
           const vir_token_t *pn =
-              expect(p, TOK_IDENT, "expected port name in select case");
+              expect_name(p, "expected port name in select case");
           if (!pn)
             break;
           expect(p, TOK_COLON, "expected ':' after select case header");
@@ -2880,7 +3167,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     /* §20: del IDENT[key] */
     const vir_token_t *dtok = advance(p);
     const vir_token_t *nm =
-        expect(p, TOK_IDENT, "expected dict name after 'del'");
+        expect_name(p, "expected dict name after 'del'");
     if (!nm)
       return NULL;
     if (!expect(p, TOK_LBRACKET, "expected '[' after dict name in 'del'"))
@@ -2935,7 +3222,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
      *        `lock IDENT` alone = atomic load expression stmt */
     advance(p);
     const vir_token_t *id =
-        expect(p, TOK_IDENT, "expected variable after 'lock'");
+        expect_name(p, "expected variable after 'lock'");
     if (!id)
       return NULL;
     if (check(p, TOK_ASSIGN)) {
@@ -2964,12 +3251,13 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
         break;
       default:
         op = OP_DIV;
-        break;
+        break; /* SLASH_ASSIGN */
       }
       ast_node_t *rhs = parse_expr(p);
       if (!rhs)
         return NULL;
       ast_node_t *idn = ast_new(AST_IDENTIFIER);
+    if (t && t->str.buf && strcmp(t->str.buf, "prog") == 0) printf("\n*** FOUND prog IDENT AT LINE %u\n", t->line);
       strncpy(idn->name, id->str.buf, AST_NAME_LEN - 1);
       idn->line = id->line;
       ast_node_t *bin = ast_new(AST_BINOP);
@@ -2986,6 +3274,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     /* Bare `lock x` statement → atomic load (no-op as stmt; kept for
      * consistency with expression-form `lock x`) */
     ast_node_t *idn = ast_new(AST_IDENTIFIER);
+    if (t && t->str.buf && strcmp(t->str.buf, "prog") == 0) printf("\n*** FOUND prog IDENT AT LINE %u\n", t->line);
     strncpy(idn->name, id->str.buf, AST_NAME_LEN - 1);
     idn->line = id->line;
     ast_node_t *al = ast_new(AST_ATOMIC_LOAD);
@@ -3044,7 +3333,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     /* emit LEVEL(arg, ...) — LEVEL is an identifier (LOG_INFO etc.) */
     advance(p);
     const vir_token_t *lvl =
-        expect(p, TOK_IDENT, "expected log level after 'emit'");
+        expect_name(p, "expected log level after 'emit'");
     if (!lvl)
       return NULL;
     ast_node_t *n = ast_new(AST_EMIT);
@@ -3071,7 +3360,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     n->int_val = 0; /* opt flags */
     if (match(p, TOK_LPAREN)) {
       while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) {
-        const vir_token_t *key = expect(p, TOK_IDENT, "expected option name");
+        const vir_token_t *key = expect_name(p, "expected option name");
         if (!key)
           break;
         if (!expect(p, TOK_COLON, "expected ':' in try option"))
@@ -3090,7 +3379,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
             break;
           size_t off = 0;
           while (!check(p, TOK_RBRACKET) && !check(p, TOK_EOF)) {
-            const vir_token_t *v = expect(p, TOK_IDENT, "expected var name");
+            const vir_token_t *v = expect_name(p, "expected var name");
             if (!v)
               break;
             size_t ln = strlen(v->str.buf);
@@ -3140,22 +3429,24 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
      *   or   import SYM1, SYM2, ... from MODULE ;     (§Phase-8)
      */
     advance(p);
-    const vir_token_t *mod =
-        expect(p, TOK_IDENT, "expected module name after import");
-    if (!mod)
+    uint32_t line = peek(p)->line;
+    char mod_name[AST_NAME_LEN];
+    if (!parse_module_path(p, mod_name)) {
+      parse_error(p, "expected module name after 'import'");
       return NULL;
+    }
     ast_node_t *n = ast_new(AST_IMPORT);
-    n->line = t->line;
+    n->line = line;
     /* Detect `import SYM1 , … from MODULE` by peeking at next token. */
     if (check(p, TOK_COMMA) || check(p, TOK_FROM)) {
       /* Treat the first IDENT as a symbol name, collect more. */
       ast_node_t *s0 = ast_new(AST_IDENTIFIER);
-      strncpy(s0->name, mod->str.buf, AST_NAME_LEN - 1);
-      s0->line = mod->line;
+      strncpy(s0->name, mod_name, AST_NAME_LEN - 1);
+      s0->line = line;
       ast_add_child(n, s0);
       while (match(p, TOK_COMMA)) {
         skip_newlines(p);
-        const vir_token_t *sym = expect(p, TOK_IDENT, "expected symbol name");
+        const vir_token_t *sym = expect_name(p, "expected symbol name");
         if (!sym)
           break;
         ast_node_t *s = ast_new(AST_IDENTIFIER);
@@ -3165,18 +3456,19 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
       }
       skip_newlines(p);
       if (match(p, TOK_FROM)) {
-        const vir_token_t *from_mod =
-            expect(p, TOK_IDENT, "expected module name after 'from'");
-        if (from_mod)
-          strncpy(n->name, from_mod->str.buf, AST_NAME_LEN - 1);
+        char from_mod[AST_NAME_LEN];
+        if (parse_module_path(p, from_mod))
+          strncpy(n->name, from_mod, AST_NAME_LEN - 1);
+        else
+          parse_error(p, "expected module name after 'from'");
       }
       match(p, TOK_SEMICOLON);
       return n;
     }
-    strncpy(n->name, mod->str.buf, AST_NAME_LEN - 1);
+    strncpy(n->name, mod_name, AST_NAME_LEN - 1);
     if (match(p, TOK_AS)) {
       const vir_token_t *alias =
-          expect(p, TOK_IDENT, "expected alias after 'as'");
+          expect_name(p, "expected alias after 'as'");
       if (alias)
         strncpy(n->name2, alias->str.buf, AST_NAME_LEN - 1);
     }
@@ -3187,7 +3479,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     /* from MODULE import SYM1, SYM2, ... */
     advance(p);
     const vir_token_t *mod =
-        expect(p, TOK_IDENT, "expected module name after from");
+        expect_name(p, "expected module name after from");
     if (!mod)
       return NULL;
     if (!expect(p, TOK_IMPORT, "expected 'import' after module name"))
@@ -3198,7 +3490,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     /* Parse imported symbols as children (AST_IDENTIFIER nodes) */
     do {
       skip_newlines(p);
-      const vir_token_t *sym = expect(p, TOK_IDENT, "expected symbol name");
+      const vir_token_t *sym = expect_name(p, "expected symbol name");
       if (!sym)
         break;
       ast_node_t *s = ast_new(AST_IDENTIFIER);
@@ -3212,7 +3504,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
   case TOK_MODULE: {
     /* module NAME  (NAME may be dotted:  vir.rt.io  or  vir::rt::io) */
     advance(p);
-    const vir_token_t *mod = expect(p, TOK_IDENT, "expected module name");
+    const vir_token_t *mod = expect_name(p, "expected module name");
     if (!mod)
       return NULL;
     ast_node_t *n = ast_new(AST_MODULE);
@@ -3257,16 +3549,19 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     return n;
   }
   case TOK_EXPORT: {
-    /* export FUNC_NAME */
     advance(p);
-    const vir_token_t *fn =
-        expect(p, TOK_IDENT, "expected function name after export");
-    if (!fn)
-      return NULL;
-    ast_node_t *n = ast_new(AST_EXPORT);
-    strncpy(n->name, fn->str.buf, AST_NAME_LEN - 1);
-    n->line = t->line;
-    return n;
+    ast_node_t *block = ast_new(AST_BLOCK);
+    while (1) {
+      const vir_token_t *fn = expect_name(p, "expected function name after export");
+      if (!fn) break;
+      ast_node_t *n = ast_new(AST_EXPORT);
+      strncpy(n->name, fn->str.buf, AST_NAME_LEN - 1);
+      n->line = t->line;
+      ast_add_child(block, n);
+      if (!match(p, TOK_COMMA)) break;
+    }
+    match(p, TOK_SEMICOLON);
+    return block;
   }
   case TOK_INCLUDE: {
     /* include "filename"  OR  include path::to::module; (§3.2) */
@@ -3276,10 +3571,10 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     if (check(p, TOK_STRING)) {
       const vir_token_t *file = advance(p);
       strncpy(n->name, file->str.buf, AST_NAME_LEN - 1);
-    } else if (check(p, TOK_IDENT)) {
+    } else if (is_name_token(peek(p)->type)) {
       /* dotted / namespaced path: A::B::C  or  a.b.c */
       size_t pos = 0;
-      while (check(p, TOK_IDENT)) {
+      while (is_name_token(peek(p)->type)) {
         const vir_token_t *seg = advance(p);
         size_t n_seg = strlen(seg->str.buf);
         if (pos + n_seg + 2 >= AST_NAME_LEN)
@@ -3318,7 +3613,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     if (check(p, TOK_AS)) {
       advance(p);
       const vir_token_t *alias =
-          expect(p, TOK_IDENT, "expected alias name after 'as'");
+          expect_name(p, "expected alias name after 'as'");
       if (alias) {
         strncpy(n->name2, alias->str.buf, AST_NAME_LEN - 1);
       }
@@ -3331,7 +3626,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     /* type <name> ; */
     advance(p);
     const vir_token_t *name =
-        expect(p, TOK_IDENT, "expected type name after 'type'");
+        expect_name(p, "expected type name after 'type'");
     if (!name)
       return NULL;
     ast_node_t *n = ast_new(AST_TYPE_DECL);
@@ -3466,7 +3761,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     if (check(p, TOK_BIT_NOT)) {
       const vir_token_t *tilde = advance(p);
       const vir_token_t *chans =
-          expect(p, TOK_IDENT, "expected channel name after '~'");
+          expect_name(p, "expected channel name after '~'");
       if (!chans)
         return NULL;
       if (check(p, TOK_ASSIGN)) {
@@ -3494,7 +3789,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     if (check(p, TOK_DOT)) {
       /* Field assign: IDENT '.' FIELD_NAME '=' expr */
       advance(p); /* consume '.' */
-      const vir_token_t *field = expect(p, TOK_IDENT, "expected field name");
+      const vir_token_t *field = expect_name(p, "expected field name");
       if (field && check(p, TOK_ASSIGN)) {
         advance(p); /* consume '=' */
         ast_node_t *val = parse_expr(p);
@@ -3564,18 +3859,23 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
  * Top-level
  * ═══════════════════════════════════════════════════════ */
 
-void parser_init(vir_parser_t *p, const vir_token_t *tokens, uint32_t count) {
+void parser_init(vir_parser_t *p, const vir_token_t *tokens, uint32_t count, uint32_t file_id) {
   memset(p, 0, sizeof(*p));
   p->tokens = tokens;
   p->token_count = count;
+  p->file_id = file_id;
 }
 
 ast_node_t *parser_parse_program(vir_parser_t *p) {
   ast_node_t *prog = ast_new(AST_PROGRAM);
 
   skip_newlines(p);
-
+  int count = 0;
   while (!check(p, TOK_EOF)) {
+    if (++count > 1000000) {
+      printf("Hanging at token %d: %d\n", p->pos, peek(p)->type);
+      exit(1);
+    }
     skip_newlines(p);
     if (check(p, TOK_EOF))
       break;

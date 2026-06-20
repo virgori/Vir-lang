@@ -67,6 +67,8 @@ typedef enum {
     Q_STORE_BYTE    = 0x63,   /* *(u8*)(src1+src2) = dest      */
     Q_LOAD_WORD     = 0x64,   /* dest = *(i64*)(src1+src2*8)   */
     Q_STORE_WORD    = 0x65,   /* *(i64*)(src1+src2*8) = dest   */
+    Q_MEM_COPY      = 0x66,   /* memcpy(dest, src1, src2)      */
+    Q_MEM_SET       = 0x67,   /* memset(dest, src1, src2)      */
 
     /* String operations */
     Q_STR_LEN       = 0x70,   /* dest = strlen(src1)           */
@@ -193,6 +195,12 @@ typedef enum {
     Q_CALL_INDIRECT = 0xF4,   /* call_indirect(src1=vreg_holding_fidx) */
     Q_TAILCALL_FUNC = 0xF8,   /* tail call function by index        */
 
+    /* §Phase-9 Intrinsic Registry – table-driven O(1) dispatch.
+     * Replaces empty-body shim functions + strcmp interception.
+     * dest = return_vreg, src1 = OPERAND_IMM intrinsic_id,
+     * src2 = OPERAND_IMM argc; args pre-loaded in R0..Rn. */
+    Q_INTRINSIC     = 0xF9,
+
     /* §13 Error handling (0xC0–0xCB) */
     Q_TRY_BEGIN     = 0xC0,   /* push try frame, dst=revert label,
                                * src1=imm (bit0 timeout, bit1 isolate),
@@ -269,10 +277,12 @@ typedef struct {
     q_instruction_t *body;
     uint32_t         body_count;
     uint32_t         body_capacity;
+    uint32_t        *label_map;
+    uint32_t         label_map_len;
 } q_function_t;
 
-#define Q_MAX_FUNCTIONS  256
-#define Q_MAX_STRINGS    8192
+#define Q_MAX_FUNCTIONS  1024
+#define Q_MAX_STRINGS    16384
 
 typedef struct {
     char             name[Q_MAX_FUNC_NAME];

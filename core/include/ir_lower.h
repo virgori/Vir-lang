@@ -170,6 +170,8 @@ typedef enum {
   AST_ADDR_OF,
   /* §4.5 Arena block — name holds bind id; children[0] = body block */
   AST_ARENA_BLOCK,
+  AST_PACKED_DEF, /* packed entity (v2 experimental) */
+  AST_TUPLE_LITERAL, /* (a, b, c) — tuple expression */
 } ast_type_t;
 
 /* Binary / comparison operators */
@@ -258,12 +260,21 @@ typedef enum {
   BUILTIN_ARENA_FREE,  /* arena_free(id) → 0                  */
   /* §22.5 Cooperative yield (`await pass` / `yield()`) */
   BUILTIN_YIELD, /* yield() — cooperative scheduler tick */
+
+  /* §Phase-9 Intrinsic Registry — emit Q_INTRINSIC (table-driven dispatch)
+   * These are distinct from opcode-based builtins above: they go through
+   * vir_intr_table[id].fn(&ctx) in the VM instead of a dedicated opcode. */
+  BUILTIN_SYSCALL,     /* __syscall(num, a1..a6) → raw OS syscall */
+  BUILTIN_MEMCPY,      /* __memcpy(dst, src, len) → dst ptr       */
+  BUILTIN_MEMSET,      /* __memset(dst, val, len) → dst ptr       */
+  BUILTIN_TRAP,        /* __trap() → abort (never returns)        */
+  BUILTIN_UNREACHABLE, /* __unreachable() → UB hint / trap        */
 } builtin_id_t;
 
 /* Forward declaration */
 typedef struct ast_node ast_node_t;
 
-#define AST_MAX_CHILDREN 1024
+#define AST_MAX_CHILDREN 16384
 #define AST_NAME_LEN 64
 
 #define AST_FLAG_REF_PARAM 0x0001u
@@ -297,8 +308,8 @@ void ast_free(ast_node_t *node);
  * Enum Table (for compile-time integer constants)
  * ═══════════════════════════════════════════════════════ */
 
-#define ENUM_MAX_VARIANTS 64
-#define ENUM_MAX_TYPES 32
+#define ENUM_MAX_VARIANTS 4096
+#define ENUM_MAX_TYPES 1024
 
 typedef struct {
   char name[AST_NAME_LEN]; /* variant name */
@@ -315,11 +326,12 @@ typedef struct {
  * Record (Struct) Table
  * ═══════════════════════════════════════════════════════ */
 
-#define RECORD_MAX_FIELDS 32
-#define RECORD_MAX_TYPES 32
+#define RECORD_MAX_FIELDS 128
+#define RECORD_MAX_TYPES 4096
 
 typedef struct {
   char name[AST_NAME_LEN]; /* field name */
+  char type_name[AST_NAME_LEN];
   uint32_t offset;         /* offset in units of int64 (0, 1, 2, ...) */
 } record_field_t;
 
@@ -338,8 +350,8 @@ typedef struct {
  * and insertion lowering (shift + mask).
  */
 
-#define BIT_TYPE_MAX_FIELDS 32
-#define BIT_TYPE_MAX 32
+#define BIT_TYPE_MAX_FIELDS 128
+#define BIT_TYPE_MAX 256
 
 typedef struct {
   char name[AST_NAME_LEN]; /* field name                */
@@ -361,7 +373,7 @@ typedef struct {
  * Maps variable names → virtual register indices.
  */
 
-#define SYM_MAX 512
+#define SYM_MAX 16384
 
 typedef struct {
   char name[AST_NAME_LEN];
@@ -425,7 +437,7 @@ typedef struct {
   int spill_slot; /* Stack offset if spilled             */
 } live_interval_t;
 
-#define LOWER_MAX_INTERVALS 4096
+#define LOWER_MAX_INTERVALS 131072
 
 /* ═══════════════════════════════════════════════════════
  * Lowering Context
@@ -445,6 +457,15 @@ typedef struct {
   uint32_t enum_type_count;
   record_type_t record_types[RECORD_MAX_TYPES];
   uint32_t record_type_count;
+
+  /* Best-effort function return record metadata, used by field-offset
+   * resolution for values initialised from helper constructors. */
+#define FUNC_RETURN_TYPE_MAX 2048
+  struct {
+    char name[AST_NAME_LEN];
+    char type_name[AST_NAME_LEN];
+  } func_return_types[FUNC_RETURN_TYPE_MAX];
+  uint32_t func_return_type_count;
 
   /* §16 Register + Mold bit-type table (compile-time) */
   bit_type_t bit_types[BIT_TYPE_MAX];
