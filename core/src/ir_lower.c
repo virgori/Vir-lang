@@ -2487,6 +2487,41 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
       break;
     }
+    case BUILTIN_CLZ:
+    case BUILTIN_CTZ:
+    case BUILTIN_POPCNT:
+    case BUILTIN_BSWAP:
+    case BUILTIN_ATOMIC_LOAD: {
+      if (a0 >= 0) {
+        emit(ctx, q_instr(Q_MOVE, q_vreg(0), q_vreg((uint32_t)a0), q_none()));
+        int intr_id = VIR_INTR_CLZ;
+        if (expr->builtin_id == BUILTIN_CTZ) intr_id = VIR_INTR_CTZ;
+        else if (expr->builtin_id == BUILTIN_POPCNT) intr_id = VIR_INTR_POPCNT;
+        else if (expr->builtin_id == BUILTIN_BSWAP) intr_id = VIR_INTR_BSWAP;
+        else if (expr->builtin_id == BUILTIN_ATOMIC_LOAD) intr_id = VIR_INTR_ATOMIC_LOAD;
+        emit(ctx, q_instr(Q_INTRINSIC, q_vreg(rd),
+                          q_imm(intr_id), q_imm(1)));
+      } else {
+        emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+      }
+      break;
+    }
+    case BUILTIN_ATOMIC_STORE:
+    case BUILTIN_ATOMIC_ADD:
+    case BUILTIN_ATOMIC_SUB: {
+      if (a0 >= 0 && a1 >= 0) {
+        emit(ctx, q_instr(Q_MOVE, q_vreg(0), q_vreg((uint32_t)a0), q_none()));
+        emit(ctx, q_instr(Q_MOVE, q_vreg(1), q_vreg((uint32_t)a1), q_none()));
+        int intr_id = VIR_INTR_ATOMIC_STORE;
+        if (expr->builtin_id == BUILTIN_ATOMIC_ADD) intr_id = VIR_INTR_ATOMIC_ADD;
+        else if (expr->builtin_id == BUILTIN_ATOMIC_SUB) intr_id = VIR_INTR_ATOMIC_SUB;
+        emit(ctx, q_instr(Q_INTRINSIC, q_vreg(rd),
+                          q_imm(intr_id), q_imm(2)));
+      } else {
+        emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+      }
+      break;
+    }
     default:
       emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
       break;

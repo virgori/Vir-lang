@@ -626,6 +626,117 @@ static void intr_memset(vir_intrinsic_ctx_t *ctx) {
     *ctx->ret = ctx->args[0];
 }
 
+/* ── Bitwise / Math ──────────────────────────────────── */
+
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
+
+static void intr_clz(vir_intrinsic_ctx_t *ctx) {
+    uint64_t v = (uint64_t)ctx->args[0];
+#if defined(__GNUC__) || defined(__clang__)
+    *ctx->ret = (v == 0) ? 64 : __builtin_clzll(v);
+#elif defined(_MSC_VER)
+    unsigned long index;
+    *ctx->ret = _BitScanReverse64(&index, v) ? (63 - index) : 64;
+#else
+    int count = 0;
+    while (!(v & (1ULL << 63)) && count < 64) { v <<= 1; count++; }
+    *ctx->ret = count;
+#endif
+}
+
+static void intr_ctz(vir_intrinsic_ctx_t *ctx) {
+    uint64_t v = (uint64_t)ctx->args[0];
+#if defined(__GNUC__) || defined(__clang__)
+    *ctx->ret = (v == 0) ? 64 : __builtin_ctzll(v);
+#elif defined(_MSC_VER)
+    unsigned long index;
+    *ctx->ret = _BitScanForward64(&index, v) ? index : 64;
+#else
+    int count = 0;
+    while (!(v & 1) && count < 64) { v >>= 1; count++; }
+    *ctx->ret = count;
+#endif
+}
+
+static void intr_popcnt(vir_intrinsic_ctx_t *ctx) {
+    uint64_t v = (uint64_t)ctx->args[0];
+#if defined(__GNUC__) || defined(__clang__)
+    *ctx->ret = __builtin_popcountll(v);
+#elif defined(_MSC_VER)
+    *ctx->ret = __popcnt64(v);
+#else
+    int count = 0;
+    while (v) { count += v & 1; v >>= 1; }
+    *ctx->ret = count;
+#endif
+}
+
+static void intr_bswap(vir_intrinsic_ctx_t *ctx) {
+    uint64_t v = (uint64_t)ctx->args[0];
+#if defined(__GNUC__) || defined(__clang__)
+    *ctx->ret = __builtin_bswap64(v);
+#elif defined(_MSC_VER)
+    *ctx->ret = _byteswap_uint64(v);
+#else
+    *ctx->ret = ((v & 0xFF00000000000000ULL) >> 56) |
+                ((v & 0x00FF000000000000ULL) >> 40) |
+                ((v & 0x0000FF0000000000ULL) >> 24) |
+                ((v & 0x000000FF00000000ULL) >>  8) |
+                ((v & 0x00000000FF000000ULL) <<  8) |
+                ((v & 0x0000000000FF0000ULL) << 24) |
+                ((v & 0x000000000000FF00ULL) << 40) |
+                ((v & 0x00000000000000FFULL) << 56);
+#endif
+}
+
+/* ── Atomics ─────────────────────────────────────────── */
+
+static void intr_atomic_load(vir_intrinsic_ctx_t *ctx) {
+    int64_t *ptr = (int64_t *)(uintptr_t)ctx->args[0];
+#if defined(__GNUC__) || defined(__clang__)
+    *ctx->ret = __atomic_load_n(ptr, __ATOMIC_SEQ_CST);
+#else
+    *ctx->ret = *ptr;
+#endif
+}
+
+static void intr_atomic_store(vir_intrinsic_ctx_t *ctx) {
+    int64_t *ptr = (int64_t *)(uintptr_t)ctx->args[0];
+    int64_t val = ctx->args[1];
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(ptr, val, __ATOMIC_SEQ_CST);
+#else
+    *ptr = val;
+#endif
+    *ctx->ret = 0;
+}
+
+static void intr_atomic_add(vir_intrinsic_ctx_t *ctx) {
+    int64_t *ptr = (int64_t *)(uintptr_t)ctx->args[0];
+    int64_t val = ctx->args[1];
+#if defined(__GNUC__) || defined(__clang__)
+    *ctx->ret = __atomic_fetch_add(ptr, val, __ATOMIC_SEQ_CST);
+#else
+    int64_t old = *ptr;
+    *ptr = old + val;
+    *ctx->ret = old;
+#endif
+}
+
+static void intr_atomic_sub(vir_intrinsic_ctx_t *ctx) {
+    int64_t *ptr = (int64_t *)(uintptr_t)ctx->args[0];
+    int64_t val = ctx->args[1];
+#if defined(__GNUC__) || defined(__clang__)
+    *ctx->ret = __atomic_fetch_sub(ptr, val, __ATOMIC_SEQ_CST);
+#else
+    int64_t old = *ptr;
+    *ptr = old - val;
+    *ctx->ret = old;
+#endif
+}
+
 /* ── Debug / Trap ───────────────────────────────────── */
 
 static void intr_trap(vir_intrinsic_ctx_t *ctx) {
@@ -653,52 +764,17 @@ vir_intr_desc_t vir_intr_table[VIR_MAX_INTRINSICS] = {
     /* ID 9 */ { intr_memcpy,    3, INTR_IMPURE,              "memcpy"     },
     /* ID10 */ { intr_memset,    3, INTR_IMPURE,              "memset"     },
     /* ID11 */ { intr_trap,      0, INTR_IMPURE | INTR_TRAP,  "trap"       },
-    /* 12..VIR_MAX_INTRINSICS-1 = {NULL,0,0,NULL} (zero-init) */
+    /* ID12 */ { intr_clz,       1, INTR_PURE,                "clz"        },
+    /* ID13 */ { intr_ctz,       1, INTR_PURE,                "ctz"        },
+    /* ID14 */ { intr_popcnt,    1, INTR_PURE,                "popcnt"     },
+    /* ID15 */ { intr_bswap,     1, INTR_PURE,                "bswap"      },
+    /* ID16 */ { intr_atomic_load, 1, INTR_IMPURE,            "atomic_load" },
+    /* ID17 */ { intr_atomic_store, 2, INTR_IMPURE,           "atomic_store" },
+    /* ID18 */ { intr_atomic_add, 2, INTR_IMPURE,             "atomic_add" },
+    /* ID19 */ { intr_atomic_sub, 2, INTR_IMPURE,             "atomic_sub" },
 };
 
-/* ═══════════════════════════════════════════════════════
- * §Phase-8 compat shim (legacy bodyless-shim intercept)
- * ═══════════════════════════════════════════════════════
- * Kept ONLY for extern functions that were compiled before
- * Phase-9 and still arrive as Q_CALL_FUNC / Q_TAILCALL_FUNC
- * to empty-body shims.  New code emits Q_INTRINSIC instead.
- *
- * When the compiler is fully upgraded to Phase-9 this
- * function can be deleted.
- * ═══════════════════════════════════════════════════════ */
-static int vm_try_syscall_intrinsic(vm_state_t *vm, const q_function_t *callee)
-{
-    if (!callee || callee->body_count != 0) return 0;
-    const char *n = callee->name;
 
-    /* Map function name → VIR_INTR_* ID, then delegate to table */
-    vir_intrinsic_id_t id;
-    if      (strcmp(n, "sys_write")  == 0) id = VIR_INTR_SYS_WRITE;
-    else if (strcmp(n, "sys_read")   == 0) id = VIR_INTR_SYS_READ;
-    else if (strcmp(n, "sys_open")   == 0) id = VIR_INTR_SYS_OPEN;
-    else if (strcmp(n, "sys_close")  == 0) id = VIR_INTR_SYS_CLOSE;
-    else if (strcmp(n, "sys_lseek")  == 0) id = VIR_INTR_SYS_LSEEK;
-    else if (strcmp(n, "sys_exit")   == 0) id = VIR_INTR_SYS_EXIT;
-    else if (strcmp(n, "sys_mmap")   == 0) id = VIR_INTR_SYS_MMAP;
-    else if (strcmp(n, "sys_munmap") == 0) id = VIR_INTR_SYS_MUNMAP;
-    else if (strcmp(n, "syscall1")   == 0 ||
-             strcmp(n, "syscall2")   == 0 ||
-             strcmp(n, "syscall3")   == 0 ||
-             strcmp(n, "syscall6")   == 0)  id = VIR_INTR_SYSCALL;
-    else return 0;
-
-    /* Dispatch via table — same path as Q_INTRINSIC */
-    int64_t ret_val = 0;
-    vir_intrinsic_ctx_t ctx = {
-        .args = &vm->regs[0],
-        .argc = (int)vir_intr_table[id].argc,
-        .ret  = &ret_val,
-        .vm   = vm,
-    };
-    vir_intr_table[id].fn(&ctx);
-    vm->regs[0] = ret_val;
-    return 1;
-}
 
 
 
@@ -709,13 +785,6 @@ static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
 {
     if (fidx >= vm->module->func_count) return VM_ERR_BAD_JUMP;
     const q_function_t *callee = &vm->module->functions[fidx];
-
-    /* §Phase-8: route empty-body shims to POSIX syscall intrinsics
-     * before pushing a frame.  If handled, just advance past the call. */
-    if (vm_try_syscall_intrinsic(vm, callee)) {
-        vm->ip++;
-        return VM_OK;
-    }
 
     if (vm->func_depth >= VM_MAX_CALL_DEPTH) return VM_ERR_STACK_OF;
     vm->func_stack[vm->func_depth].func = vm->current_func;
@@ -754,29 +823,6 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
 {
     if (fidx >= vm->module->func_count) return VM_ERR_BAD_JUMP;
     const q_function_t *callee = &vm->module->functions[fidx];
-
-    /* §Phase-8: route empty-body shims to POSIX syscall intrinsics
-     * before pushing a frame. If handled, since it's a tail call,
-     * we simulate a return from the current function frame. */
-    if (vm_try_syscall_intrinsic(vm, callee)) {
-        /* Intrinsic executed and set R0. Now simulate a return from the caller. */
-        if (vm->func_depth > 0) {
-            vm->func_depth--;
-            /* Restore saved registers but keep R0 */
-            int64_t ret_val = vm->regs[0];
-            uint32_t nregs = vm->func_stack[vm->func_depth].saved_reg_count;
-            for (uint32_t ri = 0; ri < nregs; ri++) {
-                vm->regs[ri] = vm->func_stack[vm->func_depth].saved_regs[ri];
-            }
-            vm->regs[0] = ret_val;
-            vm->ip = vm->func_stack[vm->func_depth].ip;
-            vm->current_func = vm->func_stack[vm->func_depth].func;
-        } else {
-            /* Tailcall from top-level function */
-            vm->ip = vm->current_func->body_count; /* Force exit loop */
-        }
-        return VM_OK;
-    }
 
     /* For tail call, we reuse the current frame.
      * Update parameter vregs for the callee. */
@@ -2055,15 +2101,8 @@ vm_status_t vm_exec_function(vm_state_t *vm, const q_function_t *func)
     while (vm->current_func) {
         const q_function_t *f = vm->current_func;
         if (vm->ip >= f->body_count) {
-            /* If this is an empty function, it might be a syscall intrinsic */
-            int handled = 0;
-            if (f->body_count == 0) {
-                handled = vm_try_syscall_intrinsic(vm, f);
-            }
-            if (!handled) {
-                /* Fell off end of function - implicit return 0 */
-                vm->regs[0] = 0;
-            }
+            /* Fell off end of function - implicit return 0 */
+            vm->regs[0] = 0;
             if (vm->func_depth > 0) {
                 vm->func_depth--;
                 int64_t ref_bindings[Q_MAX_PARAMS] = {0};
