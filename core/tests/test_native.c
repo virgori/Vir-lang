@@ -16,6 +16,7 @@
 #include "ir_lower.h"
 #include "lexer.h"
 #include "parser.h"
+#include "lang.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,10 +29,11 @@ static int tests_passed = 0;
 #define TEST(name)  do { \
     tests_run++; \
     printf("  [%d] %-40s ", tests_run, name); \
+    fflush(stdout); \
 } while(0)
 
-#define PASS() do { tests_passed++; printf("✓ PASS\n"); } while(0)
-#define FAIL(msg) do { printf("✗ FAIL: %s\n", msg); } while(0)
+#define PASS() do { tests_passed++; printf("✓ PASS\n"); fflush(stdout); } while(0)
+#define FAIL(msg) do { printf("✗ FAIL: %s\n", msg); fflush(stdout); } while(0)
 
 /* ═══════════════════════════════════════════════════════
  * SHA-256 Tests (NIST test vectors)
@@ -406,7 +408,7 @@ static void test_intrinsics_opcode_map(void)
 static void test_jit_bridge_init_destroy(void)
 {
     TEST("jit_bridge init + destroy");
-    jit_bridge_t jb;
+    jit_bridge_t jb = {0};
     int rc = jit_bridge_init(&jb, 4096);
     if (rc == 0 && jb.initialised && jb.region_base != NULL) {
         jit_bridge_destroy(&jb);
@@ -419,7 +421,7 @@ static void test_jit_bridge_init_destroy(void)
 static void test_jit_bridge_register_callback(void)
 {
     TEST("jit_bridge register callback");
-    jit_bridge_t jb;
+    jit_bridge_t jb = {0};
     jit_bridge_init(&jb, 4096);
 
     /* Register a dummy callback */
@@ -436,7 +438,7 @@ static void test_jit_bridge_register_callback(void)
 static void test_jit_bridge_register_intrinsics(void)
 {
     TEST("jit_bridge register intrinsics");
-    jit_bridge_t jb;
+    jit_bridge_t jb = {0};
     jit_bridge_init(&jb, 65536);
 
     int rc = jit_bridge_register_intrinsics(&jb);
@@ -450,7 +452,7 @@ static void test_jit_bridge_register_intrinsics(void)
 static void test_jit_bridge_emit_code(void)
 {
     TEST("jit_bridge emit + finalise");
-    jit_bridge_t jb;
+    jit_bridge_t jb = {0};
     jit_bridge_init(&jb, 65536);
 
     /* A trivial code block: RET (x86: 0xC3) or (arm64: 0xD65F03C0) */
@@ -513,17 +515,19 @@ static void test_ir_lower_simple_program(void)
     ast_add_child(prog, pr);
 
     /* Lower */
-    lower_ctx_t ctx;
-    lower_init(&ctx, "test");
-    int rc = lower_program(&ctx, prog);
-    q_module_t *mod = lower_get_module(&ctx);
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) { ast_free(prog); FAIL("alloc lower ctx"); return; }
+    lower_init(ctx, "test");
+    int rc = lower_program(ctx, prog);
+    q_module_t *mod = lower_get_module(ctx);
 
     /* Should have 1 function (__main__) with some instructions */
     int ok = (rc == 0 && mod->func_count >= 1 &&
               mod->functions[0].body_count > 0);
 
     ast_free(prog);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
 
     if (ok) PASS();
     else FAIL("lowering failed");
@@ -580,27 +584,29 @@ static void test_ir_lower_regalloc(void)
     ast_add_child(prog, fn);
 
     /* Lower */
-    lower_ctx_t ctx;
-    lower_init(&ctx, "regalloc_test");
-    int rc = lower_program(&ctx, prog);
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) { ast_free(prog); FAIL("alloc lower ctx"); return; }
+    lower_init(ctx, "regalloc_test");
+    int rc = lower_program(ctx, prog);
 
     /* Run liveness + regalloc on the function */
-    q_module_t *mod = lower_get_module(&ctx);
+    q_module_t *mod = lower_get_module(ctx);
     int alloc_ok = 0;
     if (rc == 0 && mod->func_count >= 1) {
-        lower_compute_liveness(&ctx, &mod->functions[0]);
-        lower_regalloc_linear_scan(&ctx, 6); /* 6 GP regs */
+        lower_compute_liveness(ctx, &mod->functions[0]);
+        lower_regalloc_linear_scan(ctx, 6); /* 6 GP regs */
         /* All intervals should have been assigned (6 regs > vregs used) */
         alloc_ok = 1;
-        for (uint32_t i = 0; i < ctx.interval_count; i++) {
-            if (ctx.intervals[i].phys_reg < 0) {
+        for (uint32_t i = 0; i < ctx->interval_count; i++) {
+            if (ctx->intervals[i].phys_reg < 0) {
                 alloc_ok = 0; break;
             }
         }
     }
 
     ast_free(prog);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
 
     if (rc == 0 && alloc_ok) PASS();
     else FAIL("regalloc failed");
@@ -630,7 +636,7 @@ static void test_ir_lower_sym_table(void)
 static void test_jit_bridge_emit_dual(void)
 {
     TEST("jit_bridge emit_dual safe start");
-    jit_bridge_t jb;
+    jit_bridge_t jb = {0};
     jit_bridge_init(&jb, 4096);
 
     /* ARM64 RET = 0xD65F03C0, use as dummy "safe" and "fast" code */
@@ -652,7 +658,7 @@ static void test_jit_bridge_emit_dual(void)
 static void test_jit_bridge_patch_and_rollback(void)
 {
     TEST("jit_bridge patch→fast→rollback");
-    jit_bridge_t jb;
+    jit_bridge_t jb = {0};
     jit_bridge_init(&jb, 4096);
 
     uint8_t safe[] = { 0xC0, 0x03, 0x5F, 0xD6 };
@@ -676,7 +682,7 @@ static void test_jit_bridge_patch_and_rollback(void)
 static void test_jit_bridge_auto_rollback(void)
 {
     TEST("jit_bridge auto-rollback on faults");
-    jit_bridge_t jb;
+    jit_bridge_t jb = {0};
     jit_bridge_init(&jb, 4096);
 
     uint8_t safe[] = { 0xC0, 0x03, 0x5F, 0xD6 };
@@ -715,7 +721,7 @@ static void test_tco_basic(void)
     q_func_emit(&fn, q_instr(Q_CALL, q_none(), q_label(10), q_none()));
     q_func_emit(&fn, q_instr(Q_RET, q_none(), q_vreg(0), q_none()));
 
-    int count = lower_tco_pass(&fn);
+    int count = lower_tco_pass(&fn, 0);
 
     int ok = (count == 1);
     ok = ok && (fn.body[1].opcode == Q_JUMP);
@@ -737,7 +743,7 @@ static void test_tco_no_tail(void)
     q_func_emit(&fn, q_instr(Q_ADD, q_vreg(0), q_vreg(1), q_vreg(2)));
     q_func_emit(&fn, q_instr(Q_RET, q_none(), q_vreg(0), q_none()));
 
-    int count = lower_tco_pass(&fn);
+    int count = lower_tco_pass(&fn, 0);
 
     int ok = (count == 0);
     ok = ok && (fn.body[0].opcode == Q_CALL);  /* untouched */
@@ -760,7 +766,7 @@ static void test_tco_multiple(void)
     q_func_emit(&fn, q_instr(Q_CALL, q_none(), q_label(2), q_none()));
     q_func_emit(&fn, q_instr(Q_RET, q_none(), q_vreg(1), q_none()));
 
-    int count = lower_tco_pass(&fn);
+    int count = lower_tco_pass(&fn, 0);
 
     int ok = (count == 2);
     ok = ok && (fn.body[0].opcode == Q_JUMP);
@@ -835,10 +841,11 @@ static void test_lexer_vietnamese_keywords(void)
                       "  bi\xe1\xba\xbfn x = 42\n"
                       "  tr\xe1\xba\xa3 v\xe1\xbb\x81 x\n"
                       "h\xe1\xba\xbft\n";
+    vir_lang_load(VIR_LANG_VI);
     vir_lexer_t lex;
     lexer_init(&lex, src, strlen(src));
     int rc = lexer_tokenize(&lex);
-    if (rc != 0) { FAIL(lex.error); return; }
+    if (rc != 0) { FAIL(lex.error); vir_lang_unload_all(); return; }
 
     int ok = lex.token_count >= 8;
     ok = ok && lex.tokens[0].type == TOK_FUNC;    /* hàm */
@@ -854,7 +861,9 @@ static void test_lexer_vietnamese_keywords(void)
         if (lex.tokens[i].type == TOK_END) { found_end = 1; break; }
     }
     ok = ok && found_end;
-    if (ok) PASS(); else FAIL("Vietnamese keyword mismatch");
+    if (ok) PASS();
+    else FAIL("Vietnamese keyword mismatch");
+    vir_lang_unload_all();
 }
 
 static void test_lexer_operators(void)
@@ -906,7 +915,7 @@ static void test_parser_simple_func(void)
     lexer_tokenize(&lex);
 
     vir_parser_t parser;
-    parser_init(&parser, lex.tokens, lex.token_count);
+    parser_init(&parser, lex.tokens, lex.token_count, 0);
     ast_node_t *ast = parser_parse_program(&parser);
 
     int ok = ast != NULL;
@@ -927,7 +936,7 @@ static void test_parser_if_else(void)
     lexer_tokenize(&lex);
 
     vir_parser_t parser;
-    parser_init(&parser, lex.tokens, lex.token_count);
+    parser_init(&parser, lex.tokens, lex.token_count, 0);
     ast_node_t *ast = parser_parse_program(&parser);
 
     int ok = ast != NULL;
@@ -954,7 +963,7 @@ static void test_parser_expression_precedence(void)
     lexer_tokenize(&lex);
 
     vir_parser_t parser;
-    parser_init(&parser, lex.tokens, lex.token_count);
+    parser_init(&parser, lex.tokens, lex.token_count, 0);
     ast_node_t *ast = parser_parse_program(&parser);
 
     int ok = ast != NULL;
@@ -991,28 +1000,29 @@ static void test_e2e_vm_simple(void)
 
     /* Parse */
     vir_parser_t parser;
-    parser_init(&parser, lex.tokens, lex.token_count);
+    parser_init(&parser, lex.tokens, lex.token_count, 0);
     ast_node_t *ast = parser_parse_program(&parser);
     if (!ast) { FAIL(parser.error); return; }
 
     /* Lower */
-    lower_ctx_t ctx;
-    lower_init(&ctx, "test_e2e");
-    if (lower_program(&ctx, ast) != 0) {
-        FAIL(ctx.last_error);
-        ast_free(ast); lower_destroy(&ctx);
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) { ast_free(ast); FAIL("alloc lower ctx"); return; }
+    lower_init(ctx, "test_e2e");
+    if (lower_program(ctx, ast) != 0) {
+        FAIL(ctx->last_error);
+        ast_free(ast); lower_destroy(ctx); free(ctx);
         return;
     }
 
     /* TCO pass */
-    for (uint32_t i = 0; i < ctx.module.func_count; i++) {
-        lower_tco_pass(&ctx.module.functions[i]);
+    for (uint32_t i = 0; i < ctx->module.func_count; i++) {
+        lower_tco_pass(&ctx->module.functions[i], i);
     }
 
     /* Execute */
     vm_state_t vm;
     vm_init(&vm);
-    vm_status_t status = vm_exec_module(&vm, &ctx.module);
+    vm_status_t status = vm_exec_module(&vm, &ctx->module);
 
     int ok = (status == VM_OK || status == VM_HALT);
     /* Result should be 30 in vreg 0 */
@@ -1027,7 +1037,8 @@ static void test_e2e_vm_simple(void)
     }
 
     ast_free(ast);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
 }
 
 static void test_e2e_vm_if_else(void)
@@ -1040,20 +1051,21 @@ static void test_e2e_vm_if_else(void)
     lexer_tokenize(&lex);
 
     vir_parser_t parser;
-    parser_init(&parser, lex.tokens, lex.token_count);
+    parser_init(&parser, lex.tokens, lex.token_count, 0);
     ast_node_t *ast = parser_parse_program(&parser);
     if (!ast) { FAIL(parser.error); return; }
 
-    lower_ctx_t ctx;
-    lower_init(&ctx, "test_if");
-    lower_program(&ctx, ast);
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) { ast_free(ast); FAIL("alloc lower ctx"); return; }
+    lower_init(ctx, "test_if");
+    lower_program(ctx, ast);
 
-    for (uint32_t i = 0; i < ctx.module.func_count; i++)
-        lower_tco_pass(&ctx.module.functions[i]);
+    for (uint32_t i = 0; i < ctx->module.func_count; i++)
+        lower_tco_pass(&ctx->module.functions[i], i);
 
     vm_state_t vm;
     vm_init(&vm);
-    vm_status_t status = vm_exec_module(&vm, &ctx.module);
+    vm_status_t status = vm_exec_module(&vm, &ctx->module);
 
     int ok = (status == VM_OK || status == VM_HALT);
     ok = ok && (vm_get_reg(&vm, 0) == 1);  /* 5 > 3 → return 1 */
@@ -1067,7 +1079,8 @@ static void test_e2e_vm_if_else(void)
     }
 
     ast_free(ast);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
 }
 
 static void test_e2e_vm_loop(void)
@@ -1082,20 +1095,21 @@ static void test_e2e_vm_loop(void)
     lexer_tokenize(&lex);
 
     vir_parser_t parser;
-    parser_init(&parser, lex.tokens, lex.token_count);
+    parser_init(&parser, lex.tokens, lex.token_count, 0);
     ast_node_t *ast = parser_parse_program(&parser);
     if (!ast) { FAIL(parser.error); return; }
 
-    lower_ctx_t ctx;
-    lower_init(&ctx, "test_loop");
-    lower_program(&ctx, ast);
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) { ast_free(ast); FAIL("alloc lower ctx"); return; }
+    lower_init(ctx, "test_loop");
+    lower_program(ctx, ast);
 
-    for (uint32_t i = 0; i < ctx.module.func_count; i++)
-        lower_tco_pass(&ctx.module.functions[i]);
+    for (uint32_t i = 0; i < ctx->module.func_count; i++)
+        lower_tco_pass(&ctx->module.functions[i], i);
 
     vm_state_t vm;
     vm_init(&vm);
-    vm_status_t status = vm_exec_module(&vm, &ctx.module);
+    vm_status_t status = vm_exec_module(&vm, &ctx->module);
 
     int ok = (status == VM_OK || status == VM_HALT);
     /* sum = 0+1+2+3+4 = 10 */
@@ -1110,7 +1124,8 @@ static void test_e2e_vm_loop(void)
     }
 
     ast_free(ast);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -1399,7 +1414,7 @@ static void test_blacklist_threshold(void)
 {
     TEST("blacklist: threshold enforcement");
 
-    jit_bridge_t jb;
+    jit_bridge_t jb = {0};
     jit_bridge_init(&jb, 65536);
     jit_bridge_set_blacklist_threshold(&jb, 3);
 
@@ -1436,28 +1451,30 @@ static int64_t run_vir(const char *src, int *out_ok)
     if (lexer_tokenize(&lex) != 0) { *out_ok = 0; return -9999; }
 
     vir_parser_t parser;
-    parser_init(&parser, lex.tokens, lex.token_count);
+    parser_init(&parser, lex.tokens, lex.token_count, 0);
     ast_node_t *ast = parser_parse_program(&parser);
     if (!ast) { *out_ok = 0; return -9999; }
 
-    lower_ctx_t ctx;
-    lower_init(&ctx, "test");
-    if (lower_program(&ctx, ast) != 0) {
-        ast_free(ast); lower_destroy(&ctx);
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) { ast_free(ast); *out_ok = 0; return -9999; }
+    lower_init(ctx, "test");
+    if (lower_program(ctx, ast) != 0) {
+        ast_free(ast); lower_destroy(ctx); free(ctx);
         *out_ok = 0; return -9999;
     }
-    for (uint32_t i = 0; i < ctx.module.func_count; i++)
-        lower_tco_pass(&ctx.module.functions[i]);
+    for (uint32_t i = 0; i < ctx->module.func_count; i++)
+        lower_tco_pass(&ctx->module.functions[i], i);
 
     vm_state_t vm;
     vm_init(&vm);
-    vm_status_t status = vm_exec_module(&vm, &ctx.module);
+    vm_status_t status = vm_exec_module(&vm, &ctx->module);
 
     int64_t result = vm_get_reg(&vm, 0);
     *out_ok = (status == VM_OK || status == VM_HALT) ? 1 : 0;
     vm_destroy(&vm);
     ast_free(ast);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
     return result;
 }
 
@@ -1738,6 +1755,84 @@ static void test_vm_word_ops(void)
     vm_destroy(&vm);
 }
 
+static void test_vm_heap_tracking_growth(void)
+{
+    TEST("vm: heap tracking allocates multiple blocks");
+    q_function_t fn;
+    q_func_init(&fn, "heap_growth");
+
+    const int64_t iterations = 100;
+    q_func_emit(&fn, q_instr(Q_LOAD, q_vreg(0), q_imm(0), q_none()));
+
+    q_instruction_t loop = q_instr(Q_LABEL, q_none(), q_none(), q_none());
+    loop.patch_id = 1;
+    q_func_emit(&fn, loop);
+    q_func_emit(&fn, q_instr(Q_CMP_LT, q_vreg(1), q_vreg(0), q_imm(iterations)));
+    q_func_emit(&fn, q_instr(Q_JUMP_IF_NOT, q_none(), q_vreg(1), q_label(2)));
+    q_func_emit(&fn, q_instr(Q_ALLOC, q_vreg(2), q_imm(8), q_none()));
+    q_func_emit(&fn, q_instr(Q_ADD, q_vreg(0), q_vreg(0), q_imm(1)));
+    q_func_emit(&fn, q_instr(Q_JUMP, q_none(), q_label(1), q_none()));
+
+    q_instruction_t done = q_instr(Q_LABEL, q_none(), q_none(), q_none());
+    done.patch_id = 2;
+    q_func_emit(&fn, done);
+    q_func_emit(&fn, q_instr(Q_ALLOC, q_vreg(3), q_imm(24), q_none()));
+    q_func_emit(&fn, q_instr(Q_STORE_WORD, q_imm(777), q_vreg(3), q_imm(16)));
+    q_func_emit(&fn, q_instr(Q_LOAD_WORD, q_vreg(4), q_vreg(3), q_imm(16)));
+    q_func_emit(&fn, q_instr(Q_RET, q_none(), q_vreg(4), q_none()));
+
+    vm_state_t vm;
+    vm_init(&vm);
+    vm_status_t status = vm_exec_function(&vm, &fn);
+
+    int ok = status >= 0 &&
+             vm_get_reg(&vm, 0) == 777 &&
+             vm.heap_count >= 100;
+    if (ok) PASS();
+    else {
+        char msg[160];
+        snprintf(msg, sizeof(msg),
+                 "status=%s r0=%lld heap_count=%u",
+                 vm_status_str(status), (long long)vm_get_reg(&vm, 0),
+                 vm.heap_count);
+        FAIL(msg);
+    }
+
+    vm_destroy(&vm);
+    q_func_free(&fn);
+}
+
+static void test_vm_native_read_u8_invalid_pointer(void)
+{
+    TEST("vm: native_read_u8 invalid pointer is safe");
+    q_module_t mod;
+    q_module_init(&mod, "native_read_guard");
+    q_module_add_func(&mod, "native_read_u8");
+    q_function_t *main_fn = q_module_add_func(&mod, "main");
+
+    q_func_emit(main_fn, q_instr(Q_LOAD, q_vreg(0), q_imm(0x1fffffffffffLL), q_none()));
+    q_func_emit(main_fn, q_instr(Q_LOAD, q_vreg(1), q_imm(0), q_none()));
+    q_func_emit(main_fn, q_instr(Q_CALL_FUNC, q_none(), q_func_idx(0), q_none()));
+    q_func_emit(main_fn, q_instr(Q_MOVE, q_vreg(2), q_vreg(0), q_none()));
+    q_func_emit(main_fn, q_instr(Q_RET, q_none(), q_vreg(2), q_none()));
+
+    vm_state_t vm;
+    vm_init(&vm);
+    vm_status_t status = vm_exec_module(&vm, &mod);
+
+    int ok = status >= 0 && vm_get_reg(&vm, 0) == 0;
+    if (ok) PASS();
+    else {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "status=%s r0=%lld",
+                 vm_status_str(status), (long long)vm_get_reg(&vm, 0));
+        FAIL(msg);
+    }
+
+    vm_destroy(&vm);
+    q_module_free(&mod);
+}
+
 static void test_vm_i_to_str(void)
 {
     TEST("vm: i_to_str + str_to_i roundtrip");
@@ -1885,6 +1980,7 @@ static void test_e2e_for_range_vi(void)
 {
     TEST("e2e: for-range (Vietnamese)");
     int ok;
+    vir_lang_load(VIR_LANG_VI);
     /* với mỗi i trong 1..4 → 1+2+3 = 6 */
     int64_t r = run_vir(
         "hàm main() thì\n"
@@ -1897,6 +1993,7 @@ static void test_e2e_for_range_vi(void)
     ok = ok && r == 6;
     if (ok) PASS();
     else { char msg[64]; snprintf(msg, sizeof(msg), "got %lld exp 6", (long long)r); FAIL(msg); }
+    vir_lang_unload_all();
 }
 
 static void test_e2e_enum_basic(void)
@@ -2010,6 +2107,109 @@ static void test_e2e_record_3field(void)
     ok = ok && r == 57;  /* 42+10+5 */
     if (ok) PASS();
     else { char msg[64]; snprintf(msg, sizeof(msg), "got %lld exp 57", (long long)r); FAIL(msg); }
+}
+
+static void test_e2e_record_duplicate_field_names(void)
+{
+    TEST("e2e: type-aware record field offsets");
+    int ok;
+    int64_t r = run_vir(
+        "record A then\n"
+        "  a: num\n"
+        "  shared: num\n"
+        "end\n"
+        "record B then\n"
+        "  shared: num\n"
+        "  a: num\n"
+        "end\n"
+        "func main() then\n"
+        "  var x = A { a: 10, shared: 20 }\n"
+        "  var y = B { shared: 7, a: 100 }\n"
+        "  y.shared = 9\n"
+        "  return x.shared + y.shared + y.a\n"
+        "end\n", &ok);
+    ok = ok && r == 129;  /* 20 + 9 + 100 */
+    if (ok) PASS();
+    else { char msg[64]; snprintf(msg, sizeof(msg), "got %lld exp 129", (long long)r); FAIL(msg); }
+}
+
+static void test_e2e_record_nested_and_array_field_types(void)
+{
+    TEST("e2e: nested/indexed record field types");
+    int ok;
+    int64_t r = run_vir(
+        "record Other then\n"
+        "  pad: num\n"
+        "  shared: num\n"
+        "end\n"
+        "record Inner then\n"
+        "  shared: num\n"
+        "  value: num\n"
+        "end\n"
+        "record Outer then\n"
+        "  inner: Inner\n"
+        "  pad: num\n"
+        "end\n"
+        "func pick(items: [Inner]) then\n"
+        "  return items[0].shared\n"
+        "end\n"
+        "func main() then\n"
+        "  var o = Outer { inner: Inner { shared: 11, value: 7 }, pad: 99 }\n"
+        "  var arr: [Inner] = [Inner { shared: 13, value: 5 }]\n"
+        "  return o.inner.shared + pick(arr)\n"
+        "end\n", &ok);
+    ok = ok && r == 24;  /* 11 + 13 */
+    if (ok) PASS();
+    else { char msg[64]; snprintf(msg, sizeof(msg), "got %lld exp 24", (long long)r); FAIL(msg); }
+}
+
+static void test_e2e_record_param_type_metadata_is_per_param(void)
+{
+    TEST("e2e: record param type metadata per param");
+    int ok;
+    int64_t r = run_vir(
+        "record A then\n"
+        "  pad: num\n"
+        "  shared: num\n"
+        "end\n"
+        "record B then\n"
+        "  shared: num\n"
+        "  pad: num\n"
+        "end\n"
+        "func sum(a: A; b: B) then\n"
+        "  return a.shared + b.shared\n"
+        "end\n"
+        "func main() then\n"
+        "  return sum(A { pad: 2, shared: 40 }, B { shared: 7, pad: 9 })\n"
+        "end\n", &ok);
+    ok = ok && r == 47;  /* 40 + 7 */
+    if (ok) PASS();
+    else { char msg[64]; snprintf(msg, sizeof(msg), "got %lld exp 47", (long long)r); FAIL(msg); }
+}
+
+static void test_e2e_record_return_type_inference(void)
+{
+    TEST("e2e: record return type inference");
+    int ok;
+    int64_t r = run_vir(
+        "record Inner then\n"
+        "  shared: num\n"
+        "  value: num\n"
+        "end\n"
+        "record Box then\n"
+        "  inner: Inner\n"
+        "  pad: num\n"
+        "end\n"
+        "func make_box() then\n"
+        "  return Box { inner: Inner { shared: 31, value: 4 }, pad: 99 }\n"
+        "end\n"
+        "func main() then\n"
+        "  var b = make_box()\n"
+        "  return b.inner.shared\n"
+        "end\n", &ok);
+    ok = ok && r == 31;
+    if (ok) PASS();
+    else { char msg[64]; snprintf(msg, sizeof(msg), "got %lld exp 31", (long long)r); FAIL(msg); }
 }
 
 static void test_e2e_enum_record_combined(void)
@@ -2214,35 +2414,37 @@ static int64_t run_vir_with_includes(const char *src, int *out_ok)
     if (lexer_tokenize(lex) != 0) { *out_ok = 0; free(lex); return -9999; }
 
     vir_parser_t parser;
-    parser_init(&parser, lex->tokens, lex->token_count);
+    parser_init(&parser, lex->tokens, lex->token_count, 0);
     ast_node_t *ast = parser_parse_program(&parser);
     if (!ast) { *out_ok = 0; free(lex); return -9999; }
 
-    lower_ctx_t ctx;
-    lower_init(&ctx, "test");
-    ctx.include_reader = test_include_reader;
-    ctx.include_user_data = NULL;
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) { ast_free(ast); free(lex); *out_ok = 0; return -9999; }
+    lower_init(ctx, "test");
+    ctx->include_reader = test_include_reader;
+    ctx->include_user_data = NULL;
 
-    if (lower_resolve_includes(&ctx, ast) != 0) {
-        ast_free(ast); lower_destroy(&ctx); free(lex);
+    if (lower_resolve_includes(ctx, ast) != 0) {
+        ast_free(ast); lower_destroy(ctx); free(ctx); free(lex);
         *out_ok = 0; return -9999;
     }
-    if (lower_program(&ctx, ast) != 0) {
-        ast_free(ast); lower_destroy(&ctx); free(lex);
+    if (lower_program(ctx, ast) != 0) {
+        ast_free(ast); lower_destroy(ctx); free(ctx); free(lex);
         *out_ok = 0; return -9999;
     }
-    for (uint32_t i = 0; i < ctx.module.func_count; i++)
-        lower_tco_pass(&ctx.module.functions[i]);
+    for (uint32_t i = 0; i < ctx->module.func_count; i++)
+        lower_tco_pass(&ctx->module.functions[i], i);
 
     vm_state_t vm;
     vm_init(&vm);
-    vm_status_t status = vm_exec_module(&vm, &ctx.module);
+    vm_status_t status = vm_exec_module(&vm, &ctx->module);
 
     int64_t result = vm_get_reg(&vm, 0);
     *out_ok = (status == VM_OK || status == VM_HALT) ? 1 : 0;
     vm_destroy(&vm);
     ast_free(ast);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
     free(lex);
     return result;
 }
@@ -2380,24 +2582,26 @@ static void test_process_imports(void)
     ast_add_child(from, s2);
     ast_add_child(prog, from);
 
-    lower_ctx_t ctx;
-    lower_init(&ctx, "test");
-    lower_process_imports(&ctx, prog);
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) { ast_free(prog); FAIL("alloc lower ctx"); return; }
+    lower_init(ctx, "test");
+    lower_process_imports(ctx, prog);
 
     int ok = 1;
-    ok = ok && strcmp(ctx.module.name, "mymod") == 0;
-    ok = ok && ctx.module_alias_count == 1;
-    ok = ok && strcmp(ctx.module_aliases[0].original, "math") == 0;
-    ok = ok && strcmp(ctx.module_aliases[0].alias, "m") == 0;
-    ok = ok && ctx.imported_sym_count == 2;
-    ok = ok && strcmp(ctx.imported_syms[0].module, "io") == 0;
-    ok = ok && strcmp(ctx.imported_syms[0].symbol, "read") == 0;
-    ok = ok && strcmp(ctx.imported_syms[1].symbol, "write") == 0;
+    ok = ok && strcmp(ctx->module.name, "mymod") == 0;
+    ok = ok && ctx->module_alias_count == 1;
+    ok = ok && strcmp(ctx->module_aliases[0].original, "math") == 0;
+    ok = ok && strcmp(ctx->module_aliases[0].alias, "m") == 0;
+    ok = ok && ctx->imported_sym_count == 2;
+    ok = ok && strcmp(ctx->imported_syms[0].module, "io") == 0;
+    ok = ok && strcmp(ctx->imported_syms[0].symbol, "read") == 0;
+    ok = ok && strcmp(ctx->imported_syms[1].symbol, "write") == 0;
 
     if (ok) PASS();
     else FAIL("import table mismatch");
     ast_free(prog);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -2510,6 +2714,8 @@ int main(void)
     test_vm_string_cat();
     test_vm_memory_ops();
     test_vm_word_ops();
+    test_vm_heap_tracking_growth();
+    test_vm_native_read_u8_invalid_pointer();
     test_vm_i_to_str();
 
     printf("\n── E2E New Features ────────────────────────\n");
@@ -2528,6 +2734,10 @@ int main(void)
     test_e2e_record_basic();
     test_e2e_record_assign();
     test_e2e_record_3field();
+    test_e2e_record_duplicate_field_names();
+    test_e2e_record_nested_and_array_field_types();
+    test_e2e_record_param_type_metadata_is_per_param();
+    test_e2e_record_return_type_inference();
     test_e2e_enum_record_combined();
     test_e2e_for_array();
 
