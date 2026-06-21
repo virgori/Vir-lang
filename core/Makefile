@@ -58,14 +58,14 @@ endif
 
 # ── Compiler settings ────────────────────────────────────
 CC      := cc
-CFLAGS  := -O2 -Wall -Wextra -Wpedantic -std=c11 -fPIC
+CFLAGS  := -g -Wall -Wextra -Wpedantic -std=c11 -fPIC
 CFLAGS  += -Iinclude
 CFLAGS  += -DVIR_ARCH_$(shell echo $(ARCH) | tr a-z A-Z)
 CFLAGS  += -DVIR_PLATFORM_$(shell echo $(PLATFORM) | tr a-z A-Z)
 ASFLAGS := -fPIC
 
 # Debug build
-ifdef DEBUG
+ifneq (,$(filter 1 true yes,$(DEBUG)))
   CFLAGS += -g -O0 -DDEBUG -fsanitize=address
   LDFLAGS += -fsanitize=address
 endif
@@ -81,8 +81,11 @@ C_SRCS := src/q_ir.c \
           src/intrinsics.c \
           src/jit_bridge.c \
           src/ir_lower.c \
+          src/hir.c \
+          src/mir.c \
           src/lexer.c \
           src/parser.c \
+          src/diagnostic.c \
           src/cpu_caps.c \
           src/task.c \
           src/vir.c \
@@ -98,7 +101,12 @@ C_SRCS := src/q_ir.c \
           src/gpu_metal.c \
           src/mem_manager.c \
           src/sublib_adapter.c \
-          src/wasm_codegen.c
+          src/wasm_codegen.c \
+          src/lang/lang.c \
+          src/lang/lang_vi.c \
+          src/lang/lang_zh.c \
+          src/lang/lang_ja.c \
+          src/lang/lang_ko.c
 
 # ── Object files ──────────────────────────────────────────
 BUILD_DIR := build
@@ -154,6 +162,7 @@ $(CLI_BIN): $(CLI_SRC) $(STATIC_PATH) | $(BUILD_DIR)
 
 # ── Compile C sources ─────────────────────────────────────
 $(BUILD_DIR)/%.o: src/%.c | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 # ── Assemble platform ASM ─────────────────────────────────
