@@ -233,6 +233,14 @@ static const builtin_map_t builtins[] = {
     {"__memset",      BUILTIN_MEMSET},
     {"__trap",        BUILTIN_TRAP},
     {"__unreachable", BUILTIN_UNREACHABLE},
+    {"__clz",         BUILTIN_CLZ},
+    {"__ctz",         BUILTIN_CTZ},
+    {"__popcnt",      BUILTIN_POPCNT},
+    {"__bswap",       BUILTIN_BSWAP},
+    {"__atomic_load", BUILTIN_ATOMIC_LOAD},
+    {"__atomic_store",BUILTIN_ATOMIC_STORE},
+    {"__atomic_add",  BUILTIN_ATOMIC_ADD},
+    {"__atomic_sub",  BUILTIN_ATOMIC_SUB},
     {NULL, 0}};
 
 static int lookup_builtin(const char *name) {
@@ -1383,6 +1391,13 @@ static ast_node_t *parse_var_decl_single(vir_parser_t *p, ast_type_t type) {
         decl->int_val |= ((int64_t)rows & 0xFFFF) << 32;
         decl->int_val |= ((int64_t)cols & 0xFFFF) << 48;
       }
+    } else if (match(p, TOK_LBRACKET)) {
+      if (check(p, TOK_IDENT)) {
+        snprintf(decl->name2, AST_NAME_LEN, "[%s]", peek(p)->str.buf);
+        advance(p);
+      }
+      expect(p, TOK_RBRACKET, "expected ']' after array type");
+      decl->int_val |= 0x10000; /* array type marker */
     } else {
       /* §Phase-8 colon-style init: `const NAME: EXPR;` is
        * accepted as sugar for `const NAME = EXPR;`.  Consume the
@@ -1726,10 +1741,17 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
             param->flags |= AST_FLAG_REF_PARAM;
           /* Optional type hint: ':' TYPE[<T>] */
           if (match(p, TOK_COLON)) {
-            const vir_token_t *type_tok =
-                expect_name(p, "expected type name");
-            if (type_tok) {
-              strncpy(param->name2, type_tok->str.buf, AST_NAME_LEN - 1);
+            if (check(p, TOK_LBRACKET)) {
+              advance(p);
+              if (check(p, TOK_IDENT)) {
+                snprintf(param->name2, AST_NAME_LEN, "[%s]", peek(p)->str.buf);
+                advance(p);
+              }
+              expect(p, TOK_RBRACKET, "expected ']' in array type");
+              param->int_val |= 0x10000;
+            } else if (check(p, TOK_IDENT)) {
+              strncpy(param->name2, peek(p)->str.buf, AST_NAME_LEN - 1);
+              advance(p);
             }
             /* Skip generic type params: Vec<KeywordEntry>, etc. */
             if (match(p, TOK_LT)) {
@@ -1815,7 +1837,15 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
       /* Optional type annotation: ':' TYPE  (skip composite types
        * like [i32], Vec<T> until separator) */
       if (match(p, TOK_COLON)) {
-        if (check(p, TOK_IDENT)) {
+        if (check(p, TOK_LBRACKET)) {
+          advance(p);
+          if (check(p, TOK_IDENT)) {
+            snprintf(param->name2, AST_NAME_LEN, "[%s]", peek(p)->str.buf);
+            advance(p);
+          }
+          expect(p, TOK_RBRACKET, "expected ']' in array type");
+          param->int_val |= 0x10000;
+        } else if (check(p, TOK_IDENT)) {
           const vir_token_t *tt = advance(p);
           strncpy(param->name2, tt->str.buf, AST_NAME_LEN - 1);
         }
@@ -2268,6 +2298,18 @@ static ast_node_t *parse_record_def(vir_parser_t *p) {
     /* Optional type hint: field_name: type
      * Skip complex types like [i32], Vec<T>, etc. until newline */
     if (match(p, TOK_COLON)) {
+      if (check(p, TOK_LBRACKET)) {
+        advance(p);
+        if (check(p, TOK_IDENT)) {
+          snprintf(field->name2, AST_NAME_LEN, "[%s]", peek(p)->str.buf);
+          advance(p);
+        }
+        expect(p, TOK_RBRACKET, "expected ']' in array type");
+        field->int_val |= 0x10000;
+      } else if (check(p, TOK_IDENT)) {
+        strncpy(field->name2, peek(p)->str.buf, AST_NAME_LEN - 1);
+        advance(p);
+      }
       while (!check(p, TOK_NEWLINE) && !check(p, TOK_END) &&
              !check(p, TOK_EOF)) {
         advance(p);
