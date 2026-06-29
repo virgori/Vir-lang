@@ -32,18 +32,40 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "diagnostic.h"
+
+extern diag_context_t g_parser_diag;
 
 /* ═══════════════════════════════════════════════════════
  * Internal Helpers
  * ═══════════════════════════════════════════════════════ */
 
 static void parse_error(vir_parser_t *p, const char *msg) {
-  if (p->error[0] == '\0') { /* keep first error */
+  if (p->error[0] == '\0') { /* keep first error in the current statement */
     const vir_token_t *t =
         &p->tokens[p->pos < p->token_count ? p->pos : p->token_count - 1];
     snprintf(p->error, sizeof(p->error), "line %u: %s (got %s)", t->line, msg,
              lexer_token_name(t->type));
     p->error_line = t->line;
+    
+    diag_span_t span = diag_span_lc(p->file_id, t->line, t->col, 1);
+    diag_entry_t *e = diag_error(&g_parser_diag, DCAT_SYNTAX, PHASE_PARSER, E1001, span, msg);
+    diag_add_cause(&g_parser_diag, e, "Unexpected token in current context");
+    diag_add_action(&g_parser_diag, e, "Check syntax and spelling");
+  }
+}
+
+static void parser_sync(vir_parser_t *p) {
+  p->error[0] = '\0'; /* Clear error to allow reporting next statement's error */
+  while (p->pos < p->token_count) {
+    vir_tok_t type = p->tokens[p->pos].type;
+    if (type == TOK_EOF || type == TOK_NEWLINE || type == TOK_SEMICOLON ||
+        type == TOK_FUNC || type == TOK_VAR || type == TOK_CONST ||
+        type == TOK_IF || type == TOK_LOOP || type == TOK_FOR ||
+        type == TOK_RETURN || type == TOK_CLASS || type == TOK_ENUM) {
+      break;
+    }
+    p->pos++;
   }
 }
 
@@ -163,12 +185,18 @@ static const builtin_map_t builtins[] = {
     {"alloc", BUILTIN_ALLOC},
     {"dealloc", BUILTIN_FREE_MEM},
     {"read_byte", BUILTIN_READ8},
+    {"native_read_u8", BUILTIN_READ8},
     {"write_byte", BUILTIN_WRITE8},
+    {"native_write_u8", BUILTIN_WRITE8},
     {"read_word", BUILTIN_READ64},
+    {"native_read_i64", BUILTIN_READ64},
     {"write_word", BUILTIN_WRITE64},
-    {"str_len", BUILTIN_STR_LEN},
+    {"native_write_i64", BUILTIN_WRITE64},
+    {"native_str_byte_len", BUILTIN_STR_LEN},
+    {"native_str_ptr", BUILTIN_CAST_PTR},
     {"str_get", BUILTIN_STR_GET},
     {"str_cat", BUILTIN_STR_CAT},
+    {"str_eq", BUILTIN_STR_EQ},
     {"str_eq", BUILTIN_STR_EQ},
     {"file_open", BUILTIN_FILE_OPEN},
     {"file_read", BUILTIN_FILE_READ},
@@ -588,8 +616,15 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
         for (;;) {
           ast_node_t *arg = NULL;
           /* Named arg: IDENT '=' expr  (but not ==).
-           * Also accept IDENT ':' expr (record-literal style). */
+           * Also accept IDENT ':' expr (record-literal style).
+           * BUT: do NOT treat IDENT '::' as named arg — that is an
+           * enum variant access like TokType::Int. */
+          int next_is_double_colon =
+              (p->tokens[p->pos + 1].type == TOK_COLON) &&
+              (p->pos + 2 < p->token_count) &&
+              (p->tokens[p->pos + 2].type == TOK_COLON);
           if (check(p, TOK_IDENT) && (p->pos + 1 < p->token_count) &&
+              !next_is_double_colon &&
               (p->tokens[p->pos + 1].type == TOK_ASSIGN ||
                p->tokens[p->pos + 1].type == TOK_COLON)) {
             const vir_token_t *nm = advance(p);
@@ -1799,6 +1834,13 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
               advance(p);
             }
           }
+        }
+      } else if (match(p, TOK_OUT)) {
+        if (match(p, TOK_LPAREN)) {
+            while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) advance(p);
+            match(p, TOK_RPAREN);
+        } else if (check(p, TOK_IDENT)) {
+            advance(p);
         }
       }
       skip_newlines(p);
@@ -3924,13 +3966,17 @@ ast_node_t *parser_parse_program(vir_parser_t *p) {
     ast_node_t *stmt = parse_statement(p);
     if (stmt) {
       ast_add_child(prog, stmt);
+    }
+    
+    if (p->error[0] != '\0') {
+      /* Recover from error */
+      parser_sync(p);
+      if (check(p, TOK_SEMICOLON) || check(p, TOK_NEWLINE)) {
+        advance(p);
+      }
+    } else {
       while (check(p, TOK_SEMICOLON))
         advance(p);
-    } else if (!check(p, TOK_EOF)) {
-      /* Avoid infinite loop on unrecoverable error */
-      if (p->error[0] != '\0')
-        break;
-      advance(p);
     }
     skip_newlines(p);
   }

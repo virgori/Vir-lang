@@ -74,8 +74,18 @@ typedef enum {
     VIR_INTR_MEMSET         = 10, /* R0=dst, R1=val, R2=len      */
     /* Debug / Trap */
     VIR_INTR_TRAP           = 11, /* abort()                     */
+    /* Bitwise / Math */
+    VIR_INTR_CLZ            = 12, /* R0=val                      */
+    VIR_INTR_CTZ            = 13, /* R0=val                      */
+    VIR_INTR_POPCNT         = 14, /* R0=val                      */
+    VIR_INTR_BSWAP          = 15, /* R0=val                      */
+    /* Atomics */
+    VIR_INTR_ATOMIC_LOAD    = 16, /* R0=addr                     */
+    VIR_INTR_ATOMIC_STORE   = 17, /* R0=addr, R1=val             */
+    VIR_INTR_ATOMIC_ADD     = 18, /* R0=addr, R1=val             */
+    VIR_INTR_ATOMIC_SUB     = 19, /* R0=addr, R1=val             */
 
-    VIR_INTR_COUNT          = 12  /* sentinel – size of table    */
+    VIR_INTR_COUNT          = 20  /* sentinel – size of table    */
 } vir_intrinsic_id_t;
 
 /* Execution context passed to every intrinsic handler */
@@ -115,7 +125,7 @@ extern vir_intr_desc_t vir_intr_table[VIR_MAX_INTRINSICS];
  * VM Array (dynamic int64 array for Q_ARR_* opcodes)
  * ═══════════════════════════════════════════════════════ */
 
-#define VM_MAX_ARRAYS   16384
+#define VM_MAX_ARRAYS   1048576
 #define VM_MAX_GLOBALS  1024
 
 typedef struct {

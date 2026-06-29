@@ -69,10 +69,69 @@ void mir_free_func(mir_func_t* func) {
             instr = next_instr;
         }
         
+        mir_phi_t* phi = block->phis;
+        while (phi) {
+            mir_phi_t* next_phi = phi->next;
+            if (phi->incoming_values) free(phi->incoming_values);
+            if (phi->incoming_blocks) free(phi->incoming_blocks);
+            free(phi);
+            phi = next_phi;
+        }
+        
+        if (block->preds) free(block->preds);
+        if (block->dom_children) free(block->dom_children);
+        if (block->df) free(block->df);
+        
         mir_block_t* next_block = block->next_block;
         free(block);
         block = next_block;
     }
     
+    
+    if (func->def_uses) {
+        for (uint32_t i = 0; i <= func->next_vreg; i++) {
+            mir_use_t* use = func->def_uses[i];
+            while (use) {
+                mir_use_t* next = use->next;
+                free(use);
+                use = next;
+            }
+        }
+        free(func->def_uses);
+    }
+
     free(func);
+}
+
+mir_opcode_info_t mir_get_opcode_info(mir_op_t op) {
+    mir_opcode_info_t info = {0, 0, 0, 0};
+    switch (op) {
+        case MIR_CALL:
+            info.has_side_effect = 1;
+            info.may_read_memory = 1;
+            info.may_write_memory = 1;
+            break;
+        case MIR_STORE:
+            info.has_side_effect = 1;
+            info.may_write_memory = 1;
+            break;
+        case MIR_LOAD:
+            info.may_read_memory = 1;
+            break;
+        case MIR_JUMP:
+        case MIR_JUMP_IF:
+        case MIR_RETURN:
+            info.is_terminator = 1;
+            info.has_side_effect = 1;
+            break;
+        case MIR_INTRINSIC:
+            info.has_side_effect = 1;
+            info.may_read_memory = 1;
+            info.may_write_memory = 1;
+            break;
+        default:
+            // Pure arithmetic, MOVE, CMP, NOP
+            break;
+    }
+    return info;
 }

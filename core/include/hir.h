@@ -18,6 +18,10 @@ typedef enum {
     HIR_CONST,
     HIR_LOAD,
     HIR_STORE,
+    HIR_BREAK,
+    HIR_CONTINUE,
+    HIR_BINOP,
+    HIR_VAR_DECL,
 } hir_kind_t;
 
 typedef struct hir_node {
@@ -57,6 +61,15 @@ typedef struct hir_node {
             uint32_t var_id;
             struct hir_node* value;
         } store;
+        struct {
+            uint32_t op; // Opcode (e.g. OP_ADD)
+            struct hir_node* left;
+            struct hir_node* right;
+        } binop;
+        struct {
+            uint32_t var_id;
+            struct hir_node* init_value;
+        } var_decl;
     } as;
 } hir_node_t;
 

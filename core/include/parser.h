@@ -27,6 +27,8 @@ typedef struct {
     uint32_t           pos;
     char               error[256];
     uint32_t           error_line;
+    uint32_t           file_id;
+    int                in_for_range_start;
 } vir_parser_t;
 
 /* ═══════════════════════════════════════════════════════
@@ -34,7 +36,7 @@ typedef struct {
  * ═══════════════════════════════════════════════════════ */
 
 /* Initialise parser with token array from lexer. */
-void parser_init(vir_parser_t *p, const vir_token_t *tokens, uint32_t count);
+void parser_init(vir_parser_t *p, const vir_token_t *tokens, uint32_t count, uint32_t file_id);
 
 /* Parse full program → AST_PROGRAM node.
  * Returns NULL on fatal error (check p->error). */

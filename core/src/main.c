@@ -19,10 +19,127 @@
 #include "codegen.h"
 #include "jit_bridge.h"
 #include "intrinsics.h"
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
+#include "diagnostic.h"
+
+extern diag_context_t g_parser_diag;
+extern int g_diag_initialized;
+
+typedef struct {
+    int enabled;
+    int timing;
+    FILE *file;
+    uint64_t start_ms;
+    const char *last_phase;
+} stage1_trace_t;
+
+static stage1_trace_t g_stage1_trace = {0};
+
+static uint64_t trace_now_ms(void)
+{
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#else
+    clock_gettime(CLOCK_REALTIME, &ts);
+#endif
+    return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+}
+
+static void trace_stage1_init(void)
+{
+    const char *stage = getenv("VIR_TRACE_STAGE1");
+    const char *timing = getenv("VIR_TRACE_TIMING");
+    const char *path = getenv("VIR_TRACE_FILE");
+    g_stage1_trace.enabled = (stage && stage[0] && strcmp(stage, "0") != 0) ||
+                             (timing && timing[0] && strcmp(timing, "0") != 0);
+    g_stage1_trace.timing = timing && timing[0] && strcmp(timing, "0") != 0;
+    if (!g_stage1_trace.enabled) return;
+
+    g_stage1_trace.start_ms = trace_now_ms();
+    g_stage1_trace.last_phase = "trace_init";
+    if (path && path[0]) {
+        g_stage1_trace.file = fopen(path, "a");
+    }
+    if (!g_stage1_trace.file) {
+        g_stage1_trace.file = stderr;
+    }
+    setvbuf(g_stage1_trace.file, NULL, _IOLBF, 0);
+}
+
+static void trace_stage1_close(void)
+{
+    if (g_stage1_trace.file && g_stage1_trace.file != stderr) {
+        fclose(g_stage1_trace.file);
+    }
+    g_stage1_trace.file = NULL;
+}
+
+static void trace_stage1_event(const char *phase, const char *fmt, ...)
+{
+    if (!g_stage1_trace.enabled || !g_stage1_trace.file) return;
+    uint64_t now = trace_now_ms();
+    fprintf(g_stage1_trace.file, "elapsed_ms=%llu phase=%s",
+            (unsigned long long)(now - g_stage1_trace.start_ms), phase);
+    if (fmt && fmt[0]) {
+        fputc(' ', g_stage1_trace.file);
+        va_list ap;
+        va_start(ap, fmt);
+        vfprintf(g_stage1_trace.file, fmt, ap);
+        va_end(ap);
+    }
+    fputc('\n', g_stage1_trace.file);
+    fflush(g_stage1_trace.file);
+    g_stage1_trace.last_phase = phase;
+}
+
+static uint64_t ast_count_nodes(const ast_node_t *node)
+{
+    if (!node) return 0;
+    uint64_t total = 1;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        total += ast_count_nodes(node->children[i]);
+    }
+    return total;
+}
+
+static uint64_t ast_count_blocks(const ast_node_t *node)
+{
+    if (!node) return 0;
+    uint64_t total = node->type == AST_BLOCK ? 1 : 0;
+    for (uint32_t i = 0; i < node->child_count; i++) {
+        total += ast_count_blocks(node->children[i]);
+    }
+    return total;
+}
+
+static uint64_t module_instruction_count(const q_module_t *mod)
+{
+    if (!mod) return 0;
+    uint64_t total = 0;
+    for (uint32_t i = 0; i < mod->func_count; i++) {
+        total += mod->functions[i].body_count;
+    }
+    return total;
+}
+
+static uint64_t module_label_count(const q_module_t *mod)
+{
+    if (!mod) return 0;
+    uint64_t total = 0;
+    for (uint32_t fi = 0; fi < mod->func_count; fi++) {
+        const q_function_t *fn = &mod->functions[fi];
+        for (uint32_t ii = 0; ii < fn->body_count; ii++) {
+            if (fn->body[ii].opcode == Q_LABEL) total++;
+        }
+    }
+    return total;
+}
 
 /* ── Read file into malloc'd buffer ────────────────── */
 static char *read_source_silent(const char *path, size_t *out_len)
@@ -106,6 +223,9 @@ static char *vir_include_reader(const char *filename, size_t *out_len,
             "vir/core",         /* env/vir/core/<rel>  */
             "vir/rt",           /* env/vir/rt/<rel>    */
             "vir/str",          /* env/vir/str/<rel>   */
+            "vir/mem",          /* env/vir/mem/<rel>   */
+            "vir/io",           /* env/vir/io/<rel>    */
+            "vir/error",        /* env/vir/error/<rel> */
             "vir/compiler",     /* env/vir/compiler/<rel> */
             "vir/collections",
             NULL
@@ -128,6 +248,8 @@ static char *vir_include_reader(const char *filename, size_t *out_len,
         if ((src = read_source_silent(path, out_len))) return src;
         snprintf(path, sizeof(path), "%s/stdlib/%s", walk, relpath);
         if ((src = read_source_silent(path, out_len))) return src;
+        snprintf(path, sizeof(path), "%s/stdlib/vir/mem/%s", walk, relpath);
+        if ((src = read_source_silent(path, out_len))) return src;
         char *last = strrchr(walk, '/');
         if (!last) break;
         if (last == walk) { walk[1] = '\0'; }  /* "/" root */
@@ -135,9 +257,32 @@ static char *vir_include_reader(const char *filename, size_t *out_len,
         if (walk[0] == '\0') break;
     }
 
-    /* 5) Fallback: cwd-relative (either translated or verbatim). */
-    if ((src = read_source_silent(relpath, out_len))) return src;
-    return read_source(filename, out_len);  /* noisy: prints cannot-open */
+    /* 5) Repo-root stdlib fallback for relative base_dir runs. */
+    static const char *cwd_subs[] = {
+        "stdlib/vir",
+        "stdlib/vir/core",
+        "stdlib/vir/rt",
+        "stdlib/vir/str",
+        "stdlib/vir/mem",
+        "stdlib/vir/io",
+        "stdlib/vir/error",
+        "stdlib/vir/compiler",
+        "stdlib/vir/collections",
+        NULL
+    };
+    for (int si = 0; cwd_subs[si] != NULL; si++) {
+        snprintf(path, sizeof(path), "%s/%s", cwd_subs[si], relpath);
+        if ((src = read_source_silent(path, out_len))) return src;
+    }
+
+    /* 6) Fallback: cwd-relative (either translated or verbatim). */
+    if ((src = read_source_silent(relpath, out_len))) {
+        fprintf(stderr, "loading: %s\n", path);
+        return src;
+    }
+    src = read_source(filename, out_len);
+    if (src) fprintf(stderr, "loading: %s\n", filename);
+    return src;  /* noisy: prints cannot-open */
 }
 
 /* Extract directory from a file path */
@@ -151,30 +296,57 @@ static void get_dir(const char *filepath, char *dir, size_t dir_size)
 }
 
 /* ── Frontend: source → AST ───────────────────────── */
-static ast_node_t *frontend(const char *source, size_t len, int verbose)
+static ast_node_t *frontend(const char *filepath, const char *source, size_t len, int verbose)
 {
+    diag_file_id_t file_id = DIAG_NO_FILE;
+    if (g_diag_initialized && filepath) {
+        file_id = diag_register_source(&g_parser_diag, filepath, source, len);
+    }
     /* Tokenize */
+    uint64_t phase_start = trace_now_ms();
+    trace_stage1_event("lexer_start", "file=%s bytes=%zu", filepath ? filepath : "", len);
     vir_lexer_t lex;
     lexer_init(&lex, source, len);
     if (lexer_tokenize(&lex) != 0) {
+        trace_stage1_event("lexer_error", "elapsed_phase_ms=%llu error=%s",
+                           (unsigned long long)(trace_now_ms() - phase_start), lex.error);
         fprintf(stderr, "lexer error: %s\n", lex.error);
         lexer_free(&lex);
         return NULL;
     }
+    trace_stage1_event("lexer_end", "elapsed_phase_ms=%llu token_count=%u",
+                       (unsigned long long)(trace_now_ms() - phase_start),
+                       lex.token_count);
     if (verbose) {
         fprintf(stderr, "[vir] %u tokens\n", lex.token_count);
     }
 
     /* Parse → AST */
+    phase_start = trace_now_ms();
+    trace_stage1_event("parser_start", "token_count=%u", lex.token_count);
     vir_parser_t parser;
-    parser_init(&parser, lex.tokens, lex.token_count);
+    parser_init(&parser, lex.tokens, lex.token_count, file_id);
     ast_node_t *ast = parser_parse_program(&parser);
     lexer_free(&lex);
-    if (!ast) {
-        fprintf(stderr, "parse error (line %u): %s\n",
-                parser.error_line, parser.error);
+    if (!ast || parser.error[0] != '\0' || (g_diag_initialized && g_parser_diag.count > 0)) {
+        trace_stage1_event("parser_error", "elapsed_phase_ms=%llu pos=%u error=%s",
+                           (unsigned long long)(trace_now_ms() - phase_start),
+                           parser.pos, parser.error);
+        if (g_diag_initialized && g_parser_diag.count > 0) {
+            diag_render_all(&g_parser_diag);
+        } else {
+            fprintf(stderr, "parse error in %s (line %u): %s\n", filepath, 
+                    parser.error_line, parser.error);
+        }
+        if (ast) ast_free(ast);
         return NULL;
     }
+    trace_stage1_event("parser_end",
+                       "elapsed_phase_ms=%llu ast_node_count=%llu block_count=%llu top_level=%u",
+                       (unsigned long long)(trace_now_ms() - phase_start),
+                       (unsigned long long)ast_count_nodes(ast),
+                       (unsigned long long)ast_count_blocks(ast),
+                       ast->child_count);
     if (verbose) {
         fprintf(stderr, "[vir] AST: %u top-level nodes\n",
                 ast->child_count);
@@ -220,41 +392,70 @@ static int cmd_tokens(const char *source, size_t len)
 /* ── cmd: dump (Q-IR text) ────────────────────────── */
 static int cmd_dump(const char *source, size_t len, const char *filepath)
 {
-    ast_node_t *ast = frontend(source, len, 0);
+    ast_node_t *ast = frontend(filepath, source, len, 0);
     if (!ast) return 1;
 
-    lower_ctx_t ctx;
-    lower_init(&ctx, "main");
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) {
+        ast_free(ast);
+        return 1;
+    }
+    lower_init(ctx, "main");
 
     /* Set up include handler */
     include_ctx_t ictx;
     get_dir(filepath, ictx.base_dir, sizeof(ictx.base_dir));
-    ctx.include_reader = vir_include_reader;
-    ctx.include_user_data = &ictx;
+    ctx->include_reader = vir_include_reader;
+    ctx->include_user_data = &ictx;
 
-    if (lower_resolve_includes(&ctx, ast) != 0) {
-        fprintf(stderr, "include error: %s\n", ctx.last_error);
-        ast_free(ast); lower_destroy(&ctx);
+    if (lower_resolve_includes(ctx, ast) != 0) {
+        if (g_diag_initialized && g_parser_diag.count > 0) {
+            diag_render_all(&g_parser_diag);
+        } else {
+            fprintf(stderr, "include error: %s\n", ctx->last_error);
+        }
+        ast_free(ast); lower_destroy(ctx); free(ctx);
         return 1;
     }
-    if (lower_program(&ctx, ast) != 0) {
-        fprintf(stderr, "lower error: %s\n", ctx.last_error);
+    if (getenv("VIR_DEBUG_COMPILER")) {
+        fprintf(stderr, "[DEBUG] program->child_count = %u\n", ast->child_count);
+    }
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        if (ast->children[i] && ast->children[i]->name[0] != '\0') {
+        }
+    }
+
+    if (lower_program(ctx, ast) != 0) {
+        if (g_diag_initialized && g_parser_diag.count > 0) {
+            diag_render_all(&g_parser_diag);
+        } else {
+            fprintf(stderr, "lower error: %s\n", ctx->last_error);
+        }
         ast_free(ast);
-        lower_destroy(&ctx);
+        lower_destroy(ctx); free(ctx);
         return 1;
     }
 
     /* Apply TCO pass to all functions */
-    for (uint32_t i = 0; i < ctx.module.func_count; i++) {
-        lower_tco_pass(&ctx.module.functions[i], i);
+    for (uint32_t i = 0; i < ctx->module.func_count; i++) {
+        lower_tco_pass(&ctx->module.functions[i], i);
     }
 
-    char buf[16384];
-    q_module_dump(&ctx.module, buf, sizeof(buf));
+    size_t dump_cap = 8 * 1024 * 1024;
+    char *buf = malloc(dump_cap);
+    if (!buf) {
+        ast_free(ast);
+        lower_destroy(ctx);
+        free(ctx);
+        return 1;
+    }
+    q_module_dump(&ctx->module, buf, dump_cap);
     printf("%s", buf);
+    free(buf);
 
     ast_free(ast);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
     return 0;
 }
 
@@ -263,66 +464,145 @@ static int cmd_run(const char *source, size_t len, int verbose,
                    int prog_argc, const char **prog_argv,
                    const char *filepath)
 {
-    ast_node_t *ast = frontend(source, len, verbose);
+    ast_node_t *ast = frontend(filepath, source, len, verbose);
     if (!ast) return 1;
 
-    lower_ctx_t ctx;
-    lower_init(&ctx, "main");
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) {
+        ast_free(ast);
+        return 1;
+    }
+    lower_init(ctx, "main");
 
     /* Set up include handler */
     include_ctx_t ictx;
     get_dir(filepath, ictx.base_dir, sizeof(ictx.base_dir));
-    ctx.include_reader = vir_include_reader;
-    ctx.include_user_data = &ictx;
+    ctx->include_reader = vir_include_reader;
+    ctx->include_user_data = &ictx;
 
-    if (lower_resolve_includes(&ctx, ast) != 0) {
-        fprintf(stderr, "include error: %s\n", ctx.last_error);
-        ast_free(ast); lower_destroy(&ctx);
+    uint64_t phase_start = trace_now_ms();
+    trace_stage1_event("include_start", "top_level=%u", ast->child_count);
+    int inc_res = lower_resolve_includes(ctx, ast);
+    if (inc_res != 0) {
+        trace_stage1_event("include_error", "elapsed_phase_ms=%llu error=%s",
+                           (unsigned long long)(trace_now_ms() - phase_start),
+                           ctx->last_error);
+        if (g_diag_initialized && g_parser_diag.count > 0) {
+            diag_render_all(&g_parser_diag);
+        } else {
+            fprintf(stderr, "include error: %s\n", ctx->last_error);
+        }
+        ast_free(ast); lower_destroy(ctx); free(ctx);
         return 1;
     }
-    if (lower_program(&ctx, ast) != 0) {
-        fprintf(stderr, "lower error: %s\n", ctx.last_error);
+    trace_stage1_event("include_end",
+                       "elapsed_phase_ms=%llu ast_node_count=%llu block_count=%llu top_level=%u",
+                       (unsigned long long)(trace_now_ms() - phase_start),
+                       (unsigned long long)ast_count_nodes(ast),
+                       (unsigned long long)ast_count_blocks(ast),
+                       ast->child_count);
+
+    phase_start = trace_now_ms();
+    trace_stage1_event("semantic_start", "top_level=%u", ast->child_count);
+    if (getenv("VIR_DEBUG_COMPILER")) {
+        fprintf(stderr, "[DEBUG] program->child_count = %u\n", ast->child_count);
+    }
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        if (ast->children[i] && ast->children[i]->name[0] != '\0') {
+        }
+    }
+
+    int prog_res = lower_program(ctx, ast);
+    if (prog_res != 0) {
+        trace_stage1_event("semantic_error", "elapsed_phase_ms=%llu error=%s",
+                           (unsigned long long)(trace_now_ms() - phase_start),
+                           ctx->last_error);
+        if (g_diag_initialized && g_parser_diag.count > 0) {
+            diag_render_all(&g_parser_diag);
+        } else {
+            fprintf(stderr, "lower error: %s\n", ctx->last_error);
+        }
         ast_free(ast);
-        lower_destroy(&ctx);
+        lower_destroy(ctx); free(ctx);
         return 1;
     }
+    trace_stage1_event("semantic_end",
+                       "elapsed_phase_ms=%llu function_count=%u block_count=%llu label_count=%llu emitted_instruction_count=%llu",
+                       (unsigned long long)(trace_now_ms() - phase_start),
+                       ctx->module.func_count,
+                       (unsigned long long)ast_count_blocks(ast),
+                       (unsigned long long)module_label_count(&ctx->module),
+                       (unsigned long long)module_instruction_count(&ctx->module));
 
     /* TCO pass */
-    for (uint32_t i = 0; i < ctx.module.func_count; i++) {
-        lower_tco_pass(&ctx.module.functions[i], i);
+    phase_start = trace_now_ms();
+    trace_stage1_event("optimizer_start", "function_count=%u", ctx->module.func_count);
+    for (uint32_t i = 0; i < ctx->module.func_count; i++) {
+        lower_tco_pass(&ctx->module.functions[i], i);
     }
+    trace_stage1_event("optimizer_end",
+                       "elapsed_phase_ms=%llu emitted_instruction_count=%llu label_count=%llu",
+                       (unsigned long long)(trace_now_ms() - phase_start),
+                       (unsigned long long)module_instruction_count(&ctx->module),
+                       (unsigned long long)module_label_count(&ctx->module));
 
     if (verbose) {
         fprintf(stderr, "[vir] module '%s': %u functions\n",
-                ctx.module.name, ctx.module.func_count);
+                ctx->module.name, ctx->module.func_count);
     }
 
-    /* Execute via VM */
-    vm_state_t vm;
-    vm_init(&vm);
-    vm_set_args(&vm, prog_argc, prog_argv);
-    vm_status_t status = vm_exec_module(&vm, &ctx.module);
+    /* Execute via VM. vm_state_t is large; keep it off the CLI stack. */
+    vm_state_t *vm = calloc(1, sizeof(*vm));
+    if (!vm) {
+        ast_free(ast);
+        lower_destroy(ctx);
+        free(ctx);
+        return 1;
+    }
+    phase_start = trace_now_ms();
+    trace_stage1_event("vm_init_start", "prog_argc=%d", prog_argc);
+    vm_init(vm);
+    vm_set_args(vm, prog_argc, prog_argv);
+    trace_stage1_event("vm_init_end", "elapsed_phase_ms=%llu",
+                       (unsigned long long)(trace_now_ms() - phase_start));
+
+    phase_start = trace_now_ms();
+    trace_stage1_event("runtime_execution_start",
+                       "function_count=%u emitted_instruction_count=%llu label_count=%llu",
+                       ctx->module.func_count,
+                       (unsigned long long)module_instruction_count(&ctx->module),
+                       (unsigned long long)module_label_count(&ctx->module));
+    vm_status_t status = vm_exec_module(vm, &ctx->module);
+    trace_stage1_event("runtime_execution_end",
+                       "elapsed_phase_ms=%llu status=%s vm_steps=%llu",
+                       (unsigned long long)(trace_now_ms() - phase_start),
+                       vm_status_str(status),
+                       (unsigned long long)vm->instr_executed);
 
     if (verbose) {
         fprintf(stderr, "[vir] VM status: %s  (%llu instrs)\n",
-                vm_status_str(status), (unsigned long long)vm.instr_executed);
+                vm_status_str(status), (unsigned long long)vm->instr_executed);
     }
 
-    int64_t result = vm_get_reg(&vm, 0);
+    int64_t result = vm_get_reg(vm, 0);
     if (status == VM_OK || status == VM_HALT) {
         if (verbose) {
             fprintf(stderr, "[vir] result = %lld\n", (long long)result);
         }
-        vm_destroy(&vm);
+        vm_destroy(vm);
+        free(vm);
         ast_free(ast);
-        lower_destroy(&ctx);
+        lower_destroy(ctx);
+        free(ctx);
         return 0;
     }
 
     fprintf(stderr, "runtime error: %s\n", vm_status_str(status));
-    vm_destroy(&vm);
+    vm_destroy(vm);
+    free(vm);
     ast_free(ast);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
     return 1;
 }
 
@@ -330,33 +610,53 @@ static int cmd_run(const char *source, size_t len, int verbose,
 static int cmd_jit(const char *source, size_t len, int verbose,
                    const char *filepath)
 {
-    ast_node_t *ast = frontend(source, len, verbose);
+    ast_node_t *ast = frontend(filepath, source, len, verbose);
     if (!ast) return 1;
 
-    lower_ctx_t ctx;
-    lower_init(&ctx, "main");
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    if (!ctx) {
+        ast_free(ast);
+        return 1;
+    }
+    lower_init(ctx, "main");
 
     /* Set up include handler */
     include_ctx_t ictx;
     get_dir(filepath, ictx.base_dir, sizeof(ictx.base_dir));
-    ctx.include_reader = vir_include_reader;
-    ctx.include_user_data = &ictx;
+    ctx->include_reader = vir_include_reader;
+    ctx->include_user_data = &ictx;
 
-    if (lower_resolve_includes(&ctx, ast) != 0) {
-        fprintf(stderr, "include error: %s\n", ctx.last_error);
-        ast_free(ast); lower_destroy(&ctx);
+    if (lower_resolve_includes(ctx, ast) != 0) {
+        if (g_diag_initialized && g_parser_diag.count > 0) {
+            diag_render_all(&g_parser_diag);
+        } else {
+            fprintf(stderr, "include error: %s\n", ctx->last_error);
+        }
+        ast_free(ast); lower_destroy(ctx); free(ctx);
         return 1;
     }
-    if (lower_program(&ctx, ast) != 0) {
-        fprintf(stderr, "lower error: %s\n", ctx.last_error);
+    if (getenv("VIR_DEBUG_COMPILER")) {
+        fprintf(stderr, "[DEBUG] program->child_count = %u\n", ast->child_count);
+    }
+    for (uint32_t i = 0; i < ast->child_count; i++) {
+        if (ast->children[i] && ast->children[i]->name[0] != '\0') {
+        }
+    }
+
+    if (lower_program(ctx, ast) != 0) {
+        if (g_diag_initialized && g_parser_diag.count > 0) {
+            diag_render_all(&g_parser_diag);
+        } else {
+            fprintf(stderr, "lower error: %s\n", ctx->last_error);
+        }
         ast_free(ast);
-        lower_destroy(&ctx);
+        lower_destroy(ctx); free(ctx);
         return 1;
     }
 
     /* TCO pass */
-    for (uint32_t i = 0; i < ctx.module.func_count; i++) {
-        lower_tco_pass(&ctx.module.functions[i], i);
+    for (uint32_t i = 0; i < ctx->module.func_count; i++) {
+        lower_tco_pass(&ctx->module.functions[i], i);
     }
 
     /* Detect target architecture */
@@ -366,7 +666,7 @@ static int cmd_jit(const char *source, size_t len, int verbose,
     target_arch_t arch = ARCH_X86_64;
 #else
     fprintf(stderr, "error: unsupported architecture for JIT\n");
-    ast_free(ast); lower_destroy(&ctx);
+    ast_free(ast); lower_destroy(ctx); free(ctx);
     return 1;
 #endif
 
@@ -374,7 +674,7 @@ static int cmd_jit(const char *source, size_t len, int verbose,
     jit_bridge_t *jb = jit_bridge_global();
     if (!jb || !jb->initialised) {
         fprintf(stderr, "error: JIT bridge init failed\n");
-        ast_free(ast); lower_destroy(&ctx);
+        ast_free(ast); lower_destroy(ctx); free(ctx);
         return 1;
     }
 
@@ -386,18 +686,18 @@ static int cmd_jit(const char *source, size_t len, int verbose,
 
     /* Generate code for first / main function */
     q_function_t *main_func = NULL;
-    for (uint32_t i = 0; i < ctx.module.func_count; i++) {
-        if (strcmp(ctx.module.functions[i].name, "__main__") == 0 ||
-            strcmp(ctx.module.functions[i].name, "main") == 0 ||
-            strcmp(ctx.module.functions[i].name, "chính") == 0 ||
+    for (uint32_t i = 0; i < ctx->module.func_count; i++) {
+        if (strcmp(ctx->module.functions[i].name, "__main__") == 0 ||
+            strcmp(ctx->module.functions[i].name, "main") == 0 ||
+            strcmp(ctx->module.functions[i].name, "chính") == 0 ||
             i == 0) {
-            main_func = &ctx.module.functions[i];
+            main_func = &ctx->module.functions[i];
             break;
         }
     }
     if (!main_func) {
         fprintf(stderr, "error: no main function found\n");
-        ast_free(ast); lower_destroy(&ctx);
+        ast_free(ast); lower_destroy(ctx); free(ctx);
         return 1;
     }
 
@@ -425,7 +725,7 @@ static int cmd_jit(const char *source, size_t len, int verbose,
 
     if (blk < 0) {
         fprintf(stderr, "error: JIT emit failed\n");
-        ast_free(ast); lower_destroy(&ctx);
+        ast_free(ast); lower_destroy(ctx); free(ctx);
         return 1;
     }
 
@@ -433,7 +733,7 @@ static int cmd_jit(const char *source, size_t len, int verbose,
     jit_entry_fn entry = jit_bridge_get_entry(jb, 0);
     if (!entry) {
         fprintf(stderr, "error: no JIT entry point\n");
-        ast_free(ast); lower_destroy(&ctx);
+        ast_free(ast); lower_destroy(ctx); free(ctx);
         return 1;
     }
 
@@ -444,7 +744,8 @@ static int cmd_jit(const char *source, size_t len, int verbose,
     }
 
     ast_free(ast);
-    lower_destroy(&ctx);
+    lower_destroy(ctx);
+    free(ctx);
     return 0;
 }
 
@@ -461,20 +762,32 @@ static void usage(const char *prog)
         "  tokens <file>   Print token stream\n"
         "  build  <file>   Emit object for --target (wasm32)\n"
         "  help            Show this message\n\n"
-        "Options:\n"
         "  -v              Verbose output\n"
-        "  --target=T      Compile target for 'build' (wasm32)\n",
+        "  --debug         Enable internal compiler debug logs\n"
+        "  --target=T      Compile target for 'build' (wasm32)\n"
+        "  --json          Output diagnostics in JSON format\n"
+        "  --report=E0000  Show full Execution Report for a specific error\n",
         prog);
 }
 
 /* ── main ─────────────────────────────────────────── */
+
 int main(int argc, char **argv)
 {
+    trace_stage1_init();
+    trace_stage1_event("process_start", "argc=%d", argc);
+
+    /* Initialize Diagnostics */
+    diag_init(&g_parser_diag, STAGE_0_C_CORE, DIAG_FMT_TERMINAL);
+    g_diag_initialized = 1;
+
     /* §28 — Register all CJK and Vietnamese keyword aliases at startup */
     vir_sublib_adapter_init();
 
     if (argc < 2) {
         usage(argv[0]);
+        trace_stage1_event("process_end", "rc=1 reason=no_command");
+        trace_stage1_close();
         return 1;
     }
 
@@ -483,6 +796,8 @@ int main(int argc, char **argv)
     if (strcmp(cmd, "help") == 0 || strcmp(cmd, "--help") == 0 ||
         strcmp(cmd, "-h") == 0) {
         usage(argv[0]);
+        trace_stage1_event("process_end", "rc=0 reason=help");
+        trace_stage1_close();
         return 0;
     }
 
@@ -495,12 +810,29 @@ int main(int argc, char **argv)
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "-v") == 0)
             verbose = 1;
+        else if (strcmp(argv[i], "--debug") == 0) {
+            setenv("VIR_DEBUG_COMPILER", "1", 1);
+        }
+        else if (strcmp(argv[i], "--json") == 0)
+            g_parser_diag.format = DIAG_FMT_JSON;
         else if (strncmp(argv[i], "--target=", 9) == 0)
             target = argv[i] + 9;
         else if (strcmp(argv[i], "--target") == 0 && i + 1 < argc)
             target = argv[++i];
-        else if (!filepath)
+        else if (strncmp(argv[i], "--report=", 9) == 0) {
+            const char *val = argv[i] + 9;
+            if (val[0] == 'E' || val[0] == 'W') val++;
+            g_parser_diag.report_code = (uint32_t)atoi(val);
+        }
+        else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc) {
+            const char *val = argv[++i];
+            if (val[0] == 'E' || val[0] == 'W') val++;
+            g_parser_diag.report_code = (uint32_t)atoi(val);
+        }
+        else if (!filepath) {
             filepath = argv[i];
+            /* Don't add filepath itself to prog_argv — extra args start after it */
+        }
         else if (prog_argc < 64)
             prog_argv[prog_argc++] = argv[i];
     }
@@ -508,13 +840,26 @@ int main(int argc, char **argv)
     if (!filepath) {
         fprintf(stderr, "error: no input file\n");
         usage(argv[0]);
+        trace_stage1_event("process_end", "rc=1 reason=no_input");
+        trace_stage1_close();
         return 1;
     }
 
     /* Read source file */
     size_t src_len = 0;
+    uint64_t phase_start = trace_now_ms();
+    trace_stage1_event("read_start", "file=%s", filepath);
     char *source = read_source(filepath, &src_len);
-    if (!source) return 1;
+    if (!source) {
+        trace_stage1_event("read_error", "elapsed_phase_ms=%llu file=%s",
+                           (unsigned long long)(trace_now_ms() - phase_start),
+                           filepath);
+        trace_stage1_event("process_end", "rc=1 reason=read_error");
+        trace_stage1_close();
+        return 1;
+    }
+    trace_stage1_event("read_end", "elapsed_phase_ms=%llu bytes=%zu",
+                       (unsigned long long)(trace_now_ms() - phase_start), src_len);
 
     /* §15.3 WASM target — compile source → Q-IR → WASM binary */
     if (strcmp(cmd, "build") == 0 && target &&
@@ -522,36 +867,56 @@ int main(int argc, char **argv)
         const char *outpath = "out.wasm";
 
         /* Step 1: Parse + lower to Q-IR */
-        ast_node_t *ast = frontend(source, src_len, verbose);
-        if (!ast) { free(source); return 1; }
-
-        lower_ctx_t ctx;
-        lower_init(&ctx, "main");
-        include_ctx_t ictx;
-        get_dir(filepath, ictx.base_dir, sizeof(ictx.base_dir));
-        ctx.include_reader    = vir_include_reader;
-        ctx.include_user_data = &ictx;
-
-        if (lower_resolve_includes(&ctx, ast) != 0 ||
-            lower_program(&ctx, ast) != 0) {
-            fprintf(stderr, "lower error: %s\n", ctx.last_error);
-            ast_free(ast); lower_destroy(&ctx); free(source);
+        ast_node_t *ast = frontend(filepath, source, src_len, verbose);
+        if (!ast) {
+            free(source);
+            trace_stage1_event("process_end", "rc=1 reason=wasm_frontend_error");
+            trace_stage1_close();
             return 1;
         }
-        for (uint32_t i = 0; i < ctx.module.func_count; i++)
-            lower_tco_pass(&ctx.module.functions[i], i);
+
+        lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+        if (!ctx) {
+            ast_free(ast); free(source);
+            trace_stage1_event("process_end", "rc=1 reason=wasm_alloc_error");
+            trace_stage1_close();
+            return 1;
+        }
+        lower_init(ctx, "main");
+        include_ctx_t ictx;
+        get_dir(filepath, ictx.base_dir, sizeof(ictx.base_dir));
+        ctx->include_reader    = vir_include_reader;
+        ctx->include_user_data = &ictx;
+
+        if (lower_resolve_includes(ctx, ast) != 0 ||
+            lower_program(ctx, ast) != 0) {
+            if (g_diag_initialized && g_parser_diag.count > 0) {
+                diag_render_all(&g_parser_diag);
+            } else {
+                fprintf(stderr, "lower error: %s\n", ctx->last_error);
+            }
+            ast_free(ast); lower_destroy(ctx); free(ctx); free(source);
+            trace_stage1_event("process_end", "rc=1 reason=wasm_lower_error");
+            trace_stage1_close();
+            return 1;
+        }
+        for (uint32_t i = 0; i < ctx->module.func_count; i++)
+            lower_tco_pass(&ctx->module.functions[i], i);
 
         /* Step 2: Emit WASM binary via codegen */
         uint8_t *wasm_buf = NULL;
         size_t   wasm_len = 0;
-        int wasm_rc = codegen_emit_wasm(&ctx.module, &wasm_buf, &wasm_len);
+        int wasm_rc = codegen_emit_wasm(&ctx->module, &wasm_buf, &wasm_len);
 
         ast_free(ast);
-        lower_destroy(&ctx);
+        lower_destroy(ctx);
+        free(ctx);
 
         if (wasm_rc != 0 || !wasm_buf) {
             fprintf(stderr, "wasm codegen error\n");
             free(source);
+            trace_stage1_event("process_end", "rc=1 reason=wasm_codegen_error");
+            trace_stage1_close();
             return 1;
         }
 
@@ -560,6 +925,8 @@ int main(int argc, char **argv)
         if (!f) {
             fprintf(stderr, "error: cannot write %s\n", outpath);
             free(wasm_buf); free(source);
+            trace_stage1_event("process_end", "rc=1 reason=wasm_write_error");
+            trace_stage1_close();
             return 1;
         }
         fwrite(wasm_buf, 1, wasm_len, f);
@@ -570,6 +937,8 @@ int main(int argc, char **argv)
             fprintf(stderr, "[vir] wrote wasm32 module → %s (%zu bytes)\n",
                     outpath, wasm_len);
         free(source);
+        trace_stage1_event("process_end", "rc=0 reason=wasm_build");
+        trace_stage1_close();
         return 0;
     }
 
@@ -588,5 +957,8 @@ int main(int argc, char **argv)
     }
 
     free(source);
+    trace_stage1_event("process_end", "rc=%d last_phase=%s", rc,
+                       g_stage1_trace.last_phase ? g_stage1_trace.last_phase : "");
+    trace_stage1_close();
     return rc;
 }

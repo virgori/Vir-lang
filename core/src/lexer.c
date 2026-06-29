@@ -10,6 +10,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "diagnostic.h"
+
+extern diag_context_t g_parser_diag;
 
 /* ═══════════════════════════════════════════════════════
  * UTF-8 Helpers
@@ -32,38 +35,6 @@ typedef struct {
 } kw_single_t;
 
 static const kw_single_t kw_singles[] = {
-    /* Vietnamese single-word */
-    {"hàm", TOK_FUNC},
-    {"biến", TOK_VAR},
-    {"hằng", TOK_CONST},
-    {"nếu", TOK_IF},
-    {"lặp", TOK_LOOP},
-    {"thì", TOK_THEN},
-    {"hết", TOK_END},
-    {"nhập", TOK_INPUT},
-    {"đúng", TOK_TRUE},
-    {"sai", TOK_FALSE},
-    {"rỗng", TOK_NONE_LIT},
-    {"cộng", TOK_PLUS},
-    {"trừ", TOK_MINUS},
-    {"nhân", TOK_STAR},
-    {"chia", TOK_SLASH},
-    {"bằng", TOK_EQ},
-    {"khác", TOK_NE},
-    {"và", TOK_AND},
-    {"hoặc", TOK_OR},
-    {"thoát", TOK_BREAK},
-    {"bản_ghi", TOK_RECORD},
-    {"liệt_kê", TOK_ENUM},
-    {"trong", TOK_IN},
-
-    /* Vietnamese module keywords */
-    {"nhập_khẩu", TOK_IMPORT},
-    {"từ", TOK_FROM},
-    {"mô_đun", TOK_MODULE},
-    {"xuất", TOK_EXPORT},
-    {"bao_gồm", TOK_INCLUDE},
-
     /* English */
     {"func", TOK_FUNC},
     {"function", TOK_FUNC},
@@ -129,6 +100,12 @@ static const kw_single_t kw_singles[] = {
     {"xor", TOK_BIT_XOR},
     {"shl", TOK_BIT_SHL},
     {"shr", TOK_BIT_SHR},
+    {"bit_and", TOK_BIT_AND},
+    {"bit_or", TOK_BIT_OR},
+    {"giao_diện", TOK_INTERFACE},
+    {"interface", TOK_INTERFACE},
+    {"thực_hiện", TOK_IMPLEMENT},
+    {"implement", TOK_IMPLEMENT},
     {"in", TOK_IN},
     {"import", TOK_IMPORT},
     {"from", TOK_FROM},
@@ -139,125 +116,7 @@ static const kw_single_t kw_singles[] = {
     {"type", TOK_TYPE_KW},
     {"lock", TOK_LOCK},
 
-    /* §28 CJK keyword aliases — Chinese, Japanese, Korean.
-     * Minimal subset covering core control-flow and declarations. */
-    /* 中文 (Simplified Chinese) */
-    {"函数", TOK_FUNC},
-    {"变量", TOK_VAR},
-    {"常量", TOK_CONST},
-    {"如果", TOK_IF},
-    {"否则", TOK_ELSE},
-    {"循环", TOK_LOOP},
-    {"结束", TOK_END},
-    {"返回", TOK_RETURN},
-    {"真", TOK_TRUE},
-    {"假", TOK_FALSE},
-    {"空", TOK_NONE_LIT},
-    {"打印", TOK_PRINT},
-    {"输入", TOK_INPUT},
-    {"导入", TOK_IMPORT},
-    {"导出", TOK_EXPORT},
-    {"模块", TOK_MODULE},
-    {"包含", TOK_INCLUDE},
-    {"跳出", TOK_BREAK},
-    {"继续", TOK_CONTINUE},
-    {"与", TOK_AND},
-    {"或", TOK_OR},
-    {"非", TOK_NOT},
-    /* 日本語 (Japanese) */
-    {"関数", TOK_FUNC},
-    {"変数", TOK_VAR},
-    {"定数", TOK_CONST},
-    {"もし", TOK_IF},
-    {"他ならば", TOK_ELIF},
-    {"そうでなければ", TOK_ELSE},
-    {"繰り返し", TOK_LOOP},
-    {"終わり", TOK_END},
-    {"戻る", TOK_RETURN},
-    {"出力", TOK_OUT},
-    {"真", TOK_TRUE},
-    {"偽", TOK_FALSE},
-    {"印刷", TOK_PRINT},
-    {"入力", TOK_INPUT},
-    {"読込", TOK_IMPORT},
-    {"書出", TOK_EXPORT},
-    {"モジュール", TOK_MODULE},
-    {"含む", TOK_INCLUDE},
-    {"抜ける", TOK_BREAK},
-    {"続ける", TOK_CONTINUE},
-    {"且つ", TOK_AND},
-    {"又は", TOK_OR},
-    {"否", TOK_NOT},
-
-    /* 한국어 (Korean) */
-    {"함수", TOK_FUNC},
-    {"변수", TOK_VAR},
-    {"상수", TOK_CONST},
-    {"만약", TOK_IF},
-    {"그외만약", TOK_ELIF},
-    {"아니면", TOK_ELSE},
-    {"반복", TOK_LOOP},
-    {"끝", TOK_END},
-    {"반환", TOK_RETURN},
-    {"출력", TOK_OUT},
-    {"참", TOK_TRUE},
-    {"거짓", TOK_FALSE},
-    {"인쇄", TOK_PRINT},
-    {"입력", TOK_INPUT},
-    {"가져오기", TOK_IMPORT},
-    {"내보내기", TOK_EXPORT},
-    {"모듈", TOK_MODULE},
-    {"포함", TOK_INCLUDE},
-    {"탈출", TOK_BREAK},
-    {"계속", TOK_CONTINUE},
-    {"그리고", TOK_AND},
-    {"또는", TOK_OR},
-    {"아님", TOK_NOT},
     {NULL, TOK_EOF}};
-
-/* ═══════════════════════════════════════════════════════
- * Multi-word Keyword Table (Vietnamese)
- * ═══════════════════════════════════════════════════════
- * Two- and three-word Vietnamese keywords.  After reading
- * the first word, we peek ahead to try matching.
- */
-
-typedef struct {
-  const char *w1;
-  const char *w2;
-  const char *w3; /* NULL if two-word */
-  vir_tok_t type;
-} kw_multi_t;
-
-static const kw_multi_t kw_multis[] = {
-    /* 3-word first (greedy match) */
-    {"ta", "có", "hàm", TOK_FUNC},        {"cho", "biến", NULL, TOK_VAR},
-    {"đặt", "biến", NULL, TOK_VAR},       {"ngược", "lại", NULL, TOK_ELSE},
-    {"còn", "nếu", NULL, TOK_ELIF},       {"nếu", "không", NULL, TOK_ELSE},
-    {"trả", "về", NULL, TOK_RETURN},      {"in", "ra", NULL, TOK_PRINT},
-    {"nhập", "vào", NULL, TOK_INPUT},     {"trong", "khi", NULL, TOK_WHILE},
-    {"với", "mỗi", NULL, TOK_FOR},        {"thoát", "vòng", NULL, TOK_BREAK},
-    {"bỏ", "qua", NULL, TOK_CONTINUE},    {"tiếp", "tục", NULL, TOK_CONTINUE},
-    {"máy", "rảnh", NULL, TOK_CHECK_CPU}, {"vá", "mã", NULL, TOK_PATCH},
-    {"lớn", "hơn", NULL, TOK_GT},         {"nhỏ", "hơn", NULL, TOK_LT},
-    {"chia", "dư", NULL, TOK_PERCENT},    {NULL, NULL, NULL, TOK_EOF}};
-
-/* ═══════════════════════════════════════════════════════
- * Vietnamese stop words (ignored during tokenization)
- * ═══════════════════════════════════════════════════════ */
-
-static const char *stop_words[] = {
-    "là",  "nhé",  "giúp", "ơi",  "đi",  "nào",  "được",  "cái", "này", "kia",
-    "đó",  "ấy",   "mà",   "rồi", "vậy", "thôi", "hãy",   "xin", "tôi", "bạn",
-    "của", "cùng", "để",   "ra",  "vào", "lên",  "xuống", NULL};
-
-static int is_stop_word(const char *word) {
-  for (int i = 0; stop_words[i]; i++) {
-    if (strcmp(word, stop_words[i]) == 0)
-      return 1;
-  }
-  return 0;
-}
 
 /* ═══════════════════════════════════════════════════════
  * Lexer Internal Helpers
@@ -437,6 +296,14 @@ int vir_register_multi_keyword(const char *w1, const char *w2, const char *w3,
 static char g_stop_registry[VIR_STOP_REGISTRY_MAX][48];
 static uint32_t g_stop_registry_count = 0;
 
+static int is_stop_word(const char *word) {
+  for (uint32_t i = 0; i < g_stop_registry_count; i++) {
+    if (strcmp(word, g_stop_registry[i]) == 0)
+      return 1;
+  }
+  return 0;
+}
+
 int vir_register_stop_word(const char *word) {
   if (!word)
     return -1;
@@ -507,13 +374,6 @@ static vir_tok_t try_multi_keyword(vir_lexer_t *lex, const char *w1) {
     return (result_type);                                                      \
   } while (0)
 
-  /* Static multi-word table */
-  for (int i = 0; kw_multis[i].w1; i++) {
-    if (strcmp(kw_multis[i].w1, w1) != 0)
-      continue;
-    TRY_MULTI_MATCH(kw_multis[i].w2, kw_multis[i].w3, kw_multis[i].type);
-  }
-
   /* §28.3 Dynamic multi-word registry */
   for (uint32_t i = 0; i < g_multi_registry_count; i++) {
     if (strcmp(g_multi_registry[i].w1, w1) != 0)
@@ -549,7 +409,7 @@ static int lex_number(vir_lexer_t *lex, vir_token_t *tok) {
       buf[n++] = (char)lex_advance(lex);
     buf[n] = '\0';
     tok->int_val = strtoll(buf, NULL, 16);
-    return 0;
+    goto consume_suffix;
   }
 
   /* Octal? (0o755 format) */
@@ -562,7 +422,7 @@ static int lex_number(vir_lexer_t *lex, vir_token_t *tok) {
       buf[n++] = (char)lex_advance(lex);
     buf[n] = '\0';
     tok->int_val = strtoll(buf + 2, NULL, 8); /* skip "0o" prefix */
-    return 0;
+    goto consume_suffix;
   }
 
   while (!lex_eof(lex) &&
@@ -594,6 +454,13 @@ static int lex_number(vir_lexer_t *lex, vir_token_t *tok) {
   } else {
     tok->int_val = strtoll(buf, NULL, 10);
   }
+
+consume_suffix:
+  /* Consume any type suffixes (e.g. _u64, _i32) */
+  while (!lex_eof(lex) && is_word_char(lex_peek(lex))) {
+    lex_advance(lex);
+  }
+
   return 0;
 }
 
@@ -668,8 +535,14 @@ static int lex_string(vir_lexer_t *lex, vir_token_t *tok) {
     }
   }
 
-  if (!lex_eof(lex))
+  if (!lex_eof(lex)) {
     lex_advance(lex); /* consume closing quote */
+  } else {
+    diag_span_t span = diag_span_lc(DIAG_NO_FILE, tok->line, tok->col, n > 0 ? (uint32_t)n : 1);
+    diag_entry_t *e = diag_error(&g_parser_diag, DCAT_SYNTAX, PHASE_LEXER, E0002, span, "Unterminated string literal");
+    diag_add_cause(&g_parser_diag, e, "Missing closing quote for string");
+    diag_add_action(&g_parser_diag, e, "Add the missing quote character at the end of the string");
+  }
   tok->str.buf[n] = '\0';
   tok->str.len = (uint32_t)n;
   return 0;
@@ -863,6 +736,23 @@ int lexer_tokenize(vir_lexer_t *lex) {
       lex_advance(lex);
       lex_push_token(lex, tok);
       continue;
+    }
+    /* :: (double colon) — module path / enum variant separator */
+    if (c == ':' && c2 == ':') {
+      vir_token_t tok = {TOK_LARROW, lex->line, lex->col, {0}};
+      /* Reuse TOK_LARROW slot? No — we need a dedicated token.
+       * Use TOK_COLON twice but as one: emit as the actual variant.
+       * Since header has no TOK_DOUBLE_COLON, store in TOK_HASH slot
+       * which is unused in the VM path and parser handles it.
+       *
+       * Actually: the parser resolves EnumName::Variant via AST_ENUM_ACCESS.
+       * The C-Core parser checks for IDENT COLON COLON IDENT.
+       * So we should leave :: as two COLON tokens — the parser handles it.
+       * But if parser errors on COLON as expression start, we need to
+       * make :: a single token. Add TOK_DOUBLE_COLON = TOK_HASH (112 in Vir).
+       * HOWEVER: the simplest fix is to handle :: in the PARSER not here.
+       * So: emit two COLON tokens as before (do nothing here). */
+      (void)tok; /* suppress warning */
     }
     /* v1.2: :~ (pattern match) */
     if (c == ':' && c2 == '~') {
@@ -1078,7 +968,11 @@ int lexer_tokenize(vir_lexer_t *lex) {
       continue;
     }
 
-    /* unknown character — skip */
+    /* unknown character — emit error */
+    diag_span_t span = diag_span_lc(DIAG_NO_FILE, lex->line, lex->col, 1);
+    diag_entry_t *e = diag_error(&g_parser_diag, DCAT_SYNTAX, PHASE_LEXER, E0001, span, "Invalid character encountered");
+    diag_add_cause(&g_parser_diag, e, "Character is not supported by the language syntax");
+    diag_add_action(&g_parser_diag, e, "Remove or replace the character");
     lex_advance(lex);
   }
 
