@@ -53,6 +53,15 @@ void hir_free_node(hir_node_t* node) {
         case HIR_STORE:
             if (node->as.store.value) hir_free_node(node->as.store.value);
             break;
+        case HIR_BINOP:
+            if (node->as.binop.left) hir_free_node(node->as.binop.left);
+            if (node->as.binop.right) hir_free_node(node->as.binop.right);
+            break;
+        case HIR_VAR_DECL:
+            if (node->as.var_decl.init_value) hir_free_node(node->as.var_decl.init_value);
+            break;
+        case HIR_BREAK:
+        case HIR_CONTINUE:
         case HIR_CONST:
         case HIR_LOAD:
             break; // No children to free

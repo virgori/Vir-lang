@@ -1654,6 +1654,9 @@ static ast_node_t *parse_case_stmt(vir_parser_t *p)
                 }
             }
             if (match(p, TOK_LPAREN)) {
+                if (check(p, TOK_IDENT)) {
+                    strncpy(arm->name2, peek(p)->str.buf, AST_NAME_LEN - 1);
+                }
                 int depth = 1;
                 while (!check(p, TOK_EOF) && depth > 0) {
                     if (check(p, TOK_LPAREN)) depth++;

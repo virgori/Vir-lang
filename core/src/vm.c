@@ -544,6 +544,12 @@ static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
     int64_t r1 = ctx->args[1], r2 = ctx->args[2], r3 = ctx->args[3];
     int64_t r4 = ctx->args[4], r5 = ctx->args[5];
     int64_t result = -1;
+    if (s == 4) {
+        /* write() — trace buf content */
+        fprintf(stderr, "[WRITE] fd=%lld buf=%p len=%lld content=", r1, (void*)(uintptr_t)r2, r3);
+        if (r2 && r3 > 0 && r3 < 200) fwrite((void*)(uintptr_t)r2, 1, (size_t)r3, stderr);
+        fprintf(stderr, "\n");
+    }
     switch (s) {
     case 1:   exit((int)r1);                                                    break;
     case 3:   result = read((int)r1, (void *)(uintptr_t)r2, (size_t)r3);      break;
@@ -563,6 +569,7 @@ static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
     *ctx->ret = result;
 }
 
+
 static void intr_sys_read(vir_intrinsic_ctx_t *ctx) {
     *ctx->ret = (int64_t)read((int)ctx->args[0],
                               (void *)(uintptr_t)ctx->args[1],
@@ -570,6 +577,11 @@ static void intr_sys_read(vir_intrinsic_ctx_t *ctx) {
 }
 
 static void intr_sys_write(vir_intrinsic_ctx_t *ctx) {
+    int fd = (int)ctx->args[0];
+    char *buf = (char *)(uintptr_t)ctx->args[1];
+    int len = (int)ctx->args[2];
+    printf("[SYS_WRITE] fd=%d, buf=%p, len=%d\n", fd, buf, len);
+
     *ctx->ret = (int64_t)write((int)ctx->args[0],
                                (const void *)(uintptr_t)ctx->args[1],
                                (size_t)ctx->args[2]);
@@ -579,6 +591,10 @@ static void intr_sys_open(vir_intrinsic_ctx_t *ctx) {
     *ctx->ret = (int64_t)open((const char *)(uintptr_t)ctx->args[0],
                               (int)ctx->args[1],
                               (mode_t)ctx->args[2]);
+    if (*ctx->ret < 0) {
+        perror("sys_open failed");
+        fprintf(stderr, "Failed path: %s\n", (const char *)(uintptr_t)ctx->args[0]);
+    }
 }
 
 static void intr_sys_close(vir_intrinsic_ctx_t *ctx) {
@@ -809,6 +825,12 @@ static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
     vm->func_depth++;
     memset(vm->pending_ref_bindings, 0, sizeof(vm->pending_ref_bindings));
 
+    /* Debug trace for rt_strlen and print_str */
+    if (strcmp(callee->name, "rt_strlen") == 0 || strcmp(callee->name, "print_str") == 0) {
+        fprintf(stderr, "[CALL %s] R0=%lld R16=%lld nregs=%u\n",
+                callee->name, (long long)vm->regs[0], (long long)vm->regs[16], nregs);
+    }
+
     for (uint32_t pi = 0; pi < callee->param_count && pi < Q_MAX_PARAMS; pi++) {
         vm->regs[callee->param_vregs[pi]] = vm->regs[pi];
     }
@@ -818,6 +840,7 @@ static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
     vm_resolve_labels(vm, callee);
     return VM_OK;
 }
+
 
 static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
 {
@@ -1205,6 +1228,24 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         if (ptr) ptr[off] = (uint8_t)val;
         break;
     }
+    case Q_MEM_COPY: {
+        int64_t dst = operand_value(vm, &instr->dest);
+        int64_t src = operand_value(vm, &instr->src1);
+        int64_t len = operand_value(vm, &instr->src2);
+        if (dst && src && len > 0) {
+            memcpy((void *)(intptr_t)dst, (const void *)(intptr_t)src, (size_t)len);
+        }
+        break;
+    }
+    case Q_MEM_SET: {
+        int64_t dst = operand_value(vm, &instr->dest);
+        int64_t val = operand_value(vm, &instr->src1);
+        int64_t len = operand_value(vm, &instr->src2);
+        if (dst && len > 0) {
+            memset((void *)(intptr_t)dst, (int)val, (size_t)len);
+        }
+        break;
+    }
     case Q_LOAD_WORD: {
         int64_t base = operand_value(vm, &instr->src1);
         int64_t idx  = operand_value(vm, &instr->src2);
@@ -1221,7 +1262,11 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
                 break;
             }
             int64_t *ptr = (int64_t *)((char *)(intptr_t)base + idx);
-            set_dest(vm, &instr->dest, ptr ? *ptr : 0);
+            int64_t v = ptr ? *ptr : 0;
+            if (ptr) {
+
+            }
+            set_dest(vm, &instr->dest, v);
         }
         break;
     }
@@ -1240,7 +1285,10 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
                 break;  /* silently ignore write to null/invalid ptr */
             }
             int64_t *ptr = (int64_t *)((char *)(intptr_t)base + idx);
-            if (ptr) *ptr = val;
+            if (ptr) {
+                *ptr = val;
+
+            }
         }
         break;
     }
@@ -1476,7 +1524,8 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     }
     case Q_PRINT_STR: {
         const char *s = (const char *)(intptr_t)operand_value(vm, &instr->src1);
-        if (s) fputs(s, stdout);
+        fprintf(stderr, "[Q_PRINT_STR] s=%p val='%s'\n", s, s ? s : "(null)");
+        if (s) { fputs(s, stdout); fflush(stdout); }
         break;
     }
     case Q_GET_ARG: {
@@ -2080,6 +2129,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     }
 
     default:
+        fprintf(stderr, "FATAL: BAD OPCODE %d at ip=%d func=%d\n", instr->opcode, vm->ip, (int)(vm->current_func - vm->module->functions));
         return VM_ERR_BAD_OP;
     }
 

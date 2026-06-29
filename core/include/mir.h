@@ -8,6 +8,7 @@
 extern "C" {
 #endif
 
+
 typedef enum {
     MIR_NOP,
     MIR_MOVE,
@@ -23,6 +24,16 @@ typedef enum {
     MIR_JUMP_IF,
     MIR_RETURN
 } mir_op_t;
+
+typedef struct {
+    int has_side_effect;
+    int may_read_memory;
+    int may_write_memory;
+    int is_terminator;
+} mir_opcode_info_t;
+
+mir_opcode_info_t mir_get_opcode_info(mir_op_t op);
+
 
 typedef enum {
     MIR_OPND_NONE,
@@ -48,14 +59,50 @@ typedef struct mir_instr {
     struct mir_instr* next;
 } mir_instr_t;
 
+typedef struct mir_phi {
+    uint32_t dst_vreg;
+    uint32_t orig_vreg; // To track the original variable during renaming
+    mir_operand_t* incoming_values;
+    struct mir_block** incoming_blocks;
+    uint32_t incoming_count;
+    struct mir_phi* next;
+} mir_phi_t;
+
+typedef struct mir_use {
+    struct mir_instr* instr; // The instruction where the use happens
+    struct mir_phi* phi;     // Or the phi node where the use happens
+    uint8_t opnd_idx;        // 1 for src1, 2 for src2, or index in phi incoming_values
+    struct mir_use* next;
+} mir_use_t;
+
 typedef struct mir_block {
     uint32_t id;
+    
+    // SSA Phi nodes
+    mir_phi_t* phis;
+    
     mir_instr_t* head;
     mir_instr_t* tail;
     
-    // CFG edges
+    // CFG edges (Successors)
     struct mir_block* succ_true;
     struct mir_block* succ_false;
+    
+    // CFG edges (Predecessors)
+    struct mir_block** preds;
+    uint32_t pred_count;
+    uint32_t pred_capacity;
+    
+    // Dominator Tree
+    struct mir_block* idom; // Immediate dominator
+    struct mir_block** dom_children;
+    uint32_t dom_child_count;
+    uint32_t dom_child_capacity;
+    
+    // Dominance Frontier
+    struct mir_block** df;
+    uint32_t df_count;
+    uint32_t df_capacity;
     
     struct mir_block* next_block; // For linked list of blocks in a function
 } mir_block_t;
@@ -63,6 +110,7 @@ typedef struct mir_block {
 typedef struct {
     uint32_t id;
     uint32_t next_vreg;
+    mir_use_t** def_uses; // Array of size next_vreg + 1
     uint32_t next_block_id;
     mir_block_t* entry_block;
     mir_block_t* blocks;

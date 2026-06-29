@@ -102,7 +102,7 @@ void lower_init(lower_ctx_t *ctx, const char *module_name) {
 extern diag_context_t g_parser_diag;
 extern int g_diag_initialized;
 
-static void lower_error(lower_ctx_t *ctx, const ast_node_t *node, const char *msg) {
+static diag_entry_t *lower_error(lower_ctx_t *ctx, const ast_node_t *node, const char *msg) {
   if (node) {
       snprintf(ctx->last_error, sizeof(ctx->last_error), "[Line %u] %s", node->line, msg);
   } else {
@@ -116,10 +116,50 @@ static void lower_error(lower_ctx_t *ctx, const ast_node_t *node, const char *ms
   }
 
   uint32_t code = E3001; // default to unsupported
-  if (strstr(msg, "undefined variable") != NULL || strstr(msg, "undefined function") != NULL) code = E3002;
-  else if (strstr(msg, "type mismatch") != NULL || strstr(msg, "invalid call") != NULL || strstr(msg, "invalid lowering target") != NULL) code = E3003;
-  else if (strstr(msg, "invariant violation") != NULL) code = E9001;
-  else if (strstr(msg, "unsupported AST node") != NULL) code = E3001;
+  diag_phase_t phase = PHASE_IR_LOWER;
+  diag_category_t cat = DCAT_LOWERING;
+
+  if (strstr(msg, "undefined variable") != NULL || strstr(msg, "undefined:") != NULL || strstr(msg, "undefined port") != NULL) {
+    code = E2001;
+    phase = PHASE_SEMA;
+    cat = DCAT_SEMANTIC;
+  } else if (strstr(msg, "undefined function") != NULL) {
+    code = E2002;
+    phase = PHASE_SEMA;
+    cat = DCAT_SEMANTIC;
+  } else if (strstr(msg, "type mismatch") != NULL || strstr(msg, "needs ") != NULL || strstr(msg, "requires ") != NULL || strstr(msg, "without ") != NULL) {
+    code = E2003;
+    phase = PHASE_SEMA;
+    cat = DCAT_SEMANTIC;
+  } else if (strstr(msg, "invalid call") != NULL) {
+    code = E3003;
+    phase = PHASE_IR_LOWER;
+    cat = DCAT_LOWERING;
+  } else if (strstr(msg, "invalid lowering target") != NULL) {
+    code = E3002;
+    phase = PHASE_IR_LOWER;
+    cat = DCAT_LOWERING;
+  } else if (strstr(msg, "of moved value") != NULL) {
+    code = E8001;
+    phase = PHASE_BORROW;
+    cat = DCAT_OWNERSHIP;
+  } else if (strstr(msg, "cannot borrow") != NULL) {
+    code = E8002;
+    phase = PHASE_BORROW;
+    cat = DCAT_OWNERSHIP;
+  } else if (strstr(msg, "module not found") != NULL) {
+    code = E7001;
+    phase = PHASE_SEMA;
+    cat = DCAT_MODULE;
+  } else if (strstr(msg, "invariant violation") != NULL || strstr(msg, "out of memory") != NULL) {
+    code = E9001;
+    phase = PHASE_IR_LOWER;
+    cat = DCAT_INTERNAL;
+  } else if (strstr(msg, "unsupported") != NULL) {
+    code = E3001;
+    phase = PHASE_IR_LOWER;
+    cat = DCAT_LOWERING;
+  }
 
   diag_span_t span = DIAG_SPAN_EMPTY;
   if (node) {
@@ -127,10 +167,46 @@ static void lower_error(lower_ctx_t *ctx, const ast_node_t *node, const char *ms
   }
 
   if (code == E9001) {
-    diag_ice_phase(&g_parser_diag, PHASE_IR_LOWER, code, ctx->last_error);
+    diag_ice_phase(&g_parser_diag, phase, code, ctx->last_error);
   } else {
-    diag_error(&g_parser_diag, DCAT_LOWERING, PHASE_IR_LOWER, code, span, ctx->last_error); fprintf(stderr, "DEBUG_ERROR: node type=%d name=%s line=%u\n", node ? node->type : -1, node && node->name ? node->name : "null", node ? node->line : 0);
+    diag_entry_t *e = diag_error(&g_parser_diag, cat, phase, code, span, ctx->last_error);
+    if (getenv("VIR_DEBUG_COMPILER")) {
+      fprintf(stderr, "DEBUG_ERROR: node type=%d name=%s line=%u\n", node ? (int)node->type : -1, node && node->name ? node->name : "null", node ? node->line : 0);
+    }
+    
+    if (e && (code == E2001 || code == E2002)) {
+      if (code == E2002) {
+        diag_set_analysis(&g_parser_diag, e, diag_str_ptr(&g_parser_diag, diag_intern_fmt(&g_parser_diag, "The compiler could not resolve the function `%s` in the current scope.", node && node->name ? node->name : "unknown")));
+      } else {
+        diag_set_analysis(&g_parser_diag, e, diag_str_ptr(&g_parser_diag, diag_intern_fmt(&g_parser_diag, "The compiler could not resolve the variable `%s` in the current scope.", node && node->name ? node->name : "unknown")));
+      }
+      diag_add_cause(&g_parser_diag, e, "Function or variable was not declared");
+      diag_add_cause(&g_parser_diag, e, "Module was not imported");
+      diag_add_cause(&g_parser_diag, e, "Symbol name contains a typo");
+      diag_add_action(&g_parser_diag, e, "Check function and variable declarations");
+      diag_add_action(&g_parser_diag, e, "Check imports");
+      diag_add_action(&g_parser_diag, e, "Check symbol spelling");
+    } else if (e && code == E2003) {
+      diag_add_cause(&g_parser_diag, e, "Expression was not provided with expected operands or arguments");
+      diag_add_action(&g_parser_diag, e, "Provide the correct number of arguments or operands");
+    } else if (e && code == E3001) {
+      diag_add_cause(&g_parser_diag, e, "The compiler IR lowering phase does not yet support this language feature");
+      diag_add_action(&g_parser_diag, e, "Avoid using this syntax until it is fully supported by the compiler backend");
+    } else if (e && code == E8001) {
+      diag_set_analysis(&g_parser_diag, e, diag_str_ptr(&g_parser_diag, diag_intern_fmt(&g_parser_diag, "The value `%s` was used after it had already been moved.", node && node->name ? node->name : "unknown")));
+      diag_add_cause(&g_parser_diag, e, "Value was assigned to another variable without cloning");
+      diag_add_cause(&g_parser_diag, e, "Value was passed to a function that consumes it");
+      diag_add_action(&g_parser_diag, e, "Pass by reference (borrow) instead of moving");
+      diag_add_action(&g_parser_diag, e, "Clone the value if you need multiple owned copies");
+    } else if (e && code == E8002) {
+      diag_set_analysis(&g_parser_diag, e, diag_str_ptr(&g_parser_diag, diag_intern_fmt(&g_parser_diag, "Conflicting borrows detected for `%s`.", node && node->name ? node->name : "unknown")));
+      diag_add_cause(&g_parser_diag, e, "Multiple mutable borrows of the same value in scope");
+      diag_add_cause(&g_parser_diag, e, "Mutable borrow while shared borrows exist");
+      diag_add_action(&g_parser_diag, e, "Ensure previous borrows end before creating a new one");
+    }
+    return e;
   }
+  return NULL;
 }
 
 static int is_soft_value_name(const char *name) {
@@ -274,6 +350,13 @@ static uint32_t fresh_vreg(lower_ctx_t *ctx) {
  * Returns: 0 = found local, 1 = found global, -1 = not found
  * If found, *idx contains vreg (local) or global_index (global) */
 static int sym_lookup_both(lower_ctx_t *ctx, const char *name, uint32_t *idx) {
+  if (strcmp(name, "STDOUT_FD") == 0) {
+    for(int i=0; i<ctx->global_symbols.count; i++) {
+      if (strcmp(ctx->global_symbols.entries[i].name, "STDOUT_FD") == 0 || strcmp(ctx->global_symbols.entries[i].name, "STDIN_FD") == 0) {
+        printf("DEBUG SYMLOOKUP STDOUT_FD: found %s at vreg=%d\n", ctx->global_symbols.entries[i].name, ctx->global_symbols.entries[i].vreg);
+      }
+    }
+  }
   if (sym_lookup(&ctx->symbols, name, idx) == 0)
     return 0; /* local */
   if (ctx->current_func) {
@@ -466,6 +549,7 @@ static void ownership_mark_moved_if_id(lower_ctx_t *ctx,
     return;
   if (ent->is_move_type) {
     ent->is_moved = 1;
+    ent->moved_at_line = src->line;
   }
 }
 
@@ -1159,7 +1243,10 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       if (lowering_strict_ownership() && ent && ent->is_moved) {
         char buf[128];
         snprintf(buf, sizeof(buf), "use of moved value: '%s'", expr->name);
-        lower_error(ctx, expr, buf);
+        diag_entry_t *e = lower_error(ctx, expr, buf);
+        if (e && ent->moved_at_line > 0) {
+          diag_add_related_span(&g_parser_diag, e, diag_span_lc(DIAG_NO_FILE, ent->moved_at_line, 1, 1), "value was moved here");
+        }
         return -1;
       }
     }
@@ -1442,7 +1529,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       /* §7: Record/entity construction via parens —
        * `TypeName(field: val, ...)` desugars to record literal. */
       {
-        record_type_t *rt = find_record_type(ctx, expr->name);
+        record_type_t *rt = find_record_type(ctx, expr->name); if (strcmp(expr->name, "VirFile") == 0) { printf("AST_RECORD_LITERAL VirFile: child_count=%d, rt->field_count=%d\n", expr->child_count, rt ? rt->field_count : -1); }
         if (rt) {
           /* Allocate field_count * 8 bytes */
           uint32_t sz_r = fresh_vreg(ctx);
@@ -1701,6 +1788,13 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       }
       nargs = tgt->param_count;
     } else {
+      q_function_t *tgt = &ctx->module.functions[fidx];
+      if (nargs != tgt->param_count) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "invalid call: expected %u arguments, got %u", tgt->param_count, nargs);
+        lower_error(ctx, expr, buf);
+        return -1;
+      }
       for (uint32_t i = 0; i < nargs && i < Q_MAX_PARAMS; i++) {
         int av = lower_expr(ctx, expr->children[i]);
         if (av < 0)
@@ -2063,7 +2157,10 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
           ent->is_moved) {
         char buf[128];
         snprintf(buf, sizeof(buf), "use of moved value: '%s'", expr->name);
-        lower_error(ctx, expr, buf);
+        diag_entry_t *e = lower_error(ctx, expr, buf);
+        if (e && ent->moved_at_line > 0) {
+          diag_add_related_span(&g_parser_diag, e, diag_span_lc(DIAG_NO_FILE, ent->moved_at_line, 1, 1), "value was moved here");
+        }
         return -1;
       }
       if (arr_scope == 1) {
@@ -2557,7 +2654,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
      * Each field is stored as an int64_t word.
      * name = record type name, children = field values
      * children[i]->name2 = field name */
-    record_type_t *rt = find_record_type(ctx, expr->name);
+    record_type_t *rt = find_record_type(ctx, expr->name); if (strcmp(expr->name, "VirFile") == 0) { printf("AST_RECORD_LITERAL VirFile: child_count=%d, rt->field_count=%d\n", expr->child_count, rt ? rt->field_count : -1); }
     if (!rt) {
       if (expr->name[0] == '\0') {
         uint32_t sz_r = fresh_vreg(ctx);
@@ -2958,7 +3055,10 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       if (ent->is_moved) {
         char buf[128];
         snprintf(buf, sizeof(buf), "borrow of moved value: '%s'", tgt->name);
-        lower_error(ctx, expr, buf);
+        diag_entry_t *e = lower_error(ctx, expr, buf);
+        if (e && ent->moved_at_line > 0) {
+          diag_add_related_span(&g_parser_diag, e, diag_span_lc(DIAG_NO_FILE, ent->moved_at_line, 1, 1), "value was moved here");
+        }
         return -1;
       }
       if (is_mut) {
@@ -2968,17 +3068,24 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
                    "cannot borrow '%s' as mutable: already "
                    "borrowed as shared",
                    tgt->name);
-          lower_error(ctx, expr, buf);
+          diag_entry_t *e = lower_error(ctx, expr, buf);
+          if (e && ent->borrowed_at_line > 0) {
+            diag_add_related_span(&g_parser_diag, e, diag_span_lc(DIAG_NO_FILE, ent->borrowed_at_line, 1, 1), "first borrow occurs here");
+          }
           return -1;
         }
         if (ent->borrow_mut_count > 0) {
           char buf[160];
           snprintf(buf, sizeof(buf),
                    "cannot borrow '%s' as mutable more than once", tgt->name);
-          lower_error(ctx, expr, buf);
+          diag_entry_t *e = lower_error(ctx, expr, buf);
+          if (e && ent->borrowed_at_line > 0) {
+            diag_add_related_span(&g_parser_diag, e, diag_span_lc(DIAG_NO_FILE, ent->borrowed_at_line, 1, 1), "first mutable borrow occurs here");
+          }
           return -1;
         }
         ent->borrow_mut_count++;
+        ent->borrowed_at_line = tgt->line;
       } else {
         if (ent->borrow_mut_count > 0) {
           char buf[160];
@@ -2986,10 +3093,14 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
                    "cannot borrow '%s' as shared: already "
                    "borrowed as mutable",
                    tgt->name);
-          lower_error(ctx, expr, buf);
+          diag_entry_t *e = lower_error(ctx, expr, buf);
+          if (e && ent->borrowed_at_line > 0) {
+            diag_add_related_span(&g_parser_diag, e, diag_span_lc(DIAG_NO_FILE, ent->borrowed_at_line, 1, 1), "first mutable borrow occurs here");
+          }
           return -1;
         }
         ent->borrow_shared_count++;
+        ent->borrowed_at_line = tgt->line;
       }
       /* §4.8 NLL: record the transient increment so it can either
        * be claimed by a binder (var_decl / assign) or released at
@@ -3462,6 +3573,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
           if (src_ent && src_ent->is_move_type) {
             new_ent->is_move_type = 1;
             src_ent->is_moved = 1;
+            src_ent->moved_at_line = init->line;
           }
         }
         /* §4.8 NLL: if RHS is &expr or &mut expr, claim the
@@ -3556,6 +3668,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
         sym_lookup_entry_both(ctx, u->name, &src_ent, NULL);
         if (src_ent && src_ent->is_move_type) {
           src_ent->is_moved = 1;
+          src_ent->moved_at_line = rhs->line;
           if (lhs_ent)
             lhs_ent->is_move_type = 1;
         }
@@ -4741,7 +4854,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
 int lower_func_def(lower_ctx_t *ctx, const ast_node_t *func_def) {
   if (!func_def || func_def->type != AST_FUNC_DEF)
     return -1;
-  fprintf(stderr, "[DEBUG] LOWERING FUNC: %s\\n", func_def->name);
+
 
   q_function_t *func = q_module_add_func(&ctx->module, func_def->name);
   if (!func)
@@ -4937,7 +5050,6 @@ static int lower_global_var(lower_ctx_t *ctx, const ast_node_t *stmt) {
 
   /* Assign next global index */
   uint32_t gidx = ctx->global_index_counter++;
-  printf("[DEBUG] REGISTERING GLOBAL: %s\n", stmt->name);
   sym_define(&ctx->global_symbols, stmt->name, gidx, VIR_TYPE_I64);
 
   symbol_entry_t *gent = NULL;
@@ -5164,6 +5276,29 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
  *   - ctx->module.name    from `module NAME`
  */
 
+static int is_module_known(const ast_node_t *program, const char *module_name) {
+  for (uint32_t i = 0; i < program->child_count; i++) {
+    const ast_node_t *c = program->children[i];
+    if (c && c->type == AST_MODULE && strcmp(c->name, module_name) == 0) {
+      return 1;
+    }
+  }
+  for (uint32_t i = 0; i < g_parser_diag.file_count; i++) {
+    if (!g_parser_diag.files[i].active) continue;
+    const char *fn = g_parser_diag.files[i].filename;
+    if (!fn) continue;
+    const char *last_slash = strrchr(fn, '/');
+    const char *base = last_slash ? (last_slash + 1) : fn;
+    size_t name_len = strlen(module_name);
+    if (strncmp(base, module_name, name_len) == 0) {
+      if (base[name_len] == '\0' || strcmp(base + name_len, ".vri") == 0) {
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 int lower_process_imports(lower_ctx_t *ctx, const ast_node_t *program) {
   if (!program || program->type != AST_PROGRAM)
     return -1;
@@ -5178,6 +5313,17 @@ int lower_process_imports(lower_ctx_t *ctx, const ast_node_t *program) {
       strncpy(ctx->module.name, child->name, sizeof(ctx->module.name) - 1);
     } else if (child->type == AST_IMPORT && child->child_count == 0) {
       /* `import X` or `import X as Y` */
+      if (!is_module_known(program, child->name)) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "module not found: '%s'", child->name);
+        diag_entry_t *e = lower_error(ctx, child, buf);
+        if (e) {
+          diag_add_cause(&g_parser_diag, e, "Module file is missing or not included");
+          diag_add_action(&g_parser_diag, e, "Ensure the module is in VIR_STDLIB or the correct path");
+          diag_add_action(&g_parser_diag, e, "Check for typos in the module name");
+        }
+        return -1;
+      }
       if (ctx->module_alias_count < MODULE_ALIAS_MAX) {
         uint32_t idx = ctx->module_alias_count++;
         strncpy(ctx->module_aliases[idx].original, child->name,
@@ -5192,6 +5338,17 @@ int lower_process_imports(lower_ctx_t *ctx, const ast_node_t *program) {
       }
     } else if (child->type == AST_IMPORT && child->child_count > 0) {
       /* `from X import sym1, sym2, ...` */
+      if (!is_module_known(program, child->name)) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "module not found: '%s'", child->name);
+        diag_entry_t *e = lower_error(ctx, child, buf);
+        if (e) {
+          diag_add_cause(&g_parser_diag, e, "Module file is missing or not included");
+          diag_add_action(&g_parser_diag, e, "Ensure the module is in VIR_STDLIB or the correct path");
+          diag_add_action(&g_parser_diag, e, "Check for typos in the module name");
+        }
+        return -1;
+      }
       for (uint32_t j = 0; j < child->child_count; j++) {
         const ast_node_t *sym = child->children[j];
         if (!sym || sym->type != AST_IDENTIFIER)
@@ -5215,7 +5372,9 @@ int lower_program(lower_ctx_t *ctx, const ast_node_t *program) {
     return -1;
 
   /* Process module metadata (import/export/module declarations) */
-  lower_process_imports(ctx, program);
+  if (lower_process_imports(ctx, program) < 0) {
+    return -1;
+  }
 
   int has_main_func = 0;
   int has_top_stmt = 0;

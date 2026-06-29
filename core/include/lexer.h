@@ -97,6 +97,7 @@ typedef enum {
 
   /* ── Type alias (v1.2) ────────────────────────────── */
   TOK_TYPE_KW, /* type (v1.2 type alias decl)  */
+  TOK_PACKED,  /* packed (v2 experimental)     */
 
   /* ── Data structures ───────────────────────────────── */
   TOK_MAP_KW, /* map keyword (v1.2)           */
@@ -158,6 +159,9 @@ typedef enum {
   TOK_MINUS_ASSIGN, /* -=                            */
   TOK_STAR_ASSIGN,  /* *=                            */
   TOK_SLASH_ASSIGN, /* /=                            */
+
+  TOK_INTERFACE, /* giao_diện, interface          */
+  TOK_IMPLEMENT, /* thực_hiện, implement          */
 
   /* ── Delimiters ────────────────────────────────────── */
   TOK_LPAREN,    /* (                            */

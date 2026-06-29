@@ -81,6 +81,8 @@ typedef enum {
   AST_SKIP,          /* skip (v1.2 continue) */
   AST_EIF,           /* eif (v1.2 else-if) */
   AST_WHEN_LOOP,     /* when cond loop ... end */
+  AST_INTERFACE_DEF, /* giao_diện Name ... end */
+  AST_IMPLEMENT_STMT, /* thực_hiện Name for Type; */
   AST_CASE,          /* case expr val: action; ... end */
   AST_MAP_LITERAL,   /* map key: val; ... end */
   AST_TRY_ERROR,     /* out expr try fallback error Name end */
@@ -266,9 +268,18 @@ typedef enum {
    * vir_intr_table[id].fn(&ctx) in the VM instead of a dedicated opcode. */
   BUILTIN_SYSCALL,     /* __syscall(num, a1..a6) → raw OS syscall */
   BUILTIN_MEMCPY,      /* __memcpy(dst, src, len) → dst ptr       */
+  BUILTIN_CAST_PTR,    /* cast_ptr(p) -> p */
   BUILTIN_MEMSET,      /* __memset(dst, val, len) → dst ptr       */
   BUILTIN_TRAP,        /* __trap() → abort (never returns)        */
   BUILTIN_UNREACHABLE, /* __unreachable() → UB hint / trap        */
+  BUILTIN_CLZ,         /* __clz(n) → count leading zeros          */
+  BUILTIN_CTZ,         /* __ctz(n) → count trailing zeros         */
+  BUILTIN_POPCNT,      /* __popcnt(n) → popcount                  */
+  BUILTIN_BSWAP,       /* __bswap(n) → byte swap                  */
+  BUILTIN_ATOMIC_LOAD, /* __atomic_load(addr)                     */
+  BUILTIN_ATOMIC_STORE,/* __atomic_store(addr, val)               */
+  BUILTIN_ATOMIC_ADD,  /* __atomic_add(addr, val)                 */
+  BUILTIN_ATOMIC_SUB,  /* __atomic_sub(addr, val)                 */
 } builtin_id_t;
 
 /* Forward declaration */
@@ -400,6 +411,9 @@ typedef struct {
    * or the enclosing function exits. */
   uint8_t borrow_kind; /* 0=none, 1=shared, 2=mut          */
   char borrow_of_name[AST_NAME_LEN];
+  /* Ownership diagnostic tracking */
+  uint32_t moved_at_line;      /* Line where the value was moved */
+  uint32_t borrowed_at_line;   /* Line where the value was borrowed */
   /* §20 Dict binding: if the symbol holds a dict handle, set flag +
    * key_is_str (1 = string keys, 0 = int keys).  Distinguishes
    * m[k] from arr[i] at lowering time. */
