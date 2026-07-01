@@ -186,7 +186,7 @@ int codegen_emit_full(codebuf_t *cb, const q_instruction_t *instrs,
  * Use codegen_rt_init() to populate from the intrinsic table.
  */
 
-#define CG_RT_MAX_FUNCS 256
+#define CG_RT_MAX_FUNCS 8192
 
 typedef struct {
     /* Intrinsic function addresses (indexed by intrinsic_id_t) */
@@ -206,6 +206,11 @@ typedef struct {
     /* Function entry points (filled by codegen for CALL_FUNC) */
     size_t func_offsets[CG_RT_MAX_FUNCS];
     uint32_t func_count;
+
+    /* Patches for Q_CALL_FUNC */
+    size_t call_patch_offsets[65536];
+    uint32_t call_target_funcs[65536];
+    uint32_t call_patch_count;
 } codegen_rt_t;
 
 /* Initialize runtime from intrinsic table */
