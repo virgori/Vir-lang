@@ -28,6 +28,8 @@ static lir_op_t map_mir_op(mir_op_t m) {
         case MIR_LOAD:
         case MIR_STORE:
             return LIR_MOV;
+        case MIR_LOAD_STRING:
+            return LIR_LOAD_STRING;
         case MIR_ADD:
             return LIR_ADD;
         case MIR_SUB:

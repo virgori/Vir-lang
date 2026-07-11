@@ -195,14 +195,16 @@ static hir_node_t* lower_node(hir_lower_ctx_t* ctx, const ast_node_t* ast) {
         }
         case AST_CALL: {
             hir = hir_create_node(HIR_CALL, 0);
-            if (ast->child_count > 0) {
-                hir->as.call.callee = lower_node(ctx, ast->children[0]);
-                hir->as.call.argc = ast->child_count - 1;
-                if (hir->as.call.argc > 0) {
-                    hir->as.call.args = (hir_node_t**)malloc(hir->as.call.argc * sizeof(hir_node_t*));
-                    for (uint32_t i = 0; i < hir->as.call.argc; i++) {
-                        hir->as.call.args[i] = lower_node(ctx, ast->children[i + 1]);
-                    }
+            strncpy(hir->as.call.callee_name, ast->name,
+                    sizeof(hir->as.call.callee_name) - 1);
+            hir->as.call.callee_name[sizeof(hir->as.call.callee_name) - 1] =
+                '\0';
+            hir->as.call.argc = ast->child_count;
+            if (hir->as.call.argc > 0) {
+                hir->as.call.args =
+                    (hir_node_t **)malloc(hir->as.call.argc * sizeof(hir_node_t *));
+                for (uint32_t i = 0; i < hir->as.call.argc; i++) {
+                    hir->as.call.args[i] = lower_node(ctx, ast->children[i]);
                 }
             }
             break;
@@ -221,7 +223,11 @@ static hir_node_t* lower_node(hir_lower_ctx_t* ctx, const ast_node_t* ast) {
         }
         case AST_LITERAL_STR: {
             hir = hir_create_node(HIR_CONST, 0);
-            hir->as.constant.value = (int64_t)ast->int_val;
+            hir->as.constant.is_string = 1;
+            strncpy(hir->as.constant.str_value, ast->name,
+                    sizeof(hir->as.constant.str_value) - 1);
+            hir->as.constant.str_value[sizeof(hir->as.constant.str_value) - 1] =
+                '\0';
             break;
         }
         case AST_INPUT: {

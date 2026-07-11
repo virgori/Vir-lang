@@ -25,7 +25,6 @@ void hir_free_node(hir_node_t* node) {
             }
             break;
         case HIR_CALL:
-            if (node->as.call.callee) hir_free_node(node->as.call.callee);
             if (node->as.call.args) {
                 for (uint32_t i = 0; i < node->as.call.argc; i++) {
                     hir_free_node(node->as.call.args[i]);
