@@ -82,18 +82,16 @@ lir_func_t *lower_mir_to_lir(const mir_func_t *mir) {
             lir_operand_t l_src1 = map_mir_opnd(m_inst->src1);
             lir_operand_t l_src2 = map_mir_opnd(m_inst->src2);
 
-            if (m_inst->op == MIR_JUMP) {
-                lir_operand_t target = map_mir_opnd(m_inst->dst);
-                lir_append_instr(l_blk, LIR_JMP, none, target, none);
-                continue;
-            }
-
             if (m_inst->op == MIR_JUMP_IF) {
                 lir_operand_t cond = map_mir_opnd(m_inst->dst);
                 lir_operand_t target = map_mir_opnd(m_inst->src1);
-                lir_operand_t imm0 = { LIR_OPND_IMM, {0} };
-                lir_append_instr(l_blk, LIR_CMP, cond, imm0, none);
                 lir_append_instr(l_blk, LIR_JMP_COND, none, target, cond);
+                continue;
+            }
+
+            if (m_inst->op == MIR_JUMP) {
+                lir_operand_t target = map_mir_opnd(m_inst->dst);
+                lir_append_instr(l_blk, LIR_JMP, none, target, none);
                 continue;
             }
 
