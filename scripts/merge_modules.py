@@ -50,9 +50,9 @@ class ModuleMerger:
         """Resolve an include spec to an actual file path."""
         spec = include_spec.strip().strip('"').strip("'")
 
-        # Qualified path: vir::rt::syscall → stdlib/vir/rt/syscall.vri
-        if "::" in spec:
-            rel = spec.replace("::", "/") + ".vri"
+        # Qualified path: vir::rt::syscall or vir.rt.syscall → stdlib/vir/rt/syscall.vri
+        if "::" in spec or (spec.startswith("vir.") and "." in spec):
+            rel = spec.replace("::", "/").replace(".", "/") + ".vri"
             full = self.vir_root / "stdlib" / rel
             if full.exists():
                 return full
