@@ -337,14 +337,14 @@ void diag_set_analysis(diag_context_t *ctx, diag_entry_t *entry,
 
 void diag_add_cause(diag_context_t *ctx, diag_entry_t *entry,
                     const char *cause) {
-  if (entry->cause_count < 8) {
+  if (!entry) return; if (entry->cause_count < 8) {
     entry->causes[entry->cause_count++] = diag_intern(ctx, cause);
   }
 }
 
 void diag_add_action(diag_context_t *ctx, diag_entry_t *entry,
                      const char *action) {
-  if (entry->action_count < 8) {
+  if (!entry) return; if (entry->action_count < 8) {
     entry->actions[entry->action_count++] = diag_intern(ctx, action);
   }
 }

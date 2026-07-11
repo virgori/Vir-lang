@@ -22,6 +22,7 @@ typedef enum {
     HIR_CONTINUE,
     HIR_BINOP,
     HIR_VAR_DECL,
+    HIR_PRINT,
 } hir_kind_t;
 
 typedef struct hir_node {
@@ -70,6 +71,9 @@ typedef struct hir_node {
             uint32_t var_id;
             struct hir_node* init_value;
         } var_decl;
+        struct {
+            struct hir_node* value;
+        } print;
     } as;
 } hir_node_t;
 

@@ -207,6 +207,28 @@ static hir_node_t* lower_node(hir_lower_ctx_t* ctx, const ast_node_t* ast) {
             }
             break;
         }
+        case AST_PRINT: {
+            hir = hir_create_node(HIR_PRINT, 0);
+            if (ast->child_count > 0) {
+                hir->as.print.value = lower_node(ctx, ast->children[0]);
+            }
+            break;
+        }
+        case AST_LITERAL_FLOAT: {
+            hir = hir_create_node(HIR_CONST, 0);
+            hir->as.constant.value = (int64_t)ast->float_val;
+            break;
+        }
+        case AST_LITERAL_STR: {
+            hir = hir_create_node(HIR_CONST, 0);
+            hir->as.constant.value = (int64_t)ast->int_val;
+            break;
+        }
+        case AST_INPUT: {
+            hir = hir_create_node(HIR_INTRINSIC_CALL, 0);
+            hir->as.intrinsic_call.intrinsic_id = 1; /* input */
+            break;
+        }
         case AST_FUNC_DEF: {
             uint32_t body_idx = 0;
             for (uint32_t i = 0; i < ast->child_count; i++) {

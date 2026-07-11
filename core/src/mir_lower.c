@@ -1,4 +1,5 @@
 #include "mir_lower.h"
+#include "ir_lower.h"
 #include <stdlib.h>
 
 // Helper to generate a new virtual register
@@ -44,14 +45,22 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             return dst;
         }
         case HIR_BINOP: {
-            mir_operand_t dst = { MIR_OPND_VREG, {alloc_vreg(func)} };
             mir_operand_t arg1 = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.binop.left);
             mir_operand_t arg2 = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.binop.right);
-            // In a real compiler, map `hir->as.binop.op` to `MIR_ADD`, `MIR_SUB`, etc.
-            mir_op_t op = MIR_ADD; // Simplification
-            if (hir->as.binop.op == 1) op = MIR_SUB; // Assuming OP_SUB is 1
-            else if (hir->as.binop.op == 2) op = MIR_MUL;
-            else if (hir->as.binop.op == 3) op = MIR_DIV;
+            mir_operand_t dst = { MIR_OPND_VREG, {alloc_vreg(func)} };
+            mir_op_t op = MIR_ADD;
+            switch (hir->as.binop.op) {
+            case OP_SUB: op = MIR_SUB; break;
+            case OP_MUL: op = MIR_MUL; break;
+            case OP_DIV: op = MIR_DIV; break;
+            case OP_GT:  op = MIR_CMP_GT; break;
+            case OP_LT:  op = MIR_CMP_LT; break;
+            case OP_GE:  op = MIR_CMP_GE; break;
+            case OP_LE:  op = MIR_CMP_LE; break;
+            case OP_EQ:  op = MIR_CMP_EQ; break;
+            case OP_NE:  op = MIR_CMP_NE; break;
+            default: op = MIR_ADD; break;
+            }
             mir_append_instr(*current_block, op, dst, arg1, arg2);
             return dst;
         }
@@ -74,6 +83,13 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             // Ignore arguments mapping for this stub
             mir_append_instr(*current_block, MIR_CALL, dst, callee, none);
             return dst;
+        }
+        case HIR_PRINT: {
+            mir_operand_t val =
+                lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end,
+                                      hir->as.print.value);
+            mir_append_instr(*current_block, MIR_PRINT, none, val, none);
+            return none;
         }
         case HIR_RETURN: {
             mir_operand_t val = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.ret.value);

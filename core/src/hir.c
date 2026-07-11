@@ -36,6 +36,9 @@ void hir_free_node(hir_node_t* node) {
         case HIR_RETURN:
             if (node->as.ret.value) hir_free_node(node->as.ret.value);
             break;
+        case HIR_PRINT:
+            if (node->as.print.value) hir_free_node(node->as.print.value);
+            break;
         case HIR_IF:
             if (node->as.if_stmt.cond) hir_free_node(node->as.if_stmt.cond);
             if (node->as.if_stmt.then_block) hir_free_node(node->as.if_stmt.then_block);
