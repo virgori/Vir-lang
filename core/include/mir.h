@@ -22,7 +22,14 @@ typedef enum {
     MIR_INTRINSIC,
     MIR_JUMP,
     MIR_JUMP_IF,
-    MIR_RETURN
+    MIR_RETURN,
+    MIR_PRINT,
+    MIR_CMP_GT,
+    MIR_CMP_LT,
+    MIR_CMP_EQ,
+    MIR_CMP_GE,
+    MIR_CMP_LE,
+    MIR_CMP_NE
 } mir_op_t;
 
 typedef struct {

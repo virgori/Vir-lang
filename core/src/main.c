@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <stdint.h>
 #include <time.h>
 #include "diagnostic.h"
@@ -782,7 +783,7 @@ int main(int argc, char **argv)
     g_diag_initialized = 1;
 
     /* §28 — Register all CJK and Vietnamese keyword aliases at startup */
-    vir_sublib_adapter_init();
+    // vir_sublib_adapter_init();
 
     if (argc < 2) {
         usage(argv[0]);

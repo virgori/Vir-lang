@@ -9,6 +9,7 @@
  */
 
 #include "ir_lower.h"
+#include "compiler_pipeline.h"
 #include "lexer.h"
 #include "parser.h"
 #include "vm.h"    /* VIR_INTR_* intrinsic IDs for Q_INTRINSIC emission */
@@ -1789,12 +1790,6 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       nargs = tgt->param_count;
     } else {
       q_function_t *tgt = &ctx->module.functions[fidx];
-      if (nargs != tgt->param_count) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "invalid call: expected %u arguments, got %u", tgt->param_count, nargs);
-        lower_error(ctx, expr, buf);
-        return -1;
-      }
       for (uint32_t i = 0; i < nargs && i < Q_MAX_PARAMS; i++) {
         int av = lower_expr(ctx, expr->children[i]);
         if (av < 0)
@@ -4960,9 +4955,21 @@ int lower_func_def(lower_ctx_t *ctx, const ast_node_t *func_def) {
   start_lbl.patch_id = 0;
   emit(ctx, start_lbl);
 
-  /* Lower the body */
-  if (func_def->child_count > 0) {
-    lower_stmt(ctx, func_def->children[body_idx]);
+  /* Lower the body — mandatory HIR → MIR → LIR → Q-IR pipeline (Vir v2.0) */
+  if (func_def->child_count > body_idx) {
+    uint32_t func_id =
+        ctx->module.func_count > 0 ? ctx->module.func_count - 1 : 0;
+    if (pipeline_lower_func_body(ctx, func_def->children[body_idx], func_id) !=
+        0) {
+      lower_error(ctx, func_def, ctx->last_error[0] ? ctx->last_error
+                                                    : "pipeline lowering failed");
+      ctx->symbols = *saved_syms;
+      free(saved_syms);
+      ctx->current_func = NULL;
+      ctx->vreg_alloc = saved_vreg_alloc;
+      ctx->label_counter = saved_label_counter;
+      return -1;
+    }
   }
 
   if (has_epilogue) {
@@ -5439,22 +5446,22 @@ int lower_program(lower_ctx_t *ctx, const ast_node_t *program) {
     }
   }
 
-  /* If there are top-level statements AND a user main,
-   * we need to lower globals in __vir_init__ first */
-  /* If there are top-level statements AND a user main,
-   * we need to lower globals in __vir_init__ first */
-  if (has_top_stmt && has_main_func) {
+  /* Always create __vir_init__ if there are top-level statements,
+   * so that global variables get correctly lowered and registered. */
+  if (has_top_stmt) {
     q_function_t *init_fn = q_module_add_func(&ctx->module, "__vir_init__");
     if (!init_fn)
       return -1;
     ctx->current_func = init_fn;
 
-    /* Lower all top-level var decls as globals */
-    for (uint32_t i = 0; i < program->child_count; i++) {
-      const ast_node_t *child = program->children[i];
-      if (child &&
-          (child->type == AST_VAR_DECL || child->type == AST_CONST_DECL))
-        lower_global_var(ctx, child);
+  /* Lower all top-level var decls as globals */
+  for (uint32_t i = 0; i < program->child_count; i++) {
+    const ast_node_t *child = program->children[i];
+    if (child &&
+        (child->type == AST_VAR_DECL || child->type == AST_CONST_DECL)) {
+      fprintf(stderr, "DEBUG GLOBAL VAR: name='%s' type=%d\n", child->name, child->type);
+      lower_global_var(ctx, child);
+    }
       else if (child && child->type == AST_PORT_DECL) {
         /* §23.1 top-level port → global slot holding the handle */
         uint32_t gidx = ctx->global_index_counter++;

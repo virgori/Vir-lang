@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <time.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -539,8 +540,10 @@ int vm_resolve_labels(vm_state_t *vm, const q_function_t *func)
 /* VIR_INTR_SYSCALL: R0=syscall_num, R1..R6=args
  * Translates macOS BSD layer numbers (| 0x2000000). */
 static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
-    long sn = (long)ctx->args[0];
-    long s  = sn & 0x00FFFFFF;
+    int64_t s = ctx->args[0];
+#ifdef VIR_PLATFORM_MACOS
+    s &= 0xFFFFFF;
+#endif
     int64_t r1 = ctx->args[1], r2 = ctx->args[2], r3 = ctx->args[3];
     int64_t r4 = ctx->args[4], r5 = ctx->args[5];
     int64_t result = -1;
@@ -558,9 +561,9 @@ static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
     case 6:   result = close((int)r1);                                          break;
     case 73:  result = munmap((void *)(uintptr_t)r1, (size_t)r2);             break;
     case 197: {
-        void *p = mmap((void *)(uintptr_t)r1, (size_t)r2,
+        int saved_errno; void *p = mmap((void *)(uintptr_t)r1, (size_t)r2,
                        (int)r3, (int)r4, (int)r5, 0);
-        result = (int64_t)(intptr_t)p;
+        saved_errno = errno; fprintf(stderr, "MMAP returned %p, errno=%d (size=%zu, prot=%d, flags=%d, fd=%d)\n", p, saved_errno, (size_t)r2, (int)r3, (int)r4, (int)r5); result = (int64_t)(intptr_t)p;
         break;
     }
     case 199: result = lseek((int)r1, (off_t)r2, (int)r3);                    break;
@@ -580,9 +583,8 @@ static void intr_sys_write(vir_intrinsic_ctx_t *ctx) {
     int fd = (int)ctx->args[0];
     char *buf = (char *)(uintptr_t)ctx->args[1];
     int len = (int)ctx->args[2];
-    printf("[SYS_WRITE] fd=%d, buf=%p, len=%d\n", fd, buf, len);
 
-    *ctx->ret = (int64_t)write((int)ctx->args[0],
+    fprintf(stderr, "SYS_WRITE called with fd=%d, len=%d\n", (int)ctx->args[0], (int)ctx->args[2]); *ctx->ret = (int64_t)write((int)ctx->args[0],
                                (const void *)(uintptr_t)ctx->args[1],
                                (size_t)ctx->args[2]);
 }
@@ -608,7 +610,7 @@ static void intr_sys_lseek(vir_intrinsic_ctx_t *ctx) {
 }
 
 static void intr_sys_mmap(vir_intrinsic_ctx_t *ctx) {
-    void *p = mmap((void *)(uintptr_t)ctx->args[0],
+    int saved_errno; void *p = mmap((void *)(uintptr_t)ctx->args[0],
                    (size_t)ctx->args[1],
                    (int)ctx->args[2],
                    (int)ctx->args[3],
@@ -802,6 +804,41 @@ static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
     if (fidx >= vm->module->func_count) return VM_ERR_BAD_JUMP;
     const q_function_t *callee = &vm->module->functions[fidx];
 
+    if (callee->body_count == 0) {
+        /* Intrinsic / Extern intercept */
+        if (strncmp(callee->name, "syscall", 7) == 0) {
+            int64_t ret_val = 0;
+            vir_intrinsic_ctx_t ctx = {
+                .args = &vm->regs[0],
+                .argc = callee->param_count,
+                .ret  = &ret_val,
+                .vm   = vm,
+            };
+            intr_syscall(&ctx);
+            vm->regs[0] = ret_val;
+            vm->ip++;
+            return VM_OK;
+        }
+
+        for (int i = 0; i < VIR_MAX_INTRINSICS; i++) {
+            if (vir_intr_table[i].fn && strcmp(vir_intr_table[i].name, callee->name) == 0) {
+                int64_t ret_val = 0;
+                vir_intrinsic_ctx_t ctx = {
+                    .args = &vm->regs[0],
+                    .argc = callee->param_count,
+                    .ret  = &ret_val,
+                    .vm   = vm,
+                };
+                vir_intr_table[i].fn(&ctx);
+                vm->regs[0] = ret_val;
+                vm->ip++;
+                return VM_OK;
+            }
+        }
+        vm->ip++;
+        return VM_OK; /* No-op for unhandled extern */
+    }
+
     if (vm->func_depth >= VM_MAX_CALL_DEPTH) return VM_ERR_STACK_OF;
     vm->func_stack[vm->func_depth].func = vm->current_func;
     vm->func_stack[vm->func_depth].ip   = vm->ip + 1;
@@ -846,6 +883,83 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
 {
     if (fidx >= vm->module->func_count) return VM_ERR_BAD_JUMP;
     const q_function_t *callee = &vm->module->functions[fidx];
+
+    if (callee->body_count == 0) {
+        if (strncmp(callee->name, "syscall", 7) == 0) {
+            int64_t ret_val = 0;
+            vir_intrinsic_ctx_t ctx = {
+                .args = &vm->regs[0],
+                .argc = callee->param_count,
+                .ret  = &ret_val,
+                .vm   = vm,
+            };
+            intr_syscall(&ctx);
+            
+            if (vm->func_depth == 0) {
+                vm->regs[0] = ret_val;
+                return VM_OK;
+            }
+            vm->func_depth--;
+            vm->current_func = vm->func_stack[vm->func_depth].func;
+            vm->ip           = vm->func_stack[vm->func_depth].ip;
+            vm->reg_count    = vm->func_stack[vm->func_depth].saved_reg_count;
+            if (vm->func_stack[vm->func_depth].saved_regs) {
+                for (uint32_t ri = 0; ri < vm->reg_count && ri < VREG_MAX; ri++) {
+                    vm->regs[ri] = vm->func_stack[vm->func_depth].saved_regs[ri];
+                }
+                free(vm->func_stack[vm->func_depth].saved_regs);
+                vm->func_stack[vm->func_depth].saved_regs = NULL;
+            }
+            vm->regs[0] = ret_val;
+            return VM_OK;
+        }
+
+        for (int i = 0; i < VIR_MAX_INTRINSICS; i++) {
+            if (vir_intr_table[i].fn && strcmp(vir_intr_table[i].name, callee->name) == 0) {
+                int64_t ret_val = 0;
+                vir_intrinsic_ctx_t ctx = {
+                    .args = &vm->regs[0],
+                    .argc = callee->param_count,
+                    .ret  = &ret_val,
+                    .vm   = vm,
+                };
+                vir_intr_table[i].fn(&ctx);
+                
+                if (vm->func_depth == 0) {
+                    vm->regs[0] = ret_val;
+                    return VM_OK;
+                }
+                vm->func_depth--;
+                vm->current_func = vm->func_stack[vm->func_depth].func;
+                vm->ip           = vm->func_stack[vm->func_depth].ip;
+                vm->reg_count    = vm->func_stack[vm->func_depth].saved_reg_count;
+                if (vm->func_stack[vm->func_depth].saved_regs) {
+                    for (uint32_t ri = 0; ri < vm->reg_count && ri < VREG_MAX; ri++) {
+                        vm->regs[ri] = vm->func_stack[vm->func_depth].saved_regs[ri];
+                    }
+                    free(vm->func_stack[vm->func_depth].saved_regs);
+                    vm->func_stack[vm->func_depth].saved_regs = NULL;
+                }
+                vm->regs[0] = ret_val;
+                return VM_OK;
+            }
+        }
+
+        if (vm->func_depth == 0) return VM_OK;
+        vm->func_depth--;
+        vm->current_func = vm->func_stack[vm->func_depth].func;
+        vm->ip           = vm->func_stack[vm->func_depth].ip;
+        vm->reg_count    = vm->func_stack[vm->func_depth].saved_reg_count;
+        if (vm->func_stack[vm->func_depth].saved_regs) {
+            for (uint32_t ri = 0; ri < vm->reg_count && ri < VREG_MAX; ri++) {
+                vm->regs[ri] = vm->func_stack[vm->func_depth].saved_regs[ri];
+            }
+            free(vm->func_stack[vm->func_depth].saved_regs);
+            vm->func_stack[vm->func_depth].saved_regs = NULL;
+        }
+        return VM_OK;
+    }
+
 
     /* For tail call, we reuse the current frame.
      * Update parameter vregs for the callee. */
@@ -2263,7 +2377,7 @@ vm_status_t vm_exec_module(vm_state_t *vm, const q_module_t *mod)
     }
     if (!entry) return VM_HALT;
 
-    return vm_exec_function(vm, entry);
+    fprintf(stderr, "EXECUTING: %s\n", entry->name); return vm_exec_function(vm, entry);
 }
 
 /* ═══════════════════════════════════════════════════════

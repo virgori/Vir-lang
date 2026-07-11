@@ -127,22 +127,23 @@ static int is_stmt_start(vir_tok_t t) {
  * ═══════════════════════════════════════════════════════ */
 
 static int expect_block_open(vir_parser_t *p, const char *context) {
-  /* v1.2 uses ':' to open blocks, legacy uses 'then'.
-   * Accept the dual form ':' THEN (e.g. `if cond: do`) by absorbing
-   * a redundant THEN/`do` after the colon. */
   if (match(p, TOK_COLON)) {
-    match(p, TOK_THEN);
+    if (match(p, TOK_THEN)) return 1;
+    if (check(p, TOK_IDENT) && strcmp(peek(p)->str.buf, "do") == 0) {
+      advance(p);
+    }
     return 1;
   }
-  if (match(p, TOK_THEN))
+  if (match(p, TOK_THEN)) return 1;
+  if (check(p, TOK_IDENT) && strcmp(peek(p)->str.buf, "do") == 0) {
+    advance(p);
     return 1;
-  /* Also accept a bare newline as an implicit block opener for legacy-style
-   * function bodies: `func f(x) -> T\n  body  end` */
+  }
   if (check(p, TOK_NEWLINE)) {
-    return 1; /* Don't consume — skip_newlines inside parse_block will */
+    return 1;
   }
   char msg[128];
-  snprintf(msg, sizeof(msg), "expected ':' or 'then' after %s", context);
+  snprintf(msg, sizeof(msg), "expected ':', 'then', or 'do' after %s", context);
   parse_error(p, msg);
   return 0;
 }
@@ -540,7 +541,8 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
             full[pos++] = ':';
             full[pos++] = ':';
           }
-          if (!check(p, TOK_IDENT))
+          /* Allow identifiers and keywords as path segments */
+          if (strlen(peek(p)->str.buf) == 0)
             break;
           const vir_token_t *seg = advance(p);
           size_t ns = strlen(seg->str.buf);
@@ -786,7 +788,7 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
     return arr;
   }
   default:
-    parse_error(p, "expected expression");
+    fprintf(stderr, "EXPECTED EXPR at line %d, token %s\n", peek(p)->line, peek(p)->str.buf); parse_error(p, "expected expression");
     return NULL;
   }
 }
@@ -1710,9 +1712,9 @@ static ast_node_t *parse_print_stmt(vir_parser_t *p) {
 }
 
 static ast_node_t *parse_func_def(vir_parser_t *p) {
-  /* v1.2:   FUNC IDENT ':' [in(params)] block END
-   * legacy: FUNC IDENT '(' params ')' THEN block END
-   * Both forms supported for backwards compatibility. */
+  /* v2.0:   func IDENT ':' [in(...)] block end.
+   *         func IDENT '(' params ')' [-> type] ':' block end.
+   * Both inline `()` and body `in`/`ref`/`out` groups are valid (§6, §14). */
   const vir_token_t *name_tok = expect_func_name(p);
   if (!name_tok)
     return NULL;
@@ -1784,7 +1786,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
               }
               expect(p, TOK_RBRACKET, "expected ']' in array type");
               param->int_val |= 0x10000;
-            } else if (check(p, TOK_IDENT)) {
+            } else if (peek(p)->type != TOK_EOF && peek(p)->type != TOK_RPAREN && peek(p)->type != TOK_COMMA && peek(p)->type != TOK_SEMICOLON) {
               strncpy(param->name2, peek(p)->str.buf, AST_NAME_LEN - 1);
               advance(p);
             }
@@ -1850,12 +1852,11 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
     ast_add_child(fn, body);
 
     expect(p, TOK_END, "expected 'end' to close function");
-    /* §12: `end.` — optional module/function sentinel period. */
-    match(p, TOK_DOT);
+    match(p, TOK_DOT); /* Vir v2.0: definition blocks close with end. */
     return fn;
   }
 
-  /* ─── Legacy syntax: func name(params) then block end ─── */
+  /* Vir v2.0 inline params: func name(a, b): ... end. (§6, §14.1) */
   expect(p, TOK_LPAREN, "expected '(' after function name");
 
   /* Parse parameters → stored as IDENTIFIER children.
@@ -3955,7 +3956,8 @@ ast_node_t *parser_parse_program(vir_parser_t *p) {
 
   skip_newlines(p);
   int count = 0;
-  while (!check(p, TOK_EOF)) {
+  while (1) {
+    uint32_t start_pos = p->pos;
     if (++count > 1000000) {
       printf("Hanging at token %d: %d\n", p->pos, peek(p)->type);
       exit(1);
@@ -3975,10 +3977,16 @@ ast_node_t *parser_parse_program(vir_parser_t *p) {
         advance(p);
       }
     } else {
+      uint32_t before = p->pos;
       while (check(p, TOK_SEMICOLON))
         advance(p);
+      skip_newlines(p);
+      if (p->pos == before && p->pos == start_pos) {
+          parse_error(p, "unexpected token at top level");
+          parser_sync(p);
+          if (p->pos == start_pos) p->pos++;
+      }
     }
-    skip_newlines(p);
   }
 
   return prog;

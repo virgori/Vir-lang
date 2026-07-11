@@ -82,7 +82,34 @@ C_SRCS := src/q_ir.c \
           src/jit_bridge.c \
           src/ir_lower.c \
           src/hir.c \
+          src/hir_lower.c \
           src/mir.c \
+          src/mir_lower.c \
+          src/mir_cfg.c \
+          src/mir_ssa.c \
+          src/mir_pass.c \
+          src/mir_opt_dce.c \
+          src/mir_opt_cp.c \
+          src/mir_opt_cf.c \
+          src/mir_opt_cfg_cleanup.c \
+          src/mir_analysis_def_use.c \
+          src/mir_move_resolver.c \
+          src/mir_ssa_destruct.c \
+          src/mir_verify.c \
+          src/lir_lower.c \
+          src/lir.c \
+          src/lir_liveness.c \
+          src/lir_interval.c \
+          src/lir_regalloc.c \
+          src/lir_opt_coalesce.c \
+          src/lir_rewrite.c \
+          src/lir_verify.c \
+          src/lir_to_qir.c \
+          src/compiler_pipeline.c \
+          src/mach_isel.c \
+          src/mach_ir.c \
+          src/mach_encode.c \
+          src/target.c \
           src/lexer.c \
           src/parser.c \
           src/diagnostic.c \
@@ -100,13 +127,7 @@ C_SRCS := src/q_ir.c \
           src/simd_index.c \
           src/gpu_metal.c \
           src/mem_manager.c \
-          src/sublib_adapter.c \
-          src/wasm_codegen.c \
-          src/lang/lang.c \
-          src/lang/lang_vi.c \
-          src/lang/lang_zh.c \
-          src/lang/lang_ja.c \
-          src/lang/lang_ko.c
+          src/wasm_codegen.c
 
 # ── Object files ──────────────────────────────────────────
 BUILD_DIR := build
