@@ -168,32 +168,56 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             return none;
         }
         case HIR_LOOP: {
-            mir_block_t* new_loop_hdr = mir_create_block(func);
-            mir_block_t* loop_body = mir_create_block(func);
-            mir_block_t* new_loop_end = mir_create_block(func);
-            
-            mir_operand_t hdr_opnd = { MIR_OPND_BLOCK, {new_loop_hdr->id} };
-            mir_append_instr(*current_block, MIR_JUMP, hdr_opnd, none, none);
-            (*current_block)->succ_true = new_loop_hdr;
-            
-            *current_block = new_loop_hdr;
-            // Unconditional loop logic for stub
-            mir_operand_t body_opnd = { MIR_OPND_BLOCK, {loop_body->id} };
-            mir_append_instr(*current_block, MIR_JUMP, body_opnd, none, none);
-            (*current_block)->succ_true = loop_body;
-            
-            *current_block = loop_body;
-            // Body is usually block
-            if (hir->as.block.body) {
-                for (uint32_t i = 0; i < hir->as.block.count; i++) {
-                    lower_hir_node_to_mir(func, current_block, new_loop_hdr, new_loop_end, hir->as.block.body[i], lctx);
+            mir_block_t *hdr = mir_create_block(func);
+            mir_block_t *body_blk = mir_create_block(func);
+            mir_block_t *end_blk = mir_create_block(func);
+
+            mir_operand_t hdr_op = { MIR_OPND_BLOCK, {hdr->id} };
+            mir_operand_t body_op = { MIR_OPND_BLOCK, {body_blk->id} };
+            mir_operand_t end_op = { MIR_OPND_BLOCK, {end_blk->id} };
+
+            mir_append_instr(*current_block, MIR_JUMP, hdr_op, none, none);
+            (*current_block)->succ_true = hdr;
+
+            *current_block = hdr;
+
+            /* while desugar: loop { if cond { body } else { break } } */
+            hir_node_t *inner = (hir->as.block.count == 1 && hir->as.block.body)
+                                    ? hir->as.block.body[0]
+                                    : NULL;
+            int is_while = inner && inner->kind == HIR_IF &&
+                           inner->as.if_stmt.else_block &&
+                           inner->as.if_stmt.else_block->kind == HIR_BREAK;
+
+            if (is_while) {
+                mir_operand_t cond = lower_hir_node_to_mir(
+                    func, current_block, hdr, end_blk, inner->as.if_stmt.cond, lctx);
+                mir_append_instr(*current_block, MIR_JUMP_IF, cond, body_op, none);
+                (*current_block)->succ_false = end_blk;
+                mir_append_instr(*current_block, MIR_JUMP, end_op, none, none);
+                (*current_block)->succ_true = end_blk;
+
+                *current_block = body_blk;
+                lower_hir_node_to_mir(func, current_block, hdr, end_blk,
+                                      inner->as.if_stmt.then_block, lctx);
+                mir_append_instr(*current_block, MIR_JUMP, hdr_op, none, none);
+                (*current_block)->succ_true = hdr;
+
+                *current_block = end_blk;
+            } else {
+                mir_append_instr(*current_block, MIR_JUMP, body_op, none, none);
+                (*current_block)->succ_true = body_blk;
+                *current_block = body_blk;
+                if (hir->as.block.body) {
+                    for (uint32_t i = 0; i < hir->as.block.count; i++) {
+                        lower_hir_node_to_mir(func, current_block, hdr, end_blk,
+                                              hir->as.block.body[i], lctx);
+                    }
                 }
+                mir_append_instr(*current_block, MIR_JUMP, hdr_op, none, none);
+                (*current_block)->succ_true = hdr;
+                *current_block = end_blk;
             }
-            
-            mir_append_instr(*current_block, MIR_JUMP, hdr_opnd, none, none);
-            (*current_block)->succ_true = new_loop_hdr;
-            
-            *current_block = new_loop_end;
             return none;
         }
         case HIR_BLOCK: {

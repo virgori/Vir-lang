@@ -107,8 +107,9 @@ int lir_to_qir_append(lower_ctx_t *ctx, const lir_func_t *lir) {
             }
 
             if (ins->op == LIR_JMP_COND) {
-                q_func_emit(fn, q_instr(Q_JUMP_IF, map_lir_opnd(&ins->src2),
-                                        map_lir_opnd(&ins->src1), q_none()));
+                q_func_emit(fn, q_instr(Q_JUMP_IF, q_none(),
+                                        map_lir_opnd(&ins->src2),
+                                        map_lir_opnd(&ins->src1)));
                 continue;
             }
 
