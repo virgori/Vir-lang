@@ -566,6 +566,22 @@ int lower_find_func_index(lower_ctx_t *ctx, const char *name) {
   return -1;
 }
 
+int lower_lookup_vreg(lower_ctx_t *ctx, const char *name, uint32_t *vreg) {
+  if (!ctx || !name)
+    return -1;
+  return sym_lookup_both(ctx, name, vreg);
+}
+
+int lower_declare_var(lower_ctx_t *ctx, const char *name, uint32_t *vreg) {
+  if (!ctx || !name || !vreg)
+    return -1;
+  uint32_t v = fresh_vreg(ctx);
+  if (sym_define(&ctx->symbols, name, v, VIR_TYPE_I64) != 0)
+    return -1;
+  *vreg = v;
+  return 0;
+}
+
 static int find_func_index(lower_ctx_t *ctx, const char *name) {
   return lower_find_func_index(ctx, name);
 }

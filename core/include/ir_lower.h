@@ -557,6 +557,8 @@ void lower_init(lower_ctx_t *ctx, const char *module_name);
 
 /* Resolve a function name to its module index (-1 if missing). */
 int lower_find_func_index(lower_ctx_t *ctx, const char *name);
+int lower_lookup_vreg(lower_ctx_t *ctx, const char *name, uint32_t *vreg);
+int lower_declare_var(lower_ctx_t *ctx, const char *name, uint32_t *vreg);
 
 /* Lower an AST program → Q-IR module.
  * Returns 0 on success. */

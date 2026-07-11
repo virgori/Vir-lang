@@ -41,7 +41,7 @@ int pipeline_lower_func_body(lower_ctx_t *ctx, const ast_node_t *body_ast,
   if (!ctx || !body_ast || !ctx->current_func)
     return -1;
 
-  hir_node_t *hir = lower_ast_to_hir(body_ast);
+  hir_node_t *hir = lower_ast_to_hir(body_ast, ctx);
   if (!hir) {
     strncpy(ctx->last_error, "HIR lowering failed", sizeof(ctx->last_error) - 1);
     return -1;
