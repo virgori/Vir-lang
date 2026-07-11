@@ -12,7 +12,7 @@ extern "C" {
  * Lower an AST node (usually a statement, expression, or function body)
  * into a HIR node. This is the first pass of the modern compiler backend.
  */
-hir_node_t* lower_ast_to_hir(const ast_node_t* ast);
+hir_node_t* lower_ast_to_hir(const ast_node_t* ast, lower_ctx_t *lctx);
 
 #ifdef __cplusplus
 }
