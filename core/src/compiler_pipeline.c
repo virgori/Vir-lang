@@ -47,7 +47,7 @@ int pipeline_lower_func_body(lower_ctx_t *ctx, const ast_node_t *body_ast,
     return -1;
   }
 
-  mir_func_t *mir = lower_hir_to_mir(hir, func_id);
+  mir_func_t *mir = lower_hir_to_mir(hir, func_id, ctx);
   hir_free_node(hir);
   if (!mir) {
     strncpy(ctx->last_error, "MIR lowering failed", sizeof(ctx->last_error) - 1);

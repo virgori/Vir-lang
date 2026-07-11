@@ -36,7 +36,7 @@ typedef struct hir_node {
             uint32_t argc;
         } intrinsic_call;
         struct {
-            struct hir_node* callee;
+            char callee_name[64];
             struct hir_node** args;
             uint32_t argc;
         } call;
@@ -54,6 +54,8 @@ typedef struct hir_node {
         } block;
         struct {
             int64_t value;
+            int is_string;
+            char str_value[64];
         } constant;
         struct {
             uint32_t var_id;

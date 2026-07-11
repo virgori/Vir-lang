@@ -555,6 +555,9 @@ typedef struct {
 /* Initialise lowering context */
 void lower_init(lower_ctx_t *ctx, const char *module_name);
 
+/* Resolve a function name to its module index (-1 if missing). */
+int lower_find_func_index(lower_ctx_t *ctx, const char *name);
+
 /* Lower an AST program → Q-IR module.
  * Returns 0 on success. */
 int lower_program(lower_ctx_t *ctx, const ast_node_t *program);

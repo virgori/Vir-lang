@@ -558,12 +558,16 @@ static void ownership_mark_moved_if_id(lower_ctx_t *ctx,
 static uint32_t fresh_label(lower_ctx_t *ctx) { return ctx->label_counter++; }
 
 /* Find function index by name (returns -1 if not found) */
-static int find_func_index(lower_ctx_t *ctx, const char *name) {
+int lower_find_func_index(lower_ctx_t *ctx, const char *name) {
   for (uint32_t i = 0; i < ctx->module.func_count; i++) {
     if (strcmp(ctx->module.functions[i].name, name) == 0)
       return (int)i;
   }
   return -1;
+}
+
+static int find_func_index(lower_ctx_t *ctx, const char *name) {
+  return lower_find_func_index(ctx, name);
 }
 
 /* Emit instruction into current function */

@@ -1,6 +1,7 @@
 #include "mir_lower.h"
 #include "ir_lower.h"
 #include <stdlib.h>
+#include <string.h>
 
 // Helper to generate a new virtual register
 static uint32_t alloc_vreg(mir_func_t* func) {
@@ -8,15 +9,22 @@ static uint32_t alloc_vreg(mir_func_t* func) {
 }
 
 // Forward declaration
-static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** current_block, mir_block_t* loop_hdr, mir_block_t* loop_end, const hir_node_t* hir);
+static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** current_block, mir_block_t* loop_hdr, mir_block_t* loop_end, const hir_node_t* hir, lower_ctx_t *lctx);
 
-static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** current_block, mir_block_t* loop_hdr, mir_block_t* loop_end, const hir_node_t* hir) {
+static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** current_block, mir_block_t* loop_hdr, mir_block_t* loop_end, const hir_node_t* hir, lower_ctx_t *lctx) {
     mir_operand_t none = { MIR_OPND_NONE, {0} };
     if (!hir || !*current_block) return none;
 
     switch (hir->kind) {
         case HIR_CONST: {
             mir_operand_t dst = { MIR_OPND_VREG, {alloc_vreg(func)} };
+            if (hir->as.constant.is_string && lctx) {
+                uint32_t str_idx =
+                    q_module_add_string(&lctx->module, hir->as.constant.str_value);
+                mir_operand_t idx = { MIR_OPND_IMM, {(int64_t)str_idx} };
+                mir_append_instr(*current_block, MIR_LOAD_STRING, dst, idx, none);
+                return dst;
+            }
             mir_operand_t imm = { MIR_OPND_IMM, {(int64_t)hir->as.constant.value} };
             mir_append_instr(*current_block, MIR_LOAD, dst, imm, none);
             return dst;
@@ -28,7 +36,7 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             return dst;
         }
         case HIR_STORE: {
-            mir_operand_t val = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.store.value);
+            mir_operand_t val = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.store.value, lctx);
             mir_operand_t dst = { MIR_OPND_VREG, {hir->as.store.var_id} };
             mir_append_instr(*current_block, MIR_MOVE, dst, val, none);
             return val;
@@ -36,7 +44,7 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
         case HIR_VAR_DECL: {
             mir_operand_t val = none;
             if (hir->as.var_decl.init_value) {
-                val = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.var_decl.init_value);
+                val = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.var_decl.init_value, lctx);
             }
             mir_operand_t dst = { MIR_OPND_VREG, {hir->as.var_decl.var_id} };
             if (val.type != MIR_OPND_NONE) {
@@ -45,8 +53,8 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             return dst;
         }
         case HIR_BINOP: {
-            mir_operand_t arg1 = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.binop.left);
-            mir_operand_t arg2 = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.binop.right);
+            mir_operand_t arg1 = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.binop.left, lctx);
+            mir_operand_t arg2 = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.binop.right, lctx);
             mir_operand_t dst = { MIR_OPND_VREG, {alloc_vreg(func)} };
             mir_op_t op = MIR_ADD;
             switch (hir->as.binop.op) {
@@ -69,30 +77,44 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             mir_operand_t arg1 = none;
             mir_operand_t arg2 = none;
             if (hir->as.intrinsic_call.argc > 0) {
-                arg1 = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.intrinsic_call.args[0]);
+                arg1 = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.intrinsic_call.args[0], lctx);
             }
             if (hir->as.intrinsic_call.argc > 1) {
-                arg2 = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.intrinsic_call.args[1]);
+                arg2 = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.intrinsic_call.args[1], lctx);
             }
             mir_append_instr(*current_block, MIR_INTRINSIC, dst, arg1, arg2);
             return dst;
         }
         case HIR_CALL: {
+            int fidx = lctx ? lower_find_func_index(lctx, hir->as.call.callee_name)
+                            : -1;
+            if (fidx < 0)
+                return none;
+
+            for (uint32_t i = 0; i < hir->as.call.argc && i < Q_MAX_PARAMS; i++) {
+                mir_operand_t arg = lower_hir_node_to_mir(
+                    func, current_block, loop_hdr, loop_end, hir->as.call.args[i],
+                    lctx);
+                mir_operand_t slot = { MIR_OPND_VREG, {i} };
+                mir_append_instr(*current_block, MIR_MOVE, slot, arg, none);
+            }
+
+            mir_operand_t fidx_op = { MIR_OPND_IMM, {(int64_t)fidx} };
             mir_operand_t dst = { MIR_OPND_VREG, {alloc_vreg(func)} };
-            mir_operand_t callee = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.call.callee);
-            // Ignore arguments mapping for this stub
-            mir_append_instr(*current_block, MIR_CALL, dst, callee, none);
+            mir_append_instr(*current_block, MIR_CALL, none, fidx_op, none);
+            mir_operand_t r0 = { MIR_OPND_VREG, {0} };
+            mir_append_instr(*current_block, MIR_MOVE, dst, r0, none);
             return dst;
         }
         case HIR_PRINT: {
             mir_operand_t val =
                 lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end,
-                                      hir->as.print.value);
+                                      hir->as.print.value, lctx);
             mir_append_instr(*current_block, MIR_PRINT, none, val, none);
             return none;
         }
         case HIR_RETURN: {
-            mir_operand_t val = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.ret.value);
+            mir_operand_t val = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.ret.value, lctx);
             mir_append_instr(*current_block, MIR_RETURN, val, none, none);
             return none;
         }
@@ -115,7 +137,7 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             return none;
         }
         case HIR_IF: {
-            mir_operand_t cond = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.if_stmt.cond);
+            mir_operand_t cond = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.if_stmt.cond, lctx);
             
             mir_block_t* then_block = mir_create_block(func);
             mir_block_t* else_block = mir_create_block(func);
@@ -129,7 +151,7 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             
             // Generate then
             *current_block = then_block;
-            lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.if_stmt.then_block);
+            lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.if_stmt.then_block, lctx);
             mir_operand_t merge_opnd = { MIR_OPND_BLOCK, {merge_block->id} };
             mir_append_instr(*current_block, MIR_JUMP, merge_opnd, none, none);
             (*current_block)->succ_true = merge_block;
@@ -137,7 +159,7 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             // Generate else
             *current_block = else_block;
             if (hir->as.if_stmt.else_block) {
-                lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.if_stmt.else_block);
+                lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.if_stmt.else_block, lctx);
             }
             mir_append_instr(*current_block, MIR_JUMP, merge_opnd, none, none);
             (*current_block)->succ_true = merge_block;
@@ -164,7 +186,7 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             // Body is usually block
             if (hir->as.block.body) {
                 for (uint32_t i = 0; i < hir->as.block.count; i++) {
-                    lower_hir_node_to_mir(func, current_block, new_loop_hdr, new_loop_end, hir->as.block.body[i]);
+                    lower_hir_node_to_mir(func, current_block, new_loop_hdr, new_loop_end, hir->as.block.body[i], lctx);
                 }
             }
             
@@ -178,7 +200,7 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             mir_operand_t last_val = none;
             if (hir->as.block.body) {
                 for (uint32_t i = 0; i < hir->as.block.count; i++) {
-                    last_val = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.block.body[i]);
+                    last_val = lower_hir_node_to_mir(func, current_block, loop_hdr, loop_end, hir->as.block.body[i], lctx);
                 }
             }
             return last_val;
@@ -188,7 +210,7 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
     return none;
 }
 
-mir_func_t* lower_hir_to_mir(const hir_node_t* hir, uint32_t func_id) {
+mir_func_t* lower_hir_to_mir(const hir_node_t* hir, uint32_t func_id, lower_ctx_t *lctx) {
     if (!hir) return NULL;
     
     mir_func_t* func = mir_create_func(func_id);
@@ -197,7 +219,7 @@ mir_func_t* lower_hir_to_mir(const hir_node_t* hir, uint32_t func_id) {
         current_block = mir_create_block(func);
     }
     
-    lower_hir_node_to_mir(func, &current_block, NULL, NULL, hir);
+    lower_hir_node_to_mir(func, &current_block, NULL, NULL, hir, lctx);
     
     return func;
 }

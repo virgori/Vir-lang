@@ -13,6 +13,7 @@ typedef enum {
     MIR_NOP,
     MIR_MOVE,
     MIR_LOAD,
+    MIR_LOAD_STRING,
     MIR_STORE,
     MIR_ADD,
     MIR_SUB,

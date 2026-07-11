@@ -82,6 +82,24 @@ int lir_to_qir_append(lower_ctx_t *ctx, const lir_func_t *lir) {
                 continue;
             }
 
+            if (ins->op == LIR_LOAD_STRING) {
+                q_instruction_t qload =
+                    q_instr(Q_LOAD, map_lir_opnd(&ins->dst),
+                            q_str((uint32_t)ins->src1.as.imm), q_none());
+                q_func_emit(fn, qload);
+                continue;
+            }
+
+            if (ins->op == LIR_CALL) {
+                q_operand_t fidx = q_func_idx((uint32_t)ins->src1.as.imm);
+                q_func_emit(fn, q_instr(Q_CALL_FUNC, q_none(), fidx, q_none()));
+                if (ins->dst.type != LIR_OPND_NONE) {
+                    q_func_emit(fn, q_instr(Q_MOVE, map_lir_opnd(&ins->dst),
+                                            q_vreg(0), q_none()));
+                }
+                continue;
+            }
+
             if (ins->op == LIR_JMP) {
                 q_func_emit(fn, q_instr(Q_JUMP, q_none(), map_lir_opnd(&ins->src1),
                                         q_none()));
