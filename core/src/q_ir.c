@@ -283,6 +283,7 @@ const char* q_opcode_name(q_opcode_t op)
         case Q_CMP_LT:       return "Q_CMP_LT";
         case Q_CMP_GE:       return "Q_CMP_GE";
         case Q_CMP_LE:       return "Q_CMP_LE";
+        case Q_CMP_NE:       return "Q_CMP_NE";
         case Q_AND:          return "Q_AND";
         case Q_OR:           return "Q_OR";
         case Q_XOR:          return "Q_XOR";

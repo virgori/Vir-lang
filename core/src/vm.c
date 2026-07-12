@@ -20,6 +20,23 @@
 #include <sys/types.h>
 #include <stdint.h>
 
+/* Minimum vregs preserved across Q_CALL_FUNC. reg_count reflects the
+ * highest written vreg, but nested returns can temporarily shrink it while
+ * outer locals (e.g. R17+) remain live — callees then clobber unsaved regs. */
+#ifndef VM_CALL_SAVE_MIN
+#define VM_CALL_SAVE_MIN  1024u
+#endif
+
+static inline uint32_t vm_call_save_count(const vm_state_t *vm)
+{
+    uint32_t nregs = vm->reg_count;
+    if (nregs < VM_CALL_SAVE_MIN)
+        nregs = VM_CALL_SAVE_MIN;
+    if (nregs > VREG_MAX)
+        nregs = VREG_MAX;
+    return nregs;
+}
+
 /* §13.7 try(timeout:) — monotonic clock in nanoseconds. */
 static inline uint64_t vm_now_ns(void)
 {
@@ -408,9 +425,8 @@ static int64_t vm_dict_values(vm_state_t *vm, int64_t handle)
 static void vm_clear_func_frames(vm_state_t *vm)
 {
     for (uint32_t i = 0; i < VM_MAX_CALL_DEPTH; i++) {
-        free(vm->func_stack[i].saved_regs);
-        vm->func_stack[i].saved_regs = NULL;
         vm->func_stack[i].saved_reg_count = 0;
+        vm->func_stack[i].caller_reg_count = 0;
         vm->func_stack[i].func = NULL;
         vm->func_stack[i].ip = 0;
     }
@@ -547,12 +563,6 @@ static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
     int64_t r1 = ctx->args[1], r2 = ctx->args[2], r3 = ctx->args[3];
     int64_t r4 = ctx->args[4], r5 = ctx->args[5];
     int64_t result = -1;
-    if (s == 4) {
-        /* write() — trace buf content */
-        fprintf(stderr, "[WRITE] fd=%lld buf=%p len=%lld content=", r1, (void*)(uintptr_t)r2, r3);
-        if (r2 && r3 > 0 && r3 < 200) fwrite((void*)(uintptr_t)r2, 1, (size_t)r3, stderr);
-        fprintf(stderr, "\n");
-    }
     switch (s) {
     case 1:   exit((int)r1);                                                    break;
     case 3:   result = read((int)r1, (void *)(uintptr_t)r2, (size_t)r3);      break;
@@ -561,9 +571,9 @@ static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
     case 6:   result = close((int)r1);                                          break;
     case 73:  result = munmap((void *)(uintptr_t)r1, (size_t)r2);             break;
     case 197: {
-        int saved_errno; void *p = mmap((void *)(uintptr_t)r1, (size_t)r2,
+        void *p = mmap((void *)(uintptr_t)r1, (size_t)r2,
                        (int)r3, (int)r4, (int)r5, 0);
-        saved_errno = errno; fprintf(stderr, "MMAP returned %p, errno=%d (size=%zu, prot=%d, flags=%d, fd=%d)\n", p, saved_errno, (size_t)r2, (int)r3, (int)r4, (int)r5); result = (int64_t)(intptr_t)p;
+        result = (int64_t)(intptr_t)p;
         break;
     }
     case 199: result = lseek((int)r1, (off_t)r2, (int)r3);                    break;
@@ -584,7 +594,7 @@ static void intr_sys_write(vir_intrinsic_ctx_t *ctx) {
     char *buf = (char *)(uintptr_t)ctx->args[1];
     int len = (int)ctx->args[2];
 
-    fprintf(stderr, "SYS_WRITE called with fd=%d, len=%d\n", (int)ctx->args[0], (int)ctx->args[2]); *ctx->ret = (int64_t)write((int)ctx->args[0],
+    *ctx->ret = (int64_t)write((int)ctx->args[0],
                                (const void *)(uintptr_t)ctx->args[1],
                                (size_t)ctx->args[2]);
 }
@@ -642,6 +652,86 @@ static void intr_memset(vir_intrinsic_ctx_t *ctx) {
            (int)ctx->args[1],
            (size_t)ctx->args[2]);
     *ctx->ret = ctx->args[0];
+}
+
+/* Raw memory access for virc_boot `extern func native_*` shims (Stage-0 VM). */
+static int vm_host_ptr_ok(int64_t base)
+{
+    if (base == 0)
+        return 0;
+    if (base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE)
+        return 1;
+    if (base > 0 && base < 4096)
+        return 0;
+    return 1;
+}
+
+static void intr_native_read_u8(vir_intrinsic_ctx_t *ctx)
+{
+    int64_t base = ctx->args[0];
+    int64_t off = ctx->args[1];
+    if (!vm_host_ptr_ok(base)) {
+        *ctx->ret = 0;
+        return;
+    }
+    const uint8_t *ptr = (const uint8_t *)(intptr_t)base;
+    *ctx->ret = (int64_t)ptr[off];
+}
+
+static void intr_native_write_u8(vir_intrinsic_ctx_t *ctx)
+{
+    int64_t base = ctx->args[0];
+    int64_t off = ctx->args[1];
+    int64_t val = ctx->args[2];
+    if (!vm_host_ptr_ok(base)) {
+        *ctx->ret = 0;
+        return;
+    }
+    uint8_t *ptr = (uint8_t *)(intptr_t)base;
+    ptr[off] = (uint8_t)val;
+    *ctx->ret = 0;
+}
+
+static void intr_native_read_i64(vir_intrinsic_ctx_t *ctx)
+{
+    int64_t base = ctx->args[0];
+    int64_t off = ctx->args[1];
+    if (base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE) {
+        size_t slot = (size_t)((base - VM_MMIO_BASE) / (int64_t)sizeof(int64_t) + off);
+        size_t slots = VM_MMIO_SIZE / sizeof(int64_t);
+        *ctx->ret = slot < slots ? ctx->vm->mmio_region[slot] : 0;
+        return;
+    }
+    if (!vm_host_ptr_ok(base)) {
+        *ctx->ret = 0;
+        return;
+    }
+    const int64_t *ptr = (const int64_t *)((const char *)(intptr_t)base +
+                                           off * (int64_t)sizeof(int64_t));
+    *ctx->ret = *ptr;
+}
+
+static void intr_native_write_i64(vir_intrinsic_ctx_t *ctx)
+{
+    int64_t base = ctx->args[0];
+    int64_t off = ctx->args[1];
+    int64_t val = ctx->args[2];
+    if (base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE) {
+        size_t slot = (size_t)((base - VM_MMIO_BASE) / (int64_t)sizeof(int64_t) + off);
+        size_t slots = VM_MMIO_SIZE / sizeof(int64_t);
+        if (slot < slots)
+            ctx->vm->mmio_region[slot] = val;
+        *ctx->ret = 0;
+        return;
+    }
+    if (!vm_host_ptr_ok(base)) {
+        *ctx->ret = 0;
+        return;
+    }
+    int64_t *ptr = (int64_t *)((char *)(intptr_t)base +
+                               off * (int64_t)sizeof(int64_t));
+    *ptr = val;
+    *ctx->ret = 0;
 }
 
 /* ── Bitwise / Math ──────────────────────────────────── */
@@ -790,6 +880,21 @@ vir_intr_desc_t vir_intr_table[VIR_MAX_INTRINSICS] = {
     /* ID17 */ { intr_atomic_store, 2, INTR_IMPURE,           "atomic_store" },
     /* ID18 */ { intr_atomic_add, 2, INTR_IMPURE,             "atomic_add" },
     /* ID19 */ { intr_atomic_sub, 2, INTR_IMPURE,             "atomic_sub" },
+    /* virc_boot extern memory shims (empty body → name dispatch) */
+    /* ID20 */ { intr_native_read_u8,  2, INTR_PURE,          "native_read_u8" },
+    /* ID21 */ { intr_native_write_u8, 3, INTR_IMPURE,        "native_write_u8" },
+    /* ID22 */ { intr_native_read_i64, 2, INTR_PURE,          "native_read_i64" },
+    /* ID23 */ { intr_native_write_i64,3, INTR_IMPURE,        "native_write_i64" },
+    /* ID24 */ { intr_native_read_u8,  2, INTR_PURE,          "read_byte" },
+    /* ID25 */ { intr_native_read_u8,  2, INTR_PURE,          "read_u8" },
+    /* virc_boot extern syscall shims (empty body → name dispatch) */
+    /* ID26 */ { intr_syscall, 1, INTR_IMPURE,              "syscall0" },
+    /* ID27 */ { intr_syscall, 2, INTR_IMPURE,              "syscall1" },
+    /* ID28 */ { intr_syscall, 3, INTR_IMPURE,              "syscall2" },
+    /* ID29 */ { intr_syscall, 4, INTR_IMPURE,              "syscall3" },
+    /* ID30 */ { intr_syscall, 5, INTR_IMPURE,              "syscall4" },
+    /* ID31 */ { intr_syscall, 6, INTR_IMPURE,              "syscall5" },
+    /* ID32 */ { intr_syscall, 7, INTR_IMPURE,              "syscall6" },
 };
 
 
@@ -842,34 +947,22 @@ static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
     if (vm->func_depth >= VM_MAX_CALL_DEPTH) return VM_ERR_STACK_OF;
     vm->func_stack[vm->func_depth].func = vm->current_func;
     vm->func_stack[vm->func_depth].ip   = vm->ip + 1;
+    vm->func_stack[vm->func_depth].caller_reg_count = vm->reg_count;
 
-    uint32_t nregs = vm->reg_count;
+    uint32_t nregs = vm_call_save_count(vm);
     vm->func_stack[vm->func_depth].saved_reg_count = nregs;
-    vm->func_stack[vm->func_depth].saved_regs = NULL;
-    if (nregs > 0) {
-        vm->func_stack[vm->func_depth].saved_regs =
-            (int64_t *)malloc(sizeof(int64_t) * nregs);
-        if (!vm->func_stack[vm->func_depth].saved_regs) {
-            vm->func_stack[vm->func_depth].saved_reg_count = 0;
-            return VM_ERR_STACK_OF;
-        }
-        for (uint32_t ri = 0; ri < nregs; ri++)
-            vm->func_stack[vm->func_depth].saved_regs[ri] = vm->regs[ri];
-    }
+    for (uint32_t ri = 0; ri < nregs; ri++)
+        vm->func_stack[vm->func_depth].saved_regs[ri] = vm->regs[ri];
     for (uint32_t pi = 0; pi < Q_MAX_PARAMS; pi++)
         vm->func_stack[vm->func_depth].ref_bindings[pi] =
             vm->pending_ref_bindings[pi];
     vm->func_depth++;
     memset(vm->pending_ref_bindings, 0, sizeof(vm->pending_ref_bindings));
 
-    /* Debug trace for rt_strlen and print_str */
-    if (strcmp(callee->name, "rt_strlen") == 0 || strcmp(callee->name, "print_str") == 0) {
-        fprintf(stderr, "[CALL %s] R0=%lld R16=%lld nregs=%u\n",
-                callee->name, (long long)vm->regs[0], (long long)vm->regs[16], nregs);
-    }
-
     for (uint32_t pi = 0; pi < callee->param_count && pi < Q_MAX_PARAMS; pi++) {
         vm->regs[callee->param_vregs[pi]] = vm->regs[pi];
+        if (callee->param_vregs[pi] >= vm->reg_count)
+            vm->reg_count = callee->param_vregs[pi] + 1;
     }
 
     vm->current_func = callee;
@@ -902,13 +995,12 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
             vm->func_depth--;
             vm->current_func = vm->func_stack[vm->func_depth].func;
             vm->ip           = vm->func_stack[vm->func_depth].ip;
-            vm->reg_count    = vm->func_stack[vm->func_depth].saved_reg_count;
-            if (vm->func_stack[vm->func_depth].saved_regs) {
-                for (uint32_t ri = 0; ri < vm->reg_count && ri < VREG_MAX; ri++) {
+            {
+                uint32_t nrestore = vm->func_stack[vm->func_depth].saved_reg_count;
+                for (uint32_t ri = 0; ri < nrestore; ri++)
                     vm->regs[ri] = vm->func_stack[vm->func_depth].saved_regs[ri];
-                }
-                free(vm->func_stack[vm->func_depth].saved_regs);
-                vm->func_stack[vm->func_depth].saved_regs = NULL;
+                vm->reg_count = vm->func_stack[vm->func_depth].caller_reg_count;
+                vm->func_stack[vm->func_depth].saved_reg_count = 0;
             }
             vm->regs[0] = ret_val;
             return VM_OK;
@@ -932,13 +1024,12 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
                 vm->func_depth--;
                 vm->current_func = vm->func_stack[vm->func_depth].func;
                 vm->ip           = vm->func_stack[vm->func_depth].ip;
-                vm->reg_count    = vm->func_stack[vm->func_depth].saved_reg_count;
-                if (vm->func_stack[vm->func_depth].saved_regs) {
-                    for (uint32_t ri = 0; ri < vm->reg_count && ri < VREG_MAX; ri++) {
+                {
+                    uint32_t nrestore = vm->func_stack[vm->func_depth].saved_reg_count;
+                    for (uint32_t ri = 0; ri < nrestore; ri++)
                         vm->regs[ri] = vm->func_stack[vm->func_depth].saved_regs[ri];
-                    }
-                    free(vm->func_stack[vm->func_depth].saved_regs);
-                    vm->func_stack[vm->func_depth].saved_regs = NULL;
+                    vm->reg_count = vm->func_stack[vm->func_depth].caller_reg_count;
+                    vm->func_stack[vm->func_depth].saved_reg_count = 0;
                 }
                 vm->regs[0] = ret_val;
                 return VM_OK;
@@ -949,13 +1040,12 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
         vm->func_depth--;
         vm->current_func = vm->func_stack[vm->func_depth].func;
         vm->ip           = vm->func_stack[vm->func_depth].ip;
-        vm->reg_count    = vm->func_stack[vm->func_depth].saved_reg_count;
-        if (vm->func_stack[vm->func_depth].saved_regs) {
-            for (uint32_t ri = 0; ri < vm->reg_count && ri < VREG_MAX; ri++) {
+        {
+            uint32_t nrestore = vm->func_stack[vm->func_depth].saved_reg_count;
+            for (uint32_t ri = 0; ri < nrestore; ri++)
                 vm->regs[ri] = vm->func_stack[vm->func_depth].saved_regs[ri];
-            }
-            free(vm->func_stack[vm->func_depth].saved_regs);
-            vm->func_stack[vm->func_depth].saved_regs = NULL;
+            vm->reg_count = vm->func_stack[vm->func_depth].caller_reg_count;
+            vm->func_stack[vm->func_depth].saved_reg_count = 0;
         }
         return VM_OK;
     }
@@ -1090,6 +1180,12 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         set_dest(vm, &instr->dest, (a <= b) ? 1 : 0);
         break;
 
+    case Q_CMP_NE:
+        a = operand_value(vm, &instr->src1);
+        b = operand_value(vm, &instr->src2);
+        set_dest(vm, &instr->dest, (a != b) ? 1 : 0);
+        break;
+
     /* ── Bitwise ───────────────────────────────────────── */
     case Q_AND:
         set_dest(vm, &instr->dest,
@@ -1181,8 +1277,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
             for (uint32_t ri = 0; ri < nregs; ri++) {
                 vm->regs[ri] = vm->func_stack[vm->func_depth].saved_regs[ri];
             }
-            free(vm->func_stack[vm->func_depth].saved_regs);
-            vm->func_stack[vm->func_depth].saved_regs = NULL;
+            vm->reg_count = vm->func_stack[vm->func_depth].caller_reg_count;
             vm->func_stack[vm->func_depth].saved_reg_count = 0;
             vm_apply_ref_writeback(vm, ref_bindings, ref_values, ref_count);
             /* Put return value in R0 */
@@ -2285,8 +2380,7 @@ vm_status_t vm_exec_function(vm_state_t *vm, const q_function_t *func)
                 for (uint32_t ri = 0; ri < saved_count; ri++) {
                     vm->regs[ri] = vm->func_stack[vm->func_depth].saved_regs[ri];
                 }
-                free(vm->func_stack[vm->func_depth].saved_regs);
-                vm->func_stack[vm->func_depth].saved_regs = NULL;
+                vm->reg_count = vm->func_stack[vm->func_depth].caller_reg_count;
                 vm->func_stack[vm->func_depth].saved_reg_count = 0;
                 vm_apply_ref_writeback(vm, ref_bindings, ref_values, ref_count);
                 vm->regs[0] = 0; /* overwrite with return value */

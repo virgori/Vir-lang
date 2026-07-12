@@ -44,10 +44,18 @@ static int lower_hir_tree(lower_ctx_t *ctx, hir_node_t *hir, uint32_t func_id) {
   return rc;
 }
 
+static int pipeline_lower_block(lower_ctx_t *ctx, const ast_node_t *block,
+                                uint32_t func_id);
+
 static int pipeline_lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt,
                                uint32_t func_id) {
   if (!stmt)
     return 0;
+
+  /* §5.3 var groups are synthetic AST_BLOCK nodes — lower stmt-by-stmt so
+   * tuple destructuring and other legacy-only forms are not skipped. */
+  if (stmt->type == AST_BLOCK)
+    return pipeline_lower_block(ctx, stmt, func_id);
 
   hir_node_t *hir = lower_ast_to_hir(stmt, ctx);
   if (hir) {

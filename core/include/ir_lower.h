@@ -465,6 +465,9 @@ typedef struct {
   uint32_t global_index_counter; /* next global slot index */
   uint32_t label_counter;
   uint32_t patch_counter;
+  /* Running label-id offset for pipeline stmt-by-stmt appends (avoids @L*
+   * collisions when each HIR subtree uses block ids starting at 1). */
+  uint32_t pipeline_label_base;
 
   /* Enum + record type tables (compile-time) */
   enum_type_t enum_types[ENUM_MAX_TYPES];
@@ -558,7 +561,12 @@ void lower_init(lower_ctx_t *ctx, const char *module_name);
 /* Resolve a function name to its module index (-1 if missing). */
 int lower_find_func_index(lower_ctx_t *ctx, const char *name);
 int lower_lookup_vreg(lower_ctx_t *ctx, const char *name, uint32_t *vreg);
+int lower_lookup_local_vreg(lower_ctx_t *ctx, const char *name, uint32_t *vreg);
 int lower_declare_var(lower_ctx_t *ctx, const char *name, uint32_t *vreg);
+
+/* Byte offset of field on a record-typed expression (-1 if unknown). */
+int lower_record_field_offset(lower_ctx_t *ctx, const ast_node_t *base_expr,
+                              const char *field_name);
 
 /* Lower an AST program → Q-IR module.
  * Returns 0 on success. */

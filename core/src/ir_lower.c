@@ -351,13 +351,6 @@ static uint32_t fresh_vreg(lower_ctx_t *ctx) {
  * Returns: 0 = found local, 1 = found global, -1 = not found
  * If found, *idx contains vreg (local) or global_index (global) */
 static int sym_lookup_both(lower_ctx_t *ctx, const char *name, uint32_t *idx) {
-  if (strcmp(name, "STDOUT_FD") == 0) {
-    for(int i=0; i<ctx->global_symbols.count; i++) {
-      if (strcmp(ctx->global_symbols.entries[i].name, "STDOUT_FD") == 0 || strcmp(ctx->global_symbols.entries[i].name, "STDIN_FD") == 0) {
-        printf("DEBUG SYMLOOKUP STDOUT_FD: found %s at vreg=%d\n", ctx->global_symbols.entries[i].name, ctx->global_symbols.entries[i].vreg);
-      }
-    }
-  }
   if (sym_lookup(&ctx->symbols, name, idx) == 0)
     return 0; /* local */
   if (ctx->current_func) {
@@ -570,6 +563,23 @@ int lower_lookup_vreg(lower_ctx_t *ctx, const char *name, uint32_t *vreg) {
   if (!ctx || !name)
     return -1;
   return sym_lookup_both(ctx, name, vreg);
+}
+
+int lower_lookup_local_vreg(lower_ctx_t *ctx, const char *name, uint32_t *vreg) {
+  if (!ctx || !name)
+    return -1;
+  if (sym_lookup(&ctx->symbols, name, vreg) == 0)
+    return 0;
+  if (ctx->current_func) {
+    for (uint32_t i = 0; i < ctx->current_func->param_count; i++) {
+      if (strcmp(ctx->current_func->param_names[i], name) == 0) {
+        if (vreg)
+          *vreg = ctx->current_func->param_vregs[i];
+        return 0;
+      }
+    }
+  }
+  return -1;
 }
 
 int lower_declare_var(lower_ctx_t *ctx, const char *name, uint32_t *vreg) {
@@ -902,6 +912,13 @@ static int record_field_offset_for_expr(lower_ctx_t *ctx,
   return -1;
 }
 
+int lower_record_field_offset(lower_ctx_t *ctx, const ast_node_t *base_expr,
+                              const char *field_name) {
+  if (!ctx || !base_expr || !field_name)
+    return -1;
+  return record_field_offset_for_expr(ctx, base_expr, field_name, NULL);
+}
+
 static int record_field_offset_for_symbol(lower_ctx_t *ctx,
                                           const char *symbol_name,
                                           const char *field,
@@ -1207,9 +1224,6 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
   case AST_IDENTIFIER: {
     uint32_t idx;
     int scope = sym_lookup_both(ctx, expr->name, &idx);
-    if (strcmp(expr->name, "BLOCK_HEADER") == 0) {
-        printf("[DEBUG] LOOKUP BLOCK_HEADER: scope=%d\n", scope);
-    }
 
     if (scope < 0) {
       /* §Phase-8 scoped identifier `A::B` — fold as enum access. */
@@ -1550,7 +1564,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       /* §7: Record/entity construction via parens —
        * `TypeName(field: val, ...)` desugars to record literal. */
       {
-        record_type_t *rt = find_record_type(ctx, expr->name); if (strcmp(expr->name, "VirFile") == 0) { printf("AST_RECORD_LITERAL VirFile: child_count=%d, rt->field_count=%d\n", expr->child_count, rt ? rt->field_count : -1); }
+        record_type_t *rt = find_record_type(ctx, expr->name);
         if (rt) {
           /* Allocate field_count * 8 bytes */
           uint32_t sz_r = fresh_vreg(ctx);
@@ -4676,7 +4690,8 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     emit(ctx, q_instr(Q_JUMP, q_none(), q_label(end), q_none()));
     return 0;
   }
-  case AST_CONTINUE: {
+  case AST_CONTINUE:
+  case AST_SKIP: {
     if (ctx->loop_depth == 0) {
       lower_error(ctx, stmt, "continue outside of loop");
       return -1;
@@ -4974,6 +4989,8 @@ int lower_func_def(lower_ctx_t *ctx, const ast_node_t *func_def) {
   q_instruction_t start_lbl = q_instr(Q_LABEL, q_none(), q_none(), q_none());
   start_lbl.patch_id = 0;
   emit(ctx, start_lbl);
+
+  ctx->pipeline_label_base = 0;
 
   /* Lower the body — mandatory HIR → MIR → LIR → Q-IR pipeline (Vir v2.0) */
   if (func_def->child_count > body_idx) {
@@ -5479,7 +5496,6 @@ int lower_program(lower_ctx_t *ctx, const ast_node_t *program) {
     const ast_node_t *child = program->children[i];
     if (child &&
         (child->type == AST_VAR_DECL || child->type == AST_CONST_DECL)) {
-      fprintf(stderr, "DEBUG GLOBAL VAR: name='%s' type=%d\n", child->name, child->type);
       lower_global_var(ctx, child);
     }
       else if (child && child->type == AST_PORT_DECL) {
@@ -5795,6 +5811,9 @@ int lower_tco_pass(q_function_t *func, uint32_t func_idx) {
     if ((cur->opcode == Q_CALL_FUNC || cur->opcode == Q_CALL) &&
         next->opcode == Q_RET) {
       if (cur->opcode == Q_CALL_FUNC) {
+        if (cur->src1.type != OPERAND_FUNC_IDX ||
+            cur->src1.func_idx != func_idx)
+          continue;
         cur->opcode = Q_TAILCALL_FUNC;
         cur->dest = q_none();
         cur->src2 = q_none();
@@ -5821,6 +5840,9 @@ int lower_tco_pass(q_function_t *func, uint32_t func_idx) {
           ret->src1.type == OPERAND_VREG && ret->src1.vreg == move->dest.vreg) {
 
         if (cur->opcode == Q_CALL_FUNC) {
+          if (cur->src1.type != OPERAND_FUNC_IDX ||
+              cur->src1.func_idx != func_idx)
+            continue;
           cur->opcode = Q_TAILCALL_FUNC;
           cur->dest = q_none();
           cur->src2 = q_none();

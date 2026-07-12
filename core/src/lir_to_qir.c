@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static q_operand_t map_lir_opnd(const lir_operand_t *op) {
+static q_operand_t map_lir_opnd(const lir_operand_t *op, uint32_t label_offset) {
     switch (op->type) {
     case LIR_OPND_VREG_INT:
     case LIR_OPND_VREG_FLOAT:
@@ -13,7 +13,7 @@ static q_operand_t map_lir_opnd(const lir_operand_t *op) {
     case LIR_OPND_IMM:
         return q_imm(op->as.imm);
     case LIR_OPND_LABEL:
-        return q_label((uint32_t)op->as.label_id);
+        return q_label((uint32_t)(op->as.label_id + label_offset));
     case LIR_OPND_STACK_MEM:
         return q_imm(op->as.stack_offset);
     default:
@@ -56,7 +56,7 @@ static q_opcode_t map_lir_op(lir_op_t op) {
     case LIR_CMP_EQ:
         return Q_CMP_EQ;
     case LIR_CMP_NE:
-        return Q_CMP_EQ;
+        return Q_CMP_NE;
     default:
         return Q_NOP;
     }
@@ -67,16 +67,21 @@ int lir_to_qir_append(lower_ctx_t *ctx, const lir_func_t *lir) {
         return -1;
 
     q_function_t *fn = ctx->current_func;
+    uint32_t label_offset = ctx->pipeline_label_base;
+    uint32_t max_block_id = 0;
 
     for (const lir_block_t *blk = lir->blocks; blk; blk = blk->next) {
+        if (blk->id > max_block_id)
+            max_block_id = blk->id;
+
         q_instruction_t bl = q_instr(Q_LABEL, q_none(), q_none(), q_none());
-        bl.patch_id = blk->id;
+        bl.patch_id = blk->id + label_offset;
         q_func_emit(fn, bl);
 
         for (const lir_instr_t *ins = blk->head; ins; ins = ins->next) {
             if (ins->op == LIR_PRINT) {
                 q_instruction_t pin =
-                    q_instr(Q_PRINT, q_none(), map_lir_opnd(&ins->src1), q_none());
+                    q_instr(Q_PRINT, q_none(), map_lir_opnd(&ins->src1, label_offset), q_none());
                 strncpy(pin.operand_type, "int", sizeof(pin.operand_type) - 1);
                 q_func_emit(fn, pin);
                 continue;
@@ -84,9 +89,62 @@ int lir_to_qir_append(lower_ctx_t *ctx, const lir_func_t *lir) {
 
             if (ins->op == LIR_LOAD_STRING) {
                 q_instruction_t qload =
-                    q_instr(Q_LOAD, map_lir_opnd(&ins->dst),
+                    q_instr(Q_LOAD, map_lir_opnd(&ins->dst, label_offset),
                             q_str((uint32_t)ins->src1.as.imm), q_none());
                 q_func_emit(fn, qload);
+                continue;
+            }
+
+            if (ins->op == LIR_ARG_COUNT) {
+                q_func_emit(fn, q_instr(Q_ARG_COUNT,
+                                        map_lir_opnd(&ins->dst, label_offset),
+                                        q_none(), q_none()));
+                continue;
+            }
+
+            if (ins->op == LIR_GET_ARG) {
+                q_func_emit(fn, q_instr(Q_GET_ARG,
+                                        map_lir_opnd(&ins->dst, label_offset),
+                                        map_lir_opnd(&ins->src1, label_offset),
+                                        q_none()));
+                continue;
+            }
+
+            if (ins->op == LIR_LOAD_BYTE) {
+                q_func_emit(fn, q_instr(Q_LOAD_BYTE,
+                                        map_lir_opnd(&ins->dst, label_offset),
+                                        map_lir_opnd(&ins->src1, label_offset),
+                                        map_lir_opnd(&ins->src2, label_offset)));
+                continue;
+            }
+
+            if (ins->op == LIR_STORE_BYTE) {
+                q_func_emit(fn, q_instr(Q_STORE_BYTE,
+                                        map_lir_opnd(&ins->dst, label_offset),
+                                        map_lir_opnd(&ins->src1, label_offset),
+                                        map_lir_opnd(&ins->src2, label_offset)));
+                continue;
+            }
+
+            if (ins->op == LIR_LOAD_WORD) {
+                q_func_emit(fn, q_instr(Q_LOAD_WORD,
+                                        map_lir_opnd(&ins->dst, label_offset),
+                                        map_lir_opnd(&ins->src1, label_offset),
+                                        map_lir_opnd(&ins->src2, label_offset)));
+                continue;
+            }
+
+            if (ins->op == LIR_STORE_WORD) {
+                q_func_emit(fn, q_instr(Q_STORE_WORD,
+                                        map_lir_opnd(&ins->dst, label_offset),
+                                        map_lir_opnd(&ins->src1, label_offset),
+                                        map_lir_opnd(&ins->src2, label_offset)));
+                continue;
+            }
+
+            if (ins->op == LIR_RET) {
+                q_func_emit(fn, q_instr(Q_RET, q_none(),
+                                        map_lir_opnd(&ins->dst, label_offset), q_none()));
                 continue;
             }
 
@@ -94,31 +152,33 @@ int lir_to_qir_append(lower_ctx_t *ctx, const lir_func_t *lir) {
                 q_operand_t fidx = q_func_idx((uint32_t)ins->src1.as.imm);
                 q_func_emit(fn, q_instr(Q_CALL_FUNC, q_none(), fidx, q_none()));
                 if (ins->dst.type != LIR_OPND_NONE) {
-                    q_func_emit(fn, q_instr(Q_MOVE, map_lir_opnd(&ins->dst),
+                    q_func_emit(fn, q_instr(Q_MOVE, map_lir_opnd(&ins->dst, label_offset),
                                             q_vreg(0), q_none()));
                 }
                 continue;
             }
 
             if (ins->op == LIR_JMP) {
-                q_func_emit(fn, q_instr(Q_JUMP, q_none(), map_lir_opnd(&ins->src1),
+                q_func_emit(fn, q_instr(Q_JUMP, q_none(),
+                                        map_lir_opnd(&ins->src1, label_offset),
                                         q_none()));
                 continue;
             }
 
             if (ins->op == LIR_JMP_COND) {
                 q_func_emit(fn, q_instr(Q_JUMP_IF, q_none(),
-                                        map_lir_opnd(&ins->src2),
-                                        map_lir_opnd(&ins->src1)));
+                                        map_lir_opnd(&ins->src2, label_offset),
+                                        map_lir_opnd(&ins->src1, label_offset)));
                 continue;
             }
 
             q_opcode_t qop = map_lir_op(ins->op);
-            q_func_emit(fn, q_instr(qop, map_lir_opnd(&ins->dst),
-                                    map_lir_opnd(&ins->src1),
-                                    map_lir_opnd(&ins->src2)));
+            q_func_emit(fn, q_instr(qop, map_lir_opnd(&ins->dst, label_offset),
+                                    map_lir_opnd(&ins->src1, label_offset),
+                                    map_lir_opnd(&ins->src2, label_offset)));
         }
     }
 
+    ctx->pipeline_label_base = label_offset + max_block_id;
     return 0;
 }

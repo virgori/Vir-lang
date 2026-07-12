@@ -44,7 +44,13 @@ typedef enum {
     LIR_CMP_EQ,
     LIR_CMP_GE,
     LIR_CMP_LE,
-    LIR_CMP_NE
+    LIR_CMP_NE,
+    LIR_ARG_COUNT,
+    LIR_GET_ARG,
+    LIR_LOAD_BYTE,
+    LIR_STORE_BYTE,
+    LIR_LOAD_WORD,
+    LIR_STORE_WORD
 } lir_op_t;
 
 // Operand types representing physical registers and stack memory

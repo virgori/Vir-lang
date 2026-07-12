@@ -25,6 +25,8 @@ extern "C" {
 #define VM_STACK_SIZE     4096
 #define VM_MAX_LABELS     1024
 #define VM_MAX_CALL_DEPTH 256
+/* Minimum vregs preserved across Q_CALL_FUNC (must match vm.c). */
+#define VM_CALL_SAVE_MIN  1024u
 
 #define VM_MMIO_BASE  0x1000
 #define VM_MMIO_SIZE  4096
@@ -198,8 +200,9 @@ typedef struct vm_state {
     struct { 
         const q_function_t *func; 
         uint32_t ip;
-        int64_t *saved_regs;
+        int64_t saved_regs[VM_CALL_SAVE_MIN];
         uint32_t saved_reg_count;
+        uint32_t caller_reg_count;
         int64_t ref_bindings[Q_MAX_PARAMS];
     } func_stack[VM_MAX_CALL_DEPTH];
     uint32_t        func_depth;
