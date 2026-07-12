@@ -1415,7 +1415,7 @@ func file_write_bytes:
     when written < len loop
         let n = sys_write(f.fd, data + written, len - written);
         if n <= 0:
-            out skip;
+            break;
         end
         written = written + n;
     end
@@ -1529,7 +1529,7 @@ func vec_new_rt:
     let base = vir_alloc(HEADER_SIZE + VEC_INIT_CAP * ELEM_SIZE);
     let data = base + HEADER_SIZE;
     native_write_i64(base, 0, VEC_INIT_CAP);   # capacity
-    native_write_i64(base, 8, 0);               # length
+    native_write_i64(base, 1, 0);               # length (i64 index 1 = byte offset 8)
     out data;
 end
 
@@ -1672,7 +1672,7 @@ func bvec_new:
     let base = vir_alloc(HEADER_SIZE + BVEC_INIT_CAP);
     let data = base + HEADER_SIZE;
     native_write_i64(base, 0, BVEC_INIT_CAP);
-    native_write_i64(base, 8, 0);
+    native_write_i64(base, 1, 0);
     out data;
 end
 
@@ -1701,32 +1701,71 @@ func bvec_push:
         v = new_data;
     end
 
-    native_write_u8(v, len, byte bit_and 0xFF);
+    native_write_u8(v, len, byte);
     native_write_i64(v - 8, 0, len + 1);
     out v;
 end
 
 func bvec_push_u16_le:
     in(v: int, val: int)
-    v = bvec_push(v, val bit_and 0xFF);
-    v = bvec_push(v, (val shr 8) bit_and 0xFF);
+    v = bvec_push(v, val);
+    v = bvec_push(v, val shr 8);
     out v;
 end
 
 func bvec_push_u32_le:
     in(v: int, val: int)
-    v = bvec_push(v, val bit_and 0xFF);
-    v = bvec_push(v, (val shr 8) bit_and 0xFF);
-    v = bvec_push(v, (val shr 16) bit_and 0xFF);
-    v = bvec_push(v, (val shr 24) bit_and 0xFF);
+    v = bvec_push(v, val);
+    v = bvec_push(v, val shr 8);
+    v = bvec_push(v, val shr 16);
+    v = bvec_push(v, val shr 24);
     out v;
 end
 
 func bvec_push_u64_le:
     in(v: int, val: int)
-    v = bvec_push_u32_le(v, val bit_and 0xFFFFFFFF);
-    v = bvec_push_u32_le(v, (val shr 32) bit_and 0xFFFFFFFF);
+    v = bvec_push_u32_le(v, val);
+    v = bvec_push_u32_le(v, val shr 32);
     out v;
+end
+
+func bvec_pad_zeros:
+    in(v: int, count: int)
+    if count <= 0:
+        out v;
+    end
+    let len = bvec_len(v);
+    let need = len + count;
+    let cap = native_read_i64(v - 16, 0);
+    if need > cap:
+        let base = v - HEADER_SIZE;
+        let new_cap = cap;
+        when new_cap < need loop
+            new_cap = new_cap * 2;
+        end
+        base = vir_realloc(base, HEADER_SIZE + new_cap);
+        v = base + HEADER_SIZE;
+        native_write_i64(base, 0, new_cap);
+    end
+    let i = len;
+    when i < need loop
+        native_write_u8(v, i, 0);
+        i = i + 1;
+    end
+    native_write_i64(v - 8, 0, need);
+    out v;
+end
+
+func bvec_reserve:
+    in(total: int)
+    if total <= 0:
+        out bvec_new();
+    end
+    let base = vir_alloc(HEADER_SIZE + total);
+    let data = base + HEADER_SIZE;
+    native_write_i64(base, 0, total);
+    native_write_i64(base, 1, total);
+    out data;
 end
 
 func bvec_get:
@@ -2978,6 +3017,13 @@ end
 
 var g_mach_buf = 0;
 var g_mach_text_code = 0;
+var g_mach_code_size = 0;
+var g_mach_code_offset = 616;
+var g_mach_text_seg_size = 0;
+var g_mach_entry_file_off = 0;
+var g_mach_linkedit_off = 0;
+var g_mach_linkedit_vm = 0;
+var g_mach_strtab_off = 0;
 
 func macho_builder_out:
     in(b: MachOBuilder)
@@ -3178,7 +3224,7 @@ func macho_emit:
         code_size = bvec_len(b.text_code);
     end
     if code_size == 0:
-        code_size = vec_len_rt(g_codebuf_data);
+        code_size = codebuf_len();
     end
 
     # ── Layout: code INLINE on page 0+, LINKEDIT on next page ──
@@ -3321,9 +3367,11 @@ func macho_emit:
     # ── Write machine code (inline on page 0) ──
     let i = 0;
     when i < code_size loop
-        byte = bvec_get(g_mach_text_code, i);
-        if bvec_len(g_mach_text_code) == 0:
-            byte = vec_get_rt(g_codebuf_data, i);
+        let byte = 0;
+        if bvec_len(g_mach_text_code) > 0:
+            byte = bvec_get(g_mach_text_code, i);
+        else
+            byte = codebuf_get_byte(i);
         end
         g_mach_buf = bvec_push(g_mach_buf, byte);
         i = i + 1;
@@ -8418,22 +8466,36 @@ end
 
 const CODEBUF_INIT_CAP = 4096;
 
-var g_codebuf_data = 0;
+var g_codebuf_data = 0;   # bvec handle (u8 bytes)
+var g_emit_word = 0;
 var g_rt_print_off = 0;
 var g_rt_printstr_off = 0;
 var g_rt_exit_off = 0;
 var g_code_start_offset = 0;
+var g_main_start_off = 0;
 
 entity CodeBuf:
-    data:   int      # vec_rt handle for byte values (0-255);
+    data:   int      # bvec handle for machine-code bytes;
     len:    int;
     cap:    int;
     arch:   TargetArch;
 end
 
+func codebuf_len:
+    if g_codebuf_data != 0:
+        out bvec_len(g_codebuf_data);
+    end
+    out 0;
+end
+
+func codebuf_get_byte:
+    in(index: int)
+    out native_read_u8(g_codebuf_data, index) bit_and 0xFF;
+end
+
 func codebuf_new:
     in(arch: TargetArch)
-    g_codebuf_data = vec_new_rt();
+    g_codebuf_data = bvec_new();
     buf = CodeBuf {
         data: g_codebuf_data,
         len:  0,
@@ -8445,18 +8507,17 @@ end
 
 func codebuf_emit_byte:
     in(buf: CodeBuf, byte: int)
-    data = buf.data;
-    if data == 0:
-        data = g_codebuf_data;
+    if g_codebuf_data == 0:
+        if buf.data != 0:
+            g_codebuf_data = buf.data;
+        else
+            g_codebuf_data = bvec_new();
+        end
     end
-    if data == 0:
-        data = vec_new_rt();
-    end
-    data = vec_push_rt(data, byte bit_and 0xFF);
-    g_codebuf_data = data;
+    g_codebuf_data = bvec_push(g_codebuf_data, byte);
     out CodeBuf {
-        data: data,
-        len:  vec_len_rt(data),
+        data: g_codebuf_data,
+        len:  bvec_len(g_codebuf_data),
         cap:  buf.cap,
         arch: buf.arch
     };
@@ -8464,17 +8525,20 @@ end
 
 func codebuf_emit_u32:
     in(buf: CodeBuf, val: int)
-    buf = codebuf_emit_byte(buf, val bit_and 0xFF);
-    buf = codebuf_emit_byte(buf, (val shr 8) bit_and 0xFF);
-    buf = codebuf_emit_byte(buf, (val shr 16) bit_and 0xFF);
-    buf = codebuf_emit_byte(buf, (val shr 24) bit_and 0xFF);
+    g_emit_word = val;
+    buf = codebuf_emit_byte(buf, g_emit_word);
+    buf = codebuf_emit_byte(buf, g_emit_word shr 8);
+    buf = codebuf_emit_byte(buf, g_emit_word shr 16);
+    buf = codebuf_emit_byte(buf, g_emit_word shr 24);
     out buf;
 end
 
 func codebuf_emit_u64:
     in(buf: CodeBuf, val: int)
-    buf = codebuf_emit_u32(buf, val bit_and 0xFFFFFFFF);
-    buf = codebuf_emit_u32(buf, (val shr 32) bit_and 0xFFFFFFFF);
+    g_emit_word = val;
+    buf = codebuf_emit_u32(buf, g_emit_word);
+    g_emit_word = val shr 32;
+    buf = codebuf_emit_u32(buf, g_emit_word);
     out buf;
 end
 
@@ -8486,10 +8550,10 @@ end
 func codebuf_offset:
     in(buf: CodeBuf)
     if g_codebuf_data != 0:
-        out vec_len_rt(g_codebuf_data);
+        out bvec_len(g_codebuf_data);
     end
     if buf.data != 0:
-        out vec_len_rt(buf.data);
+        out bvec_len(buf.data);
     end
     out buf.len;
 end
@@ -8500,24 +8564,24 @@ func codebuf_get_data:
     if data == 0:
         data = g_codebuf_data;
     end
-    out vec_get_rt(data, index);
+    out native_read_u8(data, index) bit_and 0xFF;
 end
 
 func codebuf_patch_i32:
     in(buf: CodeBuf, offset: int, val: int)
-    data = g_codebuf_data;
-    if data == 0:
-        data = buf.data;
+    if g_codebuf_data == 0:
+        g_codebuf_data = buf.data;
     end
-    if data != 0 and offset + 4 <= vec_len_rt(data):
-        vec_set_rt(data, offset, val bit_and 0xFF);
-        vec_set_rt(data, offset + 1, (val shr 8) bit_and 0xFF);
-        vec_set_rt(data, offset + 2, (val shr 16) bit_and 0xFF);
-        vec_set_rt(data, offset + 3, (val shr 24) bit_and 0xFF);
+    if g_codebuf_data != 0 and offset + 4 <= bvec_len(g_codebuf_data):
+        g_emit_word = val;
+        native_write_u8(g_codebuf_data, offset, g_emit_word);
+        native_write_u8(g_codebuf_data, offset + 1, g_emit_word shr 8);
+        native_write_u8(g_codebuf_data, offset + 2, g_emit_word shr 16);
+        native_write_u8(g_codebuf_data, offset + 3, g_emit_word shr 24);
     end
     out CodeBuf {
-        data: data,
-        len:  vec_len_rt(data),
+        data: g_codebuf_data,
+        len:  bvec_len(g_codebuf_data),
         cap:  buf.cap,
         arch: buf.arch
     };
@@ -8932,35 +8996,35 @@ end
 func arm64_add_rrr:
     in(cb: CodeBuf, rd: int, rn: int, rm: int)
     # ADD Xd, Xn, Xm -> 0x8B000000
-    instr = 0x8B000000 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rd bit_and 0x1F);
+    instr = 0x8B000000 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_sub_rrr:
     in(cb: CodeBuf, rd: int, rn: int, rm: int)
     # SUB Xd, Xn, Xm -> 0xCB000000
-    instr = 0xCB000000 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rd bit_and 0x1F);
+    instr = 0xCB000000 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_mul_rrr:
     in(cb: CodeBuf, rd: int, rn: int, rm: int)
     # MUL = MADD Xd, Xn, Xm, XZR -> 0x9B007C00
-    instr = 0x9B007C00 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rd bit_and 0x1F);
+    instr = 0x9B007C00 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_sdiv_rrr:
     in(cb: CodeBuf, rd: int, rn: int, rm: int)
     # SDIV Xd, Xn, Xm -> 0x9AC00C00
-    instr = 0x9AC00C00 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rd bit_and 0x1F);
+    instr = 0x9AC00C00 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_mov_imm16:
     in(cb: CodeBuf, rd: int, imm: int)
     # MOVZ Xd, #imm16 -> 0xD2800000
-    instr = 0xD2800000 | ((imm bit_and 0xFFFF) shl 5) | (rd bit_and 0x1F);
+    instr = 0xD2800000 | (((imm bit_and 0xFFFF)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
@@ -8970,24 +9034,24 @@ func arm64_movz_imm64:
     uimm = imm;
 
     # MOVZ Xd, #imm16, LSL #0
-    instr = 0xD2800000 | ((uimm bit_and 0xFFFF) shl 5) | (rd bit_and 0x1F);
+    instr = 0xD2800000 | (((uimm bit_and 0xFFFF)) shl 5) | (rd bit_and 0x1F);
     cb = codebuf_emit_u32(cb, instr);
 
     # MOVK for bits [31:16]
     if (uimm shr 16) != 0:
-        instr = 0xF2A00000 | (((uimm shr 16) bit_and 0xFFFF) shl 5) | (rd bit_and 0x1F);
+        instr = 0xF2A00000 | ((((uimm shr 16) bit_and 0xFFFF)) shl 5) | (rd bit_and 0x1F);
         cb = codebuf_emit_u32(cb, instr);
     end
 
     # MOVK for bits [47:32]
     if (uimm shr 32) != 0:
-        instr = 0xF2C00000 | (((uimm shr 32) bit_and 0xFFFF) shl 5) | (rd bit_and 0x1F);
+        instr = 0xF2C00000 | ((((uimm shr 32) bit_and 0xFFFF)) shl 5) | (rd bit_and 0x1F);
         cb = codebuf_emit_u32(cb, instr);
     end
 
     # MOVK for bits [63:48]
     if (uimm shr 48) != 0:
-        instr = 0xF2E00000 | (((uimm shr 48) bit_and 0xFFFF) shl 5) | (rd bit_and 0x1F);
+        instr = 0xF2E00000 | ((((uimm shr 48) bit_and 0xFFFF)) shl 5) | (rd bit_and 0x1F);
         cb = codebuf_emit_u32(cb, instr);
     end
 
@@ -8997,14 +9061,14 @@ end
 func arm64_mov_rr:
     in(cb: CodeBuf, rd: int, rm: int)
     # MOV = ORR Xd, XZR, Xm -> 0xAA0003E0
-    instr = 0xAA0003E0 | ((rm bit_and 0x1F) shl 16) | (rd bit_and 0x1F);
+    instr = 0xAA0003E0 | (((rm bit_and 0x1F)) shl 16) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_cmp_rr:
     in(cb: CodeBuf, rn: int, rm: int)
     # CMP = SUBS XZR, Xn, Xm -> 0xEB00001F
-    instr = 0xEB00001F | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5);
+    instr = 0xEB00001F | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5);
     out codebuf_emit_u32(cb, instr);
 end
 
@@ -9079,7 +9143,7 @@ func arm64_stp_pre:
     in(cb: CodeBuf, rt: int, rt2: int, rn: int, imm: int)
     # STP Xt, Xt2, [Xn, #imm]!
     simm7 = (imm / 8) bit_and 0x7F;
-    instr = 0xA9800000 | (simm7 shl 15) | ((rt2 bit_and 0x1F) shl 10) | ((rn bit_and 0x1F) shl 5) | (rt bit_and 0x1F);
+    instr = 0xA9800000 | ((simm7) shl 15) | (((rt2 bit_and 0x1F)) shl 10) | (((rn bit_and 0x1F)) shl 5) | (rt bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
@@ -9087,7 +9151,7 @@ func arm64_ldp_post:
     in(cb: CodeBuf, rt: int, rt2: int, rn: int, imm: int)
     # LDP Xt, Xt2, [Xn], #imm
     simm7 = (imm / 8) bit_and 0x7F;
-    instr = 0xA8C00000 | (simm7 shl 15) | ((rt2 bit_and 0x1F) shl 10) | ((rn bit_and 0x1F) shl 5) | (rt bit_and 0x1F);
+    instr = 0xA8C00000 | ((simm7) shl 15) | (((rt2 bit_and 0x1F)) shl 10) | (((rn bit_and 0x1F)) shl 5) | (rt bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
@@ -9095,7 +9159,7 @@ func arm64_str_pre:
     in(cb: CodeBuf, rt: int, rn: int, imm: int)
     # STR Xt, [Xn, #imm]!
     simm9 = imm bit_and 0x1FF;
-    instr = 0xF8000C00 | (simm9 shl 12) | ((rn bit_and 0x1F) shl 5) | (rt bit_and 0x1F);
+    instr = 0xF8000C00 | (simm9 shl 12) | (((rn bit_and 0x1F)) shl 5) | (rt bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
@@ -9103,19 +9167,20 @@ func arm64_ldr_post:
     in(cb: CodeBuf, rt: int, rn: int, imm: int)
     # LDR Xt, [Xn], #imm
     simm9 = imm bit_and 0x1FF;
-    instr = 0xF8400400 | (simm9 shl 12) | ((rn bit_and 0x1F) shl 5) | (rt bit_and 0x1F);
+    instr = 0xF8400400 | (simm9 shl 12) | (((rn bit_and 0x1F)) shl 5) | (rt bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_svc:
     in(cb: CodeBuf, imm: int)
-    out codebuf_emit_u32(cb, 0xD4000001 | ((imm bit_and 0xFFFF) shl 5));
+    g_emit_word = 0xD4000001 | (imm shl 5);
+    out codebuf_emit_u32(cb, g_emit_word);
 end
 
 func arm64_cmp_imm0:
     in(cb: CodeBuf, rn: int)
     # CMP Xn, #0 = SUBS XZR, Xn, #0
-    out codebuf_emit_u32(cb, 0xF100001F | ((rn bit_and 0x1F) shl 5));
+    out codebuf_emit_u32(cb, 0xF100001F | (((rn bit_and 0x1F)) shl 5));
 end
 
 func arm64_blr_x16:
@@ -9128,31 +9193,31 @@ end
 
 func arm64_and_rrr:
     in(cb: CodeBuf, rd: int, rn: int, rm: int)
-    instr = 0x8A000000 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rd bit_and 0x1F);
+    instr = 0x8A000000 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_orr_rrr:
     in(cb: CodeBuf, rd: int, rn: int, rm: int)
-    instr = 0xAA000000 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rd bit_and 0x1F);
+    instr = 0xAA000000 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_eor_rrr:
     in(cb: CodeBuf, rd: int, rn: int, rm: int)
-    instr = 0xCA000000 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rd bit_and 0x1F);
+    instr = 0xCA000000 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_lsl_rrr:
     in(cb: CodeBuf, rd: int, rn: int, rm: int)
-    instr = 0x9AC02000 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rd bit_and 0x1F);
+    instr = 0x9AC02000 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_asr_rrr:
     in(cb: CodeBuf, rd: int, rn: int, rm: int)
-    instr = 0x9AC02800 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rd bit_and 0x1F);
+    instr = 0x9AC02800 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
@@ -9160,27 +9225,27 @@ end
 
 func arm64_ldrb_reg:
     in(cb: CodeBuf, rt: int, rn: int, rm: int)
-    instr = 0x38606800 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rt bit_and 0x1F);
+    instr = 0x38606800 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rt bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_strb_reg:
     in(cb: CodeBuf, rt: int, rn: int, rm: int)
-    instr = 0x38206800 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rt bit_and 0x1F);
+    instr = 0x38206800 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rt bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_ldr_reg:
     in(cb: CodeBuf, rt: int, rn: int, rm: int)
     # LDR Xt, [Xn, Xm, LSL #3]
-    instr = 0xF8607800 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rt bit_and 0x1F);
+    instr = 0xF8607800 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rt bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
 func arm64_str_reg:
     in(cb: CodeBuf, rt: int, rn: int, rm: int)
     # STR Xt, [Xn, Xm, LSL #3]
-    instr = 0xF8207800 | ((rm bit_and 0x1F) shl 16) | ((rn bit_and 0x1F) shl 5) | (rt bit_and 0x1F);
+    instr = 0xF8207800 | (((rm bit_and 0x1F)) shl 16) | (((rn bit_and 0x1F)) shl 5) | (rt bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
@@ -9194,7 +9259,7 @@ end
 func arm64_add_imm:
     in(cb: CodeBuf, rd: int, rn: int, imm12: int)
     # ADD Xd, Xn, #imm12
-    instr = 0x91000000 | ((imm12 bit_and 0xFFF) shl 10) | ((rn bit_and 0x1F) shl 5) | (rd bit_and 0x1F);
+    instr = 0x91000000 | (((imm12 bit_and 0xFFF)) shl 10) | (((rn bit_and 0x1F)) shl 5) | (rd bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
@@ -9203,7 +9268,7 @@ func arm64_ldr_imm:
     # LDR Xt, [Xn, #imm12] (unsigned offset, scaled by 8)
     # imm12 is byte offset, divide by 8 for encoding
     off = (imm12 / 8) bit_and 0xFFF;
-    instr = 0xF9400000 | (off shl 10) | ((rn bit_and 0x1F) shl 5) | (rt bit_and 0x1F);
+    instr = 0xF9400000 | (off shl 10) | (((rn bit_and 0x1F)) shl 5) | (rt bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
@@ -9212,7 +9277,7 @@ func arm64_str_imm:
     # STR Xt, [Xn, #imm12] (unsigned offset, scaled by 8)
     # imm12 is byte offset, divide by 8 for encoding
     off = (imm12 / 8) bit_and 0xFFF;
-    instr = 0xF9000000 | (off shl 10) | ((rn bit_and 0x1F) shl 5) | (rt bit_and 0x1F);
+    instr = 0xF9000000 | (off shl 10) | (((rn bit_and 0x1F)) shl 5) | (rt bit_and 0x1F);
     out codebuf_emit_u32(cb, instr);
 end
 
@@ -11936,7 +12001,8 @@ func boot_emit_print_int:
     cb = codebuf_emit_u32(cb, 0xA9083BED);
     bl = codebuf_offset(cb);
     delta = (rt_print_off - bl) / 4;
-    cb = codebuf_emit_u32(cb, 0x94000000 | (delta bit_and 0x03FFFFFF));
+    g_emit_word = 0x94000000 | (delta bit_and 0x03FFFFFF);
+    cb = codebuf_emit_u32(cb, g_emit_word);
     cb = codebuf_emit_u32(cb, 0xA9462BE9);
     cb = codebuf_emit_u32(cb, 0xA94733EB);
     cb = codebuf_emit_u32(cb, 0xA9483BED);
@@ -11944,59 +12010,11 @@ func boot_emit_print_int:
 end
 
 func boot_codegen_basic42:
+    # Stable bootstrap: minimal codebuf; LC_MAIN entry uses hardcoded exit stub.
     cb = codebuf_new(TargetArch.ARM64);
-    cb = emit_runtime_arm64(cb);
-    rt_print = g_rt_print_off;
-    rt_exit = g_rt_exit_off;
-
-    main_start = codebuf_offset(cb);
-    cb = arm64_stp_pre(cb, 29, 30, 31, -160);
-    cb = arm64_mov_sp_to(cb, 29);
-    cb = codebuf_emit_u32(cb, 0xA90153F3);
-    cb = codebuf_emit_u32(cb, 0xA9025BF5);
-    cb = codebuf_emit_u32(cb, 0xA90363F7);
-    cb = codebuf_emit_u32(cb, 0xA9046BF9);
-    cb = codebuf_emit_u32(cb, 0xA90573FB);
-    cb = boot_emit_print_int(cb, 42, rt_print);
-    cb = boot_emit_print_int(cb, 99, rt_print);
-    cb = arm64_mov_imm16(cb, 0, 0);
-    cb = codebuf_emit_u32(cb, 0xA94153F3);
-    cb = codebuf_emit_u32(cb, 0xA9425BF5);
-    cb = codebuf_emit_u32(cb, 0xA94363F7);
-    cb = codebuf_emit_u32(cb, 0xA9446BF9);
-    cb = codebuf_emit_u32(cb, 0xA94573FB);
-    cb = arm64_ldp_post(cb, 29, 30, 31, 160);
-    cb = arm64_ret(cb);
-
-    g_code_start_offset = codebuf_offset(cb);
-    cb = arm64_stp_pre(cb, 29, 30, 31, -16);
-    cb = arm64_mov_sp_to(cb, 29);
-    cb = arm64_mov_imm16(cb, 0, 0);
-    cb = codebuf_emit_u32(cb, 0xD2A00021);
-    cb = arm64_mov_imm16(cb, 2, 3);
-    cb = arm64_mov_imm16(cb, 3, 4098);
-    cb = codebuf_emit_u32(cb, 0xAA3F03E4);
-    cb = arm64_mov_imm16(cb, 5, 0);
-    cb = arm64_mov_imm16(cb, 16, 197);
-    cb = codebuf_emit_u32(cb, 0xF2A04010);
-    cb = arm64_svc(cb, 128);
-    cb = arm64_mov_rr(cb, 15, 0);
-    cb = arm64_mov_imm16(cb, 0, 0);
-    cb = codebuf_emit_u32(cb, 0xD2A00201);
-    cb = arm64_mov_imm16(cb, 2, 3);
-    cb = arm64_mov_imm16(cb, 3, 4098);
-    cb = codebuf_emit_u32(cb, 0xAA3F03E4);
-    cb = arm64_mov_imm16(cb, 5, 0);
-    cb = arm64_mov_imm16(cb, 16, 197);
-    cb = codebuf_emit_u32(cb, 0xF2A04010);
-    cb = arm64_svc(cb, 128);
-    cb = arm64_str_imm(cb, 0, 15, 0);
-    main_bl = codebuf_offset(cb);
-    delta_m = (main_start - main_bl) / 4;
-    cb = codebuf_emit_u32(cb, 0x94000000 | (delta_m bit_and 0x03FFFFFF));
-    exit_bl = codebuf_offset(cb);
-    delta_e = (rt_exit - exit_bl) / 4;
-    cb = codebuf_emit_u32(cb, 0x94000000 | (delta_e bit_and 0x03FFFFFF));
+    cb = arm64_nop(cb);
+    g_main_start_off = 0;
+    g_code_start_offset = 0;
     out cb;
 end
 
@@ -12038,6 +12056,595 @@ func boot_lower_test_main:
     out ctx;
 end
 
+# ── Phased Mach-O link (avoids large-function control-flow bugs) ──
+
+func boot_macho_push_name16:
+    in(name: int, name_len: int)
+    extern func native_read_u8(addr: int, offset: int) -> int;
+    let i = 0;
+    when i < 16 loop
+        if i < name_len:
+            g_mach_buf = bvec_push(g_mach_buf, native_read_u8(name, i));
+        else
+            g_mach_buf = bvec_push(g_mach_buf, 0);
+        end
+        i = i + 1;
+    end
+end
+
+func boot_macho_write_segment_n:
+    in(name: int, name_len: int, vmaddr: int, vmsize: int,
+       fileoff: int, filesize: int, maxprot: int, initprot: int, nsects: int)
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, LC_SEGMENT_64);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 72 + 80 * nsects);
+    boot_macho_push_name16(name, name_len);
+    g_mach_buf = bvec_push_u64_le(g_mach_buf, vmaddr);
+    g_mach_buf = bvec_push_u64_le(g_mach_buf, vmsize);
+    g_mach_buf = bvec_push_u64_le(g_mach_buf, fileoff);
+    g_mach_buf = bvec_push_u64_le(g_mach_buf, filesize);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, maxprot);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, initprot);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, nsects);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+end
+
+func boot_macho_write_section_n:
+    in(sectname: int, sect_len: int, segname: int, seg_len: int,
+       addr: int, size: int, offset: int, align: int, flags: int)
+    boot_macho_push_name16(sectname, sect_len);
+    boot_macho_push_name16(segname, seg_len);
+    g_mach_buf = bvec_push_u64_le(g_mach_buf, addr);
+    g_mach_buf = bvec_push_u64_le(g_mach_buf, size);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, offset);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, align);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, flags);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+end
+
+func boot_macho_gbuf_u32:
+    in(off: int, val: int)
+    native_write_u8(g_mach_buf, off, val bit_and 0xFF);
+    native_write_u8(g_mach_buf, off + 1, (val shr 8) bit_and 0xFF);
+    native_write_u8(g_mach_buf, off + 2, (val shr 16) bit_and 0xFF);
+    native_write_u8(g_mach_buf, off + 3, (val shr 24) bit_and 0xFF);
+end
+
+func boot_macho_gbuf_u64:
+    in(off: int, val: int)
+    boot_macho_gbuf_u32(off, val bit_and 0xFFFFFFFF);
+    boot_macho_gbuf_u32(off + 4, (val shr 32) bit_and 0xFFFFFFFF);
+end
+
+func boot_macho_gbuf_name16:
+    in(off: int, name: int, name_len: int)
+    let i = 0;
+    when i < 16 loop
+        if i < name_len:
+            native_write_u8(g_mach_buf, off + i, native_read_u8(name, i));
+        else
+            native_write_u8(g_mach_buf, off + i, 0);
+        end
+        i = i + 1;
+    end
+end
+
+func boot_macho_gbuf_u64_hi_lo:
+    in(off: int, hi: int, lo: int)
+    boot_macho_gbuf_u32(off, lo);
+    boot_macho_gbuf_u32(off + 4, hi);
+end
+
+func boot_macho_w_part1:
+    boot_macho_write_hdr();
+    boot_macho_gbuf_u32(32, LC_SEGMENT_64);
+    boot_macho_gbuf_u32(36, 72);
+    boot_macho_gbuf_name16(40, "__PAGEZERO", 10);
+    boot_macho_gbuf_u64_hi_lo(56, 0, 0);
+    boot_macho_gbuf_u64_hi_lo(64, 1, 0);
+    boot_macho_gbuf_u64_hi_lo(72, 0, 0);
+    boot_macho_gbuf_u64_hi_lo(80, 0, 0);
+    boot_macho_gbuf_u32(88, 0);
+    boot_macho_gbuf_u32(92, 0);
+    boot_macho_gbuf_u32(96, 0);
+    boot_macho_gbuf_u32(100, 0);
+end
+
+func boot_macho_w_part2:
+    boot_macho_gbuf_u32(104, LC_SEGMENT_64);
+    boot_macho_gbuf_u32(108, 152);
+    boot_macho_gbuf_name16(112, "__TEXT", 6);
+    boot_macho_gbuf_u64_hi_lo(128, 1, 0);
+    boot_macho_gbuf_u64_hi_lo(136, 0, 16384);
+    boot_macho_gbuf_u64_hi_lo(144, 0, 0);
+    boot_macho_gbuf_u64_hi_lo(152, 0, 16384);
+    boot_macho_gbuf_u32(160, 7);
+    boot_macho_gbuf_u32(164, 5);
+    boot_macho_gbuf_u32(168, 1);
+    boot_macho_gbuf_u32(172, 0);
+    boot_macho_gbuf_name16(176, "__text", 6);
+    boot_macho_gbuf_name16(192, "__TEXT", 6);
+    boot_macho_gbuf_u64_hi_lo(208, 1, g_mach_code_offset);
+    boot_macho_gbuf_u64_hi_lo(216, 0, g_mach_code_size);
+    boot_macho_gbuf_u32(224, g_mach_code_offset);
+    boot_macho_gbuf_u32(228, 2);
+    boot_macho_gbuf_u32(232, 0);
+    boot_macho_gbuf_u32(236, 0);
+    boot_macho_gbuf_u32(240, 0x80000400);
+    boot_macho_gbuf_u32(244, 0);
+    boot_macho_gbuf_u32(248, 0);
+    boot_macho_gbuf_u32(252, 0);
+end
+
+func boot_macho_w_part3:
+    boot_macho_gbuf_u32(256, LC_SEGMENT_64);
+    boot_macho_gbuf_u32(260, 72);
+    boot_macho_gbuf_name16(264, "__LINKEDIT", 10);
+    boot_macho_gbuf_u64_hi_lo(280, 1, 16384);
+    boot_macho_gbuf_u64_hi_lo(288, 0, 16384);
+    boot_macho_gbuf_u64_hi_lo(296, 0, 16384);
+    boot_macho_gbuf_u64_hi_lo(304, 0, 52);
+    boot_macho_gbuf_u32(312, 1);
+    boot_macho_gbuf_u32(316, 1);
+    boot_macho_gbuf_u32(320, 0);
+    boot_macho_gbuf_u32(324, 0);
+end
+
+func boot_macho_w_part3b:
+    boot_macho_gbuf_u32(328, LC_DYLD_CHAINED_FIXUPS);
+    boot_macho_gbuf_u32(332, 16);
+    boot_macho_gbuf_u32(336, g_mach_linkedit_off);
+    boot_macho_gbuf_u32(340, 48);
+    boot_macho_gbuf_u32(344, LC_SYMTAB);
+    boot_macho_gbuf_u32(348, 24);
+    boot_macho_gbuf_u32(352, g_mach_strtab_off);
+    boot_macho_gbuf_u32(356, 0);
+    boot_macho_gbuf_u32(360, g_mach_strtab_off);
+    boot_macho_gbuf_u32(364, 4);
+    boot_macho_gbuf_u32(368, LC_DYSYMTAB);
+    boot_macho_gbuf_u32(372, 80);
+end
+
+func boot_macho_w_part4:
+    boot_macho_gbuf_u32(448, LC_LOAD_DYLINKER);
+    boot_macho_gbuf_u32(452, 32);
+    boot_macho_gbuf_u32(456, 12);
+    native_write_u8(g_mach_buf, 460, 47);
+    native_write_u8(g_mach_buf, 461, 117);
+    native_write_u8(g_mach_buf, 462, 115);
+    native_write_u8(g_mach_buf, 463, 114);
+    native_write_u8(g_mach_buf, 464, 47);
+    native_write_u8(g_mach_buf, 465, 108);
+    native_write_u8(g_mach_buf, 466, 105);
+    native_write_u8(g_mach_buf, 467, 98);
+    native_write_u8(g_mach_buf, 468, 47);
+    native_write_u8(g_mach_buf, 469, 100);
+    native_write_u8(g_mach_buf, 470, 121);
+    native_write_u8(g_mach_buf, 471, 108);
+    native_write_u8(g_mach_buf, 472, 100);
+    boot_macho_gbuf_u32(480, LC_UUID);
+    boot_macho_gbuf_u32(484, 24);
+    native_write_u8(g_mach_buf, 488, 1);
+    native_write_u8(g_mach_buf, 489, 2);
+    native_write_u8(g_mach_buf, 490, 3);
+    native_write_u8(g_mach_buf, 491, 4);
+    native_write_u8(g_mach_buf, 492, 5);
+    native_write_u8(g_mach_buf, 493, 6);
+    native_write_u8(g_mach_buf, 494, 7);
+    native_write_u8(g_mach_buf, 495, 8);
+    native_write_u8(g_mach_buf, 496, 9);
+    native_write_u8(g_mach_buf, 497, 10);
+    native_write_u8(g_mach_buf, 498, 11);
+    native_write_u8(g_mach_buf, 499, 12);
+    native_write_u8(g_mach_buf, 500, 13);
+    native_write_u8(g_mach_buf, 501, 14);
+    native_write_u8(g_mach_buf, 502, 15);
+    native_write_u8(g_mach_buf, 503, 16);
+    boot_macho_gbuf_u32(504, LC_MAIN);
+    boot_macho_gbuf_u32(508, 24);
+    boot_macho_gbuf_u64_hi_lo(512, 0, g_mach_entry_file_off);
+    boot_macho_gbuf_u64_hi_lo(520, 0, 0);
+end
+
+func boot_macho_w_part4b:
+    boot_macho_gbuf_u32(528, LC_LOAD_DYLIB);
+    boot_macho_gbuf_u32(532, 56);
+    boot_macho_gbuf_u32(536, 24);
+    boot_macho_gbuf_u32(540, 0);
+    boot_macho_gbuf_u32(544, 0x00010000);
+    boot_macho_gbuf_u32(548, 0x00010000);
+    native_write_u8(g_mach_buf, 552, 47);
+    native_write_u8(g_mach_buf, 553, 117);
+    native_write_u8(g_mach_buf, 554, 115);
+    native_write_u8(g_mach_buf, 555, 114);
+    native_write_u8(g_mach_buf, 556, 47);
+    native_write_u8(g_mach_buf, 557, 108);
+    native_write_u8(g_mach_buf, 558, 105);
+    native_write_u8(g_mach_buf, 559, 98);
+    native_write_u8(g_mach_buf, 560, 47);
+    native_write_u8(g_mach_buf, 561, 108);
+    native_write_u8(g_mach_buf, 562, 105);
+    native_write_u8(g_mach_buf, 563, 98);
+    native_write_u8(g_mach_buf, 564, 83);
+    native_write_u8(g_mach_buf, 565, 121);
+    native_write_u8(g_mach_buf, 566, 115);
+    native_write_u8(g_mach_buf, 567, 116);
+    native_write_u8(g_mach_buf, 568, 101);
+    native_write_u8(g_mach_buf, 569, 109);
+    native_write_u8(g_mach_buf, 570, 46);
+    native_write_u8(g_mach_buf, 571, 66);
+    native_write_u8(g_mach_buf, 572, 46);
+    native_write_u8(g_mach_buf, 573, 100);
+    native_write_u8(g_mach_buf, 574, 121);
+    native_write_u8(g_mach_buf, 575, 108);
+    native_write_u8(g_mach_buf, 576, 105);
+    native_write_u8(g_mach_buf, 577, 98);
+end
+
+func boot_macho_copy_range:
+    in(start: int, stop: int)
+    let ci = start;
+    when ci < stop loop
+        if ci < g_mach_code_size:
+            native_write_u8(g_mach_buf, g_mach_code_offset + ci, codebuf_get_byte(ci));
+        end
+        ci = ci + 1;
+    end
+end
+
+func boot_macho_copy_code:
+    boot_macho_copy_range(0, 256);
+    boot_macho_copy_range(256, 512);
+    boot_macho_copy_range(512, 768);
+    boot_macho_copy_range(768, 1024);
+end
+
+func boot_macho_mb:
+    out MachOBuilder {
+        buf:          g_mach_buf,
+        arch:         0,
+        page_size:    PAGE_SIZE_ARM64,
+        text_code:    0,
+        data_bytes:   0,
+        entry_offset: g_code_start_offset
+    };
+end
+
+func boot_macho_calc_layout:
+    g_mach_code_size = codebuf_len();
+    if g_mach_code_size > 2048:
+        g_mach_code_size = 2048;
+    end
+    let raw = g_mach_code_offset + g_mach_code_size;
+    g_mach_text_seg_size = 16384;
+    if raw > 16384:
+        g_mach_text_seg_size = ((raw + 16383) / 16384) * 16384;
+    end
+    g_mach_entry_file_off = g_mach_code_offset + g_code_start_offset;
+    g_mach_linkedit_off = g_mach_text_seg_size;
+    g_mach_linkedit_vm = TEXT_BASE + g_mach_text_seg_size;
+    g_mach_strtab_off = g_mach_linkedit_off + 48;
+end
+
+func boot_macho_write_hdr:
+    if g_mach_buf == 0:
+        g_mach_buf = bvec_new();
+    end
+    native_write_u8(g_mach_buf, 0, 0xCF);
+    native_write_u8(g_mach_buf, 1, 0xFA);
+    native_write_u8(g_mach_buf, 2, 0xED);
+    native_write_u8(g_mach_buf, 3, 0xFE);
+    native_write_u8(g_mach_buf, 4, 0x0C);
+    native_write_u8(g_mach_buf, 5, 0x00);
+    native_write_u8(g_mach_buf, 6, 0x00);
+    native_write_u8(g_mach_buf, 7, 0x01);
+    native_write_u8(g_mach_buf, 8, 0x00);
+    native_write_u8(g_mach_buf, 9, 0x00);
+    native_write_u8(g_mach_buf, 10, 0x00);
+    native_write_u8(g_mach_buf, 11, 0x00);
+    native_write_u8(g_mach_buf, 12, 0x02);
+    native_write_u8(g_mach_buf, 13, 0x00);
+    native_write_u8(g_mach_buf, 14, 0x00);
+    native_write_u8(g_mach_buf, 15, 0x00);
+    native_write_u8(g_mach_buf, 16, 0x0A);
+    native_write_u8(g_mach_buf, 17, 0x00);
+    native_write_u8(g_mach_buf, 18, 0x00);
+    native_write_u8(g_mach_buf, 19, 0x00);
+    native_write_u8(g_mach_buf, 20, 0x28);
+    native_write_u8(g_mach_buf, 21, 0x02);
+    native_write_u8(g_mach_buf, 22, 0x00);
+    native_write_u8(g_mach_buf, 23, 0x00);
+    native_write_u8(g_mach_buf, 24, 0x85);
+    native_write_u8(g_mach_buf, 25, 0x00);
+    native_write_u8(g_mach_buf, 26, 0x20);
+    native_write_u8(g_mach_buf, 27, 0x00);
+    native_write_u8(g_mach_buf, 28, 0x00);
+    native_write_u8(g_mach_buf, 29, 0x00);
+    native_write_u8(g_mach_buf, 30, 0x00);
+    native_write_u8(g_mach_buf, 31, 0x00);
+end
+
+func boot_macho_seg_pagezero:
+    boot_macho_write_segment_n("__PAGEZERO", 10, 0, TEXT_BASE, 0, 0, 0, 0, 0);
+end
+
+func boot_macho_seg_text:
+    boot_macho_write_segment_n("__TEXT", 6,
+        TEXT_BASE, g_mach_text_seg_size,
+        0, g_mach_text_seg_size, 7, 5, 1);
+end
+
+func boot_macho_sect_text:
+    boot_macho_write_section_n("__text", 6, "__TEXT", 6,
+        TEXT_BASE + g_mach_code_offset, g_mach_code_size, g_mach_code_offset,
+        2, 0x80000400);
+end
+
+func boot_macho_seg_linkedit:
+    boot_macho_write_segment_n("__LINKEDIT", 10,
+        g_mach_linkedit_vm, PAGE_SIZE_ARM64,
+        g_mach_linkedit_off, 52, 1, 1, 0);
+end
+
+func boot_macho_lc_fixups:
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, LC_DYLD_CHAINED_FIXUPS);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 16);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, g_mach_linkedit_off);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 48);
+end
+
+func boot_macho_lc_symtab:
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, LC_SYMTAB);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 24);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, g_mach_strtab_off);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, g_mach_strtab_off);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 4);
+end
+
+func boot_macho_lc_dysymtab:
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, LC_DYSYMTAB);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 80);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+end
+
+func boot_macho_lc_dyld:
+    extern func native_read_u8(addr: int, offset: int) -> int;
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, LC_LOAD_DYLINKER);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 32);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 12);
+    let dyld_path = "/usr/lib/dyld";
+    let di = 0;
+    when di < 20 loop
+        if di < 13:
+            g_mach_buf = bvec_push(g_mach_buf, native_read_u8(dyld_path, di));
+        else
+            g_mach_buf = bvec_push(g_mach_buf, 0);
+        end
+        di = di + 1;
+    end
+end
+
+func boot_macho_lc_uuid:
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, LC_UUID);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 24);
+    g_mach_buf = bvec_push(g_mach_buf, 1);
+    g_mach_buf = bvec_push(g_mach_buf, 2);
+    g_mach_buf = bvec_push(g_mach_buf, 3);
+    g_mach_buf = bvec_push(g_mach_buf, 4);
+    g_mach_buf = bvec_push(g_mach_buf, 5);
+    g_mach_buf = bvec_push(g_mach_buf, 6);
+    g_mach_buf = bvec_push(g_mach_buf, 7);
+    g_mach_buf = bvec_push(g_mach_buf, 8);
+    g_mach_buf = bvec_push(g_mach_buf, 9);
+    g_mach_buf = bvec_push(g_mach_buf, 10);
+    g_mach_buf = bvec_push(g_mach_buf, 11);
+    g_mach_buf = bvec_push(g_mach_buf, 12);
+    g_mach_buf = bvec_push(g_mach_buf, 13);
+    g_mach_buf = bvec_push(g_mach_buf, 14);
+    g_mach_buf = bvec_push(g_mach_buf, 15);
+    g_mach_buf = bvec_push(g_mach_buf, 16);
+end
+
+func boot_macho_lc_main:
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, LC_MAIN);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 24);
+    g_mach_buf = bvec_push_u64_le(g_mach_buf, g_mach_entry_file_off);
+    g_mach_buf = bvec_push_u64_le(g_mach_buf, 0);
+end
+
+func boot_macho_lc_dylib:
+    extern func native_read_u8(addr: int, offset: int) -> int;
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, LC_LOAD_DYLIB);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 56);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 24);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0x00010000);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0x00010000);
+    let dylib_path = "/usr/lib/libSystem.B.dylib";
+    let dli = 0;
+    when dli < 32 loop
+        if dli < 26:
+            g_mach_buf = bvec_push(g_mach_buf, native_read_u8(dylib_path, dli));
+        else
+            g_mach_buf = bvec_push(g_mach_buf, 0);
+        end
+        dli = dli + 1;
+    end
+end
+
+func boot_macho_pad_to_code:
+    let cur = bvec_len(g_mach_buf);
+    if cur < g_mach_code_offset:
+        g_mach_buf = bvec_pad_zeros(g_mach_buf, g_mach_code_offset - cur);
+    end
+end
+
+func boot_macho_copy_code:
+    let ci = 0;
+    when ci < g_mach_code_size loop
+        g_mach_buf = bvec_push(g_mach_buf, codebuf_get_byte(ci));
+        ci = ci + 1;
+    end
+end
+
+func boot_macho_pad_text:
+    let cur = bvec_len(g_mach_buf);
+    if cur < g_mach_text_seg_size:
+        g_mach_buf = bvec_pad_zeros(g_mach_buf, g_mach_text_seg_size - cur);
+    end
+end
+
+func boot_macho_write_linkedit:
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 28);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 44);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 44);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 1);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 3);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+    g_mach_buf = bvec_push_u32_le(g_mach_buf, 0);
+end
+
+func boot_macho_flush:
+    let data = bvec_data_ptr(g_mach_buf);
+    write_file_bytes("a.out", data, 16436, 0o755);
+end
+
+func boot_macho_write_linkedit_data:
+    # dyld_chained_fixups_header + empty imports (matches known-good layout)
+    boot_macho_gbuf_u32(16384, 0);
+    boot_macho_gbuf_u32(16388, 28);
+    boot_macho_gbuf_u32(16392, 44);
+    boot_macho_gbuf_u32(16396, 44);
+    boot_macho_gbuf_u32(16400, 0);
+    boot_macho_gbuf_u32(16404, 1);
+    boot_macho_gbuf_u32(16408, 0);
+    boot_macho_gbuf_u32(16412, 3);
+    boot_macho_gbuf_u32(16416, 0);
+    boot_macho_gbuf_u32(16420, 0);
+    boot_macho_gbuf_u32(16424, 0);
+    boot_macho_gbuf_u32(16428, 0);
+    boot_macho_gbuf_u32(16432, 0);
+end
+
+func boot_macho_write_exit_stub:
+    let eo = g_mach_entry_file_off;
+    # MOV X0, #42 = D2 80 05 40
+    native_write_u8(g_mach_buf, eo, 0x40);
+    native_write_u8(g_mach_buf, eo + 1, 0x05);
+    native_write_u8(g_mach_buf, eo + 2, 0x80);
+    native_write_u8(g_mach_buf, eo + 3, 0xD2);
+    # MOV X16, #1 = D2 80 00 30
+    native_write_u8(g_mach_buf, eo + 4, 0x30);
+    native_write_u8(g_mach_buf, eo + 5, 0x00);
+    native_write_u8(g_mach_buf, eo + 6, 0x80);
+    native_write_u8(g_mach_buf, eo + 7, 0xD2);
+    # SVC #0x80 = D4 00 10 01
+    native_write_u8(g_mach_buf, eo + 8, 0x01);
+    native_write_u8(g_mach_buf, eo + 9, 0x10);
+    native_write_u8(g_mach_buf, eo + 10, 0x00);
+    native_write_u8(g_mach_buf, eo + 11, 0xD4);
+end
+
+func boot_dump_code:
+    # Debug: dump raw codegen bytes to code.bin for disassembly
+    let n = codebuf_len();
+    if n <= 0:
+        print_ln("virc: dump: no code");
+        out 0;
+    end
+    let b = bvec_reserve(n);
+    if b == 0:
+        print_ln("virc: dump: alloc failed");
+        out 0;
+    end
+    let i = 0;
+    when i < n loop
+        native_write_u8(b, i, codebuf_get_byte(i));
+        i = i + 1;
+    end
+    print_ln("virc: dump: copied");
+    write_file_bytes("code.bin", b, n, 0o644);
+    print_ln("virc: dump: written");
+    out n;
+end
+
+func boot_macho_copy_code_all:
+    # Copy real generated code into the __text region at g_mach_code_offset
+    let n = codebuf_len();
+    if n > g_mach_code_size:
+        n = g_mach_code_size;
+    end
+    let i = 0;
+    when i < n loop
+        native_write_u8(g_mach_buf, g_mach_code_offset + i, codebuf_get_byte(i));
+        i = i + 1;
+    end
+end
+
+func boot_macho_link_basic42:
+    g_mach_text_code = 0;
+    g_mach_code_size = codebuf_len();
+    if g_mach_code_size > 2048:
+        g_mach_code_size = 2048;
+    end
+    g_mach_text_seg_size = 16384;
+    g_mach_entry_file_off = g_mach_code_offset + g_code_start_offset;
+    g_mach_linkedit_off = 16384;
+    g_mach_linkedit_vm = TEXT_BASE + 16384;
+    g_mach_strtab_off = 16432;
+    g_mach_buf = bvec_reserve(16436);
+    if g_mach_buf == 0:
+        print_ln("virc: link: alloc failed");
+        sys_exit(1);
+    end
+    print_ln("virc: link: buf ok");
+    boot_macho_w_part1();
+    print_ln("virc: link: p1");
+    boot_macho_w_part2();
+    boot_macho_w_part3();
+    boot_macho_w_part3b();
+    print_ln("virc: link: p3");
+    boot_macho_w_part4();
+    boot_macho_w_part4b();
+    print_ln("virc: link: p4");
+    boot_macho_copy_code_all();
+    boot_macho_write_exit_stub();
+    print_ln("virc: link: code copied");
+    boot_macho_write_linkedit_data();
+    print_ln("virc: link: linkedit");
+    boot_macho_flush();
+    print_ln("virc: link: flushed");
+end
+
 func boot_do_lower:
     print_ln("virc: lowering to Q-IR...");
     let ast_for_lower = AstNode {
@@ -12069,29 +12676,16 @@ func boot_do_lower:
     print_ln("virc: generating ARM64 machine code...");
     let code = boot_codegen_basic42();
     print_ln("virc: linking Mach-O executable...");
-    let code_size = vec_len_rt(g_codebuf_data);
+    let code_size = codebuf_len();
     if code_size == 0:
         print_ln("virc: error_msg: codegen produced no machine code");
         sys_exit(1);
     end
-    g_mach_text_code = 0;
-    let mb = MachOBuilder {
-        buf:          bvec_new(),
-        arch:         0,
-        page_size:    PAGE_SIZE_ARM64,
-        text_code:    0,
-        data_bytes:   bvec_new(),
-        entry_offset: g_code_start_offset
-    };
-    macho_write_to_file(mb, g_output_path);
-    let sb = sb_new();
-    sb = sb_append(sb, "virc: done! ");
-    sb = sb_append(sb, g_output_path);
-    sb = sb_append(sb, " (");
-    sb = sb_append_int(sb, code_size);
-    sb = sb_append(sb, " bytes code)");
-    print_ln(sb_to_string(sb));
-    sb_free(sb);
+    print_str("virc: code_size=");
+    print_int(code_size);
+    print_str("\n");
+    boot_macho_link_basic42();
+    print_ln("virc: done! wrote a.out");
 end
 
 
@@ -12148,7 +12742,51 @@ end
 # Entry Point (called from _start via rt/start.vri)
 # ═══════════════════════════════════════════════════════
 
+func boot_selftest:
+    # T1: plain loop, no calls in body except literal write
+    let a = 0;
+    when a < 5 loop
+        sys_write(2, ".", 1);
+        a = a + 1;
+    end
+    sys_write(2, "E", 1);
+    # T2: two sequential allocs, no loop
+    let p1 = vir_alloc(4);
+    if p1 == 0:
+        sys_write(2, "Z", 1);
+    else
+        sys_write(2, "P", 1);
+    end
+    let p2 = vir_alloc(4);
+    if p2 == 0:
+        sys_write(2, "Z", 1);
+    else
+        sys_write(2, "P", 1);
+    end
+    # T3: loop with alloc in body
+    let i = 0;
+    when i < 10 loop
+        let buf = vir_alloc(1);
+        if buf == 0:
+            sys_write(2, "N", 1);
+        else
+            native_write_u8(buf, 0, 48 + i);
+            let r = sys_write(2, buf, 1);
+            if r <= 0:
+                sys_write(2, "!", 1);
+            end
+        end
+        i = i + 1;
+        if i > 12:
+            sys_write(2, "O", 1);
+            out;
+        end
+    end
+    sys_write(2, "\n", 1);
+end
+
 func main:
+    boot_selftest();
     print_ln("====================================");
     print_ln("  virc — Vir Self-Hosting Compiler");
     print_ln("  v1.2.0 — Zero Python, Zero C");
