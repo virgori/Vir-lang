@@ -830,6 +830,11 @@ int main(int argc, char **argv)
             if (val[0] == 'E' || val[0] == 'W') val++;
             g_parser_diag.report_code = (uint32_t)atoi(val);
         }
+        else if (strcmp(argv[i], "--") == 0) {
+            for (i++; i < argc && prog_argc < 64; i++)
+                prog_argv[prog_argc++] = argv[i];
+            break;
+        }
         else if (!filepath) {
             filepath = argv[i];
             /* Don't add filepath itself to prog_argv — extra args start after it */

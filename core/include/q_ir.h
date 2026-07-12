@@ -41,6 +41,7 @@ typedef enum {
     Q_CMP_LT        = 0x22,
     Q_CMP_GE        = 0x23,
     Q_CMP_LE        = 0x24,
+    Q_CMP_NE        = 0x25,
 
     /* Bitwise */
     Q_AND           = 0x30,

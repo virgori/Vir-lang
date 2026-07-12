@@ -50,8 +50,19 @@ static lir_op_t map_mir_op(mir_op_t m) {
             return LIR_CMP_LE;
         case MIR_CMP_NE:
             return LIR_CMP_NE;
+        case MIR_ARG_COUNT:
+            return LIR_ARG_COUNT;
+        case MIR_GET_ARG:
+            return LIR_GET_ARG;
+        case MIR_LOAD_BYTE:
+            return LIR_LOAD_BYTE;
+        case MIR_STORE_BYTE:
+            return LIR_STORE_BYTE;
+        case MIR_LOAD_WORD:
+            return LIR_LOAD_WORD;
+        case MIR_STORE_WORD:
+            return LIR_STORE_WORD;
         case MIR_CALL:
-        case MIR_INTRINSIC:
             return LIR_CALL;
         case MIR_JUMP:
             return LIR_JMP;

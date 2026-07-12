@@ -30,7 +30,13 @@ typedef enum {
     MIR_CMP_EQ,
     MIR_CMP_GE,
     MIR_CMP_LE,
-    MIR_CMP_NE
+    MIR_CMP_NE,
+    MIR_ARG_COUNT,
+    MIR_GET_ARG,
+    MIR_LOAD_BYTE,
+    MIR_STORE_BYTE,
+    MIR_LOAD_WORD,
+    MIR_STORE_WORD
 } mir_op_t;
 
 typedef struct {

@@ -23,6 +23,7 @@ typedef enum {
     HIR_BINOP,
     HIR_VAR_DECL,
     HIR_PRINT,
+    HIR_FIELD_LOAD,
 } hir_kind_t;
 
 typedef struct hir_node {
@@ -32,6 +33,7 @@ typedef struct hir_node {
     union {
         struct {
             uint32_t intrinsic_id;
+            char callee_name[64];
             struct hir_node** args;
             uint32_t argc;
         } intrinsic_call;
@@ -76,6 +78,10 @@ typedef struct hir_node {
         struct {
             struct hir_node* value;
         } print;
+        struct {
+            struct hir_node* base;
+            int64_t offset;
+        } field_load;
     } as;
 } hir_node_t;
 
