@@ -67,16 +67,34 @@ int lir_to_qir_append(lower_ctx_t *ctx, const lir_func_t *lir) {
         return -1;
 
     q_function_t *fn = ctx->current_func;
+    /* Allocate pipeline block labels from the shared label counter so they
+     * can never collide with legacy fresh_label() ids emitted by lower_stmt
+     * fallbacks within the same function. */
     uint32_t label_offset = ctx->pipeline_label_base;
+    if (ctx->label_counter > label_offset)
+        label_offset = ctx->label_counter;
     uint32_t max_block_id = 0;
 
-    for (const lir_block_t *blk = lir->blocks; blk; blk = blk->next) {
+    for (const lir_block_t *blk = lir->blocks; blk; blk = blk->next)
         if (blk->id > max_block_id)
             max_block_id = blk->id;
 
+    /* Label placed after the whole chunk. Open blocks (no LIR_JMP/LIR_RET
+     * terminator, e.g. a loop's empty exit block or an if's merge block)
+     * must jump here explicitly: their layout position can be followed by
+     * unrelated nested blocks, so plain fallthrough would re-enter the
+     * middle of a loop or branch body. */
+    uint32_t chunk_end_label = label_offset + max_block_id + 1;
+
+    for (const lir_block_t *blk = lir->blocks; blk; blk = blk->next) {
         q_instruction_t bl = q_instr(Q_LABEL, q_none(), q_none(), q_none());
         bl.patch_id = blk->id + label_offset;
         q_func_emit(fn, bl);
+
+        const lir_instr_t *last = NULL;
+        for (const lir_instr_t *ins = blk->head; ins; ins = ins->next)
+            last = ins;
+        int has_terminator = last && (last->op == LIR_JMP || last->op == LIR_RET);
 
         for (const lir_instr_t *ins = blk->head; ins; ins = ins->next) {
             if (ins->op == LIR_PRINT) {
@@ -177,8 +195,23 @@ int lir_to_qir_append(lower_ctx_t *ctx, const lir_func_t *lir) {
                                     map_lir_opnd(&ins->src1, label_offset),
                                     map_lir_opnd(&ins->src2, label_offset)));
         }
+
+        if (!has_terminator)
+            q_func_emit(fn, q_instr(Q_JUMP, q_none(),
+                                    q_label(chunk_end_label), q_none()));
     }
 
-    ctx->pipeline_label_base = label_offset + max_block_id;
+    {
+        q_instruction_t el = q_instr(Q_LABEL, q_none(), q_none(), q_none());
+        el.patch_id = chunk_end_label;
+        q_func_emit(fn, el);
+    }
+
+    /* Next chunk starts past every label used here (blocks + chunk end),
+     * otherwise its block 0 collides with this chunk's labels and jumps
+     * resolve to the wrong instruction. */
+    ctx->pipeline_label_base = chunk_end_label + 1;
+    if (ctx->label_counter < ctx->pipeline_label_base)
+        ctx->label_counter = ctx->pipeline_label_base;
     return 0;
 }

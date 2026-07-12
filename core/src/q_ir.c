@@ -238,6 +238,9 @@ void q_module_dump(const q_module_t *mod, char *buf, size_t buf_size)
             if (instr->opcode == Q_PATCH_POINT) {
                 pos += snprintf(buf + pos, buf_size - pos, " ; patch_id=%u", instr->patch_id);
             }
+            if (instr->opcode == Q_LABEL) {
+                pos += snprintf(buf + pos, buf_size - pos, " @L%u", instr->patch_id);
+            }
             pos += snprintf(buf + pos, buf_size - pos, "\n");
         }
     }
