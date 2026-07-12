@@ -23,7 +23,7 @@ extern "C" {
  * ═══════════════════════════════════════════════════════ */
 
 #define VM_STACK_SIZE     4096
-#define VM_MAX_LABELS     1024
+#define VM_MAX_LABELS     65536
 #define VM_MAX_CALL_DEPTH 256
 /* Minimum vregs preserved across Q_CALL_FUNC (must match vm.c). */
 #define VM_CALL_SAVE_MIN  1024u
@@ -196,18 +196,28 @@ typedef struct vm_state {
     uint32_t        call_stack[VM_MAX_CALL_DEPTH];
     uint32_t        call_depth;
 
-    /* Cross-function call stack */
+    /* Cross-function call stack.
+     * Caller registers are preserved on a shared, dynamically grown flat
+     * save-stack (reg_save_stack) instead of a fixed per-frame array. The
+     * old fixed array overflowed whenever a function used more than
+     * VM_CALL_SAVE_MIN vregs (common in the self-hosting compiler), which
+     * corrupted adjacent frames — the root cause of "entity clobbering". */
     struct { 
         const q_function_t *func; 
         uint32_t ip;
-        int64_t saved_regs[VM_CALL_SAVE_MIN];
-        uint32_t saved_reg_count;
+        uint32_t saved_base;        /* offset into reg_save_stack          */
+        uint32_t saved_reg_count;   /* number of regs saved for this frame */
         uint32_t caller_reg_count;
         int64_t ref_bindings[Q_MAX_PARAMS];
     } func_stack[VM_MAX_CALL_DEPTH];
     uint32_t        func_depth;
     const q_function_t *current_func;  /* currently executing function */
     int64_t         pending_ref_bindings[Q_MAX_PARAMS];
+
+    /* Shared flat register save-stack (LIFO, grows on demand). */
+    int64_t        *reg_save_stack;
+    uint32_t        reg_save_cap;
+    uint32_t        reg_save_top;
 
     /* Global variables (shared across function calls) */
     int64_t         globals[VM_MAX_GLOBALS];
