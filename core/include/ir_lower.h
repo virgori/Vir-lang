@@ -568,6 +568,12 @@ int lower_declare_var(lower_ctx_t *ctx, const char *name, uint32_t *vreg);
 int lower_record_field_offset(lower_ctx_t *ctx, const ast_node_t *base_expr,
                               const char *field_name);
 
+/* Record the record/array type of a local `name` from its declaration
+ * annotation (`annot`, may be NULL) or initializer expression (`init`, may be
+ * NULL). Used by the HIR pipeline so entity field access resolves offsets. */
+void lower_infer_symbol_type(lower_ctx_t *ctx, const char *name,
+                             const char *annot, const ast_node_t *init);
+
 /* Lower an AST program → Q-IR module.
  * Returns 0 on success. */
 int lower_program(lower_ctx_t *ctx, const ast_node_t *program);

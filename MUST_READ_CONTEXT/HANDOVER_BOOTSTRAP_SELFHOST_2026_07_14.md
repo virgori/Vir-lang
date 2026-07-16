@@ -26,7 +26,15 @@ Pipeline expected: tokenize → parse → lower → codegen → Mach-O → `a.ou
 | Tokenize | ✅ | |
 | Parse | ✅ | `virc: parse done` |
 | Lower | ✅ | `virc: lower done` (~2 min after parse) |
-| Codegen / link | ⚠️ stub | Still uses `boot_codegen_basic42` / basic Mach-O path, not real self-AST codegen |
+| Codegen / link | ⚠️ partial | Flat-IR path (`boot_codegen_flat_min`) emits real Print/Ret for small programs; full `codegen_emit_module` still too fragile on C VM |
+
+**Codegen smoke (verified):**
+
+```bash
+./core/build/vir run virc_boot.vri -- tmp/cg_arith.vri
+codesign -s - -f a.out && ./a.out
+# expect: 30\n90\n (print immediates via flat staging → ARM64)
+```
 
 **Regression sanity (must stay green):**
 
@@ -51,12 +59,25 @@ Root theme: **C-core VM entity return/assign + stale parse scratch are unreliabl
 | String literals | Seed/use `g_mod_strings_acc` in `q_module_new`; avoid nested `ctx.mod_obj.strings` |
 | Skip during self-lower | `compile`, `virc_legacy_main` (old `print "..."` / Result / concat) still SIGSEGV the lowerer |
 
+## 3b. Field-offset + first real codegen (2026-07-17 continued)
+
+| Fix | Where | Idea |
+|-----|-------|------|
+| `Vec<T>` → `[T]` in parser | `core/src/parser.c` | Preserve element type so `vec_get_rt` can infer |
+| Element-type for `vec_get_rt` | `core/src/ir_lower.c` | `copy_expr_type_name` returns `T` from container `[T]` |
+| HIR var-decl type infer | `hir_lower.c` + `lower_infer_symbol_type` | Pipeline path previously never set `symbol.type_name` → field offsets fell back to scan-all (wrong) |
+| Flat staging codegen | `virc_boot.vri` `boot_codegen_flat_min` | Walk `g_boot_q_*` with `g_emit_word` only (multi-arg helpers clobbered on C VM) |
+| `boot_ir_*` staging | `virc_boot.vri` | Write flat arrays via `native_write_i64` / `boot_set_imm` cell — avoid 2-arg helpers |
+
+**Root-cause note (entity fields):** the bug was **not** primarily `vm.c` LoadWord/StoreWord. It was **`ir_lower.c` field-offset fallback** picking the first record type that had a matching field name when the base expression had no inferred type. The HIR pipeline also skipped record-type inference on `let` bindings.
+
 ### Still open (next)
 
-1. **Real codegen** of lowered self-AST (replace `boot_codegen_basic42`).
-2. Fix/lower legacy `compile` / `virc_legacy_main` (or delete once unused).
-3. CaseStmt / Ok-Err lowering gaps.
-4. Optional: harden C VM entity return so workarounds can shrink.
+1. Wire `print x` (Identifier) end-to-end with correct vreg/const (last-vreg fallback prints wrong var; name lookup still flaky).
+2. Grow `boot_codegen_flat_min` (Add/Sub/Mul + non-const) until it can replace the stub for self-host.
+3. Eventually run full `codegen_emit_module` once multi-arg/entity issues shrink (or under a native stage-1 binary).
+4. Fix/lower legacy `compile` / `virc_legacy_main` (or delete once unused).
+5. CaseStmt / Ok-Err lowering gaps.
 
 ---
 
@@ -64,7 +85,7 @@ Root theme: **C-core VM entity return/assign + stale parse scratch are unreliabl
 
 ```bash
 cd /Users/gengyang/Vir
-./core/build/vir run virc_boot.vri -- test_arithmetic.vri
+./core/build/vir run virc_boot.vri -- tmp/cg_arith.vri && codesign -s - -f a.out && ./a.out
 ./core/build/vir run virc_boot.vri -- virc_boot.vri
 # Watch for: parse done → lower done → done! wrote a.out
 ```
@@ -77,5 +98,7 @@ cd /Users/gengyang/Vir
 |------|------|
 | `virc_boot.vri` | Bootstrap compiler |
 | `./core/build/vir` | C host VM |
-| `core/src/vm.c` | Entity/call-frame issues |
-| `core/src/ir_lower.c` | Reference lowering |
+| `core/src/vm.c` | Interpreter (LoadWord/StoreWord OK) |
+| `core/src/ir_lower.c` | Field-offset + type inference (critical) |
+| `core/src/hir_lower.c` | HIR var-decl must call `lower_infer_symbol_type` |
+| `core/src/parser.c` | `Vec<T>` stored as `[T]` |
