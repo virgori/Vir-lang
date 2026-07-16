@@ -747,6 +747,19 @@ static int copy_expr_type_name(lower_ctx_t *ctx, const ast_node_t *expr,
     return 1;
   }
 
+  /* Element accessors over a generic container `Vec<T>` (stored as `[T]`):
+   * infer the element type from the container argument. This is what makes
+   * `f = vec_get_rt(mod.functions, i); f.body` resolve to the right offset. */
+  if (expr->type == AST_CALL && expr->name[0] && expr->child_count >= 1 &&
+      (strcmp(expr->name, "vec_get_rt") == 0 ||
+       strcmp(expr->name, "vec_get") == 0)) {
+    char cont_type[AST_NAME_LEN];
+    if (copy_expr_type_name(ctx, expr->children[0], cont_type,
+                            sizeof(cont_type)) &&
+        copy_array_element_type_name(cont_type, out, out_sz))
+      return 1;
+  }
+
   if (expr->type == AST_CALL && expr->name[0]) {
     const char *ret_type = find_func_return_type(ctx, expr->name);
     if (ret_type && ret_type[0]) {
@@ -842,6 +855,28 @@ static void symbol_infer_record_type_from_expr(lower_ctx_t *ctx,
     strncpy(ent->type_name, type_name, AST_NAME_LEN - 1);
     ent->type_name[AST_NAME_LEN - 1] = '\0';
   }
+}
+
+/* Exported for the HIR pipeline: record the (record/array) type of a local
+ * variable so later field-offset resolution can find the right offset. Mirrors
+ * the annotation/inference logic in the legacy lower_stmt VAR_DECL path — the
+ * HIR var-decl lowering otherwise never assigns a record type to the symbol,
+ * which forced entity field reads onto the ambiguous scan-all fallback. */
+void lower_infer_symbol_type(lower_ctx_t *ctx, const char *name,
+                             const char *annot, const ast_node_t *init) {
+  if (!ctx || !name || !name[0])
+    return;
+  symbol_entry_t *ent = NULL;
+  if (sym_lookup_entry_both(ctx, name, &ent, NULL) < 0 || !ent)
+    return;
+  if (ent->type_name[0])
+    return;
+  if (annot && annot[0]) {
+    strncpy(ent->type_name, annot, AST_NAME_LEN - 1);
+    ent->type_name[AST_NAME_LEN - 1] = '\0';
+    return;
+  }
+  symbol_infer_record_type_from_expr(ctx, ent, init);
 }
 
 static int infer_return_type_from_stmt(lower_ctx_t *ctx, const ast_node_t *stmt,

@@ -77,6 +77,12 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
                     lower_lookup_local_vreg(ctx->lctx, ast->name, &vreg) != 0 &&
                     lower_declare_var(ctx->lctx, ast->name, &vreg) != 0)
                     return NULL;
+                /* Record the local's record/array type so later field-access
+                 * lowering resolves offsets against the correct entity. */
+                if (ctx->lctx)
+                    lower_infer_symbol_type(
+                        ctx->lctx, ast->name, ast->name2[0] ? ast->name2 : NULL,
+                        ast->child_count > 0 ? ast->children[0] : NULL);
                 hir = hir_create_node(HIR_VAR_DECL, 0);
                 hir->as.var_decl.var_id = vreg;
                 if (ast->child_count > 0) {

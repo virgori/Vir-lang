@@ -93,6 +93,20 @@ static int match(vir_parser_t *p, vir_tok_t type) {
   return 0;
 }
 
+/* If the parser is positioned on a generic argument list `<T>` immediately
+ * after a base type identifier, rewrite `node->name2` to the array-element
+ * form `[T]`. This lets downstream element-type inference (e.g. vec_get_rt or
+ * indexing into a `Vec<T>` field) recover the element type. Non-consuming:
+ * the surrounding skip logic still consumes the `< ... >` tokens. */
+static void capture_generic_elem_type(vir_parser_t *p, ast_node_t *node) {
+  if (!node || !check(p, TOK_LT))
+    return;
+  if (p->pos + 1 < p->token_count &&
+      p->tokens[p->pos + 1].type == TOK_IDENT) {
+    snprintf(node->name2, AST_NAME_LEN, "[%s]", p->tokens[p->pos + 1].str.buf);
+  }
+}
+
 static const vir_token_t *expect(vir_parser_t *p, vir_tok_t type,
                                  const char *msg) {
   if (check(p, type))
@@ -1791,6 +1805,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
               advance(p);
             }
             /* Skip generic type params: Vec<KeywordEntry>, etc. */
+            capture_generic_elem_type(p, param);
             if (match(p, TOK_LT)) {
               int depth = 1;
               while (depth > 0 && !check(p, TOK_EOF)) {
@@ -1891,6 +1906,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
         } else if (check(p, TOK_IDENT)) {
           const vir_token_t *tt = advance(p);
           strncpy(param->name2, tt->str.buf, AST_NAME_LEN - 1);
+          capture_generic_elem_type(p, param);
         }
         /* Consume any remaining type-decoration tokens until
          * separator/closing-paren, accounting for nested generic brackets `< >`. */
@@ -2352,6 +2368,7 @@ static ast_node_t *parse_record_def(vir_parser_t *p) {
       } else if (check(p, TOK_IDENT)) {
         strncpy(field->name2, peek(p)->str.buf, AST_NAME_LEN - 1);
         advance(p);
+        capture_generic_elem_type(p, field);
       }
       while (!check(p, TOK_NEWLINE) && !check(p, TOK_END) &&
              !check(p, TOK_EOF)) {
