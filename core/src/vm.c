@@ -20,9 +20,8 @@
 #include <sys/types.h>
 #include <stdint.h>
 
-/* Minimum vregs preserved across Q_CALL_FUNC. reg_count reflects the
- * highest written vreg, but nested returns can temporarily shrink it while
- * outer locals (e.g. R17+) remain live — callees then clobber unsaved regs. */
+/* Preserve enough caller vregs across Call. Nested returns can shrink
+ * reg_count while outer locals remain live — always keep SAVE_MIN. */
 #ifndef VM_CALL_SAVE_MIN
 #define VM_CALL_SAVE_MIN  1024u
 #endif
@@ -32,9 +31,43 @@ static inline uint32_t vm_call_save_count(const vm_state_t *vm)
     uint32_t nregs = vm->reg_count;
     if (nregs < VM_CALL_SAVE_MIN)
         nregs = VM_CALL_SAVE_MIN;
+    if (vm->reg_need_by_fidx && vm->module && vm->current_func &&
+        vm->current_func >= vm->module->functions &&
+        vm->current_func < vm->module->functions + vm->module->func_count) {
+        uint32_t fidx = (uint32_t)(vm->current_func - vm->module->functions);
+        if (fidx < vm->label_by_fidx_n && vm->reg_need_by_fidx[fidx] > nregs)
+            nregs = vm->reg_need_by_fidx[fidx];
+    }
     if (nregs > VREG_MAX)
         nregs = VREG_MAX;
     return nregs;
+}
+
+static uint32_t vm_function_reg_need(const q_function_t *func)
+{
+    uint32_t max_vreg = 0;
+    int found = 0;
+    for (uint32_t pi = 0; pi < func->param_count && pi < Q_MAX_PARAMS; pi++) {
+        if (func->param_vregs[pi] > max_vreg)
+            max_vreg = func->param_vregs[pi];
+        found = 1;
+    }
+    for (uint32_t i = 0; i < func->body_count; i++) {
+        const q_instruction_t *ins = &func->body[i];
+        const q_operand_t *ops[3] = { &ins->dest, &ins->src1, &ins->src2 };
+        for (uint32_t oi = 0; oi < 3; oi++) {
+            if (ops[oi]->type == OPERAND_VREG) {
+                if (ops[oi]->vreg > max_vreg)
+                    max_vreg = ops[oi]->vreg;
+                found = 1;
+            }
+        }
+    }
+    if (!found)
+        return 1;
+    if (max_vreg >= VREG_MAX)
+        return VREG_MAX;
+    return max_vreg + 1;
 }
 
 /* Ensure the shared flat register save-stack can hold at least `need`
@@ -446,6 +479,7 @@ static void vm_clear_func_frames(vm_state_t *vm)
         vm->func_stack[i].saved_reg_count = 0;
         vm->func_stack[i].saved_base = 0;
         vm->func_stack[i].caller_reg_count = 0;
+        vm->func_stack[i].caller_regs = NULL;
         vm->func_stack[i].func = NULL;
         vm->func_stack[i].ip = 0;
     }
@@ -460,7 +494,9 @@ static void vm_clear_func_frames(vm_state_t *vm)
 void vm_init(vm_state_t *vm)
 {
     memset(vm, 0, sizeof(*vm));
+    vm->regs = vm->root_regs;
     vm->status = VM_OK;
+    vm->active_label_map = vm->label_map;
     /* §22.5 Initialize cooperative green-thread scheduler so that
      * Q_TASK_SPAWN/Q_TASK_YIELD/Q_TASK_WAIT and `await pass` are
      * operational. Safe to call repeatedly (idempotent reset). */
@@ -470,7 +506,8 @@ void vm_init(vm_state_t *vm)
 void vm_reset(vm_state_t *vm)
 {
     vm_clear_func_frames(vm);
-    memset(vm->regs, 0, sizeof(vm->regs));
+    vm->regs = vm->root_regs;
+    memset(vm->root_regs, 0, sizeof(vm->root_regs));
     vm->reg_count        = 0;
     vm->call_depth       = 0;
     vm->ip               = 0;
@@ -510,16 +547,66 @@ void vm_destroy(vm_state_t *vm)
         vm->ports[i].buf = NULL;
     }
     vm->port_count = 0;
+    /* Free label-map cache */
+    if (vm->label_by_fidx) {
+        for (uint32_t i = 0; i < vm->label_by_fidx_n; i++)
+            free(vm->label_by_fidx[i]);
+        free(vm->label_by_fidx);
+        free(vm->label_len_by_fidx);
+        free(vm->reg_need_by_fidx);
+        vm->label_by_fidx = NULL;
+        vm->label_len_by_fidx = NULL;
+        vm->reg_need_by_fidx = NULL;
+        vm->label_by_fidx_n = 0;
+    }
     /* Free shared register save-stack */
     free(vm->reg_save_stack);
     vm->reg_save_stack = NULL;
     vm->reg_save_cap = 0;
     vm->reg_save_top = 0;
+    for (uint32_t i = 0; i < VM_MAX_CALL_DEPTH; i++) {
+        free(vm->reg_windows[i]);
+        vm->reg_windows[i] = NULL;
+    }
+    vm->reg_window_size = 0;
 }
 
 void vm_set_module(vm_state_t *vm, const q_module_t *mod)
 {
+    /* Drop previous module's label caches. */
+    if (vm->label_by_fidx) {
+        for (uint32_t i = 0; i < vm->label_by_fidx_n; i++)
+            free(vm->label_by_fidx[i]);
+        free(vm->label_by_fidx);
+        free(vm->label_len_by_fidx);
+        free(vm->reg_need_by_fidx);
+        vm->label_by_fidx = NULL;
+        vm->label_len_by_fidx = NULL;
+        vm->reg_need_by_fidx = NULL;
+        vm->label_by_fidx_n = 0;
+    }
+    for (uint32_t i = 0; i < VM_MAX_CALL_DEPTH; i++) {
+        free(vm->reg_windows[i]);
+        vm->reg_windows[i] = NULL;
+    }
+    vm->reg_window_size = 0;
+    vm->regs = vm->root_regs;
     vm->module = mod;
+    if (mod && mod->func_count > 0) {
+        vm->label_by_fidx = (uint32_t **)calloc(mod->func_count, sizeof(uint32_t *));
+        vm->label_len_by_fidx = (uint32_t *)calloc(mod->func_count, sizeof(uint32_t));
+        vm->reg_need_by_fidx = (uint32_t *)calloc(mod->func_count, sizeof(uint32_t));
+        vm->label_by_fidx_n = mod->func_count;
+        if (vm->reg_need_by_fidx) {
+            uint32_t max_need = 1;
+            for (uint32_t i = 0; i < mod->func_count; i++) {
+                vm->reg_need_by_fidx[i] = vm_function_reg_need(&mod->functions[i]);
+                if (vm->reg_need_by_fidx[i] > max_need)
+                    max_need = vm->reg_need_by_fidx[i];
+            }
+            vm->reg_window_size = max_need;
+        }
+    }
 }
 
 void vm_set_args(vm_state_t *vm, int argc, const char **argv)
@@ -540,8 +627,23 @@ void vm_set_patch_handler(vm_state_t *vm, vm_patch_handler_t handler, void *ud)
 
 int vm_resolve_labels(vm_state_t *vm, const q_function_t *func)
 {
+    /* O(1) cache by function index. Each entry is a full VM_MAX_LABELS map
+     * so Jump(lid < VM_MAX_LABELS) cannot SIGBUS. Short maps were unsafe. */
+    uint32_t fidx = UINT32_MAX;
+    if (vm->module && func >= vm->module->functions &&
+        func < vm->module->functions + vm->module->func_count) {
+        fidx = (uint32_t)(func - vm->module->functions);
+    }
+    if (fidx != UINT32_MAX && fidx < vm->label_by_fidx_n &&
+        vm->label_by_fidx && vm->label_by_fidx[fidx]) {
+        vm->active_label_map = vm->label_by_fidx[fidx];
+        vm->label_count = vm->label_len_by_fidx[fidx];
+        return 0;
+    }
+
     memset(vm->label_map, 0, sizeof(vm->label_map));
     vm->label_count = 0;
+    vm->active_label_map = vm->label_map;
     uint32_t overflow_count = 0;
 
     static const q_function_t *dup_warned = NULL;
@@ -567,6 +669,18 @@ int vm_resolve_labels(vm_state_t *vm, const q_function_t *func)
     if (overflow_count > 0) {
         fprintf(stderr, "[WARN] vm_resolve_labels: %u labels exceeded VM_MAX_LABELS (%d) in function '%s' (body_count=%u)\n",
                 overflow_count, VM_MAX_LABELS, func->name, func->body_count);
+    }
+
+    if (vm->label_count > 0 && fidx != UINT32_MAX && fidx < vm->label_by_fidx_n &&
+        vm->label_by_fidx) {
+        uint32_t *cache = (uint32_t *)calloc(VM_MAX_LABELS, sizeof(uint32_t));
+        if (cache) {
+            memcpy(cache, vm->label_map, sizeof(vm->label_map));
+            free(vm->label_by_fidx[fidx]);
+            vm->label_by_fidx[fidx] = cache;
+            vm->label_len_by_fidx[fidx] = vm->label_count;
+            vm->active_label_map = cache;
+        }
     }
     return 0;
 }
@@ -966,8 +1080,22 @@ vir_intr_desc_t vir_intr_table[VIR_MAX_INTRINSICS] = {
 
 
 /* Shared dispatch used by both Q_CALL_FUNC and Q_CALL_INDIRECT.
- * Saves caller registers, copies R0..R(n-1) into callee param vregs,
- * and switches ip/current_func. */
+ * Switches to a per-depth register window, copies arguments into callee
+ * param vregs, and switches ip/current_func. Caller registers remain in
+ * their own window, so Call/return no longer memcpy the whole bank. */
+static void vm_restore_caller_window(vm_state_t *vm, uint32_t frame_index)
+{
+    /* memcpy Call path: pop saved caller regs from the flat save-stack. */
+    uint32_t nrestore = vm->func_stack[frame_index].saved_reg_count;
+    uint32_t base = vm->func_stack[frame_index].saved_base;
+    for (uint32_t ri = 0; ri < nrestore; ri++)
+        vm->regs[ri] = vm->reg_save_stack[base + ri];
+    vm->reg_save_top = base;
+    vm->reg_count = vm->func_stack[frame_index].caller_reg_count;
+    vm->func_stack[frame_index].saved_reg_count = 0;
+    vm->func_stack[frame_index].caller_regs = NULL;
+}
+
 static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
 {
     if (fidx >= vm->module->func_count) return VM_ERR_BAD_JUMP;
@@ -1009,9 +1137,12 @@ static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
     }
 
     if (vm->func_depth >= VM_MAX_CALL_DEPTH) return VM_ERR_STACK_OF;
+    /* Proven self-host Call path (green ~2 min): memcpy-save caller bank.
+     * Label maps stay O(1) via label_by_fidx cache. */
     vm->func_stack[vm->func_depth].func = vm->current_func;
     vm->func_stack[vm->func_depth].ip   = vm->ip + 1;
     vm->func_stack[vm->func_depth].caller_reg_count = vm->reg_count;
+    vm->func_stack[vm->func_depth].caller_regs = NULL;
 
     uint32_t nregs = vm_call_save_count(vm);
     if (vm_reg_save_reserve(vm, vm->reg_save_top + nregs) != 0)
@@ -1028,10 +1159,15 @@ static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
     vm->func_depth++;
     memset(vm->pending_ref_bindings, 0, sizeof(vm->pending_ref_bindings));
 
-    for (uint32_t pi = 0; pi < callee->param_count && pi < Q_MAX_PARAMS; pi++) {
-        vm->regs[callee->param_vregs[pi]] = vm->regs[pi];
-        if (callee->param_vregs[pi] >= vm->reg_count)
-            vm->reg_count = callee->param_vregs[pi] + 1;
+    {
+        int64_t args[Q_MAX_PARAMS] = {0};
+        for (uint32_t pi = 0; pi < callee->param_count && pi < Q_MAX_PARAMS; pi++)
+            args[pi] = vm->regs[pi];
+        for (uint32_t pi = 0; pi < callee->param_count && pi < Q_MAX_PARAMS; pi++) {
+            vm->regs[callee->param_vregs[pi]] = args[pi];
+            if (callee->param_vregs[pi] >= vm->reg_count)
+                vm->reg_count = callee->param_vregs[pi] + 1;
+        }
     }
 
     vm->current_func = callee;
@@ -1064,15 +1200,7 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
             vm->func_depth--;
             vm->current_func = vm->func_stack[vm->func_depth].func;
             vm->ip           = vm->func_stack[vm->func_depth].ip;
-            {
-                uint32_t nrestore = vm->func_stack[vm->func_depth].saved_reg_count;
-                uint32_t base = vm->func_stack[vm->func_depth].saved_base;
-                for (uint32_t ri = 0; ri < nrestore; ri++)
-                    vm->regs[ri] = vm->reg_save_stack[base + ri];
-                vm->reg_save_top = base;
-                vm->reg_count = vm->func_stack[vm->func_depth].caller_reg_count;
-                vm->func_stack[vm->func_depth].saved_reg_count = 0;
-            }
+            vm_restore_caller_window(vm, vm->func_depth);
             vm->regs[0] = ret_val;
             return VM_OK;
         }
@@ -1095,15 +1223,7 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
                 vm->func_depth--;
                 vm->current_func = vm->func_stack[vm->func_depth].func;
                 vm->ip           = vm->func_stack[vm->func_depth].ip;
-                {
-                    uint32_t nrestore = vm->func_stack[vm->func_depth].saved_reg_count;
-                    uint32_t base = vm->func_stack[vm->func_depth].saved_base;
-                    for (uint32_t ri = 0; ri < nrestore; ri++)
-                        vm->regs[ri] = vm->reg_save_stack[base + ri];
-                    vm->reg_save_top = base;
-                    vm->reg_count = vm->func_stack[vm->func_depth].caller_reg_count;
-                    vm->func_stack[vm->func_depth].saved_reg_count = 0;
-                }
+                vm_restore_caller_window(vm, vm->func_depth);
                 vm->regs[0] = ret_val;
                 return VM_OK;
             }
@@ -1113,23 +1233,20 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
         vm->func_depth--;
         vm->current_func = vm->func_stack[vm->func_depth].func;
         vm->ip           = vm->func_stack[vm->func_depth].ip;
-        {
-            uint32_t nrestore = vm->func_stack[vm->func_depth].saved_reg_count;
-            uint32_t base = vm->func_stack[vm->func_depth].saved_base;
-            for (uint32_t ri = 0; ri < nrestore; ri++)
-                vm->regs[ri] = vm->reg_save_stack[base + ri];
-            vm->reg_save_top = base;
-            vm->reg_count = vm->func_stack[vm->func_depth].caller_reg_count;
-            vm->func_stack[vm->func_depth].saved_reg_count = 0;
-        }
+        vm_restore_caller_window(vm, vm->func_depth);
         return VM_OK;
     }
 
 
-    /* For tail call, we reuse the current frame.
-     * Update parameter vregs for the callee. */
+    /* Tailcall: reuse frame; stage args first so param_vreg writes cannot
+     * clobber later ABI argument slots. */
+    int64_t args[Q_MAX_PARAMS] = {0};
+    for (uint32_t pi = 0; pi < callee->param_count && pi < Q_MAX_PARAMS; pi++)
+        args[pi] = vm->regs[pi];
     for (uint32_t pi = 0; pi < callee->param_count && pi < Q_MAX_PARAMS; pi++) {
-        vm->regs[callee->param_vregs[pi]] = vm->regs[pi];
+        vm->regs[callee->param_vregs[pi]] = args[pi];
+        if (callee->param_vregs[pi] >= vm->reg_count)
+            vm->reg_count = callee->param_vregs[pi] + 1;
     }
 
     /* Update ref bindings in the current frame if any were staged */
@@ -1192,7 +1309,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         break;
 
     /* ── Arithmetic ────────────────────────────────────── */
-    case Q_ADD:
+    case Q_ADD: 
         a = operand_value(vm, &instr->src1);
         b = operand_value(vm, &instr->src2);
         set_dest(vm, &instr->dest, a + b);
@@ -1287,8 +1404,8 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_JUMP:
         if (instr->src1.type == OPERAND_LABEL) {
             uint32_t lid = instr->src1.label;
-            if (lid < VM_MAX_LABELS) {
-                vm->ip = vm->label_map[lid];
+            if (lid < VM_MAX_LABELS && vm->active_label_map) {
+                vm->ip = vm->active_label_map[lid];
                 return VM_OK;
             }
         }
@@ -1297,8 +1414,9 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_JUMP_IF:
         a = operand_value(vm, &instr->src1);
         if (a != 0 && instr->src2.type == OPERAND_LABEL) {
-            if (instr->src2.label >= VM_MAX_LABELS) return VM_ERR_BAD_JUMP;
-            vm->ip = vm->label_map[instr->src2.label];
+            if (instr->src2.label >= VM_MAX_LABELS || !vm->active_label_map)
+                return VM_ERR_BAD_JUMP;
+            vm->ip = vm->active_label_map[instr->src2.label];
             return VM_OK;
         }
         break;
@@ -1306,8 +1424,9 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_JUMP_IF_NOT:
         a = operand_value(vm, &instr->src1);
         if (a == 0 && instr->src2.type == OPERAND_LABEL) {
-            if (instr->src2.label >= VM_MAX_LABELS) return VM_ERR_BAD_JUMP;
-            vm->ip = vm->label_map[instr->src2.label];
+            if (instr->src2.label >= VM_MAX_LABELS || !vm->active_label_map)
+                return VM_ERR_BAD_JUMP;
+            vm->ip = vm->active_label_map[instr->src2.label];
             return VM_OK;
         }
         break;
@@ -1317,7 +1436,9 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
             return VM_ERR_STACK_OF;
         vm->call_stack[vm->call_depth++] = vm->ip + 1;
         if (instr->src1.type == OPERAND_LABEL) {
-            vm->ip = vm->label_map[instr->src1.label];
+            if (instr->src1.label >= VM_MAX_LABELS || !vm->active_label_map)
+                return VM_ERR_BAD_JUMP;
+            vm->ip = vm->active_label_map[instr->src1.label];
             return VM_OK;
         }
         return VM_ERR_BAD_JUMP;
@@ -1349,15 +1470,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
                     ref_values[pi] = vm->regs[vm->current_func->param_vregs[pi]];
                 }
             }
-            /* Restore saved registers */
-            uint32_t nregs = vm->func_stack[vm->func_depth].saved_reg_count;
-            uint32_t rbase = vm->func_stack[vm->func_depth].saved_base;
-            for (uint32_t ri = 0; ri < nregs; ri++) {
-                vm->regs[ri] = vm->reg_save_stack[rbase + ri];
-            }
-            vm->reg_save_top = rbase;
-            vm->reg_count = vm->func_stack[vm->func_depth].caller_reg_count;
-            vm->func_stack[vm->func_depth].saved_reg_count = 0;
+            vm_restore_caller_window(vm, vm->func_depth);
             vm_apply_ref_writeback(vm, ref_bindings, ref_values, ref_count);
             /* Put return value in R0 */
             vm->regs[0] = ret_val;
@@ -1802,6 +1915,32 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_I_TO_STR: {
         char *buf = (char *)malloc(32);
         snprintf(buf, 32, "%lld", (long long)operand_value(vm, &instr->src1));
+        set_dest(vm, &instr->dest, vm_add_rt_string(vm, buf));
+        break;
+    }
+    case Q_CHAR_TO_STR: {
+        /* Convert an integer char code to a 1-character string */
+        int64_t code = operand_value(vm, &instr->src1);
+        char *buf = (char *)malloc(5); /* up to 4 UTF-8 bytes + NUL */
+        if (code < 0x80) {
+            buf[0] = (char)(code & 0x7F);
+            buf[1] = '\0';
+        } else if (code < 0x800) {
+            buf[0] = (char)(0xC0 | (code >> 6));
+            buf[1] = (char)(0x80 | (code & 0x3F));
+            buf[2] = '\0';
+        } else if (code < 0x10000) {
+            buf[0] = (char)(0xE0 | (code >> 12));
+            buf[1] = (char)(0x80 | ((code >> 6) & 0x3F));
+            buf[2] = (char)(0x80 | (code & 0x3F));
+            buf[3] = '\0';
+        } else {
+            buf[0] = (char)(0xF0 | (code >> 18));
+            buf[1] = (char)(0x80 | ((code >> 12) & 0x3F));
+            buf[2] = (char)(0x80 | ((code >> 6) & 0x3F));
+            buf[3] = (char)(0x80 | (code & 0x3F));
+            buf[4] = '\0';
+        }
         set_dest(vm, &instr->dest, vm_add_rt_string(vm, buf));
         break;
     }
@@ -2347,8 +2486,9 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         if (vm->try_sp >= sizeof(vm->try_stack) / sizeof(vm->try_stack[0]))
             return VM_ERR_STACK_OF;
         uint32_t revert_pc = 0;
-        if (instr->dest.type == OPERAND_LABEL && instr->dest.label < VM_MAX_LABELS) {
-            revert_pc = vm->label_map[instr->dest.label];
+        if (instr->dest.type == OPERAND_LABEL &&
+            instr->dest.label < VM_MAX_LABELS && vm->active_label_map) {
+            revert_pc = vm->active_label_map[instr->dest.label];
         }
         vm->try_stack[vm->try_sp].revert_pc = revert_pc;
         vm->try_stack[vm->try_sp].retry_pc  = vm->ip + 1;
@@ -2477,15 +2617,7 @@ vm_status_t vm_exec_function(vm_state_t *vm, const q_function_t *func)
                         ref_values[pi] = vm->regs[vm->current_func->param_vregs[pi]];
                     }
                 }
-                /* Restore caller's registers */
-                uint32_t saved_count = vm->func_stack[vm->func_depth].saved_reg_count;
-                uint32_t sbase = vm->func_stack[vm->func_depth].saved_base;
-                for (uint32_t ri = 0; ri < saved_count; ri++) {
-                    vm->regs[ri] = vm->reg_save_stack[sbase + ri];
-                }
-                vm->reg_save_top = sbase;
-                vm->reg_count = vm->func_stack[vm->func_depth].caller_reg_count;
-                vm->func_stack[vm->func_depth].saved_reg_count = 0;
+                vm_restore_caller_window(vm, vm->func_depth);
                 vm_apply_ref_writeback(vm, ref_bindings, ref_values, ref_count);
                 vm->regs[0] = 0; /* overwrite with return value */
                 vm->current_func = vm->func_stack[vm->func_depth].func;
@@ -2500,7 +2632,10 @@ vm_status_t vm_exec_function(vm_state_t *vm, const q_function_t *func)
         if (s == VM_HALT) {
             /* Check if we should pop the call stack */
             if (vm->func_depth > 0) {
+                int64_t ret_val = vm->regs[0];
                 vm->func_depth--;
+                vm_restore_caller_window(vm, vm->func_depth);
+                vm->regs[0] = ret_val;
                 vm->current_func = vm->func_stack[vm->func_depth].func;
                 vm->ip = vm->func_stack[vm->func_depth].ip;
                 if (vm->current_func)
