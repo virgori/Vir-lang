@@ -5245,7 +5245,10 @@ func boot_vmap_put:
     in(nm: int, vr: int)
     extern func native_write_i64(addr: int, offset: int, val: int);
     extern func native_read_i64(addr: int, offset: int) -> int;
-    if g_boot_flat_active == 0 and g_boot_small_multi == 0 do
+    # Needed for print-of-local under body-dump (self-host dump has
+    # small_multi=0; AstNode.name is unreliable on C VM so vmap is the
+    # reliable Ident→vreg path when parse scratch sets print/var names).
+    if g_boot_flat_active == 0 and g_boot_small_multi == 0 and boot_bd_dump_on() == 0 do
         out;
     end
     if g_boot_vmap_names == 0 do
@@ -5296,6 +5299,40 @@ func boot_vmap_get:
         i = i + 1;
     end
     out 0 - 1;
+end.
+
+func boot_set_binop_lhs:
+    in(nm: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 192, nm);
+end.
+
+func boot_get_binop_lhs:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if g_boot_name_cell == 0 do
+        out 0;
+    end
+    out native_read_i64(g_boot_name_cell, 192);
+end.
+
+func boot_set_binop_rhs:
+    in(nm: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 200, nm);
+end.
+
+func boot_get_binop_rhs:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if g_boot_name_cell == 0 do
+        out 0;
+    end
+    out native_read_i64(g_boot_name_cell, 200);
 end.
 
 func boot_set_imm:
@@ -6409,6 +6446,8 @@ end.
 var g_boot_blk_types = 0;
 var g_boot_blk_names = 0;
 var g_boot_blk_inits = 0;
+var g_boot_blk_lhs = 0;    # BinOp lhs Ident name (parse-time, survives C VM)
+var g_boot_blk_rhs = 0;    # BinOp rhs Ident name
 var g_boot_blk_count = 0;
 var g_snap_blk_types = 0;
 var g_snap_blk_names = 0;
@@ -6683,6 +6722,8 @@ func boot_blk_reset:
         g_boot_blk_types = heap_alloc(4096);
         g_boot_blk_names = heap_alloc(4096);
         g_boot_blk_inits = heap_alloc(4096);
+        g_boot_blk_lhs = heap_alloc(4096);
+        g_boot_blk_rhs = heap_alloc(4096);
     end
     g_boot_blk_count = 0;
 end.
@@ -6694,7 +6735,19 @@ func boot_blk_push:
     native_write_i64(g_boot_blk_types, idx * 8, stype);
     native_write_i64(g_boot_blk_names, idx * 8, sname);
     native_write_i64(g_boot_blk_inits, idx * 8, iconst);
-    g_boot_blk_count = g_boot_blk_count + 1;
+    native_write_i64(g_boot_blk_lhs, idx * 8, 0);
+    native_write_i64(g_boot_blk_rhs, idx * 8, 0);
+    g_boot_blk_count = idx + 1;
+end.
+
+func boot_blk_set_binop_ops:
+    in(idx: int, lhs: int, rhs: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_blk_lhs == 0 do
+        out;
+    end
+    native_write_i64(g_boot_blk_lhs, idx * 8, lhs);
+    native_write_i64(g_boot_blk_rhs, idx * 8, rhs);
 end.
 
 func boot_blk_types_base:
@@ -6853,6 +6906,29 @@ func parse_block:
                 end
             end
             boot_blk_push(stmt.node_type, aux_name, ic);
+            # Capture BinOp Ident operands while names are still valid (parse-time).
+            if stmt.node_type == AstType.VarDecl or stmt.node_type == AstType.ConstDecl do
+                if vec_len_rt(stmt.children) > 0 do
+                    let init_n = vec_get_rt(stmt.children, 0);
+                    if init_n.node_type == AstType.BinOp do
+                        if vec_len_rt(init_n.children) >= 2 do
+                            let lc = vec_get_rt(init_n.children, 0);
+                            let rc = vec_get_rt(init_n.children, 1);
+                            let ln = 0;
+                            let rn = 0;
+                            if lc.node_type == AstType.Identifier do
+                                ln = lc.name;
+                            end
+                            if rc.node_type == AstType.Identifier do
+                                rn = rc.name;
+                            end
+                            if ln != 0 or rn != 0 do
+                                boot_blk_set_binop_ops(g_boot_blk_count - 1, ln, rn);
+                            end
+                        end
+                    end
+                end
+            end
             block = ast_add_child(block, stmt);
             if rt_strlen(p.error_msg) > 0 do
                 out (p, block);
@@ -9340,11 +9416,43 @@ func lower_expr:
     end
 
     if expr.node_type == AstType.BinOp do
-        lhs = lower_expr(ctx, vec_get_rt(expr.children, 0));
+        lhs = 0 - 1;
+        rhs = 0 - 1;
+        let bln0 = boot_get_binop_lhs();
+        let brn0 = boot_get_binop_rhs();
+        if bln0 != 0 do
+            let pv0 = boot_vmap_get(bln0);
+            if pv0 < 0 do
+                var (bs0, bi0) = sym_lookup_both(ctx, bln0);
+                if bs0 >= 0 do
+                    pv0 = bi0 as int;
+                end
+            end
+            if pv0 >= 0 do
+                lhs = pv0;
+            end
+        end
+        if brn0 != 0 do
+            let pv1 = boot_vmap_get(brn0);
+            if pv1 < 0 do
+                var (bs1, bi1) = sym_lookup_both(ctx, brn0);
+                if bs1 >= 0 do
+                    pv1 = bi1 as int;
+                end
+            end
+            if pv1 >= 0 do
+                rhs = pv1;
+            end
+        end
+        if lhs < 0 do
+            lhs = lower_expr(ctx, vec_get_rt(expr.children, 0));
+        end
+        if rhs < 0 do
+            rhs = lower_expr(ctx, vec_get_rt(expr.children, 1));
+        end
         if lhs < 0 do
             out -1;
         end
-        rhs = lower_expr(ctx, vec_get_rt(expr.children, 1));
         if rhs < 0 do
             out -1;
         end
@@ -10048,6 +10156,12 @@ func lower_stmt:
         let pn = boot_get_print_name();
         if pn != 0 do
             let pv = boot_vmap_get(pn);
+            if pv < 0 do
+                var (pscope, pidx) = sym_lookup_both(ctx, pn);
+                if pscope >= 0 do
+                    pv = pidx as int;
+                end
+            end
             if pv >= 0 do
                 boot_set_s1v(pv);
                 boot_ir_print();
@@ -10059,6 +10173,12 @@ func lower_stmt:
         end
         if boot_bd_dump_on() != 0 do
             val = lower_expr(ctx, child);
+            if val < 0 and pn != 0 do
+                var (pscope2, pidx2) = sym_lookup_both(ctx, pn);
+                if pscope2 >= 0 do
+                    val = pidx2 as int;
+                end
+            end
             if val >= 0 do
                 boot_bd_push_print(val as int);
             end
@@ -10251,6 +10371,8 @@ func lower_stmt:
             boot_set_var_name(0);
             boot_set_print_name(0);
             boot_set_init_const(0 - 1);
+            boot_set_binop_lhs(0);
+            boot_set_binop_rhs(0);
             if use_blk == 1 do
                 let bty = native_read_i64(g_boot_blk_types, i * 8);
                 let bnm = native_read_i64(g_boot_blk_names, i * 8);
@@ -10258,6 +10380,10 @@ func lower_stmt:
                 if bty == AstType.VarDecl or bty == AstType.ConstDecl do
                     boot_set_var_name(bnm);
                     boot_set_init_const(bic);
+                    if g_boot_blk_lhs != 0 do
+                        boot_set_binop_lhs(native_read_i64(g_boot_blk_lhs, i * 8));
+                        boot_set_binop_rhs(native_read_i64(g_boot_blk_rhs, i * 8));
+                    end
                 end
                 if bty == AstType.PrintStmt do
                     boot_set_print_name(bnm);
@@ -10267,6 +10393,8 @@ func lower_stmt:
             boot_set_var_name(0);
             boot_set_print_name(0);
             boot_set_init_const(0 - 1);
+            boot_set_binop_lhs(0);
+            boot_set_binop_rhs(0);
             i = i + 1;
         end
         out 0;
@@ -15572,19 +15700,20 @@ func boot_cg_emit_bd_binop:
     if g_boot_name_cell == 0 do
         boot_name_cell_init();
     end
-    native_write_i64(g_boot_name_cell, 72, g_cg_off);
-    native_write_i64(g_boot_name_cell, 80, g_cg_imm);
-    native_write_i64(g_boot_name_cell, 88, g_cg_target);
-    native_write_i64(g_boot_name_cell, 96, g_cg_rn);
+    # Scratch MUST NOT reuse flag slots 64/72/80 (small_multi / bd_dump / bd_cap).
+    native_write_i64(g_boot_name_cell, 160, g_cg_off);
+    native_write_i64(g_boot_name_cell, 168, g_cg_imm);
+    native_write_i64(g_boot_name_cell, 176, g_cg_target);
+    native_write_i64(g_boot_name_cell, 184, g_cg_rn);
     g_cg_rd = 8;
     boot_cg_ldr_fp0();
-    g_cg_off = native_read_i64(g_boot_name_cell, 80);
+    g_cg_off = native_read_i64(g_boot_name_cell, 168);
     g_cg_rd = 9;
     boot_cg_ldr_fp0();
     g_cg_rd = 8;
     g_cg_rn = 8;
     g_cg_rm = 9;
-    g_cg_imm = native_read_i64(g_boot_name_cell, 96);
+    g_cg_imm = native_read_i64(g_boot_name_cell, 184);
     if g_cg_imm == 3 do
         boot_cg_add0();
     end
@@ -15611,7 +15740,7 @@ func boot_cg_emit_bd_binop:
         g_cg_rm = 10;
         boot_cg_sub0();
     end
-    g_cg_off = native_read_i64(g_boot_name_cell, 88);
+    g_cg_off = native_read_i64(g_boot_name_cell, 176);
     g_cg_rd = 8;
     boot_cg_str_fp0();
 end.
@@ -15695,7 +15824,9 @@ func boot_codegen_emit_mod_min:
     native_write_i64(g_boot_name_cell, 104, g_boot_rt_print);
     native_write_i64(g_boot_name_cell, 112, g_boot_rt_exit);
     if g_boot_func_tab == 0 do
-        g_boot_func_tab = heap_alloc(512);
+        # ≥1024 i64 slots — self-host dump emits hundreds of funcs; 512B (~64)
+        # overflowed and silently corrupted Call targets / main entry.
+        g_boot_func_tab = heap_alloc(8192);
     end
     g_boot_main_off = 0 - 1;
     native_write_i64(g_boot_name_cell, 120, g_boot_main_off);
