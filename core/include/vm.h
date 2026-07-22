@@ -24,8 +24,10 @@ extern "C" {
 
 #define VM_STACK_SIZE     4096
 #define VM_MAX_LABELS     65536
+#define VM_LABEL_CACHE_MAX 1024
 #define VM_MAX_CALL_DEPTH 256
-/* Minimum vregs preserved across Q_CALL_FUNC (must match vm.c). */
+/* Minimum vregs preserved across Q_CALL_FUNC. Values below ~1024 break
+ * deep bootstrap frames (parse SIGBUS / empty AST). */
 #define VM_CALL_SAVE_MIN  1024u
 
 #define VM_MMIO_BASE  0x1000
@@ -188,8 +190,11 @@ typedef struct {
 
 typedef struct vm_state {
 
-    /* Virtual registers (§2.2 – unlimited, but capped at VREG_MAX) */
-    int64_t         regs[VREG_MAX];
+    /* Virtual registers (§2.2 – unlimited, but capped at VREG_MAX).
+     * Calls switch to a per-depth register window instead of memcpy-saving
+     * the caller bank on every invocation. */
+    int64_t         root_regs[VREG_MAX];
+    int64_t        *regs;
     uint32_t        reg_count;      /* Highest vreg used + 1 */
 
     /* Stack (for call/ret - intra-function labels) */
@@ -208,6 +213,7 @@ typedef struct vm_state {
         uint32_t saved_base;        /* offset into reg_save_stack          */
         uint32_t saved_reg_count;   /* number of regs saved for this frame */
         uint32_t caller_reg_count;
+        int64_t *caller_regs;
         int64_t ref_bindings[Q_MAX_PARAMS];
     } func_stack[VM_MAX_CALL_DEPTH];
     uint32_t        func_depth;
@@ -218,6 +224,8 @@ typedef struct vm_state {
     int64_t        *reg_save_stack;
     uint32_t        reg_save_cap;
     uint32_t        reg_save_top;
+    int64_t        *reg_windows[VM_MAX_CALL_DEPTH];
+    uint32_t        reg_window_size;
 
     /* Global variables (shared across function calls) */
     int64_t         globals[VM_MAX_GLOBALS];
@@ -226,6 +234,14 @@ typedef struct vm_state {
     /* Label → instruction index mapping */
     uint32_t        label_map[VM_MAX_LABELS];
     uint32_t        label_count;
+    /* Active map used by jumps — points at label_map or a cache entry. */
+    uint32_t       *active_label_map;
+
+    /* Per-function label-map cache indexed by module function index (O(1)). */
+    uint32_t      **label_by_fidx;   /* [func_count] → map or NULL */
+    uint32_t       *label_len_by_fidx;
+    uint32_t       *reg_need_by_fidx; /* exact caller register-save span */
+    uint32_t        label_by_fidx_n;
 
     /* Instruction pointer */
     uint32_t        ip;
