@@ -743,7 +743,7 @@ end
 ### 9.3 For Range
 
 ```vir
-for i in 0..10:
+for i in 0..10 do
     print i         # prints 0 through 9
 end
 ```

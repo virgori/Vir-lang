@@ -14,13 +14,16 @@ Quá trình "Compiler tự build chính nó" đang được diễn ra và đã v
 Để đảm bảo tính ổn định và tính tương thích ngược từ nay về sau, **ngữ pháp và cú pháp của Vir được chính thức đóng băng tại phiên bản 1.0**. Mọi quy tắc dưới đây là **hợp đồng vĩnh viễn** của trình biên dịch:
 
 ### 2.1. Cấu trúc Khối (Block Structure)
-- **LOẠI BỎ hoàn toàn dấu chấm ở `end.`**: Kể từ Vir 1.0, các khối định nghĩa (`func`, `entity`, `enum`, `record`, v.v.) mở bằng `:` và **kết thúc bằng `end`** (không có dấu chấm).
-- Các khối điều khiển (`if`, `when`) mở bằng `do` và kết thúc bằng `end`.
+- **Khối định nghĩa** (`func`, `entity`, `enum`, `record`, …): mở bằng `:` và **đóng bằng `end.`** (có dấu chấm).
+- **Khối điều khiển** (`if`/`eif`, `when`, `for`, …): mở bằng `do` / `loop` tương ứng và **đóng bằng `end`** (không dấu chấm).
+  - `if cond do` … `end`
+  - `when cond loop` … `end`
+  - `for i in 0..n do` … `end`
 
 ### 2.2. Vòng lặp (Loops)
 - Vòng lặp for được chuẩn hoá với từ khoá tiếng Anh `for` (Loại bỏ hoàn toàn biến thể `với mỗi`).
-- Cú pháp chính thức: `for i in 0..len:` hoặc `for i in 0..len do`.
-- Khóa đóng lặp `loop` ở cuối định nghĩa vòng lặp đã bị loại bỏ, thay thế bằng dấu `:` hoặc `do`.
+- Cú pháp chính thức: **`for i in 0..len do`** … `end` (luôn `do`; không dùng `:` / `loop` / `;` làm opener).
+- `when cond loop` … `end` cho vòng while.
 - Từ khoá để thoát vòng lặp là `break` (loại bỏ hoàn toàn biến thể `thoát`).
 
 ### 2.3. Khai báo Hàm (Functions) — Vir v2.0
