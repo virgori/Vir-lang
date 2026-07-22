@@ -24,7 +24,7 @@
 | Lower | ✅ | Cap **400** funcs when `nfuncs > 64`; name-skip huge bodies |
 | Codegen / link | ✅ body-dump | `boot_codegen_emit_mod_min` when `g_bd_total > 0` (name-cell dump flag) |
 | Call / print-local / add@scale | ✅ | `cg_call`→42; `cg_scale70`→10/41; Call+Add under dump→30 |
-| Stage-1 `a.out` | ✅ stub main | Cap skips bodies; **always lowers `main`** with dump-safe stub; codegen **main-only** → `42` |
+| Stage-1 `a.out` | ✅ stub main | Always lowers `main` stub: **PrintStr `virc-ok` + print 42**; codegen main-only |
 
 ```bash
 ./core/build/vir run virc_boot.vri -- virc_boot.vri   # ~45s, EXIT 0
@@ -60,14 +60,15 @@
 10. Pass-1 stores **main func index** at name-cell **208** (AstNode.name unreliable for `is_main`).
 11. Self-host without dumped `main`: **skip emitting** capped bodies (they SIGBUS'd even with a trailing stub) and emit **stub main** (`print 42`).
 12. Cap still skips helpers after #400, but **always lowers `main`**: name-cell **216** = stub body, **224** = codegen main-only (not keyed on nfuncs alone — preserves `cg_scale70`).
+13. Body-dump **PrintStr (opc 41)**: min runtime includes `_rt_print_str`; stack-embed ≤15 bytes; stub main prints `virc-ok` then `42`.
 
 ---
 
 ## 4. Still open
 
-1. Grow stub `main` toward a real driver (`PrintStr` / `sys_write` / argv) then lower selected callees.
+1. Grow stub `main` / PrintStr (longer strings, argv) then lower selected callees.
 2. Raise / remove the 400-fn lower cap once bodies are safe.
-3. Grow opcode coverage in `boot_codegen_emit_mod_min` (branches, strings, more locals).
+3. Grow opcode coverage in `boot_codegen_emit_mod_min` (branches, more locals).
 4. True entity-walking `codegen_emit_module` under C VM (still unsafe).
 5. Fixed-point: Stage-1 compiles a smoke.
 
