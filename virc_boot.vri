@@ -8668,6 +8668,54 @@ func boot_bd_push_call:
     g_bd_total = ix + 1;
 end.
 
+var g_bd_strdata = 0;
+var g_bd_str_len = 0;
+
+func boot_bd_push_printstr:
+    # opc 41: PrintStr — s1i = byte offset in g_bd_strdata, s2v = length (≤15).
+    in(s: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    extern func native_write_u8(addr: int, offset: int, val: int);
+    extern func native_read_u8(addr: int, offset: int) -> int;
+    if boot_bd_dump_on() == 0 do
+        out;
+    end
+    boot_body_dump_init();
+    if g_bd_strdata == 0 do
+        g_bd_strdata = heap_alloc(4096);
+        g_bd_str_len = 0;
+    end
+    let sl = rt_strlen(s);
+    if sl < 0 do
+        sl = 0;
+    end
+    if sl > 15 do
+        sl = 15;
+    end
+    let start = g_bd_str_len;
+    if start + sl + 1 > 4000 do
+        out;
+    end
+    let i = 0;
+    when i < sl loop
+        native_write_u8(g_bd_strdata, start + i, native_read_u8(s, i));
+        i = i + 1;
+    end
+    g_bd_str_len = start + sl;
+    let ix = g_bd_total;
+    if ix >= boot_bd_cap() do
+        out;
+    end
+    native_write_i64(g_bd_opc, ix * 8, 41);
+    native_write_i64(g_bd_dv, ix * 8, 0);
+    native_write_i64(g_bd_di, ix * 8, 0);
+    native_write_i64(g_bd_s1t, ix * 8, 2);
+    native_write_i64(g_bd_s1v, ix * 8, 0);
+    native_write_i64(g_bd_s1i, ix * 8, start);
+    native_write_i64(g_bd_s2v, ix * 8, sl);
+    g_bd_total = ix + 1;
+end.
+
 func boot_q_stage_reset:
     if g_boot_q_opc == 0 do
         g_boot_q_opc = heap_alloc(4096);
@@ -10142,6 +10190,9 @@ func lower_stmt:
             var (mod2, str_idx) = q_module_add_string(ctx.mod_obj, child.name);
             ctx.mod_obj = mod2;
             ir_emit(ctx, q_instr(QOp.PrintStr, q_none(), q_str_ref(str_idx), q_none()));
+            if boot_bd_dump_on() != 0 do
+                boot_bd_push_printstr(child.name);
+            end
             out 0;
         end
         if child.node_type == AstType.LiteralInt do
@@ -10645,6 +10696,7 @@ func lower_func_def:
     end
     if stub_main != 0 and boot_bd_dump_on() != 0 do
         print_ln("virc: lower stub main body (self-host dump-safe)");
+        boot_bd_push_printstr("virc-ok");
         let sr = fresh_vreg(ctx);
         boot_bd_push_load(sr, 42);
         boot_bd_push_print(sr);
@@ -13656,6 +13708,28 @@ func emit_runtime_arm64:
     cb = codebuf_emit_u32(cb, g_emit_word);
 
     if g_runtime_min != 0 do
+        # Keep _rt_print_str in min runtime — Stage-1 stub / dump PrintStr need it.
+        g_rt_printstr_off = codebuf_offset(cb);
+        cb = arm64_stp_pre(cb, 29, 30, 31, -16);
+        cb = arm64_mov_rr(cb, 2, 1);
+        cb = arm64_mov_rr(cb, 1, 0);
+        cb = arm64_mov_imm16(cb, 0, 1);
+        cb = arm64_mov_imm16(cb, 16, 4);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = arm64_mov_imm16(cb, 17, 10);
+        cb = codebuf_emit_u32(cb, 0xD10043FF);
+        cb = codebuf_emit_u32(cb, 0x390003F1);
+        cb = arm64_mov_imm16(cb, 0, 1);
+        cb = arm64_mov_sp_to(cb, 1);
+        cb = arm64_mov_imm16(cb, 2, 1);
+        cb = arm64_mov_imm16(cb, 16, 4);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = codebuf_emit_u32(cb, 0x910043FF);
+        cb = arm64_ldp_post(cb, 29, 30, 31, 16);
+        cb = arm64_ret(cb);
+
         g_rt_exit_off = codebuf_offset(cb);
         g_emit_word = 0xD2800030;
         cb = codebuf_emit_u32(cb, g_emit_word);
@@ -15729,6 +15803,51 @@ func boot_cg_emit_bd_print:
     boot_cg_bl0();
 end.
 
+func boot_cg_emit_bd_printstr:
+    # Embed ≤15 bytes on stack; X0=sp, X1=len; BL rt_printstr.
+    # g_cg_off = start in g_bd_strdata, g_cg_imm = length.
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_read_u8(addr: int, offset: int) -> int;
+    let sl = g_cg_imm;
+    let start = g_cg_off;
+    if sl < 0 do
+        sl = 0;
+    end
+    if sl > 15 do
+        sl = 15;
+    end
+    # SUB SP, SP, #16
+    g_emit_word = 0xD10043FF;
+    boot_cg_emit_word0();
+    let i = 0;
+    when i < sl loop
+        let ch = 0;
+        if g_bd_strdata != 0 do
+            ch = native_read_u8(g_bd_strdata, start + i) bit_and 0xFF;
+        end
+        # MOVZ W8, #ch
+        g_cg_imm = ch;
+        g_cg_rd = 8;
+        boot_cg_movz0();
+        # STRB W8, [SP, #i] — 0x39000000 | (imm12<<10) | (Rn<<5) | Rt
+        g_emit_word = 0x390003E8 | ((i bit_and 0xFFF) shl 10);
+        boot_cg_emit_word0();
+        i = i + 1;
+    end
+    # MOV X0, SP
+    g_emit_word = 0x910003E0;
+    boot_cg_emit_word0();
+    # MOVZ X1, #sl
+    g_cg_imm = sl;
+    g_cg_rd = 1;
+    boot_cg_movz0();
+    g_cg_target = native_read_i64(g_boot_name_cell, 232);
+    boot_cg_bl0();
+    # ADD SP, SP, #16
+    g_emit_word = 0x910043FF;
+    boot_cg_emit_word0();
+end.
+
 func boot_cg_emit_bd_ret_v:
     # LDR x0, [fp,#slot]; epilogue — g_cg_off
     g_cg_rd = 0;
@@ -15874,6 +15993,7 @@ func boot_codegen_emit_mod_min:
     end
     native_write_i64(g_boot_name_cell, 104, g_boot_rt_print);
     native_write_i64(g_boot_name_cell, 112, g_boot_rt_exit);
+    native_write_i64(g_boot_name_cell, 232, g_rt_printstr_off);
     if g_boot_func_tab == 0 do
         # ≥1024 i64 slots — self-host dump emits hundreds of funcs; 512B (~64)
         # overflowed and silently corrupted Call targets / main entry.
@@ -15970,6 +16090,12 @@ func boot_codegen_emit_mod_min:
             if opc == 40 do
                 g_cg_off = boot_cg_slot_off(s1v);
                 boot_cg_emit_bd_print();
+            end
+
+            if opc == 41 do
+                g_cg_off = s1i;
+                g_cg_imm = s2v;
+                boot_cg_emit_bd_printstr();
             end
 
             if opc == 35 do
