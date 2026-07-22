@@ -23,11 +23,13 @@
 | Tokenize / Parse | ✅ | `for … do` via `match_block_open` |
 | Lower | ✅ | Cap **400** funcs when `nfuncs > 64`; name-skip huge bodies |
 | Codegen / link | ✅ body-dump | `boot_codegen_emit_mod_min` when `g_bd_total > 0` (name-cell dump flag) |
-| Call smokes | ✅ | `cg_arith`/`cg_call`/`cg_mod2` → expected exits |
+| Call / print-local / add@scale | ✅ | `cg_call`→42; `cg_scale70`→10/41; Call+Add under dump→30 |
+| Stage-1 `a.out` | ⚠️ | Links; bare run may SIGBUS (138); not yet a useful compiler |
 
 ```bash
 ./core/build/vir run virc_boot.vri -- virc_boot.vri   # ~45s, EXIT 0
 ./core/build/vir run virc_boot.vri -- tests/bootstrap_codegen/cg_call.vri  # → 42
+./core/build/vir run virc_boot.vri -- tests/bootstrap_codegen/cg_scale70.vri  # → 10 / 41
 ```
 
 ### Syntax contract (do not “normalize” wrongly)
@@ -51,18 +53,22 @@
    - Larger `heap_alloc` bd buffers; `boot_do_lower` uses `mod_min` when `g_bd_total > 0`
 4. **Do not** add new boot globals near the flag block — layout shift breaks Call smokes on C VM.
 5. **Do not** dual-write `ir_emit` on the bd path (entity returns clobber mid-lower).
+6. **`g_boot_func_tab`** sized **8192** (≥1024 funcs) — old 512B overflowed Call targets at scale.
+7. **`boot_vmap_put`** also active when dump-on (not only small_multi) — fixes `print x` after Call at `nfuncs>64`.
+8. Parse-time **blk lhs/rhs** Ident names for BinOp inits — fixes `let c = a + b` under dump (Ident.name clobber).
+9. Binop emit scratch moved to name-cell **160..184** — must not reuse flag slots 72/80.
 
 ---
 
 ## 4. Still open
 
 1. Raise / remove the 400-fn lower cap once remaining bodies are safe.
-2. Grow opcode coverage in `boot_codegen_emit_mod_min` (branches, locals beyond smoke set).
+2. Grow opcode coverage in `boot_codegen_emit_mod_min` (branches, strings/`sys_write`, more locals).
 3. True entity-walking `codegen_emit_module` under C VM (still unsafe).
 4. Persist entity metadata in native cells so Vec headers cannot clobber mid-lower.
-5. Prove Stage-1 `a.out` can compile a smoke (fixed-point path).
+5. Prove Stage-1 `a.out` can compile a smoke (fixed-point path) — needs I/O + fuller main.
 
-**Flat policy:** `main` only when AST kids `< 40` and dump off. **Small-multi:** `1 < nfuncs < 8`.
+**Flat policy:** `main` only when AST kids `< 40` and dump off. **Small-multi:** `1 < nfuncs < 8`. **Self-host dump:** `nfuncs > 64`.
 
 ---
 
