@@ -374,7 +374,7 @@ end.
 # Shared borrow — chỉ đọc, không tiêu thụ
 func tong_tat_ca(data: &[i32]) -> int:
     var total = 0
-    for x in data:
+    for x in data do
         total = total + x
     end
     out total
@@ -748,7 +748,7 @@ end
 ### 9.3 Vòng For phạm vi
 
 ```vir
-for i in 0..10:
+for i in 0..10 do
     print i         # in từ 0 đến 9
 end
 ```
@@ -1789,7 +1789,7 @@ list[0] = 100            # gán theo chỉ mục
 
 ```vir
 var sum = 0
-for i in 0..len(nums):
+for i in 0..len(nums) do
     sum = sum + nums[i]
 end
 print sum                # → 150
@@ -1814,7 +1814,7 @@ Khi mảng động vượt dung lượng, nó cấp phát một khối mới l�
 var data = arr_new(10000)
 
 # Hoặc compact sau khi push số lượng lớn
-for i in 0..10000:
+for i in 0..10000 do
     push(data, tinh_toan(i))
 end
 arr_compact(data)          # cấp phát lại vừa khít, khối cũ thành dead space (một lần)
@@ -1868,15 +1868,15 @@ print len(m)                       # số phần tử
 #### 20.1.3 Duyệt (Iteration)
 
 ```vir
-for k, v in ages:
+for k, v in ages do
     print("$k: $v")
 end
 
-for k in keys(ages):
+for k in keys(ages) do
     print k
 end
 
-for v in values(ages):
+for v in values(ages) do
     print v
 end
 ```
@@ -2384,7 +2384,7 @@ v~xyz |> project |> draw      # swizzle, rồi pipe qua các hàm
 deck screen: Pixel[1920 * 1080]
 
 func clear_screen:
-    for i in 0..screen.len:
+    for i in 0..screen.len do
         screen[i] = Pixel(r: 0, g: 0, b: 0)
     end
 end.
