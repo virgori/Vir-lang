@@ -24,7 +24,7 @@
 | Lower | ✅ | Cap **400** funcs when `nfuncs > 64`; name-skip huge bodies |
 | Codegen / link | ✅ body-dump | `boot_codegen_emit_mod_min` when `g_bd_total > 0` (name-cell dump flag) |
 | Call / print-local / add@scale | ✅ | `cg_call`→42; `cg_scale70`→10/41; Call+Add under dump→30 |
-| Stage-1 `a.out` | ✅ stub | Cap skips real `main` (~667); codegen skips dump bodies + emits stub `print 42` → EXIT 0 |
+| Stage-1 `a.out` | ✅ stub main | Cap skips bodies; **always lowers `main`** with dump-safe stub; codegen **main-only** → `42` |
 
 ```bash
 ./core/build/vir run virc_boot.vri -- virc_boot.vri   # ~45s, EXIT 0
