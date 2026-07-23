@@ -1765,7 +1765,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
     /* Optional in(...) parameter block */
     if (check(p, TOK_IN)) {
       advance(p); /* consume 'in' */
-      expect(p, TOK_LPAREN, "expected '(' after 'in'");
+      int has_paren = match(p, TOK_LPAREN);
 
       /* §12.5 Leading orphan separator: `in(; a:int)` */
       if (check(p, TOK_SEMICOLON) || check(p, TOK_COMMA)) {
@@ -1842,7 +1842,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
           }
         }
       }
-      expect(p, TOK_RPAREN, "expected ')' after parameters");
+      if (has_paren) match(p, TOK_RPAREN);
       if (match(p, TOK_ARROW)) {
         if (check(p, TOK_IDENT)) {
           const vir_token_t *rt = advance(p);
