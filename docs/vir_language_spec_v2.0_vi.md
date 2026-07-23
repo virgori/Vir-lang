@@ -92,9 +92,10 @@ include → import/get → const → var → entity → func → export → shar
 `include` là **nạp vật lý toàn bộ module** vào đồ thị biên dịch. Nó dùng khi muốn nhúng cả file/lib và cho phép truy cập qua namespace.
 
 ```vir
-include math;                    # nhúng math.vri
-include net.http;                # nhúng net/http.vri
-include net.http as web;         # nhúng net/http.vri, namespace cục bộ là web
+include math;                                   # nhúng math.vri
+include net.http;                               # nhúng net/http.vri
+include net.http as web;                        # nhúng net/http.vri, namespace cục bộ là web
+include math, io.file as file, net.http as web; # nhúng nhiều module trên 1 dòng với alias
 ```
 
 **Cơ chế ánh xạ:** `A.B.C` → tìm file `A/B/C.vri` từ gốc dự án.

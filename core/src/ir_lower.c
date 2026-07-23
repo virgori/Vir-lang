@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 
 /* ═══════════════════════════════════════════════════════
@@ -5193,6 +5194,38 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
   if (!ctx->include_reader)
     return 0; /* No reader → skip */
 
+  /* Flatten top-level AST_BLOCK nodes */
+  for (uint32_t i = 0; i < program->child_count; i++) {
+    ast_node_t *child = program->children[i];
+    if (child && child->type == AST_BLOCK) {
+      uint32_t n_b = child->child_count;
+      if (n_b == 0) {
+        ast_free(child);
+        for (uint32_t j = i; j + 1 < program->child_count; j++)
+          program->children[j] = program->children[j + 1];
+        program->child_count--;
+        i--;
+        continue;
+      }
+      program->children[i] = child->children[0];
+      if (n_b > 1) {
+        for (int32_t j = (int32_t)program->child_count - 1; j > (int32_t)i; j--) {
+          if (j + n_b - 1 < AST_MAX_CHILDREN) {
+            program->children[j + n_b - 1] = program->children[j];
+          }
+        }
+        for (uint32_t k = 1; k < n_b; k++) {
+          if (i + k < AST_MAX_CHILDREN) {
+            program->children[i + k] = child->children[k];
+          }
+        }
+        program->child_count += (n_b - 1);
+      }
+      free(child);
+      i--;
+    }
+  }
+
   for (uint32_t i = 0; i < program->child_count; i++) {
     ast_node_t *child = program->children[i];
     if (!child || child->type != AST_INCLUDE)
@@ -5356,6 +5389,9 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
  */
 
 static int is_module_known(const ast_node_t *program, const char *module_name) {
+  if (module_name && access(module_name, F_OK) == 0) {
+    return 1;
+  }
   for (uint32_t i = 0; i < program->child_count; i++) {
     const ast_node_t *c = program->children[i];
     if (c && c->type == AST_MODULE && strcmp(c->name, module_name) == 0) {
@@ -5475,7 +5511,7 @@ int lower_program(lower_ctx_t *ctx, const ast_node_t *program) {
     const ast_node_t *child = program->children[i];
     if (!child)
       continue;
-    if (strcmp(child->name, "vec_push") == 0) printf("[DEBUG] FOUND VEC_PUSH IN AST!\n");
+    /* if (strcmp(child->name, "vec_push") == 0) printf("[DEBUG] FOUND VEC_PUSH IN AST!\n"); */
 
     if (child->type == AST_FUNC_DEF) {
       infer_func_return_type(ctx, child);
@@ -5500,7 +5536,7 @@ int lower_program(lower_ctx_t *ctx, const ast_node_t *program) {
     const ast_node_t *child = program->children[i];
     if (!child)
       continue;
-    if (strcmp(child->name, "vec_push") == 0) printf("[DEBUG] FOUND VEC_PUSH IN AST!\n");
+    /* if (strcmp(child->name, "vec_push") == 0) printf("[DEBUG] FOUND VEC_PUSH IN AST!\n"); */
 
     if (child->type == AST_FUNC_DEF) {
       q_module_add_func(&ctx->module, child->name);

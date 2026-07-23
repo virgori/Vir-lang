@@ -3714,63 +3714,74 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     return block;
   }
   case TOK_INCLUDE: {
-    /* include "filename"  OR  include path::to::module; (§3.2) */
+    /* include math, io.file as file, net.http as web; (§3.2) */
     advance(p);
-    ast_node_t *n = ast_new(AST_INCLUDE);
-    n->line = t->line;
-    if (check(p, TOK_STRING)) {
-      const vir_token_t *file = advance(p);
-      strncpy(n->name, file->str.buf, AST_NAME_LEN - 1);
-      match(p, TOK_SEMICOLON);
-    } else if (is_name_token(peek(p)->type)) {
-      /* dotted / namespaced path: A::B::C  or  a.b.c */
-      size_t pos = 0;
-      while (is_name_token(peek(p)->type)) {
-        const vir_token_t *seg = advance(p);
-        size_t n_seg = strlen(seg->str.buf);
-        if (pos + n_seg + 2 >= AST_NAME_LEN)
-          break;
-        memcpy(n->name + pos, seg->str.buf, n_seg);
-        pos += n_seg;
-        /* Accept `::` (two COLONs) or `.` as separator. */
-        if (check(p, TOK_COLON)) {
-          const vir_token_t *nxt =
-              (p->pos + 1 < p->token_count) ? &p->tokens[p->pos + 1] : NULL;
-          if (nxt && nxt->type == TOK_COLON) {
-            advance(p);
-            advance(p);
-            if (pos + 2 < AST_NAME_LEN) {
-              n->name[pos++] = ':';
-              n->name[pos++] = ':';
+    ast_node_t *block = ast_new(AST_BLOCK);
+    block->line = t->line;
+    for (;;) {
+      ast_node_t *n = ast_new(AST_INCLUDE);
+      n->line = peek(p)->line;
+      if (check(p, TOK_STRING)) {
+        const vir_token_t *file = advance(p);
+        strncpy(n->name, file->str.buf, AST_NAME_LEN - 1);
+      } else if (is_name_token(peek(p)->type)) {
+        /* dotted / namespaced path: A::B::C  or  a.b.c */
+        size_t pos = 0;
+        while (is_name_token(peek(p)->type)) {
+          const vir_token_t *seg = advance(p);
+          size_t n_seg = strlen(seg->str.buf);
+          if (pos + n_seg + 2 >= AST_NAME_LEN)
+            break;
+          memcpy(n->name + pos, seg->str.buf, n_seg);
+          pos += n_seg;
+          /* Accept `::` (two COLONs) or `.` as separator. */
+          if (check(p, TOK_COLON)) {
+            const vir_token_t *nxt =
+                (p->pos + 1 < p->token_count) ? &p->tokens[p->pos + 1] : NULL;
+            if (nxt && nxt->type == TOK_COLON) {
+              advance(p);
+              advance(p);
+              if (pos + 2 < AST_NAME_LEN) {
+                n->name[pos++] = ':';
+                n->name[pos++] = ':';
+              }
+              continue;
             }
+          }
+          if (check(p, TOK_DOT)) {
+            advance(p);
+            if (pos + 1 < AST_NAME_LEN)
+              n->name[pos++] = '.';
             continue;
           }
+          break;
         }
-        if (check(p, TOK_DOT)) {
-          advance(p);
-          if (pos + 1 < AST_NAME_LEN)
-            n->name[pos++] = '.';
-          continue;
-        }
+        n->name[pos] = '\0';
+      } else {
+        expect(p, TOK_STRING, "expected filename or path after include");
         break;
       }
-      n->name[pos] = '\0';
-      match(p, TOK_SEMICOLON);
-    } else {
-      expect(p, TOK_STRING, "expected filename or path after include");
-      return n;
-    }
-    /* `as alias` (already supported elsewhere) */
-    if (check(p, TOK_AS)) {
-      advance(p);
-      const vir_token_t *alias =
-          expect_name(p, "expected alias name after 'as'");
-      if (alias) {
-        strncpy(n->name2, alias->str.buf, AST_NAME_LEN - 1);
+      /* Optional `as alias` */
+      if (check(p, TOK_AS)) {
+        advance(p);
+        const vir_token_t *alias =
+            expect_name(p, "expected alias name after 'as'");
+        if (alias) {
+          strncpy(n->name2, alias->str.buf, AST_NAME_LEN - 1);
+        }
       }
+      ast_add_child(block, n);
+      if (!match(p, TOK_COMMA))
+        break;
     }
     match(p, TOK_SEMICOLON);
-    return n;
+    if (block->child_count == 1) {
+      ast_node_t *single = block->children[0];
+      free(block->children);
+      free(block);
+      return single;
+    }
+    return block;
   }
 
   case TOK_TYPE_KW: {
