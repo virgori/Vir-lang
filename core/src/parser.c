@@ -3775,9 +3775,10 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
         break;
     }
     match(p, TOK_SEMICOLON);
+    /* children[] is inline in ast_node_t — never free(block->children). */
     if (block->child_count == 1) {
       ast_node_t *single = block->children[0];
-      free(block->children);
+      block->child_count = 0; /* unlink so we don't free the include node */
       free(block);
       return single;
     }
