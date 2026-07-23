@@ -1780,6 +1780,7 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
       /* Parse params: [ref] name[:type] separated by ';' or ',' */
       if (!check(p, TOK_RPAREN)) {
         for (;;) {
+          skip_newlines(p);
           int is_ref_param = 0;
           if (check(p, TOK_IDENT) && strcmp(peek(p)->str.buf, "ref") == 0) {
             advance(p); /* consume 'ref' */
