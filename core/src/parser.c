@@ -209,8 +209,12 @@ static const builtin_map_t builtins[] = {
     {"native_write_i64", BUILTIN_WRITE64},
     {"native_str_byte_len", BUILTIN_STR_LEN},
     {"native_str_ptr", BUILTIN_CAST_PTR},
+    {"str_byte_at", BUILTIN_STR_GET},
+    {"str_char_at", BUILTIN_STR_GET},
     {"str_get", BUILTIN_STR_GET},
     {"str_cat", BUILTIN_STR_CAT},
+    {"str_concat", BUILTIN_STR_CAT},
+    {"str_len", BUILTIN_STR_LEN},
     {"str_eq", BUILTIN_STR_EQ},
     {"str_eq", BUILTIN_STR_EQ},
     {"file_open", BUILTIN_FILE_OPEN},
@@ -802,7 +806,7 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
     return arr;
   }
   default:
-    fprintf(stderr, "EXPECTED EXPR at line %d, token %s\n", peek(p)->line, peek(p)->str.buf); parse_error(p, "expected expression");
+    parse_error(p, "expected expression");
     return NULL;
   }
 }
@@ -2250,7 +2254,7 @@ static ast_node_t *parse_enum_def(vir_parser_t *p) {
  * (type hints are stored in name2 but not used for codegen yet)
  */
 
-static ast_node_t *parse_record_def(vir_parser_t *p) {
+static ast_node_t *parse_record_def(vir_parser_t *p, int is_interface) {
   uint32_t line = peek(p)->line;
 
   const vir_token_t *name_tok = expect_name(p, "expected record name");
@@ -2281,7 +2285,7 @@ static ast_node_t *parse_record_def(vir_parser_t *p) {
   rec->line = line;
 
   while (!check(p, TOK_END) && !check(p, TOK_EOF)) {
-    if (match(p, TOK_METHOD)) {
+    if (match(p, TOK_METHOD) || match(p, TOK_FUNC)) {
       /* §11.4: method name(params) block end */
       const vir_token_t *mname = expect_name(p, "expected method name");
       if (!mname)
@@ -2290,6 +2294,9 @@ static ast_node_t *parse_record_def(vir_parser_t *p) {
       ast_node_t *fn = ast_new(AST_FUNC_DEF);
       strncpy(fn->name, mname->str.buf, AST_NAME_LEN - 1);
       fn->line = mname->line;
+      if (is_interface) {
+        fn->int_val |= 0x8000; /* extern marker — body-less shim */
+      }
 
       /* Add implicit 'this' parameter as first child */
       ast_node_t *this_param = ast_new(AST_IDENTIFIER);
@@ -2335,10 +2342,38 @@ static ast_node_t *parse_record_def(vir_parser_t *p) {
       }
 
       expect_block_open(p, "method signature");
+      skip_newlines(p);
 
-      ast_node_t *body = parse_block(p);
-      ast_add_child(fn, body);
-      expect(p, TOK_END, "expected 'end' after method body");
+      /* Optional in(...) parameter block inside the method (Vir 2.0 syntax) */
+      if (check(p, TOK_IN)) {
+        advance(p); /* consume 'in' */
+        expect(p, TOK_LPAREN, "expected '(' after 'in'");
+        if (!check(p, TOK_RPAREN)) {
+          for (;;) {
+            const vir_token_t *pname = expect_name(p, "expected param name");
+            if (!pname) break;
+            ast_node_t *param = ast_new(AST_IDENTIFIER);
+            strncpy(param->name, pname->str.buf, AST_NAME_LEN - 1);
+            param->line = pname->line;
+            if (match(p, TOK_COLON)) {
+              if (check(p, TOK_IDENT)) {
+                strncpy(param->name2, peek(p)->str.buf, AST_NAME_LEN - 1);
+                advance(p);
+              }
+            }
+            ast_add_child(fn, param);
+            if (!match(p, TOK_SEMICOLON) && !match(p, TOK_COMMA)) break;
+          }
+        }
+        expect(p, TOK_RPAREN, "expected ')' after method params");
+        skip_newlines(p);
+      }
+
+      if (!is_interface) {
+        ast_node_t *body = parse_block(p);
+        ast_add_child(fn, body);
+        expect(p, TOK_END, "expected 'end' after method body");
+      }
       match(p, TOK_DOT); /* optional '.' */
 
       ast_add_child(rec, fn);
@@ -2377,6 +2412,8 @@ static ast_node_t *parse_record_def(vir_parser_t *p) {
     }
 
     ast_add_child(rec, field);
+    /* printf("DEBUG: parse_record_def parsed field: %s at line %d\n", field->name, field->line); */
+    match(p, TOK_SEMICOLON);
     skip_newlines(p);
   }
 
@@ -2702,6 +2739,12 @@ static ast_node_t *parse_case_stmt(vir_parser_t *p) {
 }
 
 static int parse_module_path(vir_parser_t *p, char *out_name) {
+  if (check(p, TOK_STRING)) {
+    const vir_token_t *tok = advance(p);
+    strncpy(out_name, tok->str.buf, AST_NAME_LEN - 1);
+    out_name[AST_NAME_LEN - 1] = '\0';
+    return 1;
+  }
   size_t pos = 0;
   out_name[0] = '\0';
   while (is_name_token(peek(p)->type)) {
@@ -3286,14 +3329,18 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
 
   case TOK_RECORD:
   case TOK_ENTITY:
+  case TOK_INTERFACE:
+  case TOK_CLASS: {
+    int is_interface = (t->type == TOK_INTERFACE);
     advance(p);
-    return parse_record_def(p);
+    return parse_record_def(p, is_interface);
+  }
 
   case TOK_PACKED: {
     advance(p);
     if (check(p, TOK_ENTITY) || check(p, TOK_RECORD)) {
       advance(p);
-      ast_node_t *ed = parse_record_def(p);
+      ast_node_t *ed = parse_record_def(p, 0);
       if (ed)
         ed->type = AST_PACKED_DEF;
       return ed;
@@ -3673,6 +3720,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
     if (check(p, TOK_STRING)) {
       const vir_token_t *file = advance(p);
       strncpy(n->name, file->str.buf, AST_NAME_LEN - 1);
+      match(p, TOK_SEMICOLON);
     } else if (is_name_token(peek(p)->type)) {
       /* dotted / namespaced path: A::B::C  or  a.b.c */
       size_t pos = 0;
