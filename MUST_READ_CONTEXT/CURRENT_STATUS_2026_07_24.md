@@ -45,6 +45,7 @@ graph LR
 | 6 | `70707be5` | **feat(compiler)**: support TupleExpr lowering in virc_boot and ir_optimizer | 2 | +4/-4 |
 | 7 | `7a3f4fbc` | **feat(parser)**: multiline & semicolon grouped var decls without repeating var | 4 | +90/-19 |
 | 8 | `a5be5dd9` | **fix(compiler/lexer)**: fix lookup sentinel, report unknown chars, deduplicate keywords, expand token names | 1 | +107/-8 |
+| 9 | `28fdc124` | **feat(compiler/lexer)**: implement P0 spec compliance items (keywords, operators, binary/scientific numbers) | 1 | +110/-2 |
 
 ---
 
