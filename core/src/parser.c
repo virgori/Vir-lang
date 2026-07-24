@@ -1482,10 +1482,7 @@ static ast_node_t *parse_var_decl_single(vir_parser_t *p, ast_type_t type) {
 }
 
 static ast_node_t *parse_var_decl(vir_parser_t *p, ast_type_t type) {
-  /* §5.3 — Group syntax: `var a = 1; b = 2; c = 3` produces three
-   * declarations. Separator is `;` followed by an IDENT that is NOT a
-   * statement-starting keyword. A trailing `;` is allowed but not
-   * required. Single-decl form (no `;`) stays identical to before. */
+  skip_newlines(p);
   ast_node_t *first = parse_var_decl_single(p, type);
   if (!first)
     return NULL;
