@@ -61,6 +61,7 @@ graph LR
 | 22 | `5b00db79` | **feat(compiler/mir)**: complete AST to MIR Lowering Engine for Vir v2.0 | 1 | +272/-152 |
 | 23 | `f1190956` | **feat(compiler/mir)**: complete MIR Optimizations & SSA Construction for Vir v2.0 | 1 | +148/-15 |
 | 24 | `eee964a4` | **feat(compiler/lir)**: complete LIR & Chaitin-Briggs Graph Coloring Register Allocator | 1 | +38/-26 |
+| 25 | `02debe4c` | **feat(compiler/pipeline)**: wire AST→MIR→SSA→Opt→LIR→RegAlloc into driver & 11/11 tests pass | 5 | +113/-58 |
 
 ---
 
