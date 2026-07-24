@@ -1,42 +1,38 @@
 # Báo Cáo Tình Trạng Dự Án Vir v2.0
-**Ngày:** 2026-07-25 02:40 (GMT+7)  
+**Ngày:** 2026-07-25 02:45 (GMT+7)  
 **Branch hiện tại:** `recovered_stash`  
-**Trạng thái Pipeline (honest):** Bootstrap emit = **Q-IR staging → Phase-8 MIR/LIR flat tables → LIR Mach-O emit** (multifn Call/SetArg/PrintStr + flat const-fold). Q body-dump chỉ còn fallback khi thiếu metadata.
+**Trạng thái Pipeline (honest):** Q staging → Phase-8 MIR/LIR tables → **flat const-fold/DCE** → LIR Mach-O emit (multifn + flat).
 
 ---
 
-## 1. Kiến Trúc Bootstrap Thực Tế (`virc_boot.vri`)
+## 1. Kiến Trúc Bootstrap (`virc_boot.vri`)
 
 ```mermaid
 graph TD
-    SRC[Vir source] --> LEX[Lexer]
-    LEX --> PAR[Parser]
-    PAR --> QIR[Q-IR lower → flat / body-dump staging]
-    QIR --> P8[Phase 8: MIR/LIR tables]
-    P8 --> CHOICE{bd func table?}
-    CHOICE -->|yes| MF[boot_codegen_from_lir_multifn]
-    CHOICE -->|no| FLAT[boot_codegen_from_lir_tables flat]
-    MF --> LINK[Mach-O link]
-    FLAT --> LINK
-    LINK --> BIN[a.out — 11/11 LIR emit]
+    QIR[Q staging / body-dump] --> MIR[MIR flat tables]
+    MIR --> OPT[flat const-fold + DCE nop-in-place]
+    OPT --> LIR[LIR opc project]
+    LIR --> MF[LIR multifn emit]
+    LIR --> FLAT[LIR flat emit]
+    MF --> BIN[a.out 11/11]
+    FLAT --> BIN
 ```
 
-**Ghi chú**
-- Multifn LIR đọc opcode/operands từ `g_mir_*` (1:1 body-dump), bounds từ `g_bd_f*`.
-- Flat LIR: const-fold Print cho single-stream staging.
-- Q fallback chỉ khi Call thiếu `g_bd_nfuncs` hoặc PrintStr thiếu `g_bd_strdata`.
+**Opt (Phase-8 flat, C-VM safe)**
+- `boot_mir_flat_const_fold`: fold Load/Move/binop → Load imm; Call clears const map
+- `boot_mir_flat_dce_nop`: identity Move → Nop (không compact — giữ `g_bd_f*` bounds)
+- Emit bỏ qua Nop (qopc 0)
 
 ---
 
-## 2. Bootstrap Suite (stdout + exit 0)
+## 2. Suite
 
-| Test | Emit path |
-|------|-----------|
-| cg_arith / cg_mul / cg_var | LIR-flat |
-| cg_call / cg_call0 / cg_mod2 / cg_printstr | LIR-MF |
-| cg_scale65_* / cg_scale70 | LIR-MF |
+**11/11 PASS** — tất cả có log `virc: phase8 — flat opt done` + LIR emit.
 
-**11/11 PASS** — toàn bộ qua LIR emit (không còn Q+BD trong suite).
+| Path | Tests |
+|------|-------|
+| LIR-flat + opt | arith, mul, var |
+| LIR-MF + opt | call*, mod2, printstr, scale* |
 
 ---
 
@@ -44,13 +40,13 @@ graph TD
 
 | Hash | Mô tả |
 |------|--------|
-| `58773cd3` | LIR-table Mach-O emit (Print/arith) + fix mir push reset |
-| `431df9bc` | LIR multifn Call/SetArg/PrintStr — suite 11/11 LIR |
+| `431df9bc` | LIR multifn Call/SetArg/PrintStr |
+| *(pending)* | flat MIR const-fold + DCE trong phase8 gate |
 
 ---
 
 ## 4. Việc còn lại
 
-1. SSA/opt/regalloc trên flat tables.
-2. Modular `virc.vri` driver ổn định.
-3. Thu hẹp / xóa Q `boot_codegen_emit_mod_min` khi LIR multifn đủ cover self-host.
+1. Dead-Load DCE / simple copy-prop trên flat (vẫn nop-in-place).
+2. Flat regalloc (stack slots → phys) — sau khi DCE ổn.
+3. Modular `virc.vri`; thu hẹp Q `boot_codegen_emit_mod_min`.
