@@ -41,7 +41,7 @@ graph TD
 | Hash | Mô tả |
 |------|--------|
 | `431df9bc` | LIR multifn Call/SetArg/PrintStr |
-| *(pending)* | flat MIR const-fold + DCE trong phase8 gate |
+| `ec4f5a17` | flat MIR const-fold + DCE trong phase8 gate |
 
 ---
 
