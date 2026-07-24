@@ -17079,7 +17079,7 @@ func boot_do_lower:
         body0_n = vec_len_rt(f0.body);
     end
 
-    # Prefer Phase-8 LIR-table emit when stream has no Call/SetArg.
+    # Prefer Phase-8 LIR-table emit (multifn Call/PrintStr or flat const-fold).
     var used_lir_emit = 0;
     if g_lir_n > 0 do
         if boot_lir_stream_needs_q_fallback() == 0 do
@@ -17655,8 +17655,8 @@ end.
 # bootstrap path. We project it into parallel MIR then LIR opcode
 # tables (heap i64 arrays) so Phase 8 is real and countable — without
 # MirFunc/LirInstr entity field stores (unreliable on the C-VM).
-# Prefer LIR-table Mach-O emit when stream has no Call/SetArg;
-# otherwise fall back to proven Q body-dump / flat codegen.
+# Prefer LIR-table Mach-O emit (multifn + flat).
+# Fall back to Q body-dump only when Call lacks bd metadata / PrintStr lacks pool.
 # ═══════════════════════════════════════════════════════
 
 var g_mir_n = 0;
@@ -17668,6 +17668,7 @@ var g_mir_s1t = 0;
 var g_mir_s1v = 0;
 var g_mir_s1i = 0;
 var g_mir_s2v = 0;
+var g_mir_di = 0;    # dest imm (SetArg ABI index; Call unused)
 var g_lir_opc = 0;
 var g_phase8_lir_emit = 0;  # 1 if Mach-O body came from LIR tables
 
@@ -17684,6 +17685,7 @@ func boot_mir_tables_ensure:
         g_mir_s1v = heap_alloc(4096);
         g_mir_s1i = heap_alloc(4096);
         g_mir_s2v = heap_alloc(4096);
+        g_mir_di = heap_alloc(4096);
         g_lir_opc = heap_alloc(4096)
     end
 end.
@@ -17759,6 +17761,15 @@ func boot_mir_set_last_qopc:
     native_write_i64(g_mir_qopc, (g_mir_n - 1) * 8, qopc);
 end.
 
+func boot_mir_set_last_di:
+    in(di: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_mir_n <= 0 do
+        out
+    end
+    native_write_i64(g_mir_di, (g_mir_n - 1) * 8, di);
+end.
+
 func boot_build_mir_from_staging:
     extern func native_read_i64(addr: int, offset: int) -> int;
     extern func native_write_i64(addr: int, offset: int, val: int);
@@ -17775,9 +17786,11 @@ func boot_build_mir_from_staging:
             let s1v = native_read_i64(g_bd_s1v, j * 8);
             let s1i = native_read_i64(g_bd_s1i, j * 8);
             let s2v = native_read_i64(g_bd_s2v, j * 8);
+            let di = native_read_i64(g_bd_di, j * 8);
             let mop = q_opc_to_mir_opc(opc);
             boot_mir_push(mop, dv, s1t, s1v, s1i, s2v);
             boot_mir_set_last_qopc(opc);
+            boot_mir_set_last_di(di);
             j = j + 1
         end
     else
@@ -17799,6 +17812,7 @@ func boot_build_mir_from_staging:
                 let mop2 = q_opc_to_mir_opc(opc2);
                 boot_mir_push(mop2, dv2, s1t2, s1v2, s1i2, s2v2);
                 boot_mir_set_last_qopc(opc2);
+                boot_mir_set_last_di(0);
                 j2 = j2 + 1
             end
         end
@@ -17835,26 +17849,229 @@ end.
 
 func boot_lir_stream_needs_q_fallback:
     extern func native_read_i64(addr: int, offset: int) -> int;
+    # Call/SetArg need per-function body-dump metadata (func_tab / slots).
     if boot_lir_stream_has_call() != 0 do
-        out 1
+        if g_bd_nfuncs <= 0 or g_bd_total <= 0 do
+            out 1
+        end
     end
     var i = 0;
     when i < g_mir_n loop
         let q = native_read_i64(g_mir_qopc, i * 8);
-        # PrintStr stays on proven body-dump emit for now
         if q == 41 do
-            out 1
+            if g_bd_strdata == 0 do
+                out 1
+            end
         end
         i = i + 1
     end
     out 0
 end.
 
-# Emit Mach-O text from Phase-8 MIR/LIR tables (const-fold + runtime Print).
-# Operands live in g_mir_*; opcodes for control use g_mir_qopc (QOp).
+# Multi-function Mach-O emit from Phase-8 MIR/LIR tables.
+# MIR rows are 1:1 with body-dump indices; function bounds stay in g_bd_f*.
+func boot_codegen_from_lir_multifn:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    let nfuncs = g_bd_nfuncs;
+    g_cg_cb = codebuf_new(TargetArch.ARM64);
+    g_runtime_min = 1;
+    g_cg_cb = emit_runtime_arm64(g_cg_cb);
+    g_runtime_min = 0;
+    g_boot_rt_print = g_rt_print_off;
+    g_boot_rt_exit = g_rt_exit_off;
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 104, g_boot_rt_print);
+    native_write_i64(g_boot_name_cell, 112, g_boot_rt_exit);
+    native_write_i64(g_boot_name_cell, 232, g_rt_printstr_off);
+    if g_boot_func_tab == 0 do
+        g_boot_func_tab = heap_alloc(8192);
+    end
+    g_boot_main_off = 0 - 1;
+    native_write_i64(g_boot_name_cell, 120, g_boot_main_off);
+
+    let have_main = 0;
+    let hi = 0;
+    when hi < nfuncs loop
+        if native_read_i64(g_bd_fmain, hi * 8) != 0 do
+            have_main = 1
+        end
+        hi = hi + 1
+    end
+    let emit_only_main = 0;
+    if native_read_i64(g_boot_name_cell, 224) != 0 and have_main != 0 do
+        emit_only_main = 1;
+        print_ln("virc: LIR multifn emit main-only (self-host)")
+    end
+    let emit_bodies = 1;
+    if have_main == 0 and native_read_i64(g_boot_name_cell, 144) > 64 do
+        emit_bodies = 0;
+        print_ln("virc: LIR multifn skip dump bodies (no main)")
+    end
+
+    let fi = 0;
+    when fi < nfuncs and emit_bodies != 0 loop
+        let fstart = native_read_i64(g_bd_fstart, fi * 8);
+        let blen = native_read_i64(g_bd_flen, fi * 8);
+        let npc = native_read_i64(g_bd_fnpc, fi * 8);
+        let is_main = native_read_i64(g_bd_fmain, fi * 8);
+        let ping_fi = native_read_i64(g_boot_name_cell, 240);
+        let keep = is_main;
+        if ping_fi >= 0 and fi == ping_fi and blen > 0 do
+            keep = 1
+        end
+        if emit_only_main != 0 and keep == 0 do
+            fi = fi + 1
+        else
+            let func_off = codebuf_len();
+            native_write_i64(g_boot_func_tab, fi * 8, func_off);
+            if is_main != 0 do
+                g_boot_main_off = func_off;
+                native_write_i64(g_boot_name_cell, 120, func_off)
+            end
+
+            boot_cg_prologue0();
+
+            let pi = 0;
+            when pi < npc loop
+                if pi < 8 do
+                    g_cg_rm = pi;
+                    boot_cg_emit_bd_save_param()
+                end
+                pi = pi + 1
+            end
+
+            let did_ret = 0;
+            let j = 0;
+            when j < blen loop
+                let ix = fstart + j;
+                let opc = native_read_i64(g_mir_qopc, ix * 8);
+                let dv = native_read_i64(g_mir_dst, ix * 8);
+                let di = native_read_i64(g_mir_di, ix * 8);
+                let s1t = native_read_i64(g_mir_s1t, ix * 8);
+                let s1v = native_read_i64(g_mir_s1v, ix * 8);
+                let s1i = native_read_i64(g_mir_s1i, ix * 8);
+                let s2v = native_read_i64(g_mir_s2v, ix * 8);
+
+                if opc == 1 do
+                    let immv = s1i;
+                    if immv < 0 do
+                        immv = 0
+                    end
+                    if immv > 65535 do
+                        immv = immv bit_and 65535
+                    end
+                    g_cg_imm = immv;
+                    g_cg_off = boot_cg_slot_off(dv);
+                    boot_cg_emit_bd_load()
+                end
+
+                if opc == 2 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_imm = boot_cg_slot_off(dv);
+                    boot_cg_emit_bd_move()
+                end
+
+                if opc == 3 or opc == 4 or opc == 5 or opc == 6 or opc == 7 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_imm = boot_cg_slot_off(s2v);
+                    g_cg_target = boot_cg_slot_off(dv);
+                    g_cg_rn = opc;
+                    boot_cg_emit_bd_binop()
+                end
+
+                if opc == 40 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    boot_cg_emit_bd_print()
+                end
+
+                if opc == 41 do
+                    g_cg_off = s1i;
+                    g_cg_imm = s2v;
+                    boot_cg_emit_bd_printstr()
+                end
+
+                if opc == 35 do
+                    if s1t == 1 do
+                        g_cg_off = boot_cg_slot_off(s1v);
+                        boot_cg_emit_bd_ret_v()
+                    else
+                        g_cg_imm = s1i bit_and 65535;
+                        boot_cg_emit_bd_ret_i()
+                    end
+                    did_ret = 1
+                end
+
+                if opc == 96 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = di bit_and 0x1F;
+                    boot_cg_emit_bd_setarg()
+                end
+
+                if opc == 34 do
+                    g_cg_rn = native_read_i64(g_boot_func_tab, s1v * 8);
+                    if dv >= 0 do
+                        g_cg_imm = boot_cg_slot_off(dv)
+                    else
+                        g_cg_imm = 0 - 1
+                    end
+                    boot_cg_emit_bd_call()
+                end
+
+                j = j + 1
+            end
+
+            if did_ret == 0 do
+                g_cg_imm = 0;
+                g_cg_rd = 0;
+                boot_cg_movz0();
+                boot_cg_epilogue0()
+            end
+            fi = fi + 1
+        end
+    end
+
+    if g_boot_main_off < 0 do
+        print_ln("virc: LIR multifn stub main (missing)");
+        let stub_off = codebuf_len();
+        native_write_i64(g_boot_name_cell, 104, g_boot_rt_print);
+        native_write_i64(g_boot_name_cell, 112, g_boot_rt_exit);
+        g_boot_main_off = stub_off;
+        native_write_i64(g_boot_name_cell, 120, stub_off);
+        boot_cg_prologue0();
+        g_cg_imm = 42;
+        g_cg_off = 16;
+        boot_cg_emit_bd_load();
+        g_cg_off = 16;
+        boot_cg_emit_bd_print();
+        g_cg_imm = 0;
+        boot_cg_emit_bd_ret_i();
+        native_write_i64(g_boot_name_cell, 120, stub_off);
+        native_write_i64(g_boot_name_cell, 112, g_boot_rt_exit)
+    end
+
+    g_snap_entry_off = codebuf_len();
+    g_code_start_offset = g_snap_entry_off;
+    native_write_i64(g_boot_name_cell, 120, g_boot_main_off);
+    native_write_i64(g_boot_name_cell, 112, g_boot_rt_exit);
+    boot_cg_emit_entry0();
+    g_phase8_lir_emit = 1;
+    out 0
+end.
+
+# Emit Mach-O text from Phase-8 MIR/LIR tables.
+# Multi-fn (Call/SetArg/PrintStr) uses slot/BL path; flat uses const-fold Print.
 func boot_codegen_from_lir_tables:
     extern func native_read_i64(addr: int, offset: int) -> int;
     extern func native_write_i64(addr: int, offset: int, val: int);
+    # Prefer multi-fn LIR emit when body-dump function table is available.
+    if g_bd_nfuncs > 0 and g_bd_total > 0 and g_lir_n > 0 do
+        print_ln("virc: codegen via LIR multifn");
+        boot_codegen_from_lir_multifn();
+        out 0
+    end
     g_cg_cb = codebuf_new(TargetArch.ARM64);
     g_runtime_min = 1;
     g_cg_cb = emit_runtime_arm64(g_cg_cb);
