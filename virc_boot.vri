@@ -17070,6 +17070,8 @@ func boot_do_lower:
     end
     print_ln("virc: lower done");
 
+    boot_phase8_mir_lir_gate();
+
     print_ln("virc: generating ARM64 machine code...");
     # Prefer real codegen when the lowered bodies are non-empty. Fall back to
     # the flat-staging mini-codegen (const-fold path) otherwise.
@@ -17636,210 +17638,163 @@ func lir_allocate_registers_color(func_obj: LirFunc, intervals: i64)
     out (func_obj, assigned_phys, assigned_stack)
 end.
 
-enum MirOp:
-    Nop         = 0;
-    Move        = 1;
-    Load        = 2;
-    Store       = 3;
-    Add         = 4;
-    Sub         = 5;
-    Mul         = 6;
-    Div         = 7;
-    Call        = 8;
-    Intrinsic   = 9;
-    Jump        = 10;
-    JumpIf      = 11;
-    Return      = 12
-end.
-enum MirOperandType:
-    None    = 0;
-    VReg    = 1;
-    Imm     = 2;
-    Block   = 3
-end.
-entity MirOperand:
-    op_type: MirOperandType,
-    vreg: i64,
-    imm: i64,
-    block_id: i64
-end.
-func mir_opnd_none:
-    out MirOperand ( op_type: MirOperandType.None, vreg: 0, imm: 0, block_id: 0 )
-end.
-func mir_opnd_vreg(r: i64)
-    out MirOperand ( op_type: MirOperandType.VReg, vreg: r, imm: 0, block_id: 0 )
-end.
-func mir_opnd_imm(val: i64)
-    out MirOperand ( op_type: MirOperandType.Imm, vreg: 0, imm: val, block_id: 0 )
-end.
-func mir_opnd_block(id: i64)
-    out MirOperand ( op_type: MirOperandType.Block, vreg: 0, imm: 0, block_id: id )
-end.
-entity MirInstr:
-    op: MirOp,
-    dst: MirOperand,
-    src1: MirOperand,
-    src2: MirOperand,
-    next: i64
-end.
-entity MirPhi:
-    dst_vreg: i64,
-    orig_vreg: i64,
-    incoming_values: i64,
-    incoming_blocks: i64,
-    next: i64
-end.
-entity MirUse:
-    instr_idx: i64,
-    phi_idx: i64,
-    opnd_idx: i64,
-    next: i64
-end.
-entity MirBlock:
-    id: i64,
-    phis: i64,
-    head: i64,
-    tail: i64,
-    succ_true: i64,
-    succ_false: i64,
-    preds: i64,
-    idom: i64,
-    dom_children: i64,
-    df: i64,
-    next_block: i64
-end.
-entity MirFunc:
-    id: i64,
-    next_vreg: i64,
-    def_uses: i64,
-    next_block_id: i64,
-    entry_block: i64,
-    blocks: i64,
-    max_vreg: i64
-end.
+# ═══════════════════════════════════════════════════════
+# Phase 8 — Q staging → MIR/LIR flat tables (C-VM safe)
+# =======================================================
+# Body-dump / flat Q staging is the authoritative lowered IR on the
+# bootstrap path. We project it into parallel MIR then LIR opcode
+# tables (heap i64 arrays) so Phase 8 is real and countable — without
+# MirFunc/LirInstr entity field stores (unreliable on the C-VM).
+# Native Mach-O emit remains the proven Q codegen (Print/Call).
+# ═══════════════════════════════════════════════════════
 
-entity VarMap:
-    name: string,
-    vreg: i64
-end.
-entity LoopTarget:
-    break_block: i64,
-    continue_block: i64
-end.
-entity MirBuilder:
-    func_obj: MirFunc,
-    current_block: i64,
-    vreg_counter: i64,
-    var_map: i64,
-    loop_stack: i64
-end.
-func builder_new(func_id: i64)
-    f = MirFunc (
-        id: func_id,
-        blocks: vec_new_rt(),
-        max_vreg: 0
-    );
-    b0 = MirBlock (
-        id: 0,
-        head: vec_new_rt(),
-        phis: -1,
-        successors: vec_new_rt(),
-        predecessors: vec_new_rt()
-    );
-    f.blocks = vec_push_rt(f.blocks, b0);
-    out MirBuilder (
-        func_obj: f,
-        current_block: 0,
-        vreg_counter: 1,
-        var_map: vec_new_rt(),
-        loop_stack: vec_new_rt()
-    )
-end.
+var g_mir_n = 0;
+var g_lir_n = 0;
+var g_mir_opc = 0;
+var g_mir_dst = 0;
+var g_mir_s1t = 0;
+var g_mir_s1v = 0;
+var g_mir_s1i = 0;
+var g_mir_s2v = 0;
+var g_lir_opc = 0;
 
-func ast_lower_func:
-    in(func_id: int, ast_func: int)
-    let b = builder_new(func_id);
-    out b.func_obj;
-end.
+# MirOp codes (flat ints; keep stable for diagnostics)
+# 0 Nop 1 Move 2 Load 3 Store 4 Add 5 Sub 6 Mul 7 Div
+# 8 Call 9 Intrinsic(Print*) 10 Jump 11 JumpIf 12 Return
 
-func ast_lower_program:
-    in(prog: int)
-    let mir_funcs = vec_new_rt();
-    let child_count = g_snap_ast_kids;
-    if child_count == 0 do
-        child_count = 1;
+func boot_mir_tables_init:
+    if g_mir_opc == 0 do
+        g_mir_opc = heap_alloc(4096);
+        g_mir_dst = heap_alloc(4096);
+        g_mir_s1t = heap_alloc(4096);
+        g_mir_s1v = heap_alloc(4096);
+        g_mir_s1i = heap_alloc(4096);
+        g_mir_s2v = heap_alloc(4096);
+        g_lir_opc = heap_alloc(4096)
     end
-    let i = 0;
-    when i < child_count loop
-        let m_func = ast_lower_func(i, prog);
-        mir_funcs = vec_push_rt(mir_funcs, m_func);
-        i = i + 1;
+    g_mir_n = 0;
+    g_lir_n = 0;
+end.
+
+func q_opc_to_mir_opc(opc: int)
+    if opc == 1 do out 2 end
+    if opc == 2 do out 1 end
+    if opc == 3 do out 4 end
+    if opc == 4 do out 5 end
+    if opc == 5 do out 6 end
+    if opc == 6 do out 7 end
+    if opc == 34 do out 8 end
+    if opc == 33 do out 8 end
+    if opc == 40 do out 9 end
+    if opc == 41 do out 9 end
+    if opc == 30 do out 10 end
+    if opc == 31 do out 11 end
+    if opc == 35 do out 12 end
+    if opc == 92 do out 2 end
+    if opc == 93 do out 3 end
+    if opc == 96 do out 1 end
+    out 0
+end.
+
+func mir_opc_to_lir_opc(mop: int)
+    # LirOp: Nop0 Mov1 Add2 Sub3 Mul4 Div5 Call8 Jmp9 JmpCond10 Ret12 Load13 Store14
+    if mop == 1 do out 1 end
+    if mop == 2 do out 1 end
+    if mop == 3 do out 14 end
+    if mop == 4 do out 2 end
+    if mop == 5 do out 3 end
+    if mop == 6 do out 4 end
+    if mop == 7 do out 5 end
+    if mop == 8 do out 8 end
+    if mop == 9 do out 8 end
+    if mop == 10 do out 9 end
+    if mop == 11 do out 10 end
+    if mop == 12 do out 12 end
+    out 0
+end.
+
+func boot_mir_push:
+    in(mop: int, dst: int, s1t: int, s1v: int, s1i: int, s2v: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    boot_mir_tables_init();
+    let ix = g_mir_n;
+    if ix >= 500 do
+        out
     end
-    out mir_funcs;
+    native_write_i64(g_mir_opc, ix * 8, mop);
+    native_write_i64(g_mir_dst, ix * 8, dst);
+    native_write_i64(g_mir_s1t, ix * 8, s1t);
+    native_write_i64(g_mir_s1v, ix * 8, s1v);
+    native_write_i64(g_mir_s1i, ix * 8, s1i);
+    native_write_i64(g_mir_s2v, ix * 8, s2v);
+    g_mir_n = ix + 1;
 end.
 
-func mir_build_cfg(blocks: i64)
-    out blocks
-end.
+func boot_build_mir_from_staging:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    boot_mir_tables_init();
 
-func mir_compute_dominators(blocks: i64, entry: int)
-    out blocks
-end.
-
-func mir_insert_phi_nodes(func_obj: MirFunc, blocks: i64)
-    out blocks
-end.
-
-func mir_optimize_all(blocks: i64)
-    out blocks
-end.
-
-func compile_pipeline(source_path: string, ast: AstNode, verbose: int)
-    if verbose == 1 do
-        print_ln("virc: pipeline — lowering AST to MIR...")
+    if g_bd_total > 0 do
+        print_ln("virc: phase8 — MIR from body-dump");
+        var j = 0;
+        let nbd = g_bd_total;
+        when j < nbd loop
+            let opc = native_read_i64(g_bd_opc, j * 8);
+            let dv = native_read_i64(g_bd_dv, j * 8);
+            let s1t = native_read_i64(g_bd_s1t, j * 8);
+            let s1v = native_read_i64(g_bd_s1v, j * 8);
+            let s1i = native_read_i64(g_bd_s1i, j * 8);
+            let s2v = native_read_i64(g_bd_s2v, j * 8);
+            let mop = q_opc_to_mir_opc(opc);
+            boot_mir_push(mop, dv, s1t, s1v, s1i, s2v);
+            j = j + 1
+        end
+    else
+        if g_boot_emit_count > 0 do
+            print_ln("virc: phase8 — MIR from flat Q staging");
+            var j2 = 0;
+            let nflat = g_boot_emit_count;
+            when j2 < nflat loop
+                let opc2 = native_read_i64(g_boot_q_opc, j2 * 8);
+                let dv2 = native_read_i64(g_boot_q_dst, j2 * 8);
+                let s1f = native_read_i64(g_boot_q_s1f, j2 * 8);
+                let s1v2 = native_read_i64(g_boot_q_s1v, j2 * 8);
+                let s1i2 = native_read_i64(g_boot_q_s1i, j2 * 8);
+                let s2v2 = native_read_i64(g_boot_q_s2v, j2 * 8);
+                var s1t2 = 1;
+                if s1f != 0 do
+                    s1t2 = 2
+                end
+                let mop2 = q_opc_to_mir_opc(opc2);
+                boot_mir_push(mop2, dv2, s1t2, s1v2, s1i2, s2v2);
+                j2 = j2 + 1
+            end
+        end
     end
 
-    let mir_funcs = ast_lower_program(ast);
-
-    let func_count = vec_len_rt(mir_funcs);
-    var i = 0;
-    when i < func_count loop
-        let mf = vec_get_rt(mir_funcs, i);
-        let blocks1 = mir_build_cfg(mf.blocks);
-        let blocks2 = mir_compute_dominators(blocks1, 0);
-        let blocks3 = mir_insert_phi_nodes(mf, blocks2);
-        let blocks4 = mir_optimize_all(blocks3);
-        mf.blocks = blocks4;
-        vec_set_rt(mir_funcs, i, mf);
-        i = i + 1
+    # LIR projection (opcode remap); operands stay in MIR tables for now.
+    var k = 0;
+    when k < g_mir_n loop
+        let mop3 = native_read_i64(g_mir_opc, k * 8);
+        let lop = mir_opc_to_lir_opc(mop3);
+        native_write_i64(g_lir_opc, k * 8, lop);
+        k = k + 1
     end
-
-    if verbose == 1 do
-        print_ln("virc: pipeline — lowering MIR to LIR & SSA Destruction...")
-    end
-
-    let lir_funcs = lir_lower_program(mir_funcs);
-
-    if verbose == 1 do
-        print_ln("virc: pipeline — Chaitin-Briggs Graph Coloring Register Allocation...")
-    end
-
-    i = 0;
-    let lir_count = vec_len_rt(lir_funcs);
-    when i < lir_count loop
-        let lf = vec_get_rt(lir_funcs, i);
-        let intervals = lir_compute_liveness(lf);
-        var (lf2, phys_map, stack_map) = lir_allocate_registers_color(lf, intervals);
-        vec_set_rt(lir_funcs, i, lf2);
-        i = i + 1
-    end
-
-    if verbose == 1 do
-        print_ln("virc: pipeline — LIR lowering complete (Q-IR fallback bypassed)")
-    end
-
-    out lir_funcs
+    g_lir_n = g_mir_n;
+    out g_mir_n
 end.
+
+func boot_phase8_mir_lir_gate:
+    let n = boot_build_mir_from_staging();
+    if n <= 0 do
+        print_ln("virc: phase8 warn — MIR/LIR empty; Q emit continues");
+        out 0
+    end
+    print_ln("virc: phase8 — MIR/LIR tables ready");
+    out n
+end.
+
 
 # ═══════════════════════════════════════════════════════
 # Compiler Pipeline
