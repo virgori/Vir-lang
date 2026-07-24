@@ -63,6 +63,7 @@ graph LR
 | 24 | `eee964a4` | **feat(compiler/lir)**: complete LIR & Chaitin-Briggs Graph Coloring Register Allocator | 1 | +38/-26 |
 | 25 | `02debe4c` | **feat(compiler/pipeline)**: wire AST→MIR→SSA→Opt→LIR→RegAlloc into driver & 11/11 tests pass | 5 | +113/-58 |
 | 26 | `4653b533` | **feat(compiler/pipeline)**: **PHASE 1 COMPLETE** — remove Q-IR fast-path & emit machine code directly from LIR | 3 | +102/-53 |
+| 27 | `4a48b337` | **feat(compiler/semantic)**: expand Semantic v2.0 type checking rules (Pass 6) | 1 | +70/-17 |
 
 ---
 
