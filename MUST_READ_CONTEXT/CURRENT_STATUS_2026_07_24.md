@@ -43,6 +43,7 @@ graph LR
 | 4 | `29239fc3` | **feat(compiler)**: ARM64 callee-save, array/alloc, entity/enum registry, preludes | 11 | +2233/-90 |
 | 5 | `f0564dc9` | **feat(bootstrap)**: stub ping, PrintStr ≤48, docs §1.1, VPS spec | 4 | +783/-87 |
 | 6 | `70707be5` | **feat(compiler)**: support TupleExpr lowering in virc_boot and ir_optimizer | 2 | +4/-4 |
+| 7 | `7a3f4fbc` | **feat(parser)**: multiline & semicolon grouped var decls without repeating var | 4 | +90/-19 |
 
 ---
 
