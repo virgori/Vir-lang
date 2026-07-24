@@ -59,6 +59,7 @@ graph LR
 | 20 | `70c6b407` | **feat(compiler/semantic)**: complete 10-pass Semantic Analyzer for Vir v2.0 (100% Coverage) | 6 | +312/-53 |
 | 21 | `681c2e70` | **docs**: update status with commit 20 | 1 | +1/-0 |
 | 22 | `5b00db79` | **feat(compiler/mir)**: complete AST to MIR Lowering Engine for Vir v2.0 | 1 | +272/-152 |
+| 23 | `f1190956` | **feat(compiler/mir)**: complete MIR Optimizations & SSA Construction for Vir v2.0 | 1 | +148/-15 |
 
 ---
 
