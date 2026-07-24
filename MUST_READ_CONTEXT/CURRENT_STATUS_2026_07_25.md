@@ -45,6 +45,7 @@ graph TD
 | 25 | `02debe4c` | **feat(compiler/pipeline)**: wire AST→MIR→SSA→Opt→LIR→RegAlloc into driver & 11/11 tests pass | 5 | +113/-58 |
 | 26 | `4653b533` | **feat(compiler/pipeline)**: **PHASE 1 COMPLETE** — remove Q-IR fast-path & emit machine code directly from LIR | 3 | +102/-53 |
 | 27 | `4a48b337` | **feat(compiler/semantic)**: expand Semantic v2.0 type checking rules (Pass 6) | 1 | +70/-17 |
+| 28 | `1701b315` | **feat(compiler/mir)**: **PHASE 3 COMPLETE** — expand AST to MIR lowering coverage for Match, Case, For, Ensure, Revert | 1 | +48/-0 |
 
 ---
 
