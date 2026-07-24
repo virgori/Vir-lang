@@ -1574,6 +1574,12 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
   case AST_CALL: {
     /* Function call: evaluate args, put in R0..Rn, call, result in R0 */
     int fidx = find_func_index(ctx, expr->name);
+    /* Empty extern stubs (body_count==0) for soft/native_* names must not
+     * become Q_CALL_FUNC no-ops — e.g. native_file_open would leave R0
+     * unchanged instead of emitting Q_FILE_OPEN. Prefer the soft handlers. */
+    if (fidx >= 0 && ctx->module.functions[fidx].body_count == 0 &&
+        is_soft_call_name(expr->name))
+      fidx = -1;
     if (fidx < 0) {
       /* §11.4 bước 2 — Callable field fallback.
        * UFCS rewrite produced AST_CALL with children[0] = receiver.

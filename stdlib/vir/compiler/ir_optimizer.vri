@@ -407,6 +407,7 @@ end.
 # ═══════════════════════════════════════════════════════
 
 const G_MAX_FUNCS = 64;
+const G_MAX_LOOP_DEPTH = 16;
 const G_OFF_NFUNCS = 0;
 const G_OFF_CUR = 8;
 const G_OFF_VREG = 16;
@@ -414,11 +415,219 @@ const G_OFF_SCRATCH = 24;
 const G_OFF_ERR = 32;
 const G_OFF_NAMES = 40;
 const G_OFF_BODIES = 552;   # 40 + 64*8
-const G_META_SIZE = 1064;   # 552 + 64*8
+const G_OFF_LABEL = 1064;
+const G_OFF_LOOP_DEPTH = 1072;
+const G_OFF_LOOP_STARTS = 1080;                  # 16 × i64
+const G_OFF_LOOP_ENDS = 1080 + G_MAX_LOOP_DEPTH * 8;  # 1208
+const G_META_SIZE = 1080 + G_MAX_LOOP_DEPTH * 8 * 2;  # 1336
 # Packed instr words in body rt-vec (ints only — no soft QInstr handles).
 const G_INSTR_WORDS = 11;
 
+# Hard entity registry (soft EntityType/Vec dies under C-core).
+# Layout in g_ent:
+#   [0] nents
+#   [8] total flat fields used
+#   [16 .. 16+16*8) entity name ptrs
+#   [144 .. 144+16*8) nfields per entity
+#   [272 .. 272+16*8) flat-field start index per entity
+#   [400 .. 400+64*8) field name ptrs
+#   [912 .. 912+64*8) field byte offsets
+const G_ENT_MAX = 16;
+const G_ENT_MAX_FIELDS = 64;
+const G_ENT_OFF_N = 0;
+const G_ENT_OFF_NFTOTAL = 8;
+const G_ENT_OFF_NAMES = 16;
+const G_ENT_OFF_NFIELDS = 144;
+const G_ENT_OFF_FSTART = 272;
+const G_ENT_OFF_FNAMES = 400;
+const G_ENT_OFF_FOFFS = 912;
+const G_ENT_SIZE = 912 + G_ENT_MAX_FIELDS * 8;  # 1424
+
+# Hard enum registry (soft enum_map never filled — vir_lower_program skips EnumDef).
+# Layout in g_enum:
+#   [0] nenums
+#   [8] total flat variants used
+#   [16 .. 16+32*8) enum name ptrs
+#   [272 .. 272+32*8) nvariants per enum
+#   [528 .. 528+32*8) flat-variant start index per enum
+#   [784 .. 784+256*8) variant name ptrs
+#   [2832 .. 2832+256*8) variant int values
+const G_ENUM_MAX = 32;
+const G_ENUM_MAX_VARS = 256;
+const G_ENUM_OFF_N = 0;
+const G_ENUM_OFF_NVTOTAL = 8;
+const G_ENUM_OFF_NAMES = 16;
+const G_ENUM_OFF_NVARS = 272;
+const G_ENUM_OFF_VSTART = 528;
+const G_ENUM_OFF_VNAMES = 784;
+const G_ENUM_OFF_VVALS = 2832;
+const G_ENUM_SIZE = 2832 + G_ENUM_MAX_VARS * 8;  # 4880
+
 var g_meta = 0;
+var g_ent = 0;
+var g_enum = 0;
+
+func g_ent_init:
+    if g_ent == 0 do
+        g_ent = vir_alloc(G_ENT_SIZE)
+    end
+    native_write_i64(g_ent, G_ENT_OFF_N, 0);
+    native_write_i64(g_ent, G_ENT_OFF_NFTOTAL, 0)
+end.
+
+func g_enum_init:
+    if g_enum == 0 do
+        g_enum = vir_alloc(G_ENUM_SIZE)
+    end
+    native_write_i64(g_enum, G_ENUM_OFF_N, 0);
+    native_write_i64(g_enum, G_ENUM_OFF_NVTOTAL, 0)
+end.
+
+func g_enum_n:
+    out native_read_i64(g_enum, G_ENUM_OFF_N)
+end.
+
+func g_enum_register(name: string, variants: int):
+    # variants = AstNode children rt-vec of EnumDef (name + int_val)
+    ei = g_enum_n();
+    if ei < 0 or ei >= G_ENUM_MAX do
+        out 0 - 1
+    end
+    native_write_i64(g_enum, G_ENUM_OFF_NAMES + ei * 8, fat_str_concat(name, fat_str_new("")));
+    vstart = native_read_i64(g_enum, G_ENUM_OFF_NVTOTAL);
+    nv = 0;
+    if variants != 0 do
+        nch = vec_len_rt(variants);
+        i = 0;
+        when i < nch and (vstart + nv) < G_ENUM_MAX_VARS loop
+            v = vec_get_rt(variants, i);
+            slot = vstart + nv;
+            native_write_i64(g_enum, G_ENUM_OFF_VNAMES + slot * 8, fat_str_concat(v.name, fat_str_new("")));
+            native_write_i64(g_enum, G_ENUM_OFF_VVALS + slot * 8, v.int_val);
+            nv = nv + 1;
+            i = i + 1
+        end
+    end
+    native_write_i64(g_enum, G_ENUM_OFF_NVARS + ei * 8, nv);
+    native_write_i64(g_enum, G_ENUM_OFF_VSTART + ei * 8, vstart);
+    native_write_i64(g_enum, G_ENUM_OFF_NVTOTAL, vstart + nv);
+    native_write_i64(g_enum, G_ENUM_OFF_N, ei + 1);
+    out ei
+end.
+
+func g_enum_find(name: string):
+    i = 0;
+    n = g_enum_n();
+    when i < n loop
+        en = native_read_i64(g_enum, G_ENUM_OFF_NAMES + i * 8);
+        if fat_str_eq(en, name) do
+            out i
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func g_enum_variant_val(ei: int, variant: string):
+    if ei < 0 or ei >= g_enum_n() do
+        out (false, 0)
+    end
+    vstart = native_read_i64(g_enum, G_ENUM_OFF_VSTART + ei * 8);
+    nv = native_read_i64(g_enum, G_ENUM_OFF_NVARS + ei * 8);
+    i = 0;
+    when i < nv loop
+        vn = native_read_i64(g_enum, G_ENUM_OFF_VNAMES + (vstart + i) * 8);
+        if fat_str_eq(vn, variant) do
+            out (true, native_read_i64(g_enum, G_ENUM_OFF_VVALS + (vstart + i) * 8))
+        end
+        i = i + 1
+    end
+    out (false, 0)
+end.
+
+func g_ent_n:
+    out native_read_i64(g_ent, G_ENT_OFF_N)
+end.
+
+func g_ent_register(name: string, fields: int):
+    # fields = AstNode children rt-vec handle of EntityDef field decls
+    ei = g_ent_n();
+    if ei < 0 or ei >= G_ENT_MAX do
+        out 0 - 1
+    end
+    native_write_i64(g_ent, G_ENT_OFF_NAMES + ei * 8, fat_str_concat(name, fat_str_new("")));
+    fstart = native_read_i64(g_ent, G_ENT_OFF_NFTOTAL);
+    nf = 0;
+    if fields != 0 do
+        nch = vec_len_rt(fields);
+        i = 0;
+        when i < nch and (fstart + nf) < G_ENT_MAX_FIELDS loop
+            f = vec_get_rt(fields, i);
+            slot = fstart + nf;
+            native_write_i64(g_ent, G_ENT_OFF_FNAMES + slot * 8, fat_str_concat(f.name, fat_str_new("")));
+            native_write_i64(g_ent, G_ENT_OFF_FOFFS + slot * 8, nf * 8);
+            nf = nf + 1;
+            i = i + 1
+        end
+    end
+    native_write_i64(g_ent, G_ENT_OFF_NFIELDS + ei * 8, nf);
+    native_write_i64(g_ent, G_ENT_OFF_FSTART + ei * 8, fstart);
+    native_write_i64(g_ent, G_ENT_OFF_NFTOTAL, fstart + nf);
+    native_write_i64(g_ent, G_ENT_OFF_N, ei + 1);
+    out ei
+end.
+
+func g_ent_find(name: string):
+    i = 0;
+    n = g_ent_n();
+    when i < n loop
+        en = native_read_i64(g_ent, G_ENT_OFF_NAMES + i * 8);
+        if fat_str_eq(en, name) do
+            out i
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func g_ent_nbytes(ei: int):
+    if ei < 0 or ei >= g_ent_n() do
+        out 0
+    end
+    nf = native_read_i64(g_ent, G_ENT_OFF_NFIELDS + ei * 8);
+    out nf * 8
+end.
+
+func g_ent_field_off(ei: int, field: string):
+    if ei < 0 or ei >= g_ent_n() do
+        out 0 - 1
+    end
+    fstart = native_read_i64(g_ent, G_ENT_OFF_FSTART + ei * 8);
+    nf = native_read_i64(g_ent, G_ENT_OFF_NFIELDS + ei * 8);
+    i = 0;
+    when i < nf loop
+        fn = native_read_i64(g_ent, G_ENT_OFF_FNAMES + (fstart + i) * 8);
+        if fat_str_eq(fn, field) do
+            out native_read_i64(g_ent, G_ENT_OFF_FOFFS + (fstart + i) * 8)
+        end
+        i = i + 1
+    end
+    # Fallback: scan all entities' fields by name (first match).
+    out 0 - 1
+end.
+
+func g_ent_field_off_any(field: string):
+    ei = 0;
+    n = g_ent_n();
+    when ei < n loop
+        off = g_ent_field_off(ei, field);
+        if off >= 0 do
+            out off
+        end
+        ei = ei + 1
+    end
+    out 0 - 1
+end.
 
 func g_meta_init:
     if g_meta == 0 do
@@ -429,12 +638,16 @@ func g_meta_init:
     native_write_i64(g_meta, G_OFF_VREG, 0);
     native_write_i64(g_meta, G_OFF_SCRATCH, 0);
     native_write_i64(g_meta, G_OFF_ERR, 0);
+    native_write_i64(g_meta, G_OFF_LABEL, 0);
+    native_write_i64(g_meta, G_OFF_LOOP_DEPTH, 0);
     i = 0;
     when i < G_MAX_FUNCS loop
         native_write_i64(g_meta, G_OFF_NAMES + i * 8, 0);
         native_write_i64(g_meta, G_OFF_BODIES + i * 8, 0);
         i = i + 1
     end
+    g_ent_init();
+    g_enum_init()
 end.
 
 func g_nfuncs_get:
@@ -478,6 +691,49 @@ func g_body_get(i: int):
 end.
 func g_body_set(i: int, body: int):
     native_write_i64(g_meta, G_OFF_BODIES + i * 8, body)
+end.
+
+func g_label_fresh:
+    l = native_read_i64(g_meta, G_OFF_LABEL);
+    native_write_i64(g_meta, G_OFF_LABEL, l + 1);
+    out l
+end.
+
+func g_loop_depth:
+    out native_read_i64(g_meta, G_OFF_LOOP_DEPTH)
+end.
+
+func g_loop_push(start_lbl: int, end_lbl: int):
+    d = g_loop_depth();
+    if d < 0 or d >= G_MAX_LOOP_DEPTH do
+        out
+    end
+    native_write_i64(g_meta, G_OFF_LOOP_STARTS + d * 8, start_lbl);
+    native_write_i64(g_meta, G_OFF_LOOP_ENDS + d * 8, end_lbl);
+    native_write_i64(g_meta, G_OFF_LOOP_DEPTH, d + 1)
+end.
+
+func g_loop_pop:
+    d = g_loop_depth();
+    if d > 0 do
+        native_write_i64(g_meta, G_OFF_LOOP_DEPTH, d - 1)
+    end
+end.
+
+func g_loop_start_top:
+    d = g_loop_depth();
+    if d <= 0 do
+        out 0 - 1
+    end
+    out native_read_i64(g_meta, G_OFF_LOOP_STARTS + (d - 1) * 8)
+end.
+
+func g_loop_end_top:
+    d = g_loop_depth();
+    if d <= 0 do
+        out 0 - 1
+    end
+    out native_read_i64(g_meta, G_OFF_LOOP_ENDS + (d - 1) * 8)
 end.
 
 entity LowerCtx:
@@ -551,7 +807,8 @@ func fresh_vreg(ctx: LowerCtx):
 end.
 func fresh_label(ctx: LowerCtx):
 
-    l = ctx.label_counter;
+    # C-core: soft label_counter drops — use native meta.
+    l = g_label_fresh();
     ctx.label_counter = l + 1;
     ctx.scratch = l;
     g_scratch_set(l);
@@ -899,7 +1156,86 @@ func lower_expr_scratch(ctx: LowerCtx, expr: AstNode):
         out ctx
     end
 
+    # `e as T` — identity at runtime for soft ARM64 path.
+    if expr.node_type == AstType.CastExpr do
+        if vec_len_rt(expr.children) > 0 do
+            out lower_expr_scratch(ctx, vec_get_rt(expr.children, 0))
+        end
+        g_scratch_set(0 - 1);
+        out ctx
+    end
+
     if expr.node_type == AstType.BinOp do
+        # Boolean `and`/`or`: short-circuit (do not evaluate rhs when decided).
+        if expr.op == OpType.Land do
+            lhs_node = vec_get_rt(expr.children, 0);
+            rhs_node = vec_get_rt(expr.children, 1);
+            ctx = lower_expr_scratch(ctx, lhs_node);
+            lhs = g_scratch_get();
+            if lhs < 0 do
+                out ctx
+            end
+            ctx = fresh_vreg(ctx);
+            rd = g_scratch_get();
+            ctx = emit_words(ctx, 0 + QOp.Move, 0 + OperandType.VReg, rd, 0,
+                             0 + OperandType.VReg, lhs, 0, 0, 0, 0, 0);
+            ctx = fresh_label(ctx);
+            end_lbl = g_scratch_get();
+            # if lhs == 0 → skip rhs (result already lhs)
+            ctx = emit_words(ctx, 0 + QOp.JumpIfNot, 0, 0, 0,
+                             0 + OperandType.VReg, lhs, 0,
+                             0 + OperandType.LabelRef, end_lbl, 0, 0);
+            ctx = lower_expr_scratch(ctx, rhs_node);
+            rhs = g_scratch_get();
+            if rhs < 0 do
+                out ctx
+            end
+            ctx = emit_words(ctx, 0 + QOp.Move, 0 + OperandType.VReg, rd, 0,
+                             0 + OperandType.VReg, rhs, 0, 0, 0, 0, 0);
+            ctx = emit_words(ctx, 0 + QOp.Label, 0 + OperandType.VReg, end_lbl, 0,
+                             0, 0, 0, 0, 0, 0, 0);
+            ctx.scratch = rd;
+            g_scratch_set(rd);
+            out ctx
+        end
+        if expr.op == OpType.Lor do
+            lhs_node = vec_get_rt(expr.children, 0);
+            rhs_node = vec_get_rt(expr.children, 1);
+            ctx = lower_expr_scratch(ctx, lhs_node);
+            lhs = g_scratch_get();
+            if lhs < 0 do
+                out ctx
+            end
+            ctx = fresh_vreg(ctx);
+            rd = g_scratch_get();
+            ctx = emit_words(ctx, 0 + QOp.Move, 0 + OperandType.VReg, rd, 0,
+                             0 + OperandType.VReg, lhs, 0, 0, 0, 0, 0);
+            ctx = fresh_label(ctx);
+            rhs_lbl = g_scratch_get();
+            ctx = fresh_label(ctx);
+            end_lbl = g_scratch_get();
+            # if lhs == 0 → evaluate rhs; else → end
+            ctx = emit_words(ctx, 0 + QOp.JumpIfNot, 0, 0, 0,
+                             0 + OperandType.VReg, lhs, 0,
+                             0 + OperandType.LabelRef, rhs_lbl, 0, 0);
+            ctx = emit_words(ctx, 0 + QOp.Jump, 0, 0, 0,
+                             0 + OperandType.LabelRef, end_lbl, 0, 0, 0, 0, 0);
+            ctx = emit_words(ctx, 0 + QOp.Label, 0 + OperandType.VReg, rhs_lbl, 0,
+                             0, 0, 0, 0, 0, 0, 0);
+            ctx = lower_expr_scratch(ctx, rhs_node);
+            rhs = g_scratch_get();
+            if rhs < 0 do
+                out ctx
+            end
+            ctx = emit_words(ctx, 0 + QOp.Move, 0 + OperandType.VReg, rd, 0,
+                             0 + OperandType.VReg, rhs, 0, 0, 0, 0, 0);
+            ctx = emit_words(ctx, 0 + QOp.Label, 0 + OperandType.VReg, end_lbl, 0,
+                             0, 0, 0, 0, 0, 0, 0);
+            ctx.scratch = rd;
+            g_scratch_set(rd);
+            out ctx
+        end
+
         lhs_node = vec_get_rt(expr.children, 0);
         rhs_node = vec_get_rt(expr.children, 1);
         ctx = lower_expr_scratch(ctx, lhs_node);
@@ -1051,6 +1387,183 @@ func lower_expr_scratch(ctx: LowerCtx, expr: AstNode):
         out ctx
     end
 
+    if expr.node_type == AstType.ArrayLiteral do
+        ctx = fresh_vreg(ctx);
+        cap_r = g_scratch_get();
+        ctx = fresh_vreg(ctx);
+        arr_r = g_scratch_get();
+        n = vec_len_rt(expr.children) as i64;
+        cap = n;
+        if cap < 16 do
+            cap = 16
+        end
+        ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, cap_r, 0,
+                         0 + OperandType.Immediate, 0, cap, 0, 0, 0, 0);
+        ctx = emit_words(ctx, 0 + QOp.ArrNew, 0 + OperandType.VReg, arr_r, 0,
+                         0 + OperandType.VReg, cap_r, 0, 0, 0, 0, 0);
+        i = 0;
+        when i < vec_len_rt(expr.children) loop
+            ctx = lower_expr_scratch(ctx, vec_get_rt(expr.children, i));
+            elem = g_scratch_get();
+            if elem >= 0 do
+                ctx = emit_words(ctx, 0 + QOp.ArrPush, 0, 0, 0,
+                                 0 + OperandType.VReg, arr_r, 0,
+                                 0 + OperandType.VReg, elem, 0, 0)
+            end
+            i = i + 1
+        end
+        ctx.scratch = arr_r;
+        g_scratch_set(arr_r);
+        out ctx
+    end
+
+    if expr.node_type == AstType.IndexAccess do
+        var (scope, arr_idx) = sym_lookup_both(ctx, expr.name);
+        if scope < 0 do
+            ctx = lower_error(ctx, fat_str_new("undefined variable for index"));
+            ctx.scratch = -1;
+            g_scratch_set(0 - 1);
+            out ctx
+        end
+        arr_vreg = arr_idx;
+        if scope == 1 do
+            ctx = fresh_vreg(ctx);
+            gv = g_scratch_get();
+            ctx = emit_words(ctx, 0 + QOp.LoadGlobal, 0 + OperandType.VReg, gv, 0,
+                             0 + OperandType.Immediate, 0, arr_idx as i64, 0, 0, 0, 0);
+            arr_vreg = gv
+        end
+        ctx = lower_expr_scratch(ctx, vec_get_rt(expr.children, 0));
+        idx_v = g_scratch_get();
+        if idx_v < 0 do
+            out ctx
+        end
+        ctx = fresh_vreg(ctx);
+        rd = g_scratch_get();
+        ctx = emit_words(ctx, 0 + QOp.ArrGet, 0 + OperandType.VReg, rd, 0,
+                         0 + OperandType.VReg, arr_vreg, 0,
+                         0 + OperandType.VReg, idx_v, 0, 0);
+        ctx.scratch = rd;
+        g_scratch_set(rd);
+        out ctx
+    end
+
+    if expr.node_type == AstType.EntityLiteral do
+        ei = g_ent_find(expr.name);
+        if ei < 0 do
+            ctx = lower_error(ctx, fat_str_concat(fat_str_new("undefined entity: "), expr.name));
+            ctx.scratch = -1;
+            g_scratch_set(0 - 1);
+            out ctx
+        end
+        ctx = fresh_vreg(ctx);
+        sz_r = g_scratch_get();
+        ctx = fresh_vreg(ctx);
+        ptr_r = g_scratch_get();
+        sz = g_ent_nbytes(ei);
+        ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, sz_r, 0,
+                         0 + OperandType.Immediate, 0, sz, 0, 0, 0, 0);
+        ctx = emit_words(ctx, 0 + QOp.Alloc, 0 + OperandType.VReg, ptr_r, 0,
+                         0 + OperandType.VReg, sz_r, 0, 0, 0, 0, 0);
+        i = 0;
+        when i < vec_len_rt(expr.children) loop
+            child = vec_get_rt(expr.children, i);
+            foff = g_ent_field_off(ei, child.name2);
+            if foff < 0 do
+                foff = g_ent_field_off_any(child.name2)
+            end
+            if foff >= 0 do
+                ctx = lower_expr_scratch(ctx, child);
+                val_r = g_scratch_get();
+                if val_r >= 0 do
+                    ctx = fresh_vreg(ctx);
+                    off_r = g_scratch_get();
+                    ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, off_r, 0,
+                                     0 + OperandType.Immediate, 0, foff, 0, 0, 0, 0);
+                    ctx = emit_words(ctx, 0 + QOp.StoreWord, 0 + OperandType.VReg, val_r, 0,
+                                     0 + OperandType.VReg, ptr_r, 0,
+                                     0 + OperandType.VReg, off_r, 0, 0)
+                end
+            end
+            i = i + 1
+        end
+        ctx.scratch = ptr_r;
+        g_scratch_set(ptr_r);
+        out ctx
+    end
+
+    if expr.node_type == AstType.EnumAccess do
+        ei = g_enum_find(expr.name);
+        if ei < 0 do
+            ctx = lower_error(ctx, fat_str_concat(fat_str_new("undefined enum: "), expr.name));
+            ctx.scratch = -1;
+            g_scratch_set(0 - 1);
+            out ctx
+        end
+        var (ok, val) = g_enum_variant_val(ei, expr.name2);
+        if not ok do
+            ctx = lower_error(ctx, fat_str_concat(fat_str_new("unknown variant: "), expr.name2));
+            ctx.scratch = -1;
+            g_scratch_set(0 - 1);
+            out ctx
+        end
+        ctx = fresh_vreg(ctx);
+        r = g_scratch_get();
+        ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, r, 0,
+                         0 + OperandType.Immediate, 0, val, 0, 0, 0, 0);
+        ctx.scratch = r;
+        g_scratch_set(r);
+        out ctx
+    end
+
+    if expr.node_type == AstType.FieldAccess do
+        # Enum.Variant via Identifier base (hard enum registry)
+        base = vec_get_rt(expr.children, 0);
+        if base.node_type == AstType.Identifier do
+            ei = g_enum_find(base.name);
+            if ei >= 0 do
+                var (ok, val) = g_enum_variant_val(ei, expr.name);
+                if ok do
+                    ctx = fresh_vreg(ctx);
+                    r = g_scratch_get();
+                    ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, r, 0,
+                                     0 + OperandType.Immediate, 0, val, 0, 0, 0, 0);
+                    ctx.scratch = r;
+                    g_scratch_set(r);
+                    out ctx
+                end
+                ctx = lower_error(ctx, fat_str_concat(fat_str_new("unknown variant: "), expr.name));
+                ctx.scratch = -1;
+                g_scratch_set(0 - 1);
+                out ctx
+            end
+        end
+        ctx = lower_expr_scratch(ctx, base);
+        base_r = g_scratch_get();
+        if base_r < 0 do
+            out ctx
+        end
+        offset = g_ent_field_off_any(expr.name);
+        if offset < 0 do
+            ctx = lower_error(ctx, fat_str_concat(fat_str_new("unknown field: "), expr.name));
+            ctx.scratch = -1;
+            g_scratch_set(0 - 1);
+            out ctx
+        end
+        ctx = fresh_vreg(ctx);
+        off_r = g_scratch_get();
+        ctx = fresh_vreg(ctx);
+        rd = g_scratch_get();
+        ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, off_r, 0,
+                         0 + OperandType.Immediate, 0, offset, 0, 0, 0, 0);
+        ctx = emit_words(ctx, 0 + QOp.LoadWord, 0 + OperandType.VReg, rd, 0,
+                         0 + OperandType.VReg, base_r, 0,
+                         0 + OperandType.VReg, off_r, 0, 0);
+        ctx.scratch = rd;
+        g_scratch_set(rd);
+        out ctx
+    end
+
     # Fallback: legacy tuple path for other expr kinds
     var (ctx2, val) = lower_expr(ctx, expr);
     ctx2.scratch = val;
@@ -1169,6 +1682,11 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
     end
 
     if expr.node_type == AstType.BinOp do
+        if expr.op == OpType.Land or expr.op == OpType.Lor do
+            # Prefer scratch path (short-circuit); keep tuple API for callers.
+            ctx2 = lower_expr_scratch(ctx, expr);
+            out (ctx2, g_scratch_get() as i64)
+        end
         var (ctx2, lhs) = lower_expr(ctx, vec_get_rt(expr.children, 0));
         if lhs < 0 do
             out (ctx2, -1)
@@ -1459,13 +1977,12 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
     end
 
     if expr.node_type == AstType.FieldAccess do
-        # Check for enum access first
+        # Check for enum access first (hard registry)
         base = vec_get_rt(expr.children, 0);
         if base.node_type == AstType.Identifier do
-            var (found, eidx) = type_lookup_enum(ctx, base.name);
-            if found do
-                et = vec_get(ctx.enum_types, eidx);
-                var (ok, val) = enum_lookup_variant(et, expr.name);
+            ei = g_enum_find(base.name);
+            if ei >= 0 do
+                var (ok, val) = g_enum_variant_val(ei, expr.name);
                 if ok do
                     ctx2 = fresh_vreg(ctx);
             r = ctx2.scratch;
@@ -1493,6 +2010,11 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
                 offset = off
             end
             j = j + 1
+        end
+
+        if offset < 0 do
+            # Hard entity registry fallback
+            offset = g_ent_field_off_any(expr.name)
         end
 
         if offset < 0 do
@@ -1563,7 +2085,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
             ctx = lower_expr_scratch(ctx, init);
             val = g_scratch_get();
             if val >= 0 and val != r do
-                ctx = emit_instr(ctx, q_instr(QOp.Move, q_vreg(r), q_vreg(val), q_none()))
+                ctx = emit_words(ctx, 0 + QOp.Move, 0 + OperandType.VReg, r, 0,
+                                 0 + OperandType.VReg, val, 0, 0, 0, 0, 0)
             end
             # §4.1 sized-type narrowing — emit AND mask for u8/u16/u32/i8/i16/i32
             mask = 0;
@@ -1579,8 +2102,11 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
             if mask != 0 do
                 ctx = fresh_vreg(ctx);
                 mr = g_scratch_get();
-                ctx = emit_instr(ctx, q_instr(QOp.Load, q_vreg(mr), q_imm(mask), q_none()));
-                ctx = emit_instr(ctx, q_instr(QOp.And, q_vreg(r), q_vreg(r), q_vreg(mr)))
+                ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, mr, 0,
+                                 0 + OperandType.Immediate, 0, mask, 0, 0, 0, 0);
+                ctx = emit_words(ctx, 0 + QOp.And, 0 + OperandType.VReg, r, 0,
+                                 0 + OperandType.VReg, r, 0,
+                                 0 + OperandType.VReg, mr, 0, 0)
             end
             if ast_produces_move_type(init) do
                 var (ef, ei) = sym_lookup_entry(ctx.symbols, stmt.name);
@@ -1601,27 +2127,40 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
             ctx = ownership_release_unclaimed(ctx);
             out ctx
         else
-            ctx = emit_instr(ctx, q_instr(QOp.Load, q_vreg(r), q_imm(0), q_none()));
+            ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, r, 0,
+                             0 + OperandType.Immediate, 0, 0, 0, 0, 0, 0);
             out ctx
         end
     end
 
     if stmt.node_type == AstType.Assign do
+        # Vir allows first assignment as definition (C-core sym_define on miss).
         var (scope, idx) = sym_lookup_both(ctx, stmt.name);
-        if scope < 0 do
-            out lower_error(ctx, fat_str_concat(fat_str_new("assign to undefined: "), stmt.name))
-        end
         rhs = vec_get_rt(stmt.children, 0);
         ctx = lower_expr_scratch(ctx, rhs);
         val = g_scratch_get();
         if val < 0 do
             out ctx
         end
-        if scope == 1 do
-            ctx = emit_instr(ctx, q_instr(QOp.StoreGlobal, q_none(), q_imm(idx as i64), q_vreg(val)))
-        else
+        if scope < 0 do
+            ctx = fresh_vreg(ctx);
+            idx = g_scratch_get();
+            ctx.symbols = sym_define(ctx.symbols, stmt.name, idx);
+            scope = 0;
             if val != idx do
-                ctx = emit_instr(ctx, q_instr(QOp.Move, q_vreg(idx), q_vreg(val), q_none()))
+                ctx = emit_words(ctx, 0 + QOp.Move, 0 + OperandType.VReg, idx, 0,
+                                 0 + OperandType.VReg, val, 0, 0, 0, 0, 0)
+            end
+        else
+            if scope == 1 do
+                ctx = emit_words(ctx, 0 + QOp.StoreGlobal, 0, 0, 0,
+                                 0 + OperandType.Immediate, 0, idx as i64,
+                                 0 + OperandType.VReg, val, 0, 0)
+            else
+                if val != idx do
+                    ctx = emit_words(ctx, 0 + QOp.Move, 0 + OperandType.VReg, idx, 0,
+                                     0 + OperandType.VReg, val, 0, 0, 0, 0, 0)
+                end
             end
         end
         # §4.8: release old borrow on LHS, track move, claim new borrow
@@ -1675,7 +2214,9 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
         ctx = lower_expr_scratch(ctx, val_node);
         val_v = g_scratch_get();
         if idx_v >= 0 and val_v >= 0 do
-            ctx = emit_instr(ctx, q_instr(QOp.ArrSet, q_vreg(val_v), q_vreg(arr_vreg), q_vreg(idx_v)))
+            ctx = emit_words(ctx, 0 + QOp.ArrSet, 0 + OperandType.VReg, val_v, 0,
+                             0 + OperandType.VReg, arr_vreg, 0,
+                             0 + OperandType.VReg, idx_v, 0, 0)
         end
         out ctx
     end
@@ -1746,32 +2287,35 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
     end
 
     if stmt.node_type == AstType.WhileStmt do
-        ctx2 = fresh_label(ctx);
-            loop_lbl = ctx2.scratch;
-        ctx3 = fresh_label(ctx2);
-            end_lbl = ctx3.scratch;
+        ctx = fresh_label(ctx);
+        loop_lbl = g_scratch_get();
+        ctx = fresh_label(ctx);
+        end_lbl = g_scratch_get();
 
-        ctx3 = emit_instr(ctx3, q_instr(QOp.Label, q_vreg(loop_lbl), q_none(), q_none()));
+        ctx = emit_words(ctx, 0 + QOp.Label, 0 + OperandType.VReg, loop_lbl, 0,
+                         0, 0, 0, 0, 0, 0, 0);
 
-        var (ctx4, cond_r) = lower_expr(ctx3, vec_get_rt(stmt.children, 0));
+        cond_node = vec_get_rt(stmt.children, 0);
+        ctx = lower_expr_scratch(ctx, cond_node);
+        cond_r = g_scratch_get();
         if cond_r < 0 do
-            out ctx4
+            out ctx
         end
-        ctx4 = emit_instr(ctx4, q_instr(QOp.JumpIfNot, q_none(), q_vreg(cond_r as i64), q_label(end_lbl)));
+        ctx = emit_words(ctx, 0 + QOp.JumpIfNot, 0, 0, 0,
+                         0 + OperandType.VReg, cond_r, 0,
+                         0 + OperandType.LabelRef, end_lbl, 0, 0);
 
-        # Push loop labels
-        vec_push(ctx4.loop_start_labels, loop_lbl);
-        vec_push(ctx4.loop_end_labels, end_lbl);
-        ctx4.loop_depth = ctx4.loop_depth + 1;
+        g_loop_push(loop_lbl, end_lbl);
 
-        ctx4 = lower_stmt(ctx4, vec_get_rt(stmt.children, 1));
+        ctx = lower_stmt(ctx, vec_get_rt(stmt.children, 1));
 
-        ctx4.loop_depth = ctx4.loop_depth - 1;
+        g_loop_pop();
 
-        ctx4 = emit_instr(ctx4, q_instr(QOp.Jump, q_none(), q_label(loop_lbl), q_none()));
-
-        ctx4 = emit_instr(ctx4, q_instr(QOp.Label, q_vreg(end_lbl), q_none(), q_none()));
-        out ctx4
+        ctx = emit_words(ctx, 0 + QOp.Jump, 0, 0, 0,
+                         0 + OperandType.LabelRef, loop_lbl, 0, 0, 0, 0, 0);
+        ctx = emit_words(ctx, 0 + QOp.Label, 0 + OperandType.VReg, end_lbl, 0,
+                         0, 0, 0, 0, 0, 0, 0);
+        out ctx
     end
 
     if stmt.node_type == AstType.LoopStmt do
@@ -1885,20 +2429,22 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
     end
 
     if stmt.node_type == AstType.BreakStmt do
-        if ctx.loop_depth == 0 do
+        if g_loop_depth() == 0 do
             out lower_error(ctx, fat_str_new("break outside of loop"))
         end
-        end_lbl = vec_get(ctx.loop_end_labels, (ctx.loop_depth - 1) as i64);
-        ctx = emit_instr(ctx, q_instr(QOp.Jump, q_none(), q_label(end_lbl), q_none()));
+        end_lbl = g_loop_end_top();
+        ctx = emit_words(ctx, 0 + QOp.Jump, 0, 0, 0,
+                         0 + OperandType.LabelRef, end_lbl, 0, 0, 0, 0, 0);
         out ctx
     end
 
     if stmt.node_type == AstType.ContinueStmt do
-        if ctx.loop_depth == 0 do
+        if g_loop_depth() == 0 do
             out lower_error(ctx, fat_str_new("continue outside of loop"))
         end
-        start_lbl = vec_get(ctx.loop_start_labels, (ctx.loop_depth - 1) as i64);
-        ctx = emit_instr(ctx, q_instr(QOp.Jump, q_none(), q_label(start_lbl), q_none()));
+        start_lbl = g_loop_start_top();
+        ctx = emit_words(ctx, 0 + QOp.Jump, 0, 0, 0,
+                         0 + OperandType.LabelRef, start_lbl, 0, 0, 0, 0, 0);
         out ctx
     end
 
@@ -1925,6 +2471,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
             i = i + 1
         end
         vec_push(ctx.entity_types, et);
+        let eidx = (vec_len(ctx.entity_types) - 1) as i64;
+        map_insert<string, i64>(&ctx.entity_map, stmt.name, eidx);
         out ctx
     end
 
@@ -1935,37 +2483,29 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
         end
         base_vreg = idx;
         if scope == 1 do
-            ctx2 = fresh_vreg(ctx);
-            gv = ctx2.scratch;
-            ctx = ctx2;
-            ctx = emit_instr(ctx, q_instr(QOp.LoadGlobal, q_vreg(gv), q_imm(idx as i64), q_none()));
+            ctx = fresh_vreg(ctx);
+            gv = g_scratch_get();
+            ctx = emit_words(ctx, 0 + QOp.LoadGlobal, 0 + OperandType.VReg, gv, 0,
+                             0 + OperandType.Immediate, 0, idx as i64, 0, 0, 0, 0);
             base_vreg = gv
         end
-
-        # Find field offset across all entity types
-        offset = -1;
-        j = 0;
-        when j < vec_len(ctx.entity_types) and offset < 0 loop
-            et = vec_get(ctx.entity_types, j);
-            var (ok, off) = entity_field_offset(et, stmt.name2);
-            if ok do
-                offset = off
-            end
-            j = j + 1
-        end
+        offset = g_ent_field_off_any(stmt.name2);
         if offset < 0 do
             out lower_error(ctx, fat_str_concat(fat_str_new("unknown field: "), stmt.name2))
         end
-
-        var (ctx3, val_r) = lower_expr(ctx, vec_get_rt(stmt.children, 0));
+        ctx = lower_expr_scratch(ctx, vec_get_rt(stmt.children, 0));
+        val_r = g_scratch_get();
         if val_r < 0 do
-            out ctx3
+            out ctx
         end
-        ctx4 = fresh_vreg(ctx3);
-            off_r = ctx4.scratch;
-        ctx4 = emit_instr(ctx4, q_instr(QOp.Load, q_vreg(off_r), q_imm(offset as i64), q_none()));
-        ctx4 = emit_instr(ctx4, q_instr(QOp.StoreWord, q_vreg(val_r as i64), q_vreg(base_vreg), q_vreg(off_r)));
-        out ctx4
+        ctx = fresh_vreg(ctx);
+        off_r = g_scratch_get();
+        ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, off_r, 0,
+                         0 + OperandType.Immediate, 0, offset, 0, 0, 0, 0);
+        ctx = emit_words(ctx, 0 + QOp.StoreWord, 0 + OperandType.VReg, val_r, 0,
+                         0 + OperandType.VReg, base_vreg, 0,
+                         0 + OperandType.VReg, off_r, 0, 0);
+        out ctx
     end
 
     if stmt.node_type == AstType.CheckCpu or stmt.node_type == AstType.PatchPoint do
@@ -2053,6 +2593,8 @@ func lower_func_def_at(ctx: LowerCtx, func_def: AstNode, fidx: int):
     ctx.next_vreg = 0;
     g_vreg_set(0);
     ctx.label_counter = 0;
+    native_write_i64(g_meta, G_OFF_LABEL, 0);
+    native_write_i64(g_meta, G_OFF_LOOP_DEPTH, 0);
 
     # Save local scope
     saved_syms = ctx.symbols;
@@ -2076,7 +2618,10 @@ func lower_func_def_at(ctx: LowerCtx, func_def: AstNode, fidx: int):
         idx = idx - 1
     end
 
-    # Register parameters
+    # Register parameters in ABI regs X0..Xn (vreg 0..n-1), then
+    # immediately copy into X19+ locals and rebind names so params
+    # survive recursive/nested calls that clobber X0..X7.
+    nparams = 0;
     i = 0;
     when i < body_idx loop
         param = vec_get_rt(func_def.children, i);
@@ -2084,11 +2629,34 @@ func lower_func_def_at(ctx: LowerCtx, func_def: AstNode, fidx: int):
             ctx = fresh_vreg(ctx);
             pr = g_scratch_get();
             ctx.symbols = sym_define(ctx.symbols, param.name, pr);
-            # §6.4 — record param name on QFunction for named-arg reorder
-            # Soft QFunction mutation is best-effort under C-core; skip if unsafe.
+            nparams = nparams + 1;
             i = i + 1
         else
             i = i + 1
+        end
+    end
+
+    # Locals/temps use X19+ (callee-saved).
+    if g_vreg_get() < 19 do
+        g_vreg_set(19);
+        ctx.next_vreg = 19
+    end
+
+    # Spill each incoming param into a callee-saved local and rebind.
+    if nparams > 0 do
+        pi = 0;
+        when pi < nparams loop
+            ctx = fresh_vreg(ctx);
+            dest = g_scratch_get();
+            ctx = emit_words(ctx, 0 + QOp.Move, 0 + OperandType.VReg, dest, 0,
+                             0 + OperandType.VReg, pi, 0, 0, 0, 0, 0);
+            # Rebind the pi-th param symbol to dest (entries are in order).
+            if pi < vec_len(ctx.symbols.entries) do
+                e = vec_get(ctx.symbols.entries, pi);
+                e.vreg = dest;
+                vec_set(ctx.symbols.entries, pi, e)
+            end
+            pi = pi + 1
         end
     end
 
@@ -2158,6 +2726,20 @@ end.
 # ═══════════════════════════════════════════════════════
 
 func vir_lower_program(ctx: LowerCtx, program: AstNode):
+
+    # Pass 0: register EntityDef / EnumDef into hard tables only (skip soft lower —
+    # EntityType/Vec/map_insert hang or corrupt under C-core).
+    i = 0;
+    when i < vec_len_rt(program.children) loop
+        child = vec_get_rt(program.children, i);
+        if child.node_type == AstType.EntityDef do
+            g_ent_register(child.name, child.children)
+        end
+        if child.node_type == AstType.EnumDef do
+            g_enum_register(child.name, child.children)
+        end
+        i = i + 1
+    end
 
     # Pass 1: register all FuncDef names so Call can resolve forward refs.
     i = 0;
