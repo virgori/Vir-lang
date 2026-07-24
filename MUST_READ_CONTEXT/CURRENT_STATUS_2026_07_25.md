@@ -45,7 +45,7 @@ graph TD
 | Hash | Mô tả |
 |------|--------|
 | `58773cd3` | LIR-table Mach-O emit (Print/arith) + fix mir push reset |
-| *(pending)* | LIR multifn Call/SetArg/PrintStr — suite 11/11 LIR |
+| `431df9bc` | LIR multifn Call/SetArg/PrintStr — suite 11/11 LIR |
 
 ---
 
