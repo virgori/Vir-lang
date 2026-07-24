@@ -51,7 +51,7 @@ graph TD
 | 31 | `ccf5fb7f` | **feat(compiler/lir)**: **PHASE 6 COMPLETE** — Chaitin-Briggs Graph Coloring Register Allocation VReg rewriting | 1 | +70/-26 |
 | 32 | `5ee5023d` | **feat(compiler/backend)**: **PHASE 7 COMPLETE** — Multi-Backend (Mach-O, ELF, WASM) Driver Integration & LIR Codegen Export | 4 | +20/-18 |
 | 33 | `033366d0` | **feat(compiler)**: **PHASE 8 VERIFIED** — End-to-End Canonical MIR/SSA/LIR/RegAlloc Direct Pipeline Binary Emission | 2 | +733/-4 |
-| 34 | `3a189f21` | **feat(compiler)**: **PHASE 8 COMPLETE** — 100% Pure Self-Hosting Binary Emission Pipeline Verification | 2 | +50/-10 |
+| 34 | `1f942b2c` | **fix(compiler)**: **PHASE 8 STDOUT VERIFIED** — 11/11 stdout and exit codes matched 100% on direct bootstrap suite | 1 | +1/-8 |
 
 ---
 
