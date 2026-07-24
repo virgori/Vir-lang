@@ -51,6 +51,9 @@ graph LR
 | 12 | `a90fa3ef` | **feat(compiler/parser)**: implement P0 parser items (Dict literals, **, ><, !!, throw, select, port, send, recv) | 1 | +101/-14 |
 | 13 | `9d23eb0b` | **feat(compiler/parser)**: implement P1 parser items (entity methods, train/infer AI blocks, deck/mold) | 1 | +53/-0 |
 | 14 | `209e8f6b` | **feat(compiler/parser)**: implement P2 parser items (peek_n lookahead helper & sync_statement error recovery) | 1 | +22/-0 |
+| 15 | `e5a0696d` | **feat(compiler/semantic)**: implement P0 Semantic Analyzer (infrastructure + Pass 2/3/6) | 7 | +644/-7 |
+| 16 | `68341ced` | **feat(compiler/semantic)**: complete P0 pipeline wiring (orchestrator + diagnostics + virc.vri) | 3 | +201/-105 |
+| 17 | `db25ecf2` | **feat(compiler/semantic)**: implement P1 — Type Resolution, Inference, CFA (Pass 4/5/7) | 4 | +593/-1 |
 
 ---
 
