@@ -50,6 +50,7 @@ graph LR
 | 11 | `e4058e48` | **feat(compiler/lexer)**: implement P2 spec & VPS items (nested block comments, VPS delimiters `:(`, `:)`) | 1 | +13/-6 |
 | 12 | `a90fa3ef` | **feat(compiler/parser)**: implement P0 parser items (Dict literals, **, ><, !!, throw, select, port, send, recv) | 1 | +101/-14 |
 | 13 | `9d23eb0b` | **feat(compiler/parser)**: implement P1 parser items (entity methods, train/infer AI blocks, deck/mold) | 1 | +53/-0 |
+| 14 | `209e8f6b` | **feat(compiler/parser)**: implement P2 parser items (peek_n lookahead helper & sync_statement error recovery) | 1 | +22/-0 |
 
 ---
 
