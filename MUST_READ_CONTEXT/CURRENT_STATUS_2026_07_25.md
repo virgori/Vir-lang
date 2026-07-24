@@ -41,7 +41,8 @@ graph TD
 | Hash | Mô tả |
 |------|--------|
 | `431df9bc` | LIR multifn Call/SetArg/PrintStr |
-| `ec4f5a17` | flat MIR const-fold + DCE trong phase8 gate |
+| `ec4f5a17` | Flat MIR Constant Folding & DCE before LIR Emit |
+| `300cef97` | Flat MIR Copy-Propagation & Dead-Load DCE (11/11 PASS) |
 
 ---
 
