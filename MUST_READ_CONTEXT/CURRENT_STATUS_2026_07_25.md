@@ -50,7 +50,7 @@ graph TD
 |------|--------|
 | `5dc4cf68` | drop stub `compile_pipeline` trước Q emit |
 | `ac9d8c4f` | Phase 8 MIR/LIR flat tables từ Q staging |
-| *(pending)* | LIR-table Mach-O emit + fix `boot_mir_push` reset bug |
+| `58773cd3` | LIR-table Mach-O emit + fix `boot_mir_push` reset bug |
 
 ---
 
