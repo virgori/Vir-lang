@@ -56,6 +56,7 @@ graph LR
 | 17 | `db25ecf2` | **feat(compiler/semantic)**: implement P1 — Type Resolution, Inference, CFA (Pass 4/5/7) | 4 | +593/-1 |
 | 18 | `aaf2f866` | **docs**: update status with commits 16-17 | 1 | +3/-0 |
 | 19 | `7a20f8d2` | **feat(compiler/semantic)**: implement P2 — Borrow Analysis + Constant Folding (Pass 8/9) | 4 | +494/-10 |
+| 20 | `70c6b407` | **feat(compiler/semantic)**: complete 10-pass Semantic Analyzer for Vir v2.0 (100% Coverage) | 6 | +312/-53 |
 
 ---
 
