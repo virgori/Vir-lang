@@ -198,17 +198,20 @@ entity QFunction:
 end.
 func q_func_new(name: string):
 
+    body = vec_new();
+    pv = vec_new();
+    pn = vec_new();
     out QFunction (
         name:        name,
-        body:        vec_new<QInstr>(),
+        body:        body,
         param_count: 0,
-        param_vregs: vec_new<int>(),
-        param_names: vec_new<string>()
+        param_vregs: pv,
+        param_names: pn
     )
 end.
 func q_func_emit(f: QFunction, instr: QInstr):
 
-    vec_push(f.body, instr);
+    f.body = vec_push(f.body, instr);
     out f
 end.
 entity QModule:
@@ -220,21 +223,23 @@ entity QModule:
 end.
 func q_module_new(name: string):
 
+    fns = vec_new();
+    strs = vec_new();
+    smap = string_map_new();
+    fmap = string_map_new();
     out QModule (
         name:       name,
-        functions:  vec_new<QFunction>(),
-        strings:    vec_new<string>(),
-        string_map: string_map_new<i64>(),
-        func_map:   string_map_new<i64>()
+        functions:  fns,
+        strings:    strs,
+        string_map: smap,
+        func_map:   fmap
     )
 end.
 func q_module_add_func(m: QModule, name: string):
 
     f = q_func_new(name);
-    vec_push(m.functions, f);
-    let idx = (vec_len(m.functions) - 1) as i64;
-    map_insert<string, i64>(&m.func_map, name, idx);
-    out (m, idx)
+    m.functions = vec_push(m.functions, f);
+    out m
 end.
 func q_module_add_string(m: QModule, s: string):
 
@@ -244,7 +249,7 @@ func q_module_add_string(m: QModule, s: string):
         out (m, unwrap<i64>(idx_opt))
     end
     
-    vec_push(m.strings, s);
+    m.strings = vec_push(m.strings, s);
     let idx = (vec_len(m.strings) - 1) as i64;
     map_insert<string, i64>(&m.string_map, s, idx);
     out (m, idx)
@@ -274,7 +279,9 @@ entity SymTable:
         name_map:   Map<string, i64>
 end.
 func sym_new:
-    out SymTable ( entries: vec_new<SymEntry>(), name_map: string_map_new<i64>() )
+    ents = vec_new();
+    nmap = string_map_new();
+    out SymTable ( entries: ents, name_map: nmap )
 end.
 func sym_define:
     in  st: SymTable;
@@ -386,44 +393,62 @@ entity LowerCtx:
         loop_end_labels:    Vec<int>,
         error_count: i64,
         last_error:         string,
-        patch_counter: i64;
+        patch_counter: i64,
+        scratch: i64,
     # §4.8 NLL borrow checker state
     stmt_borrows:       Vec<BorrowRecord>
 end.
 func lower_ctx_new(mod_name: string):
 
+    # C-core: build with temps — nested calls in entity literals clobber R0.
+    prog = q_module_new(mod_name);
+    syms = sym_new();
+    gsyms = sym_new();
+    enums = vec_new();
+    entities = vec_new();
+    emap = string_map_new();
+    entmap = string_map_new();
+    loop_starts = vec_new();
+    loop_ends = vec_new();
+        err = "";
+    borrows = vec_new();
     out LowerCtx (
-        prog:             q_module_new(mod_name),
+        prog:             prog,
         next_vreg:          0,
         label_counter:      0,
-        symbols:            sym_new(),
-        global_symbols:     sym_new(),
+        symbols:            syms,
+        global_symbols:     gsyms,
         global_idx_counter: 0,
-        enum_types:         vec_new<EnumType>(),
-        entity_types:       vec_new<EntityType>(),
-        enum_map:           string_map_new<i64>(),
-        entity_map:         string_map_new<i64>(),
+        enum_types:         enums,
+        entity_types:       entities,
+        enum_map:           emap,
+        entity_map:         entmap,
         current_func_idx:   -1,
         loop_depth:         0,
-        loop_start_labels:  vec_new<int>(),
-        loop_end_labels:    vec_new<int>(),
+        loop_start_labels:  loop_starts,
+        loop_end_labels:    loop_ends,
         error_count:        0,
-        last_error:         str_new(""),
+        last_error:         err,
         patch_counter:      0,
-        stmt_borrows:       vec_new<BorrowRecord>()
+        scratch:            0,
+        stmt_borrows:       borrows
     )
 end.
 func fresh_vreg(ctx: LowerCtx):
 
+    # C-core: do not return (ctx, r) tuples — large entity copies via tuples
+    # drop soft fields (e.g. prog.functions). Stash r in scratch instead.
     r = ctx.next_vreg;
-    ctx.next_vreg = ctx.next_vreg + 1;
-    out (ctx, r)
+    ctx.next_vreg = r + 1;
+    ctx.scratch = r;
+    out ctx
 end.
 func fresh_label(ctx: LowerCtx):
 
     l = ctx.label_counter;
-    ctx.label_counter = ctx.label_counter + 1;
-    out (ctx, l)
+    ctx.label_counter = l + 1;
+    ctx.scratch = l;
+    out ctx
 end.
 func lower_error(ctx: LowerCtx, msg: string):
 
@@ -596,24 +621,60 @@ end.
 # Expression Lowering
 # ═══════════════════════════════════════════════════════
 
-func lower_expr(ctx: LowerCtx, expr: AstNode):
+# C-core safe: returns ctx with result vreg in ctx.scratch (-1 on error).
+func lower_expr_scratch(ctx: LowerCtx, expr: AstNode):
 
     if expr.node_type == AstType.LiteralInt do
-        var (ctx2, r) = fresh_vreg(ctx);
-        ctx2 = emit_instr(ctx2, q_instr(QOp.Load, q_vreg(r), q_imm(expr.int_val), q_none()));
-        out (ctx2, r as i64)
+        ctx = fresh_vreg(ctx);
+        r = ctx.scratch;
+        imm = expr.int_val;
+        instr = q_instr(QOp.Load, q_vreg(r), q_imm(imm), q_none());
+        ctx = emit_instr(ctx, instr);
+        ctx.scratch = r;
+        out ctx
     end
 
     if expr.node_type == AstType.LiteralFloat do
-        var (ctx2, r) = fresh_vreg(ctx);
-        ctx2 = emit_instr(ctx2, q_instr(QOp.Load, q_vreg(r), q_imm(expr.float_val as i64), q_none()));
-        out (ctx2, r as i64)
+        ctx = fresh_vreg(ctx);
+        r = ctx.scratch;
+        imm = expr.float_val as i64;
+        instr = q_instr(QOp.Load, q_vreg(r), q_imm(imm), q_none());
+        ctx = emit_instr(ctx, instr);
+        ctx.scratch = r;
+        out ctx
+    end
+
+    # Fallback: legacy tuple path for other expr kinds
+    var (ctx2, val) = lower_expr(ctx, expr);
+    ctx2.scratch = val;
+    out ctx2
+end.
+
+func lower_expr(ctx: LowerCtx, expr: AstNode):
+
+    if expr.node_type == AstType.LiteralInt do
+        ctx = fresh_vreg(ctx);
+        r = ctx.scratch;
+        imm = expr.int_val;
+        instr = q_instr(QOp.Load, q_vreg(r), q_imm(imm), q_none());
+        ctx = emit_instr(ctx, instr);
+        out (ctx, r as i64)
+    end
+
+    if expr.node_type == AstType.LiteralFloat do
+        ctx = fresh_vreg(ctx);
+        r = ctx.scratch;
+        imm = expr.float_val as i64;
+        instr = q_instr(QOp.Load, q_vreg(r), q_imm(imm), q_none());
+        ctx = emit_instr(ctx, instr);
+        out (ctx, r as i64)
     end
 
     if expr.node_type == AstType.LiteralStr do
         var (ctx2, str_idx) = q_module_add_string(ctx.prog, expr.name);
         ctx.prog = ctx2;
-        var (ctx3, r) = fresh_vreg(ctx);
+        ctx3 = fresh_vreg(ctx);
+            r = ctx3.scratch;
         ctx3 = emit_instr(ctx3, q_instr(QOp.Load, q_vreg(r), q_str_ref(str_idx), q_none()));
         out (ctx3, r as i64)
     end
@@ -636,7 +697,8 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
             end
         end
         if scope == 1 do
-            var (ctx2, rd) = fresh_vreg(ctx);
+            ctx2 = fresh_vreg(ctx);
+            rd = ctx2.scratch;
             ctx2 = emit_instr(ctx2, q_instr(QOp.LoadGlobal, q_vreg(rd), q_imm(idx as i64), q_none()));
             out (ctx2, rd as i64)
         end
@@ -687,7 +749,8 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
             # Materialise value like a plain read
             var (scope2, idx2) = sym_lookup_both(ctx, tgt.name);
             if scope2 == 1 do
-                var (ctx2, rd) = fresh_vreg(ctx);
+                ctx2 = fresh_vreg(ctx);
+            rd = ctx2.scratch;
                 ctx2 = emit_instr(ctx2, q_instr(QOp.LoadGlobal, q_vreg(rd), q_imm(idx2 as i64), q_none()));
                 out (ctx2, rd as i64)
             end
@@ -706,7 +769,8 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
         if rhs < 0 do
             out (ctx3, -1)
         end
-        var (ctx4, rd) = fresh_vreg(ctx3);
+        ctx4 = fresh_vreg(ctx3);
+            rd = ctx4.scratch;
         op = QOp.Add;
         if expr.op == OpType.Sub do
             op = QOp.Sub
@@ -748,12 +812,15 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
         if rhs < 0 do
             out (ctx3, -1)
         end
-        var (ctx4, rd) = fresh_vreg(ctx3);
+        ctx4 = fresh_vreg(ctx3);
+            rd = ctx4.scratch;
 
         if expr.op == OpType.Ne do
             # NE = XOR(EQ(lhs, rhs), 1)
-            var (ctx5, eq_r) = fresh_vreg(ctx4);
-            var (ctx6, one_r) = fresh_vreg(ctx5);
+            ctx5 = fresh_vreg(ctx4);
+            eq_r = ctx5.scratch;
+            ctx6 = fresh_vreg(ctx5);
+            one_r = ctx6.scratch;
             ctx6 = emit_instr(ctx6, q_instr(QOp.CmpEq, q_vreg(eq_r), q_vreg(lhs as i64), q_vreg(rhs as i64)));
             ctx6 = emit_instr(ctx6, q_instr(QOp.Load, q_vreg(one_r), q_imm(1), q_none()));
             ctx6 = emit_instr(ctx6, q_instr(QOp.Xor, q_vreg(rd), q_vreg(eq_r), q_vreg(one_r)));
@@ -789,7 +856,8 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
             end
             i = i + 1
         end
-        var (ctx3, rd) = fresh_vreg(ctx);
+        ctx3 = fresh_vreg(ctx);
+            rd = ctx3.scratch;
         if expr.builtin_id == BuiltinId.Syscall do
             ctx3 = emit_instr(ctx3, q_instr(QOp.Intrinsic, q_vreg(rd), q_imm(0), q_imm(i as i64)))
         end
@@ -837,7 +905,8 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
         fidx = find_func_index(ctx, expr.name);
         if fidx < 0 do
             ctx = lower_error(ctx, str_concat(str_new("undefined function: "), expr.name));
-            var (ctx2, rd) = fresh_vreg(ctx);
+            ctx2 = fresh_vreg(ctx);
+            rd = ctx2.scratch;
             ctx2 = emit_instr(ctx2, q_instr(QOp.Load, q_vreg(rd), q_imm(0), q_none()));
             out (ctx2, rd as i64)
         end
@@ -874,7 +943,8 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
                 end
                 if found < 0 do
                     # Unmatched slot — emit 0 placeholder
-                    var (ctx_z, zr) = fresh_vreg(ctx);
+                    ctx_z = fresh_vreg(ctx);
+            zr = ctx_z.scratch;
                     ctx = ctx_z;
                     ctx = emit_instr(ctx, q_instr(QOp.Load, q_vreg(zr), q_imm(0), q_none()));
                     vec_push(reordered, zr)
@@ -898,13 +968,15 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
         ctx = emit_instr(ctx, q_instr(QOp.CallFunc, q_none(), q_func_idx(fidx as i64), q_none()));
 
         # Result in R0
-        var (ctx3, rd) = fresh_vreg(ctx);
+        ctx3 = fresh_vreg(ctx);
+            rd = ctx3.scratch;
         ctx3 = emit_instr(ctx3, q_instr(QOp.Move, q_vreg(rd), q_vreg(0), q_none()));
         out (ctx3, rd as i64)
     end
 
     if expr.node_type == AstType.InputExpr do
-        var (ctx2, rd) = fresh_vreg(ctx);
+        ctx2 = fresh_vreg(ctx);
+            rd = ctx2.scratch;
         ctx2 = emit_instr(ctx2, q_instr(QOp.Input, q_vreg(rd), q_none(), q_none()));
         out (ctx2, rd as i64)
     end
@@ -914,22 +986,27 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
         if vec_len_rt(expr.children) > 0 do
             var (ctx_a, tr) = lower_expr(ctx, vec_get_rt(expr.children, 0));
             if tr < 0 do
-                var (ctx_z, rd0) = fresh_vreg(ctx_a);
+                ctx_z = fresh_vreg(ctx_a);
+            rd0 = ctx_z.scratch;
                 ctx_z = emit_instr(ctx_z, q_instr(QOp.Load, q_vreg(rd0), q_imm(0), q_none()));
                 out (ctx_z, rd0 as i64)
             end
-            var (ctx_b, rd) = fresh_vreg(ctx_a);
+            ctx_b = fresh_vreg(ctx_a);
+            rd = ctx_b.scratch;
             ctx_b = emit_instr(ctx_b, q_instr(QOp.TaskWait, q_vreg(rd), q_vreg(tr as i64), q_none()));
             out (ctx_b, rd as i64)
         end
-        var (ctx2, rd2) = fresh_vreg(ctx);
+        ctx2 = fresh_vreg(ctx);
+            rd2 = ctx2.scratch;
         ctx2 = emit_instr(ctx2, q_instr(QOp.Load, q_vreg(rd2), q_imm(0), q_none()));
         out (ctx2, rd2 as i64)
     end
 
     if expr.node_type == AstType.ArrayLiteral do
-        var (ctx2, cap_r) = fresh_vreg(ctx);
-        var (ctx3, arr_r) = fresh_vreg(ctx2);
+        ctx2 = fresh_vreg(ctx);
+            cap_r = ctx2.scratch;
+        ctx3 = fresh_vreg(ctx2);
+            arr_r = ctx3.scratch;
         n = vec_len_rt(expr.children) as i64;
         cap = n;
         if cap < 16 do
@@ -957,7 +1034,8 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
         end
         arr_vreg = arr_idx;
         if scope == 1 do
-            var (ctx2, gv) = fresh_vreg(ctx);
+            ctx2 = fresh_vreg(ctx);
+            gv = ctx2.scratch;
             ctx = ctx2;
             ctx = emit_instr(ctx, q_instr(QOp.LoadGlobal, q_vreg(gv), q_imm(arr_idx as i64), q_none()));
             arr_vreg = gv
@@ -966,7 +1044,8 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
         if idx_v < 0 do
             out (ctx3, -1)
         end
-        var (ctx4, rd) = fresh_vreg(ctx3);
+        ctx4 = fresh_vreg(ctx3);
+            rd = ctx4.scratch;
         ctx4 = emit_instr(ctx4, q_instr(QOp.ArrGet, q_vreg(rd), q_vreg(arr_vreg), q_vreg(idx_v as i64)));
         out (ctx4, rd as i64)
     end
@@ -980,7 +1059,8 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
                 et = vec_get(ctx.enum_types, eidx);
                 var (ok, val) = enum_lookup_variant(et, expr.name);
                 if ok do
-                    var (ctx2, r) = fresh_vreg(ctx);
+                    ctx2 = fresh_vreg(ctx);
+            r = ctx2.scratch;
                     ctx2 = emit_instr(ctx2, q_instr(QOp.Load, q_vreg(r), q_imm(val), q_none()));
                     out (ctx2, r as i64)
                 end
@@ -1012,8 +1092,10 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
             out (ctx2, -1)
         end
 
-        var (ctx3, off_r) = fresh_vreg(ctx2);
-        var (ctx4, rd) = fresh_vreg(ctx3);
+        ctx3 = fresh_vreg(ctx2);
+            off_r = ctx3.scratch;
+        ctx4 = fresh_vreg(ctx3);
+            rd = ctx4.scratch;
         ctx4 = emit_instr(ctx4, q_instr(QOp.Load, q_vreg(off_r), q_imm(offset as i64), q_none()));
         ctx4 = emit_instr(ctx4, q_instr(QOp.LoadWord, q_vreg(rd), q_vreg(base_r as i64), q_vreg(off_r)));
         out (ctx4, rd as i64)
@@ -1026,8 +1108,10 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
             out (ctx, -1)
         end
         et = vec_get(ctx.entity_types, eidx);
-        var (ctx2, sz_r) = fresh_vreg(ctx);
-        var (ctx3, ptr_r) = fresh_vreg(ctx2);
+        ctx2 = fresh_vreg(ctx);
+            sz_r = ctx2.scratch;
+        ctx3 = fresh_vreg(ctx2);
+            ptr_r = ctx3.scratch;
         sz = (vec_len(et.fields) as i64) * 8;
         ctx3 = emit_instr(ctx3, q_instr(QOp.Load, q_vreg(sz_r), q_imm(sz), q_none()));
         ctx3 = emit_instr(ctx3, q_instr(QOp.Alloc, q_vreg(ptr_r), q_vreg(sz_r), q_none()));
@@ -1040,7 +1124,8 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
                 var (ctx4, val_r) = lower_expr(ctx3, child);
                 ctx3 = ctx4;
                 if val_r >= 0 do
-                    var (ctx5, off_r) = fresh_vreg(ctx3);
+                    ctx5 = fresh_vreg(ctx3);
+            off_r = ctx5.scratch;
                     ctx3 = ctx5;
                     ctx3 = emit_instr(ctx3, q_instr(QOp.Load, q_vreg(off_r), q_imm(foff as i64), q_none()));
                     ctx3 = emit_instr(ctx3, q_instr(QOp.StoreWord, q_vreg(val_r as i64), q_vreg(ptr_r), q_vreg(off_r)))
@@ -1062,7 +1147,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
 
 
     if stmt.node_type == AstType.VarDecl or stmt.node_type == AstType.ConstDecl do
-        var (ctx2, r) = fresh_vreg(ctx);
+        ctx2 = fresh_vreg(ctx);
+            r = ctx2.scratch;
         ctx2.symbols = sym_define(ctx2.symbols, stmt.name, r);
         if vec_len_rt(stmt.children) > 0 do
             init = vec_get_rt(stmt.children, 0);
@@ -1082,7 +1168,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
                 mask = 4294967295
             end
             if mask != 0 do
-                var (ctx4, mr) = fresh_vreg(ctx3);
+                ctx4 = fresh_vreg(ctx3);
+            mr = ctx4.scratch;
                 ctx4 = emit_instr(ctx4, q_instr(QOp.Load, q_vreg(mr), q_imm(mask), q_none()));
                 ctx4 = emit_instr(ctx4, q_instr(QOp.And, q_vreg(r), q_vreg(r), q_vreg(mr)));
                 # §4.8: mark move type + claim borrow
@@ -1186,7 +1273,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
         end
         arr_vreg = arr_idx;
         if scope == 1 do
-            var (ctx2, gv) = fresh_vreg(ctx);
+            ctx2 = fresh_vreg(ctx);
+            gv = ctx2.scratch;
             ctx = ctx2;
             ctx = emit_instr(ctx, q_instr(QOp.LoadGlobal, q_vreg(gv), q_imm(arr_idx as i64), q_none()));
             arr_vreg = gv
@@ -1209,13 +1297,18 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
 
     if stmt.node_type == AstType.ReturnStmt do
         if vec_len_rt(stmt.children) > 0 do
-            var (ctx2, val) = lower_expr(ctx, vec_get_rt(stmt.children, 0));
+            # Avoid entity-tuple returns from lower_expr under C-core.
+            ret_expr = vec_get_rt(stmt.children, 0);
+            ctx = lower_expr_scratch(ctx, ret_expr);
+            val = ctx.scratch;
             if val >= 0 do
-                ctx2 = emit_instr(ctx2, q_instr(QOp.Ret, q_none(), q_vreg(val as i64), q_none()))
+                ret_i = q_instr(QOp.Ret, q_none(), q_vreg(val), q_none());
+                ctx = emit_instr(ctx, ret_i)
             end
-            out ctx2
+            out ctx
         else
-            ctx = emit_instr(ctx, q_instr(QOp.Ret, q_none(), q_none(), q_none()));
+            ret_i = q_instr(QOp.Ret, q_none(), q_none(), q_none());
+            ctx = emit_instr(ctx, ret_i);
             out ctx
         end
     end
@@ -1225,8 +1318,10 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
         if cond_r < 0 do
             out ctx2
         end
-        var (ctx3, else_lbl) = fresh_label(ctx2);
-        var (ctx4, end_lbl) = fresh_label(ctx3);
+        ctx3 = fresh_label(ctx2);
+            else_lbl = ctx3.scratch;
+        ctx4 = fresh_label(ctx3);
+            end_lbl = ctx4.scratch;
 
         ctx4 = emit_instr(ctx4, q_instr(QOp.JumpIfNot, q_none(), q_vreg(cond_r as i64), q_label(else_lbl)));
 
@@ -1252,8 +1347,10 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
     end
 
     if stmt.node_type == AstType.WhileStmt do
-        var (ctx2, loop_lbl) = fresh_label(ctx);
-        var (ctx3, end_lbl) = fresh_label(ctx2);
+        ctx2 = fresh_label(ctx);
+            loop_lbl = ctx2.scratch;
+        ctx3 = fresh_label(ctx2);
+            end_lbl = ctx3.scratch;
 
         lbl = q_instr(QOp.Label, q_none(), q_none(), q_none());
         lbl.patch_id = loop_lbl;
@@ -1283,7 +1380,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
 
     if stmt.node_type == AstType.LoopStmt do
         # Counter-based loop
-        var (ctx2, counter) = fresh_vreg(ctx);
+        ctx2 = fresh_vreg(ctx);
+            counter = ctx2.scratch;
         ctx2 = emit_instr(ctx2, q_instr(QOp.Load, q_vreg(counter), q_imm(0), q_none()));
 
         var (ctx3, limit_r) = lower_expr(ctx2, vec_get_rt(stmt.children, 0));
@@ -1291,15 +1389,19 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
             out ctx3
         end
 
-        var (ctx4, loop_lbl) = fresh_label(ctx3);
-        var (ctx5, cont_lbl) = fresh_label(ctx4);
-        var (ctx6, end_lbl) = fresh_label(ctx5);
+        ctx4 = fresh_label(ctx3);
+            loop_lbl = ctx4.scratch;
+        ctx5 = fresh_label(ctx4);
+            cont_lbl = ctx5.scratch;
+        ctx6 = fresh_label(ctx5);
+            end_lbl = ctx6.scratch;
 
         lbl = q_instr(QOp.Label, q_none(), q_none(), q_none());
         lbl.patch_id = loop_lbl;
         ctx6 = emit_instr(ctx6, lbl);
 
-        var (ctx7, cmp_r) = fresh_vreg(ctx6);
+        ctx7 = fresh_vreg(ctx6);
+            cmp_r = ctx7.scratch;
         ctx7 = emit_instr(ctx7, q_instr(QOp.CmpLt, q_vreg(cmp_r), q_vreg(counter), q_vreg(limit_r as i64)));
         ctx7 = emit_instr(ctx7, q_instr(QOp.JumpIfNot, q_none(), q_vreg(cmp_r), q_label(end_lbl)));
 
@@ -1313,7 +1415,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
 
         lbl.patch_id = cont_lbl;
         ctx7 = emit_instr(ctx7, lbl);
-        var (ctx8, one_r) = fresh_vreg(ctx7);
+        ctx8 = fresh_vreg(ctx7);
+            one_r = ctx8.scratch;
         ctx8 = emit_instr(ctx8, q_instr(QOp.Load, q_vreg(one_r), q_imm(1), q_none()));
         ctx8 = emit_instr(ctx8, q_instr(QOp.Add, q_vreg(counter), q_vreg(counter), q_vreg(one_r)));
         ctx8 = emit_instr(ctx8, q_instr(QOp.Jump, q_none(), q_label(loop_lbl), q_none()));
@@ -1333,19 +1436,24 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
             out ctx3
         end
 
-        var (ctx4, loop_var) = fresh_vreg(ctx3);
+        ctx4 = fresh_vreg(ctx3);
+            loop_var = ctx4.scratch;
         ctx4.symbols = sym_define(ctx4.symbols, stmt.name, loop_var);
         ctx4 = emit_instr(ctx4, q_instr(QOp.Move, q_vreg(loop_var), q_vreg(start_v as i64), q_none()));
 
-        var (ctx5, loop_lbl) = fresh_label(ctx4);
-        var (ctx6, end_lbl) = fresh_label(ctx5);
-        var (ctx7, cont_lbl) = fresh_label(ctx6);
+        ctx5 = fresh_label(ctx4);
+            loop_lbl = ctx5.scratch;
+        ctx6 = fresh_label(ctx5);
+            end_lbl = ctx6.scratch;
+        ctx7 = fresh_label(ctx6);
+            cont_lbl = ctx7.scratch;
 
         lbl = q_instr(QOp.Label, q_none(), q_none(), q_none());
         lbl.patch_id = loop_lbl;
         ctx7 = emit_instr(ctx7, lbl);
 
-        var (ctx8, cmp_r) = fresh_vreg(ctx7);
+        ctx8 = fresh_vreg(ctx7);
+            cmp_r = ctx8.scratch;
         ctx8 = emit_instr(ctx8, q_instr(QOp.CmpLt, q_vreg(cmp_r), q_vreg(loop_var), q_vreg(end_v as i64)));
         ctx8 = emit_instr(ctx8, q_instr(QOp.JumpIfNot, q_none(), q_vreg(cmp_r), q_label(end_lbl)));
 
@@ -1359,7 +1467,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
 
         lbl.patch_id = cont_lbl;
         ctx8 = emit_instr(ctx8, lbl);
-        var (ctx9, one_r) = fresh_vreg(ctx8);
+        ctx9 = fresh_vreg(ctx8);
+            one_r = ctx9.scratch;
         ctx9 = emit_instr(ctx9, q_instr(QOp.Load, q_vreg(one_r), q_imm(1), q_none()));
         ctx9 = emit_instr(ctx9, q_instr(QOp.Add, q_vreg(loop_var), q_vreg(loop_var), q_vreg(one_r)));
         ctx9 = emit_instr(ctx9, q_instr(QOp.Jump, q_none(), q_label(loop_lbl), q_none()));
@@ -1372,7 +1481,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
     if stmt.node_type == AstType.Block do
         i = 0;
         when i < vec_len_rt(stmt.children) loop
-            ctx = lower_stmt(ctx, vec_get_rt(stmt.children, i));
+            child_stmt = vec_get_rt(stmt.children, i);
+            ctx = lower_stmt(ctx, child_stmt);
             i = i + 1
         end
         out ctx
@@ -1429,7 +1539,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
         end
         base_vreg = idx;
         if scope == 1 do
-            var (ctx2, gv) = fresh_vreg(ctx);
+            ctx2 = fresh_vreg(ctx);
+            gv = ctx2.scratch;
             ctx = ctx2;
             ctx = emit_instr(ctx, q_instr(QOp.LoadGlobal, q_vreg(gv), q_imm(idx as i64), q_none()));
             base_vreg = gv
@@ -1454,7 +1565,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
         if val_r < 0 do
             out ctx3
         end
-        var (ctx4, off_r) = fresh_vreg(ctx3);
+        ctx4 = fresh_vreg(ctx3);
+            off_r = ctx4.scratch;
         ctx4 = emit_instr(ctx4, q_instr(QOp.Load, q_vreg(off_r), q_imm(offset as i64), q_none()));
         ctx4 = emit_instr(ctx4, q_instr(QOp.StoreWord, q_vreg(val_r as i64), q_vreg(base_vreg), q_vreg(off_r)));
         out ctx4
@@ -1470,9 +1582,11 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
 
     # §4.5 arena NAME: body end — scoped arena allocator
     if stmt.node_type == AstType.ArenaBlock do
-        var (ctx_a, size_r) = fresh_vreg(ctx);
+        ctx_a = fresh_vreg(ctx);
+            size_r = ctx_a.scratch;
         ctx_a = emit_instr(ctx_a, q_instr(QOp.Load, q_vreg(size_r), q_imm(4096), q_none()));
-        var (ctx_b, aid_r) = fresh_vreg(ctx_a);
+        ctx_b = fresh_vreg(ctx_a);
+            aid_r = ctx_b.scratch;
         ctx_b = emit_instr(ctx_b, q_instr(QOp.ArenaNew, q_vreg(aid_r), q_vreg(size_r), q_none()));
         ctx_b.symbols = sym_define(ctx_b.symbols, stmt.name, aid_r);
         if vec_len_rt(stmt.children) > 0 do
@@ -1501,7 +1615,8 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
             if tr < 0 do
                 out ctx2
             end
-            var (ctx3, rd) = fresh_vreg(ctx2);
+            ctx3 = fresh_vreg(ctx2);
+            rd = ctx3.scratch;
             ctx3 = emit_instr(ctx3, q_instr(QOp.TaskCancel, q_vreg(rd), q_vreg(tr as i64), q_none()));
             out ctx3
         end
@@ -1532,14 +1647,13 @@ end.
 
 func lower_func_def(ctx: LowerCtx, func_def: AstNode):
 
-    var (ctx2, fidx) = q_module_add_func(ctx.prog, func_def.name);
-    ctx.prog = ctx2;
+    ctx.prog = q_module_add_func(ctx.prog, func_def.name);
+    fidx = vec_len(ctx.prog.functions) - 1;
     ctx.current_func_idx = fidx;
 
     # Save local scope
     saved_syms = ctx.symbols;
-    ctx.symbols = sym_new()
-
+    ctx.symbols = sym_new();
     # Find body, ensure, and revert blocks
     body_idx = -1;
     ensure_node_idx = -1;
@@ -1564,7 +1678,8 @@ func lower_func_def(ctx: LowerCtx, func_def: AstNode):
     when i < body_idx loop
         param = vec_get_rt(func_def.children, i);
         if param.node_type == AstType.Identifier do
-            var (ctx3, pr) = fresh_vreg(ctx);
+            ctx3 = fresh_vreg(ctx);
+            pr = ctx3.scratch;
             ctx = ctx3;
             ctx.symbols = sym_define(ctx.symbols, param.name, pr);
             # §6.4 — record param name on QFunction for named-arg reorder
@@ -1581,8 +1696,10 @@ func lower_func_def(ctx: LowerCtx, func_def: AstNode):
     ensure_L = -1;
 
     if has_epilogue do
-        var (ctx4, rl) = fresh_label(ctx);
-        var (ctx5, el) = fresh_label(ctx4);
+        ctx4 = fresh_label(ctx);
+            rl = ctx4.scratch;
+        ctx5 = fresh_label(ctx4);
+            el = ctx5.scratch;
         revert_L = rl;
         ensure_L = el;
         ctx = ctx5;
@@ -1591,7 +1708,8 @@ func lower_func_def(ctx: LowerCtx, func_def: AstNode):
 
     # Lower body
     if body_idx >= 0 do
-        ctx = lower_stmt(ctx, vec_get_rt(func_def.children, body_idx))
+        body_node = vec_get_rt(func_def.children, body_idx);
+        ctx = lower_stmt(ctx, body_node);
     end
 
     if has_epilogue do
@@ -1639,15 +1757,13 @@ end.
 
 func vir_lower_program(ctx: LowerCtx, program: AstNode):
 
-    # Bootstrap stub: full Vir lower currently hangs under C-core VM when
-    # mutating a real QModule (map_insert / body lower). Register function
-    # names only so codegen has a non-empty module to emit.
+    # Single-pass lower: register each FuncDef and lower its body.
+    # (Two-pass name registration used to double-add via lower_func_def.)
     i = 0;
     when i < vec_len_rt(program.children) loop
         child = vec_get_rt(program.children, i);
         if child.node_type == AstType.FuncDef do
-            f = q_func_new(child.name);
-            vec_push(ctx.prog.functions, f)
+            ctx = lower_func_def(ctx, child);
         end
         i = i + 1
     end
@@ -1948,9 +2064,9 @@ end.
 # the driver can emit a non-empty binary first.
 func optimize_module(m):
 
-    out (m, 0, 0, 0)
+    out m
 end.
 
-export LowerCtx, QModule, QOp, QFunction, QInstr, lower_ctx_new,
+export LowerCtx, QModule, QOp, QFunction, QInstr, OperandType, lower_ctx_new,
        lower_program, vir_lower_program, optimize_module,
        tco_pass, regalloc_linear_scan, compute_liveness;
