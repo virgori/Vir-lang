@@ -48,6 +48,7 @@ graph LR
 | 9 | `28fdc124` | **feat(compiler/lexer)**: implement P0 spec compliance items (keywords, operators, binary/scientific numbers) | 1 | +110/-2 |
 | 10 | `55cebdc9` | **feat(compiler/lexer)**: implement P1 spec compliance items (AI/SIMD/UI keywords, &mut borrow, \r/\0 escapes) | 1 | +48/-1 |
 | 11 | `e4058e48` | **feat(compiler/lexer)**: implement P2 spec & VPS items (nested block comments, VPS delimiters `:(`, `:)`) | 1 | +13/-6 |
+| 12 | `a90fa3ef` | **feat(compiler/parser)**: implement P0 parser items (Dict literals, **, ><, !!, throw, select, port, send, recv) | 1 | +101/-14 |
 
 ---
 
