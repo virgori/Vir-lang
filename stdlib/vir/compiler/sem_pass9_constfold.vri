@@ -1,0 +1,279 @@
+##
+ * vir/compiler/sem_pass9_constfold.vri
+ * ==============================================================
+ * Pass 9: Constant Folding Analysis.
+ * Detects compile-time evaluable expressions and constant propagation.
+ * Reports warnings for always-true/false conditions (dead code).
+ * Actual folding is deferred to MIR optimizer.
+ ##
+
+include vec_rt;
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt;
+
+include string_rt;
+import rt_streq, rt_strcat, rt_itoa, rt_strlen from string_rt;
+
+include parser;
+import AstNode, AstType, OpType from parser;
+
+include symbol_table;
+import SymbolTable, SymbolKind, SymbolNode from symbol_table;
+
+include scope_tree;
+import ScopeTree, ScopeKind, ScopeNode, scope_push, scope_pop from scope_tree;
+
+include context;
+import DiagnosticEngine, report_warning from context;
+
+func pass9_const_fold(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode)
+    # const_map: vec of (name, value) pairs for const propagation
+    let const_map = vec_new_rt();
+    pass9_walk(symbols, scopes, diag, node, const_map)
+end.
+func pass9_is_const_expr(node: AstNode, const_map: int)
+    # Returns 1 if the expression can be evaluated at compile time
+    if node.node_type == AstType.LiteralInt do
+        out 1
+    end
+    if node.node_type == AstType.LiteralFloat do
+        out 1
+    end
+    if node.node_type == AstType.LiteralStr do
+        out 1
+    end
+    if node.node_type == AstType.Identifier do
+        # Check if it's a known const
+        out pass9_is_known_const(const_map, node.name)
+    end
+    if node.node_type == AstType.BinOp or node.node_type == AstType.Compare do
+        child_count = vec_len_rt(node.children);
+        if child_count >= 2 do
+            left = vec_get_rt(node.children, 0);
+            right = vec_get_rt(node.children, 1);
+            left_const = pass9_is_const_expr(left, const_map);
+            right_const = pass9_is_const_expr(right, const_map);
+            out left_const and right_const
+        end
+    end
+    if node.node_type == AstType.UnaryMinus do
+        child_count = vec_len_rt(node.children);
+        if child_count > 0 do
+            child = vec_get_rt(node.children, 0);
+            out pass9_is_const_expr(child, const_map)
+        end
+    end
+    out 0
+end.
+func pass9_eval_int(node: AstNode, const_map: int)
+    # Try to evaluate an integer constant expression
+    # Returns the value, or -999999 if not evaluable
+    if node.node_type == AstType.LiteralInt do
+        out node.int_val
+    end
+    if node.node_type == AstType.Identifier do
+        out pass9_get_const_val(const_map, node.name)
+    end
+    if node.node_type == AstType.BinOp do
+        child_count = vec_len_rt(node.children);
+        if child_count >= 2 do
+            left = vec_get_rt(node.children, 0);
+            right = vec_get_rt(node.children, 1);
+            lv = pass9_eval_int(left, const_map);
+            rv = pass9_eval_int(right, const_map);
+            if lv == -999999 or rv == -999999 do
+                out -999999
+            end
+            if node.op == OpType.Add do out lv + rv end
+            if node.op == OpType.Sub do out lv - rv end
+            if node.op == OpType.Mul do out lv * rv end
+            if node.op == OpType.Div do
+                if rv != 0 do
+                    out lv / rv
+                end
+                out -999999
+            end
+            if node.op == OpType.ModOp do
+                if rv != 0 do
+                    out lv mod rv
+                end
+                out -999999
+            end
+        end
+    end
+    if node.node_type == AstType.UnaryMinus do
+        child_count = vec_len_rt(node.children);
+        if child_count > 0 do
+            child = vec_get_rt(node.children, 0);
+            v = pass9_eval_int(child, const_map);
+            if v != -999999 do
+                out 0 - v
+            end
+        end
+    end
+    out -999999
+end.
+func pass9_eval_bool_condition(node: AstNode, const_map: int)
+    # Returns: 0 = always false, 1 = always true, -1 = not determinable
+    if node.node_type == AstType.Compare do
+        child_count = vec_len_rt(node.children);
+        if child_count >= 2 do
+            left = vec_get_rt(node.children, 0);
+            right = vec_get_rt(node.children, 1);
+            if pass9_is_const_expr(left, const_map) and pass9_is_const_expr(right, const_map) do
+                lv = pass9_eval_int(left, const_map);
+                rv = pass9_eval_int(right, const_map);
+                if lv != -999999 and rv != -999999 do
+                    if node.op == OpType.Eq do
+                        if lv == rv do out 1 else out 0 end
+                    end
+                    if node.op == OpType.Ne do
+                        if lv != rv do out 1 else out 0 end
+                    end
+                    if node.op == OpType.Gt do
+                        if lv > rv do out 1 else out 0 end
+                    end
+                    if node.op == OpType.Lt do
+                        if lv < rv do out 1 else out 0 end
+                    end
+                    if node.op == OpType.Ge do
+                        if lv >= rv do out 1 else out 0 end
+                    end
+                    if node.op == OpType.Le do
+                        if lv <= rv do out 1 else out 0 end
+                    end
+                end
+            end
+        end
+    end
+    out -1
+end.
+func pass9_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode, const_map: int)
+
+    # Register const declarations for propagation
+    if node.node_type == AstType.ConstDecl do
+        child_count = vec_len_rt(node.children);
+        if child_count > 0 do
+            init = vec_get_rt(node.children, 0);
+            if pass9_is_const_expr(init, const_map) do
+                val = pass9_eval_int(init, const_map);
+                if val != -999999 do
+                    pass9_add_const(const_map, node.name, val)
+                end
+            end
+        end
+        out 0
+    end
+
+    # Check if-conditions for always-true/false
+    if node.node_type == AstType.IfStmt do
+        child_count = vec_len_rt(node.children);
+        if child_count >= 1 do
+            cond = vec_get_rt(node.children, 0);
+            result = pass9_eval_bool_condition(cond, const_map);
+            if result == 0 do
+                # Always false — dead then-branch
+                report_warning(diag, 4003, node.line, 0)
+            eif result == 1 do
+                # Always true — dead else-branch (if exists)
+                if child_count >= 3 do
+                    report_warning(diag, 4003, node.line, 0)
+                end
+            end
+        end
+        # Recurse into children
+        var i = 0;
+        when i < child_count loop
+            child = vec_get_rt(node.children, i);
+            pass9_walk(symbols, scopes, diag, child, const_map);
+            i = i + 1
+        end
+        out 0
+    end
+
+    # Check while-conditions for always-false (dead loop)
+    if node.node_type == AstType.WhileStmt do
+        child_count = vec_len_rt(node.children);
+        if child_count >= 1 do
+            cond = vec_get_rt(node.children, 0);
+            result = pass9_eval_bool_condition(cond, const_map);
+            if result == 0 do
+                report_warning(diag, 4003, node.line, 0)
+            end
+        end
+        var i = 0;
+        when i < child_count loop
+            child = vec_get_rt(node.children, i);
+            pass9_walk(symbols, scopes, diag, child, const_map);
+            i = i + 1
+        end
+        out 0
+    end
+
+    # Scope management
+    if node.node_type == AstType.FuncDef do
+        scope_push(scopes, ScopeKind.Func);
+        child_count = vec_len_rt(node.children);
+        var i = 0;
+        when i < child_count loop
+            child = vec_get_rt(node.children, i);
+            pass9_walk(symbols, scopes, diag, child, const_map);
+            i = i + 1
+        end
+        scope_pop(scopes);
+        out 0
+    end
+
+    if node.node_type == AstType.Block do
+        scope_push(scopes, ScopeKind.Block);
+        child_count = vec_len_rt(node.children);
+        var i = 0;
+        when i < child_count loop
+            child = vec_get_rt(node.children, i);
+            pass9_walk(symbols, scopes, diag, child, const_map);
+            i = i + 1
+        end
+        scope_pop(scopes);
+        out 0
+    end
+
+    # Default recurse
+    child_count = vec_len_rt(node.children);
+    var i = 0;
+    when i < child_count loop
+        child = vec_get_rt(node.children, i);
+        pass9_walk(symbols, scopes, diag, child, const_map);
+        i = i + 1
+    end
+    out 0
+end.
+func pass9_is_known_const(const_map: int, name: string)
+    # const_map stores pairs: [name0, val0, name1, val1, ...]
+    count = vec_len_rt(const_map);
+    var i = 0;
+    when i < count loop
+        cname = vec_get_rt(const_map, i);
+        if rt_streq(cname, name) do
+            out 1
+        end
+        i = i + 2
+    end
+    out 0
+end.
+func pass9_get_const_val(const_map: int, name: string)
+    count = vec_len_rt(const_map);
+    var i = 0;
+    when i < count loop
+        cname = vec_get_rt(const_map, i);
+        if rt_streq(cname, name) do
+            out vec_get_rt(const_map, i + 1)
+        end
+        i = i + 2
+    end
+    out -999999
+end.
+func pass9_add_const(const_map: int, name: string, value: int)
+    vec_push_rt(const_map, name);
+    vec_push_rt(const_map, value)
+end.
+
+export pass9_const_fold
