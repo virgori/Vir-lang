@@ -47,6 +47,7 @@ graph TD
 | 27 | `4a48b337` | **feat(compiler/semantic)**: expand Semantic v2.0 type checking rules (Pass 6) | 1 | +70/-17 |
 | 28 | `1701b315` | **feat(compiler/mir)**: **PHASE 3 COMPLETE** — expand AST to MIR lowering coverage for Match, Case, For, Ensure, Revert | 1 | +48/-0 |
 | 29 | `3fdb487c` | **feat(compiler/mir)**: **PHASE 4 COMPLETE** — expand MIR SSA Optimizations (Copy Propagation, CSE, DCE, Constant Folding) | 1 | +94/-20 |
+| 30 | `24ace3a5` | **feat(compiler/ssa)**: **PHASE 5 COMPLETE** — SSA Refinement & SSA Destruction into LIR predecessor moves | 2 | +26/-53 |
 
 ---
 
