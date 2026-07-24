@@ -46,6 +46,7 @@ graph TD
 | 26 | `4653b533` | **feat(compiler/pipeline)**: **PHASE 1 COMPLETE** — remove Q-IR fast-path & emit machine code directly from LIR | 3 | +102/-53 |
 | 27 | `4a48b337` | **feat(compiler/semantic)**: expand Semantic v2.0 type checking rules (Pass 6) | 1 | +70/-17 |
 | 28 | `1701b315` | **feat(compiler/mir)**: **PHASE 3 COMPLETE** — expand AST to MIR lowering coverage for Match, Case, For, Ensure, Revert | 1 | +48/-0 |
+| 29 | `3fdb487c` | **feat(compiler/mir)**: **PHASE 4 COMPLETE** — expand MIR SSA Optimizations (Copy Propagation, CSE, DCE, Constant Folding) | 1 | +94/-20 |
 
 ---
 
