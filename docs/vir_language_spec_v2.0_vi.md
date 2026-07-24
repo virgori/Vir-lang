@@ -7,7 +7,7 @@
 
 ## Mục lục
 
-1. [Tổng quan](#1-tổng-quan)
+1. [Tổng quan](#1-tổng-quan) — gồm [§1.1 Phân tầng Language / Compiler / Library](#11-phân-tầng-language--compiler--library)
 2. [Chú thích (Comments)](#2-chú-thích-comments)
 3. [Hệ thống Module](#3-hệ-thống-module)
 4. [Kiểu dữ liệu](#4-kiểu-dữ-liệu)
@@ -59,6 +59,91 @@ func main:
     print("Hello from $name!")
 end.
 ```
+
+### 1.1 Phân tầng Language / Compiler / Library
+
+Vir **không** gắn ngôn ngữ vào một runtime thực thi duy nhất (khác Go, Erlang, …). Mục tiêu là thay được mô hình concurrency / allocator mà **không đổi ngôn ngữ**, và chương trình không dùng thì **không mang** chi phí đó trong binary.
+
+**Ranh giới cứng:**
+
+| Thành phần | Trách nhiệm |
+|------------|-------------|
+| **Language** | Cú pháp, type system, ownership, lifetime, memory model |
+| **Compiler** | Phân tích, tối ưu, codegen |
+| **Library** | Thread, async executor, scheduler, actor, work stealing, ArenaPool |
+
+#### Nguyên tắc: Compiler không được biết scheduler tồn tại
+
+Cấu trúc song song cấp ngôn ngữ (ví dụ `parallel for`, nếu có) chỉ hạ xuống IR trung gian hoặc intrinsic — **không** sinh sẵn Worker, Scheduler, hay ArenaPool.
+
+```text
+parallel_begin
+parallel_chunk
+parallel_end
+```
+
+Backend / thư viện được chọn mới quyết định ánh xạ:
+
+| Backend / lib | `parallel_*` thành |
+|---------------|-------------------|
+| A | `pthread` |
+| B | work-stealing |
+| C | OpenMP |
+| D | tuần tự (serial) — zero overhead khi không song song |
+
+Cùng một chương trình nguồn có thể chạy trên các implementation khác nhau:
+
+```text
+vir/thread/pthread     # Linux / POSIX
+vir/thread/win32       # Windows
+vir/thread/spin        # kernel / bare-metal
+vir/thread/none        # embedded — serial hoá mọi parallel
+```
+
+Người dùng chọn bằng `include`, ví dụ:
+
+```vir
+include std.thread.pthread
+# hoặc
+include std.thread.worksteal
+```
+
+Ngôn ngữ không đổi. Compiler không đổi. Chỉ thay implementation.
+
+#### Arena vs ArenaPool
+
+Compiler **chỉ** biết **Arena** (bump, watermark, `arena:`, vùng Static/Stack — §4.5–4.6).
+
+**ArenaPool**, chiến lược `mmap` / `malloc` / custom allocator, và việc Worker cho task mượn arena rồi `reset` — thuộc **Library**. Compiler không giả định pool tồn tại.
+
+#### Zero-cost = không dùng thì không tồn tại trong binary
+
+Zero-cost không chỉ nghĩa là “không chậm”, mà còn:
+
+> **Không dùng thì không có trong binary.**
+
+```vir
+@entry
+func main:
+    print("Hello")
+end.
+```
+
+Binary hợp lệ gần như C thuần:
+
+```text
+_start → main → syscall
+```
+
+Nếu binary tối giản vẫn chứa thread scheduler, work stealing, async executor, hay mailbox — đó là **vi phạm** nguyên tắc này.
+
+#### Bản sắc kiến trúc
+
+- **Ngôn ngữ** không áp đặt mô hình thực thi.
+- **Compiler** không phụ thuộc một runtime cố định.
+- **Thư viện** cung cấp các mô hình concurrency **cạnh tranh** với nhau.
+
+Khi xuất hiện scheduler tốt hơn (Rayon, Tokio, TBB, …), Vir chỉ cần thêm một thư viện mới — không sửa ngôn ngữ, không sửa compiler, không bắt mọi chương trình trả phí cho mô hình cũ. Đặc tả đầy đủ: [`VIR_EXECUTION_MODEL.md`](VIR_EXECUTION_MODEL.md). Tóm tắt EN: [`RUNTIME_SEPARATION.md`](RUNTIME_SEPARATION.md).
 
 ---
 
@@ -274,6 +359,7 @@ Vir sử dụng ba vùng nhớ, không có garbage collector:
 - Không giải phóng từng đối tượng — giải phóng toàn bộ arena cùng lúc
 - Mỗi hàm `main` (hoặc scope lớn) tạo một arena mặc định
 - Không cần GC, không cần reference counting
+- **ArenaPool / chiến lược cấp phát nền (mmap, malloc, …)** thuộc thư viện — compiler chỉ thấy Arena (§1.1)
 
 **String:**
 - Immutable — mọi thao tác nối/nội suy tạo string mới
@@ -2038,19 +2124,19 @@ var r1 = wait t1
 var r2 = wait t2
 ```
 
-Task chạy đồng thời (concurrent) — không song song (parallel) trừ khi runtime hỗ trợ thread pool.
+Task chạy đồng thời (concurrent) — không song song (parallel) trừ khi chương trình `include` một thư viện thread pool / work-stealing (xem §1.1).
 
 ### 22.5 Mô hình Scheduler
 
 | Thuộc tính | Giá trị |
 |-----------|---------|
-| Loại | Cooperative (stackless coroutine) |
+| Loại | Cooperative (stackless coroutine) — semantics ngôn ngữ |
 | Chuyển ngữ cảnh | Tại mỗi `await` hoặc `await pass` |
-| Event loop | Polling-based, single-thread mặc định |
-| Thread pool | Tuỳ chọn — mở rộng cho target có OS |
-| Overhead | Nhỏ — state machine, không cấp phát stack riêng |
+| Event loop | Do **thư viện** cung cấp khi được include — không nhúng sẵn vào mọi binary |
+| Thread pool / work-steal | Tuỳ chọn qua `include` (POSIX, win32, spin, none, …) |
+| Overhead khi không dùng | **Không** — binary tối giản không chứa scheduler (§1.1) |
 
-Scheduler mặc định là vòng lặp polling đơn luồng. Trên target có OS, có thể mở rộng thành thread pool. Trên bare-metal, scheduler tích hợp vào main loop.
+Compiler hạ `async`/`await`/`task` xuống state machine và điểm tạm dừng. **Compiler không biết** Scheduler / Worker / ArenaPool tồn tại — ai chạy các điểm đó do thư viện quyết định (polling đơn luồng, thread pool, work-stealing, hoặc serial trên embedded). Xem [`VIR_EXECUTION_MODEL.md`](VIR_EXECUTION_MODEL.md) §7.
 
 ### 22.6 Nhường quyền chủ động — `await pass`
 
@@ -2938,6 +3024,7 @@ Từ cao đến thấp:
 | `&` / `&mut` | — | Cú pháp shared / mutable borrow — kiểm tra bởi borrow checker (§4.8) |
 | Move semantics | — | Kiểu non-copy move khi gán; ràng buộc cũ bị vô hiệu hoá (§4.8) |
 | arena block | — | `arena: ... end` sub-arena có phạm vi cho thu hồi bộ nhớ vòng lặp (§4.6) |
+| Phân tầng runtime | — | Language / Compiler / Library tách cứng; compiler không biết scheduler; zero-cost = không dùng thì không có trong binary (§1.1, `VIR_EXECUTION_MODEL.md`) |
 | callable field | — | Bước UFCS 2: `x.callback()` gọi field con trỏ hàm (§11) |
 | Quy tắc biên lexer nội suy | — | `$ident` dừng tại `[`, toán tử; dùng `$(expr)` cho biểu thức phức tạp (§12.6) |
 | arr_compact | — | `arr_compact(arr)` — thu hồi dead space resize mảng (§19.4) |

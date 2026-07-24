@@ -7,7 +7,7 @@
 
 ## Table of Contents
 
-1. [Overview](#1-overview)
+1. [Overview](#1-overview) — includes [§1.1 Language / Compiler / Library Separation](#11-language--compiler--library-separation)
 2. [Comments](#2-comments)
 3. [Module System](#3-module-system)
 4. [Types](#4-types)
@@ -57,6 +57,91 @@ func main:
     print("Hello from $name!")
 end.
 ```
+
+### 1.1 Language / Compiler / Library Separation
+
+Vir **does not** bind the language to a single execution runtime (unlike Go, Erlang, and similar). Concurrency and allocator strategies must be replaceable **without changing the language**, and unused machinery must **not** appear in the binary.
+
+**Hard boundary:**
+
+| Layer | Responsibility |
+|-------|----------------|
+| **Language** | Syntax, type system, ownership, lifetime, memory model |
+| **Compiler** | Analysis, optimization, codegen |
+| **Library** | Threads, async executors, schedulers, actors, work stealing, ArenaPool |
+
+#### Principle: the compiler must not know that a scheduler exists
+
+Language-level parallel forms (e.g. `parallel for`, if present) lower only to intermediate IR or intrinsics — they **must not** hard-code Workers, Schedulers, or ArenaPools.
+
+```text
+parallel_begin
+parallel_chunk
+parallel_end
+```
+
+The chosen backend / library decides the mapping:
+
+| Backend / lib | `parallel_*` becomes |
+|---------------|----------------------|
+| A | `pthread` |
+| B | work-stealing |
+| C | OpenMP |
+| D | serial — zero overhead when parallelism is unused |
+
+The same source can run on interchangeable implementations:
+
+```text
+vir/thread/pthread     # Linux / POSIX
+vir/thread/win32       # Windows
+vir/thread/spin        # kernel / bare-metal
+vir/thread/none        # embedded — serialize all parallel regions
+```
+
+Users select via `include`, for example:
+
+```vir
+include std.thread.pthread
+# or
+include std.thread.worksteal
+```
+
+The language stays the same. The compiler stays the same. Only the implementation changes.
+
+#### Arena vs ArenaPool
+
+The compiler knows only **Arena** (bump, watermark, `arena:`, Static/Stack — §§4.5–4.6).
+
+**ArenaPool**, `mmap` / `malloc` / custom allocator policy, and Worker→task arena lending with `reset` belong to the **Library**. The compiler must not assume a pool exists.
+
+#### Zero-cost means unused code is absent from the binary
+
+Zero-cost is not only “not slow”; it also means:
+
+> **If you do not use it, it must not exist in the binary.**
+
+```vir
+@entry
+func main:
+    print("Hello")
+end.
+```
+
+A valid binary is essentially pure C:
+
+```text
+_start → main → syscall
+```
+
+If a minimal binary still contains a thread scheduler, work-stealing runtime, async executor, or mailbox, that is a **violation** of this principle.
+
+#### Architectural identity
+
+- The **language** does not prescribe an execution model.
+- The **compiler** does not depend on a fixed runtime.
+- **Libraries** supply competing concurrency models.
+
+When a better scheduler appears (Rayon, Tokio, TBB, …), Vir only needs a new library — no language change, no compiler change, and no mandatory tax on every program. Full specification: [`VIR_EXECUTION_MODEL.md`](VIR_EXECUTION_MODEL.md). Short EN note: [`RUNTIME_SEPARATION.md`](RUNTIME_SEPARATION.md).
 
 ---
 
@@ -273,6 +358,7 @@ Vir uses three memory regions with no garbage collector:
 - No per-object deallocation — the entire arena is freed at once
 - Each `main` function (or large scope) creates a default arena
 - No GC, no reference counting
+- **ArenaPool / backing allocation strategy (mmap, malloc, …)** belong to libraries — the compiler only sees Arena (§1.1)
 
 **String:**
 - Immutable — all concatenation/interpolation creates a new string
@@ -2049,19 +2135,19 @@ var r1 = wait t1
 var r2 = wait t2
 ```
 
-Tasks run concurrently — not in parallel unless the runtime supports a thread pool.
+Tasks run concurrently — not in parallel unless the program `include`s a thread-pool / work-stealing library (see §1.1).
 
 ### 22.5 Scheduler Model
 
 | Property | Value |
 |----------|-------|
-| Type | Cooperative (stackless coroutine) |
+| Type | Cooperative (stackless coroutine) — language semantics |
 | Context switch | At each `await` or `await pass` |
-| Event loop | Polling-based, single-threaded by default |
-| Thread pool | Optional — available for OS targets |
-| Overhead | Minimal — state machine, no per-task stack allocation |
+| Event loop | Provided by a **library** when included — not baked into every binary |
+| Thread pool / work-steal | Optional via `include` (POSIX, win32, spin, none, …) |
+| Overhead when unused | **None** — a minimal binary contains no scheduler (§1.1) |
 
-The default scheduler is a single-threaded polling loop. On OS targets, it can be extended to a thread pool. On bare-metal, the scheduler integrates into the main loop.
+The compiler lowers `async` / `await` / `task` to a state machine and suspension points. The **compiler does not know** that a Scheduler, Worker, or ArenaPool exists — how those points are driven is a library choice (single-thread polling, thread pool, work-stealing, or serial on embedded). See [`VIR_EXECUTION_MODEL.md`](VIR_EXECUTION_MODEL.md) §7.
 
 ### 22.6 Explicit Yielding — `await pass`
 
@@ -2689,6 +2775,7 @@ From highest to lowest:
 | `&` / `&mut` | — | Shared / mutable borrow syntax — no move, validated by borrow checker |
 | Move semantics | — | Non-copy types move on assignment; old binding invalidated (§4.8) |
 | arena block | — | `arena: ... end` scoped sub-arena for loop memory reclamation (§4.6) |
+| Runtime separation | — | Hard Language / Compiler / Library split; compiler must not know schedulers; zero-cost = unused code absent from the binary (§1.1, `VIR_EXECUTION_MODEL.md`) |
 | arr_compact | — | `arr_compact(arr)` — reclaim array resize dead space (§19.4) |
 | Callable field | — | UFCS step 2: `x.callback()` calls function-pointer field (§11) |
 | Interpolation boundary | — | `$ident` stops at non-identifier chars; use `$(expr)` for `[]` access (§12.6) |
