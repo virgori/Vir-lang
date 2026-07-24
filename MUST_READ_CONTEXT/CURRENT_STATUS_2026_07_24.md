@@ -57,6 +57,8 @@ graph LR
 | 18 | `aaf2f866` | **docs**: update status with commits 16-17 | 1 | +3/-0 |
 | 19 | `7a20f8d2` | **feat(compiler/semantic)**: implement P2 — Borrow Analysis + Constant Folding (Pass 8/9) | 4 | +494/-10 |
 | 20 | `70c6b407` | **feat(compiler/semantic)**: complete 10-pass Semantic Analyzer for Vir v2.0 (100% Coverage) | 6 | +312/-53 |
+| 21 | `681c2e70` | **docs**: update status with commit 20 | 1 | +1/-0 |
+| 22 | `5b00db79` | **feat(compiler/mir)**: complete AST to MIR Lowering Engine for Vir v2.0 | 1 | +272/-152 |
 
 ---
 
