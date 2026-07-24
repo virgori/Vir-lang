@@ -1718,7 +1718,8 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
           return lower_expr(ctx, expr->children[0]);
         }
         if ((strcmp(expr->name, "native_memcpy") == 0 ||
-             strcmp(expr->name, "native_memmove") == 0) &&
+             strcmp(expr->name, "native_memmove") == 0 ||
+             strcmp(expr->name, "native_mem_copy") == 0) &&
             expr->child_count >= 3) {
           int dst = lower_expr(ctx, expr->children[0]);
           int src = lower_expr(ctx, expr->children[1]);
