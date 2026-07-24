@@ -17073,39 +17073,49 @@ func boot_do_lower:
     boot_phase8_mir_lir_gate();
 
     print_ln("virc: generating ARM64 machine code...");
-    # Prefer real codegen when the lowered bodies are non-empty. Fall back to
-    # the flat-staging mini-codegen (const-fold path) otherwise.
     let body0_n = 0;
     if g_snap_func_count > 0 do
         let f0 = vec_get_rt(g_snap_mod_funcs, 0);
         body0_n = vec_len_rt(f0.body);
     end
-    if g_bd_total > 0 do
-        print_ln("virc: codegen via body-dump");
+
+    # Prefer Phase-8 LIR-table emit when stream has no Call/SetArg.
+    var used_lir_emit = 0;
+    if g_lir_n > 0 do
+        if boot_lir_stream_needs_q_fallback() == 0 do
+            print_ln("virc: codegen via LIR tables");
+            boot_codegen_from_lir_tables();
+            used_lir_emit = 1
+        end
     end
-    # Body-dump codegen (small_multi or self-host dump). Else flat / stub.
-    if g_boot_small_multi != 0 or g_bd_total > 0 do
-        let real_mod = QModule {
-            name:       "main",
-            functions:  g_snap_mod_funcs,
-            strings:    g_snap_mod_strings
-        };
-        boot_codegen_emit_mod_min(real_mod);
-        g_snap_entry_off = g_code_start_offset;
-    else
-        if g_boot_emit_count > 0 do
-            boot_codegen_flat_min();
+
+    if used_lir_emit == 0 do
+        if g_bd_total > 0 do
+            print_ln("virc: codegen via body-dump");
+        end
+        if g_boot_small_multi != 0 or g_bd_total > 0 do
+            let real_mod = QModule {
+                name:       "main",
+                functions:  g_snap_mod_funcs,
+                strings:    g_snap_mod_strings
+            };
+            boot_codegen_emit_mod_min(real_mod);
+            g_snap_entry_off = g_code_start_offset;
         else
-            if body0_n > 0 do
-                let real_mod2 = QModule {
-                    name:       "main",
-                    functions:  g_snap_mod_funcs,
-                    strings:    g_snap_mod_strings
-                };
-                boot_codegen_emit_mod_min(real_mod2);
-                g_snap_entry_off = g_code_start_offset;
+            if g_boot_emit_count > 0 do
+                boot_codegen_flat_min();
             else
-                boot_codegen_basic42();
+                if body0_n > 0 do
+                    let real_mod2 = QModule {
+                        name:       "main",
+                        functions:  g_snap_mod_funcs,
+                        strings:    g_snap_mod_strings
+                    };
+                    boot_codegen_emit_mod_min(real_mod2);
+                    g_snap_entry_off = g_code_start_offset;
+                else
+                    boot_codegen_basic42();
+                end
             end
         end
     end
@@ -17645,26 +17655,30 @@ end.
 # bootstrap path. We project it into parallel MIR then LIR opcode
 # tables (heap i64 arrays) so Phase 8 is real and countable — without
 # MirFunc/LirInstr entity field stores (unreliable on the C-VM).
-# Native Mach-O emit remains the proven Q codegen (Print/Call).
+# Prefer LIR-table Mach-O emit when stream has no Call/SetArg;
+# otherwise fall back to proven Q body-dump / flat codegen.
 # ═══════════════════════════════════════════════════════
 
 var g_mir_n = 0;
 var g_lir_n = 0;
 var g_mir_opc = 0;
+var g_mir_qopc = 0;   # original QOp (Print=40 PrintStr=41 Call=34 Ret=35 ...)
 var g_mir_dst = 0;
 var g_mir_s1t = 0;
 var g_mir_s1v = 0;
 var g_mir_s1i = 0;
 var g_mir_s2v = 0;
 var g_lir_opc = 0;
+var g_phase8_lir_emit = 0;  # 1 if Mach-O body came from LIR tables
 
 # MirOp codes (flat ints; keep stable for diagnostics)
 # 0 Nop 1 Move 2 Load 3 Store 4 Add 5 Sub 6 Mul 7 Div
 # 8 Call 9 Intrinsic(Print*) 10 Jump 11 JumpIf 12 Return
 
-func boot_mir_tables_init:
+func boot_mir_tables_ensure:
     if g_mir_opc == 0 do
         g_mir_opc = heap_alloc(4096);
+        g_mir_qopc = heap_alloc(4096);
         g_mir_dst = heap_alloc(4096);
         g_mir_s1t = heap_alloc(4096);
         g_mir_s1v = heap_alloc(4096);
@@ -17672,8 +17686,13 @@ func boot_mir_tables_init:
         g_mir_s2v = heap_alloc(4096);
         g_lir_opc = heap_alloc(4096)
     end
+end.
+
+func boot_mir_tables_init:
+    boot_mir_tables_ensure();
     g_mir_n = 0;
     g_lir_n = 0;
+    g_phase8_lir_emit = 0;
 end.
 
 func q_opc_to_mir_opc(opc: int)
@@ -17716,7 +17735,8 @@ end.
 func boot_mir_push:
     in(mop: int, dst: int, s1t: int, s1v: int, s1i: int, s2v: int)
     extern func native_write_i64(addr: int, offset: int, val: int);
-    boot_mir_tables_init();
+    # ensure only — never reset g_mir_n here (init resets once per build)
+    boot_mir_tables_ensure();
     let ix = g_mir_n;
     if ix >= 500 do
         out
@@ -17728,6 +17748,15 @@ func boot_mir_push:
     native_write_i64(g_mir_s1i, ix * 8, s1i);
     native_write_i64(g_mir_s2v, ix * 8, s2v);
     g_mir_n = ix + 1;
+end.
+
+func boot_mir_set_last_qopc:
+    in(qopc: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_mir_n <= 0 do
+        out
+    end
+    native_write_i64(g_mir_qopc, (g_mir_n - 1) * 8, qopc);
 end.
 
 func boot_build_mir_from_staging:
@@ -17748,6 +17777,7 @@ func boot_build_mir_from_staging:
             let s2v = native_read_i64(g_bd_s2v, j * 8);
             let mop = q_opc_to_mir_opc(opc);
             boot_mir_push(mop, dv, s1t, s1v, s1i, s2v);
+            boot_mir_set_last_qopc(opc);
             j = j + 1
         end
     else
@@ -17768,6 +17798,7 @@ func boot_build_mir_from_staging:
                 end
                 let mop2 = q_opc_to_mir_opc(opc2);
                 boot_mir_push(mop2, dv2, s1t2, s1v2, s1i2, s2v2);
+                boot_mir_set_last_qopc(opc2);
                 j2 = j2 + 1
             end
         end
@@ -17783,6 +17814,213 @@ func boot_build_mir_from_staging:
     end
     g_lir_n = g_mir_n;
     out g_mir_n
+end.
+
+
+func boot_lir_stream_has_call:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    var i = 0;
+    when i < g_mir_n loop
+        let q = native_read_i64(g_mir_qopc, i * 8);
+        if q == 34 do
+            out 1
+        end
+        if q == 96 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func boot_lir_stream_needs_q_fallback:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if boot_lir_stream_has_call() != 0 do
+        out 1
+    end
+    var i = 0;
+    when i < g_mir_n loop
+        let q = native_read_i64(g_mir_qopc, i * 8);
+        # PrintStr stays on proven body-dump emit for now
+        if q == 41 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+# Emit Mach-O text from Phase-8 MIR/LIR tables (const-fold + runtime Print).
+# Operands live in g_mir_*; opcodes for control use g_mir_qopc (QOp).
+func boot_codegen_from_lir_tables:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    g_cg_cb = codebuf_new(TargetArch.ARM64);
+    g_runtime_min = 1;
+    g_cg_cb = emit_runtime_arm64(g_cg_cb);
+    g_runtime_min = 0;
+    g_boot_rt_print = g_rt_print_off;
+    g_boot_rt_exit = g_rt_exit_off;
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 104, g_boot_rt_print);
+    native_write_i64(g_boot_name_cell, 112, g_boot_rt_exit);
+    native_write_i64(g_boot_name_cell, 232, g_rt_printstr_off);
+    g_snap_entry_off = codebuf_len();
+    g_code_start_offset = g_snap_entry_off;
+
+    if g_boot_vreg_tab == 0 do
+        g_boot_vreg_tab = heap_alloc(256);
+    end
+    let zi = 0;
+    when zi < 32 loop
+        native_write_i64(g_boot_vreg_tab, zi * 8, 0);
+        zi = zi + 1
+    end
+
+    let exit_code = 0;
+    var j = 0;
+    when j < g_lir_n loop
+        let qopc = native_read_i64(g_mir_qopc, j * 8);
+        let lop = native_read_i64(g_lir_opc, j * 8);
+        let d_v = native_read_i64(g_mir_dst, j * 8);
+        let s1t = native_read_i64(g_mir_s1t, j * 8);
+        let s1v = native_read_i64(g_mir_s1v, j * 8);
+        let s1i = native_read_i64(g_mir_s1i, j * 8);
+        let s2v = native_read_i64(g_mir_s2v, j * 8);
+
+        # Load / Move (Q 1/2) — const-fold into vreg tab (value+1 encoding)
+        if qopc == 1 or qopc == 2 do
+            if d_v >= 0 and d_v < 32 do
+                if s1t == 2 do
+                    native_write_i64(g_boot_vreg_tab, d_v * 8, s1i + 1)
+                else
+                    if s1v >= 0 and s1v < 32 do
+                        let raw = native_read_i64(g_boot_vreg_tab, s1v * 8);
+                        if raw != 0 do
+                            native_write_i64(g_boot_vreg_tab, d_v * 8, raw)
+                        end
+                    end
+                end
+            end
+        end
+
+        # Add/Sub/Mul/Div/Mod (Q 3..7)
+        if qopc == 3 or qopc == 4 or qopc == 5 or qopc == 6 or qopc == 7 do
+            if d_v >= 0 and d_v < 32 do
+                var av = 0 - 1;
+                var bv = 0 - 1;
+                if s1t == 2 do
+                    av = s1i
+                else
+                    if s1v >= 0 and s1v < 32 do
+                        let ra = native_read_i64(g_boot_vreg_tab, s1v * 8);
+                        if ra != 0 do
+                            av = ra - 1
+                        end
+                    end
+                end
+                # s2 always vreg in staging for binops
+                if s2v >= 0 and s2v < 32 do
+                    let rb = native_read_i64(g_boot_vreg_tab, s2v * 8);
+                    if rb != 0 do
+                        bv = rb - 1
+                    end
+                end
+                if av >= 0 and bv >= 0 do
+                    var rv = 0 - 1;
+                    if qopc == 3 do
+                        rv = av + bv
+                    end
+                    if qopc == 4 do
+                        rv = av - bv
+                    end
+                    if qopc == 5 do
+                        rv = av * bv
+                    end
+                    if qopc == 6 do
+                        if bv != 0 do
+                            rv = av / bv
+                        end
+                    end
+                    if qopc == 7 do
+                        if bv != 0 do
+                            rv = av - (av / bv) * bv
+                        end
+                    end
+                    if rv >= 0 do
+                        native_write_i64(g_boot_vreg_tab, d_v * 8, rv + 1)
+                    end
+                end
+            end
+        end
+
+        # Print int (Q 40)
+        if qopc == 40 do
+            var pv = 0;
+            if s1t == 2 do
+                pv = s1i
+            else
+                if s1v >= 0 and s1v < 32 do
+                    let rp = native_read_i64(g_boot_vreg_tab, s1v * 8);
+                    if rp != 0 do
+                        pv = rp - 1
+                    end
+                end
+            end
+            if pv < 0 do
+                pv = 0
+            end
+            if pv > 65535 do
+                pv = pv bit_and 65535
+            end
+            g_emit_word = 0xD2800000;
+            g_emit_word = g_emit_word | ((pv bit_and 0xFFFF) shl 5);
+            boot_cg_emit_word0();
+            g_cg_target = native_read_i64(g_boot_name_cell, 104);
+            boot_cg_bl0()
+        end
+
+        # PrintStr (Q 41) — uses body-dump string pool
+        if qopc == 41 do
+            g_cg_off = s1i;
+            g_cg_imm = s2v;
+            boot_cg_emit_bd_printstr()
+        end
+
+        # Ret (Q 35) — record exit code
+        if qopc == 35 do
+            if s1t == 2 do
+                exit_code = s1i
+            else
+                if s1v >= 0 and s1v < 32 do
+                    let re = native_read_i64(g_boot_vreg_tab, s1v * 8);
+                    if re != 0 do
+                        exit_code = re - 1
+                    end
+                end
+            end
+        end
+
+        j = j + 1
+    end
+
+    if exit_code < 0 do
+        exit_code = 0
+    end
+    if exit_code > 65535 do
+        exit_code = exit_code bit_and 65535
+    end
+    g_emit_word = 0xD2800000;
+    g_emit_word = g_emit_word | ((exit_code bit_and 0xFFFF) shl 5);
+    boot_cg_emit_word0();
+    g_emit_word = 0xD2800030;
+    boot_cg_emit_word0();
+    g_emit_word = 0xD4001001;
+    boot_cg_emit_word0();
+    g_phase8_lir_emit = 1;
+    out 0
 end.
 
 func boot_phase8_mir_lir_gate:

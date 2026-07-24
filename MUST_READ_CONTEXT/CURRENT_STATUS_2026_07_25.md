@@ -1,7 +1,7 @@
 # Báo Cáo Tình Trạng Dự Án Vir v2.0
-**Ngày:** 2026-07-25 02:20 (GMT+7)  
+**Ngày:** 2026-07-25 02:30 (GMT+7)  
 **Branch hiện tại:** `recovered_stash`  
-**Trạng thái Pipeline (honest):** Bootstrap emit = **Q-IR staging → Phase-8 MIR/LIR flat tables → Q Mach-O codegen**. Không còn stub `compile_pipeline` giả.
+**Trạng thái Pipeline (honest):** Bootstrap emit = **Q-IR staging → Phase-8 MIR/LIR flat tables → LIR-table Mach-O emit (no Call/PrintStr) hoặc Q body-dump fallback**.
 
 ---
 
@@ -12,34 +12,35 @@ graph TD
     SRC[Vir source] --> LEX[Lexer]
     LEX --> PAR[Parser]
     PAR --> QIR[Q-IR lower → flat / body-dump staging]
-    QIR --> P8[Phase 8: project staging → MIR then LIR opcode tables]
-    P8 --> CG[Q Mach-O codegen Print/Call]
-    CG --> LINK[Mach-O link]
+    QIR --> P8[Phase 8: project staging → MIR then LIR tables]
+    P8 --> CHOICE{Call or PrintStr?}
+    CHOICE -->|no| LIRCG[boot_codegen_from_lir_tables]
+    CHOICE -->|yes| QCG[Q body-dump / flat Mach-O codegen]
+    LIRCG --> LINK[Mach-O link]
+    QCG --> LINK
     LINK --> BIN[a.out — 11/11 stdout verified]
 ```
 
 **Ghi chú quan trọng**
-- Phase 8 **có** dựng bảng MIR/LIR thật từ staging (heap i64 arrays), không còn empty-entity stubs.
-- Native emit vẫn dùng **Q codegen** (hỗ trợ Print/Call/body-dump). `lir_emit_module` entity path chưa đủ Print/Call trên C-VM.
-- Entity `MirFunc.blocks` / `LirInstr` field stores trên C-VM không đáng tin → Phase 8 dùng flat tables.
+- Phase 8 dựng bảng MIR/LIR thật (heap i64). `boot_mir_push` chỉ `ensure` alloc — **không** reset `g_mir_n` mỗi push.
+- Emit ưu tiên LIR tables khi stream không có Call/SetArg/PrintStr; còn lại fallback Q body-dump.
+- Entity `MirFunc.blocks` / `LirInstr` trên C-VM vẫn không đáng tin → flat tables.
 
 ---
 
 ## 2. Bootstrap Suite (stdout + exit 0)
 
-| Test | stdout | Status |
-|------|--------|--------|
-| cg_arith | `30\n90` | PASS |
-| cg_call / cg_call0 / cg_mod2 | `42` | PASS |
-| cg_mul | `30\n90` | PASS |
-| cg_printstr | `hi\n42` | PASS |
-| cg_scale65_call | `0\n7` | PASS |
-| cg_scale65_print | `42` | PASS |
-| cg_scale65_trace | `1\n2\n0\n3` | PASS |
-| cg_scale70 | `10\n41` | PASS |
-| cg_var | `30` | PASS |
+| Test | stdout | Emit path |
+|------|--------|-----------|
+| cg_arith / cg_mul / cg_var | `30\n90` / `30` | LIR |
+| cg_mod2 / cg_scale65_print | `42` | LIR |
+| cg_call / cg_call0 | `42` | Q+BD |
+| cg_printstr | `hi\n42` | Q+BD |
+| cg_scale65_call | `0\n7` | Q+BD |
+| cg_scale65_trace | `1\n2\n0\n3` | Q+BD |
+| cg_scale70 | `10\n41` | Q+BD |
 
-**11/11 PASS** với log `virc: phase8 — MIR/LIR tables ready`.
+**11/11 PASS** (codesign `a.out` trước khi chạy). Host: `core/build/vir` rebuild bằng `make -C core all`.
 
 ---
 
@@ -47,13 +48,14 @@ graph TD
 
 | Hash | Mô tả |
 |------|--------|
-| `5dc4cf68` | drop stub `compile_pipeline` trước Q emit (fix printstr) |
-| *(pending)* | Phase 8: Q staging → MIR/LIR flat tables + gate trong `boot_do_lower` |
+| `5dc4cf68` | drop stub `compile_pipeline` trước Q emit |
+| `ac9d8c4f` | Phase 8 MIR/LIR flat tables từ Q staging |
+| *(pending)* | LIR-table Mach-O emit + fix `boot_mir_push` reset bug |
 
 ---
 
-## 4. Việc còn lại (sau Phase 8)
+## 4. Việc còn lại
 
-1. Emit Mach-O trực tiếp từ LIR tables (Print/Call helpers).
-2. Modular `virc.vri` driver ổn định (lexer fat_str / include).
-3. SSA/opt/regalloc trên flat tables (không phụ thuộc entity field).
+1. LIR emit cho Call/SetArg và PrintStr (bỏ Q fallback).
+2. Modular `virc.vri` driver ổn định.
+3. SSA/opt/regalloc trên flat tables.
