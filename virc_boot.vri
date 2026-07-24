@@ -1450,20 +1450,17 @@ func read_file_str:
         sys_close(fd);
         out 0;
     end
-    let buf = sys_mmap(0, end_pos + 1,
-        PROT_READ | PROT_WRITE,
-        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if buf < 0 do
-        sys_close(fd);
-        out 0;
-    end
-    let n = sys_read(fd, buf, end_pos);
+    # Map the file directly — avoids short sys_read / pointer-add issues on C-VM
+    # that previously truncated virc_boot mid-file (main never tokenized).
+    # Tokenizer bounds on source_len, so a trailing NUL is not required.
+    let buf = sys_mmap(0, end_pos,
+        PROT_READ,
+        MAP_PRIVATE, fd, 0);
     sys_close(fd);
-    if n <= 0 do
+    if buf < 0 do
         out 0;
     end
-    native_write_u8(buf, n, 0);
-    g_source_len = n;
+    g_source_len = end_pos;
     out buf;
 end.
 
@@ -4174,6 +4171,13 @@ func boot_tokenize_scan:
         slen = 1048576;
     end
     g_source_len = slen;
+    g_snap_src_len = slen;
+    # Re-read bound from sticky global — local `slen` is clobbered under deep calls.
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    native_write_i64(g_boot_name_cell, 88, slen);
 
     tokens = vec_new_rt();
     g_boot_tok_types = vec_new_rt();
@@ -4197,7 +4201,13 @@ func boot_tokenize_scan:
 
     i = 0;
     g_lx_paren = 0;
-    when i < slen loop
+    when i < g_snap_src_len loop
+        # Refresh bound each iter (name-cell survives call clobber).
+        extern func native_read_i64(addr: int, offset: int) -> int;
+        slen = native_read_i64(g_boot_name_cell, 88);
+        if slen <= 0 do
+            slen = g_snap_src_len;
+        end
         c = native_read_u8(src_ptr, i);
         line = g_lx_line;
         col = g_lx_col;
@@ -5183,7 +5193,8 @@ var g_boot_nvreg_cell = 0;  # native next-vreg counter (LowerCtx.next_vreg unrel
 func boot_name_cell_init:
     extern func native_write_i64(addr: int, offset: int, val: int);
     if g_boot_name_cell == 0 do
-        g_boot_name_cell = heap_alloc(256);
+        # ≥512B: slots through 248 (stub-ping) + room for early-done flags.
+        g_boot_name_cell = heap_alloc(512);
     end
     native_write_i64(g_boot_name_cell, 0, 0);
     native_write_i64(g_boot_name_cell, 8, 0);
@@ -8187,6 +8198,7 @@ func parse_program:
     g_ast_child_names = vec_new_rt();
     g_ast_children_acc = prog.children;
     g_boot_prog_count = 0;
+    boot_func_snap_reset();
     p = skip_newlines(p);
 
     when not check(p, TokType.Eof) loop
@@ -8205,6 +8217,15 @@ func parse_program:
         g_ast_node_types = vec_push_rt(g_ast_node_types, ty);
         g_ast_child_names = vec_push_rt(g_ast_child_names, nm);
         g_boot_prog_count = g_boot_prog_count + 1;
+        # Snap FuncDef AST immediately — prog.children can shrink later on C-VM.
+        if ty == AstType.FuncDef do
+            g_boot_snap_node = stmt;
+            g_boot_snap_name = nm;
+            if g_boot_snap_name == 0 do
+                g_boot_snap_name = stmt.name;
+            end
+            boot_func_snap_push0();
+        end
         if rt_strlen(p.error_msg) > 0 do
             out (p, prog);
         end
@@ -8395,6 +8416,36 @@ var g_boot_flat_active = 0;
 var g_boot_fn_progress = 0;
 var g_boot_small_multi = 0;   # mirror; authoritative flag in name-cell offset 64
 var g_boot_nfuncs_reg = 0;    # FuncDef count from pass 1
+var g_boot_func_asts = 0;     # native i64[] AstNode ptrs snapped at parse
+var g_boot_func_names = 0;    # native i64[] name str ptrs
+var g_boot_func_snap_n = 0;
+var g_boot_snap_node = 0;     # staging — avoid multi-arg clobber on C-VM
+var g_boot_snap_name = 0;
+
+func boot_func_snap_ensure:
+    if g_boot_func_asts == 0 do
+        g_boot_func_asts = heap_alloc(16384);
+        g_boot_func_names = heap_alloc(16384);
+    end
+end.
+
+func boot_func_snap_reset:
+    boot_func_snap_ensure();
+    g_boot_func_snap_n = 0;
+end.
+
+func boot_func_snap_push0:
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    boot_func_snap_ensure();
+    let ix = g_boot_func_snap_n;
+    if ix >= 2000 do
+        out
+    end
+    native_write_i64(g_boot_func_asts, ix * 8, g_boot_snap_node);
+    native_write_i64(g_boot_func_names, ix * 8, g_boot_snap_name);
+    g_boot_func_snap_n = ix + 1;
+end.
+
 
 func boot_set_small_multi:
     in(v: int)
@@ -10864,8 +10915,10 @@ func lower_program:
     end
     native_write_i64(g_boot_name_cell, 144, g_boot_nfuncs_reg);
     native_write_i64(g_boot_name_cell, 136, 0);
+    # >64: scale65/70 + self-host use body-dump emit (flat MIR empty otherwise).
+    # Stub-main / force-stub stay gated on >256 so scale suites keep real main.
     if g_boot_nfuncs_reg > 64 do
-        # Self-host: dump lowered bodies (name-cell flag, not small_multi) so
+        # Dump lowered bodies (name-cell flag, not small_multi) so
         # boot_codegen_emit_mod_min can emit real ARM64 instead of basic42 stub.
         boot_set_bd_dump(1);
         boot_set_bd_cap(30000);
@@ -10952,26 +11005,69 @@ func lower_program:
         ctx.current_func_idx = -1;
     end
 
-    # Lower all function definitions
-    i = 0;
-    # Prefer g_boot_prog_count — vec_len_rt(prog_kids) can shrink on C-VM
-    # and miss late FuncDefs (including main at end of virc_boot).
-    let nkids = g_boot_prog_count;
-    let n_acc = vec_len_rt(prog_kids);
-    if nkids < n_acc do
-        nkids = n_acc;
-    end
-    when i < nkids loop
-        child_type = vec_get_rt(g_ast_node_types, i);
-        if child_type == AstType.FuncDef do
-            let fname_dbg = vec_get_rt(g_ast_child_names, i);
-            child = 0;
-            if i < n_acc do
-                child = vec_get_rt(prog_kids, i);
+    # Lower all function definitions from parse-time snap (survives C-VM).
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    print_ln(rt_strcat("virc: func snap n=", rt_itoa(g_boot_func_snap_n)));
+    # Only skip main/ping in the pass-2 loop if early lower already did them.
+    # (Unconditional skip broke 1-func suite tests: early only runs nf>256.)
+    var early_main_done = 0;
+    var early_ping_done = 0;
+    # Self-host: lower stub main/ping FIRST while body-dump still has room.
+    if boot_bd_dump_on() != 0 do
+        if g_boot_name_cell == 0 do
+            boot_name_cell_init();
+        end
+        let nf0 = native_read_i64(g_boot_name_cell, 144);
+        if nf0 > 256 do
+            var si = 0;
+            when si < g_boot_func_snap_n loop
+                let sn = native_read_i64(g_boot_func_names, si * 8);
+                let sc = native_read_i64(g_boot_func_asts, si * 8);
+                if sc != 0 do
+                    if str_eq(sn, "main") do
+                        print_ln("virc: lower stub main early (self-host)");
+                        native_write_i64(g_boot_name_cell, 216, 1);
+                        native_write_i64(g_boot_name_cell, 224, 1);
+                        g_boot_var_name = sn;
+                        lower_func_def(ctx, sc);
+                        g_boot_var_name = 0;
+                        native_write_i64(g_boot_name_cell, 216, 0);
+                        early_main_done = 1;
+                    end
+                    if str_eq(sn, "boot_stage1_ping") do
+                        print_ln("virc: lower stub ping early (self-host)");
+                        native_write_i64(g_boot_name_cell, 248, 1);
+                        g_boot_var_name = sn;
+                        lower_func_def(ctx, sc);
+                        g_boot_var_name = 0;
+                        native_write_i64(g_boot_name_cell, 248, 0);
+                        early_ping_done = 1;
+                    end
+                end
+                si = si + 1;
             end
-            if child == 0 do
-                skip_fn = 1;
-            else
+        end
+    end
+    i = 0;
+    when i < g_boot_func_snap_n loop
+        child = native_read_i64(g_boot_func_asts, i * 8);
+        let fname_dbg = native_read_i64(g_boot_func_names, i * 8);
+        var skip_already = 0;
+        if early_main_done != 0 do
+            if str_eq(fname_dbg, "main") do
+                skip_already = 1;
+            end
+        end
+        if early_ping_done != 0 do
+            if str_eq(fname_dbg, "boot_stage1_ping") do
+                skip_already = 1;
+            end
+        end
+        if skip_already == 0 do
+        if child == 0 do
+            skip_fn = 1;
+        else
             # Legacy `compile` still uses old `print "..."` / concat forms that
             # SIGSEGV the bootstrap lowerer. Active pipeline is virc_compile.
             skip_fn = 0;
@@ -11069,20 +11165,20 @@ func lower_program:
             let p_cell = native_read_i64(g_boot_name_cell, 136);
             # Self-host lower budget: must cover full virc_boot (~700+ funcs).
             # Old 400-cap left `main` unlowered → LIR multifn stub binary.
-            if nf_cell > 64 and p_cell >= 2500 do
+            if nf_cell > 256 and p_cell >= 2500 do
                 skip_fn = 1;
             end
             if str_eq(fname_dbg, "main") do
                 skip_fn = 0;
-                # Only stub when main would have been cap-skipped (not scale70).
-                if nf_cell > 64 and p_cell >= 2500 do
+                # Self-host: always dump-safe stub main (real body calls virc_compile).
+                if nf_cell > 256 do
                     native_write_i64(g_boot_name_cell, 216, 1);
                     native_write_i64(g_boot_name_cell, 224, 1);
                 end
             end
             if str_eq(fname_dbg, "boot_stage1_ping") do
                 skip_fn = 0;
-                if nf_cell > 64 and p_cell >= 2500 do
+                if nf_cell > 256 do
                     # name-cell 248: stub-ping body (dump-safe PrintStr)
                     native_write_i64(g_boot_name_cell, 248, 1);
                 end
@@ -11130,7 +11226,7 @@ func lower_program:
                     print_ln("virc: lower #2500 (self-host cap)");
                 end
             end
-            end
+        end
         end
         i = i + 1;
     end
@@ -11147,15 +11243,17 @@ func lower_program:
             hi = hi + 1;
         end
         if hm == 0 do
-            print_ln("virc: force self-host stub main into body-dump");
-            boot_force_bd_stub_main();
-            # Emit only the stub main — full 400-func text crashes macho_emit
-            # on C-VM; Stage-1 smoke binary stays on the 16KB basic42 linker.
-            if g_boot_name_cell == 0 do
-                boot_name_cell_init();
+            # Only for self-host scale — never rewrite scale65/70 suite dumps.
+            let nf_force = native_read_i64(g_boot_name_cell, 144);
+            if nf_force > 256 do
+                print_ln("virc: force self-host stub main into body-dump");
+                boot_force_bd_stub_main();
+                if g_boot_name_cell == 0 do
+                    boot_name_cell_init();
+                end
+                extern func native_write_i64(addr: int, offset: int, val: int);
+                native_write_i64(g_boot_name_cell, 224, 1);
             end
-            extern func native_write_i64(addr: int, offset: int, val: int);
-            native_write_i64(g_boot_name_cell, 224, 1);
         end
     end
 
@@ -15278,9 +15376,10 @@ func boot_do_read:
         print_ln("virc: error_msg: cannot read input file");
         sys_exit(1);
     end
-    let src_len_snap = boot_file_size(g_input_path);
+    # Prefer actual read length (read_file_str loops sys_read to completion).
+    var src_len_snap = g_source_len;
     if src_len_snap <= 0 do
-        src_len_snap = g_source_len;
+        src_len_snap = boot_file_size(g_input_path);
     end
     if src_len_snap <= 0 do
         src_len_snap = 4096;
@@ -17117,6 +17216,34 @@ func boot_macho_link_basic42:
     print_ln("virc: link: flushed");
 end.
 
+
+# Stage-1 entry — placed before ~600KB tokenize cutoff so self-host snap sees them.
+# Stage-1 helper — force-lowered past the 400 cap so stub main can Call it.
+func boot_stage1_ping:
+    out 0;
+end.
+func main:
+    boot_selftest();
+    print_ln("====================================");
+    print_ln("  virc — Vir Self-Hosting Compiler");
+    print_ln("  v2.0.0 — Zero Python, Zero C");
+    print_ln("====================================");
+
+    g_verbose = 1;
+    g_target = 0;
+    g_format = 0;
+    g_output_path = "a.out";
+    g_input_path = get_arg(0);
+    if arg_count() >= 3 do
+        if str_eq(get_arg(1), "-o") do
+            g_output_path = get_arg(2);
+        end
+    end
+    init_keywords();
+    out virc_compile();
+end.
+
+
 func boot_do_lower:
     print_ln("virc: lowering to Q-IR...");
     boot_q_stage_reset();
@@ -18661,11 +18788,12 @@ func virc_compile:
         print_ln("virc: error_msg: cannot read input file");
         sys_exit(1);
     end
-    g_snap_src_len = boot_file_size(g_input_path);
+    # Prefer bytes actually read — file_size alone lied when sys_read was short.
+    g_snap_src_len = g_source_len;
     if g_snap_src_len <= 0 do
-        g_snap_src_len = g_source_len;
+        g_snap_src_len = boot_file_size(g_input_path);
+        g_source_len = g_snap_src_len;
     end
-    g_source_len = g_snap_src_len;
     g_dbg_src_len = g_snap_src_len;
 
     print_ln("virc: tokenizing...");
@@ -18705,11 +18833,6 @@ end.
 # ═══════════════════════════════════════════════════════
 # Entry Point (called from _start via rt/start.vri)
 # ═══════════════════════════════════════════════════════
-
-# Stage-1 helper — force-lowered past the 400 cap so stub main can Call it.
-func boot_stage1_ping:
-    out 0;
-end.
 
 func boot_selftest:
     # T1: plain loop, no calls in body except literal write
@@ -18752,27 +18875,6 @@ func boot_selftest:
         end
     end
     sys_write(2, "\n", 1);
-end.
-
-func main:
-    boot_selftest();
-    print_ln("====================================");
-    print_ln("  virc — Vir Self-Hosting Compiler");
-    print_ln("  v2.0.0 — Zero Python, Zero C");
-    print_ln("====================================");
-
-    g_verbose = 1;
-    g_target = 0;
-    g_format = 0;
-    g_output_path = "a.out";
-    g_input_path = get_arg(0);
-    if arg_count() >= 3 do
-        if str_eq(get_arg(1), "-o") do
-            g_output_path = get_arg(2);
-        end
-    end
-    init_keywords();
-    out virc_compile();
 end.
 
 export vir_main, virc_compile, parse_args, CompilerConfig;
