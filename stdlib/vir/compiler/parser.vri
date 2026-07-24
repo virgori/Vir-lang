@@ -128,7 +128,9 @@ enum OpType:
     XorOp   = 22;
     ShlOp   = 23;
     ShrOp   = 24;
-    PowOp   = 25
+    PowOp   = 25;
+    Land    = 26;   # boolean `and` — short-circuit
+    Lor     = 27    # boolean `or`  — short-circuit
 end.
 # ═══════════════════════════════════════════════════════
 # AST Node
@@ -317,10 +319,12 @@ entity Parser:
 end.
 func parser_new(tokens: int):
 
+    # Snapshot before CALLs (same ABI footgun as lexer_new).
     tc = vec_len_rt(tokens);
+    held_toks = tokens;
     bi = build_builtins();
     p = Parser (
-        tokens:      tokens,
+        tokens:      held_toks,
         pos:         0,
         token_count: tc,
         error_msg:       "",
@@ -519,11 +523,10 @@ func parse_primary(p: Parser):
     if t.tok_type == TokType.Ident do
         var (p2, id_tok) = advance(p);
 
-        # Check for enum access: IDENT '.' variant
+        # Enum access via '::' (rare). Dot form is FieldAccess; lower resolves Enum.Variant.
         if check(p, TokType.DoubleColon) do
-            var (p3, _) = advance(p);  # consume .
-            # The variant name might be a keyword (e.g. TokType.Func)
-            # Accept any token that has a str_val
+            var (p3, _) = advance(p);  # consume ::
+            # Variant may be a keyword (e.g. TokType::Func)
             vt = peek(p3);
             var (p4, _) = advance(p3);
             ea = ast_new(AstType.EnumAccess);
@@ -533,8 +536,10 @@ func parse_primary(p: Parser):
             out (p4, ea)
         end
 
-        # Check for entity literal: IDENT '(' field: val, ... ')'
-        if check(p, TokType.LBrace) and check_entity_literal(p) do
+        # Entity/record literal: IDENT '(' field: val, ... ')'
+        # (Hard C also accepts '{'…'}' as record literal; soft path uses paren form
+        # which is what lexer.vri / most stdlib entities emit.)
+        if check(p, TokType.LParen) and check_entity_literal(p) do
             var (p3, _) = advance(p)  # consume '(';
             el = ast_new(AstType.EntityLiteral);
             el.name = id_tok.str_val;
@@ -542,7 +547,7 @@ func parse_primary(p: Parser):
             p3 = skip_newlines(p3);    # skip optional newline/semicolon after '('
             var (p3, _) = match_tok(p3, TokType.Semicolon);
             p3 = skip_newlines(p3);
-            when not check(p3, TokType.RBrace) and not check(p3, TokType.Eof) loop
+            when not check(p3, TokType.RParen) and not check(p3, TokType.Eof) loop
                 var (p4, fname, ok) = expect_tok(p3, TokType.Ident, "expected field name");
                 p3 = p4;
                 if not ok do
@@ -554,11 +559,17 @@ func parse_primary(p: Parser):
                 p3 = p6;
                 val.name2 = fname.str_val;
                 el = ast_add_child(el, val);
-                var (p7, _) = match_tok(p3, TokType.Comma);
-                p3 = p7;
+                # Accept ',' or ';' between fields (stdlib uses both).
+                var (p7, had_comma) = match_tok(p3, TokType.Comma);
+                if had_comma do
+                    p3 = p7
+                else
+                    var (p7b, _) = match_tok(p7, TokType.Semicolon);
+                    p3 = p7b
+                end
                 p3 = skip_newlines(p3)
             end
-            var (p8, _, _) = expect_tok(p3, TokType.RBrace, "expected ')' after entity literal");
+            var (p8, _, _) = expect_tok(p3, TokType.RParen, "expected ')' after entity literal");
             out (p8, el)
         end
 
@@ -711,11 +722,38 @@ func parse_primary(p: Parser):
         out (p2, n)
     end
 
-    # Parenthesised expression
+    # Parenthesised expression or tuple: (expr) / (a, b, …)
     if t.tok_type == TokType.LParen do
         var (p2, _) = advance(p);
+        p2 = skip_newlines(p2);
+        if check(p2, TokType.RParen) do
+            # Empty tuple ()
+            var (p3, _) = advance(p2);
+            tup = ast_new(AstType.TupleExpr);
+            tup.line = t.line;
+            out (p3, tup)
+        end
         var (p3, inner) = parse_expr(p2);
-        var (p4, _, _) = expect_tok(p3, TokType.RParen, "expected ')'");
+        p2 = p3;
+        if check(p2, TokType.Comma) do
+            tup = ast_new(AstType.TupleExpr);
+            tup.line = t.line;
+            tup = ast_add_child(tup, inner);
+            when check(p2, TokType.Comma) loop
+                var (p4, _) = advance(p2);
+                p4 = skip_newlines(p4);
+                if check(p4, TokType.RParen) do
+                    p2 = p4
+                else
+                    var (p5, elem) = parse_expr(p4);
+                    tup = ast_add_child(tup, elem);
+                    p2 = p5
+                end
+            end
+            var (p6, _, _) = expect_tok(p2, TokType.RParen, "expected ')' to close tuple");
+            out (p6, tup)
+        end
+        var (p4, _, _) = expect_tok(p2, TokType.RParen, "expected ')'");
         out (p4, inner)
     end
 
@@ -751,16 +789,16 @@ func parse_primary(p: Parser):
 end.
 func check_entity_literal(p: Parser):
 
-    # Check if '(' starts an entity literal (lookahead for '(' IDENT ':' or '(' ')' or '( ;')
-    if not check(p, TokType.LBrace) do
+    # Lookahead: '(' IDENT ':'  or  '(' NL/'; field…
+    # Empty '()' is a call (foo()), not an entity — hard uses '{}' for empty records.
+    if not check(p, TokType.LParen) do
         out false
     end
     next_idx = p.pos + 1;
     if next_idx < p.token_count do
         t1 = vec_get_rt(p.tokens, next_idx >> int);
-        # Empty entity: Name ( )
-        if t1.tok_type == TokType.RBrace do
-            out true
+        if t1.tok_type == TokType.RParen do
+            out false
         end
         # Entity with fields on next line: Name (; field: val ... )
         if t1.tok_type == TokType.Newline or t1.tok_type == TokType.Semicolon do
@@ -811,15 +849,17 @@ func parse_unary(p: Parser):
     var (p2, left) = parse_primary(p);
     when check(p2, TokType.Dot) loop
         var (p3, _) = advance(p2);
-        var (p4, field, ok) = expect_tok(p3, TokType.Ident, "expected field name after '.'");
-        if not ok do
-            out (p4, left)
+        # Field/variant name may be a keyword (TokType.Func, AstType.If, …)
+        ft = peek(p3);
+        if ft.tok_type == TokType.Eof or ft.tok_type == TokType.Newline do
+            out (p3, left)
         end
+        var (p4, field_tok) = advance(p3);
         # UFCS: obj.method(args) → MethodCall(name=method, children=[obj, args...])
         if check(p4, TokType.LParen) do
             mc = ast_new(AstType.MethodCall);
-            mc.name = field.str_val;
-            mc.line = field.line;
+            mc.name = field_tok.str_val;
+            mc.line = field_tok.line;
             mc = ast_add_child(mc, left);
             var (p5, _) = advance(p4);
             if not check(p5, TokType.RParen) do
@@ -844,8 +884,8 @@ func parse_unary(p: Parser):
             p2 = p9
         else
             fa = ast_new(AstType.FieldAccess);
-            fa.name = field.str_val;
-            fa.line = field.line;
+            fa.name = field_tok.str_val;
+            fa.line = field_tok.line;
             fa = ast_add_child(fa, left);
             left = fa;
             p2 = p4
@@ -987,7 +1027,7 @@ func parse_and_expr(p: Parser):
         var (p3, _) = advance(p2);
         var (p4, right) = parse_compare(p3);
         bin = ast_new(AstType.BinOp);
-        bin.op = OpType.AndOp;
+        bin.op = OpType.Land;
         bin = ast_add_child(bin, left);
         bin = ast_add_child(bin, right);
         left = bin;
@@ -1003,7 +1043,7 @@ func parse_or_expr(p: Parser):
         var (p3, _) = advance(p2);
         var (p4, right) = parse_and_expr(p3);
         bin = ast_new(AstType.BinOp);
-        bin.op = OpType.OrOp;
+        bin.op = OpType.Lor;
         bin = ast_add_child(bin, left);
         bin = ast_add_child(bin, right);
         left = bin;
@@ -1013,7 +1053,19 @@ func parse_or_expr(p: Parser):
 end.
 func parse_expr(p: Parser):
 
-    out parse_or_expr(p)
+    var (p2, left) = parse_or_expr(p);
+    # Postfix `as TypeName` (identity cast for soft path).
+    if check(p2, TokType.As) do
+        var (p3, _) = advance(p2);
+        if check(p3, TokType.Ident) do
+            var (p4, _) = advance(p3);
+            p3 = p4
+        end
+        cast_n = ast_new(AstType.CastExpr);
+        cast_n = ast_add_child(cast_n, left);
+        out (p3, cast_n)
+    end
+    out (p2, left)
 end.
 # ═══════════════════════════════════════════════════════
 # Statement Parsing
@@ -1154,12 +1206,69 @@ func parse_case_stmt(p: Parser):
     n.line = line;
     n = ast_add_child(n, expr);
     when not check(p2, TokType.Else) and not check(p2, TokType.End) and not check(p2, TokType.Eof) loop
-        var (p3, val) = parse_expr(p2);
-        var (p4, _) = match_tok(p3, TokType.Colon);
+        # Optional leading `case` on each arm (v2 style).
+        var (p2b, _) = match_tok(p2, TokType.Case);
+        p2 = p2b;
+        # Pattern: _ | else | Int | Str | Ident[(...)]
+        pat = ast_new(AstType.Identifier);
+        pat.name = "_";
+        pat.int_val = 0 - 1;
+        if check(p2, TokType.Else) do
+            var (p3, _) = advance(p2);
+            p2 = p3
+        eif check(p2, TokType.Int) do
+            var (p3, it) = advance(p2);
+            pat = ast_new(AstType.LiteralInt);
+            pat.int_val = it.int_val;
+            p2 = p3
+        eif check(p2, TokType.Str) do
+            var (p3, st) = advance(p2);
+            pat = ast_new(AstType.LiteralStr);
+            pat.name = st.str_val;
+            p2 = p3
+        eif check(p2, TokType.Ident) or check(p2, TokType.NoneLit) or check(p2, TokType.True) or check(p2, TokType.False) do
+            var (p3, idt) = advance(p2);
+            pat = ast_new(AstType.Identifier);
+            if idt.tok_type == TokType.NoneLit do
+                pat.name = "None"
+            eif idt.tok_type == TokType.True do
+                pat.name = "true"
+            eif idt.tok_type == TokType.False do
+                pat.name = "false"
+            else
+                pat.name = idt.str_val
+            end
+            pat.int_val = 0 - 3;
+            p2 = p3;
+            # Tagged payload Some(v) / Some(_) — skip (...)
+            if check(p2, TokType.LParen) do
+                var (p_lp, _) = advance(p2);
+                depth = 1;
+                p2 = p_lp;
+                when depth > 0 and not check(p2, TokType.Eof) loop
+                    if check(p2, TokType.LParen) do
+                        depth = depth + 1
+                    end
+                    if check(p2, TokType.RParen) do
+                        depth = depth - 1
+                    end
+                    var (p_adv, _) = advance(p2);
+                    p2 = p_adv
+                end
+            end
+        else
+            # Force progress
+            var (p3, _) = advance(p2);
+            p2 = p3
+        end
+        var (p4, _) = match_tok(p2, TokType.Colon);
+        p4 = skip_newlines(p4);
         var (p5, body) = parse_statement(p4);
-        n = ast_add_child(n, val);
+        n = ast_add_child(n, pat);
         n = ast_add_child(n, body);
         p2 = p5;
+        var (p2s, _) = match_tok(p2, TokType.Semicolon);
+        p2 = p2s;
         p2 = skip_newlines(p2)
     end
     var (p3, has_else) = match_tok(p2, TokType.Else);
@@ -1572,6 +1681,22 @@ func parse_enum_def(p: Parser):
         else
             p2 = p4
         end
+        # Optional payload: Some(v) / Ok(value) — skip parenthesized binder list.
+        if check(p2, TokType.LParen) do
+            var (p_lp, _) = advance(p2);
+            depth = 1;
+            p2 = p_lp;
+            when depth > 0 and not check(p2, TokType.Eof) loop
+                if check(p2, TokType.LParen) do
+                    depth = depth + 1
+                end
+                if check(p2, TokType.RParen) do
+                    depth = depth - 1
+                end
+                var (p_adv, _) = advance(p2);
+                p2 = p_adv
+            end
+        end
         next_val = val + 1;
 
         variant = ast_new(AstType.LiteralInt);
@@ -1625,7 +1750,23 @@ func parse_entity_def(p: Parser):
             if check(p4, TokType.Ident) do
                 var (p5, type_tok) = advance(p4);
                 field.name2 = type_tok.str_val;
-                p2 = p5
+                p2 = p5;
+                # Skip generic args: Vec<T>, Map<K,V>, …
+                if check(p2, TokType.Lt) do
+                    var (p_g, _) = advance(p2);
+                    depth = 1;
+                    p2 = p_g;
+                    when depth > 0 and not check(p2, TokType.Eof) loop
+                        if check(p2, TokType.Lt) do
+                            depth = depth + 1
+                        end
+                        if check(p2, TokType.Gt) do
+                            depth = depth - 1
+                        end
+                        var (p_adv, _) = advance(p2);
+                        p2 = p_adv
+                    end
+                end
             else
                 p2 = p4
             end
@@ -1634,8 +1775,14 @@ func parse_entity_def(p: Parser):
         end
 
         ed = ast_add_child(ed, field);
-        var (p6, _) = match_tok(p2, TokType.Semicolon);
-        p2 = p6;
+        # Hard parser accepts ',' or ';' between entity fields (lexer.vri uses commas).
+        var (p6, had_semi) = match_tok(p2, TokType.Semicolon);
+        if had_semi do
+            p2 = p6
+        else
+            var (p7, _) = match_tok(p6, TokType.Comma);
+            p2 = p7
+        end
         p2 = skip_newlines(p2)
     end
 
@@ -1672,6 +1819,17 @@ func parse_statement(p: Parser):
             p2 = p3
         end
         out (p2, ast_new(AstType.ExternFunc))
+    end
+
+    # `type name;` / `type name = ...;` — skip (soft lower ignores aliases).
+    if t.tok_type == TokType.TypeKw do
+        var (p2, _) = advance(p);
+        when not check(p2, TokType.Semicolon) and not check(p2, TokType.Newline) and not check(p2, TokType.Eof) loop
+            var (p3, _) = advance(p2);
+            p2 = p3
+        end
+        var (p3, _) = match_tok(p2, TokType.Semicolon);
+        out (p3, ast_new(AstType.ExternFunc))
     end
 
     if t.tok_type == TokType.Func do
@@ -1988,8 +2146,8 @@ func parse_statement(p: Parser):
         end
 
         var (p3, _) = match_tok(p2, TokType.Semicolon);
-        if vec_len(inc_block.children) == 1 do
-            out (p3, vec_get(inc_block.children, 0))
+        if vec_len_rt(inc_block.children) == 1 do
+            out (p3, vec_get_rt(inc_block.children, 0))
         else
             out (p3, inc_block)
         end
