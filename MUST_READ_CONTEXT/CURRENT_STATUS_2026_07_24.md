@@ -54,6 +54,8 @@ graph LR
 | 15 | `e5a0696d` | **feat(compiler/semantic)**: implement P0 Semantic Analyzer (infrastructure + Pass 2/3/6) | 7 | +644/-7 |
 | 16 | `68341ced` | **feat(compiler/semantic)**: complete P0 pipeline wiring (orchestrator + diagnostics + virc.vri) | 3 | +201/-105 |
 | 17 | `db25ecf2` | **feat(compiler/semantic)**: implement P1 — Type Resolution, Inference, CFA (Pass 4/5/7) | 4 | +593/-1 |
+| 18 | `aaf2f866` | **docs**: update status with commits 16-17 | 1 | +3/-0 |
+| 19 | `7a20f8d2` | **feat(compiler/semantic)**: implement P2 — Borrow Analysis + Constant Folding (Pass 8/9) | 4 | +494/-10 |
 
 ---
 
