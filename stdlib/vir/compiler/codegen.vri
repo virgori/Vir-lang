@@ -19,6 +19,7 @@ module vir.compiler.codegen;
 include types;
 include "stdlib/vir/rt/vec_rt.vri";
 import bvec_new, bvec_push, bvec_len, bvec_get, bvec_set from "stdlib/vir/rt/vec_rt.vri";
+import vec_new_rt, vec_push_rt, vec_len_rt, vec_get_rt from "stdlib/vir/rt/vec_rt.vri";
 
 # ═══════════════════════════════════════════════════════
 # Architecture Detection
@@ -671,9 +672,15 @@ func arm64_mov_rr:
         rd: int;
         rm: int
 
-    # MOV = ORR Xd, XZR, Xm -> 0xAA0003E0
+    # MOV Xd, Xm = ORR Xd, XZR, Xm.  Note: rm=31 is XZR here, NOT SP.
     instr = 0xAA0003E0 | ((rm & 0x1F) << 16) | (rd & 0x1F);
     out codebuf_emit_u32(cb, instr)
+end.
+
+# MOV Xd, SP  (ADD Xd, SP, #0) — ARM64 SP is not usable as Xm in ORR.
+func arm64_mov_from_sp(cb: CodeBuf, rd: int):
+
+    out codebuf_emit_u32(cb, 0x91000000 | (31 << 5) | (rd & 0x1F))
 end.
 func arm64_cmp_rr:
     in  cb: CodeBuf;
@@ -1060,17 +1067,19 @@ entity CgFixup:
         is_cond:        int
 end.
 entity PatchState:
-    labels:         [CgLabel],
-        fixups:         [CgFixup],
-        label_count:    int,
-        fixup_count:    int
+    label_ids:      int,   # rt-vec of label ids
+    label_offs:     int,   # rt-vec of code offsets
+    fix_offs:       int,   # rt-vec of patch sites
+    fix_targets:    int,   # rt-vec of target label ids
+    fix_conds:      int    # rt-vec of is_cond flags
 end.
 func patch_new:
     out PatchState (
-        labels: [],
-        fixups: [],
-        label_count: 0,
-        fixup_count: 0
+        label_ids:   vec_new_rt(),
+        label_offs:  vec_new_rt(),
+        fix_offs:    vec_new_rt(),
+        fix_targets: vec_new_rt(),
+        fix_conds:   vec_new_rt()
     )
 end.
 func patch_add_label:
@@ -1078,10 +1087,8 @@ func patch_add_label:
         label_id: int;
         offset: int
 
-    if ps.label_count < CG_MAX_LABELS do
-        ps.labels = ps.labels + [CgLabel ( label_id: label_id, offset: offset )];
-        ps.label_count = ps.label_count + 1
-    end
+    ps.label_ids = vec_push_rt(ps.label_ids, label_id);
+    ps.label_offs = vec_push_rt(ps.label_offs, offset);
     out ps
 end.
 func patch_add_fixup:
@@ -1090,30 +1097,29 @@ func patch_add_fixup:
         target_label: int;
         is_cond: int
 
-    if ps.fixup_count < CG_MAX_FIXUPS do
-        ps.fixups = ps.fixups + [CgFixup ( patch_offset: patch_offset, target_label: target_label, is_cond: is_cond )];
-        ps.fixup_count = ps.fixup_count + 1
-    end
+    ps.fix_offs = vec_push_rt(ps.fix_offs, patch_offset);
+    ps.fix_targets = vec_push_rt(ps.fix_targets, target_label);
+    ps.fix_conds = vec_push_rt(ps.fix_conds, is_cond);
     out ps
 end.
 func patch_find_label(ps: PatchState, label_id: int):
 
     i = 0;
-    when i < ps.label_count loop
-        if ps.labels[i].label_id == label_id do
-            out ps.labels[i].offset
+    when i < vec_len_rt(ps.label_ids) loop
+        if vec_get_rt(ps.label_ids, i) == label_id do
+            out vec_get_rt(ps.label_offs, i)
         end
         i = i + 1
     end
-    out -1  # not found
+    out -1
 end.
 func backpatch_x86(cb: CodeBuf, ps: PatchState):
 
     f = 0;
-    when f < ps.fixup_count loop
-        target = patch_find_label(ps, ps.fixups[f].target_label);
+    when f < vec_len_rt(ps.fix_offs) loop
+        target = patch_find_label(ps, vec_get_rt(ps.fix_targets, f));
         if target >= 0 do
-            patch_at = ps.fixups[f].patch_offset;
+            patch_at = vec_get_rt(ps.fix_offs, f);
             instr_end = patch_at + 4;
             rel = target - instr_end;
             cb = codebuf_patch_i32(cb, patch_at, rel)
@@ -1125,19 +1131,20 @@ end.
 func backpatch_arm64(cb: CodeBuf, ps: PatchState):
 
     f = 0;
-    when f < ps.fixup_count loop
-        target = patch_find_label(ps, ps.fixups[f].target_label);
+    when f < vec_len_rt(ps.fix_offs) loop
+        target = patch_find_label(ps, vec_get_rt(ps.fix_targets, f));
         if target >= 0 do
-            patch_at = ps.fixups[f].patch_offset;
+            patch_at = vec_get_rt(ps.fix_offs, f);
             byte_offset = target - patch_at;
-            # Read original instruction (little-endian)
-            orig = cb.data[patch_at] | (cb.data[patch_at + 1] << 8) | (cb.data[patch_at + 2] << 16) | (cb.data[patch_at + 3] << 24);
-            if ps.fixups[f].is_cond == 1 do
-                # B.cond: imm19 at bits [23:5]
+            b0 = bvec_get(cb.data, patch_at);
+            b1 = bvec_get(cb.data, patch_at + 1);
+            b2 = bvec_get(cb.data, patch_at + 2);
+            b3 = bvec_get(cb.data, patch_at + 3);
+            orig = b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+            if vec_get_rt(ps.fix_conds, f) == 1 do
                 imm19 = (byte_offset shr 2) & 0x7FFFF;
                 orig = (orig & (~(0x7FFFF << 5))) | (imm19 << 5)
             else
-                # B / BL: imm26 at bits [25:0]
                 imm26 = (byte_offset shr 2) & 0x03FFFFFF;
                 orig = (orig & (~0x03FFFFFF)) | imm26
             end
@@ -1949,7 +1956,7 @@ export codebuf_new, codebuf_emit_byte, codebuf_emit_u32, codebuf_emit_u64,
        avx_vminps, avx_vmaxps, avx_vmovaps_load, avx_vmovaps_store,
        avx_vbroadcastss, avx_vhaddps, x86_vex2,
        arm64_add_rrr, arm64_sub_rrr, arm64_mul_rrr, arm64_sdiv_rrr,
-       arm64_mov_imm16, arm64_movz_imm64, arm64_mov_rr,
+       arm64_mov_imm16, arm64_movz_imm64, arm64_mov_rr, arm64_mov_from_sp,
        arm64_cmp_rr, arm64_cmp_imm0,
        arm64_cset_eq, arm64_cset_gt, arm64_cset_lt, arm64_cset_ge, arm64_cset_le,
        arm64_b_imm26, arm64_beq_imm19, arm64_bne_imm19, arm64_bl_imm26,

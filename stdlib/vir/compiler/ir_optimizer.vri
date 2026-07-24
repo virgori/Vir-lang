@@ -10,7 +10,9 @@
 
 include types;
 include "stdlib/vir/rt/string_rt.vri";
-import str_new, str_concat, str_len, rt_streq from "stdlib/vir/rt/string_rt.vri";
+import fat_str_new, fat_str_concat, fat_str_eq, fat_cstr_eq, rt_streq from "stdlib/vir/rt/string_rt.vri";
+include "stdlib/vir/rt/alloc.vri";
+import vir_alloc from "stdlib/vir/rt/alloc.vri";
 include option;
 import Option, is_some, unwrap from option;
 include vec;
@@ -23,6 +25,9 @@ include lexer;
 import TokType from lexer;
 include parser;
 import AstNode, AstType, OpType, BuiltinId from parser;
+
+extern func native_read_i64(addr: int, offset: int) -> int;
+extern func native_write_i64(addr: int, offset: int, val: int);
 
 
 # ═══════════════════════════════════════════════════════
@@ -211,7 +216,16 @@ func q_func_new(name: string):
 end.
 func q_func_emit(f: QFunction, instr: QInstr):
 
+    # Soft entity copies via vec_push drop sibling fields; keep name/params.
+    saved_name = f.name;
+    saved_pc = f.param_count;
+    saved_pn = f.param_names;
+    saved_pv = f.param_vregs;
     f.body = vec_push(f.body, instr);
+    f.name = saved_name;
+    f.param_count = saved_pc;
+    f.param_names = saved_pn;
+    f.param_vregs = saved_pv;
     out f
 end.
 entity QModule:
@@ -288,27 +302,31 @@ func sym_define:
         name: string;
         vreg: i64
 
-    # Check map first for O(1) lookup
-    var idx_opt = map_get<string, i64>(st.name_map, name);
-    if is_some(idx_opt) do
-        idx = unwrap<i64>(idx_opt);
-        entry = vec_get(st.entries, idx);
-        entry.vreg = vreg;
-        vec_set(st.entries, idx, entry);
-        out st
+    # Linear scan under C-core (hash map soft-string keys are unreliable).
+    i = 0;
+    when i < vec_len(st.entries) loop
+        entry = vec_get(st.entries, i);
+        if fat_str_eq(entry.name, name) do
+            entry.vreg = vreg;
+            vec_set(st.entries, i, entry);
+            out st
+        end
+        i = i + 1
     end
-    # Not found, add new
-    vec_push(st.entries, SymEntry ( name: name, vreg: vreg, is_move_type: 0, is_moved: 0, borrow_shared_count: 0, borrow_mut_count: 0, borrow_kind: 0, borrow_of_name: str_new("") ));
-    map_insert<string, i64>(&st.name_map, name, vec_len(st.entries) - 1);
+    empty = fat_str_new("");
+    ent = SymEntry ( name: name, vreg: vreg, is_move_type: 0, is_moved: 0, borrow_shared_count: 0, borrow_mut_count: 0, borrow_kind: 0, borrow_of_name: empty );
+    st.entries = vec_push(st.entries, ent);
     out st
 end.
 func sym_lookup(st: SymTable, name: string):
 
-    var idx_opt = map_get<string, i64>(st.name_map, name);
-    if is_some(idx_opt) do
-        idx = unwrap<i64>(idx_opt);
-        entry = vec_get(st.entries, idx);
-        out (true, entry.vreg)
+    i = 0;
+    when i < vec_len(st.entries) loop
+        entry = vec_get(st.entries, i);
+        if fat_str_eq(entry.name, name) do
+            out (true, entry.vreg)
+        end
+        i = i + 1
     end
     out (false, 0)
 end.
@@ -345,7 +363,7 @@ func enum_lookup_variant(et: EnumType, variant: string):
     i = 0;
     when i < vec_len(et.variants) loop
         v = vec_get(et.variants, i);
-        if str_eq(v.name, variant) do
+        if fat_str_eq(v.name, variant) do
             out (true, v.value)
         end
         i = i + 1
@@ -365,7 +383,7 @@ func entity_field_offset(et: EntityType, field: string):
     i = 0;
     when i < vec_len(et.fields) loop
         f = vec_get(et.fields, i);
-        if str_eq(f.name, field) do
+        if fat_str_eq(f.name, field) do
             out (true, f.offset as i64)
         end
         i = i + 1
@@ -375,6 +393,92 @@ end.
 # ═══════════════════════════════════════════════════════
 # Lowering Context
 # ═══════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════
+# Hard function registry (C-core: soft globals / Vec len are unreliable)
+# Native block layout:
+#   [0] nfuncs
+#   [8] current_func_idx
+#   [16] next_vreg
+#   [24] scratch
+#   [32] error_count
+#   [40..40+8*64) name pointers
+#   [552..552+8*64) body rt-vec pointers
+# ═══════════════════════════════════════════════════════
+
+const G_MAX_FUNCS = 64;
+const G_OFF_NFUNCS = 0;
+const G_OFF_CUR = 8;
+const G_OFF_VREG = 16;
+const G_OFF_SCRATCH = 24;
+const G_OFF_ERR = 32;
+const G_OFF_NAMES = 40;
+const G_OFF_BODIES = 552;   # 40 + 64*8
+const G_META_SIZE = 1064;   # 552 + 64*8
+# Packed instr words in body rt-vec (ints only — no soft QInstr handles).
+const G_INSTR_WORDS = 11;
+
+var g_meta = 0;
+
+func g_meta_init:
+    if g_meta == 0 do
+        g_meta = vir_alloc(G_META_SIZE)
+    end
+    native_write_i64(g_meta, G_OFF_NFUNCS, 0);
+    native_write_i64(g_meta, G_OFF_CUR, 0 - 1);
+    native_write_i64(g_meta, G_OFF_VREG, 0);
+    native_write_i64(g_meta, G_OFF_SCRATCH, 0);
+    native_write_i64(g_meta, G_OFF_ERR, 0);
+    i = 0;
+    when i < G_MAX_FUNCS loop
+        native_write_i64(g_meta, G_OFF_NAMES + i * 8, 0);
+        native_write_i64(g_meta, G_OFF_BODIES + i * 8, 0);
+        i = i + 1
+    end
+end.
+
+func g_nfuncs_get:
+    out native_read_i64(g_meta, G_OFF_NFUNCS)
+end.
+func g_nfuncs_set(n: int):
+    native_write_i64(g_meta, G_OFF_NFUNCS, n)
+end.
+func g_cur_get:
+    out native_read_i64(g_meta, G_OFF_CUR)
+end.
+func g_cur_set(v: int):
+    native_write_i64(g_meta, G_OFF_CUR, v)
+end.
+func g_vreg_get:
+    out native_read_i64(g_meta, G_OFF_VREG)
+end.
+func g_vreg_set(v: int):
+    native_write_i64(g_meta, G_OFF_VREG, v)
+end.
+func g_scratch_get:
+    out native_read_i64(g_meta, G_OFF_SCRATCH)
+end.
+func g_scratch_set(v: int):
+    native_write_i64(g_meta, G_OFF_SCRATCH, v)
+end.
+func g_err_get:
+    out native_read_i64(g_meta, G_OFF_ERR)
+end.
+func g_err_inc:
+    native_write_i64(g_meta, G_OFF_ERR, g_err_get() + 1)
+end.
+func g_name_get(i: int):
+    out native_read_i64(g_meta, G_OFF_NAMES + i * 8)
+end.
+func g_name_set(i: int, name: int):
+    native_write_i64(g_meta, G_OFF_NAMES + i * 8, name)
+end.
+func g_body_get(i: int):
+    out native_read_i64(g_meta, G_OFF_BODIES + i * 8)
+end.
+func g_body_set(i: int, body: int):
+    native_write_i64(g_meta, G_OFF_BODIES + i * 8, body)
+end.
 
 entity LowerCtx:
     prog:             QModule,
@@ -412,6 +516,7 @@ func lower_ctx_new(mod_name: string):
     loop_ends = vec_new();
         err = "";
     borrows = vec_new();
+    g_meta_init();
     out LowerCtx (
         prog:             prog,
         next_vreg:          0,
@@ -436,11 +541,12 @@ func lower_ctx_new(mod_name: string):
 end.
 func fresh_vreg(ctx: LowerCtx):
 
-    # C-core: do not return (ctx, r) tuples — large entity copies via tuples
-    # drop soft fields (e.g. prog.functions). Stash r in scratch instead.
-    r = ctx.next_vreg;
+    # C-core: soft LowerCtx drops scratch/next_vreg — use native meta.
+    r = g_vreg_get();
+    g_vreg_set(r + 1);
     ctx.next_vreg = r + 1;
     ctx.scratch = r;
+    g_scratch_set(r);
     out ctx
 end.
 func fresh_label(ctx: LowerCtx):
@@ -448,22 +554,139 @@ func fresh_label(ctx: LowerCtx):
     l = ctx.label_counter;
     ctx.label_counter = l + 1;
     ctx.scratch = l;
+    g_scratch_set(l);
     out ctx
 end.
 func lower_error(ctx: LowerCtx, msg: string):
 
     ctx.last_error = msg;
     ctx.error_count = ctx.error_count + 1;
+    g_err_inc();
     out ctx
 end.
-func emit_instr(ctx: LowerCtx, instr: QInstr):
+func emit_words(ctx: LowerCtx, op: int, d_ty: int, d_vr: int, d_im: int,
+                s1_ty: int, s1_vr: int, s1_im: int,
+                s2_ty: int, s2_vr: int, s2_im: int, pid: int):
 
-    if ctx.current_func_idx >= 0 do
-        f = vec_get(ctx.prog.functions, ctx.current_func_idx);
-        f = q_func_emit(f, instr);
-        vec_set(ctx.prog.functions, ctx.current_func_idx, f)
+    bi = g_cur_get();
+    if bi >= 0 and bi < g_nfuncs_get() do
+        body = g_body_get(bi);
+        if body == 0 do
+            body = vec_new_rt();
+            g_body_set(bi, body);
+            body = g_body_get(bi)
+        end
+        body = vec_push_rt(body, op);
+        body = vec_push_rt(body, d_ty);
+        body = vec_push_rt(body, d_vr);
+        body = vec_push_rt(body, d_im);
+        body = vec_push_rt(body, s1_ty);
+        body = vec_push_rt(body, s1_vr);
+        body = vec_push_rt(body, s1_im);
+        body = vec_push_rt(body, s2_ty);
+        body = vec_push_rt(body, s2_vr);
+        body = vec_push_rt(body, s2_im);
+        body = vec_push_rt(body, pid);
+        g_body_set(bi, body)
     end
     out ctx
+end.
+
+func emit_instr(ctx: LowerCtx, instr: QInstr):
+
+    # Snapshot soft fields into plain ints BEFORE any vec alloc (soft handles die on realloc).
+    op = 0 + instr.opcode;
+    d_ty = 0 + instr.dest.op_type;
+    d_vr = instr.dest.vreg;
+    d_im = instr.dest.imm_val;
+    s1_ty = 0 + instr.src1.op_type;
+    s1_vr = instr.src1.vreg;
+    s1_im = instr.src1.imm_val;
+    s2_ty = 0 + instr.src2.op_type;
+    s2_vr = instr.src2.vreg;
+    s2_im = instr.src2.imm_val;
+    pid = instr.patch_id;
+    out emit_words(ctx, op, d_ty, d_vr, d_im, s1_ty, s1_vr, s1_im, s2_ty, s2_vr, s2_im, pid)
+end.
+
+func func_count:
+
+    out g_nfuncs_get()
+end.
+
+func func_name_at(fidx: int):
+
+    out g_name_get(fidx)
+end.
+
+func func_body_len(fidx: int):
+
+    if fidx < 0 or fidx >= g_nfuncs_get() do
+        out 0
+    end
+    body = g_body_get(fidx);
+    if body == 0 do
+        out 0
+    end
+    out vec_len_rt(body) / G_INSTR_WORDS
+end.
+
+func func_body_instr(fidx: int, i: int):
+
+    # Legacy soft reconstruct — prefer word accessors in codegen.
+    body = g_body_get(fidx);
+    base = i * G_INSTR_WORDS;
+    op = vec_get_rt(body, base);
+    d_ty = vec_get_rt(body, base + 1);
+    d_vr = vec_get_rt(body, base + 2);
+    d_im = vec_get_rt(body, base + 3);
+    s1_ty = vec_get_rt(body, base + 4);
+    s1_vr = vec_get_rt(body, base + 5);
+    s1_im = vec_get_rt(body, base + 6);
+    s2_ty = vec_get_rt(body, base + 7);
+    s2_vr = vec_get_rt(body, base + 8);
+    s2_im = vec_get_rt(body, base + 9);
+    pid = vec_get_rt(body, base + 10);
+    d = QOperand ( op_type: d_ty, vreg: d_vr, imm_val: d_im );
+    s1 = QOperand ( op_type: s1_ty, vreg: s1_vr, imm_val: s1_im );
+    s2 = QOperand ( op_type: s2_ty, vreg: s2_vr, imm_val: s2_im );
+    ins = QInstr ( opcode: op, dest: d, src1: s1, src2: s2, patch_id: pid );
+    out ins
+end.
+
+# Raw packed-word accessors for codegen (avoid soft QInstr field loss).
+func func_instr_op(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS)
+end.
+func func_instr_d_ty(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS + 1)
+end.
+func func_instr_d_vr(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS + 2)
+end.
+func func_instr_d_im(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS + 3)
+end.
+func func_instr_s1_ty(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS + 4)
+end.
+func func_instr_s1_vr(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS + 5)
+end.
+func func_instr_s1_im(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS + 6)
+end.
+func func_instr_s2_ty(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS + 7)
+end.
+func func_instr_s2_vr(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS + 8)
+end.
+func func_instr_s2_im(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS + 9)
+end.
+func func_instr_patch(fidx: int, i: int):
+    out vec_get_rt(g_body_get(fidx), i * G_INSTR_WORDS + 10)
 end.
 func sym_lookup_both(ctx: LowerCtx, name: string):
 
@@ -480,9 +703,14 @@ func sym_lookup_both(ctx: LowerCtx, name: string):
 end.
 func find_func_index(ctx: LowerCtx, name: string):
 
-    var idx_opt = map_get<string, i64>(ctx.prog.func_map, name);
-    if is_some(idx_opt) do
-        out unwrap<i64>(idx_opt)
+    # Native name slots — soft QFunction.name is dropped by vec_push/emit.
+    i = 0;
+    n = g_nfuncs_get();
+    when i < n loop
+        if fat_str_eq(g_name_get(i), name) do
+            out i
+        end
+        i = i + 1
     end
     out -1
 end.
@@ -493,9 +721,13 @@ end.
 # Look up a symbol entry by name (returns found flag + entry index in table)
 func sym_lookup_entry(st: SymTable, name: string):
 
-    var idx_opt = map_get<string, i64>(st.name_map, name);
-    if is_some(idx_opt) do
-        out (true, unwrap<i64>(idx_opt))
+    i = 0;
+    when i < vec_len(st.entries) loop
+        entry = vec_get(st.entries, i);
+        if fat_str_eq(entry.name, name) do
+            out (true, i)
+        end
+        i = i + 1
     end
     out (false, -1)
 end.
@@ -540,7 +772,7 @@ func ownership_release_borrow(ctx: LowerCtx, table_name: string):
     end
     # Clear the borrower's borrow state
     borrower.borrow_kind = 0;
-    borrower.borrow_of_name = str_new("");
+    borrower.borrow_of_name = fat_str_new("");
     vec_set(ctx.symbols.entries, bidx, borrower);
     out ctx
 end.
@@ -579,7 +811,7 @@ func ownership_claim_stmt_borrow:
     i = vec_len(ctx.stmt_borrows) - 1;
     when i >= 0 loop
         rec = vec_get(ctx.stmt_borrows, i);
-        if rec.claimed == 0 and rec.kind == kind and str_eq(rec.target, target_name) do
+        if rec.claimed == 0 and rec.kind == kind and fat_str_eq(rec.target, target_name) do
             rec.claimed = 1;
             vec_set(ctx.stmt_borrows, i, rec);
             # Set borrower's back-link
@@ -626,27 +858,203 @@ func lower_expr_scratch(ctx: LowerCtx, expr: AstNode):
 
     if expr.node_type == AstType.LiteralInt do
         ctx = fresh_vreg(ctx);
-        r = ctx.scratch;
+        r = g_scratch_get();
         imm = expr.int_val;
-        instr = q_instr(QOp.Load, q_vreg(r), q_imm(imm), q_none());
-        ctx = emit_instr(ctx, instr);
+        ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, r, 0,
+                         0 + OperandType.Immediate, 0, imm, 0, 0, 0, 0);
         ctx.scratch = r;
+        g_scratch_set(r);
         out ctx
     end
 
     if expr.node_type == AstType.LiteralFloat do
         ctx = fresh_vreg(ctx);
-        r = ctx.scratch;
+        r = g_scratch_get();
         imm = expr.float_val as i64;
-        instr = q_instr(QOp.Load, q_vreg(r), q_imm(imm), q_none());
-        ctx = emit_instr(ctx, instr);
+        ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, r, 0,
+                         0 + OperandType.Immediate, 0, imm, 0, 0, 0, 0);
         ctx.scratch = r;
+        g_scratch_set(r);
+        out ctx
+    end
+
+    if expr.node_type == AstType.Identifier do
+        var (scope, idx) = sym_lookup_both(ctx, expr.name);
+        if scope < 0 do
+            ctx = lower_error(ctx, fat_str_concat(fat_str_new("undefined variable: "), expr.name));
+            ctx.scratch = -1;
+            g_scratch_set(0 - 1);
+            out ctx
+        end
+        if scope == 1 do
+            ctx = fresh_vreg(ctx);
+            rd = g_scratch_get();
+            ctx = emit_instr(ctx, q_instr(QOp.LoadGlobal, q_vreg(rd), q_imm(idx as i64), q_none()));
+            ctx.scratch = rd;
+            g_scratch_set(rd);
+            out ctx
+        end
+        ctx.scratch = idx;
+        g_scratch_set(idx);
+        out ctx
+    end
+
+    if expr.node_type == AstType.BinOp do
+        lhs_node = vec_get_rt(expr.children, 0);
+        rhs_node = vec_get_rt(expr.children, 1);
+        ctx = lower_expr_scratch(ctx, lhs_node);
+        lhs = g_scratch_get();
+        if lhs < 0 do
+            out ctx
+        end
+        ctx = lower_expr_scratch(ctx, rhs_node);
+        rhs = g_scratch_get();
+        if rhs < 0 do
+            out ctx
+        end
+        ctx = fresh_vreg(ctx);
+        rd = g_scratch_get();
+        op = 0 + QOp.Add;
+        if expr.op == OpType.Sub do
+            op = 0 + QOp.Sub
+        end
+        if expr.op == OpType.Mul do
+            op = 0 + QOp.Mul
+        end
+        if expr.op == OpType.Div do
+            op = 0 + QOp.Div
+        end
+        if expr.op == OpType.ModOp do
+            op = 0 + QOp.Mod
+        end
+        if expr.op == OpType.AndOp do
+            op = 0 + QOp.And
+        end
+        if expr.op == OpType.OrOp do
+            op = 0 + QOp.Or
+        end
+        if expr.op == OpType.XorOp do
+            op = 0 + QOp.Xor
+        end
+        if expr.op == OpType.ShlOp do
+            op = 0 + QOp.Shl
+        end
+        if expr.op == OpType.ShrOp do
+            op = 0 + QOp.Shr
+        end
+        ctx = emit_words(ctx, op, 0 + OperandType.VReg, rd, 0,
+                         0 + OperandType.VReg, lhs, 0,
+                         0 + OperandType.VReg, rhs, 0, 0);
+        ctx.scratch = rd;
+        g_scratch_set(rd);
+        out ctx
+    end
+
+    if expr.node_type == AstType.Compare do
+        lhs_node = vec_get_rt(expr.children, 0);
+        rhs_node = vec_get_rt(expr.children, 1);
+        ctx = lower_expr_scratch(ctx, lhs_node);
+        lhs = g_scratch_get();
+        if lhs < 0 do
+            out ctx
+        end
+        ctx = lower_expr_scratch(ctx, rhs_node);
+        rhs = g_scratch_get();
+        if rhs < 0 do
+            out ctx
+        end
+        ctx = fresh_vreg(ctx);
+        rd = g_scratch_get();
+
+        if expr.op == OpType.Ne do
+            ctx = fresh_vreg(ctx);
+            eq_r = g_scratch_get();
+            ctx = fresh_vreg(ctx);
+            one_r = g_scratch_get();
+            ctx = emit_words(ctx, 0 + QOp.CmpEq, 0 + OperandType.VReg, eq_r, 0,
+                             0 + OperandType.VReg, lhs, 0,
+                             0 + OperandType.VReg, rhs, 0, 0);
+            ctx = emit_words(ctx, 0 + QOp.Load, 0 + OperandType.VReg, one_r, 0,
+                             0 + OperandType.Immediate, 0, 1, 0, 0, 0, 0);
+            ctx = emit_words(ctx, 0 + QOp.Xor, 0 + OperandType.VReg, rd, 0,
+                             0 + OperandType.VReg, eq_r, 0,
+                             0 + OperandType.VReg, one_r, 0, 0);
+            ctx.scratch = rd;
+            g_scratch_set(rd);
+            out ctx
+        end
+
+        cmp_op = 0 + QOp.CmpEq;
+        if expr.op == OpType.Gt do
+            cmp_op = 0 + QOp.CmpGt
+        end
+        if expr.op == OpType.Lt do
+            cmp_op = 0 + QOp.CmpLt
+        end
+        if expr.op == OpType.Ge do
+            cmp_op = 0 + QOp.CmpGe
+        end
+        if expr.op == OpType.Le do
+            cmp_op = 0 + QOp.CmpLe
+        end
+        ctx = emit_words(ctx, cmp_op, 0 + OperandType.VReg, rd, 0,
+                         0 + OperandType.VReg, lhs, 0,
+                         0 + OperandType.VReg, rhs, 0, 0);
+        ctx.scratch = rd;
+        g_scratch_set(rd);
+        out ctx
+    end
+
+    if expr.node_type == AstType.Call do
+        fidx = find_func_index(ctx, expr.name);
+        if fidx < 0 do
+            ctx = lower_error(ctx, fat_str_concat(fat_str_new("undefined function: "), expr.name));
+            ctx = fresh_vreg(ctx);
+            rd = g_scratch_get();
+            ctx = emit_instr(ctx, q_instr(QOp.Load, q_vreg(rd), q_imm(0), q_none()));
+            ctx.scratch = rd;
+            g_scratch_set(rd);
+            out ctx
+        end
+
+        # Evaluate args into temps first (avoid nested-call R0 clobber).
+        arg_vregs = vec_new();
+        i = 0;
+        when i < vec_len_rt(expr.children) loop
+            arg_node = vec_get_rt(expr.children, i);
+            ctx = lower_expr_scratch(ctx, arg_node);
+            av = g_scratch_get();
+            if av < 0 do
+                out ctx
+            end
+            arg_vregs = vec_push(arg_vregs, av);
+            i = i + 1
+        end
+
+        # Move to R0..Rn
+        i = 0;
+        when i < vec_len(arg_vregs) loop
+            av = vec_get(arg_vregs, i);
+            ctx = emit_words(ctx, 0 + QOp.Move, 0 + OperandType.VReg, i as i64, 0,
+                             0 + OperandType.VReg, av, 0, 0, 0, 0, 0);
+            i = i + 1
+        end
+
+        ctx = emit_words(ctx, 0 + QOp.CallFunc, 0, 0, 0,
+                         0 + OperandType.FuncIdx, fidx as i64, 0, 0, 0, 0, 0);
+        ctx = fresh_vreg(ctx);
+        rd = g_scratch_get();
+        ctx = emit_words(ctx, 0 + QOp.Move, 0 + OperandType.VReg, rd, 0,
+                         0 + OperandType.VReg, 0, 0, 0, 0, 0, 0);
+        ctx.scratch = rd;
+        g_scratch_set(rd);
         out ctx
     end
 
     # Fallback: legacy tuple path for other expr kinds
     var (ctx2, val) = lower_expr(ctx, expr);
     ctx2.scratch = val;
+    g_scratch_set(val);
     out ctx2
 end.
 
@@ -654,7 +1062,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
 
     if expr.node_type == AstType.LiteralInt do
         ctx = fresh_vreg(ctx);
-        r = ctx.scratch;
+        r = g_scratch_get();
         imm = expr.int_val;
         instr = q_instr(QOp.Load, q_vreg(r), q_imm(imm), q_none());
         ctx = emit_instr(ctx, instr);
@@ -663,7 +1071,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
 
     if expr.node_type == AstType.LiteralFloat do
         ctx = fresh_vreg(ctx);
-        r = ctx.scratch;
+        r = g_scratch_get();
         imm = expr.float_val as i64;
         instr = q_instr(QOp.Load, q_vreg(r), q_imm(imm), q_none());
         ctx = emit_instr(ctx, instr);
@@ -682,7 +1090,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
     if expr.node_type == AstType.Identifier do
         var (scope, idx) = sym_lookup_both(ctx, expr.name);
         if scope < 0 do
-            ctx = lower_error(ctx, str_concat(str_new("undefined variable: "), expr.name));
+            ctx = lower_error(ctx, fat_str_concat(fat_str_new("undefined variable: "), expr.name));
             out (ctx, -1)
         end
         # §4.8: reject read of a moved value
@@ -691,7 +1099,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
             if efound do
                 ent = vec_get(ctx.symbols.entries, eidx);
                 if ent.is_moved == 1 do
-                    ctx = lower_error(ctx, str_concat(str_new("use of moved value: '"), str_concat(expr.name, str_new("'"))));
+                    ctx = lower_error(ctx, fat_str_concat(fat_str_new("use of moved value: '"), fat_str_concat(expr.name, fat_str_new("'"))));
                     out (ctx, -1)
                 end
             end
@@ -708,7 +1116,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
     # §4.8 AddrOf: &x (shared) / &mut x — borrow conflict check
     if expr.node_type == AstType.AddrOf do
         if vec_len_rt(expr.children) < 1 do
-            ctx = lower_error(ctx, str_new("borrow without operand"));
+            ctx = lower_error(ctx, fat_str_new("borrow without operand"));
             out (ctx, -1)
         end
         is_mut = expr.int_val;
@@ -718,22 +1126,22 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
             if efound do
                 ent = vec_get(ctx.symbols.entries, eidx);
                 if ent.is_moved == 1 do
-                    ctx = lower_error(ctx, str_concat(str_new("borrow of moved value: '"), str_concat(tgt.name, str_new("'"))));
+                    ctx = lower_error(ctx, fat_str_concat(fat_str_new("borrow of moved value: '"), fat_str_concat(tgt.name, fat_str_new("'"))));
                     out (ctx, -1)
                 end
                 if is_mut != 0 do
                     if ent.borrow_shared_count > 0 do
-                        ctx = lower_error(ctx, str_concat(str_new("cannot borrow '"), str_concat(tgt.name, str_new("' as mutable: already borrowed as shared"))));
+                        ctx = lower_error(ctx, fat_str_concat(fat_str_new("cannot borrow '"), fat_str_concat(tgt.name, fat_str_new("' as mutable: already borrowed as shared"))));
                         out (ctx, -1)
                     end
                     if ent.borrow_mut_count > 0 do
-                        ctx = lower_error(ctx, str_concat(str_new("cannot borrow '"), str_concat(tgt.name, str_new("' as mutable more than once"))));
+                        ctx = lower_error(ctx, fat_str_concat(fat_str_new("cannot borrow '"), fat_str_concat(tgt.name, fat_str_new("' as mutable more than once"))));
                         out (ctx, -1)
                     end
                     ent.borrow_mut_count = ent.borrow_mut_count + 1
                 else
                     if ent.borrow_mut_count > 0 do
-                        ctx = lower_error(ctx, str_concat(str_new("cannot borrow '"), str_concat(tgt.name, str_new("' as shared: already borrowed as mutable"))));
+                        ctx = lower_error(ctx, fat_str_concat(fat_str_new("cannot borrow '"), fat_str_concat(tgt.name, fat_str_new("' as shared: already borrowed as mutable"))));
                         out (ctx, -1)
                     end
                     ent.borrow_shared_count = ent.borrow_shared_count + 1
@@ -904,7 +1312,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
     if expr.node_type == AstType.Call do
         fidx = find_func_index(ctx, expr.name);
         if fidx < 0 do
-            ctx = lower_error(ctx, str_concat(str_new("undefined function: "), expr.name));
+            ctx = lower_error(ctx, fat_str_concat(fat_str_new("undefined function: "), expr.name));
             ctx2 = fresh_vreg(ctx);
             rd = ctx2.scratch;
             ctx2 = emit_instr(ctx2, q_instr(QOp.Load, q_vreg(rd), q_imm(0), q_none()));
@@ -912,7 +1320,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
         end
 
         # Evaluate arguments
-        arg_vregs = vec_new<int>()
+        arg_vregs = vec_new();
         i = 0;
         when i < vec_len_rt(expr.children) loop
             var (ctx2, av) = lower_expr(ctx, vec_get_rt(expr.children, i));
@@ -920,7 +1328,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
             if av < 0 do
                 out (ctx, -1)
             end
-            vec_push(arg_vregs, av);
+            arg_vregs = vec_push(arg_vregs, av);
             i = i + 1
         end
 
@@ -936,7 +1344,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
                 ai = 0;
                 when ai < vec_len_rt(expr.children) and found < 0 loop
                     child = vec_get_rt(expr.children, ai);
-                    if str_eq(child.name, pname) do
+                    if fat_str_eq(child.name, pname) do
                         found = ai
                     end
                     ai = ai + 1
@@ -1029,7 +1437,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
     if expr.node_type == AstType.IndexAccess do
         var (scope, arr_idx) = sym_lookup_both(ctx, expr.name);
         if scope < 0 do
-            ctx = lower_error(ctx, str_new("undefined variable for index"));
+            ctx = lower_error(ctx, fat_str_new("undefined variable for index"));
             out (ctx, -1)
         end
         arr_vreg = arr_idx;
@@ -1064,7 +1472,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
                     ctx2 = emit_instr(ctx2, q_instr(QOp.Load, q_vreg(r), q_imm(val), q_none()));
                     out (ctx2, r as i64)
                 end
-                ctx = lower_error(ctx, str_concat(str_new("unknown variant: "), expr.name));
+                ctx = lower_error(ctx, fat_str_concat(fat_str_new("unknown variant: "), expr.name));
                 out (ctx, -1)
             end
         end
@@ -1088,7 +1496,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
         end
 
         if offset < 0 do
-            ctx2 = lower_error(ctx2, str_concat(str_new("unknown field: "), expr.name));
+            ctx2 = lower_error(ctx2, fat_str_concat(fat_str_new("unknown field: "), expr.name));
             out (ctx2, -1)
         end
 
@@ -1104,7 +1512,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
     if expr.node_type == AstType.EntityLiteral do
         var (found, eidx) = find_entity_type(ctx, expr.name);
         if not found do
-            ctx = lower_error(ctx, str_concat(str_new("undefined entity: "), expr.name));
+            ctx = lower_error(ctx, fat_str_concat(fat_str_new("undefined entity: "), expr.name));
             out (ctx, -1)
         end
         et = vec_get(ctx.entity_types, eidx);
@@ -1136,7 +1544,7 @@ func lower_expr(ctx: LowerCtx, expr: AstNode):
         out (ctx3, ptr_r as i64)
     end
 
-    ctx = lower_error(ctx, str_new("unsupported expression type"));
+    ctx = lower_error(ctx, fat_str_new("unsupported expression type"));
     out (ctx, -1)
 end.
 # ═══════════════════════════════════════════════════════
@@ -1147,103 +1555,85 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
 
 
     if stmt.node_type == AstType.VarDecl or stmt.node_type == AstType.ConstDecl do
-        ctx2 = fresh_vreg(ctx);
-            r = ctx2.scratch;
-        ctx2.symbols = sym_define(ctx2.symbols, stmt.name, r);
+        ctx = fresh_vreg(ctx);
+        r = g_scratch_get();
+        ctx.symbols = sym_define(ctx.symbols, stmt.name, r);
         if vec_len_rt(stmt.children) > 0 do
             init = vec_get_rt(stmt.children, 0);
-            var (ctx3, val) = lower_expr(ctx2, init);
-            if val >= 0 and (val as u32) != r do
-                ctx3 = emit_instr(ctx3, q_instr(QOp.Move, q_vreg(r), q_vreg(val as i64), q_none()))
+            ctx = lower_expr_scratch(ctx, init);
+            val = g_scratch_get();
+            if val >= 0 and val != r do
+                ctx = emit_instr(ctx, q_instr(QOp.Move, q_vreg(r), q_vreg(val), q_none()))
             end
             # §4.1 sized-type narrowing — emit AND mask for u8/u16/u32/i8/i16/i32
             mask = 0;
-            if str_eq(stmt.name2, str_new("u8")) or str_eq(stmt.name2, str_new("i8")) do
+            if fat_cstr_eq(stmt.name2, "u8") or fat_cstr_eq(stmt.name2, "i8") do
                 mask = 255
             end
-            if str_eq(stmt.name2, str_new("u16")) or str_eq(stmt.name2, str_new("i16")) do
+            if fat_cstr_eq(stmt.name2, "u16") or fat_cstr_eq(stmt.name2, "i16") do
                 mask = 65535
             end
-            if str_eq(stmt.name2, str_new("u32")) or str_eq(stmt.name2, str_new("i32")) do
+            if fat_cstr_eq(stmt.name2, "u32") or fat_cstr_eq(stmt.name2, "i32") do
                 mask = 4294967295
             end
             if mask != 0 do
-                ctx4 = fresh_vreg(ctx3);
-            mr = ctx4.scratch;
-                ctx4 = emit_instr(ctx4, q_instr(QOp.Load, q_vreg(mr), q_imm(mask), q_none()));
-                ctx4 = emit_instr(ctx4, q_instr(QOp.And, q_vreg(r), q_vreg(r), q_vreg(mr)));
-                # §4.8: mark move type + claim borrow
-                if ast_produces_move_type(init) do
-                    var (ef, ei) = sym_lookup_entry(ctx4.symbols, stmt.name);
-                    if ef do
-                        e2 = vec_get(ctx4.symbols.entries, ei);
-                        e2.is_move_type = 1;
-                        vec_set(ctx4.symbols.entries, ei, e2)
-                    end
-                end
-                ctx4 = ownership_mark_moved_if_id(ctx4, init);
-                if init.node_type == AstType.AddrOf and vec_len_rt(init.children) > 0 do
-                    bk = 1;
-                    if init.int_val != 0 do
-                        bk = 2
-                    end
-                    ctx4 = ownership_claim_stmt_borrow(ctx4, stmt.name, vec_get_rt(init.children, 0).name, bk)
-                end
-                ctx4 = ownership_release_unclaimed(ctx4);
-                out ctx4
+                ctx = fresh_vreg(ctx);
+                mr = g_scratch_get();
+                ctx = emit_instr(ctx, q_instr(QOp.Load, q_vreg(mr), q_imm(mask), q_none()));
+                ctx = emit_instr(ctx, q_instr(QOp.And, q_vreg(r), q_vreg(r), q_vreg(mr)))
             end
-            # §4.8: mark move type + claim borrow (no mask path)
             if ast_produces_move_type(init) do
-                var (ef, ei) = sym_lookup_entry(ctx3.symbols, stmt.name);
+                var (ef, ei) = sym_lookup_entry(ctx.symbols, stmt.name);
                 if ef do
-                    e2 = vec_get(ctx3.symbols.entries, ei);
+                    e2 = vec_get(ctx.symbols.entries, ei);
                     e2.is_move_type = 1;
-                    vec_set(ctx3.symbols.entries, ei, e2)
+                    vec_set(ctx.symbols.entries, ei, e2)
                 end
             end
-            ctx3 = ownership_mark_moved_if_id(ctx3, init);
+            ctx = ownership_mark_moved_if_id(ctx, init);
             if init.node_type == AstType.AddrOf and vec_len_rt(init.children) > 0 do
                 bk = 1;
                 if init.int_val != 0 do
                     bk = 2
                 end
-                ctx3 = ownership_claim_stmt_borrow(ctx3, stmt.name, vec_get_rt(init.children, 0).name, bk)
+                ctx = ownership_claim_stmt_borrow(ctx, stmt.name, vec_get_rt(init.children, 0).name, bk)
             end
-            ctx3 = ownership_release_unclaimed(ctx3);
-            out ctx3
+            ctx = ownership_release_unclaimed(ctx);
+            out ctx
         else
-            ctx2 = emit_instr(ctx2, q_instr(QOp.Load, q_vreg(r), q_imm(0), q_none()));
-            out ctx2
+            ctx = emit_instr(ctx, q_instr(QOp.Load, q_vreg(r), q_imm(0), q_none()));
+            out ctx
         end
     end
 
     if stmt.node_type == AstType.Assign do
         var (scope, idx) = sym_lookup_both(ctx, stmt.name);
         if scope < 0 do
-            out lower_error(ctx, str_concat(str_new("assign to undefined: "), stmt.name))
+            out lower_error(ctx, fat_str_concat(fat_str_new("assign to undefined: "), stmt.name))
         end
         rhs = vec_get_rt(stmt.children, 0);
-        var (ctx2, val) = lower_expr(ctx, rhs);
+        ctx = lower_expr_scratch(ctx, rhs);
+        val = g_scratch_get();
         if val < 0 do
-            out ctx2
+            out ctx
         end
         if scope == 1 do
-            ctx2 = emit_instr(ctx2, q_instr(QOp.StoreGlobal, q_none(), q_imm(idx as i64), q_vreg(val as i64)))
+            ctx = emit_instr(ctx, q_instr(QOp.StoreGlobal, q_none(), q_imm(idx as i64), q_vreg(val)))
         else
-            if (val as u32) != idx do
-                ctx2 = emit_instr(ctx2, q_instr(QOp.Move, q_vreg(idx), q_vreg(val as i64), q_none()))
+            if val != idx do
+                ctx = emit_instr(ctx, q_instr(QOp.Move, q_vreg(idx), q_vreg(val), q_none()))
             end
         end
         # §4.8: release old borrow on LHS, track move, claim new borrow
-        ctx2 = ownership_release_borrow(ctx2, stmt.name);
+        ctx = ownership_release_borrow(ctx, stmt.name);
         if rhs.node_type != AstType.AddrOf do
-            ctx2 = ownership_mark_moved_if_id(ctx2, rhs);
+            ctx = ownership_mark_moved_if_id(ctx, rhs);
             if ast_produces_move_type(rhs) do
-                var (ef, ei) = sym_lookup_entry(ctx2.symbols, stmt.name);
+                var (ef, ei) = sym_lookup_entry(ctx.symbols, stmt.name);
                 if ef do
-                    e2 = vec_get(ctx2.symbols.entries, ei);
+                    e2 = vec_get(ctx.symbols.entries, ei);
                     e2.is_move_type = 1;
-                    vec_set(ctx2.symbols.entries, ei, e2)
+                    vec_set(ctx.symbols.entries, ei, e2)
                 end
             end
         else
@@ -1252,47 +1642,53 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
                 if rhs.int_val != 0 do
                     bk = 2
                 end
-                ctx2 = ownership_claim_stmt_borrow(ctx2, stmt.name, vec_get_rt(rhs.children, 0).name, bk)
+                ctx = ownership_claim_stmt_borrow(ctx, stmt.name, vec_get_rt(rhs.children, 0).name, bk)
             end
         end
         # Resurrect LHS (no longer moved)
-        var (ef2, ei2) = sym_lookup_entry(ctx2.symbols, stmt.name);
+        var (ef2, ei2) = sym_lookup_entry(ctx.symbols, stmt.name);
         if ef2 do
-            e3 = vec_get(ctx2.symbols.entries, ei2);
+            e3 = vec_get(ctx.symbols.entries, ei2);
             e3.is_moved = 0;
-            vec_set(ctx2.symbols.entries, ei2, e3)
+            vec_set(ctx.symbols.entries, ei2, e3)
         end
-        ctx2 = ownership_release_unclaimed(ctx2);
-        out ctx2
+        ctx = ownership_release_unclaimed(ctx);
+        out ctx
     end
 
     if stmt.node_type == AstType.IndexAssign do
         var (scope, arr_idx) = sym_lookup_both(ctx, stmt.name);
         if scope < 0 do
-            out lower_error(ctx, str_new("index assign to undefined variable"))
+            out lower_error(ctx, fat_str_new("index assign to undefined variable"))
         end
         arr_vreg = arr_idx;
         if scope == 1 do
-            ctx2 = fresh_vreg(ctx);
-            gv = ctx2.scratch;
-            ctx = ctx2;
+            ctx = fresh_vreg(ctx);
+            gv = g_scratch_get();
             ctx = emit_instr(ctx, q_instr(QOp.LoadGlobal, q_vreg(gv), q_imm(arr_idx as i64), q_none()));
             arr_vreg = gv
         end
-        var (ctx3, idx_v) = lower_expr(ctx, vec_get_rt(stmt.children, 0));
-        var (ctx4, val_v) = lower_expr(ctx3, vec_get_rt(stmt.children, 1));
+        idx_node = vec_get_rt(stmt.children, 0);
+        val_node = vec_get_rt(stmt.children, 1);
+        ctx = lower_expr_scratch(ctx, idx_node);
+        idx_v = g_scratch_get();
+        ctx = lower_expr_scratch(ctx, val_node);
+        val_v = g_scratch_get();
         if idx_v >= 0 and val_v >= 0 do
-            ctx4 = emit_instr(ctx4, q_instr(QOp.ArrSet, q_vreg(val_v as i64), q_vreg(arr_vreg), q_vreg(idx_v as i64)))
+            ctx = emit_instr(ctx, q_instr(QOp.ArrSet, q_vreg(val_v), q_vreg(arr_vreg), q_vreg(idx_v)))
         end
-        out ctx4
+        out ctx
     end
 
     if stmt.node_type == AstType.PrintStmt do
-        var (ctx2, val) = lower_expr(ctx, vec_get_rt(stmt.children, 0));
+        print_expr = vec_get_rt(stmt.children, 0);
+        ctx = lower_expr_scratch(ctx, print_expr);
+        val = g_scratch_get();
         if val >= 0 do
-            ctx2 = emit_instr(ctx2, q_instr(QOp.Print, q_none(), q_vreg(val as i64), q_none()))
+            ctx = emit_words(ctx, 0 + QOp.Print, 0, 0, 0,
+                             0 + OperandType.VReg, val, 0, 0, 0, 0, 0)
         end
-        out ctx2
+        out ctx
     end
 
     if stmt.node_type == AstType.ReturnStmt do
@@ -1300,50 +1696,53 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
             # Avoid entity-tuple returns from lower_expr under C-core.
             ret_expr = vec_get_rt(stmt.children, 0);
             ctx = lower_expr_scratch(ctx, ret_expr);
-            val = ctx.scratch;
+            val = g_scratch_get();
             if val >= 0 do
-                ret_i = q_instr(QOp.Ret, q_none(), q_vreg(val), q_none());
-                ctx = emit_instr(ctx, ret_i)
+                ctx = emit_words(ctx, 0 + QOp.Ret, 0, 0, 0,
+                                 0 + OperandType.VReg, val, 0, 0, 0, 0, 0)
             end
             out ctx
         else
-            ret_i = q_instr(QOp.Ret, q_none(), q_none(), q_none());
-            ctx = emit_instr(ctx, ret_i);
+            ctx = emit_words(ctx, 0 + QOp.Ret, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
             out ctx
         end
     end
 
     if stmt.node_type == AstType.IfStmt do
-        var (ctx2, cond_r) = lower_expr(ctx, vec_get_rt(stmt.children, 0));
+        cond_node = vec_get_rt(stmt.children, 0);
+        ctx = lower_expr_scratch(ctx, cond_node);
+        cond_r = g_scratch_get();
         if cond_r < 0 do
-            out ctx2
+            out ctx
         end
-        ctx3 = fresh_label(ctx2);
-            else_lbl = ctx3.scratch;
-        ctx4 = fresh_label(ctx3);
-            end_lbl = ctx4.scratch;
+        ctx = fresh_label(ctx);
+        else_lbl = g_scratch_get();
+        ctx = fresh_label(ctx);
+        end_lbl = g_scratch_get();
 
-        ctx4 = emit_instr(ctx4, q_instr(QOp.JumpIfNot, q_none(), q_vreg(cond_r as i64), q_label(else_lbl)));
+        ctx = emit_words(ctx, 0 + QOp.JumpIfNot, 0, 0, 0,
+                         0 + OperandType.VReg, cond_r, 0,
+                         0 + OperandType.LabelRef, else_lbl, 0, 0);
 
         # Then block
-        ctx4 = lower_stmt(ctx4, vec_get_rt(stmt.children, 1));
+        ctx = lower_stmt(ctx, vec_get_rt(stmt.children, 1));
 
         if vec_len_rt(stmt.children) > 2 do
-            ctx4 = emit_instr(ctx4, q_instr(QOp.Jump, q_none(), q_label(end_lbl), q_none()))
+            ctx = emit_words(ctx, 0 + QOp.Jump, 0, 0, 0,
+                             0 + OperandType.LabelRef, end_lbl, 0, 0, 0, 0, 0)
         end
 
-        # Else label
-        lbl = q_instr(QOp.Label, q_none(), q_none(), q_none());
-        lbl.patch_id = else_lbl;
-        ctx4 = emit_instr(ctx4, lbl);
+        # Else label — id in dest.vreg
+        ctx = emit_words(ctx, 0 + QOp.Label, 0 + OperandType.VReg, else_lbl, 0,
+                         0, 0, 0, 0, 0, 0, 0);
 
         # Else block
         if vec_len_rt(stmt.children) > 2 do
-            ctx4 = lower_stmt(ctx4, vec_get_rt(stmt.children, 2));
-            lbl.patch_id = end_lbl;
-            ctx4 = emit_instr(ctx4, lbl)
+            ctx = lower_stmt(ctx, vec_get_rt(stmt.children, 2));
+            ctx = emit_words(ctx, 0 + QOp.Label, 0 + OperandType.VReg, end_lbl, 0,
+                             0, 0, 0, 0, 0, 0, 0)
         end
-        out ctx4
+        out ctx
     end
 
     if stmt.node_type == AstType.WhileStmt do
@@ -1352,9 +1751,7 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
         ctx3 = fresh_label(ctx2);
             end_lbl = ctx3.scratch;
 
-        lbl = q_instr(QOp.Label, q_none(), q_none(), q_none());
-        lbl.patch_id = loop_lbl;
-        ctx3 = emit_instr(ctx3, lbl);
+        ctx3 = emit_instr(ctx3, q_instr(QOp.Label, q_vreg(loop_lbl), q_none(), q_none()));
 
         var (ctx4, cond_r) = lower_expr(ctx3, vec_get_rt(stmt.children, 0));
         if cond_r < 0 do
@@ -1373,8 +1770,7 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
 
         ctx4 = emit_instr(ctx4, q_instr(QOp.Jump, q_none(), q_label(loop_lbl), q_none()));
 
-        lbl.patch_id = end_lbl;
-        ctx4 = emit_instr(ctx4, lbl);
+        ctx4 = emit_instr(ctx4, q_instr(QOp.Label, q_vreg(end_lbl), q_none(), q_none()));
         out ctx4
     end
 
@@ -1490,7 +1886,7 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
 
     if stmt.node_type == AstType.BreakStmt do
         if ctx.loop_depth == 0 do
-            out lower_error(ctx, str_new("break outside of loop"))
+            out lower_error(ctx, fat_str_new("break outside of loop"))
         end
         end_lbl = vec_get(ctx.loop_end_labels, (ctx.loop_depth - 1) as i64);
         ctx = emit_instr(ctx, q_instr(QOp.Jump, q_none(), q_label(end_lbl), q_none()));
@@ -1499,7 +1895,7 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
 
     if stmt.node_type == AstType.ContinueStmt do
         if ctx.loop_depth == 0 do
-            out lower_error(ctx, str_new("continue outside of loop"))
+            out lower_error(ctx, fat_str_new("continue outside of loop"))
         end
         start_lbl = vec_get(ctx.loop_start_labels, (ctx.loop_depth - 1) as i64);
         ctx = emit_instr(ctx, q_instr(QOp.Jump, q_none(), q_label(start_lbl), q_none()));
@@ -1535,7 +1931,7 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
     if stmt.node_type == AstType.FieldAssign do
         var (scope, idx) = sym_lookup_both(ctx, stmt.name);
         if scope < 0 do
-            out lower_error(ctx, str_concat(str_new("field assign to undefined: "), stmt.name))
+            out lower_error(ctx, fat_str_concat(fat_str_new("field assign to undefined: "), stmt.name))
         end
         base_vreg = idx;
         if scope == 1 do
@@ -1558,7 +1954,7 @@ func lower_stmt(ctx: LowerCtx, stmt: AstNode):
             j = j + 1
         end
         if offset < 0 do
-            out lower_error(ctx, str_concat(str_new("unknown field: "), stmt.name2))
+            out lower_error(ctx, fat_str_concat(fat_str_new("unknown field: "), stmt.name2))
         end
 
         var (ctx3, val_r) = lower_expr(ctx, vec_get_rt(stmt.children, 0));
@@ -1645,11 +2041,18 @@ end.
 # Function Lowering
 # ═══════════════════════════════════════════════════════
 
-func lower_func_def(ctx: LowerCtx, func_def: AstNode):
+func lower_func_def_at(ctx: LowerCtx, func_def: AstNode, fidx: int):
 
-    ctx.prog = q_module_add_func(ctx.prog, func_def.name);
-    fidx = vec_len(ctx.prog.functions) - 1;
+    if fidx < 0 or fidx >= g_nfuncs_get() do
+        ctx = lower_error(ctx, fat_str_new("bad function index"));
+        out ctx
+    end
     ctx.current_func_idx = fidx;
+    g_cur_set(fidx);
+    # Each function remaps params to X0..Xn; reset vreg allocator.
+    ctx.next_vreg = 0;
+    g_vreg_set(0);
+    ctx.label_counter = 0;
 
     # Save local scope
     saved_syms = ctx.symbols;
@@ -1677,18 +2080,16 @@ func lower_func_def(ctx: LowerCtx, func_def: AstNode):
     i = 0;
     when i < body_idx loop
         param = vec_get_rt(func_def.children, i);
-        if param.node_type == AstType.Identifier do
-            ctx3 = fresh_vreg(ctx);
-            pr = ctx3.scratch;
-            ctx = ctx3;
+        if param.node_type == AstType.Identifier or param.node_type == AstType.RefParam do
+            ctx = fresh_vreg(ctx);
+            pr = g_scratch_get();
             ctx.symbols = sym_define(ctx.symbols, param.name, pr);
             # §6.4 — record param name on QFunction for named-arg reorder
-            cf = vec_get(ctx.prog.functions, fidx);
-            vec_push(cf.param_names, param.name);
-            cf.param_count = cf.param_count + 1;
-            vec_set(ctx.prog.functions, fidx, cf)
+            # Soft QFunction mutation is best-effort under C-core; skip if unsafe.
+            i = i + 1
+        else
+            i = i + 1
         end
-        i = i + 1
     end
 
     has_epilogue = ensure_node_idx >= 0 or revert_node_idx >= 0;
@@ -1749,6 +2150,7 @@ func lower_func_def(ctx: LowerCtx, func_def: AstNode):
     # Restore scope
     ctx.symbols = saved_syms;
     ctx.current_func_idx = -1;
+    g_cur_set(0 - 1);
     out ctx
 end.
 # ═══════════════════════════════════════════════════════
@@ -1757,16 +2159,35 @@ end.
 
 func vir_lower_program(ctx: LowerCtx, program: AstNode):
 
-    # Single-pass lower: register each FuncDef and lower its body.
-    # (Two-pass name registration used to double-add via lower_func_def.)
+    # Pass 1: register all FuncDef names so Call can resolve forward refs.
     i = 0;
     when i < vec_len_rt(program.children) loop
         child = vec_get_rt(program.children, i);
         if child.node_type == AstType.FuncDef do
-            ctx = lower_func_def(ctx, child);
+            ctx.prog = q_module_add_func(ctx.prog, child.name);
+            fi = g_nfuncs_get();
+            if fi < G_MAX_FUNCS do
+                # Own a stable copy of the name fat-string.
+                g_name_set(fi, fat_str_concat(child.name, fat_str_new("")));
+                g_body_set(fi, vec_new_rt());
+                g_nfuncs_set(fi + 1)
+            end
         end
         i = i + 1
     end
+
+    # Pass 2: lower bodies by registration index (avoid soft name lookup).
+    fi = 0;
+    i = 0;
+    when i < vec_len_rt(program.children) loop
+        child = vec_get_rt(program.children, i);
+        if child.node_type == AstType.FuncDef do
+            ctx = lower_func_def_at(ctx, child, fi);
+            fi = fi + 1
+        end
+        i = i + 1
+    end
+    ctx.error_count = g_err_get();
     out ctx
 end.
 func is_metadata(t: AstType):
@@ -2069,4 +2490,8 @@ end.
 
 export LowerCtx, QModule, QOp, QFunction, QInstr, OperandType, lower_ctx_new,
        lower_program, vir_lower_program, optimize_module,
+       func_body_len, func_body_instr, func_count, func_name_at,
+       func_instr_op, func_instr_d_ty, func_instr_d_vr, func_instr_d_im,
+       func_instr_s1_ty, func_instr_s1_vr, func_instr_s1_im,
+       func_instr_s2_ty, func_instr_s2_vr, func_instr_s2_im, func_instr_patch,
        tco_pass, regalloc_linear_scan, compute_liveness;
