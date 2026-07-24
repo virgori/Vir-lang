@@ -17655,7 +17655,7 @@ end.
 # bootstrap path. We project it into parallel MIR then LIR opcode
 # tables (heap i64 arrays) so Phase 8 is real and countable — without
 # MirFunc/LirInstr entity field stores (unreliable on the C-VM).
-# Prefer LIR-table Mach-O emit (multifn + flat).
+# Prefer LIR-table Mach-O emit (multifn + flat) after flat const-fold/DCE.
 # Fall back to Q body-dump only when Call lacks bd metadata / PrintStr lacks pool.
 # ═══════════════════════════════════════════════════════
 
@@ -17671,6 +17671,8 @@ var g_mir_s2v = 0;
 var g_mir_di = 0;    # dest imm (SetArg ABI index; Call unused)
 var g_lir_opc = 0;
 var g_phase8_lir_emit = 0;  # 1 if Mach-O body came from LIR tables
+var g_phase8_fold_n = 0;
+var g_phase8_nop_n = 0;
 
 # MirOp codes (flat ints; keep stable for diagnostics)
 # 0 Nop 1 Move 2 Load 3 Store 4 Add 5 Sub 6 Mul 7 Div
@@ -17830,6 +17832,192 @@ func boot_build_mir_from_staging:
     out g_mir_n
 end.
 
+
+
+# ── Phase-8 flat MIR opt (C-VM safe; nop-in-place, no stream compact) ──
+
+func boot_mir_project_lir:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    boot_mir_tables_ensure();
+    var k = 0;
+    when k < g_mir_n loop
+        let mop3 = native_read_i64(g_mir_opc, k * 8);
+        let lop = mir_opc_to_lir_opc(mop3);
+        native_write_i64(g_lir_opc, k * 8, lop);
+        k = k + 1
+    end
+    g_lir_n = g_mir_n;
+end.
+
+func boot_mir_nop_at:
+    in(ix: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    native_write_i64(g_mir_opc, ix * 8, 0);
+    native_write_i64(g_mir_qopc, ix * 8, 0);
+    native_write_i64(g_mir_dst, ix * 8, 0);
+    native_write_i64(g_mir_s1t, ix * 8, 0);
+    native_write_i64(g_mir_s1v, ix * 8, 0);
+    native_write_i64(g_mir_s1i, ix * 8, 0);
+    native_write_i64(g_mir_s2v, ix * 8, 0);
+    native_write_i64(g_mir_di, ix * 8, 0);
+    g_phase8_nop_n = g_phase8_nop_n + 1;
+end.
+
+func boot_mir_rewrite_load_imm:
+    in(ix: int)
+    # Uses g_cg_imm = value, g_cg_rd = dst vreg (stash to avoid multi-arg).
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    let dv = g_cg_rd;
+    let immv = g_cg_imm;
+    native_write_i64(g_mir_opc, ix * 8, 2);
+    native_write_i64(g_mir_qopc, ix * 8, 1);
+    native_write_i64(g_mir_dst, ix * 8, dv);
+    native_write_i64(g_mir_s1t, ix * 8, 2);
+    native_write_i64(g_mir_s1v, ix * 8, 0);
+    native_write_i64(g_mir_s1i, ix * 8, immv);
+    native_write_i64(g_mir_s2v, ix * 8, 0);
+    g_phase8_fold_n = g_phase8_fold_n + 1;
+end.
+
+func boot_mir_flat_const_fold:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_vreg_tab == 0 do
+        g_boot_vreg_tab = heap_alloc(256);
+    end
+    let zi = 0;
+    when zi < 32 loop
+        native_write_i64(g_boot_vreg_tab, zi * 8, 0);
+        zi = zi + 1
+    end
+
+    var i = 0;
+    when i < g_mir_n loop
+        let qopc = native_read_i64(g_mir_qopc, i * 8);
+        let d_v = native_read_i64(g_mir_dst, i * 8);
+        let s1t = native_read_i64(g_mir_s1t, i * 8);
+        let s1v = native_read_i64(g_mir_s1v, i * 8);
+        let s1i = native_read_i64(g_mir_s1i, i * 8);
+        let s2v = native_read_i64(g_mir_s2v, i * 8);
+
+        # Call clobbers — drop known consts
+        if qopc == 34 do
+            let z = 0;
+            when z < 32 loop
+                native_write_i64(g_boot_vreg_tab, z * 8, 0);
+                z = z + 1
+            end
+        end
+
+        # Load / Move → track consts; strengthen to Load imm when src known
+        if qopc == 1 or qopc == 2 do
+            if d_v >= 0 and d_v < 32 do
+                if s1t == 2 do
+                    native_write_i64(g_boot_vreg_tab, d_v * 8, s1i + 1);
+                    if qopc == 2 do
+                        g_cg_rd = d_v;
+                        g_cg_imm = s1i;
+                        boot_mir_rewrite_load_imm(i)
+                    end
+                else
+                    if s1v >= 0 and s1v < 32 do
+                        let raw = native_read_i64(g_boot_vreg_tab, s1v * 8);
+                        if raw != 0 do
+                            native_write_i64(g_boot_vreg_tab, d_v * 8, raw);
+                            g_cg_rd = d_v;
+                            g_cg_imm = raw - 1;
+                            boot_mir_rewrite_load_imm(i)
+                        end
+                    end
+                end
+            end
+        end
+
+        # Binops → Load imm when both sides const
+        if qopc == 3 or qopc == 4 or qopc == 5 or qopc == 6 or qopc == 7 do
+            if d_v >= 0 and d_v < 32 do
+                var av = 0 - 1;
+                var bv = 0 - 1;
+                if s1t == 2 do
+                    av = s1i
+                else
+                    if s1v >= 0 and s1v < 32 do
+                        let ra = native_read_i64(g_boot_vreg_tab, s1v * 8);
+                        if ra != 0 do
+                            av = ra - 1
+                        end
+                    end
+                end
+                if s2v >= 0 and s2v < 32 do
+                    let rb = native_read_i64(g_boot_vreg_tab, s2v * 8);
+                    if rb != 0 do
+                        bv = rb - 1
+                    end
+                end
+                if av >= 0 and bv >= 0 do
+                    var rv = 0 - 1;
+                    if qopc == 3 do
+                        rv = av + bv
+                    end
+                    if qopc == 4 do
+                        rv = av - bv
+                    end
+                    if qopc == 5 do
+                        rv = av * bv
+                    end
+                    if qopc == 6 do
+                        if bv != 0 do
+                            rv = av / bv
+                        end
+                    end
+                    if qopc == 7 do
+                        if bv != 0 do
+                            rv = av - (av / bv) * bv
+                        end
+                    end
+                    if rv >= 0 do
+                        native_write_i64(g_boot_vreg_tab, d_v * 8, rv + 1);
+                        g_cg_rd = d_v;
+                        g_cg_imm = rv;
+                        boot_mir_rewrite_load_imm(i)
+                    end
+                end
+            end
+        end
+
+        i = i + 1
+    end
+end.
+
+func boot_mir_flat_dce_nop:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    var i = 0;
+    when i < g_mir_n loop
+        let qopc = native_read_i64(g_mir_qopc, i * 8);
+        # Identity Move vreg→same vreg
+        if qopc == 2 do
+            let d_v = native_read_i64(g_mir_dst, i * 8);
+            let s1t = native_read_i64(g_mir_s1t, i * 8);
+            let s1v = native_read_i64(g_mir_s1v, i * 8);
+            if s1t == 1 and d_v == s1v do
+                boot_mir_nop_at(i)
+            end
+        end
+        # Load imm 0 into unused pattern — skip (too aggressive)
+        # Redundant Load imm after fold: if instr already Nop (qopc 0), leave it
+        i = i + 1
+    end
+end.
+
+func boot_mir_flat_opt:
+    g_phase8_fold_n = 0;
+    g_phase8_nop_n = 0;
+    boot_mir_flat_const_fold();
+    boot_mir_flat_dce_nop();
+    boot_mir_project_lir();
+    print_ln("virc: phase8 — flat opt done");
+end.
 
 func boot_lir_stream_has_call:
     extern func native_read_i64(addr: int, offset: int) -> int;
@@ -18246,6 +18434,7 @@ func boot_phase8_mir_lir_gate:
         print_ln("virc: phase8 warn — MIR/LIR empty; Q emit continues");
         out 0
     end
+    boot_mir_flat_opt();
     print_ln("virc: phase8 — MIR/LIR tables ready");
     out n
 end.
