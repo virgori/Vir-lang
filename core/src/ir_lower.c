@@ -262,7 +262,6 @@ static int is_soft_call_name(const char *name) {
       strcmp(name, "eq") == 0 || strcmp(name, "char_to_str") == 0 ||
       strcmp(name, "out") == 0 || strcmp(name, "vec_set_at") == 0 ||
       strcmp(name, "str_from_i64") == 0 ||
-      strcmp(name, "optimize_module") == 0 ||
       strcmp(name, "codebuf_get_data") == 0 ||
       strcmp(name, "read_u32") == 0 || strcmp(name, "patch_u32") == 0 ||
       strcmp(name, "patch_i32") == 0 || strcmp(name, "eprintln") == 0 ||
@@ -932,9 +931,12 @@ static int record_field_offset_for_expr(lower_ctx_t *ctx,
 
   record_type_t *typed_rt = record_type_for_expr(ctx, base_expr, NULL);
   if (typed_rt) {
-    if (out_rt)
-      *out_rt = typed_rt;
-    return record_field_offset(typed_rt, field);
+    int off = record_field_offset(typed_rt, field);
+    if (off >= 0) {
+      if (out_rt)
+        *out_rt = typed_rt;
+      return off;
+    }
   }
 
   for (uint32_t i = 0; i < ctx->record_type_count; i++) {
@@ -945,6 +947,13 @@ static int record_field_offset_for_expr(lower_ctx_t *ctx,
       return off;
     }
   }
+  /* Soft layout for string-like runtime blobs (str_from_cstr): */
+  if (strcmp(field, "data") == 0)
+    return 0;
+  if (strcmp(field, "byte_len") == 0 || strcmp(field, "len") == 0)
+    return 8;
+  if (strcmp(field, "char_len") == 0 || strcmp(field, "cap") == 0)
+    return 16;
   return -1;
 }
 
@@ -968,9 +977,12 @@ static int record_field_offset_for_symbol(lower_ctx_t *ctx,
 
   record_type_t *typed_rt = record_type_for_symbol(ctx, symbol_name, NULL);
   if (typed_rt) {
-    if (out_rt)
-      *out_rt = typed_rt;
-    return record_field_offset(typed_rt, field);
+    int off = record_field_offset(typed_rt, field);
+    if (off >= 0) {
+      if (out_rt)
+        *out_rt = typed_rt;
+      return off;
+    }
   }
 
   for (uint32_t i = 0; i < ctx->record_type_count; i++) {
@@ -981,6 +993,12 @@ static int record_field_offset_for_symbol(lower_ctx_t *ctx,
       return off;
     }
   }
+  if (strcmp(field, "data") == 0)
+    return 0;
+  if (strcmp(field, "byte_len") == 0 || strcmp(field, "len") == 0)
+    return 8;
+  if (strcmp(field, "char_len") == 0 || strcmp(field, "cap") == 0)
+    return 16;
   return -1;
 }
 
@@ -1602,6 +1620,47 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       {
         record_type_t *rt = find_record_type(ctx, expr->name);
         if (rt) {
+          /* Enum variant records (Ok/Err/Some/None…): layout is
+           *   [0]=tag discriminant, [8]=payload
+           * so `Ok(x)` stores tag then x — matching case-arm binding. */
+          int64_t variant_tag = -1;
+          for (uint32_t ei = 0; ei < ctx->enum_type_count; ei++) {
+            int64_t v = enum_lookup_variant(&ctx->enum_types[ei], expr->name);
+            if (v >= 0) {
+              variant_tag = v;
+              break;
+            }
+          }
+          if (variant_tag >= 0 && rt->field_count >= 2 &&
+              strcmp(rt->fields[0].name, "tag") == 0) {
+            uint32_t sz_r = fresh_vreg(ctx);
+            uint32_t ptr_r = fresh_vreg(ctx);
+            emit(ctx, q_instr(Q_LOAD, q_vreg(sz_r), q_imm(16), q_none()));
+            emit(ctx, q_instr(Q_ALLOC, q_vreg(ptr_r), q_vreg(sz_r), q_none()));
+            uint32_t tag_r = fresh_vreg(ctx);
+            uint32_t off0 = fresh_vreg(ctx);
+            emit(ctx, q_instr(Q_LOAD, q_vreg(tag_r), q_imm(variant_tag),
+                              q_none()));
+            emit(ctx, q_instr(Q_LOAD, q_vreg(off0), q_imm(0), q_none()));
+            emit(ctx, q_instr(Q_STORE_WORD, q_vreg(tag_r), q_vreg(ptr_r),
+                              q_vreg(off0)));
+            if (expr->child_count > 0) {
+              const ast_node_t *payload = expr->children[0];
+              if (payload && payload->type == AST_NAMED_ARG &&
+                  payload->child_count > 0)
+                payload = payload->children[0];
+              if (payload) {
+                int val = lower_expr(ctx, payload);
+                if (val >= 0) {
+                  uint32_t off8 = fresh_vreg(ctx);
+                  emit(ctx, q_instr(Q_LOAD, q_vreg(off8), q_imm(8), q_none()));
+                  emit(ctx, q_instr(Q_STORE_WORD, q_vreg((uint32_t)val),
+                                    q_vreg(ptr_r), q_vreg(off8)));
+                }
+              }
+            }
+            return (int)ptr_r;
+          }
           /* Allocate field_count * 8 bytes */
           uint32_t sz_r = fresh_vreg(ctx);
           uint32_t ptr_r = fresh_vreg(ctx);
@@ -1726,6 +1785,77 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
           emit(ctx, q_instr(Q_STORE_BYTE, q_vreg((uint32_t)val),
                             q_vreg((uint32_t)base), q_vreg((uint32_t)off)));
           return val;
+        }
+        /* stdlib file.vri: native_file_open(data, len, FileMode) → Q_FILE_OPEN.
+         * Path bytes are treated as a C string (callers pass null-terminated
+         * data from get_arg / str_from_cstr). FileMode ints are accepted by VM. */
+        if (strcmp(expr->name, "native_file_open") == 0 &&
+            expr->child_count >= 2) {
+          int data = lower_expr(ctx, expr->children[0]);
+          int mode = -1;
+          if (expr->child_count >= 3)
+            mode = lower_expr(ctx, expr->children[2]);
+          else
+            mode = lower_expr(ctx, expr->children[1]);
+          if (data < 0 || mode < 0)
+            return -1;
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_FILE_OPEN, q_vreg(rd), q_vreg((uint32_t)data),
+                            q_vreg((uint32_t)mode)));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "native_file_close") == 0 &&
+            expr->child_count >= 1) {
+          int fd = lower_expr(ctx, expr->children[0]);
+          if (fd < 0)
+            return -1;
+          emit(ctx,
+               q_instr(Q_FILE_CLOSE, q_none(), q_vreg((uint32_t)fd), q_none()));
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_LOAD, q_vreg(rd), q_imm(0), q_none()));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "native_file_read") == 0 &&
+            expr->child_count >= 3) {
+          /* fread into caller buffer; return byte count via intrinsic-style
+           * soft path: reuse Q_FILE_READ only for whole-file reads. For the
+           * buffered API, emit a host call through sys_read when fd is int,
+           * else fopen FILE* via a small inline sequence is not available —
+           * map FILE* read to fread through Q_INTRINSIC sys_read is wrong.
+           * Use soft: allocate result via FILE_READ when buf is ignored… */
+          int fd = lower_expr(ctx, expr->children[0]);
+          int buf = lower_expr(ctx, expr->children[1]);
+          int len = lower_expr(ctx, expr->children[2]);
+          if (fd < 0 || buf < 0 || len < 0)
+            return -1;
+          /* Move args into R0..R2 and dispatch VIR_INTR_SYS_READ-like host
+           * fread via intrinsic ID — registered as native_file_read name
+           * table entry; emit Q_INTRINSIC with id matching table slot 32. */
+          emit(ctx, q_instr(Q_MOVE, q_vreg(0), q_vreg((uint32_t)fd), q_none()));
+          emit(ctx, q_instr(Q_MOVE, q_vreg(1), q_vreg((uint32_t)buf), q_none()));
+          emit(ctx, q_instr(Q_MOVE, q_vreg(2), q_vreg((uint32_t)len), q_none()));
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_INTRINSIC, q_vreg(rd), q_imm(33), q_imm(3)));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "native_file_write") == 0 &&
+            expr->child_count >= 3) {
+          int fd = lower_expr(ctx, expr->children[0]);
+          int buf = lower_expr(ctx, expr->children[1]);
+          int len = lower_expr(ctx, expr->children[2]);
+          if (fd < 0 || buf < 0 || len < 0)
+            return -1;
+          emit(ctx, q_instr(Q_MOVE, q_vreg(0), q_vreg((uint32_t)fd), q_none()));
+          emit(ctx, q_instr(Q_MOVE, q_vreg(1), q_vreg((uint32_t)buf), q_none()));
+          emit(ctx, q_instr(Q_MOVE, q_vreg(2), q_vreg((uint32_t)len), q_none()));
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_INTRINSIC, q_vreg(rd), q_imm(34), q_imm(3)));
+          return (int)rd;
+        }
+        if (strcmp(expr->name, "native_errno") == 0) {
+          uint32_t rd = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_INTRINSIC, q_vreg(rd), q_imm(35), q_imm(0)));
+          return (int)rd;
         }
         if (strcmp(expr->name, "native_load") == 0 && expr->child_count >= 2) {
           int base = lower_expr(ctx, expr->children[0]);
@@ -4422,14 +4552,18 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
       ev->name[AST_NAME_LEN - 1] = '\0';
       ev->value = v->int_val;
 
-      /* Automatically register this variant as a RECORD type with 1 field (payload) */
+      /* Automatically register this variant as a RECORD type with tag+payload.
+       * Layout: [0]=discriminant (variant value), [8]=payload. */
       if (ctx->record_type_count < RECORD_MAX_TYPES) {
         record_type_t *rt = &ctx->record_types[ctx->record_type_count++];
         strncpy(rt->name, v->name, AST_NAME_LEN - 1);
-        rt->field_count = 1;
-        strncpy(rt->fields[0].name, "value", AST_NAME_LEN - 1);
+        rt->field_count = 2;
+        strncpy(rt->fields[0].name, "tag", AST_NAME_LEN - 1);
         rt->fields[0].type_name[0] = '\0';
         rt->fields[0].offset = 0;
+        strncpy(rt->fields[1].name, "value", AST_NAME_LEN - 1);
+        rt->fields[1].type_name[0] = '\0';
+        rt->fields[1].offset = 8;
       }
     }
     return 0;
@@ -4824,7 +4958,20 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
             }
           }
           if (found_val >= 0) {
-            pat_val = found_val;
+            /* Tagged union: compare discriminant at offset 0. */
+            uint32_t off_r = fresh_vreg(ctx);
+            uint32_t tag_r = fresh_vreg(ctx);
+            uint32_t pat_r = fresh_vreg(ctx);
+            emit(ctx, q_instr(Q_LOAD, q_vreg(off_r), q_imm(0), q_none()));
+            emit(ctx, q_instr(Q_LOAD_WORD, q_vreg(tag_r),
+                              q_vreg((uint32_t)subject), q_vreg(off_r)));
+            emit(ctx, q_instr(Q_LOAD, q_vreg(pat_r), q_imm(found_val),
+                              q_none()));
+            emit(ctx, q_instr(Q_CMP_EQ, q_vreg(cmp_r), q_vreg(tag_r),
+                              q_vreg(pat_r)));
+            emit(ctx, q_instr(Q_JUMP_IF, q_none(), q_vreg(cmp_r),
+                              q_label(arm_labels[i])));
+            continue;
           } else {
             uint32_t idx;
             if (sym_lookup_both(ctx, arm->name, &idx) >= 0) {
@@ -4874,11 +5021,14 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
       *saved_syms = ctx->symbols;
 
       if (arm->name2[0] != '\0') {
-        /* Bind the payload variable to the subject vreg.
-         * In the C-core IR, tagged union values (e.g. Some(v)) are modelled
-         * as bare integers — the payload IS the subject itself.
-         * We alias name2 → subject so the arm body can reference it. */
-        sym_define(&ctx->symbols, arm->name2, (uint32_t)subject, VIR_TYPE_I64);
+        /* Bind payload variable: load value field at offset 8 from tagged
+         * union (layout [tag|value]). Fallback: alias subject for bare ints. */
+        uint32_t off_r = fresh_vreg(ctx);
+        uint32_t payload_r = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_LOAD, q_vreg(off_r), q_imm(8), q_none()));
+        emit(ctx, q_instr(Q_LOAD_WORD, q_vreg(payload_r),
+                          q_vreg((uint32_t)subject), q_vreg(off_r)));
+        sym_define(&ctx->symbols, arm->name2, payload_r, VIR_TYPE_I64);
       }
 
       /* Lower body — support multi-statement arms. */
@@ -5028,14 +5178,23 @@ int lower_func_def(lower_ctx_t *ctx, const ast_node_t *func_def) {
 
   ctx->pipeline_label_base = 0;
 
-  /* Lower the body — mandatory HIR → MIR → LIR → Q-IR pipeline (Vir v2.0) */
+  /* Lower the body — HIR pipeline when VIR_PIPELINE=1, else classic. */
   if (func_def->child_count > body_idx) {
-    uint32_t func_id =
-        ctx->module.func_count > 0 ? ctx->module.func_count - 1 : 0;
-    if (pipeline_lower_func_body(ctx, func_def->children[body_idx], func_id) !=
-        0) {
-      lower_error(ctx, func_def, ctx->last_error[0] ? ctx->last_error
-                                                    : "pipeline lowering failed");
+    const ast_node_t *body = func_def->children[body_idx];
+    if (pipeline_enabled()) {
+      uint32_t func_id =
+          ctx->module.func_count > 0 ? ctx->module.func_count - 1 : 0;
+      if (pipeline_lower_func_body(ctx, body, func_id) != 0) {
+        lower_error(ctx, func_def, ctx->last_error[0] ? ctx->last_error
+                                                      : "pipeline lowering failed");
+        ctx->symbols = *saved_syms;
+        free(saved_syms);
+        ctx->current_func = NULL;
+        ctx->vreg_alloc = saved_vreg_alloc;
+        ctx->label_counter = saved_label_counter;
+        return -1;
+      }
+    } else if (lower_stmt(ctx, body) != 0) {
       ctx->symbols = *saved_syms;
       free(saved_syms);
       ctx->current_func = NULL;

@@ -635,7 +635,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
         tok.type = TOK_NEWLINE;
         tok.line = lex->line;
         tok.col = lex->col;
-        lex_push_token(lex, tok);
+        lex_push_token(lex, tok); 
         prev_was_newline = 1;
       }
       continue;
@@ -667,7 +667,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
     if (c == '"' || c == '\'') {
       vir_token_t tok = {0};
       lex_string(lex, &tok);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
 
@@ -675,7 +675,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
     if (is_digit_char(c)) {
       vir_token_t tok = {0};
       lex_number(lex, &tok);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
 
@@ -686,28 +686,28 @@ int lexer_tokenize(vir_lexer_t *lex) {
       vir_token_t tok = {TOK_EQ, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     if (c == '!' && c2 == '=') {
       vir_token_t tok = {TOK_NE, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     if (c == '>' && c2 == '=') {
       vir_token_t tok = {TOK_GE, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     if (c == '<' && c2 == '=') {
       vir_token_t tok = {TOK_LE, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     /* v1.2: ?=/= (safe not-equal, 4 chars) — check before ?= */
@@ -718,7 +718,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
       lex_advance(lex);
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     /* v1.2: ?= (safe equal) */
@@ -726,7 +726,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
       vir_token_t tok = {TOK_SAFE_EQ, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     /* v1.2: ?. (safe member access) */
@@ -734,46 +734,30 @@ int lexer_tokenize(vir_lexer_t *lex) {
       vir_token_t tok = {TOK_SAFE_ACCESS, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
-    /* :: (double colon) — module path / enum variant separator */
-    if (c == ':' && c2 == ':') {
-      vir_token_t tok = {TOK_LARROW, lex->line, lex->col, {0}};
-      /* Reuse TOK_LARROW slot? No — we need a dedicated token.
-       * Use TOK_COLON twice but as one: emit as the actual variant.
-       * Since header has no TOK_DOUBLE_COLON, store in TOK_HASH slot
-       * which is unused in the VM path and parser handles it.
-       *
-       * Actually: the parser resolves EnumName::Variant via AST_ENUM_ACCESS.
-       * The C-Core parser checks for IDENT COLON COLON IDENT.
-       * So we should leave :: as two COLON tokens — the parser handles it.
-       * But if parser errors on COLON as expression start, we need to
-       * make :: a single token. Add TOK_DOUBLE_COLON = TOK_HASH (112 in Vir).
-       * HOWEVER: the simplest fix is to handle :: in the PARSER not here.
-       * So: emit two COLON tokens as before (do nothing here). */
-      (void)tok; /* suppress warning */
-    }
+
     /* v1.2: :~ (pattern match) */
     if (c == ':' && c2 == '~') {
       vir_token_t tok = {TOK_PATTERN, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     if (c == '|' && c2 == '|') {
       vir_token_t tok = {TOK_OR, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     if (c == '-' && c2 == '>') {
       vir_token_t tok = {TOK_ARROW, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     /* §23.2 `<-` port send arrow */
@@ -781,14 +765,14 @@ int lexer_tokenize(vir_lexer_t *lex) {
       vir_token_t tok = {TOK_LARROW, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     if (c == '<' && c2 == '<') {
       vir_token_t tok = {TOK_BIT_SHL, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     /* v1.2: >> is cast (not bit shift right) */
@@ -796,7 +780,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
       vir_token_t tok = {TOK_CAST, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     /* §26.2: ** matmul */
@@ -804,7 +788,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
       vir_token_t tok = {TOK_MATMUL, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     /* §26.2: >< fused multiply-add */
@@ -812,7 +796,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
       vir_token_t tok = {TOK_FMA, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     /* §24.4: !! atomic postfix */
@@ -820,7 +804,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
       vir_token_t tok = {TOK_ATOMIC_BANG, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     /* Compound assignment: += -= *= /= */
@@ -828,35 +812,35 @@ int lexer_tokenize(vir_lexer_t *lex) {
       vir_token_t tok = {TOK_PLUS_ASSIGN, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     if (c == '-' && c2 == '=') {
       vir_token_t tok = {TOK_MINUS_ASSIGN, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     if (c == '*' && c2 == '=') {
       vir_token_t tok = {TOK_STAR_ASSIGN, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     if (c == '/' && c2 == '=') {
       vir_token_t tok = {TOK_SLASH_ASSIGN, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
     if (c == '.' && c2 == '.') {
       vir_token_t tok = {TOK_DOTDOT, lex->line, lex->col, {0}};
       lex_advance(lex);
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
 
@@ -875,7 +859,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
     case '/':
       single_sym = TOK_SLASH;
       break;
-    case '%':
+    case '%': single_sym = TOK_PERCENT; printf("LEXER: tokenized %% as TOK_PERCENT\n"); break;
       single_sym = TOK_PERCENT;
       break;
     case '^':
@@ -954,7 +938,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
     if (single_sym != TOK_EOF) {
       vir_token_t tok = {single_sym, lex->line, lex->col, {0}};
       lex_advance(lex);
-      lex_push_token(lex, tok);
+      lex_push_token(lex, tok); 
       continue;
     }
 
@@ -963,7 +947,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
       vir_token_t tok = {0};
       int rc = lex_word(lex, &tok);
       if (rc == 0) {
-        lex_push_token(lex, tok);
+        lex_push_token(lex, tok); 
       }
       continue;
     }

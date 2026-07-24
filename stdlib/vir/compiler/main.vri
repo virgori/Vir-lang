@@ -25,7 +25,7 @@ import compile_pipeline from pipeline;
 include ir_optimizer;
 include codegen;
 include binary;
-import Arch, ByteBuffer, buf_new, buf_write_u8, buf_write_u32_le, buf_write_u64_le, buf_write_zeros, buf_write_string_padded, buf_write_bytes, buf_size, buf_align from binary;
+import Arch, ByteBuffer, buf_new, buf_write_u8, buf_write_u32_le, buf_write_u64_le, buf_write_zeros, buf_write_string_padded, buf_write_cstr_padded, buf_write_bytes, buf_size, buf_align, buf_get_u8 from binary;
 include linker;
 import link_single_kernel from linker;
 include file;
@@ -33,8 +33,10 @@ import File, FileMode, file_open, file_read_all, file_create, file_write_all, fi
 include slice;
 import Slice, slice_new from slice;
 include "stdlib/vir/rt/string_rt.vri";
-import str_new, str_len, rt_streq from "stdlib/vir/rt/string_rt.vri";
+import str_new, str_len, rt_streq, str_from_cstr from "stdlib/vir/rt/string_rt.vri";
     str_concat;
+include "stdlib/vir/rt/vec_rt.vri";
+import bvec_len, bvec_get from "stdlib/vir/rt/vec_rt.vri";
 
 
 # ═══════════════════════════════════════════════════════
@@ -47,8 +49,13 @@ const CPU_SUB_ALL: 0x00000000;
 const MH_EXECUTE: 2;
 const MH_FLAGS: 0x00200085    # PIE | TWOLEVEL | DYLDLINK;
 const LC_SEGMENT_64: 0x19;
-const LC_MAIN: 0x80000028;
 const LC_SYMTAB: 0x02;
+const LC_DYSYMTAB: 0x0B;
+const LC_LOAD_DYLIB: 0x0C;
+const LC_LOAD_DYLINKER: 0x0E;
+const LC_UUID: 0x1B;
+const LC_MAIN: 0x80000028;
+const LC_DYLD_CHAINED_FIXUPS: 0x80000034;
 const TEXT_BASE: 0x100000000;
 const PAGE_SIZE: 0x4000;
 
@@ -501,6 +508,7 @@ func codegen_emit_module(m: QModule, arch: TargetArch):
     # Phase 3: Emit _start entry point
     # _start calls main(), then exits with return value
     start_offset = codebuf_offset(cb);
+    cb.start_offset = start_offset;
     # STP X29, X30, [SP, #-16]!
     cb = arm64_stp_pre(cb, 29, 30, 31, -16);
     cb = arm64_mov_rr(cb, 29, 31);
@@ -538,111 +546,196 @@ func emit_macho_executable(code: CodeBuf):
     out_buf = buf_new();
     code_size = codebuf_offset(code) as i64;
 
-    # Page-align the code segment
-    text_filesize = ((code_size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    # Full dyld-linked layout (codesign / kernel require __LINKEDIT):
+    #   PAGEZERO(72) + TEXT+sect(152) + LINKEDIT(72)
+    #   + CHAINED_FIXUPS(16) + SYMTAB(24) + DYSYMTAB(80)
+    #   + LOAD_DYLINKER(32) + UUID(24) + MAIN(24) + LOAD_DYLIB(56)
+    # = 10 cmds, 552 bytes
+    ncmds = 10 as i64;
+    cmds_size = 552 as i64;
+    header_end = 32 + cmds_size;
+    code_offset = header_end + 32;
 
-    # Layout: [header 32B] [PAGEZERO 72B] [TEXT seg 72+80B] [LC_MAIN 24B] [LC_SYMTAB 24B]
-    ncmds = 4 as i64;
-    cmds_size = (72 + 72 + 80 + 24 + 24) as i64   # 272 bytes;
-    header_plus_cmds = 32 + cmds_size as i64
+    entry_in_code = code.start_offset;
+    if entry_in_code < 0 do
+        entry_in_code = 0
+    end
+    if entry_in_code >= code_size do
+        entry_in_code = 0
+    end
+    entryoff = code_offset + entry_in_code;
 
-    # Entry point = start of code (_start is at end of module, but we want
-    # the _start function which is the last thing emitted in codegen_emit_module)
-    # Actually the entry offset is relative to __TEXT segment start
-    # Since code starts right after header+cmds, entry = offset of _start in code
-    # For simplicity, entry at offset 0 (runtime stubs are first, _start is last)
-    # We need to pass the _start offset... for now, use the code layout
+    text_raw = code_offset + code_size;
+    text_filesize = ((text_raw + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+
+    chained_fixups_size = 48 as i64;
+    string_table_size = 4 as i64;
+    linkedit_data_size = chained_fixups_size + string_table_size;
+    linkedit_fileoff = text_filesize;
+    linkedit_vmaddr = TEXT_BASE + text_filesize;
+    strtab_off = linkedit_fileoff + chained_fixups_size;
 
     # ── Mach-O Header (32 bytes) ──
-    out_buf = buf_write_u32_le(out_buf, MACHO_MAGIC);
-    out_buf = buf_write_u32_le(out_buf, CPU_ARM64);
-    out_buf = buf_write_u32_le(out_buf, CPU_SUB_ALL);
-    out_buf = buf_write_u32_le(out_buf, MH_EXECUTE);
+    out_buf = buf_write_u8(out_buf, 0xCF);
+    out_buf = buf_write_u8(out_buf, 0xFA);
+    out_buf = buf_write_u8(out_buf, 0xED);
+    out_buf = buf_write_u8(out_buf, 0xFE);
+    out_buf = buf_write_u8(out_buf, 0x0C);
+    out_buf = buf_write_u8(out_buf, 0x00);
+    out_buf = buf_write_u8(out_buf, 0x00);
+    out_buf = buf_write_u8(out_buf, 0x01);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 2);
     out_buf = buf_write_u32_le(out_buf, ncmds);
     out_buf = buf_write_u32_le(out_buf, cmds_size);
     out_buf = buf_write_u32_le(out_buf, MH_FLAGS);
-    out_buf = buf_write_u32_le(out_buf, 0)               # reserved;
+    out_buf = buf_write_u32_le(out_buf, 0);
 
-    # ── LC_SEGMENT_64: __PAGEZERO (72 bytes) ──
+    # ── 1. __PAGEZERO ──
     out_buf = buf_write_u32_le(out_buf, LC_SEGMENT_64);
     out_buf = buf_write_u32_le(out_buf, 72);
-    out_buf = buf_write_string_padded(out_buf, str_new("__PAGEZERO"), 16);
-    out_buf = buf_write_u64_le(out_buf, 0)               # vmaddr;
-    out_buf = buf_write_u64_le(out_buf, TEXT_BASE)        # vmsize = 4GB;
-    out_buf = buf_write_u64_le(out_buf, 0)               # fileoff;
-    out_buf = buf_write_u64_le(out_buf, 0)               # filesize;
-    out_buf = buf_write_u32_le(out_buf, 0)               # maxprot;
-    out_buf = buf_write_u32_le(out_buf, 0)               # initprot;
-    out_buf = buf_write_u32_le(out_buf, 0)               # nsects;
-    out_buf = buf_write_u32_le(out_buf, 0)               # flags;
+    out_buf = buf_write_cstr_padded(out_buf, "__PAGEZERO", 16);
+    out_buf = buf_write_u64_le(out_buf, 0);
+    out_buf = buf_write_u64_le(out_buf, TEXT_BASE);
+    out_buf = buf_write_u64_le(out_buf, 0);
+    out_buf = buf_write_u64_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
 
-    # ── LC_SEGMENT_64: __TEXT (72 + 80 = 152 bytes) ──
+    # ── 2. __TEXT + __text ──
     out_buf = buf_write_u32_le(out_buf, LC_SEGMENT_64);
-    out_buf = buf_write_u32_le(out_buf, 152)             # 72 + 1 section * 80;
-    out_buf = buf_write_string_padded(out_buf, str_new("__TEXT"), 16);
-    out_buf = buf_write_u64_le(out_buf, TEXT_BASE)        # vmaddr;
-    out_buf = buf_write_u64_le(out_buf, text_filesize)   # vmsize;
-    out_buf = buf_write_u64_le(out_buf, 0)               # fileoff;
-    out_buf = buf_write_u64_le(out_buf, header_plus_cmds + text_filesize)  # filesize;
-    out_buf = buf_write_u32_le(out_buf, 5)               # maxprot (r-x);
-    out_buf = buf_write_u32_le(out_buf, 5)               # initprot (r-x);
-    out_buf = buf_write_u32_le(out_buf, 1)               # nsects;
-    out_buf = buf_write_u32_le(out_buf, 0)               # flags;
+    out_buf = buf_write_u32_le(out_buf, 152);
+    out_buf = buf_write_cstr_padded(out_buf, "__TEXT", 16);
+    out_buf = buf_write_u64_le(out_buf, TEXT_BASE);
+    out_buf = buf_write_u64_le(out_buf, text_filesize);
+    out_buf = buf_write_u64_le(out_buf, 0);
+    out_buf = buf_write_u64_le(out_buf, text_filesize);
+    out_buf = buf_write_u32_le(out_buf, 5);
+    out_buf = buf_write_u32_le(out_buf, 5);
+    out_buf = buf_write_u32_le(out_buf, 1);
+    out_buf = buf_write_u32_le(out_buf, 0);
 
-    # __text section header (80 bytes)
-    out_buf = buf_write_string_padded(out_buf, str_new("__text"), 16)       # sectname;
-    out_buf = buf_write_string_padded(out_buf, str_new("__TEXT"), 16)       # segname;
-    out_buf = buf_write_u64_le(out_buf, TEXT_BASE + header_plus_cmds)       # addr;
-    out_buf = buf_write_u64_le(out_buf, code_size)                          # size;
-    out_buf = buf_write_u32_le(out_buf, header_plus_cmds as i64)            # offset;
-    out_buf = buf_write_u32_le(out_buf, 2)               # align = 2^2 = 4 bytes;
-    out_buf = buf_write_u32_le(out_buf, 0)               # reloff;
-    out_buf = buf_write_u32_le(out_buf, 0)               # nreloc;
-    out_buf = buf_write_u32_le(out_buf, 0x80000400)      # flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
-    out_buf = buf_write_u32_le(out_buf, 0)               # reserved1;
-    out_buf = buf_write_u32_le(out_buf, 0)               # reserved2;
-    out_buf = buf_write_u32_le(out_buf, 0)               # reserved3;
+    out_buf = buf_write_cstr_padded(out_buf, "__text", 16);
+    out_buf = buf_write_cstr_padded(out_buf, "__TEXT", 16);
+    out_buf = buf_write_u64_le(out_buf, TEXT_BASE + code_offset);
+    out_buf = buf_write_u64_le(out_buf, code_size);
+    out_buf = buf_write_u32_le(out_buf, code_offset);
+    out_buf = buf_write_u32_le(out_buf, 2);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0x80000400);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
 
-    # ── LC_MAIN (24 bytes) ──
-    out_buf = buf_write_u32_le(out_buf, LC_MAIN);
-    out_buf = buf_write_u32_le(out_buf, 24);
-    # Entry offset = code starts at header_plus_cmds, _start is a known offset
-    # For now, we put the _start at the beginning of code
-    # Actually _start is the LAST thing in the code... we need its offset.
-    # We'll pass it as a parameter. For now, entry at 0 = runtime stubs start.
-    out_buf = buf_write_u64_le(out_buf, 0)               # entryoff (will be patched);
-    out_buf = buf_write_u64_le(out_buf, 0)               # stacksize;
+    # ── 3. __LINKEDIT ──
+    out_buf = buf_write_u32_le(out_buf, LC_SEGMENT_64);
+    out_buf = buf_write_u32_le(out_buf, 72);
+    out_buf = buf_write_cstr_padded(out_buf, "__LINKEDIT", 16);
+    out_buf = buf_write_u64_le(out_buf, linkedit_vmaddr);
+    out_buf = buf_write_u64_le(out_buf, PAGE_SIZE);
+    out_buf = buf_write_u64_le(out_buf, linkedit_fileoff);
+    out_buf = buf_write_u64_le(out_buf, linkedit_data_size);
+    out_buf = buf_write_u32_le(out_buf, 1);
+    out_buf = buf_write_u32_le(out_buf, 1);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
 
-    # ── LC_SYMTAB (24 bytes, empty) ──
+    # ── 4. LC_DYLD_CHAINED_FIXUPS ──
+    out_buf = buf_write_u32_le(out_buf, LC_DYLD_CHAINED_FIXUPS);
+    out_buf = buf_write_u32_le(out_buf, 16);
+    out_buf = buf_write_u32_le(out_buf, linkedit_fileoff);
+    out_buf = buf_write_u32_le(out_buf, chained_fixups_size);
+
+    # ── 5. LC_SYMTAB ──
     out_buf = buf_write_u32_le(out_buf, LC_SYMTAB);
     out_buf = buf_write_u32_le(out_buf, 24);
-    out_buf = buf_write_u32_le(out_buf, 0)               # symoff;
-    out_buf = buf_write_u32_le(out_buf, 0)               # nsyms;
-    out_buf = buf_write_u32_le(out_buf, 0)               # stroff;
-    out_buf = buf_write_u32_le(out_buf, 0)               # strsize;
+    out_buf = buf_write_u32_le(out_buf, strtab_off);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, strtab_off);
+    out_buf = buf_write_u32_le(out_buf, string_table_size);
 
-    # ── Pad to page boundary ──
-    current = buf_size(out_buf);
-    pad_needed = header_plus_cmds as i64 - current;
-    if pad_needed > 0 do
-        out_buf = buf_write_zeros(out_buf, pad_needed as i64)
+    # ── 6. LC_DYSYMTAB (80 bytes) ──
+    out_buf = buf_write_u32_le(out_buf, LC_DYSYMTAB);
+    out_buf = buf_write_u32_le(out_buf, 80);
+    dsi = 0;
+    when dsi < 18 loop
+        out_buf = buf_write_u32_le(out_buf, 0);
+        dsi = dsi + 1
     end
 
-    # ── Code data ──
+    # ── 7. LC_LOAD_DYLINKER ──
+    out_buf = buf_write_u32_le(out_buf, LC_LOAD_DYLINKER);
+    out_buf = buf_write_u32_le(out_buf, 32);
+    out_buf = buf_write_u32_le(out_buf, 12);
+    out_buf = buf_write_cstr_padded(out_buf, "/usr/lib/dyld", 20);
+
+    # ── 8. LC_UUID ──
+    out_buf = buf_write_u32_le(out_buf, LC_UUID);
+    out_buf = buf_write_u32_le(out_buf, 24);
+    ui = 1;
+    when ui <= 16 loop
+        out_buf = buf_write_u8(out_buf, ui);
+        ui = ui + 1
+    end
+
+    # ── 9. LC_MAIN ──
+    out_buf = buf_write_u32_le(out_buf, LC_MAIN);
+    out_buf = buf_write_u32_le(out_buf, 24);
+    out_buf = buf_write_u64_le(out_buf, entryoff);
+    out_buf = buf_write_u64_le(out_buf, 0);
+
+    # ── 10. LC_LOAD_DYLIB (libSystem) ──
+    out_buf = buf_write_u32_le(out_buf, LC_LOAD_DYLIB);
+    out_buf = buf_write_u32_le(out_buf, 56);
+    out_buf = buf_write_u32_le(out_buf, 24);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0x00010000);
+    out_buf = buf_write_u32_le(out_buf, 0x00010000);
+    out_buf = buf_write_cstr_padded(out_buf, "/usr/lib/libSystem.B.dylib", 32);
+
+    # ── Pad to code_offset (fixed layout — do not use buf_size) ──
+    pad_i = 0;
+    pad_n = code_offset - (32 + cmds_size);
+    when pad_i < pad_n loop
+        out_buf = buf_write_u8(out_buf, 0);
+        pad_i = pad_i + 1
+    end
+
+    # ── Code ──
     ci = 0;
-    when ci < code.len loop
-        out_buf = buf_write_u8(out_buf, code.data[ci] as i64);
+    when ci < code_size loop
+        b = bvec_get(code.data, ci);
+        out_buf = buf_write_u8(out_buf, b);
         ci = ci + 1
     end
 
-    # ── Pad code to page ──
-    code_pad = text_filesize as i64 - code_size as i64;
+    # ── Pad __TEXT to page ──
+    code_pad = text_filesize - code_offset - code_size;
     if code_pad > 0 do
         out_buf = buf_write_zeros(out_buf, code_pad as i64)
     end
 
+    # ── LINKEDIT: chained fixups (48) + strtab (4) ──
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 28);
+    out_buf = buf_write_u32_le(out_buf, 44);
+    out_buf = buf_write_u32_le(out_buf, 44);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 1);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 3);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+
     out out_buf
 end.
+
 # Emit with known _start offset
 func emit_macho_with_entry(code: CodeBuf, start_offset: int):
 
@@ -687,6 +780,17 @@ end.
 # Compile Pipeline
 # ═══════════════════════════════════════════════════════
 
+# Write ByteBuffer bytes to an already-opened builtin file handle.
+func write_buf_to_file(f: int, buf: ByteBuffer):
+    wi = 0;
+    n = buf_size(buf);
+    when wi < n loop
+        b = buf_get_u8(buf, wi);
+        file_write_byte(f, b);
+        wi = wi + 1
+    end
+end.
+
 func compile(source: string, output_path: string):
 
     # Step 1: Tokenize
@@ -721,17 +825,17 @@ func compile(source: string, output_path: string):
         out 1
     end
 
-    func_count = vec_len(ctx.module.functions);
+    func_count = vec_len(ctx.prog.functions);
     print "virc: " + str_from_i64(func_count) + " functions";
 
     # Step 4: Optimize — TCO + register allocation per function
     print "virc: optimizing...";
-    let opt = optimize_module(ctx.module);
-    ctx.module = opt.0;
+    let opt = optimize_module(ctx.prog);
+    ctx.prog = opt.0;
 
     # Step 5: Code generation (ARM64)
     print "virc: generating ARM64 machine code...";
-    code = codegen_emit_module(ctx.module, TargetArch.ARM64);
+    code = codegen_emit_module(ctx.prog, TargetArch.ARM64);
     code_size = codebuf_offset(code);
     print "virc: " + str_from_i64(code_size) + " bytes of machine code";
 
@@ -744,24 +848,22 @@ func compile(source: string, output_path: string):
     print "virc: linking Mach-O ARM64 executable...";
     binary = emit_macho_executable(code);
 
-    # Step 7: Write output
+    # Step 7: Write output (C-core: output_path is a C string from get_arg)
     print "virc: writing " + output_path + "...";
-    f = file_create(output_path);
-    if is_err(f) do
+    f = file_open(output_path, "w");
+    if f == 0 do
         print "virc: error_msg: cannot create output file";
         out 1
     end
 
-    file = unwrap(f);
-    data_slice = slice_new(binary.data.data, vec_len(binary.data));
-    file_write_all(file, data_slice);
-    file_close(file);
+    file_size = buf_size(binary);
+    write_buf_to_file(f, binary);
+    file_close(f);
 
     # Step 8: Make executable (chmod +x)
     # syscall(SYS_CHMOD, path, 0755)
     # For now this is handled by the build script
 
-    file_size = vec_len(binary.data);
     print "virc: done! " + output_path + " (" + str_from_i64(file_size) + " bytes)";
     out 0
 end.
@@ -784,34 +886,32 @@ func main:
     end
 
     input_path = get_arg(0);
-    output_path = str_new("a.out");
+    output_path = "a.out";
 
     # Parse -o flag
     if arg_count() >= 3 do
-        if str_eq(get_arg(1), str_new("-o")) do
+        if rt_streq(get_arg(1), "-o") do
             output_path = get_arg(2)
         end
     end
 
-    # Read source file
-    print "virc: reading " + input_path + "...";
-    f = file_open(input_path, FileMode.Read);
-    if is_err(f) do
-        print "virc: error_msg: cannot open " + input_path;
+    # Read source file (C-core: get_arg returns C strings; use builtin file I/O)
+    print "virc: reading...";
+    f = file_open(input_path, "r");
+    if f == 0 do
+        print "virc: error_msg: cannot open input";
         out 1
     end
 
-    file = unwrap(f);
-    source_result = file_read_all(file);
-    file_close(file);
+    source = file_read(f);
+    file_close(f);
 
-    if is_err(source_result) do
-        print "virc: error_msg: cannot read " + input_path;
+    if source == 0 do
+        print "virc: error_msg: cannot read input";
         out 1
     end
 
-    source = unwrap(source_result);
-    print "virc: " + str_from_i64(str_len(source)) + " bytes source";
+    print "virc: source loaded";
 
     # Compile!
     result = compile(source, output_path);

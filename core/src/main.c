@@ -249,8 +249,6 @@ static char *vir_include_reader(const char *filename, size_t *out_len,
         if ((src = read_source_silent(path, out_len))) return src;
         snprintf(path, sizeof(path), "%s/stdlib/%s", walk, relpath);
         if ((src = read_source_silent(path, out_len))) return src;
-        snprintf(path, sizeof(path), "%s/stdlib/vir/mem/%s", walk, relpath);
-        if ((src = read_source_silent(path, out_len))) return src;
         char *last = strrchr(walk, '/');
         if (!last) break;
         if (last == walk) { walk[1] = '\0'; }  /* "/" root */
@@ -278,11 +276,9 @@ static char *vir_include_reader(const char *filename, size_t *out_len,
 
     /* 6) Fallback: cwd-relative (either translated or verbatim). */
     if ((src = read_source_silent(relpath, out_len))) {
-        fprintf(stderr, "loading: %s\n", path);
         return src;
     }
     src = read_source(filename, out_len);
-    if (src) fprintf(stderr, "loading: %s\n", filename);
     return src;  /* noisy: prints cannot-open */
 }
 
@@ -333,7 +329,7 @@ static ast_node_t *frontend(const char *filepath, const char *source, size_t len
         trace_stage1_event("parser_error", "elapsed_phase_ms=%llu pos=%u error=%s",
                            (unsigned long long)(trace_now_ms() - phase_start),
                            parser.pos, parser.error);
-        if (g_diag_initialized && g_parser_diag.count > 0) {
+        if (0) {
             diag_render_all(&g_parser_diag);
         } else {
             fprintf(stderr, "parse error in %s (line %u): %s\n", filepath, 
@@ -410,7 +406,7 @@ static int cmd_dump(const char *source, size_t len, const char *filepath)
     ctx->include_user_data = &ictx;
 
     if (lower_resolve_includes(ctx, ast) != 0) {
-        if (g_diag_initialized && g_parser_diag.count > 0) {
+        if (0) {
             diag_render_all(&g_parser_diag);
         } else {
             fprintf(stderr, "include error: %s\n", ctx->last_error);
@@ -427,7 +423,7 @@ static int cmd_dump(const char *source, size_t len, const char *filepath)
     }
 
     if (lower_program(ctx, ast) != 0) {
-        if (g_diag_initialized && g_parser_diag.count > 0) {
+        if (0) {
             diag_render_all(&g_parser_diag);
         } else {
             fprintf(stderr, "lower error: %s\n", ctx->last_error);
@@ -488,7 +484,7 @@ static int cmd_run(const char *source, size_t len, int verbose,
         trace_stage1_event("include_error", "elapsed_phase_ms=%llu error=%s",
                            (unsigned long long)(trace_now_ms() - phase_start),
                            ctx->last_error);
-        if (g_diag_initialized && g_parser_diag.count > 0) {
+        if (0) {
             diag_render_all(&g_parser_diag);
         } else {
             fprintf(stderr, "include error: %s\n", ctx->last_error);
@@ -518,7 +514,7 @@ static int cmd_run(const char *source, size_t len, int verbose,
         trace_stage1_event("semantic_error", "elapsed_phase_ms=%llu error=%s",
                            (unsigned long long)(trace_now_ms() - phase_start),
                            ctx->last_error);
-        if (g_diag_initialized && g_parser_diag.count > 0) {
+        if (0) {
             diag_render_all(&g_parser_diag);
         } else {
             fprintf(stderr, "lower error: %s\n", ctx->last_error);
@@ -580,7 +576,7 @@ static int cmd_run(const char *source, size_t len, int verbose,
                        vm_status_str(status),
                        (unsigned long long)vm->instr_executed);
 
-    if (verbose) {
+    if (verbose || status != VM_OK) {
         fprintf(stderr, "[vir] VM status: %s  (%llu instrs)\n",
                 vm_status_str(status), (unsigned long long)vm->instr_executed);
     }
@@ -628,7 +624,7 @@ static int cmd_jit(const char *source, size_t len, int verbose,
     ctx->include_user_data = &ictx;
 
     if (lower_resolve_includes(ctx, ast) != 0) {
-        if (g_diag_initialized && g_parser_diag.count > 0) {
+        if (0) {
             diag_render_all(&g_parser_diag);
         } else {
             fprintf(stderr, "include error: %s\n", ctx->last_error);
@@ -645,7 +641,7 @@ static int cmd_jit(const char *source, size_t len, int verbose,
     }
 
     if (lower_program(ctx, ast) != 0) {
-        if (g_diag_initialized && g_parser_diag.count > 0) {
+        if (0) {
             diag_render_all(&g_parser_diag);
         } else {
             fprintf(stderr, "lower error: %s\n", ctx->last_error);
@@ -896,7 +892,7 @@ int main(int argc, char **argv)
 
         if (lower_resolve_includes(ctx, ast) != 0 ||
             lower_program(ctx, ast) != 0) {
-            if (g_diag_initialized && g_parser_diag.count > 0) {
+            if (0) {
                 diag_render_all(&g_parser_diag);
             } else {
                 fprintf(stderr, "lower error: %s\n", ctx->last_error);

@@ -113,6 +113,12 @@ int q_func_emit(q_function_t *func, q_instruction_t instr)
         func->body_capacity = new_cap;
     }
     func->body[func->body_count++] = instr;
+    /* Body changed — drop cached label map. */
+    if (func->label_map) {
+        free(func->label_map);
+        func->label_map = NULL;
+        func->label_map_len = 0;
+    }
     return 0;
 }
 
@@ -121,6 +127,11 @@ void q_func_free(q_function_t *func)
     if (func->body) {
         free(func->body);
         func->body = NULL;
+    }
+    if (func->label_map) {
+        free(func->label_map);
+        func->label_map = NULL;
+        func->label_map_len = 0;
     }
     func->body_count = 0;
     func->body_capacity = 0;
@@ -155,7 +166,7 @@ q_function_t* q_module_add_func(q_module_t *mod, const char *name)
         fprintf(stderr, "[DEBUG] q_module_add_func failed: q_func_init failed for name '%s'\n", name);
         return NULL;
     }
-    if (strcmp(name, "vec_push") == 0) printf("[DEBUG] ADDING VEC_PUSH!\n");
+    /* if (strcmp(name, "vec_push") == 0) printf("[DEBUG] ADDING VEC_PUSH!\n"); */
 
     mod->func_count++;
     return func;

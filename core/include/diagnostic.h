@@ -342,7 +342,7 @@ typedef struct {
  * files, virtual sources, and incremental updates.
  * ═══════════════════════════════════════════════════════ */
 
-#define DIAG_MAX_FILES 32
+#define DIAG_MAX_FILES 128
 
 typedef struct {
   const char *filename;       /* File path (borrowed)                */
