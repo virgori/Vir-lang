@@ -218,6 +218,7 @@ typedef enum {
                                * current value, src1=imm slot id        */
     Q_ISOLATE_RESTORE = 0xC8, /* restore all snapshot slots for top
                                * try frame (used by resume retry)       */
+    Q_CHAR_TO_STR   = 0xC9,   /* dest = single-char string from int code */
 
     /* Pseudo */
     Q_LABEL         = 0xFE,

@@ -57,6 +57,18 @@ static q_opcode_t map_lir_op(lir_op_t op) {
         return Q_CMP_EQ;
     case LIR_CMP_NE:
         return Q_CMP_NE;
+    case LIR_MOD:
+        return Q_MOD;
+    case LIR_AND:
+        return Q_AND;
+    case LIR_OR:
+        return Q_OR;
+    case LIR_XOR:
+        return Q_XOR;
+    case LIR_SHL:
+        return Q_SHL;
+    case LIR_SHR:
+        return Q_SHR;
     default:
         return Q_NOP;
     }

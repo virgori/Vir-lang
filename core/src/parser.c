@@ -1933,12 +1933,43 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
   }
 
   expect(p, TOK_RPAREN, "expected ')' after parameters");
-  /* Optional return type: '->' TYPE  (skip until block opener) */
+  /* Optional return type annotation (§6 / Spec 2.0):
+   *   -> TYPE
+   *   out(TYPE)   /  out TYPE
+   * Must be consumed here — otherwise `out(Vec):` is misparsed as a
+   * return statement whose value is the type name Identifier `Vec`. */
   if (check(p, TOK_ARROW)) {
     advance(p);
     while (!check(p, TOK_COLON) && !check(p, TOK_THEN) &&
-           !check(p, TOK_NEWLINE) && !check(p, TOK_EOF)) {
+           !check(p, TOK_NEWLINE) && !check(p, TOK_EOF) &&
+           !check(p, TOK_OUT)) {
       advance(p);
+    }
+  }
+  if (match(p, TOK_OUT)) {
+    if (match(p, TOK_LPAREN)) {
+      int depth = 1;
+      while (depth > 0 && !check(p, TOK_EOF)) {
+        if (check(p, TOK_LPAREN))
+          depth++;
+        else if (check(p, TOK_RPAREN))
+          depth--;
+        advance(p);
+      }
+    } else if (check(p, TOK_IDENT) || is_name_token(peek(p)->type)) {
+      advance(p);
+      if (match(p, TOK_LT)) {
+        int depth = 1;
+        while (depth > 0 && !check(p, TOK_EOF)) {
+          if (check(p, TOK_LT))
+            depth++;
+          else if (check(p, TOK_GT))
+            depth--;
+          else if (check(p, TOK_CAST))
+            depth -= 2;
+          advance(p);
+        }
+      }
     }
   }
   expect_block_open(p, "function signature");
@@ -2956,11 +2987,25 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
               advance(p); /* consume closing ')' */
           }
         }
-        /* Skip `-> TYPE` if present. */
+        /* Skip `-> TYPE` or `out(TYPE)` / `out TYPE` if present. */
         if (check(p, TOK_ARROW)) {
           advance(p);
           if (check(p, TOK_IDENT))
             advance(p);
+        }
+        if (match(p, TOK_OUT)) {
+          if (match(p, TOK_LPAREN)) {
+            int depth = 1;
+            while (depth > 0 && !check(p, TOK_EOF)) {
+              if (check(p, TOK_LPAREN))
+                depth++;
+              else if (check(p, TOK_RPAREN))
+                depth--;
+              advance(p);
+            }
+          } else if (check(p, TOK_IDENT)) {
+            advance(p);
+          }
         }
         match(p, TOK_SEMICOLON);
         return f;

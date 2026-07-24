@@ -13,7 +13,8 @@
 #include <string.h>
 
 int pipeline_enabled(void) {
-  return 1;
+  /* Default ON for self-host dumps; set VIR_NO_PIPELINE=1 to force classic. */
+  return getenv("VIR_NO_PIPELINE") == NULL;
 }
 
 static int lower_hir_tree(lower_ctx_t *ctx, hir_node_t *hir, uint32_t func_id) {
@@ -51,6 +52,13 @@ static int pipeline_lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt,
                                uint32_t func_id) {
   if (!stmt)
     return 0;
+
+  /* Builtins like file_write_byte / file_close are dropped by the HIR→MIR
+   * path today (no MIR opcode). Lower them with the classic emitter. */
+  if (stmt->type == AST_BUILTIN_CALL) {
+    (void)lower_stmt(ctx, stmt);
+    return 0;
+  }
 
   /* §5.3 var groups are synthetic AST_BLOCK nodes — lower stmt-by-stmt so
    * tuple destructuring and other legacy-only forms are not skipped. */

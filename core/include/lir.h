@@ -50,7 +50,13 @@ typedef enum {
     LIR_LOAD_BYTE,
     LIR_STORE_BYTE,
     LIR_LOAD_WORD,
-    LIR_STORE_WORD
+    LIR_STORE_WORD,
+    LIR_MOD,
+    LIR_AND,
+    LIR_OR,
+    LIR_XOR,
+    LIR_SHL,
+    LIR_SHR
 } lir_op_t;
 
 // Operand types representing physical registers and stack memory

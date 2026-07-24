@@ -72,6 +72,18 @@ static lir_op_t map_mir_op(mir_op_t m) {
             return LIR_RET;
         case MIR_PRINT:
             return LIR_PRINT;
+        case MIR_MOD:
+            return LIR_MOD;
+        case MIR_AND:
+            return LIR_AND;
+        case MIR_OR:
+            return LIR_OR;
+        case MIR_XOR:
+            return LIR_XOR;
+        case MIR_SHL:
+            return LIR_SHL;
+        case MIR_SHR:
+            return LIR_SHR;
         default:
             return LIR_NOP;
     }

@@ -912,6 +912,35 @@ static void intr_native_write_i64(vir_intrinsic_ctx_t *ctx)
     *ctx->ret = 0;
 }
 
+static void intr_native_file_read(vir_intrinsic_ctx_t *ctx)
+{
+    FILE *f = (FILE *)(intptr_t)ctx->args[0];
+    void *buf = (void *)(intptr_t)ctx->args[1];
+    size_t n = (size_t)ctx->args[2];
+    if (!f || !buf) {
+        *ctx->ret = -1;
+        return;
+    }
+    *ctx->ret = (int64_t)fread(buf, 1, n, f);
+}
+
+static void intr_native_file_write(vir_intrinsic_ctx_t *ctx)
+{
+    FILE *f = (FILE *)(intptr_t)ctx->args[0];
+    const void *buf = (const void *)(intptr_t)ctx->args[1];
+    size_t n = (size_t)ctx->args[2];
+    if (!f || !buf) {
+        *ctx->ret = -1;
+        return;
+    }
+    *ctx->ret = (int64_t)fwrite(buf, 1, n, f);
+}
+
+static void intr_native_errno(vir_intrinsic_ctx_t *ctx)
+{
+    *ctx->ret = (int64_t)errno;
+}
+
 /* ── Bitwise / Math ──────────────────────────────────── */
 
 #if defined(_MSC_VER)
@@ -1073,6 +1102,10 @@ vir_intr_desc_t vir_intr_table[VIR_MAX_INTRINSICS] = {
     /* ID30 */ { intr_syscall, 5, INTR_IMPURE,              "syscall4" },
     /* ID31 */ { intr_syscall, 6, INTR_IMPURE,              "syscall5" },
     /* ID32 */ { intr_syscall, 7, INTR_IMPURE,              "syscall6" },
+    /* stdlib file.vri native I/O (Q_INTRINSIC by numeric id) */
+    /* ID33 */ { intr_native_file_read,  3, INTR_IMPURE,     "native_file_read" },
+    /* ID34 */ { intr_native_file_write, 3, INTR_IMPURE,     "native_file_write" },
+    /* ID35 */ { intr_native_errno,      0, INTR_PURE,       "native_errno" },
 };
 
 
@@ -1731,8 +1764,24 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     /* ── File I/O ──────────────────────────────────────── */
     case Q_FILE_OPEN: {
         const char *path = (const char *)(intptr_t)operand_value(vm, &instr->src1);
-        const char *mode = (const char *)(intptr_t)operand_value(vm, &instr->src2);
-        FILE *f = (path && mode) ? fopen(path, mode) : NULL;
+        int64_t mode_raw = operand_value(vm, &instr->src2);
+        const char *mode = NULL;
+        /* Accept either a C mode string ("r"/"w"/…) or FileMode enum
+         * (Read=1, Write=2, ReadWrite=3, Append=4) used by stdlib. */
+        if (mode_raw >= 1 && mode_raw <= 4) {
+            static const char *filemode_to_fopen[] = {
+                NULL, "r", "w", "r+", "a"
+            };
+            mode = filemode_to_fopen[mode_raw];
+        } else {
+            mode = (const char *)(intptr_t)mode_raw;
+            /* Reject obvious non-pointers (NULL / small integers). */
+            if ((uintptr_t)mode < 0x1000u)
+                mode = NULL;
+        }
+        FILE *f = (path && mode && (uintptr_t)path >= 0x1000u)
+                      ? fopen(path, mode)
+                      : NULL;
         set_dest(vm, &instr->dest, (int64_t)(intptr_t)f);
         break;
     }

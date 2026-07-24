@@ -89,9 +89,16 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             mir_operand_t dst = { MIR_OPND_VREG, {alloc_vreg(func)} };
             mir_op_t op = MIR_ADD;
             switch (hir->as.binop.op) {
+            case OP_ADD: op = MIR_ADD; break;
             case OP_SUB: op = MIR_SUB; break;
             case OP_MUL: op = MIR_MUL; break;
             case OP_DIV: op = MIR_DIV; break;
+            case OP_MOD: op = MIR_MOD; break;
+            case OP_AND: op = MIR_AND; break;
+            case OP_OR:  op = MIR_OR;  break;
+            case OP_XOR: op = MIR_XOR; break;
+            case OP_SHL: op = MIR_SHL; break;
+            case OP_SHR: op = MIR_SHR; break;
             case OP_GT:  op = MIR_CMP_GT; break;
             case OP_LT:  op = MIR_CMP_LT; break;
             case OP_GE:  op = MIR_CMP_GE; break;
