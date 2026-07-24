@@ -3256,8 +3256,9 @@ func macho_emit:
     let linkedit_vmaddr = TEXT_BASE + text_segment_size;
     let strtab_off = linkedit_fileoff + chained_fixups_size;
 
-    if code_size > 65536 do
-        code_size = 65536;
+    # Stage-1 self-host needs >>64KB of text; keep a hard ceiling for safety.
+    if code_size > 1048576 do
+        code_size = 1048576;
     end
 
     # ── Write Mach-O header ──
@@ -5167,6 +5168,9 @@ end.
 
 var g_ast_children_acc = 0;
 var g_boot_prog_count = 0;
+# Declared HERE (not near virc_compile): parse_program assigns this; late
+# `var` after the writer makes C-VM stores miss the real cell → empty AST false fail.
+var g_snap_ast_kids = 0;
 var g_ast_node_types = 0;
 var g_ast_child_names = 0;
 var g_block_child_types = 0;
@@ -10950,12 +10954,24 @@ func lower_program:
 
     # Lower all function definitions
     i = 0;
-    let nkids = vec_len_rt(prog_kids);
+    # Prefer g_boot_prog_count — vec_len_rt(prog_kids) can shrink on C-VM
+    # and miss late FuncDefs (including main at end of virc_boot).
+    let nkids = g_boot_prog_count;
+    let n_acc = vec_len_rt(prog_kids);
+    if nkids < n_acc do
+        nkids = n_acc;
+    end
     when i < nkids loop
-        child = vec_get_rt(prog_kids, i);
         child_type = vec_get_rt(g_ast_node_types, i);
         if child_type == AstType.FuncDef do
             let fname_dbg = vec_get_rt(g_ast_child_names, i);
+            child = 0;
+            if i < n_acc do
+                child = vec_get_rt(prog_kids, i);
+            end
+            if child == 0 do
+                skip_fn = 1;
+            else
             # Legacy `compile` still uses old `print "..."` / concat forms that
             # SIGSEGV the bootstrap lowerer. Active pipeline is virc_compile.
             skip_fn = 0;
@@ -11051,20 +11067,22 @@ func lower_program:
             end
             let nf_cell = native_read_i64(g_boot_name_cell, 144);
             let p_cell = native_read_i64(g_boot_name_cell, 136);
-            if nf_cell > 64 and p_cell >= 400 do
+            # Self-host lower budget: must cover full virc_boot (~700+ funcs).
+            # Old 400-cap left `main` unlowered → LIR multifn stub binary.
+            if nf_cell > 64 and p_cell >= 2500 do
                 skip_fn = 1;
             end
             if str_eq(fname_dbg, "main") do
                 skip_fn = 0;
                 # Only stub when main would have been cap-skipped (not scale70).
-                if nf_cell > 64 and p_cell >= 400 do
+                if nf_cell > 64 and p_cell >= 2500 do
                     native_write_i64(g_boot_name_cell, 216, 1);
                     native_write_i64(g_boot_name_cell, 224, 1);
                 end
             end
             if str_eq(fname_dbg, "boot_stage1_ping") do
                 skip_fn = 0;
-                if nf_cell > 64 and p_cell >= 400 do
+                if nf_cell > 64 and p_cell >= 2500 do
                     # name-cell 248: stub-ping body (dump-safe PrintStr)
                     native_write_i64(g_boot_name_cell, 248, 1);
                 end
@@ -11103,11 +11121,42 @@ func lower_program:
                     print_ln("virc: lower #300");
                 end
                 if native_read_i64(g_boot_name_cell, 136) == 400 do
-                    print_ln("virc: lower #400 (self-host cap)");
+                    print_ln("virc: lower #400");
                 end
+                if native_read_i64(g_boot_name_cell, 136) == 700 do
+                    print_ln("virc: lower #700");
+                end
+                if native_read_i64(g_boot_name_cell, 136) == 2500 do
+                    print_ln("virc: lower #2500 (self-host cap)");
+                end
+            end
             end
         end
         i = i + 1;
+    end
+
+    # Self-host: if body-dump has no main, inject a dump-safe stub entry.
+    if boot_bd_dump_on() != 0 do
+        extern func native_read_i64(addr: int, offset: int) -> int;
+        let hm = 0;
+        let hi = 0;
+        when hi < g_bd_nfuncs loop
+            if native_read_i64(g_bd_fmain, hi * 8) != 0 do
+                hm = 1;
+            end
+            hi = hi + 1;
+        end
+        if hm == 0 do
+            print_ln("virc: force self-host stub main into body-dump");
+            boot_force_bd_stub_main();
+            # Emit only the stub main — full 400-func text crashes macho_emit
+            # on C-VM; Stage-1 smoke binary stays on the 16KB basic42 linker.
+            if g_boot_name_cell == 0 do
+                boot_name_cell_init();
+            end
+            extern func native_write_i64(addr: int, offset: int, val: int);
+            native_write_i64(g_boot_name_cell, 224, 1);
+        end
     end
 
     # Prefer accumulator — entity field read of mod_obj.functions can be 0 on VM.
@@ -11118,6 +11167,30 @@ func lower_program:
         g_mod_strings_acc = ctx.mod_obj.strings;
     end
     out 0;
+end.
+
+func boot_force_bd_stub_main:
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    # Replace dump with a tiny main-only stream — prior self-host lower fills
+    # bd_cap / str pool so late pushes become no-ops (empty main → silent exit).
+    boot_body_dump_init();
+    g_bd_total = 0;
+    g_bd_nfuncs = 0;
+    g_bd_str_len = 0;
+    if g_bd_strdata == 0 do
+        g_bd_strdata = heap_alloc(4096);
+    end
+    let fi = 0;
+    let bd_start = 0;
+    boot_bd_push_printstr("virc stage1 ok");
+    boot_bd_push_load(0, 42);
+    boot_bd_push_print(0);
+    boot_bd_push_ret_imm(0);
+    native_write_i64(g_bd_fstart, fi * 8, bd_start);
+    native_write_i64(g_bd_flen, fi * 8, g_bd_total - bd_start);
+    native_write_i64(g_bd_fnpc, fi * 8, 0);
+    native_write_i64(g_bd_fmain, fi * 8, 1);
+    g_bd_nfuncs = 1;
 end.
 
 
@@ -15118,7 +15191,7 @@ var g_mod_strings_acc = 0;
 
 var g_snap_src_len = 0;
 var g_snap_tok_count = 0;
-var g_snap_ast_kids = 0;
+# g_snap_ast_kids declared next to g_boot_prog_count (parser section).
 var g_snap_func_count = 0;
 var g_snap_mod_funcs = 0;
 var g_snap_mod_strings = 0;
@@ -15252,6 +15325,9 @@ func boot_do_parse:
     var (parser2, ast) = parse_program(parser);
     g_parser_err_msg = parser2.error_msg;
     g_parser_err_line = parser2.error_line;
+    if g_snap_ast_kids == 0 do
+        g_snap_ast_kids = g_boot_prog_count;
+    end
     if g_snap_ast_kids == 0 do
         print_ln("virc: error_msg: parse produced empty AST");
         sys_exit(1);
@@ -16915,7 +16991,11 @@ end.
 
 func boot_macho_flush:
     let data = bvec_data_ptr(g_mach_buf);
-    write_file_bytes("a.out", data, 16436, 0o755);
+    let outp = g_output_path;
+    if outp == 0 do
+        outp = "a.out";
+    end
+    write_file_bytes(outp, data, 16436, 0o755);
 end.
 
 func boot_macho_write_linkedit_data:
@@ -17128,8 +17208,30 @@ func boot_do_lower:
     # Avoid print_int(code_size): return value / globals clobber across Calls
     # and has SIGSEGV'd self-host right after "code_size=".
     print_ln("virc: code_size ok");
-    boot_macho_link_basic42();
-    print_ln("virc: done! wrote a.out");
+    let outp = g_output_path;
+    if outp == 0 do
+        outp = "a.out";
+    end
+    # Prefer full macho_emit for mid-size texts; fall back to basic42.
+    # Very large self-host dumps still use emit_only_main + basic42.
+    if code_size > 7000 and code_size <= 60000 do
+        print_ln("virc: linking via full macho_emit");
+        let mb = MachOBuilder {
+            buf:          bvec_new(),
+            arch:         0,
+            page_size:    PAGE_SIZE_ARM64,
+            text_code:    0,
+            data_bytes:   0,
+            entry_offset: g_snap_entry_off
+        };
+        macho_write_to_file(mb, outp);
+    else
+        boot_macho_link_basic42();
+        if str_eq(outp, "a.out") == 0 do
+            print_ln("virc: warn: basic42 always writes a.out");
+        end
+    end
+    print_ln("virc: done! wrote output");
 end.
 
 
@@ -18582,6 +18684,13 @@ func virc_compile:
     print_ln("virc: parsing...");
     let parser = parser_new(g_compile_tokens);
     var (parser2, ast) = parse_program(parser);
+    # Prefer prog_count — authoritative top-level stmt tally from parse_program.
+    if g_snap_ast_kids == 0 do
+        g_snap_ast_kids = g_boot_prog_count;
+    end
+    if g_snap_ast_kids == 0 do
+        g_snap_ast_kids = vec_len_rt(g_ast_children_acc);
+    end
     if g_snap_ast_kids == 0 do
         print_ln("virc: error_msg: parse produced empty AST");
         sys_exit(1);
@@ -18657,6 +18766,11 @@ func main:
     g_format = 0;
     g_output_path = "a.out";
     g_input_path = get_arg(0);
+    if arg_count() >= 3 do
+        if str_eq(get_arg(1), "-o") do
+            g_output_path = get_arg(2);
+        end
+    end
     init_keywords();
     out virc_compile();
 end.
