@@ -6161,49 +6161,9 @@ func parse_primary:
             out (p8, el);
         end
 
-        # Check for generic call: IDENT '<' Type '>' '(' ... ')'
-        # Only when '>' appears before '(' — otherwise '<' is comparison.
-        if check(p, TokType.Lt) do
-            save_pos = p.pos;
-            scan_i = p.pos + 1;
-            found_gt = false;
-            guard = 0;
-            when guard < 12 and scan_i < p.token_count loop
-                stt = boot_parser_tok_type_at(p, scan_i);
-                if stt == TokType.Gt do
-                    found_gt = true;
-                    scan_i = scan_i + 1;
-                    guard = 12;
-                else
-                    if stt == TokType.LParen or stt == TokType.Comma or stt == TokType.Semicolon or stt == TokType.End do
-                        guard = 12;
-                    else
-                        scan_i = scan_i + 1;
-                        guard = guard + 1;
-                    end
-                end
-            end
-            if found_gt and scan_i < p.token_count and boot_parser_tok_type_at(p, scan_i) == TokType.LParen do
-                var (p_g1, _) = advance(p);
-                depth = 1;
-                when depth > 0 and not check(p_g1, TokType.Eof) loop
-                    g_tok = peek(p_g1);
-                    if g_tok.tok_type == TokType.Lt do
-                        depth = depth + 1;
-                    end
-                    if g_tok.tok_type == TokType.Gt do
-                        depth = depth - 1;
-                    end
-                    var (p_g2, _) = advance(p_g1);
-                    p_g1 = p_g2;
-                end
-                if depth == 0 do
-                    p = p_g1;
-                else
-                    p.pos = save_pos;
-                end
-            end
-        end
+        # Generic call: IDENT '<' TypeArgs '>' '(' ... ')' — skip args, keep as Call.
+        var (_, skipped_gen) = try_skip_generic_call_args(p);
+        _ = skipped_gen;
 
         # Check for function call: IDENT '('
         if check(p, TokType.LParen) do
@@ -6390,6 +6350,62 @@ func check_entity_literal:
         end
     end
     out false;
+end.
+
+
+
+func try_skip_generic_call_args:
+    in(p: Parser)
+    # If at '<' and span is type-args then '(', move p.pos to that '('; else unchanged.
+    # Allowed inside: Ident | Comma | '<' | '>'. Abort on LParen/ops before close.
+    if not check(p, TokType.Lt) do
+        out (p, false);
+    end
+    if boot_parser_tok_type_at(p, p.pos + 1) != TokType.Ident do
+        out (p, false);
+    end
+    j = p.pos;
+    depth = 0;
+    done = false;
+    failed = false;
+    end_j = 0;
+    when not done and not failed and j < p.token_count loop
+        tt = boot_parser_tok_type_at(p, j);
+        if tt == TokType.Lt do
+            depth = depth + 1;
+            j = j + 1;
+        else
+            if tt == TokType.Gt do
+                depth = depth - 1;
+                j = j + 1;
+                if depth == 0 do
+                    end_j = j;
+                    done = true;
+                else
+                    if depth < 0 do
+                        failed = true;
+                    end
+                end
+            else
+                if (tt == TokType.Ident or tt == TokType.Comma) and depth > 0 do
+                    j = j + 1;
+                else
+                    failed = true;
+                end
+            end
+        end
+    end
+    if failed or not done do
+        out (p, false);
+    end
+    if end_j >= p.token_count do
+        out (p, false);
+    end
+    if boot_parser_tok_type_at(p, end_j) != TokType.LParen do
+        out (p, false);
+    end
+    p.pos = end_j;
+    out (p, true);
 end.
 
 
@@ -7631,9 +7647,9 @@ end.
 func parse_while_stmt:
     in(p: Parser)
     line = peek(p).line;
+    # C-VM: parse_* mutates p.pos in-place; returned Parser in the tuple is unreliable.
+    # Keep using the same `p` binding after each call (do not trust discarded p2).
     var (_, cond) = parse_expr(p);
-    # C VM note: p is modified in-place by parse_expr; p2 from tuple is corrupted
-    # Consume optional 'loop' keyword (when...loop syntax)
     var (_, _) = match_tok(p, TokType.Loop);
     p = match_block_open(p);
     p = skip_newlines(p);
@@ -8440,13 +8456,8 @@ func parse_statement:
 
     # Identifier (may be assignment, field/index assign, or expression)
     if t.tok_type == TokType.Ident do
-        # Peek ahead: if IDENT followed by '(' → expression statement (function call)
-        # Do NOT advance first — let parse_expr handle it directly
-        save_pos = p.pos;
-        p.pos = p.pos + 1;
-        next_type = peek(p).tok_type;
-        p.pos = save_pos;
-        if next_type == TokType.LParen do
+        # Peek ahead: if IDENT followed by '(' -> expression statement (function call)
+        if boot_parser_tok_type_at(p, p.pos + 1) == TokType.LParen do
             out parse_expr(p);
         end
 
@@ -9006,6 +9017,30 @@ end.
 func boot_bd_push_binop:
     in(dv: int, a: int, b: int)
     # Opcode from name-cell 128 — g_st_opc / multi-arg params get clobbered on C VM.
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if boot_bd_dump_on() == 0 do
+        out;
+    end
+    boot_body_dump_init();
+    let ix = g_bd_total;
+    if ix >= boot_bd_cap() do
+        out;
+    end
+    let opc = native_read_i64(g_boot_name_cell, 128);
+    native_write_i64(g_bd_opc, ix * 8, opc);
+    native_write_i64(g_bd_dv, ix * 8, dv);
+    native_write_i64(g_bd_di, ix * 8, 0);
+    native_write_i64(g_bd_s1t, ix * 8, 1);
+    native_write_i64(g_bd_s1v, ix * 8, a);
+    native_write_i64(g_bd_s1i, ix * 8, 0);
+    native_write_i64(g_bd_s2v, ix * 8, b);
+    g_bd_total = ix + 1;
+end.
+
+func boot_bd_push_cmp:
+    in(dv: int, a: int, b: int)
+    # Opcode from name-cell 128 (CmpEq..CmpLe = 20..25) — same stash as binop.
     extern func native_write_i64(addr: int, offset: int, val: int);
     extern func native_read_i64(addr: int, offset: int) -> int;
     if boot_bd_dump_on() == 0 do
@@ -10056,17 +10091,10 @@ func lower_expr:
         end
         rd = fresh_vreg(ctx);
 
-        if expr.op == OpType::Ne do
-            # NE = XOR(EQ(lhs, rhs), 1)
-            eq_r = fresh_vreg(ctx);
-            one_r = fresh_vreg(ctx);
-            ir_emit(ctx, q_instr(QOp.CmpEq, q_vreg(eq_r), q_vreg(lhs as int), q_vreg(rhs as int)));
-            ir_emit(ctx, q_instr(QOp.Load, q_vreg(one_r), q_imm(1), q_none()));
-            ir_emit(ctx, q_instr(QOp.Xor, q_vreg(rd), q_vreg(eq_r), q_vreg(one_r)));
-            out rd as int;
-        end
-
         cmp_op = QOp.CmpEq;
+        if expr.op == OpType::Ne do
+            cmp_op = QOp.CmpNe;
+        end
         if expr.op == OpType::Gt do
             cmp_op = QOp.CmpGt;
         end
@@ -10078,6 +10106,14 @@ func lower_expr:
         end
         if expr.op == OpType::Le do
             cmp_op = QOp.CmpLe;
+        end
+        if boot_bd_dump_on() != 0 do
+            extern func native_write_i64(addr: int, offset: int, val: int);
+            if g_boot_name_cell == 0 do
+                boot_name_cell_init();
+            end
+            native_write_i64(g_boot_name_cell, 128, cmp_op as int);
+            boot_bd_push_cmp(rd, lhs as int, rhs as int);
         end
         ir_emit(ctx, q_instr(cmp_op, q_vreg(rd), q_vreg(lhs as int), q_vreg(rhs as int)));
         out rd as int;
@@ -10863,6 +10899,15 @@ func lower_stmt:
 
         cmp_r = fresh_vreg(ctx);
         ir_emit(ctx, q_instr(QOp.CmpLt, q_vreg(cmp_r), q_vreg(counter), q_vreg(limit_r as int)));
+        if boot_bd_dump_on() != 0 do
+            extern func native_write_i64(addr: int, offset: int, val: int);
+            if g_boot_name_cell == 0 do
+                boot_name_cell_init();
+            end
+            native_write_i64(g_boot_name_cell, 128, 23);
+            boot_bd_push_cmp(cmp_r, counter, limit_r as int);
+            boot_bd_push_jumpifnot(cmp_r, end_lbl);
+        end
         ir_emit(ctx, q_instr(QOp.JumpIfNot, q_none(), q_vreg(cmp_r), q_label(end_lbl)));
 
         ctx.loop_start_labels = vec_push_rt(ctx.loop_start_labels, cont_lbl);
@@ -10905,6 +10950,15 @@ func lower_stmt:
 
         cmp_r = fresh_vreg(ctx);
         ir_emit(ctx, q_instr(QOp.CmpLt, q_vreg(cmp_r), q_vreg(loop_var), q_vreg(end_v as int)));
+        if boot_bd_dump_on() != 0 do
+            extern func native_write_i64(addr: int, offset: int, val: int);
+            if g_boot_name_cell == 0 do
+                boot_name_cell_init();
+            end
+            native_write_i64(g_boot_name_cell, 128, 23);
+            boot_bd_push_cmp(cmp_r, loop_var, end_v as int);
+            boot_bd_push_jumpifnot(cmp_r, end_lbl);
+        end
         ir_emit(ctx, q_instr(QOp.JumpIfNot, q_none(), q_vreg(cmp_r), q_label(end_lbl)));
 
         ctx.loop_start_labels = vec_push_rt(ctx.loop_start_labels, cont_lbl);
@@ -16736,6 +16790,52 @@ func boot_cg_emit_bd_binop:
     boot_cg_str_fp0();
 end.
 
+func boot_cg_emit_bd_cmp:
+    # LDR x8/x9; CMP; CSET; STR — g_cg_off=a, g_cg_imm=b off, g_cg_target=dst, g_cg_rn=opc 20..25
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 160, g_cg_off);
+    native_write_i64(g_boot_name_cell, 168, g_cg_imm);
+    native_write_i64(g_boot_name_cell, 176, g_cg_target);
+    native_write_i64(g_boot_name_cell, 184, g_cg_rn);
+    g_cg_rd = 8;
+    boot_cg_ldr_fp0();
+    g_cg_off = native_read_i64(g_boot_name_cell, 168);
+    g_cg_rd = 9;
+    boot_cg_ldr_fp0();
+    # CMP X8, X9 = SUBS XZR, X8, X9
+    g_emit_word = 0xEB09011F;
+    boot_cg_emit_word0();
+    let cop = native_read_i64(g_boot_name_cell, 184);
+    # CSET into X8
+    g_emit_word = 0x9A9F17E0;  # EQ default (rd=x0 pattern; OR rd later)
+    if cop == 20 do
+        g_emit_word = 0x9A9F17E8
+    end
+    if cop == 21 do
+        g_emit_word = 0x9A9F07E8
+    end
+    if cop == 22 do
+        g_emit_word = 0x9A9FD7E8
+    end
+    if cop == 23 do
+        g_emit_word = 0x9A9FA7E8
+    end
+    if cop == 24 do
+        g_emit_word = 0x9A9FB7E8
+    end
+    if cop == 25 do
+        g_emit_word = 0x9A9FC7E8
+    end
+    boot_cg_emit_word0();
+    g_cg_off = native_read_i64(g_boot_name_cell, 176);
+    g_cg_rd = 8;
+    boot_cg_str_fp0();
+end.
+
 # Per-function label / branch fixups for body-dump emit.
 var g_bd_lbl_ids = 0;
 var g_bd_lbl_offs = 0;
@@ -17268,6 +17368,14 @@ func boot_codegen_emit_mod_min:
                 g_cg_off = boot_cg_slot_off(s1v);
                 g_cg_imm = s2v;
                 boot_cg_emit_bd_jumpif();
+            end
+
+            if opc >= 20 and opc <= 25 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_imm = boot_cg_slot_off(s2v);
+                g_cg_target = boot_cg_slot_off(dv);
+                g_cg_rn = opc;
+                boot_cg_emit_bd_cmp();
             end
 
             j = j + 1;
@@ -18197,10 +18305,12 @@ func boot_stage1_double:
     out x + x;
 end.
 func boot_stage1_choose:
-    if 0 do
-        out 9;
-    else
+    a = 1;
+    b = 2;
+    if a < b do
         out 7;
+    else
+        out 9;
     end
 end.
 func boot_stage1_compile:
@@ -18874,10 +18984,14 @@ var g_lir_opc = 0;
 var g_phase8_lir_emit = 0;  # 1 if Mach-O body came from LIR tables
 var g_phase8_fold_n = 0;
 var g_phase8_nop_n = 0;
+var g_mir_unsupported = 0;  # 1 if Q→MIR dropped a live opcode
+var g_mir_truncated = 0;    # 1 if MIR push hit capacity
+var g_mir_opt_applied = 0;    # 1 if flat opt ran and wrote back
 
 # MirOp codes (flat ints; keep stable for diagnostics)
 # 0 Nop 1 Move 2 Load 3 Store 4 Add 5 Sub 6 Mul 7 Div
 # 8 Call 9 Intrinsic(Print*) 10 Jump 11 JumpIf 12 Return
+# 13 JumpIfNot 14 Label 15-20 CmpEq..CmpLe 21 SetArg 22 Mod
 
 func boot_mir_tables_ensure:
     # Match body-dump capacity (262144B ≈ 32768 i64). Old 4096B/500-cap
@@ -18900,32 +19014,46 @@ func boot_mir_tables_init:
     g_mir_n = 0;
     g_lir_n = 0;
     g_phase8_lir_emit = 0;
+    g_mir_unsupported = 0;
+    g_mir_truncated = 0;
+    g_mir_opt_applied = 0;
 end.
 
 func q_opc_to_mir_opc(opc: int)
+    # Return 0 only for Nop or truly unsupported (caller flags unsupported).
+    if opc == 0 do out 0 end
     if opc == 1 do out 2 end
     if opc == 2 do out 1 end
     if opc == 3 do out 4 end
     if opc == 4 do out 5 end
     if opc == 5 do out 6 end
     if opc == 6 do out 7 end
+    if opc == 7 do out 22 end
+    if opc == 20 do out 15 end
+    if opc == 21 do out 16 end
+    if opc == 22 do out 17 end
+    if opc == 23 do out 18 end
+    if opc == 24 do out 19 end
+    if opc == 25 do out 20 end
+    if opc == 29 do out 11 end
+    if opc == 30 do out 10 end
+    if opc == 31 do out 13 end
+    if opc == 32 do out 14 end
     if opc == 34 do out 8 end
     if opc == 33 do out 8 end
     if opc == 40 do out 9 end
     if opc == 41 do out 9 end
-    if opc == 30 do out 10 end
-    if opc == 31 do out 11 end
     if opc == 35 do out 12 end
     if opc == 92 do out 2 end
     if opc == 93 do out 3 end
-    if opc == 96 do out 1 end
+    if opc == 96 do out 21 end
     out 0
 end.
 
 func mir_opc_to_lir_opc(mop: int)
     # LirOp: Nop0 Mov1 Add2 Sub3 Mul4 Div5 Call8 Jmp9 JmpCond10 Ret12 Load13 Store14
     if mop == 1 do out 1 end
-    if mop == 2 do out 1 end
+    if mop == 2 do out 13 end
     if mop == 3 do out 14 end
     if mop == 4 do out 2 end
     if mop == 5 do out 3 end
@@ -18936,6 +19064,11 @@ func mir_opc_to_lir_opc(mop: int)
     if mop == 10 do out 9 end
     if mop == 11 do out 10 end
     if mop == 12 do out 12 end
+    if mop == 13 do out 10 end
+    if mop == 14 do out 0 end
+    if mop >= 15 and mop <= 20 do out 1 end
+    if mop == 21 do out 1 end
+    if mop == 22 do out 5 end
     out 0
 end.
 
@@ -18946,6 +19079,7 @@ func boot_mir_push:
     boot_mir_tables_ensure();
     let ix = g_mir_n;
     if ix >= 30000 do
+        g_mir_truncated = 1;
         out
     end
     native_write_i64(g_mir_opc, ix * 8, mop);
@@ -18993,6 +19127,9 @@ func boot_build_mir_from_staging:
             let s2v = native_read_i64(g_bd_s2v, j * 8);
             let di = native_read_i64(g_bd_di, j * 8);
             let mop = q_opc_to_mir_opc(opc);
+            if opc != 0 and mop == 0 do
+                g_mir_unsupported = 1
+            end
             boot_mir_push(mop, dv, s1t, s1v, s1i, s2v);
             boot_mir_set_last_qopc(opc);
             boot_mir_set_last_di(di);
@@ -19015,6 +19152,9 @@ func boot_build_mir_from_staging:
                     s1t2 = 2
                 end
                 let mop2 = q_opc_to_mir_opc(opc2);
+                if opc2 != 0 and mop2 == 0 do
+                    g_mir_unsupported = 1
+                end
                 boot_mir_push(mop2, dv2, s1t2, s1v2, s1i2, s2v2);
                 boot_mir_set_last_qopc(opc2);
                 boot_mir_set_last_di(0);
@@ -19038,6 +19178,11 @@ end.
 
 
 # ── Phase-8 flat MIR opt (C-VM safe; nop-in-place, no stream compact) ──
+# Soundness rules:
+# - Clear const/alias at function starts, labels, jumps, calls, returns.
+# - Kill destination facts on every defining opcode (mutable vregs).
+# - dead_load_dce disabled (unsafe with vreg reuse / no liveness).
+# - After opt, write back into g_bd_* when lengths match so emit sees results.
 
 func boot_mir_project_lir:
     extern func native_read_i64(addr: int, offset: int) -> int;
@@ -19083,17 +19228,124 @@ func boot_mir_rewrite_load_imm:
     g_phase8_fold_n = g_phase8_fold_n + 1;
 end.
 
-func boot_mir_flat_const_fold:
-    extern func native_read_i64(addr: int, offset: int) -> int;
+func boot_mir_qopc_is_barrier:
+    in(qopc: int)
+    # Control-flow / call / return — facts must not cross.
+    if qopc == 29 or qopc == 30 or qopc == 31 or qopc == 32 do
+        out 1
+    end
+    if qopc == 33 or qopc == 34 or qopc == 35 do
+        out 1
+    end
+    out 0
+end.
+
+func boot_mir_qopc_defines:
+    in(qopc: int)
+    # Opcodes that write mir_dst as a vreg result.
+    if qopc == 1 or qopc == 2 do
+        out 1
+    end
+    if qopc >= 3 and qopc <= 12 do
+        out 1
+    end
+    if qopc >= 20 and qopc <= 25 do
+        out 1
+    end
+    if qopc == 34 or qopc == 92 or qopc == 94 or qopc == 95 or qopc == 97 do
+        out 1
+    end
+    if qopc == 50 or qopc == 52 or qopc == 54 do
+        out 1
+    end
+    if qopc == 60 or qopc == 62 or qopc == 64 do
+        out 1
+    end
+    if qopc >= 70 and qopc <= 75 do
+        out 1
+    end
+    out 0
+end.
+
+func boot_mir_clear_const_tab:
     extern func native_write_i64(addr: int, offset: int, val: int);
     if g_boot_vreg_tab == 0 do
-        g_boot_vreg_tab = heap_alloc(256);
+        out
     end
     let zi = 0;
     when zi < 32 loop
         native_write_i64(g_boot_vreg_tab, zi * 8, 0);
         zi = zi + 1
     end
+end.
+
+func boot_mir_clear_alias_tab:
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_vreg_alias == 0 do
+        out
+    end
+    let zi = 0;
+    when zi < 64 loop
+        native_write_i64(g_boot_vreg_alias, zi * 8, 0);
+        zi = zi + 1
+    end
+end.
+
+func boot_mir_kill_const:
+    in(dv: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_vreg_tab == 0 do
+        out
+    end
+    if dv >= 0 and dv < 32 do
+        native_write_i64(g_boot_vreg_tab, dv * 8, 0)
+    end
+end.
+
+func boot_mir_kill_alias:
+    in(dv: int)
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_vreg_alias == 0 do
+        out
+    end
+    if dv >= 0 and dv < 64 do
+        native_write_i64(g_boot_vreg_alias, dv * 8, 0)
+    end
+    # Also drop aliases that pointed at the redefined vreg.
+    let zi = 0;
+    when zi < 64 loop
+        let a = native_read_i64(g_boot_vreg_alias, zi * 8);
+        if a == dv + 1 do
+            native_write_i64(g_boot_vreg_alias, zi * 8, 0)
+        end
+        zi = zi + 1
+    end
+end.
+
+func boot_mir_at_func_start:
+    in(ix: int)
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if g_bd_nfuncs <= 0 or g_bd_fstart == 0 do
+        out 0
+    end
+    let fi = 0;
+    when fi < g_bd_nfuncs loop
+        if native_read_i64(g_bd_fstart, fi * 8) == ix do
+            out 1
+        end
+        fi = fi + 1
+    end
+    out 0
+end.
+
+func boot_mir_flat_const_fold:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_vreg_tab == 0 do
+        g_boot_vreg_tab = heap_alloc(256);
+    end
+    boot_mir_clear_const_tab();
 
     var i = 0;
     when i < g_mir_n loop
@@ -19104,24 +19356,29 @@ func boot_mir_flat_const_fold:
         let s1i = native_read_i64(g_mir_s1i, i * 8);
         let s2v = native_read_i64(g_mir_s2v, i * 8);
 
-        # Call clobbers — drop known consts
-        if qopc == 34 do
-            let z = 0;
-            when z < 32 loop
-                native_write_i64(g_boot_vreg_tab, z * 8, 0);
-                z = z + 1
-            end
+        if boot_mir_at_func_start(i) != 0 do
+            boot_mir_clear_const_tab()
+        end
+        if boot_mir_qopc_is_barrier(qopc) != 0 do
+            boot_mir_clear_const_tab()
+        end
+
+        if boot_mir_qopc_defines(qopc) != 0 do
+            boot_mir_kill_const(d_v)
         end
 
         # Load / Move → track consts; strengthen to Load imm when src known
         if qopc == 1 or qopc == 2 do
             if d_v >= 0 and d_v < 32 do
                 if s1t == 2 do
-                    native_write_i64(g_boot_vreg_tab, d_v * 8, s1i + 1);
-                    if qopc == 2 do
-                        g_cg_rd = d_v;
-                        g_cg_imm = s1i;
-                        boot_mir_rewrite_load_imm(i)
+                    # Encode imm+1; reject negatives (unrepresentable with 0=unknown).
+                    if s1i >= 0 do
+                        native_write_i64(g_boot_vreg_tab, d_v * 8, s1i + 1);
+                        if qopc == 2 do
+                            g_cg_rd = d_v;
+                            g_cg_imm = s1i;
+                            boot_mir_rewrite_load_imm(i)
+                        end
                     end
                 else
                     if s1v >= 0 and s1v < 32 do
@@ -19137,13 +19394,15 @@ func boot_mir_flat_const_fold:
             end
         end
 
-        # Binops → Load imm when both sides const
+        # Binops → Load imm when both sides const (non-negative only)
         if qopc == 3 or qopc == 4 or qopc == 5 or qopc == 6 or qopc == 7 do
             if d_v >= 0 and d_v < 32 do
                 var av = 0 - 1;
                 var bv = 0 - 1;
                 if s1t == 2 do
-                    av = s1i
+                    if s1i >= 0 do
+                        av = s1i
+                    end
                 else
                     if s1v >= 0 and s1v < 32 do
                         let ra = native_read_i64(g_boot_vreg_tab, s1v * 8);
@@ -19198,7 +19457,7 @@ func boot_mir_flat_dce_nop:
     var i = 0;
     when i < g_mir_n loop
         let qopc = native_read_i64(g_mir_qopc, i * 8);
-        # Identity Move vreg→same vreg
+        # Identity Move vreg→same vreg (always safe)
         if qopc == 2 do
             let d_v = native_read_i64(g_mir_dst, i * 8);
             let s1t = native_read_i64(g_mir_s1t, i * 8);
@@ -19207,8 +19466,6 @@ func boot_mir_flat_dce_nop:
                 boot_mir_nop_at(i)
             end
         end
-        # Load imm 0 into unused pattern — skip (too aggressive)
-        # Redundant Load imm after fold: if instr already Nop (qopc 0), leave it
         i = i + 1
     end
 end.
@@ -19221,11 +19478,7 @@ func boot_mir_flat_copy_prop:
     if g_boot_vreg_alias == 0 do
         g_boot_vreg_alias = heap_alloc(512);
     end
-    let zi = 0;
-    when zi < 64 loop
-        native_write_i64(g_boot_vreg_alias, zi * 8, 0);
-        zi = zi + 1
-    end
+    boot_mir_clear_alias_tab();
 
     var i = 0;
     when i < g_mir_n loop
@@ -19235,36 +19488,40 @@ func boot_mir_flat_copy_prop:
         let s1v = native_read_i64(g_mir_s1v, i * 8);
         let s2v = native_read_i64(g_mir_s2v, i * 8);
 
-        if qopc == 34 do
-            let z = 0;
-            when z < 64 loop
-                native_write_i64(g_boot_vreg_alias, z * 8, 0);
-                z = z + 1
-            end
+        if boot_mir_at_func_start(i) != 0 do
+            boot_mir_clear_alias_tab()
+        end
+        if boot_mir_qopc_is_barrier(qopc) != 0 do
+            boot_mir_clear_alias_tab()
         end
 
+        # Rewrite uses through alias before killing/redefining dst.
         if s1t == 1 and s1v >= 0 and s1v < 64 do
             let alias1 = native_read_i64(g_boot_vreg_alias, s1v * 8);
             if alias1 > 0 do
-                let orig1 = alias1 - 1;
-                native_write_i64(g_mir_s1v, i * 8, orig1);
+                native_write_i64(g_mir_s1v, i * 8, alias1 - 1)
             end
         end
-
         if s2v >= 0 and s2v < 64 do
             let alias2 = native_read_i64(g_boot_vreg_alias, s2v * 8);
             if alias2 > 0 do
-                let orig2 = alias2 - 1;
-                native_write_i64(g_mir_s2v, i * 8, orig2);
+                native_write_i64(g_mir_s2v, i * 8, alias2 - 1)
             end
         end
 
-        if qopc == 2 and s1t == 1 and d_v >= 0 and d_v < 64 and s1v >= 0 and s1v < 64 do
-            let target_alias = native_read_i64(g_boot_vreg_alias, s1v * 8);
+        if boot_mir_qopc_defines(qopc) != 0 do
+            boot_mir_kill_alias(d_v)
+        end
+
+        # Re-read s1 after rewrite for move-alias install.
+        let s1t2 = native_read_i64(g_mir_s1t, i * 8);
+        let s1v2 = native_read_i64(g_mir_s1v, i * 8);
+        if qopc == 2 and s1t2 == 1 and d_v >= 0 and d_v < 64 and s1v2 >= 0 and s1v2 < 64 do
+            let target_alias = native_read_i64(g_boot_vreg_alias, s1v2 * 8);
             if target_alias > 0 do
-                native_write_i64(g_boot_vreg_alias, d_v * 8, target_alias);
+                native_write_i64(g_boot_vreg_alias, d_v * 8, target_alias)
             else
-                native_write_i64(g_boot_vreg_alias, d_v * 8, s1v + 1);
+                native_write_i64(g_boot_vreg_alias, d_v * 8, s1v2 + 1)
             end
         end
 
@@ -19275,55 +19532,91 @@ end.
 var g_boot_vreg_used = 0;
 
 func boot_mir_flat_dead_load_dce:
+    # Disabled: global use-mark DCE is unsound with mutable vreg reuse and no CFG.
+    out
+end.
+
+func boot_mir_writeback_to_bd:
+    # Project optimized MIR rows back into body-dump so multifn emit consumes them.
     extern func native_read_i64(addr: int, offset: int) -> int;
     extern func native_write_i64(addr: int, offset: int, val: int);
-    if g_boot_vreg_used == 0 do
-        g_boot_vreg_used = heap_alloc(512);
+    if g_bd_total <= 0 or g_mir_n != g_bd_total do
+        out 0
     end
-    let zi = 0;
-    when zi < 64 loop
-        native_write_i64(g_boot_vreg_used, zi * 8, 0);
-        zi = zi + 1
+    if g_bd_opc == 0 do
+        out 0
     end
-
     var i = 0;
     when i < g_mir_n loop
+        let qopc = native_read_i64(g_mir_qopc, i * 8);
+        let dv = native_read_i64(g_mir_dst, i * 8);
+        let di = native_read_i64(g_mir_di, i * 8);
         let s1t = native_read_i64(g_mir_s1t, i * 8);
         let s1v = native_read_i64(g_mir_s1v, i * 8);
+        let s1i = native_read_i64(g_mir_s1i, i * 8);
         let s2v = native_read_i64(g_mir_s2v, i * 8);
-
-        if s1t == 1 and s1v >= 0 and s1v < 64 do
-            native_write_i64(g_boot_vreg_used, s1v * 8, 1);
-        end
-        if s2v >= 0 and s2v < 64 do
-            native_write_i64(g_boot_vreg_used, s2v * 8, 1);
-        end
+        native_write_i64(g_bd_opc, i * 8, qopc);
+        native_write_i64(g_bd_dv, i * 8, dv);
+        native_write_i64(g_bd_di, i * 8, di);
+        native_write_i64(g_bd_s1t, i * 8, s1t);
+        native_write_i64(g_bd_s1v, i * 8, s1v);
+        native_write_i64(g_bd_s1i, i * 8, s1i);
+        native_write_i64(g_bd_s2v, i * 8, s2v);
         i = i + 1
     end
+    out 1
+end.
 
-    i = 0;
+func boot_mir_verify_basic:
+    # Lightweight integrity check before/after opt.
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if g_mir_n < 0 do
+        out 0
+    end
+    if g_mir_truncated != 0 do
+        out 0
+    end
+    var i = 0;
     when i < g_mir_n loop
         let qopc = native_read_i64(g_mir_qopc, i * 8);
-        let d_v = native_read_i64(g_mir_dst, i * 8);
-        if (qopc == 1 or qopc == 2) and d_v >= 0 and d_v < 64 do
-            let is_used = native_read_i64(g_boot_vreg_used, d_v * 8);
-            if is_used == 0 do
-                boot_mir_nop_at(i);
-            end
+        let mop = native_read_i64(g_mir_opc, i * 8);
+        if qopc != 0 and mop == 0 do
+            out 0
         end
         i = i + 1
     end
+    out 1
 end.
 
 func boot_mir_flat_opt:
     g_phase8_fold_n = 0;
     g_phase8_nop_n = 0;
+    g_mir_opt_applied = 0;
+    if g_mir_unsupported != 0 or g_mir_truncated != 0 do
+        print_ln("virc: phase8 — skip flat opt (unsupported/truncated MIR)");
+        boot_mir_project_lir();
+        out
+    end
+    if boot_mir_verify_basic() == 0 do
+        print_ln("virc: phase8 — skip flat opt (verify failed)");
+        boot_mir_project_lir();
+        out
+    end
     boot_mir_flat_const_fold();
     boot_mir_flat_copy_prop();
     boot_mir_flat_dead_load_dce();
     boot_mir_flat_dce_nop();
     boot_mir_project_lir();
-    print_ln("virc: phase8 — flat opt done");
+    if boot_mir_verify_basic() == 0 do
+        print_ln("virc: phase8 warn — post-opt verify failed; no bd writeback");
+        out
+    end
+    if boot_mir_writeback_to_bd() != 0 do
+        g_mir_opt_applied = 1;
+        print_ln("virc: phase8 — flat opt done (bd writeback)")
+    else
+        print_ln("virc: phase8 — flat opt done (shadow MIR only)")
+    end
 end.
 
 func boot_lir_stream_has_call:
@@ -19479,6 +19772,11 @@ func boot_codegen_from_lir_multifn:
                 let s1i = native_read_i64(g_bd_s1i, ix * 8);
                 let s2v = native_read_i64(g_bd_s2v, ix * 8);
 
+                if opc == 0 do
+                    # Nop from flat opt — skip
+                    _ = 0
+                else
+
                 if opc == 1 do
                     let immv = s1i;
                     if immv < 0 do
@@ -19561,6 +19859,16 @@ func boot_codegen_from_lir_multifn:
                     g_cg_off = boot_cg_slot_off(s1v);
                     g_cg_imm = s2v;
                     boot_cg_emit_bd_jumpif()
+                end
+
+                if opc >= 20 and opc <= 25 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_imm = boot_cg_slot_off(s2v);
+                    g_cg_target = boot_cg_slot_off(dv);
+                    g_cg_rn = opc;
+                    boot_cg_emit_bd_cmp()
+                end
+
                 end
 
                 j = j + 1
@@ -19803,11 +20111,21 @@ end.
 func boot_phase8_mir_lir_gate:
     let n = boot_build_mir_from_staging();
     if n <= 0 do
-        print_ln("virc: phase8 warn — MIR/LIR empty; Q emit continues");
+        print_ln("virc: phase8 warn — MIR/LIR empty; Q/body-dump emit continues");
         out 0
     end
+    if g_mir_unsupported != 0 do
+        print_ln("virc: phase8 warn — unsupported Q ops in MIR map (shadow/raw emit)")
+    end
+    if g_mir_truncated != 0 do
+        print_ln("virc: phase8 warn — MIR truncated at capacity")
+    end
     boot_mir_flat_opt();
-    print_ln("virc: phase8 — MIR/LIR tables ready");
+    if g_mir_opt_applied != 0 do
+        print_ln("virc: phase8 — MIR opt applied to body-dump")
+    else
+        print_ln("virc: phase8 — MIR/LIR tables ready (emit still prefers body-dump)")
+    end
     out n
 end.
 
