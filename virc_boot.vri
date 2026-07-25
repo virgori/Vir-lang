@@ -11492,41 +11492,29 @@ func lower_program:
         end
         i = i + 1;
     end
-    # Small multi-fn programs (Call smoke): dual-emit into QFunction.body and
-    # codegen via native body dump. Gate ONLY on func count — g_snap_ast_kids
-    # / vec_len_rt can be clobbered on C VM to a small value and falsely enable
-    # small_multi on self-host (~600 funcs) → multi-minute lower hang.
+    # 3-tier (MIR→LIR→codegen): ALWAYS lower into body-dump MIR.
+    # No Q-IR emit fallback — suite/Stage-1 debug the MIR stream only.
     boot_set_small_multi(0);
-    boot_set_bd_dump(0);
-    boot_set_bd_cap(1000);
+    boot_set_bd_dump(1);
+    boot_set_bd_cap(30000);
+    boot_body_dump_init();
+    g_bd_total = 0;
+    g_bd_nfuncs = 0;
+    # Call smoke (2..7 funcs): keep small_multi for param/vmap quirks during lower.
     if g_boot_nfuncs_reg > 1 and g_boot_nfuncs_reg < 8 do
         boot_set_small_multi(1);
-        boot_body_dump_init();
-        g_bd_total = 0;
-        g_bd_nfuncs = 0;
     end
-    # Persist func count in native cell — Vir globals clobber under deep calls.
     extern func native_write_i64(addr: int, offset: int, val: int);
     if g_boot_name_cell == 0 do
         boot_name_cell_init();
     end
     native_write_i64(g_boot_name_cell, 144, g_boot_nfuncs_reg);
     native_write_i64(g_boot_name_cell, 136, 0);
-    # >64: scale65/70 + self-host use body-dump emit (flat MIR empty otherwise).
-    # Stub-main / force-stub stay gated on >256 so scale suites keep real main.
     if g_boot_nfuncs_reg > 64 do
-        # Dump lowered bodies (name-cell flag, not small_multi) so
-        # boot_codegen_emit_mod_min can emit real ARM64 instead of basic42 stub.
-        boot_set_bd_dump(1);
-        boot_set_bd_cap(30000);
-        boot_body_dump_init();
-        g_bd_total = 0;
-        g_bd_nfuncs = 0;
-        extern func native_write_i64(addr: int, offset: int, val: int);
         native_write_i64(g_boot_name_cell, 216, 0);
         native_write_i64(g_boot_name_cell, 224, 0);
         native_write_i64(g_boot_name_cell, 248, 0);
-        print_ln("virc: self-host lower mode (cap + body-dump)");
+        print_ln("virc: MIR lower mode (body-dump always on)");
     end
 
     # Pass 2: lower function bodies and top-level code
@@ -18327,7 +18315,9 @@ end.
 
 
 func boot_do_lower:
-    print_ln("virc: lowering to Q-IR...");
+    # 3-tier pipeline: lower → MIR (body-dump) → LIR tables → Mach-O.
+    # Q-IR entity bodies are not an emit source (legacy fallback removed).
+    print_ln("virc: lowering to MIR...");
     boot_q_stage_reset();
     g_boot_fn_progress = 0;
     g_cur_func_body = 0;
@@ -18353,61 +18343,21 @@ func boot_do_lower:
     g_snap_mod_strings = g_mod_strings_acc;
     g_snap_func_count = vec_len_rt(g_snap_mod_funcs);
     g_dbg_nfunc = g_snap_func_count;
-    if g_snap_func_count == 0 and g_boot_emit_count == 0 do
-        print_ln("virc: error_msg: lower produced no functions");
+    if g_bd_total <= 0 and g_snap_func_count == 0 and g_boot_emit_count == 0 do
+        print_ln("virc: error_msg: lower produced no MIR");
         sys_exit(1);
     end
-    print_ln("virc: lower done");
+    print_ln("virc: MIR lower done");
 
     boot_phase8_mir_lir_gate();
 
-    print_ln("virc: generating ARM64 machine code...");
-    let body0_n = 0;
-    if g_snap_func_count > 0 do
-        let f0 = vec_get_rt(g_snap_mod_funcs, 0);
-        body0_n = vec_len_rt(f0.body);
+    if g_bd_total <= 0 or g_lir_n <= 0 do
+        print_ln("virc: error_msg: empty MIR/LIR — refusing Q-IR fallback");
+        sys_exit(1);
     end
 
-    # Prefer Phase-8 LIR-table emit (multifn Call/PrintStr or flat const-fold).
-    var used_lir_emit = 0;
-    if g_lir_n > 0 do
-        if boot_lir_stream_needs_q_fallback() == 0 do
-            print_ln("virc: codegen via LIR tables");
-            boot_codegen_from_lir_tables();
-            used_lir_emit = 1
-        end
-    end
-
-    if used_lir_emit == 0 do
-        if g_bd_total > 0 do
-            print_ln("virc: codegen via body-dump");
-        end
-        if g_boot_small_multi != 0 or g_bd_total > 0 do
-            let real_mod = QModule {
-                name:       "main",
-                functions:  g_snap_mod_funcs,
-                strings:    g_snap_mod_strings
-            };
-            boot_codegen_emit_mod_min(real_mod);
-            g_snap_entry_off = g_code_start_offset;
-        else
-            if g_boot_emit_count > 0 do
-                boot_codegen_flat_min();
-            else
-                if body0_n > 0 do
-                    let real_mod2 = QModule {
-                        name:       "main",
-                        functions:  g_snap_mod_funcs,
-                        strings:    g_snap_mod_strings
-                    };
-                    boot_codegen_emit_mod_min(real_mod2);
-                    g_snap_entry_off = g_code_start_offset;
-                else
-                    boot_codegen_basic42();
-                end
-            end
-        end
-    end
+    print_ln("virc: generating ARM64 from LIR...");
+    boot_codegen_from_lir_tables();
     print_ln("virc: linking Mach-O executable...");
     let code_size = codebuf_len();
     if code_size == 0 do
@@ -19636,23 +19586,7 @@ func boot_lir_stream_has_call:
 end.
 
 func boot_lir_stream_needs_q_fallback:
-    extern func native_read_i64(addr: int, offset: int) -> int;
-    # Call/SetArg need per-function body-dump metadata (func_tab / slots).
-    if boot_lir_stream_has_call() != 0 do
-        if g_bd_nfuncs <= 0 or g_bd_total <= 0 do
-            out 1
-        end
-    end
-    var i = 0;
-    when i < g_mir_n loop
-        let q = native_read_i64(g_mir_qopc, i * 8);
-        if q == 41 do
-            if g_bd_strdata == 0 do
-                out 1
-            end
-        end
-        i = i + 1
-    end
+    # Legacy Q-IR fallback removed — 3-tier MIR/LIR only.
     out 0
 end.
 
@@ -19921,22 +19855,9 @@ end.
 func boot_codegen_from_lir_tables:
     extern func native_read_i64(addr: int, offset: int) -> int;
     extern func native_write_i64(addr: int, offset: int, val: int);
-    # Self-host: LIR multifn over large dumps has been SIGSEGV-prone; body-dump
-    # emit reads g_bd_* directly and is the Stage-1 path.
-    if g_bd_nfuncs > 256 and g_bd_total > 0 do
-        print_ln("virc: codegen via body-dump (self-host)");
-        let real_mod = QModule {
-            name:       "main",
-            functions:  g_snap_mod_funcs,
-            strings:    g_snap_mod_strings
-        };
-        boot_codegen_emit_mod_min(real_mod);
-        g_phase8_lir_emit = 1;
-        out 0
-    end
-    # Prefer multi-fn LIR emit when body-dump function table is available.
+    # Sole codegen entry: MIR/body-dump bounds + LIR/MIR rows. No QModule path.
     if g_bd_nfuncs > 0 and g_bd_total > 0 and g_lir_n > 0 do
-        print_ln("virc: codegen via LIR multifn");
+        print_ln("virc: codegen via LIR multifn (MIR tier)");
         boot_codegen_from_lir_multifn();
         out 0
     end
