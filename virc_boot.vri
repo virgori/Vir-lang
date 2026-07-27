@@ -1666,9 +1666,19 @@ extern func native_write_u8(addr: int, offset: int, val: int);
 const BVEC_INIT_CAP = 4096;
 
 func bvec_new:
-    let base = vir_alloc(HEADER_SIZE + BVEC_INIT_CAP);
+    out bvec_new_cap(BVEC_INIT_CAP);
+end.
+
+# Capacity `cap` bytes, length 0 — avoids realloc churn during large codegen.
+func bvec_new_cap:
+    in(cap: int)
+    let c = cap;
+    if c < 64 do
+        c = 64;
+    end
+    let base = vir_alloc(HEADER_SIZE + c);
     let data = base + HEADER_SIZE;
-    native_write_i64(base, 0, BVEC_INIT_CAP);
+    native_write_i64(base, 0, c);
     native_write_i64(base, 1, 0);
     out data;
 end.
@@ -3209,11 +3219,10 @@ end.
 func macho_emit:
     in(b: MachOBuilder, entry_off_param: int)
 
-    g_mach_buf = b.buf;
+    # Always fresh output buffer. Reusing b.buf/g_mach_buf can prepend
+    # leftover MIR/code tables (~32KB) so MH_MAGIC is not at file offset 0.
     g_mach_text_code = b.text_code;
-    if g_mach_buf == 0 do
-        g_mach_buf = bvec_new();
-    end
+    g_mach_buf = bvec_new_cap(1048576);
 
     let page = PAGE_SIZE_ARM64;
     let code_size = bvec_len(g_mach_text_code);
@@ -3413,6 +3422,20 @@ func macho_write_to_file:
     b = macho_emit(b, eo);
     let data = bvec_data_ptr(g_mach_buf);
     let size = bvec_len(g_mach_buf);
+    # If a stale prefix slipped in, slide to MH_MAGIC_64 (0xFEEDFACF LE).
+    let off = 0;
+    when off + 4 <= size loop
+        let b0 = native_read_u8(data, off);
+        let b1 = native_read_u8(data, off + 1);
+        let b2 = native_read_u8(data, off + 2);
+        let b3 = native_read_u8(data, off + 3);
+        if b0 == 0xCF and b1 == 0xFA and b2 == 0xED and b3 == 0xFE do
+            data = data + off;
+            size = size - off;
+            break;
+        end
+        off = off + 1;
+    end
     write_file_bytes(path, data, size, 0o755);
     out true;
 end.
@@ -4990,7 +5013,7 @@ func tokenize_full:
 
         # shr (cast in v1.2)
         if c == 62 and c2 == 62 do
-            tok = token_new(TokType.Cast, g_lx_line, g_lx_col);
+            tok = token_new(TokType.BitShr, g_lx_line, g_lx_col);
             var (l1, _) = lex_advance(lex);
             var (l2, _) = lex_advance(l1);
             lex = l2;
@@ -5364,12 +5387,18 @@ var g_block_init_const = 0;
 var g_boot_last_vreg = 0 - 1;
 var g_boot_name_cell = 0;   # heap i64[2]: [0]=var_name, [1]=print_name (native)
 var g_boot_nvreg_cell = 0;  # native next-vreg counter (LowerCtx.next_vreg unreliable)
+var g_boot_label_cell = 0;  # native next-label counter (LowerCtx.label_counter unreliable)
+var g_boot_loop_depth = 0;  # native loop nest (LowerCtx.loop_* unreliable)
+var g_boot_loop_starts = 0;
+var g_boot_loop_ends = 0;
 
 func boot_name_cell_init:
     extern func native_write_i64(addr: int, offset: int, val: int);
     if g_boot_name_cell == 0 do
-        # ≥1024B: slots through ~296 (func_tab / call fixup ptrs).
-        g_boot_name_cell = heap_alloc(1024);
+        # native_write_i64 offset is i64 ELEMENTS (×8). Slots used up to ~700+;
+        # old 2048B cell only held 256 elements → OOB writes clobbered heap /
+        # codebuf (Stage-1 emit SIGSEGV with insn-shaped pointers).
+        g_boot_name_cell = heap_alloc(65536);
     end
     native_write_i64(g_boot_name_cell, 0, 0);
     native_write_i64(g_boot_name_cell, 8, 0);
@@ -5749,6 +5778,9 @@ enum BuiltinId:
     PrintStr        = 22;
     GetArg          = 23;
     ArgCount        = 24;
+    SlurpFile       = 25;
+    SlurpLen        = 26;
+    WriteBytes      = 27;
 end.
 
 entity BuiltinEntry:
@@ -5786,6 +5818,9 @@ func build_builtins:
     table = vec_push_rt(table, BuiltinEntry ( name: "print_str", bid: BuiltinId::PrintStr ));
     table = vec_push_rt(table, BuiltinEntry ( name: "get_arg", bid: BuiltinId::GetArg ));
     table = vec_push_rt(table, BuiltinEntry ( name: "arg_count", bid: BuiltinId::ArgCount ));
+    table = vec_push_rt(table, BuiltinEntry ( name: "slurp_file", bid: BuiltinId::SlurpFile ));
+    table = vec_push_rt(table, BuiltinEntry ( name: "slurp_len", bid: BuiltinId::SlurpLen ));
+    table = vec_push_rt(table, BuiltinEntry ( name: "write_bytes", bid: BuiltinId::WriteBytes ));
     out table;
 end.
 
@@ -6974,6 +7009,134 @@ func boot_blk_set_binop_ops:
     native_write_i64(g_boot_blk_rhs, idx * 8, rhs);
 end.
 
+
+# Nested parse_block (if/while/when/loop bodies) used to clobber the enclosing
+# block's in-progress g_boot_blk_* staging. Save/restore around every call.
+var g_boot_blk_stack_types = 0;
+var g_boot_blk_stack_names = 0;
+var g_boot_blk_stack_inits = 0;
+var g_boot_blk_stack_lhs = 0;
+var g_boot_blk_stack_rhs = 0;
+var g_boot_blk_stack_counts = 0;
+var g_boot_blk_depth = 0;
+# Last finished parse_block — survives pop_scope so boot_func_blk_snap_at
+# (called after parse_block returns) still sees the body just parsed.
+var g_boot_fin_types = 0;
+var g_boot_fin_names = 0;
+var g_boot_fin_inits = 0;
+var g_boot_fin_lhs = 0;
+var g_boot_fin_rhs = 0;
+var g_boot_fin_count = 0;
+
+func boot_blk_stack_ensure:
+    if g_boot_blk_stack_types == 0 do
+        # 64 nesting levels × 4096B each (matches boot_blk_reset's per-block cap).
+        g_boot_blk_stack_types = heap_alloc(262144);
+        g_boot_blk_stack_names = heap_alloc(262144);
+        g_boot_blk_stack_inits = heap_alloc(262144);
+        g_boot_blk_stack_lhs = heap_alloc(262144);
+        g_boot_blk_stack_rhs = heap_alloc(262144);
+        g_boot_blk_stack_counts = heap_alloc(512);
+    end
+end.
+
+func boot_blk_push_scope:
+    # Save the caller's (enclosing block's) current staging before a nested
+    # parse_block() call resets/overwrites the shared g_boot_blk_* globals.
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    boot_blk_stack_ensure();
+    let d = g_boot_blk_depth;
+    if d < 0 or d >= 64 do
+        g_boot_blk_depth = d + 1;
+        out;
+    end
+    let n = g_boot_blk_count;
+    if n < 0 do
+        n = 0;
+    end
+    if n > 512 do
+        n = 512;
+    end
+    native_write_i64(g_boot_blk_stack_counts, d * 8, n);
+    let base = d * 4096;
+    let i = 0;
+    when i < n loop
+        native_write_i64(g_boot_blk_stack_types, base + i * 8, native_read_i64(g_boot_blk_types, i * 8));
+        native_write_i64(g_boot_blk_stack_names, base + i * 8, native_read_i64(g_boot_blk_names, i * 8));
+        native_write_i64(g_boot_blk_stack_inits, base + i * 8, native_read_i64(g_boot_blk_inits, i * 8));
+        native_write_i64(g_boot_blk_stack_lhs, base + i * 8, native_read_i64(g_boot_blk_lhs, i * 8));
+        native_write_i64(g_boot_blk_stack_rhs, base + i * 8, native_read_i64(g_boot_blk_rhs, i * 8));
+        i = i + 1;
+    end
+    g_boot_blk_depth = d + 1;
+end.
+
+func boot_blk_pop_scope:
+    # Restore the enclosing block's staging after the nested parse_block()
+    # returns, so subsequent sibling statements in the OUTER block are staged
+    # at the correct indices.
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if g_boot_blk_depth <= 0 do
+        out;
+    end
+    let d = g_boot_blk_depth - 1;
+    g_boot_blk_depth = d;
+    if d < 0 or d >= 64 do
+        out;
+    end
+    let n = native_read_i64(g_boot_blk_stack_counts, d * 8);
+    if n < 0 do
+        n = 0;
+    end
+    if n > 512 do
+        n = 512;
+    end
+    let base = d * 4096;
+    let i = 0;
+    when i < n loop
+        native_write_i64(g_boot_blk_types, i * 8, native_read_i64(g_boot_blk_stack_types, base + i * 8));
+        native_write_i64(g_boot_blk_names, i * 8, native_read_i64(g_boot_blk_stack_names, base + i * 8));
+        native_write_i64(g_boot_blk_inits, i * 8, native_read_i64(g_boot_blk_stack_inits, base + i * 8));
+        native_write_i64(g_boot_blk_lhs, i * 8, native_read_i64(g_boot_blk_stack_lhs, base + i * 8));
+        native_write_i64(g_boot_blk_rhs, i * 8, native_read_i64(g_boot_blk_stack_rhs, base + i * 8));
+        i = i + 1;
+    end
+    g_boot_blk_count = n;
+end.
+
+func boot_blk_finish_snapshot:
+    # Freeze the block just parsed into g_boot_fin_* BEFORE pop_scope restores
+    # the outer staging. boot_func_blk_snap_at reads from here.
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if g_boot_fin_types == 0 do
+        g_boot_fin_types = heap_alloc(4096);
+        g_boot_fin_names = heap_alloc(4096);
+        g_boot_fin_inits = heap_alloc(4096);
+        g_boot_fin_lhs = heap_alloc(4096);
+        g_boot_fin_rhs = heap_alloc(4096);
+    end
+    let n = g_boot_blk_count;
+    if n < 0 do
+        n = 0;
+    end
+    if n > 512 do
+        n = 512;
+    end
+    g_boot_fin_count = n;
+    let i = 0;
+    when i < n loop
+        native_write_i64(g_boot_fin_types, i * 8, native_read_i64(g_boot_blk_types, i * 8));
+        native_write_i64(g_boot_fin_names, i * 8, native_read_i64(g_boot_blk_names, i * 8));
+        native_write_i64(g_boot_fin_inits, i * 8, native_read_i64(g_boot_blk_inits, i * 8));
+        native_write_i64(g_boot_fin_lhs, i * 8, native_read_i64(g_boot_blk_lhs, i * 8));
+        native_write_i64(g_boot_fin_rhs, i * 8, native_read_i64(g_boot_blk_rhs, i * 8));
+        i = i + 1;
+    end
+end.
+
 # Per-FuncDef body-block staging (survives later parse_block overwrites).
 # Parallel to g_boot_func_snap_n: count_tab[i] / off_tab[i] into packed arenas.
 var g_boot_fblk_count_tab = 0;
@@ -7004,7 +7167,9 @@ func boot_fblk_arena_reset:
 end.
 
 func boot_func_blk_snap_at:
-    # Copy current g_boot_blk_* into arena at func-snap index `ix`.
+    # Copy the just-finished parse_block (g_boot_fin_*) into the arena.
+    # Must NOT read live g_boot_blk_* — parse_block pops the outer scope before
+    # returning, so those globals no longer hold this FuncDef's body.
     in(ix: int)
     extern func native_write_i64(addr: int, offset: int, val: int);
     extern func native_read_i64(addr: int, offset: int) -> int;
@@ -7012,7 +7177,7 @@ func boot_func_blk_snap_at:
     if ix < 0 or ix >= 2000 do
         out;
     end
-    let n = g_boot_blk_count;
+    let n = g_boot_fin_count;
     if n < 0 do
         n = 0;
     end
@@ -7029,11 +7194,11 @@ func boot_func_blk_snap_at:
     native_write_i64(g_boot_fblk_off_tab, ix * 8, off);
     let i = 0;
     when i < n loop
-        native_write_i64(g_boot_fblk_arena_types, (off + i) * 8, native_read_i64(g_boot_blk_types, i * 8));
-        native_write_i64(g_boot_fblk_arena_names, (off + i) * 8, native_read_i64(g_boot_blk_names, i * 8));
-        native_write_i64(g_boot_fblk_arena_inits, (off + i) * 8, native_read_i64(g_boot_blk_inits, i * 8));
-        native_write_i64(g_boot_fblk_arena_lhs, (off + i) * 8, native_read_i64(g_boot_blk_lhs, i * 8));
-        native_write_i64(g_boot_fblk_arena_rhs, (off + i) * 8, native_read_i64(g_boot_blk_rhs, i * 8));
+        native_write_i64(g_boot_fblk_arena_types, (off + i) * 8, native_read_i64(g_boot_fin_types, i * 8));
+        native_write_i64(g_boot_fblk_arena_names, (off + i) * 8, native_read_i64(g_boot_fin_names, i * 8));
+        native_write_i64(g_boot_fblk_arena_inits, (off + i) * 8, native_read_i64(g_boot_fin_inits, i * 8));
+        native_write_i64(g_boot_fblk_arena_lhs, (off + i) * 8, native_read_i64(g_boot_fin_lhs, i * 8));
+        native_write_i64(g_boot_fblk_arena_rhs, (off + i) * 8, native_read_i64(g_boot_fin_rhs, i * 8));
         i = i + 1;
     end
     g_boot_fblk_arena_n = off + n;
@@ -7195,6 +7360,10 @@ end.
 func parse_block:
     in(p: Parser)
     block = ast_new(AstType.Block);
+    # Save the enclosing (caller) block's staging BEFORE resetting — this
+    # call may itself be a nested if/while/when/loop body parse triggered
+    # from inside the caller's own in-progress parse_block loop.
+    boot_blk_push_scope();
     boot_blk_reset();
     boot_parse_vconst_reset();
     p = skip_newlines(p);
@@ -7245,7 +7414,7 @@ func parse_block:
                         init_n = vec_get_rt(stmt.children, 0);
                     end
                 end
-                if init_n.node_type == AstType.BinOp do
+                if init_n.node_type == AstType.BinOp or init_n.node_type == AstType.Compare do
                     if vec_len_rt(init_n.children) >= 2 do
                         let lc = vec_get_rt(init_n.children, 0);
                         let rc = vec_get_rt(init_n.children, 1);
@@ -7269,8 +7438,33 @@ func parse_block:
                     end
                 end
             end
+            # IfStmt cond: stage Compare Ident names for C-VM-safe lower.
+            if stmt.node_type == AstType.IfStmt do
+                if vec_len_rt(stmt.children) > 0 do
+                    let cond_n = vec_get_rt(stmt.children, 0);
+                    if cond_n.node_type == AstType.Compare do
+                        if vec_len_rt(cond_n.children) >= 2 do
+                            let lc2 = vec_get_rt(cond_n.children, 0);
+                            let rc2 = vec_get_rt(cond_n.children, 1);
+                            let ln2 = 0;
+                            let rn2 = 0;
+                            if lc2.node_type == AstType.Identifier do
+                                ln2 = lc2.name;
+                            end
+                            if rc2.node_type == AstType.Identifier do
+                                rn2 = rc2.name;
+                            end
+                            if ln2 != 0 or rn2 != 0 do
+                                boot_blk_set_binop_ops(g_boot_blk_count - 1, ln2, rn2);
+                            end
+                        end
+                    end
+                end
+            end
             block = ast_add_child(block, stmt);
             if rt_strlen(p.error_msg) > 0 do
+                boot_blk_finish_snapshot();
+                boot_blk_pop_scope();
                 out (p, block);
             end
             var (p_semi, _) = match_tok(p, TokType.Semicolon);
@@ -7282,6 +7476,8 @@ func parse_block:
     g_snap_blk_names = g_boot_blk_names;
     g_snap_blk_inits = g_boot_blk_inits;
     boot_blk_snap_copy();
+    boot_blk_finish_snapshot();
+    boot_blk_pop_scope();
     out (p, block);
 end.
 
@@ -8461,16 +8657,34 @@ func parse_statement:
             out parse_expr(p);
         end
 
+        # IDENT '=' … — snapshot name BEFORE advance/parse_expr clobbers Token.
+        if boot_parser_tok_type_at(p, p.pos + 1) == TokType.Assign do
+            let as_name = peek(p).str_val;
+            let as_line = peek(p).line;
+            var (p_a, _) = advance(p);
+            var (p_b, _) = advance(p_a);
+            var (p_c, val) = parse_expr(p_b);
+            assign = ast_new(AstType.Assign);
+            assign.line = as_line;
+            assign = ast_add_child(assign, val);
+            assign.name = as_name;
+            g_pending_stmt_name = as_name;
+            out (p_c, assign);
+        end
+
         var (p2, id_tok) = advance(p);
 
-        # Simple assignment: IDENT = expr
+        # Simple assignment: IDENT = expr (fallback if lookahead missed)
         if check(p, TokType.Assign) do
+            let as_name2 = id_tok.str_val;
+            let as_line2 = id_tok.line;
             var (p3, _) = advance(p);
             var (p4, val) = parse_expr(p3);
             assign = ast_new(AstType.Assign);
-            assign.name = id_tok.str_val;
-            assign.line = id_tok.line;
+            assign.line = as_line2;
             assign = ast_add_child(assign, val);
+            assign.name = as_name2;
+            g_pending_stmt_name = as_name2;
             out (p4, assign);
         end
 
@@ -9039,10 +9253,10 @@ func boot_bd_push_binop:
 end.
 
 func boot_bd_push_cmp:
-    in(dv: int, a: int, b: int)
-    # Opcode from name-cell 128 (CmpEq..CmpLe = 20..25) — same stash as binop.
+    in(dv: int, a: int, b: int, opc: int)
+    # Pass CmpEq..CmpLe (20..25) as arg — name-cell 128 was clobbered to
+    # binop Or(9) on C-VM so `if c == 32` never compared (Stage-1 lexer hung).
     extern func native_write_i64(addr: int, offset: int, val: int);
-    extern func native_read_i64(addr: int, offset: int) -> int;
     if boot_bd_dump_on() == 0 do
         out;
     end
@@ -9051,7 +9265,6 @@ func boot_bd_push_cmp:
     if ix >= boot_bd_cap() do
         out;
     end
-    let opc = native_read_i64(g_boot_name_cell, 128);
     native_write_i64(g_bd_opc, ix * 8, opc);
     native_write_i64(g_bd_dv, ix * 8, dv);
     native_write_i64(g_bd_di, ix * 8, 0);
@@ -9083,6 +9296,30 @@ func boot_bd_push_setarg:
     g_bd_total = ix + 1;
 end.
 
+func boot_bd_push_rtcall:
+    # opc: 94=GetArg 95=ArgCount 85=Slurp 86=SlurpLen 87=WriteFile
+    #      50=Alloc 52=LoadByte 53=StoreByte 54=LoadWord 55=StoreWord 90=Exit
+    # dv=dest vreg (-1 if void); s1v/s2v = arg vregs; di = 3rd arg vreg
+    in(opc: int, dv: int, a0: int, a1: int, a2: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if boot_bd_dump_on() == 0 do
+        out;
+    end
+    boot_body_dump_init();
+    let ix = g_bd_total;
+    if ix >= boot_bd_cap() do
+        out;
+    end
+    native_write_i64(g_bd_opc, ix * 8, opc);
+    native_write_i64(g_bd_dv, ix * 8, dv);
+    native_write_i64(g_bd_di, ix * 8, a2);
+    native_write_i64(g_bd_s1t, ix * 8, 1);
+    native_write_i64(g_bd_s1v, ix * 8, a0);
+    native_write_i64(g_bd_s1i, ix * 8, 0);
+    native_write_i64(g_bd_s2v, ix * 8, a1);
+    g_bd_total = ix + 1;
+end.
+
 func boot_bd_push_call:
     in(dv: int, fidx: int)
     extern func native_write_i64(addr: int, offset: int, val: int);
@@ -9101,6 +9338,50 @@ func boot_bd_push_call:
     native_write_i64(g_bd_s1v, ix * 8, fidx);
     native_write_i64(g_bd_s1i, ix * 8, 0);
     native_write_i64(g_bd_s2v, ix * 8, 0);
+    g_bd_total = ix + 1;
+end.
+
+func boot_bd_push_loadglobal:
+    # opc 92: dv = globals[s1i]
+    in(dv: int, gidx: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if boot_bd_dump_on() == 0 do
+        out;
+    end
+    boot_body_dump_init();
+    let ix = g_bd_total;
+    if ix >= boot_bd_cap() do
+        out;
+    end
+    native_write_i64(g_bd_opc, ix * 8, 92);
+    native_write_i64(g_bd_dv, ix * 8, dv);
+    native_write_i64(g_bd_di, ix * 8, 0);
+    native_write_i64(g_bd_s1t, ix * 8, 2);
+    native_write_i64(g_bd_s1v, ix * 8, 0);
+    native_write_i64(g_bd_s1i, ix * 8, gidx);
+    native_write_i64(g_bd_s2v, ix * 8, 0);
+    g_bd_total = ix + 1;
+end.
+
+func boot_bd_push_storeglobal:
+    # opc 93: globals[s1i] = s2v
+    in(gidx: int, sv: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if boot_bd_dump_on() == 0 do
+        out;
+    end
+    boot_body_dump_init();
+    let ix = g_bd_total;
+    if ix >= boot_bd_cap() do
+        out;
+    end
+    native_write_i64(g_bd_opc, ix * 8, 93);
+    native_write_i64(g_bd_dv, ix * 8, 0 - 1);
+    native_write_i64(g_bd_di, ix * 8, 0);
+    native_write_i64(g_bd_s1t, ix * 8, 2);
+    native_write_i64(g_bd_s1v, ix * 8, 0);
+    native_write_i64(g_bd_s1i, ix * 8, gidx);
+    native_write_i64(g_bd_s2v, ix * 8, sv);
     g_bd_total = ix + 1;
 end.
 
@@ -9306,9 +9587,15 @@ var g_cg_rd = 0;
 var g_cg_rn = 0;
 var g_cg_rm = 0;
 var g_cg_imm = 0;
+# MOVZ-wide scratch: boot_cg_movz0 must stay locals-free (locals there make the
+# C-VM drop the g_emit_word stores), so the halfword split uses globals.
+var g_cg_immw = 0;
+var g_cg_rdw = 0;
+var g_cg_hw = 0;
 var g_cg_off = 0;
 var g_cg_target = 0;
 var g_cg_bl_tgt = 0;
+var g_cg_di = 0;
 var g_boot_main_off = 0;
 var g_boot_rt_print = 0;
 var g_boot_rt_exit = 0;
@@ -9844,13 +10131,86 @@ func boot_reset_vregs:
         g_boot_nvreg_cell = heap_alloc(8);
     end
     native_write_i64(g_boot_nvreg_cell, 0, 16);
+    if g_boot_label_cell == 0 do
+        g_boot_label_cell = heap_alloc(8);
+    end
+    native_write_i64(g_boot_label_cell, 0, 0);
+    boot_loop_reset();
 end.
 
 func fresh_label:
     in(ctx: LowerCtx)
-    l = ctx.label_counter;
-    ctx.label_counter = ctx.label_counter + 1;
+    # Same pattern as fresh_vreg — entity field offsets for LowerCtx are
+    # unreliable on the C VM. Use a native cell only.
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_label_cell == 0 do
+        g_boot_label_cell = heap_alloc(8);
+        native_write_i64(g_boot_label_cell, 0, 0);
+    end
+    let l = native_read_i64(g_boot_label_cell, 0);
+    native_write_i64(g_boot_label_cell, 0, l + 1);
     out l;
+end.
+
+# LowerCtx.loop_* entity fields are unusable on the C VM (wrong offsets /
+# garbage vec pointers → SEGV in vec_push_rt). Keep loop nest state in
+# native cells instead — same pattern as fresh_vreg / fresh_label.
+func boot_loop_stack_ensure:
+    if g_boot_loop_starts == 0 do
+        g_boot_loop_starts = heap_alloc(512);
+        g_boot_loop_ends = heap_alloc(512);
+    end
+end.
+
+func boot_loop_reset:
+    boot_loop_stack_ensure();
+    g_boot_loop_depth = 0;
+end.
+
+func boot_loop_push:
+    in(start_lbl: int, end_lbl: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    boot_loop_stack_ensure();
+    let d = g_boot_loop_depth;
+    if d < 0 do
+        d = 0;
+    end
+    if d >= 64 do
+        out;
+    end
+    native_write_i64(g_boot_loop_starts, d * 8, start_lbl);
+    native_write_i64(g_boot_loop_ends, d * 8, end_lbl);
+    g_boot_loop_depth = d + 1;
+end.
+
+func boot_loop_pop:
+    let d = g_boot_loop_depth;
+    if d > 0 do
+        g_boot_loop_depth = d - 1;
+    end
+end.
+
+func boot_loop_depth:
+    out g_boot_loop_depth;
+end.
+
+func boot_loop_cur_start:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    let d = g_boot_loop_depth;
+    if d <= 0 do
+        out 0 - 1;
+    end
+    out native_read_i64(g_boot_loop_starts, (d - 1) * 8);
+end.
+
+func boot_loop_cur_end:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    let d = g_boot_loop_depth;
+    if d <= 0 do
+        out 0 - 1;
+    end
+    out native_read_i64(g_boot_loop_ends, (d - 1) * 8);
 end.
 
 func lower_error:
@@ -9962,15 +10322,42 @@ func lower_expr:
     end
 
     if expr.node_type == AstType.Identifier do
-        var (scope, idx) = sym_lookup_both(ctx, expr.name);
+        let id_nm = expr.name;
+        var (scope, idx) = sym_lookup_both(ctx, id_nm);
+        let id_nm2 = 0;
         if scope < 0 do
+            # AstNode.name may be corrupted on the C VM — only THEN fall back
+            # to the block-staged current-statement name. Trying this
+            # unconditionally (before the direct lookup) mis-resolves any
+            # Identifier used deeper in the same statement (e.g. a Call
+            # argument) to the enclosing `let`'s own fresh vreg instead of
+            # its real binding (Stage-0 bug: `let x = f(st, c)` misreads `st`).
+            id_nm2 = boot_get_var_name();
+            if id_nm2 != 0 do
+                var (scope2, idx2) = sym_lookup_both(ctx, id_nm2);
+                if scope2 >= 0 do
+                    scope = scope2;
+                    idx = idx2;
+                    id_nm = id_nm2;
+                end
+            end
+        end
+        if scope < 0 do
+            # Vmap (filled at param/let bind) — reliable when AstNode.name clobbers.
+            let pv = boot_vmap_get(id_nm);
+            if pv < 0 and id_nm2 != 0 do
+                pv = boot_vmap_get(id_nm2);
+            end
+            if pv >= 0 do
+                out pv;
+            end
             # AstNode.name reads are unreliable on C VM — single-param fallback
             # for small multi-fn smoke (e.g. bump(v) → out v + 1).
-            if g_boot_small_multi != 0 and g_boot_param_nlocal == 1 do
+            if g_boot_param_nlocal == 1 do
                 out g_boot_param_v0;
             end
             # Check if it's a function name used as a value
-            fidx = find_func_index(ctx, expr.name);
+            fidx = find_func_index(ctx, id_nm);
             if fidx >= 0 do
                 rd = fresh_vreg(ctx);
                 ir_emit(ctx, q_instr(QOp.LoadFuncAddr, q_vreg(rd), q_func_idx(fidx as int), q_none()));
@@ -9982,6 +10369,9 @@ func lower_expr:
         if scope == 1 do
             rd = fresh_vreg(ctx);
             ir_emit(ctx, q_instr(QOp.LoadGlobal, q_vreg(rd), q_imm(idx as int), q_none()));
+            if boot_bd_dump_on() != 0 do
+                boot_bd_push_loadglobal(rd as int, idx as int);
+            end
             out rd as int;
         end
         out idx as int;
@@ -10031,6 +10421,7 @@ func lower_expr:
         rd = fresh_vreg(ctx);
         # Prefer int_val stash (set at parse); AstNode.op is unreliable on C VM.
         # Write QOp codes via g_st_opc — local `op` enum gets clobbered on C VM.
+        # OpType: Add=0..Mod=4, AndOp=20..ShrOp=24 → QOp Add=3..Mod=7, And=8..Shr=12.
         let raw_op = expr.int_val;
         g_st_opc = 3;
         if raw_op == 1 do
@@ -10045,6 +10436,21 @@ func lower_expr:
         if raw_op == 4 do
             g_st_opc = 7;
         end
+        if raw_op == 20 do
+            g_st_opc = 8;
+        end
+        if raw_op == 21 do
+            g_st_opc = 9;
+        end
+        if raw_op == 22 do
+            g_st_opc = 10;
+        end
+        if raw_op == 23 do
+            g_st_opc = 11;
+        end
+        if raw_op == 24 do
+            g_st_opc = 12;
+        end
         op = QOp.Add;
         if g_st_opc == 4 do
             op = QOp.Sub;
@@ -10058,8 +10464,23 @@ func lower_expr:
         if g_st_opc == 7 do
             op = QOp.Mod;
         end
+        if g_st_opc == 8 do
+            op = QOp.And;
+        end
+        if g_st_opc == 9 do
+            op = QOp.Or;
+        end
+        if g_st_opc == 10 do
+            op = QOp.Xor;
+        end
+        if g_st_opc == 11 do
+            op = QOp.Shl;
+        end
+        if g_st_opc == 12 do
+            op = QOp.Shr;
+        end
         if g_boot_flat_active != 0 do
-            if g_st_opc >= 3 and g_st_opc <= 7 do
+            if g_st_opc >= 3 and g_st_opc <= 12 do
                 boot_set_dv(rd);
                 boot_set_s1v(lhs as int);
                 boot_set_s2v(rhs as int);
@@ -10067,7 +10488,7 @@ func lower_expr:
             end
         end
         if boot_bd_dump_on() != 0 do
-            if g_st_opc >= 3 and g_st_opc <= 7 do
+            if g_st_opc >= 3 and g_st_opc <= 12 do
                 extern func native_write_i64(addr: int, offset: int, val: int);
                 if g_boot_name_cell == 0 do
                     boot_name_cell_init();
@@ -10081,39 +10502,73 @@ func lower_expr:
     end
 
     if expr.node_type == AstType.Compare do
-        lhs = lower_expr(ctx, vec_get_rt(expr.children, 0));
+        # Same Ident capture as BinOp — AstNode.name unreliable on C-VM.
+        lhs = 0 - 1;
+        rhs = 0 - 1;
+        let cln0 = boot_get_binop_lhs();
+        let crn0 = boot_get_binop_rhs();
+        if cln0 != 0 do
+            let cpv0 = boot_vmap_get(cln0);
+            if cpv0 < 0 do
+                var (cs0, ci0) = sym_lookup_both(ctx, cln0);
+                if cs0 >= 0 do
+                    cpv0 = ci0 as int;
+                end
+            end
+            if cpv0 >= 0 do
+                lhs = cpv0;
+            end
+        end
+        if crn0 != 0 do
+            let cpv1 = boot_vmap_get(crn0);
+            if cpv1 < 0 do
+                var (cs1, ci1) = sym_lookup_both(ctx, crn0);
+                if cs1 >= 0 do
+                    cpv1 = ci1 as int;
+                end
+            end
+            if cpv1 >= 0 do
+                rhs = cpv1;
+            end
+        end
+        if lhs < 0 do
+            lhs = lower_expr(ctx, vec_get_rt(expr.children, 0));
+        end
+        if rhs < 0 do
+            rhs = lower_expr(ctx, vec_get_rt(expr.children, 1));
+        end
         if lhs < 0 do
             out -1;
         end
-        rhs = lower_expr(ctx, vec_get_rt(expr.children, 1));
         if rhs < 0 do
             out -1;
         end
         rd = fresh_vreg(ctx);
 
         cmp_op = QOp.CmpEq;
+        let cmp_bd = 20;
         if expr.op == OpType::Ne do
             cmp_op = QOp.CmpNe;
+            cmp_bd = 21;
         end
         if expr.op == OpType::Gt do
             cmp_op = QOp.CmpGt;
+            cmp_bd = 22;
         end
         if expr.op == OpType::Lt do
             cmp_op = QOp.CmpLt;
+            cmp_bd = 23;
         end
         if expr.op == OpType::Ge do
             cmp_op = QOp.CmpGe;
+            cmp_bd = 24;
         end
         if expr.op == OpType::Le do
             cmp_op = QOp.CmpLe;
+            cmp_bd = 25;
         end
         if boot_bd_dump_on() != 0 do
-            extern func native_write_i64(addr: int, offset: int, val: int);
-            if g_boot_name_cell == 0 do
-                boot_name_cell_init();
-            end
-            native_write_i64(g_boot_name_cell, 128, cmp_op as int);
-            boot_bd_push_cmp(rd, lhs as int, rhs as int);
+            boot_bd_push_cmp(rd, lhs as int, rhs as int, cmp_bd);
         end
         ir_emit(ctx, q_instr(cmp_op, q_vreg(rd), q_vreg(lhs as int), q_vreg(rhs as int)));
         out rd as int;
@@ -10289,6 +10744,7 @@ func lower_expr:
         if bid == 3 do
             rd = fresh_vreg(ctx);
             ir_emit(ctx, q_instr(QOp.Alloc, q_vreg(rd), q_vreg(a0 as int), q_none()));
+            boot_bd_push_rtcall(50, rd, a0 as int, 0, 0);
             out rd as int;
         end
 
@@ -10296,12 +10752,14 @@ func lower_expr:
         if bid == 7 do
             rd = fresh_vreg(ctx);
             ir_emit(ctx, q_instr(QOp.LoadWord, q_vreg(rd), q_vreg(a0 as int), q_vreg(a1 as int)));
+            boot_bd_push_rtcall(54, rd, a0 as int, a1 as int, 0);
             out rd as int;
         end
 
         # Write64(8): 3 args → store_word(ptr, off, val)
         if bid == 8 do
             ir_emit(ctx, q_instr(QOp.StoreWord, q_vreg(a2 as int), q_vreg(a0 as int), q_vreg(a1 as int)));
+            boot_bd_push_rtcall(55, 0 - 1, a0 as int, a1 as int, a2 as int);
             out 0;
         end
 
@@ -10309,12 +10767,14 @@ func lower_expr:
         if bid == 5 do
             rd = fresh_vreg(ctx);
             ir_emit(ctx, q_instr(QOp.LoadByte, q_vreg(rd), q_vreg(a0 as int), q_vreg(a1 as int)));
+            boot_bd_push_rtcall(52, rd, a0 as int, a1 as int, 0);
             out rd as int;
         end
 
         # Write8(6): 3 args → store_byte(ptr, off, val)
         if bid == 6 do
             ir_emit(ctx, q_instr(QOp.StoreByte, q_vreg(a2 as int), q_vreg(a0 as int), q_vreg(a1 as int)));
+            boot_bd_push_rtcall(53, 0 - 1, a0 as int, a1 as int, a2 as int);
             out 0;
         end
 
@@ -10355,6 +10815,7 @@ func lower_expr:
         # Exit(18): 1 arg → exit(code)
         if bid == 18 do
             ir_emit(ctx, q_instr(QOp.Exit, q_none(), q_vreg(a0 as int), q_none()));
+            boot_bd_push_rtcall(90, 0 - 1, a0 as int, 0, 0);
             out 0;
         end
 
@@ -10382,6 +10843,7 @@ func lower_expr:
         if bid == 23 do
             rd = fresh_vreg(ctx);
             ir_emit(ctx, q_instr(QOp.GetArg, q_vreg(rd), q_vreg(a0 as int), q_none()));
+            boot_bd_push_rtcall(94, rd, a0 as int, 0, 0);
             out rd as int;
         end
 
@@ -10389,6 +10851,26 @@ func lower_expr:
         if bid == 24 do
             rd = fresh_vreg(ctx);
             ir_emit(ctx, q_instr(QOp.ArgCount, q_vreg(rd), q_none(), q_none()));
+            boot_bd_push_rtcall(95, rd, 0, 0, 0);
+            out rd as int;
+        end
+
+        # slurp_file(25): path → ptr (len via slurp_len)
+        if bid == 25 do
+            rd = fresh_vreg(ctx);
+            boot_bd_push_rtcall(85, rd, a0 as int, 0, 0);
+            out rd as int;
+        end
+        # slurp_len(26): → last slurp length
+        if bid == 26 do
+            rd = fresh_vreg(ctx);
+            boot_bd_push_rtcall(86, rd, 0, 0, 0);
+            out rd as int;
+        end
+        # write_bytes(27): path, buf, len → ok
+        if bid == 27 do
+            rd = fresh_vreg(ctx);
+            boot_bd_push_rtcall(87, rd, a0 as int, a1 as int, a2 as int);
             out rd as int;
         end
 
@@ -10634,6 +11116,10 @@ func lower_stmt:
         if vname != 0 do
             boot_vmap_put(vname, r);
         end
+        # Drop the LHS name before lowering the init. Leaving it set makes any
+        # Identifier inside the init (Call args, BinOp operands) resolve as the
+        # new local itself — the classic `let p2 = st_get(st, 2)` stale-self bug.
+        boot_set_var_name(0);
         let icur = boot_get_init_const();
         if icur >= 0 do
             boot_set_imm(icur);
@@ -10676,6 +11162,17 @@ func lower_stmt:
     if stmt.node_type == AstType.Assign do
         var (scope, idx) = sym_lookup_both(ctx, stmt.name);
         if scope < 0 do
+            let aname = boot_get_var_name();
+            if aname == 0 do
+                aname = stmt.name;
+            end
+            let pv = boot_vmap_get(aname);
+            if pv >= 0 do
+                scope = 0;
+                idx = pv;
+            end
+        end
+        if scope < 0 do
             lower_error(ctx, str_concat(str_new("assign to undefined: "), stmt.name));
             out 0;
         end
@@ -10685,6 +11182,9 @@ func lower_stmt:
         end
         if scope == 1 do
             ir_emit(ctx, q_instr(QOp.StoreGlobal, q_none(), q_imm(idx as int), q_vreg(val as int)));
+            if boot_bd_dump_on() != 0 do
+                boot_bd_push_storeglobal(idx as int, val as int);
+            end
         else
             if (val as u32) != idx do
                 if boot_bd_dump_on() != 0 do
@@ -10860,14 +11360,11 @@ func lower_stmt:
             boot_bd_push_jumpifnot(cond_r as int, end_lbl);
         end
 
-        # Push loop labels
-        ctx.loop_start_labels = vec_push_rt(ctx.loop_start_labels, loop_lbl);
-        ctx.loop_end_labels = vec_push_rt(ctx.loop_end_labels, end_lbl);
-        ctx.loop_depth = ctx.loop_depth + 1;
+        boot_loop_push(loop_lbl, end_lbl);
 
         lower_stmt(ctx, vec_get_rt(stmt.children, 1));
 
-        ctx.loop_depth = ctx.loop_depth - 1;
+        boot_loop_pop();
 
         ir_emit(ctx, q_instr(QOp.Jump, q_none(), q_label(loop_lbl), q_none()));
         if boot_bd_dump_on() != 0 do
@@ -10904,19 +11401,16 @@ func lower_stmt:
             if g_boot_name_cell == 0 do
                 boot_name_cell_init();
             end
-            native_write_i64(g_boot_name_cell, 128, 23);
-            boot_bd_push_cmp(cmp_r, counter, limit_r as int);
+            boot_bd_push_cmp(cmp_r, counter, limit_r as int, 23);
             boot_bd_push_jumpifnot(cmp_r, end_lbl);
         end
         ir_emit(ctx, q_instr(QOp.JumpIfNot, q_none(), q_vreg(cmp_r), q_label(end_lbl)));
 
-        ctx.loop_start_labels = vec_push_rt(ctx.loop_start_labels, cont_lbl);
-        ctx.loop_end_labels = vec_push_rt(ctx.loop_end_labels, end_lbl);
-        ctx.loop_depth = ctx.loop_depth + 1;
+        boot_loop_push(cont_lbl, end_lbl);
 
         lower_stmt(ctx, vec_get_rt(stmt.children, 1));
 
-        ctx.loop_depth = ctx.loop_depth - 1;
+        boot_loop_pop();
 
         ir_emit(ctx, q_instr(QOp.Label, q_label(cont_lbl), q_none(), q_none()));
         one_r = fresh_vreg(ctx);
@@ -10955,19 +11449,16 @@ func lower_stmt:
             if g_boot_name_cell == 0 do
                 boot_name_cell_init();
             end
-            native_write_i64(g_boot_name_cell, 128, 23);
-            boot_bd_push_cmp(cmp_r, loop_var, end_v as int);
+            boot_bd_push_cmp(cmp_r, loop_var, end_v as int, 23);
             boot_bd_push_jumpifnot(cmp_r, end_lbl);
         end
         ir_emit(ctx, q_instr(QOp.JumpIfNot, q_none(), q_vreg(cmp_r), q_label(end_lbl)));
 
-        ctx.loop_start_labels = vec_push_rt(ctx.loop_start_labels, cont_lbl);
-        ctx.loop_end_labels = vec_push_rt(ctx.loop_end_labels, end_lbl);
-        ctx.loop_depth = ctx.loop_depth + 1;
+        boot_loop_push(cont_lbl, end_lbl);
 
         lower_stmt(ctx, vec_get_rt(stmt.children, 2));
 
-        ctx.loop_depth = ctx.loop_depth - 1;
+        boot_loop_pop();
 
         ir_emit(ctx, q_instr(QOp.Label, q_label(cont_lbl), q_none(), q_none()));
         one_r = fresh_vreg(ctx);
@@ -11035,6 +11526,10 @@ func lower_stmt:
                         boot_set_call_name(blh);
                     end
                 end
+                if bty == AstType.IfStmt do
+                    boot_set_binop_lhs(blh);
+                    boot_set_binop_rhs(brh);
+                end
             end
             lower_stmt(ctx, vec_get_rt(stmt.children, i));
             boot_set_var_name(0);
@@ -11049,21 +11544,21 @@ func lower_stmt:
     end
 
     if stmt.node_type == AstType.BreakStmt do
-        if ctx.loop_depth == 0 do
+        if boot_loop_depth() == 0 do
             lower_error(ctx, str_new("break outside of loop"));
             out 0;
         end
-        end_lbl = vec_get_rt(ctx.loop_end_labels, (ctx.loop_depth - 1) as int);
+        end_lbl = boot_loop_cur_end();
         ir_emit(ctx, q_instr(QOp.Jump, q_none(), q_label(end_lbl), q_none()));
         out 0;
     end
 
     if stmt.node_type == AstType.ContinueStmt do
-        if ctx.loop_depth == 0 do
+        if boot_loop_depth() == 0 do
             lower_error(ctx, str_new("continue outside of loop"));
             out 0;
         end
-        start_lbl = vec_get_rt(ctx.loop_start_labels, (ctx.loop_depth - 1) as int);
+        start_lbl = boot_loop_cur_start();
         ir_emit(ctx, q_instr(QOp.Jump, q_none(), q_label(start_lbl), q_none()));
         out 0;
     end
@@ -11257,6 +11752,7 @@ func lower_func_def:
     ctx.symbols = sym_new();
 
     # Register parameters and set param_count
+    extern func native_write_i64(addr: int, offset: int, val: int);
     body_idx = vec_len_rt(func_def.children) - 1;
     param_count = 0;
     g_boot_param_nlocal = 0;
@@ -11267,9 +11763,15 @@ func lower_func_def:
         if param.node_type == AstType.Identifier do
             pr = fresh_vreg(ctx);
             # (in-place ctx)
-            ctx.symbols = sym_define(ctx.symbols, param.name, pr);
+            let pn = param.name;
+            ctx.symbols = sym_define(ctx.symbols, pn, pr);
+            # Vmap survives AstNode.name clobber on C-VM (BinOp/Ident use it).
+            boot_vmap_put(pn, pr);
             if param_count == 0 do
                 g_boot_param_v0 = pr;
+            end
+            if g_boot_name_cell != 0 and param_count < 8 do
+                native_write_i64(g_boot_name_cell, 700 + param_count * 8, pr);
             end
             param_count = param_count + 1;
             g_boot_param_nlocal = param_count;
@@ -11391,6 +11893,1122 @@ end.
 # Program Lowering
 # ═══════════════════════════════════════════════════════
 
+func boot_is_stage1_keep_0:
+    in(name: int)
+    if str_eq(name, "advance") do
+        out 1;
+    end
+    if str_eq(name, "arm64_add_rrr") do
+        out 1;
+    end
+    if str_eq(name, "arm64_ldp_post") do
+        out 1;
+    end
+    if str_eq(name, "arm64_ldr_imm") do
+        out 1;
+    end
+    if str_eq(name, "arm64_mov_imm16") do
+        out 1;
+    end
+    if str_eq(name, "arm64_mov_rr") do
+        out 1;
+    end
+    if str_eq(name, "arm64_mov_sp_to") do
+        out 1;
+    end
+    if str_eq(name, "arm64_ret") do
+        out 1;
+    end
+    if str_eq(name, "arm64_stp_pre") do
+        out 1;
+    end
+    if str_eq(name, "arm64_str_imm") do
+        out 1;
+    end
+    if str_eq(name, "arm64_sub_rrr") do
+        out 1;
+    end
+    if str_eq(name, "arm64_svc") do
+        out 1;
+    end
+    if str_eq(name, "ast_add_child") do
+        out 1;
+    end
+    if str_eq(name, "ast_new") do
+        out 1;
+    end
+    if str_eq(name, "boot_apply_binop") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_cap") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_dump_on") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_binop") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_call") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_cmp") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_jump") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_jumpifnot") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_label") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_load") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_move") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_print") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_printstr") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_ret") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_ret_imm") do
+        out 1;
+    end
+    if str_eq(name, "boot_bd_push_setarg") do
+        out 1;
+    end
+    if str_eq(name, "boot_blk_names_base") do
+        out 1;
+    end
+    if str_eq(name, "boot_blk_push") do
+        out 1;
+    end
+    if str_eq(name, "boot_blk_reset") do
+        out 1;
+    end
+    if str_eq(name, "boot_blk_set_binop_ops") do
+        out 1;
+    end
+    if str_eq(name, "boot_blk_snap_copy") do
+        out 1;
+    end
+    if str_eq(name, "boot_blk_types_base") do
+        out 1;
+    end
+    if str_eq(name, "boot_body_dump_debug") do
+        out 1;
+    end
+    if str_eq(name, "boot_body_dump_init") do
+        out 1;
+    end
+    if str_eq(name, "boot_body_dump_mod") do
+        out 1;
+    end
+    if str_eq(name, "boot_body_dump_reset") do
+        out 1;
+    end
+    if str_eq(name, "boot_build_mir_from_staging") do
+        out 1;
+    end
+    if str_eq(name, "boot_call_fixup_reset") do
+        out 1;
+    end
+    if str_eq(name, "boot_case_arm_starts") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_add0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_bl0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_binop") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_call") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_cmp") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_jump") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_jumpif") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_jumpifnot") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_label") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_load") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_move") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_print") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_printstr") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_ret_i") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_ret_v") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_save_param") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_bd_setarg") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_entry0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_emit_word0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_epilogue0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_jfix_add") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_lbl_bind") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_lbl_ensure") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_lbl_lookup") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_lbl_reset") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_ldr_fp0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_mov_rr0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_movz0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_mul0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_patch_calls") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_patch_jumps") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_prologue0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_sdiv0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_slot_off") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_str_fp0") do
+        out 1;
+    end
+    if str_eq(name, "boot_cg_sub0") do
+        out 1;
+    end
+    if str_eq(name, "boot_codegen_emit_mod_min") do
+        out 1;
+    end
+    if str_eq(name, "boot_codegen_from_lir_multifn") do
+        out 1;
+    end
+    if str_eq(name, "boot_codegen_from_lir_tables") do
+        out 1;
+    end
+    if str_eq(name, "boot_do_lower") do
+        out 1;
+    end
+    if str_eq(name, "boot_fblk_arena_ensure") do
+        out 1;
+    end
+    if str_eq(name, "boot_fblk_arena_reset") do
+        out 1;
+    end
+    if str_eq(name, "boot_file_size") do
+        out 1;
+    end
+    if str_eq(name, "boot_flat_push") do
+        out 1;
+    end
+    if str_eq(name, "boot_func_blk_restore") do
+        out 1;
+    end
+    if str_eq(name, "boot_func_blk_restore_cur") do
+        out 1;
+    end
+    if str_eq(name, "boot_func_blk_snap_at") do
+        out 1;
+    end
+    out 0;
+end.
+
+func boot_is_stage1_keep_1:
+    in(name: int)
+    if str_eq(name, "boot_func_snap_ensure") do
+        out 1;
+    end
+    if str_eq(name, "boot_func_snap_push0") do
+        out 1;
+    end
+    if str_eq(name, "boot_func_snap_reset") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_binop_lhs") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_binop_rhs") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_call_name") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_dv") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_imm") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_init_const") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_last_vreg") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_print_name") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_s1v") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_s2v") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_small_multi") do
+        out 1;
+    end
+    if str_eq(name, "boot_get_var_name") do
+        out 1;
+    end
+    if str_eq(name, "boot_hex_val") do
+        out 1;
+    end
+    if str_eq(name, "boot_ir_binop") do
+        out 1;
+    end
+    if str_eq(name, "boot_ir_load_imm") do
+        out 1;
+    end
+    if str_eq(name, "boot_ir_move") do
+        out 1;
+    end
+    if str_eq(name, "boot_ir_print") do
+        out 1;
+    end
+    if str_eq(name, "boot_ir_print_imm") do
+        out 1;
+    end
+    if str_eq(name, "boot_ir_ret") do
+        out 1;
+    end
+    if str_eq(name, "boot_ir_ret_imm") do
+        out 1;
+    end
+    if str_eq(name, "boot_kw_add") do
+        out 1;
+    end
+    if str_eq(name, "boot_kw_buckets_reset") do
+        out 1;
+    end
+    if str_eq(name, "boot_lit_int_val") do
+        out 1;
+    end
+    if str_eq(name, "boot_lower_test_main") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_copy_code_all") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_flush") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_gbuf_name16") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_gbuf_u32") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_gbuf_u64_hi_lo") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_link_basic42") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_page_buf") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_w_part1") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_w_part2") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_w_part3") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_w_part3b") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_w_part4") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_w_part4b") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_write_hdr") do
+        out 1;
+    end
+    if str_eq(name, "boot_macho_write_linkedit_data") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_at_func_start") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_clear_alias_tab") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_clear_const_tab") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_flat_const_fold") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_flat_copy_prop") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_flat_dce_nop") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_flat_dead_load_dce") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_flat_opt") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_kill_alias") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_kill_const") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_nop_at") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_project_lir") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_push") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_qopc_defines") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_qopc_is_barrier") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_rewrite_load_imm") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_set_last_di") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_set_last_qopc") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_tables_ensure") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_tables_init") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_verify_basic") do
+        out 1;
+    end
+    if str_eq(name, "boot_mir_writeback_to_bd") do
+        out 1;
+    end
+    if str_eq(name, "boot_name_cell_init") do
+        out 1;
+    end
+    if str_eq(name, "boot_parse_fold_init_fast") do
+        out 1;
+    end
+    if str_eq(name, "boot_parse_var_init_const") do
+        out 1;
+    end
+    if str_eq(name, "boot_parse_vconst_get") do
+        out 1;
+    end
+    if str_eq(name, "boot_parse_vconst_reset") do
+        out 1;
+    end
+    if str_eq(name, "boot_parse_vconst_set") do
+        out 1;
+    end
+    if str_eq(name, "boot_parse_vslot_ic") do
+        out 1;
+    end
+    if str_eq(name, "boot_parser_tok_ival") do
+        out 1;
+    end
+    if str_eq(name, "boot_parser_tok_str") do
+        out 1;
+    end
+    if str_eq(name, "boot_parser_tok_type") do
+        out 1;
+    end
+    if str_eq(name, "boot_parser_tok_type_at") do
+        out 1;
+    end
+    if str_eq(name, "boot_phase8_mir_lir_gate") do
+        out 1;
+    end
+    if str_eq(name, "boot_pvi_binops") do
+        out 1;
+    end
+    if str_eq(name, "boot_pvi_expr_done") do
+        out 1;
+    end
+    if str_eq(name, "boot_pvi_primary") do
+        out 1;
+    end
+    if str_eq(name, "boot_pvi_read_int") do
+        out 1;
+    end
+    if str_eq(name, "boot_pvi_try_binop") do
+        out 1;
+    end
+    if str_eq(name, "boot_q_stage_reset") do
+        out 1;
+    end
+    if str_eq(name, "boot_reset_vregs") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_bd_cap") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_bd_dump") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_binop_lhs") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_binop_rhs") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_call_name") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_dv") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_imm") do
+        out 1;
+    end
+    out 0;
+end.
+
+func boot_is_stage1_keep_2:
+    in(name: int)
+    if str_eq(name, "boot_set_init_const") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_last_vreg") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_print_name") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_s1v") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_s2v") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_small_multi") do
+        out 1;
+    end
+    if str_eq(name, "boot_set_var_name") do
+        out 1;
+    end
+    if str_eq(name, "boot_slice") do
+        out 1;
+    end
+    if str_eq(name, "boot_stage1_choose") do
+        out 1;
+    end
+    if str_eq(name, "boot_stage1_compile") do
+        out 1;
+    end
+    if str_eq(name, "boot_stage1_double") do
+        out 1;
+    end
+    if str_eq(name, "boot_stage1_ping") do
+        out 1;
+    end
+    if str_eq(name, "boot_stage1_setup") do
+        out 1;
+    end
+    if str_eq(name, "boot_stage1_sum") do
+        out 1;
+    end
+    if str_eq(name, "boot_tok_record") do
+        out 1;
+    end
+    if str_eq(name, "boot_tokenize_scan") do
+        out 1;
+    end
+    if str_eq(name, "boot_vmap_get") do
+        out 1;
+    end
+    if str_eq(name, "boot_vmap_put") do
+        out 1;
+    end
+    if str_eq(name, "boot_vmap_reset") do
+        out 1;
+    end
+    if str_eq(name, "boot_vslot_of_name") do
+        out 1;
+    end
+    if str_eq(name, "boot_word_str") do
+        out 1;
+    end
+    if str_eq(name, "boot_word_tok") do
+        out 1;
+    end
+    if str_eq(name, "build_builtins") do
+        out 1;
+    end
+    if str_eq(name, "build_keyword_table") do
+        out 1;
+    end
+    if str_eq(name, "bvec_data_ptr") do
+        out 1;
+    end
+    if str_eq(name, "bvec_get") do
+        out 1;
+    end
+    if str_eq(name, "bvec_len") do
+        out 1;
+    end
+    if str_eq(name, "bvec_new") do
+        out 1;
+    end
+    if str_eq(name, "bvec_push") do
+        out 1;
+    end
+    if str_eq(name, "bvec_push_u32_le") do
+        out 1;
+    end
+    if str_eq(name, "bvec_push_u64_le") do
+        out 1;
+    end
+    if str_eq(name, "char_to_digit") do
+        out 1;
+    end
+    if str_eq(name, "check") do
+        out 1;
+    end
+    if str_eq(name, "check_entity_literal") do
+        out 1;
+    end
+    if str_eq(name, "codebuf_emit_byte") do
+        out 1;
+    end
+    if str_eq(name, "codebuf_emit_u32") do
+        out 1;
+    end
+    if str_eq(name, "codebuf_get_byte") do
+        out 1;
+    end
+    if str_eq(name, "codebuf_len") do
+        out 1;
+    end
+    if str_eq(name, "codebuf_new") do
+        out 1;
+    end
+    if str_eq(name, "codebuf_offset") do
+        out 1;
+    end
+    if str_eq(name, "codebuf_patch_i32") do
+        out 1;
+    end
+    if str_eq(name, "codebuf_patch_u32") do
+        out 1;
+    end
+    if str_eq(name, "comp_arena_begin") do
+        out 1;
+    end
+    if str_eq(name, "emit_runtime_arm64") do
+        out 1;
+    end
+    if str_eq(name, "ent_field_count_flat") do
+        out 1;
+    end
+    if str_eq(name, "ent_field_offset_flat") do
+        out 1;
+    end
+    if str_eq(name, "enum_lookup_variant") do
+        out 1;
+    end
+    if str_eq(name, "expect_name") do
+        out 1;
+    end
+    if str_eq(name, "expect_tok") do
+        out 1;
+    end
+    if str_eq(name, "file_open_write") do
+        out 1;
+    end
+    if str_eq(name, "file_write_bytes") do
+        out 1;
+    end
+    if str_eq(name, "find_ent_flat") do
+        out 1;
+    end
+    if str_eq(name, "find_enum_type") do
+        out 1;
+    end
+    if str_eq(name, "find_func_index") do
+        out 1;
+    end
+    if str_eq(name, "fresh_label") do
+        out 1;
+    end
+    if str_eq(name, "fresh_vreg") do
+        out 1;
+    end
+    if str_eq(name, "heap_alloc") do
+        out 1;
+    end
+    if str_eq(name, "heap_free") do
+        out 1;
+    end
+    if str_eq(name, "heap_init") do
+        out 1;
+    end
+    if str_eq(name, "heap_realloc") do
+        out 1;
+    end
+    if str_eq(name, "init_keywords") do
+        out 1;
+    end
+    if str_eq(name, "ir_emit") do
+        out 1;
+    end
+    if str_eq(name, "is_err") do
+        out 1;
+    end
+    if str_eq(name, "is_metadata") do
+        out 1;
+    end
+    if str_eq(name, "is_name_tok") do
+        out 1;
+    end
+    if str_eq(name, "is_ok") do
+        out 1;
+    end
+    if str_eq(name, "lexer_new") do
+        out 1;
+    end
+    if str_eq(name, "lookup_builtin") do
+        out 1;
+    end
+    if str_eq(name, "lookup_keyword") do
+        out 1;
+    end
+    if str_eq(name, "lower_ctx_new") do
+        out 1;
+    end
+    if str_eq(name, "lower_error") do
+        out 1;
+    end
+    if str_eq(name, "lower_expr") do
+        out 1;
+    end
+    if str_eq(name, "lower_func_def") do
+        out 1;
+    end
+    if str_eq(name, "lower_program") do
+        out 1;
+    end
+    if str_eq(name, "lower_stmt") do
+        out 1;
+    end
+    if str_eq(name, "macho_builder_out") do
+        out 1;
+    end
+    if str_eq(name, "macho_emit") do
+        out 1;
+    end
+    if str_eq(name, "macho_write_header") do
+        out 1;
+    end
+    if str_eq(name, "macho_write_lc_main") do
+        out 1;
+    end
+    if str_eq(name, "macho_write_section") do
+        out 1;
+    end
+    if str_eq(name, "macho_write_segment") do
+        out 1;
+    end
+    if str_eq(name, "macho_write_to_file") do
+        out 1;
+    end
+    if str_eq(name, "main") do
+        out 1;
+    end
+    if str_eq(name, "map") do
+        out 1;
+    end
+    if str_eq(name, "match_block_open") do
+        out 1;
+    end
+    if str_eq(name, "match_tok") do
+        out 1;
+    end
+    if str_eq(name, "mem_cmp") do
+        out 1;
+    end
+    if str_eq(name, "mem_copy") do
+        out 1;
+    end
+    if str_eq(name, "mir_opc_to_lir_opc") do
+        out 1;
+    end
+    if str_eq(name, "native_mem_copy") do
+        out 1;
+    end
+    out 0;
+end.
+
+func boot_is_stage1_keep_3:
+    in(name: int)
+    if str_eq(name, "page_alloc") do
+        out 1;
+    end
+    if str_eq(name, "parse_addition") do
+        out 1;
+    end
+    if str_eq(name, "parse_and_expr") do
+        out 1;
+    end
+    if str_eq(name, "parse_bitwise") do
+        out 1;
+    end
+    if str_eq(name, "parse_block") do
+        out 1;
+    end
+    if str_eq(name, "parse_call_arg") do
+        out 1;
+    end
+    if str_eq(name, "parse_case_stmt") do
+        out 1;
+    end
+    if str_eq(name, "parse_compare") do
+        out 1;
+    end
+    if str_eq(name, "parse_entity_def") do
+        out 1;
+    end
+    if str_eq(name, "parse_enum_def") do
+        out 1;
+    end
+    if str_eq(name, "parse_error") do
+        out 1;
+    end
+    if str_eq(name, "parse_expr") do
+        out 1;
+    end
+    if str_eq(name, "parse_for_range_stmt") do
+        out 1;
+    end
+    if str_eq(name, "parse_func_def") do
+        out 1;
+    end
+    if str_eq(name, "parse_if_stmt") do
+        out 1;
+    end
+    if str_eq(name, "parse_int") do
+        out 1;
+    end
+    if str_eq(name, "parse_loop_stmt") do
+        out 1;
+    end
+    if str_eq(name, "parse_mult") do
+        out 1;
+    end
+    if str_eq(name, "parse_or_expr") do
+        out 1;
+    end
+    if str_eq(name, "parse_primary") do
+        out 1;
+    end
+    if str_eq(name, "parse_print_stmt") do
+        out 1;
+    end
+    if str_eq(name, "parse_program") do
+        out 1;
+    end
+    if str_eq(name, "parse_return_stmt") do
+        out 1;
+    end
+    if str_eq(name, "parse_statement") do
+        out 1;
+    end
+    if str_eq(name, "parse_unary") do
+        out 1;
+    end
+    if str_eq(name, "parse_var_decl") do
+        out 1;
+    end
+    if str_eq(name, "parse_while_stmt") do
+        out 1;
+    end
+    if str_eq(name, "parser_new") do
+        out 1;
+    end
+    if str_eq(name, "peek") do
+        out 1;
+    end
+    if str_eq(name, "print_int") do
+        out 1;
+    end
+    if str_eq(name, "print_ln") do
+        out 1;
+    end
+    if str_eq(name, "print_str") do
+        out 1;
+    end
+    if str_eq(name, "q_func_emit") do
+        out 1;
+    end
+    if str_eq(name, "q_func_idx") do
+        out 1;
+    end
+    if str_eq(name, "q_func_new") do
+        out 1;
+    end
+    if str_eq(name, "q_imm") do
+        out 1;
+    end
+    if str_eq(name, "q_instr") do
+        out 1;
+    end
+    if str_eq(name, "q_label") do
+        out 1;
+    end
+    if str_eq(name, "q_module_add_func") do
+        out 1;
+    end
+    if str_eq(name, "q_module_add_string") do
+        out 1;
+    end
+    if str_eq(name, "q_module_new") do
+        out 1;
+    end
+    if str_eq(name, "q_none") do
+        out 1;
+    end
+    if str_eq(name, "q_opc_to_mir_opc") do
+        out 1;
+    end
+    if str_eq(name, "q_str_ref") do
+        out 1;
+    end
+    if str_eq(name, "q_vreg") do
+        out 1;
+    end
+    if str_eq(name, "read_file_str") do
+        out 1;
+    end
+    if str_eq(name, "rt_itoa") do
+        out 1;
+    end
+    if str_eq(name, "rt_strcat") do
+        out 1;
+    end
+    if str_eq(name, "rt_strcmp") do
+        out 1;
+    end
+    if str_eq(name, "rt_streq") do
+        out 1;
+    end
+    if str_eq(name, "rt_strlen") do
+        out 1;
+    end
+    if str_eq(name, "sb_append_char") do
+        out 1;
+    end
+    if str_eq(name, "sb_grow") do
+        out 1;
+    end
+    if str_eq(name, "sb_new") do
+        out 1;
+    end
+    if str_eq(name, "sb_to_string") do
+        out 1;
+    end
+    if str_eq(name, "skip_newlines") do
+        out 1;
+    end
+    if str_eq(name, "skip_type_annot") do
+        out 1;
+    end
+    if str_eq(name, "str_concat") do
+        out 1;
+    end
+    if str_eq(name, "str_eq") do
+        out 1;
+    end
+    if str_eq(name, "str_len") do
+        out 1;
+    end
+    if str_eq(name, "str_new") do
+        out 1;
+    end
+    if str_eq(name, "str_to_i64") do
+        out 1;
+    end
+    if str_eq(name, "sym_define") do
+        out 1;
+    end
+    if str_eq(name, "sym_lookup") do
+        out 1;
+    end
+    if str_eq(name, "sym_lookup_both") do
+        out 1;
+    end
+    if str_eq(name, "sym_new") do
+        out 1;
+    end
+    if str_eq(name, "sys_close") do
+        out 1;
+    end
+    if str_eq(name, "sys_exit") do
+        out 1;
+    end
+    if str_eq(name, "sys_lseek") do
+        out 1;
+    end
+    if str_eq(name, "sys_mmap") do
+        out 1;
+    end
+    if str_eq(name, "sys_open") do
+        out 1;
+    end
+    if str_eq(name, "sys_write") do
+        out 1;
+    end
+    if str_eq(name, "token_new") do
+        out 1;
+    end
+    if str_eq(name, "token_new_int") do
+        out 1;
+    end
+    if str_eq(name, "token_new_str") do
+        out 1;
+    end
+    if str_eq(name, "try_skip_generic_call_args") do
+        out 1;
+    end
+    if str_eq(name, "unwrap") do
+        out 1;
+    end
+    if str_eq(name, "utf8_count_chars") do
+        out 1;
+    end
+    if str_eq(name, "vec_cap_rt") do
+        out 1;
+    end
+    if str_eq(name, "vec_get_rt") do
+        out 1;
+    end
+    if str_eq(name, "vec_len_rt") do
+        out 1;
+    end
+    if str_eq(name, "vec_new_rt") do
+        out 1;
+    end
+    if str_eq(name, "vec_push_rt") do
+        out 1;
+    end
+    if str_eq(name, "vec_set_rt") do
+        out 1;
+    end
+    if str_eq(name, "vir_alloc") do
+        out 1;
+    end
+    if str_eq(name, "vir_free") do
+        out 1;
+    end
+    if str_eq(name, "vir_realloc") do
+        out 1;
+    end
+    if str_eq(name, "virc_compile") do
+        out 1;
+    end
+    if str_eq(name, "write_file_bytes") do
+        out 1;
+    end
+    out 0;
+end.
+func boot_is_stage1_keep:
+    in(name: int)
+    if name == 0 do
+        out 0;
+    end
+    if boot_is_stage1_keep_0(name) != 0 do
+        out 1;
+    end
+    if boot_is_stage1_keep_1(name) != 0 do
+        out 1;
+    end
+    if boot_is_stage1_keep_2(name) != 0 do
+        out 1;
+    end
+    if boot_is_stage1_keep_3(name) != 0 do
+        out 1;
+    end
+    out 0;
+end.
+
 func lower_program:
     in(ctx: LowerCtx, program: AstNode)
     prog_kids = g_ast_children_acc;
@@ -11435,6 +13053,12 @@ func lower_program:
     native_write_i64(g_boot_name_cell, 368, 0);
     native_write_i64(g_boot_name_cell, 384, 0 - 1);
     native_write_i64(g_boot_name_cell, 392, 0);
+    native_write_i64(g_boot_name_cell, 272, 0);
+    native_write_i64(g_boot_name_cell, 400, 0 - 1);
+    native_write_i64(g_boot_name_cell, 408, 0 - 1);
+    native_write_i64(g_boot_name_cell, 416, 0 - 1);
+    native_write_i64(g_boot_name_cell, 424, 0 - 1);
+    native_write_i64(g_boot_name_cell, 432, 0);
     i = 0;
     when i < vec_len_rt(prog_kids) loop
         child = vec_get_rt(prog_kids, i);
@@ -11485,6 +13109,19 @@ func lower_program:
                 # name-cell 384: real-lowered if/else (JumpIfNot/Label)
                 native_write_i64(g_boot_name_cell, 384, g_boot_nfuncs_reg - 1);
             end
+            if str_eq(child_name, "boot_do_lower") do
+                # name-cell 400: real Stage-1 compile core (MIR→LIR→Mach-O)
+                native_write_i64(g_boot_name_cell, 400, g_boot_nfuncs_reg - 1);
+            end
+            if str_eq(child_name, "boot_phase8_mir_lir_gate") do
+                native_write_i64(g_boot_name_cell, 408, g_boot_nfuncs_reg - 1);
+            end
+            if str_eq(child_name, "boot_codegen_from_lir_tables") do
+                native_write_i64(g_boot_name_cell, 416, g_boot_nfuncs_reg - 1);
+            end
+            if str_eq(child_name, "boot_macho_link_basic42") do
+                native_write_i64(g_boot_name_cell, 424, g_boot_nfuncs_reg - 1);
+            end
         else
             if not is_metadata(child_type) do
                 has_top_stmt = true;
@@ -11500,13 +13137,19 @@ func lower_program:
     boot_body_dump_init();
     g_bd_total = 0;
     g_bd_nfuncs = 0;
-    # Call smoke (2..7 funcs): keep small_multi for param/vmap quirks during lower.
-    if g_boot_nfuncs_reg > 1 and g_boot_nfuncs_reg < 8 do
-        boot_set_small_multi(1);
-    end
     extern func native_write_i64(addr: int, offset: int, val: int);
     if g_boot_name_cell == 0 do
         boot_name_cell_init();
+    end
+    # Call smoke (2..7 funcs): small_multi. Larger (Stage-1) keeps bd_dump +
+    # bd_cap 30000 — do NOT call boot_set_small_multi (it resets cap to 1000).
+    if g_boot_nfuncs_reg > 1 and g_boot_nfuncs_reg < 8 do
+        boot_set_small_multi(1);
+    end
+    # Stage-1 sized: enable vmap/param paths without shrinking bd_cap.
+    if g_boot_nfuncs_reg >= 8 and g_boot_nfuncs_reg < 64 do
+        g_boot_small_multi = 1;
+        native_write_i64(g_boot_name_cell, 64, 1);
     end
     native_write_i64(g_boot_name_cell, 144, g_boot_nfuncs_reg);
     native_write_i64(g_boot_name_cell, 136, 0);
@@ -11552,6 +13195,9 @@ func lower_program:
 
                         if val >= 0 do
                             ir_emit(ctx, q_instr(QOp.StoreGlobal, q_none(), q_imm(gidx as int), q_vreg(val as int)));
+                            if boot_bd_dump_on() != 0 do
+                                boot_bd_push_storeglobal(gidx as int, val as int);
+                            end
                         end
                     end
                 end
@@ -11602,7 +13248,9 @@ func lower_program:
     var early_sum_done = 0;
     var early_dbl_done = 0;
     var early_choose_done = 0;
-    # Self-host: real-lower Stage-1 helpers first, then stub main Call chain.
+    var early_setup_done = 0;
+    var early_lower_done = 0;
+    # Self-host: real-lower Stage-1 compile cone first, then stub main Call.
     if boot_bd_dump_on() != 0 do
         if g_boot_name_cell == 0 do
             boot_name_cell_init();
@@ -11647,8 +13295,30 @@ func lower_program:
                         native_write_i64(g_boot_name_cell, 328, 0 - 1);
                         early_choose_done = 1;
                     end
+                    if str_eq(sn, "boot_stage1_setup") do
+                        print_ln("virc: lower setup early (real lex/parse, self-host)");
+                        native_write_i64(g_boot_name_cell, 272, 1);
+                        native_write_i64(g_boot_name_cell, 328, si);
+                        g_boot_var_name = sn;
+                        lower_func_def(ctx, sc);
+                        g_boot_var_name = 0;
+                        native_write_i64(g_boot_name_cell, 272, 0);
+                        native_write_i64(g_boot_name_cell, 328, 0 - 1);
+                        early_setup_done = 1;
+                    end
+                    if str_eq(sn, "boot_do_lower") do
+                        print_ln("virc: lower boot_do_lower early (real Stage-1 compile)");
+                        native_write_i64(g_boot_name_cell, 432, 1);
+                        native_write_i64(g_boot_name_cell, 328, si);
+                        g_boot_var_name = sn;
+                        lower_func_def(ctx, sc);
+                        g_boot_var_name = 0;
+                        native_write_i64(g_boot_name_cell, 432, 0);
+                        native_write_i64(g_boot_name_cell, 328, 0 - 1);
+                        early_lower_done = 1;
+                    end
                     if str_eq(sn, "boot_stage1_compile") do
-                        print_ln("virc: lower compile early (real body, self-host)");
+                        print_ln("virc: lower compile early (setup+boot_do_lower)");
                         native_write_i64(g_boot_name_cell, 352, 1);
                         native_write_i64(g_boot_name_cell, 328, si);
                         g_boot_var_name = sn;
@@ -11667,7 +13337,8 @@ func lower_program:
                         g_boot_var_name = 0;
                         native_write_i64(g_boot_name_cell, 216, 0);
                         native_write_i64(g_boot_name_cell, 328, 0 - 1);
-                        # Keep-list emit only (main + Stage-1 helpers).
+                        # 224=1 → emit keep-list only (C-VM SIGSEGV if emit all ~750).
+                        # Self-host of virc_boot stays thin; real Stage-1 is virc_stage1.vri.
                         native_write_i64(g_boot_name_cell, 224, 1);
                         early_main_done = 1;
                     end
@@ -11722,6 +13393,16 @@ func lower_program:
                 skip_already = 1;
             end
         end
+        if early_setup_done != 0 do
+            if str_eq(fname_dbg, "boot_stage1_setup") do
+                skip_already = 1;
+            end
+        end
+        if early_lower_done != 0 do
+            if str_eq(fname_dbg, "boot_do_lower") do
+                skip_already = 1;
+            end
+        end
         if skip_already == 0 do
         if child == 0 do
             skip_fn = 1;
@@ -11772,6 +13453,11 @@ func lower_program:
             end
             let nf_cell = native_read_i64(g_boot_name_cell, 144);
             let p_cell = native_read_i64(g_boot_name_cell, 136);
+            # Self-host of virc_boot: skip bulk lowers (C-VM cannot emit ~750).
+            # Real Stage-1 compiler is built from virc_stage1.vri (small_multi).
+            if nf_cell > 256 do
+                skip_fn = 1;
+            end
             if nf_cell > 256 and p_cell >= 2500 do
                 skip_fn = 1;
             end
@@ -11816,6 +13502,27 @@ func lower_program:
                 if nf_cell > 256 do
                     native_write_i64(g_boot_name_cell, 392, 1);
                 end
+            end
+            if str_eq(fname_dbg, "boot_stage1_setup") do
+                skip_fn = 0;
+                if nf_cell > 256 do
+                    native_write_i64(g_boot_name_cell, 272, 1);
+                end
+            end
+            if str_eq(fname_dbg, "boot_do_lower") do
+                skip_fn = 0;
+                if nf_cell > 256 do
+                    native_write_i64(g_boot_name_cell, 432, 1);
+                end
+            end
+            if str_eq(fname_dbg, "boot_phase8_mir_lir_gate") do
+                skip_fn = 0;
+            end
+            if str_eq(fname_dbg, "boot_codegen_from_lir_tables") do
+                skip_fn = 0;
+            end
+            if str_eq(fname_dbg, "boot_macho_link_basic42") do
+                skip_fn = 0;
             end
             if skip_fn == 0 do
                 g_boot_var_name = fname_dbg;
@@ -11886,15 +13593,8 @@ func lower_program:
             # Only for self-host scale — never rewrite scale65/70 suite dumps.
             let nf_force = native_read_i64(g_boot_name_cell, 144);
             if nf_force > 256 do
-                print_ln("virc: force self-host stub main into body-dump");
-                boot_force_bd_stub_main();
-                if g_boot_name_cell == 0 do
-                    boot_name_cell_init();
-                end
-                extern func native_write_i64(addr: int, offset: int, val: int);
-                # 224=1 → codegen emit_only_main + keep-list (Stage-1 helpers).
-                # Emitting all 700 MIR bodies SIGSEGVs the host C-VM.
-                native_write_i64(g_boot_name_cell, 224, 1);
+                # Keep emit_only (224=1); full emit SIGSEGVs the C-VM host.
+                print_ln("virc: self-host missing main in dump — keep emit_only");
             end
         end
     end
@@ -12561,6 +14261,12 @@ var g_emit_b3 = 0;
 var g_rt_print_off = 0;
 var g_rt_printstr_off = 0;
 var g_rt_exit_off = 0;
+var g_rt_argc_off = 0;
+var g_rt_get_arg_off = 0;
+var g_rt_slurp_off = 0;
+var g_rt_slurp_len_off = 0;
+var g_rt_write_off = 0;
+var g_rt_alloc_off = 0;
 var g_code_start_offset = 0;
 var g_main_start_off = 0;
 var g_snap_entry_off = 0;
@@ -12598,11 +14304,17 @@ end.
 
 func codebuf_new:
     in(arch: TargetArch)
-    g_codebuf_data = bvec_new();
+    # Pre-size: Stage-1 emit ~12KB+; realloc mid-emit has SIGSEGV'd C-VM
+    # (g_codebuf_data clobbered into insn-shaped pointers).
+    g_codebuf_data = bvec_new_cap(262144);
+    if g_boot_name_cell != 0 do
+        extern func native_write_i64(addr: int, offset: int, val: int);
+        native_write_i64(g_boot_name_cell, 656, g_codebuf_data);
+    end
     buf = CodeBuf {
         data: g_codebuf_data,
         len:  0,
-        cap:  CODEBUF_INIT_CAP,
+        cap:  262144,
         arch: arch
     };
     out buf;
@@ -12610,14 +14322,25 @@ end.
 
 func codebuf_emit_byte:
     in(buf: CodeBuf, byte: int)
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_name_cell != 0 do
+        let sticky = native_read_i64(g_boot_name_cell, 656);
+        if sticky != 0 do
+            g_codebuf_data = sticky;
+        end
+    end
     if g_codebuf_data == 0 do
         if buf.data != 0 do
             g_codebuf_data = buf.data;
         else
-            g_codebuf_data = bvec_new();
+            g_codebuf_data = bvec_new_cap(262144);
         end
     end
     g_codebuf_data = bvec_push(g_codebuf_data, byte);
+    if g_boot_name_cell != 0 do
+        native_write_i64(g_boot_name_cell, 656, g_codebuf_data);
+    end
     out CodeBuf {
         data: g_codebuf_data,
         len:  bvec_len(g_codebuf_data),
@@ -14439,6 +16162,8 @@ end.
 
 func emit_runtime_arm64:
     in(cb: CodeBuf)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    extern func native_read_i64(addr: int, offset: int) -> int;
     g_rt_print_off = codebuf_offset(cb);
 
     # ── _rt_print_i64: all opcodes hardcoded (bootstrap VM clobbers arm64_* args) ──
@@ -14569,7 +16294,17 @@ func emit_runtime_arm64:
     g_emit_word = 0xD65F03C0;
     cb = codebuf_emit_u32(cb, g_emit_word);
 
-    if g_runtime_min != 0 do
+    # Re-read min flag from name-cell — Vir global g_runtime_min is clobbered
+    # during the long _rt_print emit on C-VM (helpers never appeared in Mach-O).
+    let rt_min = g_runtime_min;
+    let rt_cell = g_boot_name_cell;
+    if rt_cell != 0 do
+        let cell_min = native_read_i64(rt_cell, 480);
+        if cell_min != 0 do
+            rt_min = cell_min;
+        end
+    end
+    if rt_min != 0 do
         # Keep _rt_print_str in min runtime — Stage-1 stub / dump PrintStr need it.
         g_rt_printstr_off = codebuf_offset(cb);
         cb = arm64_stp_pre(cb, 29, 30, 31, -16);
@@ -14592,8 +16327,164 @@ func emit_runtime_arm64:
         cb = arm64_ldp_post(cb, 29, 30, 31, 16);
         cb = arm64_ret(cb);
 
+        # ── _rt_argc: X27→{argc,argv}; out argc ──
+        g_rt_argc_off = codebuf_offset(cb);
+        cb = codebuf_emit_u32(cb, 0xF9400360);      # LDR X0, [X27]
+        cb = arm64_ret(cb);
+
+        # ── _rt_get_arg: X0=index; out argv[i] ──
+        # Layout at x27: [0]=argc [8]=argv [16]=slen
+        g_rt_get_arg_off = codebuf_offset(cb);
+        cb = codebuf_emit_u32(cb, 0xF9400761);      # LDR X1, [X27, #8]
+        cb = codebuf_emit_u32(cb, 0xF8607820);      # LDR X0, [X1, X0, LSL #3]
+        cb = arm64_ret(cb);
+
+        # ── _rt_slurp_len: out [X27,#16] ──
+        g_rt_slurp_len_off = codebuf_offset(cb);
+        cb = codebuf_emit_u32(cb, 0xF9400B60);
+        cb = arm64_ret(cb);
+
+        # ── _rt_slurp: X0=path → X0=ptr; len → [X27,#16] ──
+        g_rt_slurp_off = codebuf_offset(cb);
+        cb = arm64_stp_pre(cb, 29, 30, 31, -48);
+        cb = codebuf_emit_u32(cb, 0xF9000BE0);
+        cb = arm64_mov_imm16(cb, 1, 0);
+        cb = arm64_mov_imm16(cb, 2, 0);
+        cb = arm64_mov_imm16(cb, 16, 5);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = codebuf_emit_u32(cb, 0xF100001F);
+        let slurp_fail1 = codebuf_offset(cb);
+        cb = codebuf_emit_u32(cb, 0x5400000B);
+        cb = codebuf_emit_u32(cb, 0xF9000FE0);
+        cb = arm64_mov_imm16(cb, 1, 0);
+        cb = arm64_mov_imm16(cb, 2, 2);
+        cb = arm64_mov_imm16(cb, 16, 199);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = codebuf_emit_u32(cb, 0xF100001F);
+        let slurp_fail2 = codebuf_offset(cb);
+        cb = codebuf_emit_u32(cb, 0x5400000B);
+        let slurp_fail2b = codebuf_offset(cb);
+        cb = codebuf_emit_u32(cb, 0xB4000000);
+        cb = codebuf_emit_u32(cb, 0xF90013E0);
+        cb = codebuf_emit_u32(cb, 0xF9400FE0);
+        cb = arm64_mov_imm16(cb, 1, 0);
+        cb = arm64_mov_imm16(cb, 2, 0);
+        cb = arm64_mov_imm16(cb, 16, 199);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = codebuf_emit_u32(cb, 0xF94013E1);
+        cb = arm64_mov_imm16(cb, 0, 0);
+        cb = arm64_mov_imm16(cb, 2, 1);
+        cb = arm64_mov_imm16(cb, 3, 2);
+        cb = codebuf_emit_u32(cb, 0xF9400FE4);
+        cb = arm64_mov_imm16(cb, 5, 0);
+        cb = arm64_mov_imm16(cb, 16, 197);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = codebuf_emit_u32(cb, 0xF90017E0);
+        cb = codebuf_emit_u32(cb, 0xF9400FE0);
+        cb = arm64_mov_imm16(cb, 16, 6);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = codebuf_emit_u32(cb, 0xF94013E0);
+        cb = codebuf_emit_u32(cb, 0xF9000B60);
+        cb = codebuf_emit_u32(cb, 0xF94017E0);
+        cb = arm64_ldp_post(cb, 29, 30, 31, 48);
+        cb = arm64_ret(cb);
+        let slurp_fail = codebuf_offset(cb);
+        let d1 = (slurp_fail - slurp_fail1) / 4;
+        cb = codebuf_patch_u32(cb, slurp_fail1, 0x5400000B | ((d1 bit_and 0x7FFFF) shl 5));
+        let d2 = (slurp_fail - slurp_fail2) / 4;
+        cb = codebuf_patch_u32(cb, slurp_fail2, 0x5400000B | ((d2 bit_and 0x7FFFF) shl 5));
+        let d2b = (slurp_fail - slurp_fail2b) / 4;
+        cb = codebuf_patch_u32(cb, slurp_fail2b, 0xB4000000 | ((d2b bit_and 0x7FFFF) shl 5));
+        cb = arm64_mov_imm16(cb, 0, 0);
+        cb = arm64_ldp_post(cb, 29, 30, 31, 48);
+        cb = arm64_ret(cb);
+
+        # ── _rt_write: X0=path X1=buf X2=len → X0=1/0 ──
+        g_rt_write_off = codebuf_offset(cb);
+        # Sticky, like _rt_alloc at cell 496: the global is clobbered before the
+        # caller copies it into the name cell, so writes lowered to _rt_print.
+        let wcell = g_boot_name_cell;
+        if wcell != 0 do
+            native_write_i64(wcell, 472, g_rt_write_off);
+        end
+        cb = arm64_stp_pre(cb, 29, 30, 31, -48);
+        cb = codebuf_emit_u32(cb, 0xF9000BE0);
+        cb = codebuf_emit_u32(cb, 0xF9000FE1);
+        cb = codebuf_emit_u32(cb, 0xF90013E2);
+        cb = arm64_mov_imm16(cb, 1, 0x601);
+        cb = arm64_mov_imm16(cb, 2, 0x1ED);
+        cb = arm64_mov_imm16(cb, 16, 5);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = codebuf_emit_u32(cb, 0xF100001F);
+        let wr_fail1 = codebuf_offset(cb);
+        cb = codebuf_emit_u32(cb, 0x5400000B);
+        cb = codebuf_emit_u32(cb, 0xF90017E0);
+        cb = codebuf_emit_u32(cb, 0xF9400FE1);
+        cb = codebuf_emit_u32(cb, 0xF94013E2);
+        cb = arm64_mov_imm16(cb, 16, 4);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = codebuf_emit_u32(cb, 0xF94017E0);
+        cb = arm64_mov_imm16(cb, 16, 6);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = arm64_mov_imm16(cb, 0, 1);
+        cb = arm64_ldp_post(cb, 29, 30, 31, 48);
+        cb = arm64_ret(cb);
+        let wr_fail = codebuf_offset(cb);
+        let wd = (wr_fail - wr_fail1) / 4;
+        cb = codebuf_patch_u32(cb, wr_fail1, 0x5400000B | ((wd bit_and 0x7FFFF) shl 5));
+        cb = arm64_mov_imm16(cb, 0, 0);
+        cb = arm64_ldp_post(cb, 29, 30, 31, 48);
+        cb = arm64_ret(cb);
+
+        # ── _rt_alloc: X0=size → X0=ptr; bump at [X27,#24] ──
+        let aoff = codebuf_offset(cb);
+        g_rt_alloc_off = aoff;
+        let cell_now = g_boot_name_cell;
+        if cell_now != 0 do
+            native_write_i64(cell_now, 496, aoff);
+        end
+        cb = arm64_stp_pre(cb, 29, 30, 31, -32);
+        cb = codebuf_emit_u32(cb, 0xF9000BE0);
+        cb = codebuf_emit_u32(cb, 0xF9400F61);
+        let al_cbz = codebuf_offset(cb);
+        cb = codebuf_emit_u32(cb, 0xB4000001);
+        let al_bump = codebuf_offset(cb);
+        cb = codebuf_emit_u32(cb, 0xAA0103E0);
+        cb = codebuf_emit_u32(cb, 0xF9400BE2);
+        cb = codebuf_emit_u32(cb, 0x8B020021);
+        cb = codebuf_emit_u32(cb, 0xF9000F61);
+        cb = arm64_ldp_post(cb, 29, 30, 31, 32);
+        cb = arm64_ret(cb);
+        let al_init = codebuf_offset(cb);
+        let ad0 = (al_init - al_cbz) / 4;
+        cb = codebuf_patch_u32(cb, al_cbz, 0xB4000001 | ((ad0 bit_and 0x7FFFF) shl 5));
+        cb = arm64_mov_imm16(cb, 0, 0);
+        cb = codebuf_emit_u32(cb, 0xD2A00021);
+        cb = arm64_mov_imm16(cb, 2, 3);
+        cb = arm64_mov_imm16(cb, 3, 0x1002);
+        cb = codebuf_emit_u32(cb, 0x92800004);
+        cb = arm64_mov_imm16(cb, 5, 0);
+        cb = arm64_mov_imm16(cb, 16, 197);
+        cb = codebuf_emit_u32(cb, 0xF2A04010);
+        cb = arm64_svc(cb, 128);
+        cb = codebuf_emit_u32(cb, 0xF9000F60);
+        cb = codebuf_emit_u32(cb, 0xF9400F61);
+        let ad1 = (al_bump - codebuf_offset(cb)) / 4;
+        cb = codebuf_emit_u32(cb, 0x14000000 | (ad1 bit_and 0x03FFFFFF));
+
         g_rt_exit_off = codebuf_offset(cb);
+        # movz x16,#1; movk x16,#0x200,lsl#16; svc #0x80  (SYS_EXIT)
         g_emit_word = 0xD2800030;
+        cb = codebuf_emit_u32(cb, g_emit_word);
+        g_emit_word = 0xF2A04010;
         cb = codebuf_emit_u32(cb, g_emit_word);
         g_emit_word = 0xD4001001;
         cb = codebuf_emit_u32(cb, g_emit_word);
@@ -16428,10 +18319,31 @@ func boot_cg_emit_word0:
 end.
 
 func boot_cg_movz0:
+    g_cg_immw = g_cg_imm;
+    g_cg_rdw = g_cg_rd bit_and 0x1F;
     g_emit_word = 0xD2800000;
     g_emit_word = g_emit_word | ((g_cg_imm bit_and 0xFFFF) shl 5);
     g_emit_word = g_emit_word | (g_cg_rd bit_and 0x1F);
     boot_cg_emit_word0();
+    # MOVZ only covers bits [15:0]. Stage-1 uses 32-bit instruction words as
+    # literals (0xFEEDFACF, 0xA9B07BFD, ...), so add MOVK per non-zero halfword.
+    if g_cg_immw > 65535 do
+        g_cg_hw = (g_cg_immw shr 16) bit_and 0xFFFF;
+        if g_cg_hw != 0 do
+            g_emit_word = 0xF2A00000 | (g_cg_hw shl 5) | g_cg_rdw;
+            boot_cg_emit_word0();
+        end
+        g_cg_hw = (g_cg_immw shr 32) bit_and 0xFFFF;
+        if g_cg_hw != 0 do
+            g_emit_word = 0xF2C00000 | (g_cg_hw shl 5) | g_cg_rdw;
+            boot_cg_emit_word0();
+        end
+        g_cg_hw = (g_cg_immw shr 48) bit_and 0xFFFF;
+        if g_cg_hw != 0 do
+            g_emit_word = 0xF2E00000 | (g_cg_hw shl 5) | g_cg_rdw;
+            boot_cg_emit_word0();
+        end
+    end
 end.
 
 func boot_cg_str_fp0:
@@ -16483,6 +18395,46 @@ func boot_cg_sdiv0:
     boot_cg_emit_word0();
 end.
 
+func boot_cg_and0:
+    g_emit_word = 0x8A000000;
+    g_emit_word = g_emit_word | ((g_cg_rm bit_and 0x1F) shl 16);
+    g_emit_word = g_emit_word | ((g_cg_rn bit_and 0x1F) shl 5);
+    g_emit_word = g_emit_word | (g_cg_rd bit_and 0x1F);
+    boot_cg_emit_word0();
+end.
+
+func boot_cg_orr0:
+    g_emit_word = 0xAA000000;
+    g_emit_word = g_emit_word | ((g_cg_rm bit_and 0x1F) shl 16);
+    g_emit_word = g_emit_word | ((g_cg_rn bit_and 0x1F) shl 5);
+    g_emit_word = g_emit_word | (g_cg_rd bit_and 0x1F);
+    boot_cg_emit_word0();
+end.
+
+func boot_cg_eor0:
+    g_emit_word = 0xCA000000;
+    g_emit_word = g_emit_word | ((g_cg_rm bit_and 0x1F) shl 16);
+    g_emit_word = g_emit_word | ((g_cg_rn bit_and 0x1F) shl 5);
+    g_emit_word = g_emit_word | (g_cg_rd bit_and 0x1F);
+    boot_cg_emit_word0();
+end.
+
+func boot_cg_lsl0:
+    g_emit_word = 0x9AC02000;
+    g_emit_word = g_emit_word | ((g_cg_rm bit_and 0x1F) shl 16);
+    g_emit_word = g_emit_word | ((g_cg_rn bit_and 0x1F) shl 5);
+    g_emit_word = g_emit_word | (g_cg_rd bit_and 0x1F);
+    boot_cg_emit_word0();
+end.
+
+func boot_cg_asr0:
+    g_emit_word = 0x9AC02800;
+    g_emit_word = g_emit_word | ((g_cg_rm bit_and 0x1F) shl 16);
+    g_emit_word = g_emit_word | ((g_cg_rn bit_and 0x1F) shl 5);
+    g_emit_word = g_emit_word | (g_cg_rd bit_and 0x1F);
+    boot_cg_emit_word0();
+end.
+
 func boot_cg_emit_movz:
     # Uses g_cg_rd, g_cg_imm — capture into locals first (VM clobbers globals).
     let rd = g_cg_rd;
@@ -16514,9 +18466,19 @@ func boot_cg_emit_ldr_fp:
 end.
 
 func boot_cg_emit_bl:
-    # Uses g_cg_target. Capture before codebuf_* (they clobber g_cg_target).
-    g_cg_bl_tgt = g_cg_target;
+    # Uses g_cg_target. Park in name-cell before codebuf_* — C-VM clobbers
+    # g_cg_target/g_cg_bl_tgt into leftover STR/LDR encodings (0xF9xxxxxx).
+    # No `let` — C-VM aborts the rest of tiny helpers when let is present.
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 632, g_cg_target);
     g_cg_off = codebuf_len();
+    native_write_i64(g_boot_name_cell, 640, g_cg_off);
+    g_cg_bl_tgt = native_read_i64(g_boot_name_cell, 632);
+    g_cg_off = native_read_i64(g_boot_name_cell, 640);
     g_emit_word = 0x94000000;
     g_emit_word = g_emit_word | (((g_cg_bl_tgt - g_cg_off) / 4) bit_and 0x03FFFFFF);
     boot_cg_emit_word0();
@@ -16531,8 +18493,18 @@ func boot_cg_mov_rr0:
 end.
 
 func boot_cg_bl0:
-    g_cg_bl_tgt = g_cg_target;
+    # Park target before codebuf_len — same clobber as boot_cg_emit_bl.
+    # No `let` — C-VM aborts the rest of this helper when let is present.
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 632, g_cg_target);
     g_cg_off = codebuf_len();
+    native_write_i64(g_boot_name_cell, 640, g_cg_off);
+    g_cg_bl_tgt = native_read_i64(g_boot_name_cell, 632);
+    g_cg_off = native_read_i64(g_boot_name_cell, 640);
     g_emit_word = 0x94000000;
     g_emit_word = g_emit_word | (((g_cg_bl_tgt - g_cg_off) / 4) bit_and 0x03FFFFFF);
     boot_cg_emit_word0();
@@ -16630,14 +18602,24 @@ func boot_cg_emit_word_imm:
 end.
 
 func boot_cg_prologue0:
-    g_emit_word = 0xA9B07BFD;
+    # 16KB frame — nested Stage-1 parse+lex still overflowed 8KB into caller.
+    # sub sp, sp, #16384
+    g_emit_word = 0xD14013FF;
     boot_cg_emit_word0();
+    # stp x29, x30, [sp, #0]
+    g_emit_word = 0xA9007BFD;
+    boot_cg_emit_word0();
+    # mov x29, sp
     g_emit_word = 0x910003FD;
     boot_cg_emit_word0();
 end.
 
 func boot_cg_epilogue0:
-    g_emit_word = 0xA8D07BFD;
+    # ldp x29, x30, [sp]
+    g_emit_word = 0xA9407BFD;
+    boot_cg_emit_word0();
+    # add sp, sp, #16384
+    g_emit_word = 0x914013FF;
     boot_cg_emit_word0();
     g_emit_word = 0xD65F03C0;
     boot_cg_emit_word0();
@@ -16776,51 +18758,61 @@ func boot_cg_emit_bd_binop:
         g_cg_rm = 10;
         boot_cg_sub0();
     end
+    if g_cg_imm == 8 do
+        boot_cg_and0();
+    end
+    if g_cg_imm == 9 do
+        boot_cg_orr0();
+    end
+    if g_cg_imm == 10 do
+        boot_cg_eor0();
+    end
+    if g_cg_imm == 11 do
+        boot_cg_lsl0();
+    end
+    if g_cg_imm == 12 do
+        boot_cg_asr0();
+    end
     g_cg_off = native_read_i64(g_boot_name_cell, 176);
     g_cg_rd = 8;
     boot_cg_str_fp0();
 end.
 
 func boot_cg_emit_bd_cmp:
-    # LDR x8/x9; CMP; CSET; STR — g_cg_off=a, g_cg_imm=b off, g_cg_target=dst, g_cg_rn=opc 20..25
+    # LDR x8/x9; CMP; CSET X8; STR. Park CSET *word* before helpers (opc slot clobbers).
     extern func native_write_i64(addr: int, offset: int, val: int);
     extern func native_read_i64(addr: int, offset: int) -> int;
     if g_boot_name_cell == 0 do
         boot_name_cell_init();
     end
+    let cset = 0x9A9F17E8;
+    if g_cg_rn == 21 do
+        cset = 0x9A9F07E8;
+    end
+    if g_cg_rn == 22 do
+        cset = 0x9A9FD7E8;
+    end
+    if g_cg_rn == 23 do
+        cset = 0x9A9FA7E8;
+    end
+    if g_cg_rn == 24 do
+        cset = 0x9A9FB7E8;
+    end
+    if g_cg_rn == 25 do
+        cset = 0x9A9FC7E8;
+    end
     native_write_i64(g_boot_name_cell, 160, g_cg_off);
     native_write_i64(g_boot_name_cell, 168, g_cg_imm);
     native_write_i64(g_boot_name_cell, 176, g_cg_target);
-    native_write_i64(g_boot_name_cell, 184, g_cg_rn);
+    native_write_i64(g_boot_name_cell, 704, cset);
     g_cg_rd = 8;
     boot_cg_ldr_fp0();
     g_cg_off = native_read_i64(g_boot_name_cell, 168);
     g_cg_rd = 9;
     boot_cg_ldr_fp0();
-    # CMP X8, X9 = SUBS XZR, X8, X9
     g_emit_word = 0xEB09011F;
     boot_cg_emit_word0();
-    let cop = native_read_i64(g_boot_name_cell, 184);
-    # CSET into X8
-    g_emit_word = 0x9A9F17E0;  # EQ default (rd=x0 pattern; OR rd later)
-    if cop == 20 do
-        g_emit_word = 0x9A9F17E8
-    end
-    if cop == 21 do
-        g_emit_word = 0x9A9F07E8
-    end
-    if cop == 22 do
-        g_emit_word = 0x9A9FD7E8
-    end
-    if cop == 23 do
-        g_emit_word = 0x9A9FA7E8
-    end
-    if cop == 24 do
-        g_emit_word = 0x9A9FB7E8
-    end
-    if cop == 25 do
-        g_emit_word = 0x9A9FC7E8
-    end
+    g_emit_word = native_read_i64(g_boot_name_cell, 704);
     boot_cg_emit_word0();
     g_cg_off = native_read_i64(g_boot_name_cell, 176);
     g_cg_rd = 8;
@@ -16997,12 +18989,14 @@ end.
 
 func boot_call_fixup_reset:
     # Fixup lists as bvecs (survive realloc). name-cell: 272=sites, 280=tgts, 288=n.
+    # Stage-1 has 500+ Calls; default 4096B bvec (512 u64s) overflows and
+    # corrupts site/tgt tables on realloc — late BLs stay imm0 (infinite loop).
     extern func native_write_i64(addr: int, offset: int, val: int);
     if g_boot_name_cell == 0 do
         boot_name_cell_init();
     end
-    g_boot_call_sites = bvec_new();
-    g_boot_call_targets = bvec_new();
+    g_boot_call_sites = bvec_new_cap(131072);
+    g_boot_call_targets = bvec_new_cap(131072);
     g_boot_call_n = 0;
     native_write_i64(g_boot_name_cell, 272, g_boot_call_sites);
     native_write_i64(g_boot_name_cell, 280, g_boot_call_targets);
@@ -17020,9 +19014,26 @@ func boot_cg_patch_calls:
     let sites = native_read_i64(g_boot_name_cell, 272);
     let tgts = native_read_i64(g_boot_name_cell, 280);
     let n = native_read_i64(g_boot_name_cell, 288);
-    let ftab = native_read_i64(g_boot_name_cell, 296);
+    # Prefer sticky ftab ptr (648) — slot 296 is clobbered mid-emit on C-VM.
+    let ftab = native_read_i64(g_boot_name_cell, 648);
+    if ftab == 0 do
+        ftab = native_read_i64(g_boot_name_cell, 296);
+    end
+    if ftab == 0 do
+        ftab = g_boot_func_tab;
+    end
     if sites == 0 or tgts == 0 or ftab == 0 or n <= 0 do
         out;
+    end
+    # Trust bvec byte length over call_n if they diverge after corruption.
+    let slen = bvec_len(sites);
+    let tlen = bvec_len(tgts);
+    let nmax = slen / 8;
+    if tlen / 8 < nmax do
+        nmax = tlen / 8;
+    end
+    if n > nmax do
+        n = nmax;
     end
     let k = 0;
     let cblen = codebuf_len();
@@ -17039,13 +19050,16 @@ func boot_cg_patch_calls:
         if site >= 0 and site + 4 <= cblen do
             if cfi >= 0 and cfi < 1024 do
                 let tgt = native_read_i64(ftab, cfi * 8);
-                let imm26 = ((tgt - site) / 4) bit_and 0x03FFFFFF;
-                let word = 0x94000000 | imm26;
-                if g_codebuf_data != 0 do
-                    native_write_u8(g_codebuf_data, site, word);
-                    native_write_u8(g_codebuf_data, site + 1, word shr 8);
-                    native_write_u8(g_codebuf_data, site + 2, word shr 16);
-                    native_write_u8(g_codebuf_data, site + 3, word shr 24);
+                # Reject insn-shaped junk (0xF9xxxxxx) / out-of-range targets.
+                if tgt > 0 and tgt < cblen and (tgt bit_and 0xFF000000) != 0xF9000000 do
+                    let imm26 = ((tgt - site) / 4) bit_and 0x03FFFFFF;
+                    let word = 0x94000000 | imm26;
+                    if g_codebuf_data != 0 do
+                        native_write_u8(g_codebuf_data, site, word);
+                        native_write_u8(g_codebuf_data, site + 1, word shr 8);
+                        native_write_u8(g_codebuf_data, site + 2, word shr 16);
+                        native_write_u8(g_codebuf_data, site + 3, word shr 24);
+                    end
                 end
             end
         end
@@ -17056,50 +19070,45 @@ end.
 func boot_cg_emit_bd_call:
     # BL callee; optional STR x0 → dst.
     # g_cg_rn = callee func index; g_cg_imm = dst slot off or -1.
-    # Snapshot FIRST — emit helpers clobber Vir globals on C-VM.
-    # If callee already emitted, BL immediately; else record fixup.
+    # Park site/callee in name-cell — codebuf/bvec helpers clobber locals.
     extern func native_read_i64(addr: int, offset: int) -> int;
     extern func native_write_i64(addr: int, offset: int, val: int);
-    let callee_fi = g_cg_rn;
-    let dst_off = g_cg_imm;
-    let ftab = 0;
-    if g_boot_name_cell != 0 do
-        ftab = native_read_i64(g_boot_name_cell, 296);
-    end
-    if ftab == 0 do
-        ftab = g_boot_func_tab;
-    end
-    # Always defer Call patches via bvec (handles update on realloc).
-    let site = codebuf_len();
-    g_emit_word = 0x94000000;
-    boot_cg_emit_word0();
     if g_boot_name_cell == 0 do
         boot_name_cell_init();
     end
-    let sites = native_read_i64(g_boot_name_cell, 272);
-    let tgts = native_read_i64(g_boot_name_cell, 280);
-    let cn = native_read_i64(g_boot_name_cell, 288);
-    if sites == 0 do
+    native_write_i64(g_boot_name_cell, 592, g_cg_rn);
+    native_write_i64(g_boot_name_cell, 600, g_cg_imm);
+    # Always defer Call patches via bvec (handles update on realloc).
+    g_cg_off = codebuf_len();
+    native_write_i64(g_boot_name_cell, 608, g_cg_off);
+    g_emit_word = 0x94000000;
+    boot_cg_emit_word0();
+    g_cg_off = native_read_i64(g_boot_name_cell, 608);
+    g_cg_rn = native_read_i64(g_boot_name_cell, 592);
+    g_cg_imm = native_read_i64(g_boot_name_cell, 600);
+    g_boot_call_sites = native_read_i64(g_boot_name_cell, 272);
+    g_boot_call_targets = native_read_i64(g_boot_name_cell, 280);
+    g_boot_call_n = native_read_i64(g_boot_name_cell, 288);
+    if g_boot_call_sites == 0 do
         boot_call_fixup_reset();
-        sites = native_read_i64(g_boot_name_cell, 272);
-        tgts = native_read_i64(g_boot_name_cell, 280);
-        cn = 0;
+        g_boot_call_sites = native_read_i64(g_boot_name_cell, 272);
+        g_boot_call_targets = native_read_i64(g_boot_name_cell, 280);
+        g_boot_call_n = 0;
     end
-    if cn < 8192 and sites != 0 and tgts != 0 do
-        sites = bvec_push_u64_le(sites, site);
-        tgts = bvec_push_u64_le(tgts, callee_fi);
-        native_write_i64(g_boot_name_cell, 272, sites);
-        native_write_i64(g_boot_name_cell, 280, tgts);
-        native_write_i64(g_boot_name_cell, 288, cn + 1);
-        g_boot_call_sites = sites;
-        g_boot_call_targets = tgts;
-        g_boot_call_n = cn + 1;
+    if g_boot_call_n < 8192 and g_boot_call_sites != 0 and g_boot_call_targets != 0 do
+        g_boot_call_sites = bvec_push_u64_le(g_boot_call_sites, g_cg_off);
+        g_boot_call_targets = bvec_push_u64_le(g_boot_call_targets, g_cg_rn);
+        native_write_i64(g_boot_name_cell, 272, g_boot_call_sites);
+        native_write_i64(g_boot_name_cell, 280, g_boot_call_targets);
+        native_write_i64(g_boot_name_cell, 288, g_boot_call_n + 1);
+        g_boot_call_n = g_boot_call_n + 1;
     end
-    if dst_off >= 0 do
+    g_cg_imm = native_read_i64(g_boot_name_cell, 600);
+    if g_cg_imm >= 0 do
         g_cg_rm = 0;
         g_cg_rd = 8;
         boot_cg_mov_rr0();
-        g_cg_off = dst_off;
+        g_cg_off = g_cg_imm;
         g_cg_rd = 8;
         boot_cg_str_fp0();
     end
@@ -17115,24 +19124,270 @@ func boot_cg_emit_bd_save_param:
     boot_cg_str_fp0();
 end.
 
-func boot_cg_emit_entry0:
-    # _start: save, bl main, movz x0,#0, bl exit, restore, ret
-    # Reload targets from native cells AFTER each emit (Vir globals get clobbered).
+func boot_zx_memrt:
+    # Emit memory/runtime ops. Plan ALL flags before any Call — locals clobber.
+    # In: g_cg_rn=opc; g_cg_off=s1 slot; g_cg_imm=s2 slot; g_cg_target=a2 slot; g_cg_di=dv
     extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    let opc = g_cg_rn;
+    let s1off = g_cg_off;
+    let s2off = g_cg_imm;
+    let a2off = g_cg_target;
+    let dv = g_cg_di;
+    # Plan flags (ints survive better than re-testing opc after Calls).
+    let narg = 0;
+    let memop = 0;
+    let rtcell = 0;
+    let do_exit = 0;
+    let need_store = 1;
+    if opc == 50 do
+        narg = 1;
+        rtcell = 496;
+    end
+    if opc == 94 do
+        narg = 1;
+        rtcell = 448;
+    end
+    if opc == 85 do
+        narg = 1;
+        rtcell = 456;
+    end
+    if opc == 90 do
+        narg = 1;
+        do_exit = 1;
+        need_store = 0;
+    end
+    if opc == 95 do
+        rtcell = 440;
+    end
+    if opc == 86 do
+        rtcell = 464;
+    end
+    if opc == 52 do
+        narg = 2;
+        memop = 52;
+    end
+    if opc == 54 do
+        narg = 2;
+        memop = 54;
+    end
+    if opc == 53 do
+        narg = 3;
+        memop = 53;
+        need_store = 0;
+    end
+    if opc == 55 do
+        narg = 3;
+        memop = 55;
+        need_store = 0;
+    end
+    if opc == 87 do
+        narg = 3;
+        rtcell = 472;
+        need_store = 0;
+    end
+    if dv < 0 do
+        need_store = 0;
+    end
+    # Park plan in name-cell (520..) so Calls cannot clobber.
+    let cell = g_boot_name_cell;
+    # Marker NOP so we can see this emitter in disassembly.
+    g_emit_word = 0xD503201F;
+    boot_cg_emit_word0();
+    native_write_i64(cell, 520, narg);
+    native_write_i64(cell, 528, memop);
+    native_write_i64(cell, 536, rtcell);
+    native_write_i64(cell, 544, do_exit);
+    native_write_i64(cell, 552, need_store);
+    native_write_i64(cell, 560, s1off);
+    native_write_i64(cell, 568, s2off);
+    native_write_i64(cell, 576, a2off);
+    native_write_i64(cell, 584, dv);
+    # Emit arg loads
+    narg = native_read_i64(cell, 520);
+    s1off = native_read_i64(cell, 560);
+    s2off = native_read_i64(cell, 568);
+    a2off = native_read_i64(cell, 576);
+    if narg >= 1 do
+        g_emit_word = 0xF9400000 | (((s1off / 8) bit_and 0xFFF) shl 10) | (29 shl 5) | 0;
+        boot_cg_emit_word0();
+    end
+    narg = native_read_i64(cell, 520);
+    s2off = native_read_i64(cell, 568);
+    if narg >= 2 do
+        g_emit_word = 0xF9400000 | (((s2off / 8) bit_and 0xFFF) shl 10) | (29 shl 5) | 1;
+        boot_cg_emit_word0();
+    end
+    narg = native_read_i64(cell, 520);
+    a2off = native_read_i64(cell, 576);
+    if narg >= 3 do
+        g_emit_word = 0xF9400000 | (((a2off / 8) bit_and 0xFFF) shl 10) | (29 shl 5) | 2;
+        boot_cg_emit_word0();
+    end
+    # Inline mem / exit
+    memop = native_read_i64(cell, 528);
+    if memop == 52 do
+        g_emit_word = 0x38616800;
+        boot_cg_emit_word0();
+    end
+    memop = native_read_i64(cell, 528);
+    if memop == 53 do
+        g_emit_word = 0x38216802;
+        boot_cg_emit_word0();
+    end
+    memop = native_read_i64(cell, 528);
+    if memop == 54 do
+        g_emit_word = 0xF8616800;
+        boot_cg_emit_word0();
+    end
+    memop = native_read_i64(cell, 528);
+    if memop == 55 do
+        g_emit_word = 0xF8216802;
+        boot_cg_emit_word0();
+    end
+    do_exit = native_read_i64(cell, 544);
+    if do_exit != 0 do
+        g_emit_word = 0xD2800030;
+        boot_cg_emit_word0();
+        g_emit_word = 0xF2A04010;
+        boot_cg_emit_word0();
+        g_emit_word = 0xD4001001;
+        boot_cg_emit_word0();
+    end
+    # Runtime BL
+    rtcell = native_read_i64(cell, 536);
+    if rtcell != 0 do
+        let rtoff = native_read_i64(cell, rtcell);
+        if rtoff != 0 do
+            native_write_i64(cell, 504, rtoff);
+            let here = codebuf_len();
+            rtoff = native_read_i64(cell, 504);
+            g_emit_word = 0x94000000 | (((rtoff - here) / 4) bit_and 0x03FFFFFF);
+            boot_cg_emit_word0();
+        end
+    end
+    # Store x0 → fp[dv]
+    need_store = native_read_i64(cell, 552);
+    if need_store != 0 do
+        dv = native_read_i64(cell, 584);
+        let dvoff = 16;
+        if dv >= 16 do
+            dvoff = 16 + (dv - 16) * 8;
+        end
+        native_write_i64(cell, 512, dvoff);
+        g_emit_word = 0xAA0003E8;
+        boot_cg_emit_word0();
+        dvoff = native_read_i64(cell, 512);
+        g_emit_word = 0xF9000000 | (((dvoff / 8) bit_and 0xFFF) shl 10) | (29 shl 5) | 8;
+        boot_cg_emit_word0();
+    end
+end.
+
+func boot_cg_emit_entry0:
+    # _start: keep argc/argv, set x27 → {argc,argv}, mmap globals→X15, bl main, SYS_EXIT.
+    # Inline exit (no BL) — name-cell/global exit offs get clobbered on C-VM.
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    # SUB SP, SP, #48; STP X0, X1, [SP]; x27→{argc,argv,slen,heap,end}
+    g_emit_word = 0xD100C3FF;
+    boot_cg_emit_word0();
+    g_emit_word = 0xA90007E0;
+    boot_cg_emit_word0();
+    # MOV X27, SP
+    g_emit_word = 0x910003FB;
+    boot_cg_emit_word0();
+    # STP XZR, XZR, [X27, #16] — zero slen + heap cursor (else alloc uses stack junk)
+    g_emit_word = 0xA9017F7F;
+    boot_cg_emit_word0();
+    # mmap 64KB globals → X15 (user globals at idx+1; slot0 reserved)
+    g_cg_imm = 0;
+    g_cg_rd = 0;
+    boot_cg_movz0();
+    g_emit_word = 0xD2A00021;
+    boot_cg_emit_word0();
+    g_cg_imm = 3;
+    g_cg_rd = 2;
+    boot_cg_movz0();
+    g_cg_imm = 0x1002;
+    g_cg_rd = 3;
+    boot_cg_movz0();
+    g_emit_word = 0xAA3F03E4;
+    boot_cg_emit_word0();
+    g_cg_imm = 0;
+    g_cg_rd = 5;
+    boot_cg_movz0();
+    g_cg_imm = 197;
+    g_cg_rd = 16;
+    boot_cg_movz0();
+    g_emit_word = 0xF2A04010;
+    boot_cg_emit_word0();
+    g_emit_word = 0xD4001001;
+    boot_cg_emit_word0();
+    # MOV X15, X0
+    g_cg_rm = 0;
+    g_cg_rd = 15;
+    boot_cg_mov_rr0();
+    # STP X29, X30, [SP, #-16]!
     g_emit_word = 0xA9BF7BFD;
     boot_cg_emit_word0();
     g_emit_word = 0x910003FD;
     boot_cg_emit_word0();
+    # Re-load main off after mmap emit (helpers clobber Vir globals).
     g_cg_target = native_read_i64(g_boot_name_cell, 120);
+    native_write_i64(g_boot_name_cell, 632, g_cg_target);
+    g_cg_target = native_read_i64(g_boot_name_cell, 632);
     boot_cg_bl0();
+    # SYS_EXIT: mov x0,#0; movz x16,#1; movk x16,#0x200,lsl#16; svc #0x80
     g_cg_imm = 0;
     g_cg_rd = 0;
     boot_cg_movz0();
-    g_cg_target = native_read_i64(g_boot_name_cell, 112);
-    boot_cg_bl0();
-    g_emit_word = 0xA8C17BFD;
+    g_emit_word = 0xD2800030;
     boot_cg_emit_word0();
-    g_emit_word = 0xD65F03C0;
+    g_emit_word = 0xF2A04010;
+    boot_cg_emit_word0();
+    g_emit_word = 0xD4001001;
+    boot_cg_emit_word0();
+end.
+
+func boot_cg_emit_bd_loadglobal:
+    # g_cg_imm = global idx; g_cg_di = dest vreg. X15 = globals base.
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 616, g_cg_imm + 1);
+    g_cg_off = boot_cg_slot_off(g_cg_di);
+    native_write_i64(g_boot_name_cell, 624, g_cg_off);
+    g_cg_imm = native_read_i64(g_boot_name_cell, 616);
+    g_cg_rd = 9;
+    boot_cg_movz0();
+    # LDR X8, [X15, X9, LSL #3]
+    g_emit_word = 0xF86979E8;
+    boot_cg_emit_word0();
+    g_cg_off = native_read_i64(g_boot_name_cell, 624);
+    g_cg_rd = 8;
+    boot_cg_str_fp0();
+end.
+
+func boot_cg_emit_bd_storeglobal:
+    # g_cg_imm = global idx; g_cg_rn = src vreg. X15 = globals base.
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 616, g_cg_imm + 1);
+    g_cg_off = boot_cg_slot_off(g_cg_rn);
+    native_write_i64(g_boot_name_cell, 624, g_cg_off);
+    g_cg_off = native_read_i64(g_boot_name_cell, 624);
+    g_cg_rd = 8;
+    boot_cg_ldr_fp0();
+    g_cg_imm = native_read_i64(g_boot_name_cell, 616);
+    g_cg_rd = 9;
+    boot_cg_movz0();
+    # STR X8, [X15, X9, LSL #3]
+    g_emit_word = 0xF82979E8;
     boot_cg_emit_word0();
 end.
 
@@ -17148,17 +19403,29 @@ func boot_codegen_emit_mod_min:
     end
     boot_body_dump_debug();
     g_cg_cb = codebuf_new(TargetArch.ARM64);
-    g_runtime_min = 1;
-    g_cg_cb = emit_runtime_arm64(g_cg_cb);
-    g_runtime_min = 0;
-    g_boot_rt_print = g_rt_print_off;
-    g_boot_rt_exit = g_rt_exit_off;
     if g_boot_name_cell == 0 do
         boot_name_cell_init();
     end
+    native_write_i64(g_boot_name_cell, 480, 1);
+    g_runtime_min = 1;
+    g_cg_cb = emit_runtime_arm64(g_cg_cb);
+    g_runtime_min = 0;
+    native_write_i64(g_boot_name_cell, 480, 0);
+    g_boot_rt_print = g_rt_print_off;
+    g_boot_rt_exit = g_rt_exit_off;
     native_write_i64(g_boot_name_cell, 104, g_boot_rt_print);
     native_write_i64(g_boot_name_cell, 112, g_boot_rt_exit);
+    native_write_i64(g_boot_name_cell, 488, g_rt_exit_off);
     native_write_i64(g_boot_name_cell, 232, g_rt_printstr_off);
+    native_write_i64(g_boot_name_cell, 440, g_rt_argc_off);
+    native_write_i64(g_boot_name_cell, 448, g_rt_get_arg_off);
+    native_write_i64(g_boot_name_cell, 456, g_rt_slurp_off);
+    native_write_i64(g_boot_name_cell, 464, g_rt_slurp_len_off);
+    # 472 sticky-written inside emit_runtime; only refill if that did not run.
+    if native_read_i64(g_boot_name_cell, 472) == 0 do
+        native_write_i64(g_boot_name_cell, 472, g_rt_write_off);
+    end
+    # 496 sticky-written inside emit_runtime; do not rewrite from clobbered global.
     if g_boot_func_tab == 0 do
         # ≥1024 i64 slots for Call targets / main entry.
         g_boot_func_tab = heap_alloc(8192);
@@ -17169,8 +19436,9 @@ func boot_codegen_emit_mod_min:
         native_write_i64(g_boot_func_tab, zfi * 8, 0);
         zfi = zfi + 1;
     end
-    # name-cell 296: func_tab ptr (Vir global clobbers mid-emit).
+    # name-cell 296 + sticky 648: func_tab ptr (296 clobbers mid-emit on C-VM).
     native_write_i64(g_boot_name_cell, 296, g_boot_func_tab);
+    native_write_i64(g_boot_name_cell, 648, g_boot_func_tab);
     boot_call_fixup_reset();
     g_boot_main_off = 0 - 1;
     native_write_i64(g_boot_name_cell, 120, g_boot_main_off);
@@ -17219,6 +19487,7 @@ func boot_codegen_emit_mod_min:
         let pipe_fi = native_read_i64(g_boot_name_cell, 336);
         let dbl_fi = native_read_i64(g_boot_name_cell, 344);
         let choose_fi = native_read_i64(g_boot_name_cell, 384);
+        let lower_fi = native_read_i64(g_boot_name_cell, 400);
         let keep = is_main;
         if ping_fi >= 0 and fi == ping_fi and blen > 0 do
             keep = 1;
@@ -17238,14 +19507,25 @@ func boot_codegen_emit_mod_min:
         if choose_fi >= 0 and fi == choose_fi and blen > 0 do
             keep = 1;
         end
+        if lower_fi >= 0 and fi == lower_fi and blen > 0 do
+            keep = 1;
+        end
+        # Skip empty bodies always under emit_only.
+        if emit_only_main != 0 and blen <= 0 and is_main == 0 do
+            keep = 0;
+        end
         if emit_only_main != 0 and keep == 0 do
             fi = fi + 1;
         else
         let func_off = codebuf_len();
-        let ftab = native_read_i64(g_boot_name_cell, 296);
+        let ftab = native_read_i64(g_boot_name_cell, 648);
+        if ftab == 0 do
+            ftab = native_read_i64(g_boot_name_cell, 296);
+        end
         if ftab == 0 do
             ftab = g_boot_func_tab;
         end
+        native_write_i64(g_boot_name_cell, 296, ftab);
         native_write_i64(ftab, fi * 8, func_off);
         if is_main != 0 do
             g_boot_main_off = func_off;
@@ -17281,9 +19561,7 @@ func boot_codegen_emit_mod_min:
                 if immv < 0 do
                     immv = 0;
                 end
-                if immv > 65535 do
-                    immv = immv bit_and 65535;
-                end
+                # No 16-bit mask: boot_cg_movz0 emits MOVZ+MOVK for wide values.
                 g_cg_imm = immv;
                 g_cg_off = boot_cg_slot_off(dv);
                 boot_cg_emit_bd_load();
@@ -17295,7 +19573,7 @@ func boot_codegen_emit_mod_min:
                 boot_cg_emit_bd_move();
             end
 
-            if opc == 3 or opc == 4 or opc == 5 or opc == 6 or opc == 7 do
+            if opc == 3 or opc == 4 or opc == 5 or opc == 6 or opc == 7 or opc == 8 or opc == 9 or opc == 10 or opc == 11 or opc == 12 do
                 g_cg_off = boot_cg_slot_off(s1v);
                 g_cg_imm = boot_cg_slot_off(s2v);
                 g_cg_target = boot_cg_slot_off(dv);
@@ -17369,17 +19647,186 @@ func boot_codegen_emit_mod_min:
                 boot_cg_emit_bd_cmp();
             end
 
+            # Runtime/mem (keep small — large helper bodies break on C-VM)
+            if opc == 50 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_rd = 0;
+                boot_cg_ldr_fp0();
+                g_cg_target = native_read_i64(g_boot_name_cell, 496);
+                boot_cg_bl0();
+                if dv >= 0 do
+                    g_cg_rm = 0;
+                    g_cg_rd = 8;
+                    boot_cg_mov_rr0();
+                    g_cg_off = boot_cg_slot_off(dv);
+                    g_cg_rd = 8;
+                    boot_cg_str_fp0();
+                end
+            end
+            if opc == 52 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_rd = 0;
+                boot_cg_ldr_fp0();
+                g_cg_off = boot_cg_slot_off(s2v);
+                g_cg_rd = 1;
+                boot_cg_ldr_fp0();
+                g_emit_word = 0x38616800;
+                boot_cg_emit_word0();
+                if dv >= 0 do
+                    g_cg_rm = 0;
+                    g_cg_rd = 8;
+                    boot_cg_mov_rr0();
+                    g_cg_off = boot_cg_slot_off(dv);
+                    g_cg_rd = 8;
+                    boot_cg_str_fp0();
+                end
+            end
+            if opc == 53 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_rd = 0;
+                boot_cg_ldr_fp0();
+                g_cg_off = boot_cg_slot_off(s2v);
+                g_cg_rd = 1;
+                boot_cg_ldr_fp0();
+                g_cg_off = boot_cg_slot_off(di);
+                g_cg_rd = 2;
+                boot_cg_ldr_fp0();
+                g_emit_word = 0x38216802;
+                boot_cg_emit_word0();
+            end
+            if opc == 54 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_rd = 0;
+                boot_cg_ldr_fp0();
+                g_cg_off = boot_cg_slot_off(s2v);
+                g_cg_rd = 1;
+                boot_cg_ldr_fp0();
+                g_emit_word = 0xF8616800;
+                boot_cg_emit_word0();
+                if dv >= 0 do
+                    g_cg_rm = 0;
+                    g_cg_rd = 8;
+                    boot_cg_mov_rr0();
+                    g_cg_off = boot_cg_slot_off(dv);
+                    g_cg_rd = 8;
+                    boot_cg_str_fp0();
+                end
+            end
+            if opc == 55 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_rd = 0;
+                boot_cg_ldr_fp0();
+                g_cg_off = boot_cg_slot_off(s2v);
+                g_cg_rd = 1;
+                boot_cg_ldr_fp0();
+                g_cg_off = boot_cg_slot_off(di);
+                g_cg_rd = 2;
+                boot_cg_ldr_fp0();
+                g_emit_word = 0xF8216802;
+                boot_cg_emit_word0();
+            end
+            if opc == 94 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_rd = 0;
+                boot_cg_ldr_fp0();
+                g_cg_target = native_read_i64(g_boot_name_cell, 448);
+                boot_cg_bl0();
+                if dv >= 0 do
+                    g_cg_rm = 0;
+                    g_cg_rd = 8;
+                    boot_cg_mov_rr0();
+                    g_cg_off = boot_cg_slot_off(dv);
+                    g_cg_rd = 8;
+                    boot_cg_str_fp0();
+                end
+            end
+            if opc == 95 do
+                g_cg_target = native_read_i64(g_boot_name_cell, 440);
+                boot_cg_bl0();
+                if dv >= 0 do
+                    g_cg_rm = 0;
+                    g_cg_rd = 8;
+                    boot_cg_mov_rr0();
+                    g_cg_off = boot_cg_slot_off(dv);
+                    g_cg_rd = 8;
+                    boot_cg_str_fp0();
+                end
+            end
+            if opc == 85 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_rd = 0;
+                boot_cg_ldr_fp0();
+                g_cg_target = native_read_i64(g_boot_name_cell, 456);
+                boot_cg_bl0();
+                if dv >= 0 do
+                    g_cg_rm = 0;
+                    g_cg_rd = 8;
+                    boot_cg_mov_rr0();
+                    g_cg_off = boot_cg_slot_off(dv);
+                    g_cg_rd = 8;
+                    boot_cg_str_fp0();
+                end
+            end
+            if opc == 86 do
+                g_cg_target = native_read_i64(g_boot_name_cell, 464);
+                boot_cg_bl0();
+                if dv >= 0 do
+                    g_cg_rm = 0;
+                    g_cg_rd = 8;
+                    boot_cg_mov_rr0();
+                    g_cg_off = boot_cg_slot_off(dv);
+                    g_cg_rd = 8;
+                    boot_cg_str_fp0();
+                end
+            end
+            if opc == 87 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_rd = 0;
+                boot_cg_ldr_fp0();
+                g_cg_off = boot_cg_slot_off(s2v);
+                g_cg_rd = 1;
+                boot_cg_ldr_fp0();
+                g_cg_off = boot_cg_slot_off(di);
+                g_cg_rd = 2;
+                boot_cg_ldr_fp0();
+                g_cg_target = native_read_i64(g_boot_name_cell, 472);
+                boot_cg_bl0();
+            end
+            if opc == 90 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_rd = 0;
+                boot_cg_ldr_fp0();
+                g_emit_word = 0xD2800030;
+                boot_cg_emit_word0();
+                g_emit_word = 0xF2A04010;
+                boot_cg_emit_word0();
+                g_emit_word = 0xD4001001;
+                boot_cg_emit_word0();
+            end
+            if opc == 92 do
+                g_cg_imm = s1i;
+                g_cg_di = dv;
+                boot_cg_emit_bd_loadglobal();
+            end
+            if opc == 93 do
+                g_cg_imm = s1i;
+                g_cg_rn = s2v;
+                boot_cg_emit_bd_storeglobal();
+            end
+
             j = j + 1;
         end
 
         boot_cg_patch_jumps();
 
-        if did_ret == 0 do
-            g_cg_imm = 0;
-            g_cg_rd = 0;
-            boot_cg_movz0();
-            boot_cg_epilogue0();
-        end
+        # Always close the function. `did_ret` only says *some* Ret was emitted;
+        # a mid-body `out` leaves the tail open and the next function's prologue
+        # becomes the fallthrough target (next_tok fell into classify_kw).
+        # A trailing epilogue after a real Ret is dead code, so it is safe.
+        g_cg_imm = 0;
+        g_cg_rd = 0;
+        boot_cg_movz0();
+        boot_cg_epilogue0();
         fi = fi + 1;
         end
     end
@@ -17435,9 +19882,14 @@ func boot_codegen_flat_min:
     extern func native_read_i64(addr: int, offset: int) -> int;
     extern func native_write_i64(addr: int, offset: int, val: int);
     g_cg_cb = codebuf_new(TargetArch.ARM64);
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 480, 1);
     g_runtime_min = 1;
     g_cg_cb = emit_runtime_arm64(g_cg_cb);
     g_runtime_min = 0;
+    native_write_i64(g_boot_name_cell, 480, 0);
     g_snap_entry_off = codebuf_len();
     g_code_start_offset = g_snap_entry_off;
 
@@ -17597,10 +20049,16 @@ func boot_codegen_flat_min:
 end.
 
 func boot_codegen_basic42:
+    extern func native_write_i64(addr: int, offset: int, val: int);
     cb = codebuf_new(TargetArch.ARM64);
+    if g_boot_name_cell == 0 do
+        boot_name_cell_init();
+    end
+    native_write_i64(g_boot_name_cell, 480, 1);
     g_runtime_min = 1;
     cb = emit_runtime_arm64(cb);
     g_runtime_min = 0;
+    native_write_i64(g_boot_name_cell, 480, 0);
     g_snap_entry_off = codebuf_offset(cb);
     g_code_start_offset = g_snap_entry_off;
     cb = boot_codegen_emit_main_min(cb);
@@ -18296,23 +20754,26 @@ func boot_stage1_double:
     out x + x;
 end.
 func boot_stage1_choose:
-    # JumpIfNot smoke: false cond → else → 7 (avoid Cmp* until named locals land).
-    if 0 do
-        out 9;
-    else
+    # Named-local Compare → JumpIfNot (C-VM-safe via blk Ident capture).
+    let a = 1;
+    let b = 2;
+    if a < b do
         out 7;
+    else
+        out 9;
     end
 end.
 func boot_stage1_compile:
-    # Self-host Stage-1 smoke: Call chain + print (not full CLI yet).
+    # Thin self-host smoke for virc_boot → a.out (Call/Cmp only).
+    # Real Stage-1 compiler: build virc_stage1.vri (separate small source).
     print boot_stage1_double();
     print boot_stage1_choose();
-    print "virc stage1 pipeline ok";
+    print "virc-boot self-host ok; use virc_stage1 for compile";
     out 0;
 end.
 func main:
-    # Host (Stage-0) uses this body. Self-host replaces with dump-safe stub
-    # that Calls boot_stage1_compile (real-lowered pipeline stand-in).
+    # Host (Stage-0): setup + full virc_compile.
+    # Self-host: stub main Calls boot_stage1_compile (setup+boot_do_lower).
     boot_stage1_setup();
     out virc_compile();
 end.
@@ -19611,17 +22072,29 @@ func boot_codegen_from_lir_multifn:
     extern func native_write_i64(addr: int, offset: int, val: int);
     let nfuncs = g_bd_nfuncs;
     g_cg_cb = codebuf_new(TargetArch.ARM64);
-    g_runtime_min = 1;
-    g_cg_cb = emit_runtime_arm64(g_cg_cb);
-    g_runtime_min = 0;
-    g_boot_rt_print = g_rt_print_off;
-    g_boot_rt_exit = g_rt_exit_off;
     if g_boot_name_cell == 0 do
         boot_name_cell_init();
     end
+    native_write_i64(g_boot_name_cell, 480, 1);
+    g_runtime_min = 1;
+    g_cg_cb = emit_runtime_arm64(g_cg_cb);
+    g_runtime_min = 0;
+    native_write_i64(g_boot_name_cell, 480, 0);
+    g_boot_rt_print = g_rt_print_off;
+    g_boot_rt_exit = g_rt_exit_off;
     native_write_i64(g_boot_name_cell, 104, g_boot_rt_print);
     native_write_i64(g_boot_name_cell, 112, g_boot_rt_exit);
+    native_write_i64(g_boot_name_cell, 488, g_rt_exit_off);
     native_write_i64(g_boot_name_cell, 232, g_rt_printstr_off);
+    native_write_i64(g_boot_name_cell, 440, g_rt_argc_off);
+    native_write_i64(g_boot_name_cell, 448, g_rt_get_arg_off);
+    native_write_i64(g_boot_name_cell, 456, g_rt_slurp_off);
+    native_write_i64(g_boot_name_cell, 464, g_rt_slurp_len_off);
+    # 472 sticky-written inside emit_runtime; only refill if that did not run.
+    if native_read_i64(g_boot_name_cell, 472) == 0 do
+        native_write_i64(g_boot_name_cell, 472, g_rt_write_off);
+    end
+    # 496 sticky-written inside emit_runtime; do not rewrite from clobbered global.
     if g_boot_func_tab == 0 do
         g_boot_func_tab = heap_alloc(8192);
     end
@@ -19631,6 +22104,7 @@ func boot_codegen_from_lir_multifn:
         zfi2 = zfi2 + 1;
     end
     native_write_i64(g_boot_name_cell, 296, g_boot_func_tab);
+    native_write_i64(g_boot_name_cell, 648, g_boot_func_tab);
     boot_call_fixup_reset();
     g_boot_main_off = 0 - 1;
     native_write_i64(g_boot_name_cell, 120, g_boot_main_off);
@@ -19666,6 +22140,7 @@ func boot_codegen_from_lir_multifn:
         let pipe_fi = native_read_i64(g_boot_name_cell, 336);
         let dbl_fi = native_read_i64(g_boot_name_cell, 344);
         let choose_fi = native_read_i64(g_boot_name_cell, 384);
+        let lower_fi = native_read_i64(g_boot_name_cell, 400);
         let keep = is_main;
         if ping_fi >= 0 and fi == ping_fi and blen > 0 do
             keep = 1
@@ -19685,11 +22160,25 @@ func boot_codegen_from_lir_multifn:
         if choose_fi >= 0 and fi == choose_fi and blen > 0 do
             keep = 1
         end
+        if lower_fi >= 0 and fi == lower_fi and blen > 0 do
+            keep = 1
+        end
+        if emit_only_main != 0 and blen <= 0 and is_main == 0 do
+            keep = 0
+        end
         if emit_only_main != 0 and keep == 0 do
             fi = fi + 1
         else
             let func_off = codebuf_len();
-            native_write_i64(g_boot_func_tab, fi * 8, func_off);
+            let ftab = native_read_i64(g_boot_name_cell, 648);
+            if ftab == 0 do
+                ftab = native_read_i64(g_boot_name_cell, 296)
+            end
+            if ftab == 0 do
+                ftab = g_boot_func_tab
+            end
+            native_write_i64(g_boot_name_cell, 296, ftab);
+            native_write_i64(ftab, fi * 8, func_off);
             if is_main != 0 do
                 g_boot_main_off = func_off;
                 native_write_i64(g_boot_name_cell, 120, func_off)
@@ -19730,9 +22219,7 @@ func boot_codegen_from_lir_multifn:
                     if immv < 0 do
                         immv = 0
                     end
-                    if immv > 65535 do
-                        immv = immv bit_and 65535
-                    end
+                    # No 16-bit mask: boot_cg_movz0 emits MOVZ+MOVK.
                     g_cg_imm = immv;
                     g_cg_off = boot_cg_slot_off(dv);
                     boot_cg_emit_bd_load()
@@ -19744,7 +22231,7 @@ func boot_codegen_from_lir_multifn:
                     boot_cg_emit_bd_move()
                 end
 
-                if opc == 3 or opc == 4 or opc == 5 or opc == 6 or opc == 7 do
+                if opc == 3 or opc == 4 or opc == 5 or opc == 6 or opc == 7 or opc == 8 or opc == 9 or opc == 10 or opc == 11 or opc == 12 do
                     g_cg_off = boot_cg_slot_off(s1v);
                     g_cg_imm = boot_cg_slot_off(s2v);
                     g_cg_target = boot_cg_slot_off(dv);
@@ -19817,6 +22304,173 @@ func boot_codegen_from_lir_multifn:
                     boot_cg_emit_bd_cmp()
                 end
 
+                # Alloc/mem/runtime (minimal; keep small for C-VM body limits)
+                if opc == 50 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = 0;
+                    boot_cg_ldr_fp0();
+                    g_cg_target = native_read_i64(g_boot_name_cell, 496);
+                    boot_cg_bl0();
+                    if dv >= 0 do
+                        g_cg_rm = 0;
+                        g_cg_rd = 8;
+                        boot_cg_mov_rr0();
+                        g_cg_off = boot_cg_slot_off(dv);
+                        g_cg_rd = 8;
+                        boot_cg_str_fp0();
+                    end
+                end
+                if opc == 52 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = 0;
+                    boot_cg_ldr_fp0();
+                    g_cg_off = boot_cg_slot_off(s2v);
+                    g_cg_rd = 1;
+                    boot_cg_ldr_fp0();
+                    g_emit_word = 0x38616800;
+                    boot_cg_emit_word0();
+                    if dv >= 0 do
+                        g_cg_rm = 0;
+                        g_cg_rd = 8;
+                        boot_cg_mov_rr0();
+                        g_cg_off = boot_cg_slot_off(dv);
+                        g_cg_rd = 8;
+                        boot_cg_str_fp0();
+                    end
+                end
+                if opc == 53 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = 0;
+                    boot_cg_ldr_fp0();
+                    g_cg_off = boot_cg_slot_off(s2v);
+                    g_cg_rd = 1;
+                    boot_cg_ldr_fp0();
+                    g_cg_off = boot_cg_slot_off(di);
+                    g_cg_rd = 2;
+                    boot_cg_ldr_fp0();
+                    g_emit_word = 0x38216802;
+                    boot_cg_emit_word0();
+                end
+                if opc == 54 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = 0;
+                    boot_cg_ldr_fp0();
+                    g_cg_off = boot_cg_slot_off(s2v);
+                    g_cg_rd = 1;
+                    boot_cg_ldr_fp0();
+                    g_emit_word = 0xF8616800;
+                    boot_cg_emit_word0();
+                    if dv >= 0 do
+                        g_cg_rm = 0;
+                        g_cg_rd = 8;
+                        boot_cg_mov_rr0();
+                        g_cg_off = boot_cg_slot_off(dv);
+                        g_cg_rd = 8;
+                        boot_cg_str_fp0();
+                    end
+                end
+                if opc == 55 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = 0;
+                    boot_cg_ldr_fp0();
+                    g_cg_off = boot_cg_slot_off(s2v);
+                    g_cg_rd = 1;
+                    boot_cg_ldr_fp0();
+                    g_cg_off = boot_cg_slot_off(di);
+                    g_cg_rd = 2;
+                    boot_cg_ldr_fp0();
+                    g_emit_word = 0xF8216802;
+                    boot_cg_emit_word0();
+                end
+                if opc == 94 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = 0;
+                    boot_cg_ldr_fp0();
+                    g_cg_target = native_read_i64(g_boot_name_cell, 448);
+                    boot_cg_bl0();
+                    if dv >= 0 do
+                        g_cg_rm = 0;
+                        g_cg_rd = 8;
+                        boot_cg_mov_rr0();
+                        g_cg_off = boot_cg_slot_off(dv);
+                        g_cg_rd = 8;
+                        boot_cg_str_fp0();
+                    end
+                end
+                if opc == 95 do
+                    g_cg_target = native_read_i64(g_boot_name_cell, 440);
+                    boot_cg_bl0();
+                    if dv >= 0 do
+                        g_cg_rm = 0;
+                        g_cg_rd = 8;
+                        boot_cg_mov_rr0();
+                        g_cg_off = boot_cg_slot_off(dv);
+                        g_cg_rd = 8;
+                        boot_cg_str_fp0();
+                    end
+                end
+                if opc == 85 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = 0;
+                    boot_cg_ldr_fp0();
+                    g_cg_target = native_read_i64(g_boot_name_cell, 456);
+                    boot_cg_bl0();
+                    if dv >= 0 do
+                        g_cg_rm = 0;
+                        g_cg_rd = 8;
+                        boot_cg_mov_rr0();
+                        g_cg_off = boot_cg_slot_off(dv);
+                        g_cg_rd = 8;
+                        boot_cg_str_fp0();
+                    end
+                end
+                if opc == 86 do
+                    g_cg_target = native_read_i64(g_boot_name_cell, 464);
+                    boot_cg_bl0();
+                    if dv >= 0 do
+                        g_cg_rm = 0;
+                        g_cg_rd = 8;
+                        boot_cg_mov_rr0();
+                        g_cg_off = boot_cg_slot_off(dv);
+                        g_cg_rd = 8;
+                        boot_cg_str_fp0();
+                    end
+                end
+                if opc == 87 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = 0;
+                    boot_cg_ldr_fp0();
+                    g_cg_off = boot_cg_slot_off(s2v);
+                    g_cg_rd = 1;
+                    boot_cg_ldr_fp0();
+                    g_cg_off = boot_cg_slot_off(di);
+                    g_cg_rd = 2;
+                    boot_cg_ldr_fp0();
+                    g_cg_target = native_read_i64(g_boot_name_cell, 472);
+                    boot_cg_bl0();
+                end
+                if opc == 90 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = 0;
+                    boot_cg_ldr_fp0();
+                    g_emit_word = 0xD2800030;
+                    boot_cg_emit_word0();
+                    g_emit_word = 0xF2A04010;
+                    boot_cg_emit_word0();
+                    g_emit_word = 0xD4001001;
+                    boot_cg_emit_word0();
+                end
+                if opc == 92 do
+                    g_cg_imm = s1i;
+                    g_cg_di = dv;
+                    boot_cg_emit_bd_loadglobal();
+                end
+                if opc == 93 do
+                    g_cg_imm = s1i;
+                    g_cg_rn = s2v;
+                    boot_cg_emit_bd_storeglobal();
+                end
+
                 end
 
                 j = j + 1
@@ -19824,12 +22478,11 @@ func boot_codegen_from_lir_multifn:
 
             boot_cg_patch_jumps();
 
-            if did_ret == 0 do
-                g_cg_imm = 0;
-                g_cg_rd = 0;
-                boot_cg_movz0();
-                boot_cg_epilogue0()
-            end
+            # Always close the function — see note in the primary emit loop.
+            g_cg_imm = 0;
+            g_cg_rd = 0;
+            boot_cg_movz0();
+            boot_cg_epilogue0();
             fi = fi + 1
         end
     end
@@ -19872,8 +22525,10 @@ func boot_codegen_from_lir_tables:
     # Sole codegen entry: MIR body-dump rows (+ LIR mirror). No QFunction.body path.
     # Large dumps: multifn walker has historically SIGSEGV'd on C-VM; emit_mod_min
     # still reads g_bd_* (MIR tier), not Q entity bodies.
-    if g_bd_nfuncs > 256 and g_bd_total > 0 do
-        print_ln("virc: codegen via MIR body-dump (large)");
+    # Stage-1 (~30 funcs, ~2k MIR ops): LIR multifn SIGSEGVs mid-emit on C-VM.
+    # Prefer emit_mod_min for all body-dump multifn below the huge self-host cut.
+    if g_bd_nfuncs > 0 and g_bd_total > 0 and g_bd_nfuncs < 256 do
+        print_ln("virc: codegen via MIR body-dump (mod_min)");
         let real_mod = QModule {
             name:       "main",
             functions:  g_snap_mod_funcs,
@@ -19883,20 +22538,33 @@ func boot_codegen_from_lir_tables:
         g_phase8_lir_emit = 1;
         out 0
     end
+    if g_bd_nfuncs > 256 and g_bd_total > 0 do
+        print_ln("virc: codegen via MIR body-dump (large)");
+        let real_mod2 = QModule {
+            name:       "main",
+            functions:  g_snap_mod_funcs,
+            strings:    g_snap_mod_strings
+        };
+        boot_codegen_emit_mod_min(real_mod2);
+        g_phase8_lir_emit = 1;
+        out 0
+    end
     if g_bd_nfuncs > 0 and g_bd_total > 0 and g_lir_n > 0 do
         print_ln("virc: codegen via LIR multifn (MIR tier)");
         boot_codegen_from_lir_multifn();
         out 0
     end
     g_cg_cb = codebuf_new(TargetArch.ARM64);
-    g_runtime_min = 1;
-    g_cg_cb = emit_runtime_arm64(g_cg_cb);
-    g_runtime_min = 0;
-    g_boot_rt_print = g_rt_print_off;
-    g_boot_rt_exit = g_rt_exit_off;
     if g_boot_name_cell == 0 do
         boot_name_cell_init();
     end
+    native_write_i64(g_boot_name_cell, 480, 1);
+    g_runtime_min = 1;
+    g_cg_cb = emit_runtime_arm64(g_cg_cb);
+    g_runtime_min = 0;
+    native_write_i64(g_boot_name_cell, 480, 0);
+    g_boot_rt_print = g_rt_print_off;
+    g_boot_rt_exit = g_rt_exit_off;
     native_write_i64(g_boot_name_cell, 104, g_boot_rt_print);
     native_write_i64(g_boot_name_cell, 112, g_boot_rt_exit);
     native_write_i64(g_boot_name_cell, 232, g_rt_printstr_off);
