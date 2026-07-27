@@ -176,10 +176,10 @@ graph LR
 
 | Block | Open | Close |
 |-------|------|-------|
-| Definition (`func`/`entity`/…) | `:` | **`end.`** |
-| `if` / `eif` | **`do`** | **`end`** |
-| `when` | **`loop`** | **`end`** |
-| `for` | **`do`** | **`end`** |
+| Definition (`func`/`entity`/`method`/`enum`/`register`/`mold`/`@bind`/…) | `:` | **`end.`** |
+| Control-flow / statement (`if`/`eif`/`else`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, …) | `do` / `loop` / `:` (tuỳ dạng) | **`end`** |
+
+Canonical: `docs/vir_language_spec_v2.0_vi.md` §1 (EN mirrors VI).
 
 ---
 

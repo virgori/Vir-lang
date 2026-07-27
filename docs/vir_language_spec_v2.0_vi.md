@@ -7,7 +7,7 @@
 
 ## Mục lục
 
-1. [Tổng quan](#1-tổng-quan) — gồm [§1.1 Phân tầng Language / Compiler / Library](#11-phân-tầng-language--compiler--library)
+1. [Tổng quan](#1-tổng-quan) — gồm [§1.0 Separator](#10-separator----hoặc-xuống-dòng), [§1.1 Phân tầng Language / Compiler / Library](#11-phân-tầng-language--compiler--library)
 2. [Chú thích (Comments)](#2-chú-thích-comments)
 3. [Hệ thống Module](#3-hệ-thống-module)
 4. [Kiểu dữ liệu](#4-kiểu-dữ-liệu)
@@ -46,10 +46,12 @@
 Vir là một ngôn ngữ lập trình hệ thống biên dịch trực tiếp, có cấu trúc khối (block-scoped). Nó biên dịch sang ARM64 (Mach-O), x86-64 (ELF) và WebAssembly — không phụ thuộc bất kỳ thư viện nào (không libc, không linker).
 
 **Nguyên tắc cốt lõi:**
-- Khối định nghĩa (`func`, `entity`, `method`, `enum`, `register`, `mold`) mở bằng `:` và đóng bằng `end.`
-- Khối điều khiển (`if` / `eif`) mở bằng `do` và đóng bằng `end`
+- **Đóng khối — luật duy nhất:**
+  - **Định nghĩa / khai báo** (`func`, `async func`, `entity`, `method`, `enum`, `register`, `mold`, stub `@bind`, …) → đóng bằng **`end.`**
+  - **Luồng điều khiển / khối câu lệnh** (`if` / `eif` / `else`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, `isolate`, …) → đóng bằng **`end`**
+- **Separator — một khái niệm duy nhất** (xem §1.0): mọi danh sách (statement, khai báo nhóm, named-arg, nhánh `case`, …) tách bằng **`;` hoặc xuống dòng (`NEWLINE`)**. Nhiều phần tử **cùng một dòng** → bắt buộc `;`
+- Khối định nghĩa mở bằng `:` (sau chữ ký). Khối `if` / `eif` / `for` mở bằng `do`; `when` mở thân bằng `loop`; nhiều khối khác (`try`, `arena`, `map`, …) mở bằng `:`
 - Dấu hai chấm `:` cũng dùng cho khai báo kiểu và ánh xạ key-value (dict, case, map)
-- Dấu chấm phẩy tuỳ chọn (xuống dòng cũng là kết thúc câu lệnh)
 - `out` thay `return`, `eif` thay `elif`, `skip` thay `continue`
 - `when ... loop` thay `while`
 
@@ -59,6 +61,57 @@ func main:
     print("Hello from $name!")
 end.
 ```
+
+### 1.0 Separator — `;` hoặc xuống dòng
+
+Vir **không** có nhiều “vai trò `;`” khác nhau. Chỉ có **một** khái niệm separator cho mọi dạng danh sách:
+
+```ebnf
+separator := ";" | NEWLINE
+list      := item (separator item)*
+```
+
+**Luật nhớ:**
+1. Separator = `;` **hoặc** xuống dòng.
+2. Nhiều phần tử trên **cùng một dòng** → bắt buộc `;` giữa chúng.
+3. Hết danh sách / hết nhóm = gặp **keyword tiếp theo**, `end` / `end.`, hoặc hết ngữ cảnh khối — **không** phải “thiếu `;` để đóng”.
+4. **`;` trước xuống dòng vẫn chấp nhận** (thừa nhưng hợp lệ). Ví dụ `var` nhiều dòng có `;` cuối mỗi dòng vẫn đúng — không bắt buộc, không lỗi:
+
+```vir
+var
+    x: int;
+    y: int;
+    z: int
+```
+
+tương đương không `;`:
+
+```vir
+var
+    x: int
+    y: int
+    z: int
+```
+
+**Tương đương:**
+
+```vir
+print("A")
+print("B")
+```
+
+```vir
+print("A");
+print("B")
+```
+
+```vir
+print("A"); print("B")    # cùng dòng → phải có ;
+```
+
+Cùng luật cho nhóm `var` / `in` / `ref` / `out`, named-arg, và nhánh `case` (§5.3, §6.4, §14, §21).
+
+> **Lưu ý:** `,` vẫn dùng cho **danh sách phẳng khác** (tham số positional một dòng `f(a, b)`, phần tử list/mold, v.v.) — đó không phải separator khối/nhóm ở trên.
 
 ### 1.1 Phân tầng Language / Compiler / Library
 
@@ -571,13 +624,24 @@ var
 
 Biến cấp module có thể truy cập từ mọi hàm trong module. Dùng `share` để mở cho module khác.
 
-**Quy tắc nhóm bằng dấu chấm phẩy:** Khi dòng kết thúc bằng `;`, dòng tiếp theo vẫn thuộc cùng nhóm `var` (không cần lặp lại từ khoá `var`). Khi dòng **không có** `;`, nhóm kết thúc.
+**Nhóm `var` dùng separator thống nhất (§1.0):** `;` hoặc xuống dòng giữa các phần tử. Xuống dòng mà vẫn có `;` cuối dòng → **vẫn chấp nhận**. Hết nhóm = keyword tiếp theo / hết ngữ cảnh.
 
 ```vir
 var
-    x: int;         # có ';' → dòng sau vẫn thuộc nhóm var
-    y: int;         # có ';'
-    z: int          # không ';' → kết thúc nhóm var
+    x: int
+    y: int
+    z: int
+```
+
+```vir
+var
+    x: int;
+    y: int;
+    z: int
+```
+
+```vir
+var x: int; y: int; z: int    # cùng dòng → bắt buộc ;
 ```
 
 ### 5.4 Gán lại
@@ -602,12 +666,64 @@ end.
 
 - `func <tên>(<tham số>):` — định nghĩa hàm
 - `out <biểu thức>` — trả về giá trị (thay thế `return`)
-- `end` — đóng thân hàm
+- `end.` — đóng thân hàm (khối định nghĩa)
 
-### 6.2 Tham số có kiểu
+### 6.2 Tham số có kiểu — hai dạng (chỉ hai)
+
+**Sai** — không đặt từ khoá nhóm `in` bên trong `()` (`in` là mặc định; không ai khai báo `in` trong ngoặc):
 
 ```vir
-func add(a: int, b: int) -> int:
+# SAI
+func add(
+    in
+        a: Int;
+        b: Int
+):
+    out a + b
+end.
+```
+
+**Đúng — dạng 1: ngoặc `()`** — danh sách trong ngoặc; tách bằng `;` (nhiều dòng) hoặc `,` (một dòng). Được dùng **`ref`** trước tên tham số (tham chiếu). Không dùng `in` trong `()`.
+
+```vir
+func add(
+        a: Int;
+        b: Int
+) -> Int:
+    out a + b
+end.
+
+func increment(ref x: Int):
+    x = x + 1
+end.
+
+func swap(ref a: Int, ref b: Int):
+    var tmp = a
+    a = b
+    b = tmp
+end.
+```
+
+Dạng rút gọn (mặc định theo giá trị — không cần viết `in`):
+
+```vir
+func add(a, b):
+    out a + b
+end.
+
+func add(a: Int, b: Int) -> Int:
+    out a + b
+end.
+```
+
+**Đúng — dạng 2: khối `in` / `ref` / `out`** — `func tên:` rồi nhóm tham số **ngoài** ngoặc (chi tiết §14). Ở đây `in` mới có ích (nhóm nhiều tham số / tách `ref`/`out`):
+
+```vir
+func add:
+    in
+        a: Int;
+        b: Int
+
     out a + b
 end.
 ```
@@ -628,8 +744,20 @@ end.
 
 ### 6.4 Đối số có tên
 
+Separator thống nhất (§1.0): `;` hoặc xuống dòng giữa các named-arg. Cùng dòng → bắt buộc `;`.
+
 ```vir
-sum(a=5; b=10);     # gọi hàm với đối số có tên, ngăn cách bằng ;
+sum(a=5; b=10)
+
+sum(
+    a = 5
+    b = 10
+)
+
+sum(
+    a = 5;
+    b = 10
+)
 ```
 
 ### 6.5 Khai báo trước
@@ -822,7 +950,7 @@ end
 
 - `eif` thay thế `elif`/`else if`
 - `else` không có dấu hai chấm
-- `end` đóng toàn bộ khối
+- `end` đóng toàn bộ chuỗi `if` / `eif` / `else` (khối điều khiển — không dùng `end.`)
 
 ### 9.2 Vòng When (while)
 
@@ -876,10 +1004,12 @@ skip         # nhảy sang vòng tiếp theo (thay thế 'continue')
 | `^` | Luỹ thừa | 30 |
 | `*` | Nhân | 20 |
 | `/` | Chia | 20 |
-| `%` | Phần trăm | 18 |
-| `mod` | Phần dư (modulo) | 18 |
+| `%` | Phần trăm (ví dụ `10%` = 0.1) — **không** phải chia dư | 18 |
+| `mod` | Phần dư / modulo (ví dụ `7 mod 3` = 1) | 18 |
 | `+` | Cộng | 10 |
 | `-` | Trừ | 10 |
+
+> **Lưu ý:** Dùng `mod` cho số dư. `%` là toán tử phần trăm, không thay cho modulo.
 
 ### 10.2 So sánh
 
@@ -1159,7 +1289,7 @@ end.
 
 **Output:** `42` rồi `close(fd)` thực thi.
 
-`ensure` là khối cuối trước `end`. Nó chạy ở cả thoát bình thường lẫn khi lỗi.
+`ensure` là khối cuối trước `end.` của hàm. Nó chạy ở cả thoát bình thường lẫn khi lỗi.
 
 ### 13.3 revert — Thực thi chỉ khi có lỗi
 
@@ -1505,57 +1635,119 @@ Từ khoá `erx` đọc mã lỗi hiện tại (giá trị truyền cho `throw`)
 
 ## 14. Tham số — in / ref / out
 
-Vir sử dụng ba từ khoá nhóm tham số: `in` (đầu vào), `ref` (tham chiếu), `out` (đầu ra). Mặc định mọi tham số đều **truyền theo giá trị**. Dùng `ref` để truyền theo tham chiếu.
+Vir có **đúng hai** cách khai báo tham số.
 
-### 14.1 Cú pháp đơn giản (inline)
+| Dạng | Chữ ký | Trong `()` / khối |
+|------|--------|-------------------|
+| **1. Ngoặc** | `func tên(…):` | Được **`ref tên`**; **không** viết `in` (mặc định theo giá trị). `out` dùng dạng khối nhóm. |
+| **2. Khối nhóm** | `func tên:` | `in` / `ref` / `out` trước thân hàm |
 
-Khi số tham số ít, khai báo trực tiếp trong ngoặc:
+Mặc định truyền **theo giá trị**. `ref` = tham chiếu (được phép cả trong `()` lẫn khối nhóm).
+
+### 14.1 Dạng 1 — ngoặc `()`
 
 ```vir
-func increment(ref x: int):
+func add(
+        a: Int;
+        b: Int
+) -> Int:
+    out a + b
+end.
+
+func add(a: Int, b: Int) -> Int:
+    out a + b
+end.
+
+# ref trong () — hợp lệ
+func increment(ref x: Int):
     x = x + 1
 end.
 
-func swap(ref a: int, ref b: int):
+func swap(ref a: Int, ref b: Int):
     var tmp = a
     a = b
     b = tmp
 end.
 ```
 
-### 14.2 Cú pháp nhóm (multi-line)
+**Sai** — `in` trong `()` (thừa và không phải cú pháp ngoặc):
 
-Khi hàm có nhiều tham số thuộc các nhóm khác nhau, sử dụng cú pháp nhóm. Dấu chấm phẩy `;` cuối dòng nghĩa là "dòng tiếp vẫn thuộc nhóm này". Không có `;` → nhóm kết thúc.
+```vir
+# SAI
+func add(
+    in
+        a: Int;
+        b: Int
+):
+    out a + b
+end.
+```
+
+### 14.2 Dạng 2 — khối `in` / `ref` / `out`
+
+`func tên:` (không danh sách trong `()`). Mỗi từ khoá mở một nhóm. Phần tử trong nhóm tách bằng separator thống nhất (§1.0): `;` hoặc xuống dòng. **Hết nhóm** = gặp từ khoá nhóm tiếp (`ref` / `out` / …) hoặc thân hàm — không phải “dòng không có `;`”.
 
 ```vir
 func process_data:
-    in  path: String;
-        timeout: Int;
-        retry: Bool         # Không có ';' → kết thúc nhóm 'in'
-    ref buffer: Array       # Không có ';' → chỉ có 1 biến nhóm 'ref'
-    out status: Bool;
-        error: String       # Kết thúc nhóm 'out'
+    in
+        path: String
+        timeout: Int
+        retry: Bool
+    ref buffer: Array
+    out
+        status: Bool
+        error: String
 
     # --- Logic ---
     var fd = open(path)
 end.
 ```
 
-**An toàn compiler — phát hiện lệch nhóm:** Vì ký tự `;` mang trọng lượng ngữ nghĩa (xác định tư cách nhóm), thêm hoặc xoá nhầm có thể lệch nhóm tham số mà không có cảnh báo. Compiler áp dụng các kiểm tra sau để phát hiện lỗi:
+```vir
+func process_data:
+    in  path: String;
+        timeout: Int;
+        retry: Bool
+    ref buffer: Array
+    out status: Bool;
+        error: String
+
+    var fd = open(path)
+end.
+```
+
+```vir
+func increment:
+    ref x: Int
+
+    x = x + 1
+end.
+
+func swap:
+    ref a: Int;
+        b: Int
+
+    var tmp = a
+    a = b
+    b = tmp
+end.
+```
+
+**An toàn compiler — phát hiện lệch nhóm** (dạng 2): Hết nhóm theo keyword; nếu sau một phần tử xuất hiện dòng định danh “trần” không thuộc keyword/`end`/thân lệnh hợp lệ, compiler báo orphan (thường do thụt lề / nhầm chỗ). Kiểm tra:
 
 | Kiểm tra | Điều kiện | Thông báo |
 |---------|-----------|----------|
-| **Tham số mồ côi** | Dòng định danh đơn tiếp sau dòng kết thúc nhóm (không `;`) nhưng không có từ khoá `in`/`ref`/`out` | **Lỗi:** "tham số `X` không có nhóm — quên `;` ở dòng trước?" |
-| **Nhóm rỗng** | Từ khoá `in`/`ref`/`out` không có tham số trước từ khoá nhóm tiếp theo hoặc thân hàm | **Lỗi:** "nhóm tham số `ref` rỗng" |
-| **Gợi ý không khớp kiểu** | Tham số được dùng kiểu `ref` (lấy địa chỉ) nhưng khai báo trong `in` | **Cảnh báo:** "tham số `X` truyền theo giá trị nhưng bị sửa — cân nhắc dùng `ref`" |
-| **Hướng dẫn thụt lề** | Dòng tiếp nối (sau `;`) phải thụt lề sâu hơn từ khoá nhóm | **Cảnh báo:** "dòng tiếp nối nên thụt lề dưới từ khoá nhóm của nó" |
+| **Tham số mồ côi** | Dòng định danh đơn không thuộc nhóm đang mở và không có `in`/`ref`/`out` | **Lỗi:** "tham số `X` không có nhóm" |
+| **Nhóm rỗng** | `in`/`ref`/`out` không có tham số trước nhóm tiếp hoặc thân hàm | **Lỗi:** "nhóm tham số `ref` rỗng" |
+| **Gợi ý không khớp kiểu** | Tham số dùng như `ref` nhưng khai báo `in` | **Cảnh báo:** "tham số `X` truyền theo giá trị nhưng bị sửa — cân nhắc dùng `ref`" |
+| **Hướng dẫn thụt lề** | Phần tử tiếp trong nhóm nên thụt lề dưới từ khoá nhóm | **Cảnh báo:** "dòng tiếp nối nên thụt lề dưới từ khoá nhóm của nó" |
 
-Quy tắc `;` cũng áp dụng cho `var` — không cần lặp lại từ khoá:
+Quy tắc separator nhóm cũng áp dụng cho `var` (§5.3, §1.0):
 
 ```vir
 var
-    x: int;
-    y: int;
+    x: int
+    y: int
     z: int
 ```
 
@@ -1612,7 +1804,7 @@ end.
 - Hàm `@bind(c)` **không có thân** — là ký hiệu ngoại
 - Chú thích kiểu **bắt buộc** (ABI của C cần biết kích thước tham số)
 - Kiểu trả về dùng `-> type` sau danh sách tham số
-- Kết thúc bằng `end`
+- Kết thúc bằng `end.` (stub `@bind` là khối định nghĩa)
 
 **Sử dụng:**
 
@@ -1758,7 +1950,7 @@ mold TCPFlags: u8
 end.
 ```
 
-**Cú pháp:** `mold Tên: <kiểu_nền>` theo sau bởi các cặp `field: độ_rộng` phân cách bằng dấu phẩy, đóng bằng `end`.
+**Cú pháp:** `mold Tên: <kiểu_nền>` theo sau bởi các cặp `field: độ_rộng` phân cách bằng dấu phẩy, đóng bằng `end.`
 
 **Sử dụng:**
 
@@ -2042,7 +2234,7 @@ end
 
 ```vir
 var evens = map x in numbers:
-    if x % 2 == 0
+    if x mod 2 == 0 do
         out x
     end
 end
@@ -2062,20 +2254,44 @@ end
 
 ## 21. Biểu thức Case
 
-Mỗi nhánh của `case` là một arm độc lập.
+`case` là khối **điều khiển** — đóng bằng `end` (không dùng `end.`).
 
-- **Kết thúc nhánh** dùng dấu chấm phẩy `;`
-- **Nhiều statement trong cùng một nhánh** dùng dấu phẩy `,`
-- **Nhánh cuối cùng** có thể bỏ dấu `;`
-- Nếu thiếu `,` hoặc `;` đúng vị trí thì đó là **lỗi cú pháp**
-- Dấu phẩy bên trong lời gọi hàm như `f(x, y)` hoặc bên trong biểu thức lồng nhau **không** tách statement
+Nhánh `case` là một **danh sách** theo separator thống nhất (§1.0): `;` hoặc xuống dòng. Cùng dòng nhiều nhánh → bắt buộc `;`.
+
+### 21.1 Dạng chuẩn
+
+```vir
+case v.virgex_fullmatch(pattern, p)
+    true: print("✅ $p")
+    false: print("❌ $p")
+end
+```
+
+```vir
+case v.virgex_fullmatch(pattern, p)
+    true: print("✅ $p");
+    false: print("❌ $p")
+end
+```
+
+```vir
+case x
+    1: print("one"); 2: print("two")
+end
+```
+
+**Quy tắc:**
+- `case <biểu_thức>` rồi các nhánh `mẫu: …`
+- Giữa các nhánh: `;` hoặc `NEWLINE` (§1.0)
+- Nhánh mặc định: `else: …`
+- Đóng khối bằng `end`
+- Nhánh mới bắt đầu khi phần tử tiếp theo là `mẫu:` / `else:` — nhiều câu lệnh trong cùng nhánh cũng dùng cùng separator (`;` / xuống dòng) cho đến khi gặp nhánh mới
 
 ```vir
 case color
-    "red": log("stop", 1), out 1;
-    "green": log("go", 2), out 2;
-    "yellow": log("wait", 3), out 3;
-    else: log("unknown", 0), out 0
+    "red": log("stop", 1); out 1
+    "green": log("go", 2); out 2
+    else: log("unknown", 0); out 0
 end
 ```
 
@@ -2791,7 +3007,8 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 | Từ khoá | Mục đích |
 |---------|---------|
 | `func` | Định nghĩa hàm |
-| `end` | Đóng bất kỳ khối nào |
+| `end.` | Đóng khối định nghĩa / khai báo (`func`, `entity`, `method`, `enum`, `register`, `mold`, stub `@bind`, …) — xem §1 |
+| `end` | Đóng khối điều khiển / câu lệnh (`if`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, …) — xem §1 |
 | `out` | Trả về giá trị từ hàm |
 | `var` | Khai báo biến có thể thay đổi |
 | `let` | Ràng buộc biến bất biến |
@@ -2985,7 +3202,7 @@ Từ cao đến thấp:
 | revert | — | `revert` bảo vệ phạm vi (chỉ khi lỗi) |
 | ref params | — | Khối tham số `in`/`ref`/`out` theo nhóm |
 | FFI | — | `@bind(c)` giao tiếp C, `@bind(asm)` hợp ngữ, `@bind(wasm)` WASM |
-| Register | — | `register Name: u32 ... end` ánh xạ bit |
+| Register | — | `register Name: u32 ... end.` ánh xạ bit |
 | precomp | — | `precomp` bổ ngữ từ khoá cho tính toán thời biên dịch |
 | @entry | — | Điểm nhập bare-metal tuỳ chọn |
 | try / revert | — | `try: ... revert ... end` ranh giới lỗi cục bộ với bồi hoàn Saga |
@@ -3000,7 +3217,7 @@ Từ cao đến thấp:
 | `quiet` | — | Tác vụ ly khai bắn-và-quên — không handle, lỗi ghi log không lan truyền (§22.9) |
 | `port` | — | Cổng tín hiệu cấp module có kiểu — MPSC, hàng đợi, an toàn qua async task (§23) |
 | `send` / `recv` | — | Gửi/nhận thông điệp port — `send` không chặn, `recv` là điểm tạm dừng (§23.2–23.3) |
-| `mold` | `register` (dùng đóng gói) | `mold Tên: u16 r:5, g:6, b:5 end` — bit-field đa dụng (§16.6) |
+| `mold` | `register` (dùng đóng gói) | `mold Tên: u16 r:5, g:6, b:5 end.` — bit-field đa dụng (§16.6) |
 | `flux` | — | `flux<T, N>` — kiểu vector SIMD, ánh xạ sang NEON/SSE-AVX/WASM SIMD (§24.1) |
 | Swizzle `~` | — | `v~xyz` — hậu tố xáo trộn/nhân bản kênh `flux`; write-masking: `v~xy = flux(a, b)` (§24.2) |
 | `deck` | — | `deck tên: Kiểu[kích_thước]` — buffer chia sẻ CPU-GPU (§24.3) |

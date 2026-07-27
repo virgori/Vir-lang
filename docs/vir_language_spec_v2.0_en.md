@@ -7,7 +7,7 @@
 
 ## Table of Contents
 
-1. [Overview](#1-overview) — includes [§1.1 Language / Compiler / Library Separation](#11-language--compiler--library-separation)
+1. [Overview](#1-overview) — includes [§1.0 Separator](#10-separator----or-newline), [§1.1 Language / Compiler / Library Separation](#11-language--compiler--library-separation)
 2. [Comments](#2-comments)
 3. [Module System](#3-module-system)
 4. [Types](#4-types)
@@ -44,10 +44,12 @@
 Vir is a compiled, structured, block-scoped systems programming language. It compiles to native ARM64 (Mach-O), x86-64 (ELF), and WebAssembly — with zero external dependencies (no libc, no linker).
 
 **Core principles:**
-- Definition blocks (`func`, `entity`, `method`, `enum`, `register`, `mold`) open with `:` and close with `end.`
-- Control-flow blocks (`if` / `eif`) open with `do` and close with `end`
+- **Block closers — single rule:**
+  - **Definitions / declarations** (`func`, `async func`, `entity`, `method`, `enum`, `register`, `mold`, `@bind` stubs, …) → close with **`end.`**
+  - **Control-flow / statement blocks** (`if` / `eif` / `else`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, `isolate`, …) → close with **`end`**
+- **Separator — one concept** (see §1.0): every list (statements, declaration groups, named-args, `case` arms, …) is separated by **`;` or newline (`NEWLINE`)**. Multiple items on the **same line** require `;`
+- Definition blocks open with `:`. `if` / `eif` / `for` open with `do`; `when` opens its body with `loop`; many other blocks (`try`, `arena`, `map`, …) open with `:`
 - Colon `:` is also used for type annotation and key-value mapping (dict, case, map)
-- Semicolons are permitted but optional (newline is a valid terminator)
 - `out` replaces `return`, `eif` replaces `elif`, `skip` replaces `continue`
 - `when ... loop` replaces `while`
 
@@ -57,6 +59,59 @@ func main:
     print("Hello from $name!")
 end.
 ```
+
+### 1.0 Separator — `;` or newline
+
+Vir does **not** give `;` many unrelated roles. There is **one** separator concept for every list form.
+
+Canonical text: `docs/vir_language_spec_v2.0_vi.md` §1.0.
+
+```ebnf
+separator := ";" | NEWLINE
+list      := item (separator item)*
+```
+
+**Rules:**
+1. A separator is `;` **or** a newline.
+2. Multiple items on the **same line** → `;` is required between them.
+3. End of list / group = next **keyword**, `end` / `end.`, or end of block context — **not** “missing `;` closes the group”.
+4. **A trailing `;` before a newline is still accepted** (redundant but valid). Multi-line `var` with `;` on each line is fine — not required, not an error:
+
+```vir
+var
+    x: int;
+    y: int;
+    z: int
+```
+
+equivalent without `;`:
+
+```vir
+var
+    x: int
+    y: int
+    z: int
+```
+
+**Equivalents:**
+
+```vir
+print("A")
+print("B")
+```
+
+```vir
+print("A");
+print("B")
+```
+
+```vir
+print("A"); print("B")    # same line → must use ;
+```
+
+The same rule applies to `var` / `in` / `ref` / `out` groups, named args, and `case` arms (§5.3, §6.4, §14, §21).
+
+> **Note:** `,` remains for other flat lists (positional `f(a, b)`, list/mold elements, etc.) — that is not the block/group separator above.
 
 ### 1.1 Language / Compiler / Library Separation
 
@@ -560,15 +615,20 @@ let result = compute()    # immutable binding
 - `var` — mutable variable
 - `let` — immutable binding (cannot reassign after initialization)
 
-**Grouped declaration** — use `var` once, then indent multiple variables:
+**Grouped declaration** — use `var` once, then list members with the unified separator (§1.0):
 
 ```vir
-var x = 10;
-    y = 20;
-    z = 30            # no ';' ends the group
+var
+    x = 10
+    y = 20
+    z = 30
 ```
 
-This avoids repeating `var` for each variable. The grouping follows the same `;` convention as parameter blocks (see [§14](#14-parameter-blocks--in--ref--out)).
+```vir
+var x = 10; y = 20; z = 30    # same line → must use ;
+```
+
+Same rule as parameter groups (see [§14](#14-parameter-blocks--in--ref--out)).
 
 ### 5.2 Constants
 
@@ -589,6 +649,14 @@ var
 ```
 
 Module-level variables are accessible by all functions within the module. Use `share` to expose them to other modules.
+
+**`var` groups use the unified separator (§1.0):** `;` or newline between members. End of group = next keyword / end of context — not “a line without `;`”.
+
+```vir
+var
+    counter: int
+    mode: string
+```
 
 ### 5.4 Reassignment
 
@@ -612,12 +680,64 @@ end.
 
 - `func <name>(<params>):` — defines a function
 - `out <expr>` — returns a value (replaces `return`)
-- `end` — closes the function body
+- `end.` — closes the function body (definition block)
 
-### 6.2 Typed Parameters
+### 6.2 Typed Parameters — exactly two forms
+
+**Wrong** — do not put the group keyword `in` inside `()` (`in` is the default; nobody writes `in` in parentheses):
 
 ```vir
-func add(a: int, b: int) -> int:
+# WRONG
+func add(
+    in
+        a: Int;
+        b: Int
+):
+    out a + b
+end.
+```
+
+**Correct — form 1: parentheses `()`** — list in parens; `;` (multi-line) or `,` (one line). **`ref`** before a parameter name is allowed (by-reference). Do not write `in` inside `()`.
+
+```vir
+func add(
+        a: Int;
+        b: Int
+) -> Int:
+    out a + b
+end.
+
+func increment(ref x: Int):
+    x = x + 1
+end.
+
+func swap(ref a: Int, ref b: Int):
+    var tmp = a
+    a = b
+    b = tmp
+end.
+```
+
+Shorthand (pass-by-value default — no `in`):
+
+```vir
+func add(a, b):
+    out a + b
+end.
+
+func add(a: Int, b: Int) -> Int:
+    out a + b
+end.
+```
+
+**Correct — form 2: `in` / `ref` / `out` blocks** — `func name:` then groups **outside** parens (see §14). Here `in` is useful (multi-param groups / split from `ref`/`out`):
+
+```vir
+func add:
+    in
+        a: Int;
+        b: Int
+
     out a + b
 end.
 ```
@@ -638,8 +758,20 @@ end.
 
 ### 6.4 Named Arguments
 
+Unified separator (§1.0): `;` or newline between named args. Same line → `;` required.
+
 ```vir
-sum(a=5; b=10);     # call with named args, ; separator
+sum(a=5; b=10)
+
+sum(
+    a = 5
+    b = 10
+)
+
+sum(
+    a = 5;
+    b = 10
+)
 ```
 
 ### 6.5 Forward Declaration
@@ -816,7 +948,7 @@ end
 
 - `eif` replaces `elif`/`else if`
 - `else` has no colon
-- `end` closes the entire block
+- `end` closes the entire `if` / `eif` / `else` chain (control-flow block — not `end.`)
 
 ### 9.2 When Loop (while)
 
@@ -870,10 +1002,12 @@ skip         # skip to next iteration (replaces 'continue')
 | `^` | Power | 30 |
 | `*` | Multiply | 20 |
 | `/` | Divide | 20 |
-| `%` | Percent | 18 |
-| `mod` | Remainder (modulo) | 18 |
+| `%` | Percent (e.g. `10%` = 0.1) — **not** remainder | 18 |
+| `mod` | Remainder / modulo (e.g. `7 mod 3` = 1) | 18 |
 | `+` | Add | 10 |
 | `-` | Subtract | 10 |
+
+> **Note:** Use `mod` for remainder. `%` is the percent operator, not a modulo substitute.
 
 ### 10.2 Comparison
 
@@ -1151,7 +1285,7 @@ end.
 
 **Output:** `42` then `close(fd)` executes.
 
-`ensure` is the last block before `end`. It runs on both normal exits and thrown errors.
+`ensure` is the last block before the function’s `end.`. It runs on both normal exits and thrown errors.
 
 ### 13.3 revert — Execute Only on Error
 
@@ -1502,58 +1636,87 @@ The `erx` keyword reads the current error code (the value passed to `throw`). Av
 
 ## 14. Parameter Blocks — in / ref / out
 
-Vir uses **grouped parameter blocks** with the keywords `in`, `ref`, and `out` to declare function parameters. Each keyword starts a group; multiple parameters in the same group are indented below, separated by `;`. A parameter without `;` ends the group.
+Vir has **exactly two** parameter declaration forms.
 
-### 14.1 Syntax
+Canonical rules follow the Vietnamese spec (`docs/vir_language_spec_v2.0_vi.md` §6.2, §14).
+
+| Form | Signature | Inside `()` / blocks |
+|------|-----------|----------------------|
+| **1. Parentheses** | `func name(…):` | **`ref name` allowed**; do **not** write `in` (pass-by-value is default). `out` uses group-block form. |
+| **2. Group blocks** | `func name:` | `in` / `ref` / `out` before the body |
+
+Default is pass-by-value. `ref` is by-reference (allowed in both `()` and group blocks).
+
+### 14.1 Form 1 — parentheses `()`
+
+```vir
+func add(
+        a: Int;
+        b: Int
+) -> Int:
+    out a + b
+end.
+
+func add(a: Int, b: Int) -> Int:
+    out a + b
+end.
+
+# ref inside () — valid
+func increment(ref x: Int):
+    x = x + 1
+end.
+
+func swap(ref a: Int, ref b: Int):
+    var tmp = a
+    a = b
+    b = tmp
+end.
+```
+
+**Wrong** — `in` inside `()` (redundant and not paren-form syntax):
+
+```vir
+# WRONG
+func add(
+    in
+        a: Int;
+        b: Int
+):
+    out a + b
+end.
+```
+
+### 14.2 Form 2 — `in` / `ref` / `out` blocks
+
+`func name:` (no parameter list in `()`). Each keyword opens a group. Members use the unified separator (§1.0): `;` or newline. **End of group** = next group keyword (`ref` / `out` / …) or the function body — not “a line without `;`”.
 
 ```vir
 func process_data:
-    in  path: String;
-        timeout: Int;
-        retry: Bool          # no ';' → ends the 'in' group
-    ref buffer: Array        # single param, no ';' → ends 'ref' group
-    out status: Bool;
-        error: String        # no ';' → ends 'out' group
+    in
+        path: String
+        timeout: Int
+        retry: Bool
+    ref buffer: Array
+    out
+        status: Bool
+        error: String
 
     # function body here
 end.
 ```
 
-**Rules:**
-- `in` — input parameters (read-only inside function, default)
-- `ref` — reference parameters (callee can read AND write, changes affect caller)
-- `out` — output parameters (callee writes, caller receives results)
-- Within a group, parameters are separated by `;` — the last parameter has **no** `;` to signal end of group
-- A single parameter in a group has no `;`
-
-**Compiler safety — semicolon mismatch detection:**
-
-Because the `;` continuation character carries semantic weight (it determines group membership), accidental insertion or deletion can silently shift parameter groups. The compiler applies these checks to catch mistakes:
-
-| Check | Condition | Diagnostic |
-|-------|-----------|------------|
-| **Orphan parameter** | A bare identifier line follows a group-ending line (no `;`) but has no `in`/`ref`/`out` keyword | **Error:** "parameter `X` has no group — did you forget `;` on the previous line?" |
-| **Empty group** | `in`/`ref`/`out` keyword with no parameters before next group keyword or function body | **Error:** "empty parameter group `ref`" |
-| **Type mismatch hint** | A parameter is used as `ref` (address taken) but declared under `in` | **Warning:** "parameter `X` is passed by value but modified — consider `ref`" |
-| **Indentation guide** | Continuation lines (after `;`) must be indented deeper than the group keyword | **Warning:** "continuation line should be indented under its group keyword" |
-
-### 14.2 Simple Functions (no block needed)
-
-For simple functions with only input parameters, the traditional parenthesis syntax remains valid:
-
 ```vir
-func add(a, b):
-    out a + b
-end.
+func process_data:
+    in  path: String;
+        timeout: Int;
+        retry: Bool
+    ref buffer: Array
+    out status: Bool;
+        error: String
 
-func clamp(value: int, lo: int, hi: int) -> int:
-    if value < lo do out lo end
-    if value > hi do out hi end
-    out value
+    var fd = open(path)
 end.
 ```
-
-### 14.3 Reference Parameters
 
 ```vir
 func increment:
@@ -1570,21 +1733,43 @@ func swap:
     a = b
     b = tmp
 end.
+```
 
+**Compiler safety** (form 2): Groups end at keywords; a bare identifier line that is not a valid continuation is an orphan. Checks:
+
+| Check | Condition | Diagnostic |
+|-------|-----------|------------|
+| **Orphan parameter** | Bare identifier line not in an open group and without `in`/`ref`/`out` | **Error:** "parameter `X` has no group" |
+| **Empty group** | `in`/`ref`/`out` with no parameters before the next group or body | **Error:** "empty parameter group `ref`" |
+| **Type mismatch hint** | Parameter used as `ref` but declared under `in` | **Warning:** "parameter `X` is passed by value but modified — consider `ref`" |
+| **Indentation guide** | Continuation members should be indented under the group keyword | **Warning:** "continuation line should be indented under its group keyword" |
+
+Same separator rule for `var` (§5.3, §1.0):
+
+```vir
+var
+    x: int
+    y: int
+    z: int
+```
+
+### 14.3 Usage
+
+```vir
 func main:
     var n = 10
     increment(n)
-    print n              # → 11 (original was modified)
+    print(n)              # → 11 (original was modified)
 
     var x = 1
     var y = 2
     swap(x, y)
-    print x              # → 2
-    print y              # → 1
+    print(x)              # → 2
+    print(y)              # → 1
 end.
 ```
 
-### 14.4 Mixed in / ref / out Example
+### 14.4 Mixed in / ref / out example
 
 ```vir
 func read_sensor:
@@ -1602,11 +1787,11 @@ end.
 
 | Parameter style | Caller passes | Callee sees | Callee writes affect original? |
 |----------------|---------------|-------------|-------------------------------|
-| `in x` | Copy of value | Local copy | No |
-| `ref x` | Address of variable | Dereferenced original | **Yes** |
-| `out x` | Address of variable | Uninitialized slot | **Yes** (caller receives value) |
+| `in` (default) | Copy of value | Local copy | No |
+| `ref` | Address of variable | Dereferenced original | **Yes** |
+| `out` | Uninitialized slot | Callee assigns | **Yes** (after return) |
 
-**Internal:** `ref` and `out` parameters emit `LoadAddr` (address of stack slot) at call site, `DerefLoad`/`DerefStore` at callee access points.
+**Internal:** `ref` parameters emit `LoadAddr` (address of stack slot) at the call site, `DerefLoad`/`DerefStore` at the callee.
 
 ---
 
@@ -1635,7 +1820,7 @@ end.
 - `@bind(c)` functions have **no body** — they are external symbols
 - Type annotations are **required** (the C ABI needs exact parameter sizes)
 - Return type uses `-> type` after the parameter list
-- Terminated with `end`
+- Terminated with `end.` (`@bind` stubs are definition blocks)
 
 **Usage:**
 
@@ -1781,7 +1966,7 @@ mold TCPFlags: u8
 end.
 ```
 
-**Syntax:** `mold Name: <backing_type>` followed by comma-separated `field: width` pairs, closed by `end`.
+**Syntax:** `mold Name: <backing_type>` followed by comma-separated `field: width` pairs, closed by `end.`
 
 **Usage:**
 
@@ -2060,7 +2245,7 @@ end
 
 ```vir
 var evens = map x in numbers:
-    if x % 2 == 0 do
+    if x mod 2 == 0 do
         out x
     end
 end
@@ -2080,13 +2265,46 @@ end
 
 ## 21. Case Expression
 
+`case` is a **control-flow** block — close with `end` (not `end.`).
+
+Canonical rules follow the Vietnamese spec (`docs/vir_language_spec_v2.0_vi.md` §21).
+
+`case` arms are a **list** under the unified separator (§1.0): `;` or newline. Multiple arms on one line require `;`.
+
+### 21.1 Standard form
+
+```vir
+case v.virgex_fullmatch(pattern, p)
+    true: print("✅ $p")
+    false: print("❌ $p")
+end
+```
+
+```vir
+case v.virgex_fullmatch(pattern, p)
+    true: print("✅ $p");
+    false: print("❌ $p")
+end
+```
+
+```vir
+case x
+    1: print("one"); 2: print("two")
+end
+```
+
+**Rules:**
+- `case <expr>` then arms `pattern: …`
+- Between arms: `;` or `NEWLINE` (§1.0)
+- Default arm: `else: …`
+- Close with `end`
+- A new arm starts when the next item is `pattern:` / `else:` — multiple statements in the same arm also use the same separator until the next arm
+
 ```vir
 case color
-    "red": print("stop")
-    "green": print("go")
-    "yellow": print("caution")
-else
-    print("unknown")
+    "red": log("stop", 1); out 1
+    "green": log("go", 2); out 2
+    else: log("unknown", 0); out 0
 end
 ```
 
@@ -2586,7 +2804,8 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 | Keyword | Purpose |
 |---------|---------|
 | `func` | Define a function |
-| `end` | Close any block |
+| `end.` | Close a definition / declaration block (`func`, `entity`, `method`, `enum`, `register`, `mold`, `@bind` stubs, …) — see §1 |
+| `end` | Close a control-flow / statement block (`if`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, …) — see §1 |
 | `out` | Return a value from function |
 | `var` | Mutable variable declaration |
 | `let` | Immutable variable binding |
@@ -2755,7 +2974,7 @@ From highest to lowest:
 | revert | — | `revert` scope guard (on error only) |
 | ref parameters | — | `in`/`ref`/`out` grouped parameter blocks |
 | FFI | — | `@bind(c)` for C interop, `@bind(asm)` for assembly, `@bind(wasm)` for WASM |
-| Register | — | `register Name: u32 ... end` for bit fields |
+| Register | — | `register Name: u32 ... end.` for bit fields |
 | precomp | — | `precomp` keyword modifier for compile-time evaluation |
 | @entry | — | Custom bare-metal entry point |
 | try / revert | — | `try: ... revert ... end` local error boundary with Saga compensation |
@@ -2779,14 +2998,14 @@ From highest to lowest:
 | arr_compact | — | `arr_compact(arr)` — reclaim array resize dead space (§19.4) |
 | Callable field | — | UFCS step 2: `x.callback()` calls function-pointer field (§11) |
 | Interpolation boundary | — | `$ident` stops at non-identifier chars; use `$(expr)` for `[]` access (§12.6) |
-| Semicolon safety | — | Compiler detects orphan parameters from missing/extra `;` (§14.1) |
+| Semicolon / separator | — | Unified list separator `;` \| `NEWLINE` (§1.0); compiler detects orphan parameters in group blocks (§14.2) |
 | isolate | — | `try(isolate: [x, y]):` auto-snapshot & restore on retry; W302 warning for unprotected mutations (§13.7) |
 | resume retry safety | — | Compiler emits W302 if variable mutated in try body, block uses `resume retry`, and variable not in `isolate` list or reset in `revert` (§13.7) |
 | `await pass` | — | Explicit yield point — prevents CPU hogging in cooperative async loops (§22.6) |
 | `cancel` | — | Cooperative task cancellation — delivered at next `await` (§22.7) |
 | `select` | — | Event multiplexing — `select: on t1 as r: ... end` races multiple tasks (§22.8) |
 | `quiet` | — | Detached fire-and-forget task — no handle, errors logged not propagated (§22.9) |
-| `mold` | `register` (data packing use) | `mold Name: u16 r:5, g:6, b:5 end` — general-purpose bit-field (§16.6) |
+| `mold` | `register` (data packing use) | `mold Name: u16 r:5, g:6, b:5 end.` — general-purpose bit-field (§16.6) |
 | `flux` | — | `flux<T, N>` — SIMD vector type, mapped to NEON/SSE-AVX/WASM SIMD (§24.1) |
 | Swizzle `~` | — | `v~xyz` — postfix channel reorder/replicate for `flux` (§24.2) |
 | `deck` | — | `deck name: Type[size]` — shared CPU-GPU buffer (§24.3) |
