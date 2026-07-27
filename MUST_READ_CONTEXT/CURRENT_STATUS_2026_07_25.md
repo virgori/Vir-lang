@@ -2,6 +2,9 @@
 **Ngày:** 2026-07-25 05:05 (GMT+7)  
 **Branch hiện tại:** `recovered_stash`
 
+> **Đã có bản mới hơn:** `CURRENT_STATUS_2026_07_26.md`. Cả ba mục "Next" bên dưới
+> đã xong; Stage-1 nay sinh được binary chạy thật.
+
 ---
 
 ## Self-host (honest)
