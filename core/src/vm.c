@@ -1592,6 +1592,9 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
 
     /* ── Memory management ─────────────────────────────── */
     case Q_ALLOC: {
+        /* Heap blocks via calloc. Do NOT bump-allocate from the TL arena:
+         * auto `when`/`while` SAVE/RESTORE would reclaim loop-carried
+         * pointers (boot parser/AST). Explicit `arena:` uses Q_ARENA_*. */
         int64_t sz = operand_value(vm, &instr->src1);
         void *p = calloc(1, (size_t)(sz > 0 ? sz : 1));
         if (p && vm->heap_count < VM_MAX_HEAP_BLOCKS) {

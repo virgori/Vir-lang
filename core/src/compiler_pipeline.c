@@ -62,6 +62,12 @@ static int pipeline_lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt,
     return 0;
   }
 
+  /* §4.6: `when`/`while`/`for` auto sub-arena (SAVE/RESTORE) lives in
+   * classic lower_stmt. HIR→MIR has no loop-watermark yet — keep classic. */
+  if (stmt->type == AST_WHILE || stmt->type == AST_FOR_RANGE) {
+    return lower_stmt(ctx, stmt);
+  }
+
   /* §5.3 var groups are synthetic AST_BLOCK nodes — lower stmt-by-stmt so
    * tuple destructuring and other legacy-only forms are not skipped. */
   if (stmt->type == AST_BLOCK)
