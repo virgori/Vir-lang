@@ -67,8 +67,8 @@ static const kw_single_t kw_singles[] = {
     {"true", TOK_TRUE},
     {"false", TOK_FALSE},
     {"none", TOK_NONE_LIT},
-    {"and", TOK_AND},
-    {"or", TOK_OR},
+    {"and", TOK_BIT_AND}, /* Spec §10.4 bitwise AND (not logical &) */
+    {"or", TOK_BIT_OR},   /* Spec §10.4 bitwise OR (not logical ||) */
     {"not", TOK_NOT},
     {"record", TOK_RECORD},
     {"struct", TOK_RECORD},
@@ -626,11 +626,13 @@ int lexer_tokenize(vir_lexer_t *lex) {
 
     unsigned char c = lex_peek(lex);
 
-    /* ── Newline (statement separator) ──────────────── */
+    /* ── Newline (statement / list separator, §1.0) ───── */
     if (c == '\n') {
       lex_advance(lex);
-      /* Collapse multiple newlines, suppress inside parens */
-      if (!prev_was_newline && lex->paren_depth == 0) {
+      /* Collapse multiple newlines. Emit inside parens/brackets too so
+       * param lists and named-args can use NEWLINE as §1.0 separator
+       * (e.g. f(a=1\n b=2), func g(\n x:int\n y:int\n)). */
+      if (!prev_was_newline) {
         vir_token_t tok = {0};
         tok.type = TOK_NEWLINE;
         tok.line = lex->line;

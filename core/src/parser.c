@@ -121,6 +121,37 @@ static void skip_newlines(vir_parser_t *p) {
     advance(p);
 }
 
+/* §1.0 list separator: ";" | NEWLINE  (+ optional "," when allow_comma).
+ * Consumes the separator and any following newlines / extra trailing seps.
+ * Returns 1 if a separator was present (caller should parse another item). */
+static int match_list_sep(vir_parser_t *p, int allow_comma) {
+  int got = 0;
+  if (allow_comma && match(p, TOK_COMMA))
+    got = 1;
+  else if (match(p, TOK_SEMICOLON))
+    got = 1;
+  else if (check(p, TOK_NEWLINE))
+    got = 1;
+  if (!got)
+    return 0;
+  skip_newlines(p);
+  while (match(p, TOK_SEMICOLON) || (allow_comma && match(p, TOK_COMMA)))
+    skip_newlines(p);
+  return 1;
+}
+
+/* §5.3 / §1.0: next tokens look like another var/let/const declarator */
+static int is_var_group_cont(vir_parser_t *p) {
+  if (!check(p, TOK_IDENT))
+    return 0;
+  uint32_t peek_pos = p->pos + 1;
+  if (peek_pos >= p->token_count)
+    return 0;
+  vir_tok_t t2 = p->tokens[peek_pos].type;
+  return t2 == TOK_ASSIGN || t2 == TOK_COLON || t2 == TOK_SEMICOLON ||
+         t2 == TOK_NEWLINE || t2 == TOK_END || t2 == TOK_EOF;
+}
+
 /* Check if token could start a statement */
 static int is_stmt_start(vir_tok_t t) {
   return t == TOK_VAR || t == TOK_CONST || t == TOK_IF || t == TOK_LOOP ||
@@ -631,7 +662,8 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
       advance(p); /* consume '(' */
 
       /* Parse arguments — accept positional, named (name=expr),
-       * separators `,` or `;` (§6.4). */
+       * separators `,` or `;` or NEWLINE (§1.0 / §6.4). */
+      skip_newlines(p);
       if (!check(p, TOK_RPAREN)) {
         for (;;) {
           ast_node_t *arg = NULL;
@@ -660,11 +692,11 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
           }
           if (arg)
             ast_add_child(call, arg);
-          if (match(p, TOK_COMMA))
-            continue;
-          if (match(p, TOK_SEMICOLON))
-            continue;
-          break;
+          /* §1.0 / §6.4: arg separator is "," | ";" | NEWLINE */
+          if (!match_list_sep(p, /*allow_comma=*/1))
+            break;
+          if (check(p, TOK_RPAREN))
+            break;
         }
       }
       expect(p, TOK_RPAREN, "expected ')' after arguments");
@@ -812,6 +844,8 @@ static ast_node_t *parse_primary(vir_parser_t *p) {
 }
 
 static ast_node_t *parse_unary(vir_parser_t *p) {
+  /* Allow `a +\n b` / multiline args inside `()` once lexer emits NEWLINE. */
+  skip_newlines(p);
   /* §4.8: `&expr` (shared borrow) or `&mut expr` (mutable borrow).
    * `&` in prefix position = borrow; in infix position = logical AND.
    * parse_unary is only called at the start of an operand, so `&` here
@@ -1018,13 +1052,15 @@ static ast_node_t *parse_unary(vir_parser_t *p) {
       advance(p); /* consume '(' */
       fa->type = AST_CALL;
       if (!check(p, TOK_RPAREN)) {
-        ast_node_t *arg = parse_expr(p);
-        if (arg)
-          ast_add_child(fa, arg);
-        while (match(p, TOK_COMMA)) {
-          arg = parse_expr(p);
+        for (;;) {
+          skip_newlines(p);
+          if (check(p, TOK_RPAREN))
+            break;
+          ast_node_t *arg = parse_expr(p);
           if (arg)
             ast_add_child(fa, arg);
+          if (!match_list_sep(p, /*allow_comma=*/1))
+            break;
         }
       }
       expect(p, TOK_RPAREN, "expected ')' after UFCS arguments");
@@ -1089,23 +1125,10 @@ static ast_node_t *parse_mult(vir_parser_t *p) {
   if (!left)
     return NULL;
 
-  while (check(p, TOK_STAR) || check(p, TOK_SLASH) || check(p, TOK_PERCENT)) {
+  /* Spec §30 prec 20: * / only (% is prec 18, not here) */
+  while (check(p, TOK_STAR) || check(p, TOK_SLASH)) {
     const vir_token_t *op_tok = advance(p);
-    ast_op_t op;
-    switch (op_tok->type) {
-    case TOK_STAR:
-      op = OP_MUL;
-      break;
-    case TOK_SLASH:
-      op = OP_DIV;
-      break;
-    case TOK_PERCENT:
-      op = OP_MOD;
-      break;
-    default:
-      op = OP_MUL;
-      break;
-    }
+    ast_op_t op = (op_tok->type == TOK_SLASH) ? OP_DIV : OP_MUL;
 
     ast_node_t *right = parse_matmul(p);
     if (!right) {
@@ -1123,20 +1146,16 @@ static ast_node_t *parse_mult(vir_parser_t *p) {
   return left;
 }
 
-static ast_node_t *parse_addition(vir_parser_t *p) {
+/* Spec §30 prec 18: mod = remainder; % = percent (OP_PERCENT, not OP_MOD) */
+static ast_node_t *parse_mod(vir_parser_t *p) {
   ast_node_t *left = parse_mult(p);
   if (!left)
     return NULL;
 
-  while (check(p, TOK_PLUS) || check(p, TOK_MINUS) || check(p, TOK_DOTDOT)) {
+  while (check(p, TOK_MOD) || check(p, TOK_PERCENT)) {
     const vir_token_t *op_tok = advance(p);
-    ast_op_t op;
-    if (op_tok->type == TOK_PLUS)
-      op = OP_ADD;
-    else if (op_tok->type == TOK_MINUS)
-      op = OP_SUB;
-    else
-      op = OP_PATTERN; /* §9.2: range '..' — reuse PATTERN opcode */
+    ast_op_t op =
+        (op_tok->type == TOK_PERCENT) ? OP_PERCENT : OP_MOD;
 
     ast_node_t *right = parse_mult(p);
     if (!right) {
@@ -1154,38 +1173,64 @@ static ast_node_t *parse_addition(vir_parser_t *p) {
   return left;
 }
 
-static ast_node_t *parse_bitwise(vir_parser_t *p) {
-  ast_node_t *left = parse_addition(p);
+/* Spec §30 prec 12: shl shr (above + -). Cast `as`/`>>` also at 12. */
+static ast_node_t *parse_shift(vir_parser_t *p) {
+  ast_node_t *left = parse_mod(p);
   if (!left)
     return NULL;
 
-  while (check(p, TOK_BIT_AND) || check(p, TOK_BIT_OR) ||
-         check(p, TOK_BIT_XOR) || check(p, TOK_BIT_SHL) ||
-         check(p, TOK_BIT_SHR)) {
+  while (check(p, TOK_BIT_SHL) || check(p, TOK_BIT_SHR)) {
     const vir_token_t *op_tok = advance(p);
-    ast_op_t op;
-    switch (op_tok->type) {
-    case TOK_BIT_AND:
-      op = OP_AND;
-      break;
-    case TOK_BIT_OR:
-      op = OP_OR;
-      break;
-    case TOK_BIT_XOR:
-      op = OP_XOR;
-      break;
-    case TOK_BIT_SHL:
-      op = OP_SHL;
-      break;
-    case TOK_BIT_SHR:
-      op = OP_SHR;
-      break;
-    default:
-      op = OP_AND;
-      break;
+    ast_op_t op = (op_tok->type == TOK_BIT_SHR) ? OP_SHR : OP_SHL;
+
+    ast_node_t *right = parse_mod(p);
+    if (!right) {
+      ast_free(left);
+      return NULL;
     }
 
-    ast_node_t *right = parse_addition(p);
+    ast_node_t *bin = ast_new(AST_BINOP);
+    bin->op = op;
+    bin->line = op_tok->line;
+    ast_add_child(bin, left);
+    ast_add_child(bin, right);
+    left = bin;
+  }
+
+  while (check(p, TOK_CAST) || check(p, TOK_AS)) {
+    const vir_token_t *op_tok = advance(p);
+    (void)op_tok;
+    const vir_token_t *type_tok =
+        expect_name(p, "expected type name after cast");
+    if (!type_tok) {
+      ast_free(left);
+      return NULL;
+    }
+    ast_node_t *cast = ast_new(AST_CAST);
+    cast->line = type_tok->line;
+    strncpy(cast->name, type_tok->str.buf, AST_NAME_LEN - 1);
+    ast_add_child(cast, left);
+    left = cast;
+  }
+  return left;
+}
+
+static ast_node_t *parse_addition(vir_parser_t *p) {
+  ast_node_t *left = parse_shift(p);
+  if (!left)
+    return NULL;
+
+  while (check(p, TOK_PLUS) || check(p, TOK_MINUS) || check(p, TOK_DOTDOT)) {
+    const vir_token_t *op_tok = advance(p);
+    ast_op_t op;
+    if (op_tok->type == TOK_PLUS)
+      op = OP_ADD;
+    else if (op_tok->type == TOK_MINUS)
+      op = OP_SUB;
+    else
+      op = OP_PATTERN; /* §9.2: range '..' — reuse PATTERN opcode */
+
+    ast_node_t *right = parse_shift(p);
     if (!right) {
       ast_free(left);
       return NULL;
@@ -1201,47 +1246,33 @@ static ast_node_t *parse_bitwise(vir_parser_t *p) {
   return left;
 }
 
-static ast_node_t *parse_cast(vir_parser_t *p) {
-  ast_node_t *left = parse_bitwise(p);
+/* Spec §30 prec 8: :~ pattern (between + and rel) */
+static ast_node_t *parse_pattern_expr(vir_parser_t *p) {
+  ast_node_t *left = parse_addition(p);
   if (!left)
     return NULL;
 
-  while (check(p, TOK_CAST) || check(p, TOK_AS) || check(p, TOK_PATTERN)) {
+  while (check(p, TOK_PATTERN)) {
     const vir_token_t *op_tok = advance(p);
-    if (op_tok->type == TOK_PATTERN) {
-      /* §8.9 pattern match: expr :~ pattern
-       *   - pattern is Ident: type-check (always 1 for now - placeholder)
-       *   - pattern is literal int: equality test
-       *   - pattern is literal string: equality test */
-      ast_node_t *pattern = parse_bitwise(p);
-      if (!pattern) {
-        ast_free(left);
-        return NULL;
-      }
-      ast_node_t *pm = ast_new(AST_PATTERN_MATCH);
-      pm->line = op_tok->line;
-      ast_add_child(pm, left);
-      ast_add_child(pm, pattern);
-      left = pm;
-      continue;
-    }
-    const vir_token_t *type_tok =
-        expect_name(p, "expected type name after cast");
-    if (!type_tok) {
+    ast_node_t *pattern = parse_addition(p);
+    if (!pattern) {
       ast_free(left);
       return NULL;
     }
-    ast_node_t *cast = ast_new(AST_CAST);
-    cast->line = op_tok->line;
-    strncpy(cast->name, type_tok->str.buf, AST_NAME_LEN - 1);
-    ast_add_child(cast, left);
-    left = cast;
+    ast_node_t *pm = ast_new(AST_PATTERN_MATCH);
+    pm->line = op_tok->line;
+    ast_add_child(pm, left);
+    ast_add_child(pm, pattern);
+    left = pm;
   }
   return left;
 }
 
+/* Removed old parse_bitwise (shl was wrongly below +). Bitwise and/or/xor
+ * sit at Spec levels 3/2 with logical & / || — see parse_and/or below. */
+
 static ast_node_t *parse_compare(vir_parser_t *p) {
-  ast_node_t *left = parse_cast(p);
+  ast_node_t *left = parse_pattern_expr(p);
   if (!left)
     return NULL;
 
@@ -1280,7 +1311,7 @@ static ast_node_t *parse_compare(vir_parser_t *p) {
       break;
     }
 
-    ast_node_t *right = parse_cast(p);
+    ast_node_t *right = parse_pattern_expr(p);
     if (!right) {
       ast_free(left);
       return NULL;
@@ -1296,12 +1327,14 @@ static ast_node_t *parse_compare(vir_parser_t *p) {
   return left;
 }
 
+/* Spec §30 prec 3: `&` logical (TOK_AND) + `and`/`bit_and` bitwise (TOK_BIT_AND).
+ * AST: both currently OP_AND; short-circuit Land is soft-path. Integers: same bits. */
 static ast_node_t *parse_and_expr(vir_parser_t *p) {
   ast_node_t *left = parse_compare(p);
   if (!left)
     return NULL;
 
-  while (check(p, TOK_AND)) {
+  while (check(p, TOK_AND) || check(p, TOK_BIT_AND)) {
     advance(p);
     ast_node_t *right = parse_compare(p);
     if (!right) {
@@ -1318,13 +1351,18 @@ static ast_node_t *parse_and_expr(vir_parser_t *p) {
   return left;
 }
 
+/* Spec §30 prec 2: `||` logical (TOK_OR) + `or`/`bit_or`/`xor` bitwise */
 static ast_node_t *parse_or_expr(vir_parser_t *p) {
   ast_node_t *left = parse_and_expr(p);
   if (!left)
     return NULL;
 
-  while (check(p, TOK_OR)) {
-    advance(p);
+  while (check(p, TOK_OR) || check(p, TOK_BIT_OR) || check(p, TOK_BIT_XOR)) {
+    const vir_token_t *op_tok = advance(p);
+    ast_op_t op = OP_OR;
+    if (op_tok->type == TOK_BIT_XOR)
+      op = OP_XOR;
+
     ast_node_t *right = parse_and_expr(p);
     if (!right) {
       ast_free(left);
@@ -1332,7 +1370,7 @@ static ast_node_t *parse_or_expr(vir_parser_t *p) {
     }
 
     ast_node_t *bin = ast_new(AST_BINOP);
-    bin->op = OP_OR;
+    bin->op = op;
     ast_add_child(bin, left);
     ast_add_child(bin, right);
     left = bin;
@@ -1487,36 +1525,18 @@ static ast_node_t *parse_var_decl(vir_parser_t *p, ast_type_t type) {
   if (!first)
     return NULL;
 
-  /* Peek past `;` — if the next token is an IDENT that is NOT the
-   * start of another statement keyword, treat it as a continuation
-   * of this var/let/const group. */
-  if (!check(p, TOK_SEMICOLON))
-    return first;
-
-  /* Look ahead: is this a group, or an end-of-stmt trailing `;`?
-   * Accept group iff `; IDENT` with IDENT followed by `:`, `=`, `;`,
-   * NEWLINE, or END. Reject if IDENT is followed by `(` (function
-   * call statement) or an operator. */
+  /* §1.0 / §5.3: separator is ";" | NEWLINE — do not require ';'.
+   * Look ahead for another declarator (IDENT followed by :/=/; /NL/end). */
   uint32_t save = p->pos;
-  advance(p); /* consume ';' */
+  int had_semi = match(p, TOK_SEMICOLON);
   uint32_t after_semi = p->pos;
   skip_newlines(p);
-  if (!check(p, TOK_IDENT)) {
-    /* Trailing `;` — stay parked just after it so the outer
-     * statement loop doesn't see a stray separator. */
-    p->pos = after_semi;
+  if (!is_var_group_cont(p)) {
+    if (had_semi)
+      p->pos = after_semi; /* keep trailing ';' consumed */
+    else
+      p->pos = save;
     return first;
-  }
-  /* Look one token past the IDENT to validate. */
-  uint32_t peek_pos = p->pos + 1;
-  if (peek_pos < p->token_count) {
-    vir_tok_t t2 = p->tokens[peek_pos].type;
-    if (t2 != TOK_ASSIGN && t2 != TOK_COLON && t2 != TOK_SEMICOLON &&
-        t2 != TOK_NEWLINE && t2 != TOK_END && t2 != TOK_EOF) {
-      /* Not a var-group continuation. Rewind to just after `;`. */
-      p->pos = after_semi;
-      return first;
-    }
   }
 
   /* It IS a group — build a synthetic AST_BLOCK holding all decls. */
@@ -1528,23 +1548,16 @@ static ast_node_t *parse_var_decl(vir_parser_t *p, ast_type_t type) {
     if (!nxt)
       break;
     ast_add_child(group, nxt);
-    if (!check(p, TOK_SEMICOLON))
-      break;
-    advance(p); /* consume ';' */
-    uint32_t after_s2 = p->pos;
+    save = p->pos;
+    had_semi = match(p, TOK_SEMICOLON);
+    after_semi = p->pos;
     skip_newlines(p);
-    if (!check(p, TOK_IDENT)) {
-      p->pos = after_s2;
+    if (!is_var_group_cont(p)) {
+      if (had_semi)
+        p->pos = after_semi;
+      else
+        p->pos = save;
       break;
-    }
-    uint32_t pp = p->pos + 1;
-    if (pp < p->token_count) {
-      vir_tok_t t2 = p->tokens[pp].type;
-      if (t2 != TOK_ASSIGN && t2 != TOK_COLON && t2 != TOK_SEMICOLON &&
-          t2 != TOK_NEWLINE && t2 != TOK_END && t2 != TOK_EOF) {
-        p->pos = after_s2;
-        break;
-      }
     }
   }
   return group;
@@ -1580,12 +1593,13 @@ static ast_node_t *parse_if_stmt(vir_parser_t *p) {
     return if_node;
   }
 
-  /* Handle ELSE */
+  /* Handle ELSE — continuation (§1.1): no ':' / do */
   if (match(p, TOK_ELSE)) {
     skip_newlines(p);
-    /* Check if ELSE is followed by block opener (optional) */
-    match(p, TOK_THEN);
-    match(p, TOK_COLON);
+    if (check(p, TOK_COLON)) {
+      parse_error(p, "'else' does not take ':' (spec 1.1)");
+      return if_node;
+    }
     ast_node_t *else_block = parse_block(p);
     ast_add_child(if_node, else_block);
   }
@@ -1802,7 +1816,9 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
               }
               expect(p, TOK_RBRACKET, "expected ']' in array type");
               param->int_val |= 0x10000;
-            } else if (peek(p)->type != TOK_EOF && peek(p)->type != TOK_RPAREN && peek(p)->type != TOK_COMMA && peek(p)->type != TOK_SEMICOLON) {
+            } else if (peek(p)->type != TOK_EOF && peek(p)->type != TOK_RPAREN &&
+                       peek(p)->type != TOK_COMMA && peek(p)->type != TOK_SEMICOLON &&
+                       peek(p)->type != TOK_NEWLINE) {
               strncpy(param->name2, peek(p)->str.buf, AST_NAME_LEN - 1);
               advance(p);
             }
@@ -1819,25 +1835,27 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
             }
           }
           ast_add_child(fn, param);
-          /* v1.2 uses ';' separator, also accept ',' */
-          if (!match(p, TOK_SEMICOLON) && !match(p, TOK_COMMA))
+          /* §1.0: param separator is "," | ";" | NEWLINE.
+           * Trailing newlines before ')' are whitespace, not W14. */
+          uint32_t before_sep = p->pos;
+          skip_newlines(p);
+          int got_nl = (p->pos != before_sep);
+          if (check(p, TOK_RPAREN))
             break;
-          /* §12.5 After a separator: trailing `;)` or consecutive `;;` */
-          if (check(p, TOK_RPAREN)) {
-            fprintf(stderr,
-                    "warning W14: trailing parameter separator before ')' at "
-                    "line %u\n",
-                    peek(p)->line);
-            break;
-          }
-          if (check(p, TOK_SEMICOLON) || check(p, TOK_COMMA)) {
-            fprintf(stderr, "warning W14: empty parameter group at line %u\n",
-                    peek(p)->line);
-            while (check(p, TOK_SEMICOLON) || check(p, TOK_COMMA))
-              advance(p);
-            if (check(p, TOK_RPAREN))
+          if (match(p, TOK_SEMICOLON) || match(p, TOK_COMMA)) {
+            skip_newlines(p);
+            if (check(p, TOK_RPAREN)) {
+              fprintf(stderr,
+                      "warning W14: trailing parameter separator before ')' at "
+                      "line %u\n",
+                      peek(p)->line);
               break;
+            }
+            continue;
           }
+          if (got_nl)
+            continue; /* another param on the next line */
+          break;
         }
       }
       if (has_paren) match(p, TOK_RPAREN);
@@ -1877,9 +1895,12 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
   expect(p, TOK_LPAREN, "expected '(' after function name");
 
   /* Parse parameters → stored as IDENTIFIER children.
-   * Each param: [ref] NAME [':' TYPE]. Separator: ',' or ';'. */
+   * Each param: [ref] NAME [':' TYPE]. Separator: §1.0 "," | ";" | NEWLINE. */
   if (!check(p, TOK_RPAREN)) {
     for (;;) {
+      skip_newlines(p);
+      if (check(p, TOK_RPAREN))
+        break;
       int is_ref_param = 0;
       if (check(p, TOK_IDENT) && strcmp(peek(p)->str.buf, "ref") == 0) {
         advance(p); /* consume 'ref' */
@@ -1917,14 +1938,15 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
           if (check(p, TOK_LT)) angle_depth++;
           else if (check(p, TOK_GT)) angle_depth--;
           
-          if (angle_depth == 0 && (check(p, TOK_COMMA) || check(p, TOK_SEMICOLON) || check(p, TOK_RPAREN))) {
+          if (angle_depth == 0 && (check(p, TOK_COMMA) || check(p, TOK_SEMICOLON) ||
+                                   check(p, TOK_RPAREN) || check(p, TOK_NEWLINE))) {
             break;
           }
           advance(p);
         }
       }
       ast_add_child(fn, param);
-      if (!match(p, TOK_COMMA) && !match(p, TOK_SEMICOLON))
+      if (!match_list_sep(p, /*allow_comma=*/1))
         break;
     }
   }
@@ -2333,10 +2355,13 @@ static ast_node_t *parse_record_def(vir_parser_t *p, int is_interface) {
       this_param->line = mname->line;
       ast_add_child(fn, this_param);
 
-      /* Optional parameters: `(n: int, ...)` */
+      /* Optional parameters: `(n: int, ...)` — §1.0 separators */
       if (match(p, TOK_LPAREN)) {
         if (!check(p, TOK_RPAREN)) {
-          do {
+          for (;;) {
+            skip_newlines(p);
+            if (check(p, TOK_RPAREN))
+              break;
             const vir_token_t *pname =
                 expect_name(p, "expected param name");
             if (!pname)
@@ -2350,7 +2375,9 @@ static ast_node_t *parse_record_def(vir_parser_t *p, int is_interface) {
                 advance(p);
             }
             ast_add_child(fn, param);
-          } while (match(p, TOK_COMMA));
+            if (!match_list_sep(p, /*allow_comma=*/1))
+              break;
+          }
         }
         expect(p, TOK_RPAREN, "expected ')' after method params");
       }
@@ -2379,6 +2406,9 @@ static ast_node_t *parse_record_def(vir_parser_t *p, int is_interface) {
         expect(p, TOK_LPAREN, "expected '(' after 'in'");
         if (!check(p, TOK_RPAREN)) {
           for (;;) {
+            skip_newlines(p);
+            if (check(p, TOK_RPAREN))
+              break;
             const vir_token_t *pname = expect_name(p, "expected param name");
             if (!pname) break;
             ast_node_t *param = ast_new(AST_IDENTIFIER);
@@ -2391,7 +2421,7 @@ static ast_node_t *parse_record_def(vir_parser_t *p, int is_interface) {
               }
             }
             ast_add_child(fn, param);
-            if (!match(p, TOK_SEMICOLON) && !match(p, TOK_COMMA)) break;
+            if (!match_list_sep(p, /*allow_comma=*/1)) break;
           }
         }
         expect(p, TOK_RPAREN, "expected ')' after method params");
@@ -2654,9 +2684,15 @@ static ast_node_t *parse_case_stmt(vir_parser_t *p) {
 
     const vir_token_t *pat = peek(p);
 
-    if (pat->type == TOK_ELSE ||
-        (pat->type == TOK_IDENT && strcmp(pat->str.buf, "_") == 0)) {
-      /* Wildcard arm (else: or _:) */
+    int is_else_arm = 0;
+    if (pat->type == TOK_ELSE) {
+      /* §1.1 / §21: else is a continuation — no ':' (unlike pattern arms). */
+      strncpy(arm->name, "_", AST_NAME_LEN - 1);
+      arm->int_val = -1; /* sentinel: wildcard */
+      is_else_arm = 1;
+      advance(p);
+    } else if (pat->type == TOK_IDENT && strcmp(pat->str.buf, "_") == 0) {
+      /* Wildcard pattern `_:` — still a pattern, so ':' required below. */
       strncpy(arm->name, "_", AST_NAME_LEN - 1);
       arm->int_val = -1; /* sentinel: wildcard */
       advance(p);
@@ -2709,8 +2745,17 @@ static ast_node_t *parse_case_stmt(vir_parser_t *p) {
 
     arm->line = pat->line;
 
-    /* Expect ':' separator */
-    expect(p, TOK_COLON, "expected ':' after pattern");
+    /* Pattern arms: `mau: …`. else continuation: no colon (spec 1.1 / 21). */
+    if (is_else_arm) {
+      if (check(p, TOK_COLON)) {
+        parse_error(p, "'else' does not take ':' (spec 1.1 / 21)");
+        ast_free(arm);
+        ast_free(node);
+        return NULL;
+      }
+    } else {
+      expect(p, TOK_COLON, "expected ':' after pattern");
+    }
 
     /* Parse body — one or more statements; terminators: newline
      * before next pattern or ';' before next pattern, or 'end'. */
@@ -2763,6 +2808,7 @@ static ast_node_t *parse_case_stmt(vir_parser_t *p) {
     ast_add_child(node, arm);
   }
 
+  /* §21: control block closes with `end` (not `end.`). */
   expect(p, TOK_END, "expected 'end'/'hết' after case block");
   return node;
 }

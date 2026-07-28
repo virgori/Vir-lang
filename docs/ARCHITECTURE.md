@@ -398,13 +398,21 @@ AST → Q-IR lowering hoàn toàn bằng C:
 4. `lower_expr()` → recursive: LITERAL→Q_LOAD, IDENTIFIER→sym_lookup, BINOP→Q_ADD/SUB/MUL/DIV, COMPARE→Q_CMP_*
 5. `lower_stmt()` → IF→Q_JUMP_IF_NOT, LOOP→counter+Q_CMP_LT+Q_JUMP, WHILE→Q_JUMP_IF_NOT, RETURN→Q_RET, PRINT→Q_PRINT
 
-**Linear-Scan Register Allocation:**
+**Linear-Scan Register Allocation** (đường Q-IR / bootstrap — Poletto & Sarkar 1999):
 1. `lower_compute_liveness()` → quét instructions tìm [start, end] cho mỗi vreg
 2. `lower_regalloc_linear_scan(num_phys_regs)`:
    - Sort intervals by start
    - Maintain active set, expire finished intervals
    - Assign physical registers; spill khi hết regs
 3. `lower_get_phys_reg(vreg)` → tra bảng kết quả
+
+**Kiến trúc RA dài hạn (soft LIR)** — không thay Linear Scan bootstrap ngay:
+
+1. **Làm sạch LIR** trước (dead move / normalize)  
+2. **Chaitin–Briggs** (hoặc Linear Scan) gán phys + spill  
+3. **George–Appel** chỉ coalescing phần copy còn lại  
+
+Chi tiết & hợp đồng pass: [`MUST_READ_CONTEXT/REGISTER_ALLOCATION_ARCHITECTURE.md`](../MUST_READ_CONTEXT/REGISTER_ALLOCATION_ARCHITECTURE.md). Keyword ngôn ngữ `register` (§16) **không** liên quan RA.
 
 ### 6.6. Redundancy Patching – Rollback (`jit_bridge.h/c`)
 
@@ -629,7 +637,8 @@ Threshold = 3 (configurable)
 - `SymTable` for variable/function symbol resolution
 - `lower_expr()` / `lower_stmt()` / `lower_func_def()` / `lower_program()` — recursive lowering
 - `compute_liveness()` → interval [start, end] per vreg
-- `regalloc_linear_scan(num_phys)` — linear-scan register allocator with spill
+- `regalloc_linear_scan(num_phys)` — linear-scan register allocator with spill (bootstrap / Q-IR)
+- Soft LIR target: clean → Chaitin–Briggs color → George–Appel coalesce — [`REGISTER_ALLOCATION_ARCHITECTURE.md`](../MUST_READ_CONTEXT/REGISTER_ALLOCATION_ARCHITECTURE.md)
 - `tco_pass()` — tail-call optimization (Q_CALL+Q_RET → Q_JUMP+Q_NOP)
 
 ### 11.6. codegen.vri — Machine Code Emitter
