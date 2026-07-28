@@ -100,7 +100,7 @@
 | 2.2 | Kiểu có kích thước: `i8`–`i64`, `u8`–`u64` | §4.1 | ⚠️ | **16/04** — Lexer tokens TypeI8–TypeU64 (180–187). Parser lưu type vào `decl.name2`. Chưa có semantic enforcement |
 | 2.3 | `ptr` (con trỏ thô) | §4.1 | ⚠️ | **16/04** — Lexer `TypePtr = 189`. Parser lưu vào AST. Chưa có semantic thực sự |
 | 2.4 | Type annotations (suy luận kiểu) | §4.4 | ✅ | **16/04** — Parser lưu type annotation vào `name2` cho var/let/const declarations, func params, và return types. Hỗ trợ cả keyword types (i8–string) và entity types |
-| 2.5 | Arena allocator (`arena: ... end` block) | §4.5–4.6 | ⚠️ | **16/04** — Parser `ArenaBlock(91)` AST. IR transparent pass-through. Chưa có allocator runtime |
+| 2.5 | Arena allocator (`arena: ... end` block) | §4.5–4.6 | ✅ | **29/07** — C Arena v2 (page/watermark/child/TL) + `arena:`/`arena NAME:` enter/leave; Stage-1 watermark on `_rt_alloc`; soft parser+QOp parity. Escape-diag + full borrow pipeline hook still open |
 | 2.6 | Arena API (`arena_alloc`, `arena_new`, `arena_free`) | §4.7 | ✅ | **22/04 sess9** — 3 builtins map tới `Q_ARENA_NEW/ALLOC/FREE`. VM hooks `vir_arena_create/alloc/destroy` từ `mem_manager.c`. `arena_new(size)` → arena_id; `arena_alloc(id, size)` → raw addr; `arena_free(id)` — destroy region |
 | 2.7 | Float arithmetic | §4.1 | ✅ | ~~Trước đánh ⚠️~~ → **Đã sửa**: IR có `FAdd/FSub/FMul/FDiv`, codegen emit ARM64 `FADD/FSUB/FMUL/FDIV` (scalar double D16/D17). NEON 4S float ops cũng có |
 | 2.8 | Ownership / Borrow Checker | §4.8 | ✅ | **21/04** — Cross-statement NLL: bound borrowers (`var b = &a`) giữ counter trên `a` cho tới khi b reassign hoặc scope exit; borrows transient (call args) auto-release cuối stmt |
@@ -595,7 +595,7 @@
 | 1.1 | `include a::b::c;` | ✅ | Parser accept `IDENT (::IDENT)*` after `include`; stored in `AST_INCLUDE.name` joined with `::` |
 | 2.2 | Sized types `iN/uN` | ✅ | `AST_VAR_DECL` auto `Q_AND` mask (0xFF/0xFFFF/0xFFFFFFFF) based on `decl.name2 ∈ {u8,u16,u32,i8,i16,i32}` |
 | 2.3 | `ptr` | ✅ | `ptr` → int64 alias; compatible with `__read8/__write8` intrinsics |
-| 2.5 | `arena: ... end` | ✅ | `AST_ARENA_BLOCK` → `Q_ARENA_NEW(4096)` @entry + body + `Q_ARENA_FREE` @exit |
+| 2.5 | `arena: ... end` | ✅ | `AST_ARENA_BLOCK` → NEW→ENTER→body→LEAVE→FREE; Arena v2 watermark/child/TL; Stage-1 bump watermark |
 | 2.9 | Move diagnostics | ✅ | Session 8 + pass-by-value consume + dict/array move-type classify; bare-ident double-move caught by ownership analyser |
 | 4.1 | Bootstrap `func/end.` | ✅ | C core parser stable; `end.` period consumed at `parse_func_def`; multi-func programs validated |
 | 4.4 | Named args `f(a=5; b=10)` | ✅ | Parser detect `IDENT '='` + `;` separator; `q_function_t.param_names[]` + lowering slot-reorder by name |

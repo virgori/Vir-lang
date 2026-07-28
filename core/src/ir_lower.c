@@ -141,12 +141,18 @@ static diag_entry_t *lower_error(lower_ctx_t *ctx, const ast_node_t *node, const
     code = E3002;
     phase = PHASE_IR_LOWER;
     cat = DCAT_LOWERING;
-  } else if (strstr(msg, "of moved value") != NULL) {
+  } else if (strstr(msg, "of moved value") != NULL ||
+             strstr(msg, "ended arena") != NULL) {
     code = E8001;
     phase = PHASE_BORROW;
     cat = DCAT_OWNERSHIP;
   } else if (strstr(msg, "cannot borrow") != NULL) {
     code = E8002;
+    phase = PHASE_BORROW;
+    cat = DCAT_OWNERSHIP;
+  } else if (strstr(msg, "escapes arena") != NULL ||
+             strstr(msg, "escape the arena") != NULL) {
+    code = E8004;
     phase = PHASE_BORROW;
     cat = DCAT_OWNERSHIP;
   } else if (strstr(msg, "module not found") != NULL) {
@@ -205,6 +211,11 @@ static diag_entry_t *lower_error(lower_ctx_t *ctx, const ast_node_t *node, const
       diag_add_cause(&g_parser_diag, e, "Multiple mutable borrows of the same value in scope");
       diag_add_cause(&g_parser_diag, e, "Mutable borrow while shared borrows exist");
       diag_add_action(&g_parser_diag, e, "Ensure previous borrows end before creating a new one");
+    } else if (e && code == E8004) {
+      diag_set_analysis(&g_parser_diag, e, diag_str_ptr(&g_parser_diag, diag_intern_fmt(&g_parser_diag, "A value allocated inside an `arena:` block must not outlive that block.")));
+      diag_add_cause(&g_parser_diag, e, "Arena-local value assigned to an outer variable");
+      diag_add_cause(&g_parser_diag, e, "Arena-local value returned from the enclosing function");
+      diag_add_action(&g_parser_diag, e, "Keep the value inside the arena block, or copy/clone before exit");
     }
     return e;
   }
@@ -444,6 +455,68 @@ static const ast_node_t *ast_unwrap_borrow(const ast_node_t *n) {
   while (n && n->type == AST_BORROW && n->child_count >= 1)
     n = n->children[0];
   return n;
+}
+
+/* §4.6: arena nesting depth of a value (0 = not arena-local). */
+static uint8_t arena_value_depth(lower_ctx_t *ctx, const ast_node_t *expr) {
+  if (!ctx || !expr)
+    return 0;
+  /* Fresh heap-ish values created inside an arena block are arena-local. */
+  if (ctx->arena_depth > 0 && ast_produces_move_type(expr))
+    return ctx->arena_depth;
+  if (ctx->arena_depth > 0 && expr->type == AST_BUILTIN_CALL &&
+      (expr->builtin_id == BUILTIN_ARENA_ALLOC ||
+       expr->builtin_id == BUILTIN_ALLOC ||
+       expr->builtin_id == BUILTIN_ARR_NEW ||
+       expr->builtin_id == BUILTIN_STR_CAT ||
+       expr->builtin_id == BUILTIN_I_TO_STR))
+    return ctx->arena_depth;
+  const ast_node_t *u = ast_unwrap_borrow(expr);
+  if (u && u->type == AST_IDENTIFIER) {
+    symbol_entry_t *ent = NULL;
+    if (sym_lookup_entry_both(ctx, u->name, &ent, NULL) == 0 && ent)
+      return ent->arena_depth;
+  }
+  return 0;
+}
+
+/* §4.6: reject storing/returning an arena value into a shorter-lived sink. */
+static int check_arena_escape(lower_ctx_t *ctx, const ast_node_t *node,
+                              const ast_node_t *src, uint8_t dest_depth) {
+  uint8_t src_d = arena_value_depth(ctx, src);
+  if (src_d > 0 && src_d > dest_depth) {
+    char buf[192];
+    const ast_node_t *u = ast_unwrap_borrow(src);
+    const char *nm = (u && u->type == AST_IDENTIFIER && u->name[0]) ? u->name
+                                                                   : "value";
+    snprintf(buf, sizeof(buf),
+             "value '%s' escapes arena block (must not outlive `arena:`)", nm);
+    lower_error(ctx, node ? node : src, buf);
+    return -1;
+  }
+  return 0;
+}
+
+static void sym_set_arena_depth(lower_ctx_t *ctx, const char *name) {
+  if (!ctx || !name || !name[0])
+    return;
+  symbol_entry_t *ent = NULL;
+  if (sym_lookup_entry_both(ctx, name, &ent, NULL) == 0 && ent)
+    ent->arena_depth = ctx->arena_depth;
+}
+
+/* Invalidate locals defined in the arena depth we are leaving. */
+static void arena_expire_depth(lower_ctx_t *ctx, uint8_t depth, uint32_t line) {
+  if (!ctx || depth == 0)
+    return;
+  for (uint32_t i = 0; i < ctx->symbols.count; i++) {
+    symbol_entry_t *ent = &ctx->symbols.entries[i];
+    if (ent->arena_depth == depth) {
+      ent->is_moved = 1;
+      ent->moved_at_line = line;
+      ent->arena_depth = 0;
+    }
+  }
 }
 
 /* §4.8 NLL: release any active borrow held by `ent`. If ent.borrow_kind
@@ -3697,8 +3770,12 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     uint32_t existing_idx = 0;
     int existing_scope = sym_lookup_both(ctx, stmt->name, &existing_idx);
     int reuse_existing_local = (existing_scope == 0);
+    uint8_t prior_arena_depth = ctx->arena_depth;
     if (reuse_existing_local) {
       r = existing_idx;
+      symbol_entry_t *prior = NULL;
+      if (sym_lookup_entry_both(ctx, stmt->name, &prior, NULL) == 0 && prior)
+        prior_arena_depth = prior->arena_depth;
     } else {
       r = fresh_vreg(ctx);
     }
@@ -3763,6 +3840,10 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     /* If there is an initialiser expression, lower it */
     if (stmt->child_count > 0) {
       const ast_node_t *init = stmt->children[0];
+      /* Rebinding an outer name via var-group (`var buf=…; outer=buf`)
+       * must use the prior binder depth for escape checks. */
+      if (check_arena_escape(ctx, stmt, init, prior_arena_depth) != 0)
+        return -1;
       symbol_infer_record_type_from_expr(ctx, new_ent, init);
       int val = lower_expr(ctx, init);
       if (val >= 0 && (uint32_t)val != r) {
@@ -3798,9 +3879,23 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
         if (init->type == AST_BORROW) {
           ownership_claim_stmt_borrow(ctx, new_ent, init);
         }
+        /* §4.6: stamp arena depth. Never promote an outer binder deeper. */
+        {
+          uint8_t ad = arena_value_depth(ctx, init);
+          if (reuse_existing_local)
+            new_ent->arena_depth = prior_arena_depth;
+          else
+            new_ent->arena_depth = ad > 0 ? ad : ctx->arena_depth;
+        }
       }
     } else {
       emit(ctx, q_instr(Q_LOAD, q_vreg(r), q_imm(0), q_none()));
+      if (new_ent) {
+        if (reuse_existing_local)
+          new_ent->arena_depth = prior_arena_depth;
+        else
+          new_ent->arena_depth = ctx->arena_depth;
+      }
     }
     /* §26.1 tensor: after init, stamp shape onto the array handle so
      * Q_TENSOR_MUL can pick the matmul path. */
@@ -3827,10 +3922,23 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
       /* Implicitly declare local variable! */
       uint32_t r = fresh_vreg(ctx);
       sym_define(&ctx->symbols, stmt->name, r, VIR_TYPE_I64);
+      sym_set_arena_depth(ctx, stmt->name);
       scope = 0; /* now local scope */
       idx = r;
     }
     const ast_node_t *rhs = stmt->children[0];
+    {
+      symbol_entry_t *lhs_pre = NULL;
+      uint8_t dest_d = ctx->arena_depth;
+      if (sym_lookup_entry_both(ctx, stmt->name, &lhs_pre, NULL) == 0 &&
+          lhs_pre) {
+        dest_d = lhs_pre->arena_depth;
+      }
+      if (scope == 1)
+        dest_d = 0; /* globals never hold arena values */
+      if (check_arena_escape(ctx, stmt, rhs, dest_d) != 0)
+        return -1;
+    }
     int val = lower_expr(ctx, rhs);
     if (val < 0)
       return -1;
@@ -3895,8 +4003,10 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
       if (rhs->type == AST_BORROW && lhs_ent) {
         ownership_claim_stmt_borrow(ctx, lhs_ent, rhs);
       }
-      if (lhs_ent)
+      if (lhs_ent) {
         lhs_ent->is_moved = 0;
+        /* Keep binder's original arena depth (do not promote on assign). */
+      }
     }
     return 0;
   }
@@ -4147,7 +4257,11 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
 
   case AST_RETURN: {
     if (stmt->child_count > 0) {
-      int val = lower_expr(ctx, stmt->children[0]);
+      const ast_node_t *ret_e = stmt->children[0];
+      /* Returning from a function always escapes any arena block. */
+      if (check_arena_escape(ctx, stmt, ret_e, 0) != 0)
+        return -1;
+      int val = lower_expr(ctx, ret_e);
       if (val < 0)
         return -1;
       /* §20.2: inside `map ... end`, `out expr` appends to array. */
@@ -4259,7 +4373,9 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
 
   case AST_WHILE: {
     /* children[0] = condition
-     * children[1] = body block */
+     * children[1] = body block
+     * §4.6: each iteration is an implicit sub-arena — SAVE TL watermark
+     * before the body, RESTORE after (no `arena:` syntax required). */
     if (stmt->child_count < 2)
       return -1;
 
@@ -4282,7 +4398,16 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     ctx->loop_end_labels[ctx->loop_depth] = end_label;
     ctx->loop_depth++;
 
+    /* Watermark only — do not bump arena_depth (escape diag stays for
+     * explicit `arena:`). Loop-carried assigns to outer locals are normal. */
+    uint32_t mark_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_SAVE, q_vreg(mark_r), q_none(), q_none()));
     lower_stmt(ctx, stmt->children[1]);
+    {
+      uint32_t dummy = fresh_vreg(ctx);
+      emit(ctx, q_instr(Q_ARENA_RESTORE, q_vreg(dummy), q_none(),
+                        q_vreg(mark_r)));
+    }
 
     ctx->loop_depth--;
 
@@ -4473,19 +4598,43 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     return 0;
   }
   case AST_ARENA_BLOCK: {
-    /* §4.5 `arena NAME: body end` — scoped arena.
-     * entry: NAME = arena_new(4096)
-     * body:  block
-     * exit:  arena_free(NAME) */
+    /* §4.6 sub-arena: create → enter (TL current) → body → leave → free.
+     * Named form also binds NAME for arena_alloc_from(NAME, …).
+     * Escape check: arena-locals may not be stored/returned outside. */
+    int64_t cap = stmt->int_val > 0 ? stmt->int_val : (64 * 1024);
     uint32_t size_r = fresh_vreg(ctx);
-    emit(ctx, q_instr(Q_LOAD, q_vreg(size_r), q_imm(4096), q_none()));
+    emit(ctx, q_instr(Q_LOAD, q_vreg(size_r), q_imm(cap), q_none()));
     uint32_t aid_r = fresh_vreg(ctx);
     emit(ctx, q_instr(Q_ARENA_NEW, q_vreg(aid_r), q_vreg(size_r), q_none()));
-    sym_define(&ctx->symbols, stmt->name, aid_r, VIR_TYPE_I64);
-    if (stmt->child_count >= 1 && stmt->children[0]) {
-      lower_stmt(ctx, stmt->children[0]);
+    if (stmt->name[0] != '\0') {
+      sym_define(&ctx->symbols, stmt->name, aid_r, VIR_TYPE_I64);
+      /* Arena id itself lives in the outer scope. */
+      {
+        symbol_entry_t *aid_ent = NULL;
+        if (sym_lookup_entry_both(ctx, stmt->name, &aid_ent, NULL) == 0 &&
+            aid_ent)
+          aid_ent->arena_depth = ctx->arena_depth;
+      }
     }
     uint32_t dummy = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_ENTER, q_vreg(dummy), q_vreg(aid_r), q_none()));
+    if (ctx->arena_depth >= 255) {
+      lower_error(ctx, stmt, "arena nesting too deep");
+      return -1;
+    }
+    ctx->arena_depth++;
+    if (stmt->child_count >= 1 && stmt->children[0]) {
+      if (lower_stmt(ctx, stmt->children[0]) != 0) {
+        arena_expire_depth(ctx, ctx->arena_depth, stmt->line);
+        ctx->arena_depth--;
+        return -1;
+      }
+    }
+    arena_expire_depth(ctx, ctx->arena_depth, stmt->line);
+    ctx->arena_depth--;
+    dummy = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_LEAVE, q_vreg(dummy), q_none(), q_none()));
+    dummy = fresh_vreg(ctx);
     emit(ctx, q_instr(Q_ARENA_FREE, q_vreg(dummy), q_vreg(aid_r), q_none()));
     return 0;
   }
@@ -4533,8 +4682,15 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     ctx->loop_end_labels[ctx->loop_depth] = end_label;
     ctx->loop_depth++;
 
-    /* Body */
-    lower_stmt(ctx, stmt->children[2]);
+    /* §4.6 auto watermark per iteration (no arena_depth / escape). */
+    {
+      uint32_t mark_r = fresh_vreg(ctx);
+      emit(ctx, q_instr(Q_ARENA_SAVE, q_vreg(mark_r), q_none(), q_none()));
+      lower_stmt(ctx, stmt->children[2]);
+      uint32_t dummy = fresh_vreg(ctx);
+      emit(ctx, q_instr(Q_ARENA_RESTORE, q_vreg(dummy), q_none(),
+                        q_vreg(mark_r)));
+    }
 
     ctx->loop_depth--;
 
@@ -5206,8 +5362,14 @@ int lower_func_def(lower_ctx_t *ctx, const ast_node_t *func_def) {
       uint32_t func_id =
           ctx->module.func_count > 0 ? ctx->module.func_count - 1 : 0;
       if (pipeline_lower_func_body(ctx, body, func_id) != 0) {
-        lower_error(ctx, func_def, ctx->last_error[0] ? ctx->last_error
-                                                      : "pipeline lowering failed");
+        /* Copy first: lower_error writes into last_error; passing that same
+         * buffer as %s is UB and mangled "LIR to Q-IR …" → "IR conversion failed". */
+        char pipe_err[sizeof(ctx->last_error)];
+        strncpy(pipe_err,
+                ctx->last_error[0] ? ctx->last_error : "pipeline lowering failed",
+                sizeof(pipe_err) - 1);
+        pipe_err[sizeof(pipe_err) - 1] = '\0';
+        lower_error(ctx, func_def, pipe_err);
         ctx->symbols = *saved_syms;
         free(saved_syms);
         ctx->current_func = NULL;

@@ -15,6 +15,7 @@
 #include "lexer.h"
 #include "parser.h"
 #include "ir_lower.h"
+#include "compiler_pipeline.h"
 #include "vm.h"
 #include "codegen.h"
 #include "jit_bridge.h"
@@ -437,6 +438,12 @@ static int cmd_dump(const char *source, size_t len, const char *filepath)
     for (uint32_t i = 0; i < ctx->module.func_count; i++) {
         lower_tco_pass(&ctx->module.functions[i], i);
     }
+    if (pipeline_borrow_check(ctx) != 0) {
+        fprintf(stderr, "borrow error: %s\n", ctx->last_error);
+        ast_free(ast);
+        lower_destroy(ctx); free(ctx);
+        return 1;
+    }
 
     size_t dump_cap = 8 * 1024 * 1024;
     char *buf = malloc(dump_cap);
@@ -542,6 +549,20 @@ static int cmd_run(const char *source, size_t len, int verbose,
                        (unsigned long long)(trace_now_ms() - phase_start),
                        (unsigned long long)module_instruction_count(&ctx->module),
                        (unsigned long long)module_label_count(&ctx->module));
+
+    phase_start = trace_now_ms();
+    trace_stage1_event("borrow_start", "function_count=%u", ctx->module.func_count);
+    if (pipeline_borrow_check(ctx) != 0) {
+        trace_stage1_event("borrow_error", "elapsed_phase_ms=%llu error=%s",
+                           (unsigned long long)(trace_now_ms() - phase_start),
+                           ctx->last_error);
+        fprintf(stderr, "borrow error: %s\n", ctx->last_error);
+        ast_free(ast);
+        lower_destroy(ctx); free(ctx);
+        return 1;
+    }
+    trace_stage1_event("borrow_end", "elapsed_phase_ms=%llu",
+                       (unsigned long long)(trace_now_ms() - phase_start));
 
     if (verbose) {
         fprintf(stderr, "[vir] module '%s': %u functions\n",
@@ -654,6 +675,12 @@ static int cmd_jit(const char *source, size_t len, int verbose,
     /* TCO pass */
     for (uint32_t i = 0; i < ctx->module.func_count; i++) {
         lower_tco_pass(&ctx->module.functions[i], i);
+    }
+    if (pipeline_borrow_check(ctx) != 0) {
+        fprintf(stderr, "borrow error: %s\n", ctx->last_error);
+        ast_free(ast);
+        lower_destroy(ctx); free(ctx);
+        return 1;
     }
 
     /* Detect target architecture */
@@ -904,6 +931,13 @@ int main(int argc, char **argv)
         }
         for (uint32_t i = 0; i < ctx->module.func_count; i++)
             lower_tco_pass(&ctx->module.functions[i], i);
+        if (pipeline_borrow_check(ctx) != 0) {
+            fprintf(stderr, "borrow error: %s\n", ctx->last_error);
+            ast_free(ast); lower_destroy(ctx); free(ctx); free(source);
+            trace_stage1_event("process_end", "rc=1 reason=wasm_borrow_error");
+            trace_stage1_close();
+            return 1;
+        }
 
         /* Step 2: Emit WASM binary via codegen */
         uint8_t *wasm_buf = NULL;

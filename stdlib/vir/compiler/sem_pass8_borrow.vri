@@ -1,13 +1,13 @@
 ##
  * vir/compiler/sem_pass8_borrow.vri
  * ==============================================================
- * Pass 8: Borrow / Ref Analysis.
- * Tracks Move-type ownership and detects use-after-move.
- * Simplified P2 version — full lifetime analysis deferred.
+ * Pass 8: Borrow / Ref Analysis (soft-path AST).
+ * Tracks Move-type ownership, active borrows, and arena escape.
+ * Mirrors C-core §4.8 borrow rules at semantic analysis time.
  ##
 
 include vec_rt;
-import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt;
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt, vec_set_rt, vec_pop_rt from vec_rt;
 
 include string_rt;
 import rt_streq, rt_strcat, rt_itoa, rt_strlen from string_rt;
@@ -28,12 +28,19 @@ include type_table;
 import TypeKind, type_is_move from type_table;
 
 func pass8_analyze_borrow(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode)
-    # moved_vars: vec of string names that have been moved
     let moved_vars = vec_new_rt();
-    pass8_walk(symbols, scopes, diag, node, moved_vars)
+    let shared_borrows = vec_new_rt();
+    let mut_borrows = vec_new_rt();
+    let bound_lhs = vec_new_rt();
+    let bound_target = vec_new_rt();
+    let bound_kind = vec_new_rt();
+    let arena_locals = vec_new_rt();
+    let pre_arena_names = vec_new_rt();
+    pass8_walk(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+               bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, 0)
 end.
+
 func pass8_is_moved(moved_vars: int, name: string)
-    # Check if a variable name is in the moved list
     count = vec_len_rt(moved_vars);
     var i = 0;
     when i < count loop
@@ -45,21 +52,98 @@ func pass8_is_moved(moved_vars: int, name: string)
     end
     out 0
 end.
+
 func pass8_mark_moved(moved_vars: int, name: string)
-    # Add variable to moved list (if not already there)
     if pass8_is_moved(moved_vars, name) == 0 do
         vec_push_rt(moved_vars, name)
     end
 end.
-func pass8_unmark_moved(moved_vars: int, name: string)
-    # When a variable is reassigned, it's no longer moved
-    # We don't have vec_remove, so we create a new vec without the name
-    # For simplicity, we skip this optimization in P2
-    # Variables that are reassigned after move will not trigger false positives
-    # because the assignment itself creates a new value
+
+func pass8_vec_contains(names: int, name: string)
+    count = vec_len_rt(names);
+    var i = 0;
+    when i < count loop
+        if rt_streq(vec_get_rt(names, i), name) do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
 end.
+
+func pass8_borrow_count(borrows: int, name: string)
+    count = vec_len_rt(borrows);
+    var total = 0;
+    var i = 0;
+    when i < count loop
+        if rt_streq(vec_get_rt(borrows, i), name) do
+            total = total + 1
+        end
+        i = i + 1
+    end
+    out total
+end.
+
+func pass8_truncate_to(lst: int, watermark: int)
+    when vec_len_rt(lst) > watermark loop
+        vec_pop_rt(lst)
+    end
+end.
+
+func pass8_remove_one_borrow(borrows: int, name: string)
+    len = vec_len_rt(borrows);
+    var i = len - 1;
+    when i >= 0 loop
+        if rt_streq(vec_get_rt(borrows, i), name) do
+            if i < len - 1 do
+                vec_set_rt(borrows, i, vec_get_rt(borrows, len - 1))
+            end
+            pass8_truncate_to(borrows, len - 1);
+            out 0
+        end
+        i = i - 1
+    end
+    out 0
+end.
+
+func pass8_release_borrower(bound_lhs: int, bound_target: int, bound_kind: int,
+                             shared_borrows: int, mut_borrows: int, borrower: string)
+    len = vec_len_rt(bound_lhs);
+    var i = 0;
+    when i < len loop
+        if rt_streq(vec_get_rt(bound_lhs, i), borrower) do
+            tgt = vec_get_rt(bound_target, i);
+            kind = vec_get_rt(bound_kind, i);
+            if kind == 2 do
+                pass8_remove_one_borrow(mut_borrows, tgt)
+            else
+                pass8_remove_one_borrow(shared_borrows, tgt)
+            end
+            j = i;
+            when j < len - 1 loop
+                vec_set_rt(bound_lhs, j, vec_get_rt(bound_lhs, j + 1));
+                vec_set_rt(bound_target, j, vec_get_rt(bound_target, j + 1));
+                vec_set_rt(bound_kind, j, vec_get_rt(bound_kind, j + 1));
+                j = j + 1
+            end
+            pass8_truncate_to(bound_lhs, len - 1);
+            pass8_truncate_to(bound_target, len - 1);
+            pass8_truncate_to(bound_kind, len - 1);
+            out 0
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass8_claim_borrow(bound_lhs: int, bound_target: int, bound_kind: int,
+                        borrower: string, target: string, kind: int)
+    vec_push_rt(bound_lhs, borrower);
+    vec_push_rt(bound_target, target);
+    vec_push_rt(bound_kind, kind)
+end.
+
 func pass8_lookup_type(symbols: SymbolTable, scopes: ScopeTree, name: string)
-    # Returns TypeKind of a symbol, or Void if not found
     if rt_strlen(name) == 0 do
         out TypeKind.Void
     end
@@ -81,76 +165,337 @@ func pass8_lookup_type(symbols: SymbolTable, scopes: ScopeTree, name: string)
     end
     out TypeKind.Void
 end.
-func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode, moved_vars: int)
 
-    # Check use-after-move for identifiers
+func pass8_name_in_scope(symbols: SymbolTable, scopes: ScopeTree, name: string)
+    if rt_strlen(name) == 0 do
+        out 0
+    end
+    curr = scopes.current_id;
+    when curr != -1 loop
+        scope_node = vec_get_rt(scopes.scopes, curr);
+        count = vec_len_rt(scope_node.symbols);
+        var i = 0;
+        when i < count loop
+            sym_id = vec_get_rt(scope_node.symbols, i);
+            sym = vec_get_rt(symbols.symbols, sym_id);
+            sym_name = sym.name_id >> string;
+            if rt_streq(sym_name, name) do
+                out 1
+            end
+            i = i + 1
+        end
+        curr = scope_node.parent_id
+    end
+    out 0
+end.
+
+func pass8_collect_scope_names(symbols: SymbolTable, scopes: ScopeTree)
+    let names = vec_new_rt();
+    curr = scopes.current_id;
+    when curr != -1 loop
+        scope_node = vec_get_rt(scopes.scopes, curr);
+        count = vec_len_rt(scope_node.symbols);
+        var i = 0;
+        when i < count loop
+            sym_id = vec_get_rt(scope_node.symbols, i);
+            sym = vec_get_rt(symbols.symbols, sym_id);
+            sym_name = sym.name_id >> string;
+            if pass8_vec_contains(names, sym_name) == 0 do
+                vec_push_rt(names, sym_name)
+            end
+            i = i + 1
+        end
+        curr = scope_node.parent_id
+    end
+    out names
+end.
+
+func pass8_expr_has_arena_local(node: AstNode, arena_locals: int, in_arena: int)
+    if in_arena == 0 do
+        out 0
+    end
+    if node.node_type == AstType.Identifier do
+        if rt_strlen(node.name) > 0 do
+            if pass8_vec_contains(arena_locals, node.name) == 1 do
+                out 1
+            end
+        end
+        out 0
+    end
+    child_count = vec_len_rt(node.children);
+    var i = 0;
+    when i < child_count loop
+        child = vec_get_rt(node.children, i);
+        if pass8_expr_has_arena_local(child, arena_locals, in_arena) == 1 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass8_check_arena_escape_assign(diag: DiagnosticEngine, lhs: string, rhs: AstNode,
+                                     arena_locals: int, pre_arena_names: int, in_arena: int, line: int)
+    if in_arena == 0 do
+        out 0
+    end
+    if pass8_vec_contains(pre_arena_names, lhs) == 0 do
+        out 0
+    end
+    if pass8_expr_has_arena_local(rhs, arena_locals, in_arena) == 1 do
+        report_error(diag, 5005, line, 0);
+        out 1
+    end
+    out 0
+end.
+
+func pass8_register_arena_local(arena_locals: int, pre_arena_names: int, name: string, in_arena: int)
+    if in_arena == 0 do
+        out 0
+    end
+    if rt_strlen(name) == 0 do
+        out 0
+    end
+    if pass8_vec_contains(pre_arena_names, name) == 1 do
+        out 0
+    end
+    if pass8_vec_contains(arena_locals, name) == 0 do
+        vec_push_rt(arena_locals, name)
+    end
+    out 0
+end.
+
+func pass8_check_arena_borrow_escape(diag: DiagnosticEngine, arena_locals: int,
+                                     shared_borrows: int, mut_borrows: int, line: int)
+    count = vec_len_rt(arena_locals);
+    var i = 0;
+    when i < count loop
+        local = vec_get_rt(arena_locals, i);
+        if pass8_borrow_count(shared_borrows, local) > 0 do
+            report_error(diag, 5005, line, 0)
+        end
+        if pass8_borrow_count(mut_borrows, local) > 0 do
+            report_error(diag, 5005, line, 0)
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass8_end_stmt(shared_borrows: int, mut_borrows: int, shared_wm: int, mut_wm: int, claimed: int)
+    if claimed == 0 do
+        pass8_truncate_to(shared_borrows, shared_wm);
+        pass8_truncate_to(mut_borrows, mut_wm)
+    end
+    out 0
+end.
+
+func pass8_handle_addr_of(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
+                          node: AstNode, moved_vars: int, shared_borrows: int, mut_borrows: int,
+                          bound_lhs: int, bound_target: int, bound_kind: int,
+                          arena_locals: int, pre_arena_names: int, in_arena: int)
+    child_count = vec_len_rt(node.children);
+    if child_count < 1 do
+        out ""
+    end
+    child = vec_get_rt(node.children, 0);
+    if child.node_type != AstType.Identifier do
+        pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
+                   bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena);
+        out ""
+    end
+    tgt = child.name;
+    if rt_strlen(tgt) == 0 do
+        out ""
+    end
+    if pass8_is_moved(moved_vars, tgt) == 1 do
+        report_error(diag, 5004, node.line, 0);
+        out ""
+    end
+    is_mut = 0;
+    if rt_streq(node.name, "mut") do
+        is_mut = 1
+    end
+    if is_mut == 1 do
+        if pass8_borrow_count(shared_borrows, tgt) > 0 do
+            report_error(diag, 5002, node.line, 0)
+        end
+        if pass8_borrow_count(mut_borrows, tgt) > 0 do
+            report_error(diag, 5003, node.line, 0)
+        end
+        vec_push_rt(mut_borrows, tgt)
+    else
+        if pass8_borrow_count(mut_borrows, tgt) > 0 do
+            report_error(diag, 5006, node.line, 0)
+        end
+        vec_push_rt(shared_borrows, tgt)
+    end
+    out tgt
+end.
+
+func pass8_process_binding_rhs(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
+                               rhs: AstNode, moved_vars: int, shared_borrows: int, mut_borrows: int,
+                               bound_lhs: int, bound_target: int, bound_kind: int,
+                               lhs: string, arena_locals: int, pre_arena_names: int, in_arena: int)
+    claimed = 0;
+    borrow_tgt = "";
+    borrow_kind = 0;
+
+    if rhs.node_type == AstType.AddrOf do
+        borrow_tgt = pass8_handle_addr_of(symbols, scopes, diag, rhs, moved_vars,
+                                          shared_borrows, mut_borrows, bound_lhs, bound_target, bound_kind,
+                                          arena_locals, pre_arena_names, in_arena);
+        if rt_strlen(borrow_tgt) > 0 do
+            if rt_streq(rhs.name, "mut") do
+                borrow_kind = 2
+            else
+                borrow_kind = 1
+            end
+            pass8_claim_borrow(bound_lhs, bound_target, bound_kind, lhs, borrow_tgt, borrow_kind);
+            claimed = 1
+        end
+    else
+        pass8_walk(symbols, scopes, diag, rhs, moved_vars, shared_borrows, mut_borrows,
+                   bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena);
+        if rhs.node_type == AstType.Identifier do
+            rhs_type = pass8_lookup_type(symbols, scopes, rhs.name);
+            if type_is_move(rhs_type) do
+                pass8_mark_moved(moved_vars, rhs.name)
+            end
+        end
+    end
+    out claimed
+end.
+
+func pass8_walk_children_stmts(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
+                               node: AstNode, moved_vars: int, shared_borrows: int, mut_borrows: int,
+                               bound_lhs: int, bound_target: int, bound_kind: int,
+                               arena_locals: int, pre_arena_names: int, in_arena: int)
+    child_count = vec_len_rt(node.children);
+    var i = 0;
+    when i < child_count loop
+        shared_wm = vec_len_rt(shared_borrows);
+        mut_wm = vec_len_rt(mut_borrows);
+        child = vec_get_rt(node.children, i);
+        claimed = pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
+                             bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena);
+        pass8_end_stmt(shared_borrows, mut_borrows, shared_wm, mut_wm, claimed);
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode,
+                moved_vars: int, shared_borrows: int, mut_borrows: int,
+                bound_lhs: int, bound_target: int, bound_kind: int,
+                arena_locals: int, pre_arena_names: int, in_arena: int)
+
     if node.node_type == AstType.Identifier do
         if rt_strlen(node.name) > 0 do
             if pass8_is_moved(moved_vars, node.name) == 1 do
-                # Error 5001: Use of moved value
                 report_error(diag, 5001, node.line, 0)
             end
         end
         out 0
     end
 
-    # Track moves in assignments
-    if node.node_type == AstType.Assign do
-        child_count = vec_len_rt(node.children);
-        if child_count >= 2 do
-            rhs = vec_get_rt(node.children, 1);
-            # If RHS is an identifier of a Move type, mark it as moved
-            if rhs.node_type == AstType.Identifier do
-                rhs_type = pass8_lookup_type(symbols, scopes, rhs.name);
-                if type_is_move(rhs_type) do
-                    pass8_mark_moved(moved_vars, rhs.name)
-                end
-            end
-        end
-        # Recurse into children
-        child_count2 = vec_len_rt(node.children);
-        var i = 0;
-        when i < child_count2 loop
-            child = vec_get_rt(node.children, i);
-            pass8_walk(symbols, scopes, diag, child, moved_vars);
-            i = i + 1
-        end
+    if node.node_type == AstType.AddrOf do
+        pass8_handle_addr_of(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                             bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena);
         out 0
     end
 
-    # Track moves in VarDecl initializers
-    if node.node_type == AstType.VarDecl or node.node_type == AstType.ConstDecl do
+    if node.node_type == AstType.Assign do
+        pass8_release_borrower(bound_lhs, bound_target, bound_kind, shared_borrows, mut_borrows, node.name);
+        claimed = 0;
         child_count = vec_len_rt(node.children);
         if child_count > 0 do
-            init = vec_get_rt(node.children, 0);
-            # If initializer is an identifier of Move type, mark it as moved
-            if init.node_type == AstType.Identifier do
-                init_type = pass8_lookup_type(symbols, scopes, init.name);
-                if type_is_move(init_type) do
-                    pass8_mark_moved(moved_vars, init.name)
+            rhs = vec_get_rt(node.children, 0);
+            pass8_register_arena_local(arena_locals, pre_arena_names, node.name, in_arena);
+            pass8_check_arena_escape_assign(diag, node.name, rhs, arena_locals, pre_arena_names, in_arena, node.line);
+            claimed = pass8_process_binding_rhs(symbols, scopes, diag, rhs, moved_vars,
+                                                  shared_borrows, mut_borrows, bound_lhs, bound_target, bound_kind,
+                                                  node.name, arena_locals, pre_arena_names, in_arena)
+        end
+        out claimed
+    end
+
+    if node.node_type == AstType.VarDecl or node.node_type == AstType.ConstDecl do
+        claimed = 0;
+        child_count = vec_len_rt(node.children);
+        if node.int_val == 16384 do
+            var ti = 0;
+            when ti < child_count loop
+                tuple_child = vec_get_rt(node.children, ti);
+                if tuple_child.node_type == AstType.Identifier do
+                    pass8_register_arena_local(arena_locals, pre_arena_names, tuple_child.name, in_arena)
                 end
+                ti = ti + 1
+            end
+        else
+            pass8_register_arena_local(arena_locals, pre_arena_names, node.name, in_arena)
+        end
+        if child_count > 0 do
+            init = vec_get_rt(node.children, child_count - 1);
+            bind_name = node.name;
+            if node.int_val == 16384 do
+                bind_name = ""
+            end
+            if rt_strlen(bind_name) > 0 do
+                pass8_check_arena_escape_assign(diag, bind_name, init, arena_locals, pre_arena_names, in_arena, node.line);
+                claimed = pass8_process_binding_rhs(symbols, scopes, diag, init, moved_vars,
+                                                      shared_borrows, mut_borrows, bound_lhs, bound_target, bound_kind,
+                                                      bind_name, arena_locals, pre_arena_names, in_arena)
+            else
+                pass8_walk(symbols, scopes, diag, init, moved_vars, shared_borrows, mut_borrows,
+                           bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena)
             end
         end
-        # Recurse
+        out claimed
+    end
+
+    if node.node_type == AstType.ReturnStmt do
+        child_count = vec_len_rt(node.children);
+        if child_count > 0 do
+            val = vec_get_rt(node.children, 0);
+            if in_arena == 1 and pass8_expr_has_arena_local(val, arena_locals, in_arena) == 1 do
+                report_error(diag, 5005, node.line, 0)
+            end
+            pass8_walk(symbols, scopes, diag, val, moved_vars, shared_borrows, mut_borrows,
+                       bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena)
+        end
+        out 0
+    end
+
+    if node.node_type == AstType.PrintStmt or node.node_type == AstType.ThrowStmt do
+        child_count = vec_len_rt(node.children);
         var i = 0;
         when i < child_count loop
             child = vec_get_rt(node.children, i);
-            pass8_walk(symbols, scopes, diag, child, moved_vars);
+            pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
+                       bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena);
             i = i + 1
         end
         out 0
     end
 
-    # Scope management
     if node.node_type == AstType.FuncDef do
         scope_push(scopes, ScopeKind.Func);
-        # Each function gets a fresh moved_vars context
         let func_moved = vec_new_rt();
+        let func_shared = vec_new_rt();
+        let func_mut = vec_new_rt();
+        let func_bound_lhs = vec_new_rt();
+        let func_bound_target = vec_new_rt();
+        let func_bound_kind = vec_new_rt();
+        let func_arena_locals = vec_new_rt();
+        let func_pre_arena = vec_new_rt();
         child_count = vec_len_rt(node.children);
         var i = 0;
         when i < child_count loop
             child = vec_get_rt(node.children, i);
-            pass8_walk(symbols, scopes, diag, child, func_moved);
+            pass8_walk(symbols, scopes, diag, child, func_moved, func_shared, func_mut,
+                       func_bound_lhs, func_bound_target, func_bound_kind,
+                       func_arena_locals, func_pre_arena, 0);
             i = i + 1
         end
         scope_pop(scopes);
@@ -159,23 +504,82 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
 
     if node.node_type == AstType.Block do
         scope_push(scopes, ScopeKind.Block);
-        child_count = vec_len_rt(node.children);
-        var i = 0;
-        when i < child_count loop
-            child = vec_get_rt(node.children, i);
-            pass8_walk(symbols, scopes, diag, child, moved_vars);
-            i = i + 1
-        end
+        moved_wm = vec_len_rt(moved_vars);
+        shared_wm = vec_len_rt(shared_borrows);
+        mut_wm = vec_len_rt(mut_borrows);
+        bound_wm = vec_len_rt(bound_lhs);
+        pass8_walk_children_stmts(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                                  bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena);
+        pass8_truncate_to(moved_vars, moved_wm);
+        pass8_truncate_to(shared_borrows, shared_wm);
+        pass8_truncate_to(mut_borrows, mut_wm);
+        pass8_truncate_to(bound_lhs, bound_wm);
+        pass8_truncate_to(bound_target, bound_wm);
+        pass8_truncate_to(bound_kind, bound_wm);
         scope_pop(scopes);
         out 0
     end
 
-    # Default recurse
+    if node.node_type == AstType.ArenaBlock do
+        scope_push(scopes, ScopeKind.Block);
+        moved_wm = vec_len_rt(moved_vars);
+        shared_wm = vec_len_rt(shared_borrows);
+        mut_wm = vec_len_rt(mut_borrows);
+        bound_wm = vec_len_rt(bound_lhs);
+        arena_wm = vec_len_rt(arena_locals);
+        let arena_pre = pass8_collect_scope_names(symbols, scopes);
+        pass8_walk_children_stmts(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                                  bound_lhs, bound_target, bound_kind, arena_locals, arena_pre, 1);
+        pass8_check_arena_borrow_escape(diag, arena_locals, shared_borrows, mut_borrows, node.line);
+        pass8_truncate_to(moved_vars, moved_wm);
+        pass8_truncate_to(shared_borrows, shared_wm);
+        pass8_truncate_to(mut_borrows, mut_wm);
+        pass8_truncate_to(bound_lhs, bound_wm);
+        pass8_truncate_to(bound_target, bound_wm);
+        pass8_truncate_to(bound_kind, bound_wm);
+        pass8_truncate_to(arena_locals, arena_wm);
+        scope_pop(scopes);
+        out 0
+    end
+
+    if node.node_type == AstType.IfStmt or node.node_type == AstType.LoopStmt or node.node_type == AstType.WhileStmt or node.node_type == AstType.ForRange do
+        scope_push(scopes, ScopeKind.Block);
+        moved_wm = vec_len_rt(moved_vars);
+        shared_wm = vec_len_rt(shared_borrows);
+        mut_wm = vec_len_rt(mut_borrows);
+        bound_wm = vec_len_rt(bound_lhs);
+        child_count = vec_len_rt(node.children);
+        if child_count > 0 do
+            cond = vec_get_rt(node.children, 0);
+            pass8_walk(symbols, scopes, diag, cond, moved_vars, shared_borrows, mut_borrows,
+                       bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena)
+        end
+        var i = 1;
+        when i < child_count loop
+            shared_stmt_wm = vec_len_rt(shared_borrows);
+            mut_stmt_wm = vec_len_rt(mut_borrows);
+            child = vec_get_rt(node.children, i);
+            claimed = pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
+                       bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena);
+            pass8_end_stmt(shared_borrows, mut_borrows, shared_stmt_wm, mut_stmt_wm, claimed);
+            i = i + 1
+        end
+        pass8_truncate_to(moved_vars, moved_wm);
+        pass8_truncate_to(shared_borrows, shared_wm);
+        pass8_truncate_to(mut_borrows, mut_wm);
+        pass8_truncate_to(bound_lhs, bound_wm);
+        pass8_truncate_to(bound_target, bound_wm);
+        pass8_truncate_to(bound_kind, bound_wm);
+        scope_pop(scopes);
+        out 0
+    end
+
     child_count = vec_len_rt(node.children);
     var i = 0;
     when i < child_count loop
         child = vec_get_rt(node.children, i);
-        pass8_walk(symbols, scopes, diag, child, moved_vars);
+        pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
+                   bound_lhs, bound_target, bound_kind, arena_locals, pre_arena_names, in_arena);
         i = i + 1
     end
     out 0

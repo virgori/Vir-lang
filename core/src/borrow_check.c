@@ -53,21 +53,20 @@ static var_info_t *bc_get_var(borrow_ctx_t *ctx, uint32_t vreg) {
 static bool is_alloc_opcode(q_opcode_t op) {
     switch (op) {
     case Q_ALLOC:
-    case Q_STACK_ALLOC:
     case Q_ARR_NEW:
-    case Q_MAP_NEW:
-    case Q_ENTITY_NEW:
+    case Q_ARR_COMPACT:
+    case Q_DICT_NEW:
+    case Q_DICT_KEYS:
+    case Q_DICT_VALUES:
     case Q_STR_CAT:
-    case Q_STR_SLICE:
-    case Q_STR_UPPER:
-    case Q_STR_LOWER:
-    case Q_STR_REPLACE:
-    case Q_STR_TRIM:
-    case Q_STR_ALLOC:
-    case Q_SPRINTF:
     case Q_I_TO_STR:
-    case Q_F_TO_STR:
     case Q_FILE_READ:
+    case Q_GET_ARG:
+    case Q_ARENA_ALLOC:
+    case Q_PORT_NEW:
+    case Q_FLUX_NORM:
+    case Q_FLUX_SPLAT:
+    case Q_FLUX_LOAD:
         return true;
     default:
         return false;
@@ -77,28 +76,21 @@ static bool is_alloc_opcode(q_opcode_t op) {
 /* Check if an opcode produces a copy-type result (int/float/bool) */
 static bool is_copy_result(q_opcode_t op) {
     switch (op) {
-    /* Integer arithmetic → int */
     case Q_ADD: case Q_SUB: case Q_MUL: case Q_DIV: case Q_MOD:
-    case Q_NEG: case Q_POW: case Q_ABS:
     case Q_AND: case Q_OR: case Q_XOR: case Q_SHL: case Q_SHR:
-    case Q_NOT:
-    /* Float arithmetic → float */
-    case Q_FADD: case Q_FSUB: case Q_FMUL: case Q_FDIV:
-    case Q_SIN: case Q_COS: case Q_TAN: case Q_SQRT:
-    /* Comparison → int (0 or 1) */
     case Q_CMP_EQ: case Q_CMP_GT: case Q_CMP_LT:
     case Q_CMP_GE: case Q_CMP_LE: case Q_CMP_NE:
-    case Q_STR_EQ: case Q_STR_LEN: case Q_STR_FIND:
-    case Q_STR_STARTS: case Q_STR_CONTAINS:
-    /* Type conversions to numeric */
-    case Q_I_TO_F: case Q_F_TO_I: case Q_STR_TO_I: case Q_STR_TO_F:
-    /* Array operations returning scalars */
-    case Q_ARR_LEN: case Q_MAP_HAS:
-    /* Immediate load */
-    case Q_LOAD:
-    /* System */
-    case Q_ARG_COUNT: case Q_TIME:
-    case Q_PERCENT:
+    case Q_STR_EQ: case Q_STR_LEN: case Q_STR_GET:
+    case Q_STR_TO_I:
+    case Q_ARR_LEN: case Q_ARR_CAP: case Q_ARR_GET:
+    case Q_DICT_LEN: case Q_DICT_HAS_I: case Q_DICT_HAS_S:
+    case Q_DICT_GET_I: case Q_DICT_GET_S:
+    case Q_HASH_I: case Q_HASH_S:
+    case Q_LOAD: case Q_LOAD_BYTE: case Q_LOAD_WORD:
+    case Q_LOAD_GLOBAL: case Q_ATOMIC_LOAD_GLOBAL:
+    case Q_ARG_COUNT: case Q_ARENA_NEW: case Q_ARENA_SAVE:
+    case Q_PORT_LEN: case Q_PORT_RECV:
+    case Q_ERX_LOAD: case Q_VREDUCE:
         return true;
     default:
         return false;
@@ -210,6 +202,11 @@ static void track_moves(borrow_ctx_t *ctx, const q_function_t *func) {
         /* Static: no transfer needed */
         if (src->state == OWN_STATIC) continue;
 
+        /* ABI arg/return shuffles (R0–R7): lowering uses Q_MOVE to stage
+         * call arguments; these are never ownership transfers. */
+        if (instr->dest.vreg < 8)
+            continue;
+
         /* Only treat as move if src is not used after this point */
         if (src->death_ip <= ip) {
             /* True last-use: ownership transfers */
@@ -300,8 +297,9 @@ static void compute_drops(borrow_ctx_t *ctx, const q_function_t *func) {
                     escaped[j] = true;
             }
         }
-        /* Q_SET_FIELD: dest = value stored into entity field */
-        if (instr->opcode == Q_SET_FIELD && instr->dest.type == OPERAND_VREG) {
+        /* Dict/store: value may escape into a container. */
+        if ((instr->opcode == Q_DICT_SET_I || instr->opcode == Q_DICT_SET_S) &&
+            instr->dest.type == OPERAND_VREG) {
             for (uint32_t j = 0; j < ctx->var_count; j++) {
                 if (ctx->vars[j].vreg == instr->dest.vreg && ctx->vars[j].is_alloc)
                     escaped[j] = true;
@@ -374,7 +372,7 @@ void borrow_enable_polychrome(borrow_ctx_t *ctx) {
 /* Forward declarations for NLL + polychrome passes */
 static void nll_build_cfg(borrow_ctx_t *ctx, const q_function_t *func);
 static void nll_compute_liveness(borrow_ctx_t *ctx, const q_function_t *func);
-static void nll_refine_deaths(borrow_ctx_t *ctx);
+static void nll_refine_deaths(borrow_ctx_t *ctx, const q_function_t *func);
 static void polychrome_classify_borrows(borrow_ctx_t *ctx, const q_function_t *func);
 static void polychrome_check_conflicts(borrow_ctx_t *ctx);
 
@@ -400,7 +398,7 @@ int borrow_check_function(borrow_ctx_t *ctx, const q_function_t *func) {
     if (ctx->nll_enabled) {
         nll_build_cfg(ctx, func);
         nll_compute_liveness(ctx, func);
-        nll_refine_deaths(ctx);
+        nll_refine_deaths(ctx, func);
     }
 
     /* Pass 3: Track moves */
@@ -756,13 +754,14 @@ static void nll_compute_liveness(borrow_ctx_t *ctx, const q_function_t *func) {
 }
 
 /* ── Pass NLL-3: Refine death_ip using CFG liveness ─── */
-static void nll_refine_deaths(borrow_ctx_t *ctx) {
+static void nll_refine_deaths(borrow_ctx_t *ctx, const q_function_t *func) {
     /*
-     * For each variable, walk backwards from the end of the function.
-     * The true death is the latest IP in any block where the variable
-     * is in live_out, or the latest IP where it is used.
-     * The key insight: if a variable is NOT in live_out of a block,
-     * it dies before the end of that block.
+     * For each variable, the NLL death is the latest IP where it is
+     * live_in/live_out of a block, or actually used as src (defs alone
+     * do not extend). Vars defined+used entirely inside one block are
+     * neither live_in nor live_out — without scanning uses, death would
+     * collapse to birth_ip and track_moves would false-positive on
+     * ABI moves like `MOVE R0, Rx` before a later FILE_CLOSE Rx.
      */
     for (uint32_t vi = 0; vi < ctx->var_count; vi++) {
         var_info_t *v = &ctx->vars[vi];
@@ -778,6 +777,18 @@ static void nll_refine_deaths(borrow_ctx_t *ctx) {
             if (bv_test(ctx->blocks[b].live_in, vi)) {
                 if (ctx->blocks[b].end_ip > nll_death)
                     nll_death = ctx->blocks[b].end_ip;
+            }
+        }
+
+        if (func) {
+            for (uint32_t ip = 0; ip < func->body_count; ip++) {
+                const q_instruction_t *ins = &func->body[ip];
+                if (ins->src1.type == OPERAND_VREG &&
+                    ins->src1.vreg == v->vreg && ip > nll_death)
+                    nll_death = ip;
+                if (ins->src2.type == OPERAND_VREG &&
+                    ins->src2.vreg == v->vreg && ip > nll_death)
+                    nll_death = ip;
             }
         }
 
@@ -873,14 +884,19 @@ static void polychrome_classify_borrows(borrow_ctx_t *ctx, const q_function_t *f
                     if (!saw_field) { first_field = (int32_t)ins->src2.imm; saw_field = true; }
                 }
                 break;
-            case Q_ARR_GET: case Q_MAP_GET: case Q_STR_GET:
+            case Q_ARR_GET:
+            case Q_DICT_GET_I:
+            case Q_DICT_GET_S:
+            case Q_STR_GET:
                 colors |= BORROW_READ;
                 break;
-            case Q_ARR_SET: case Q_MAP_SET:
+            case Q_ARR_SET:
+            case Q_DICT_SET_I:
+            case Q_DICT_SET_S:
                 colors |= BORROW_WRITE;
                 saw_write = true;
                 break;
-            case Q_ARR_PUSH: case Q_ARR_POP:
+            case Q_ARR_PUSH:
                 colors |= BORROW_WRITE | BORROW_CONTAINER;
                 saw_write = true;
                 break;
@@ -988,7 +1004,7 @@ static void ipa_build_summary(ipa_func_summary_t *sum, const q_function_t *func,
             const q_instruction_t *ins = &func->body[ip];
             /* Check if param is used as a store target (mutated) */
             if (ins->opcode == Q_STORE_WORD || ins->opcode == Q_ARR_SET ||
-                ins->opcode == Q_MAP_SET) {
+                ins->opcode == Q_DICT_SET_I || ins->opcode == Q_DICT_SET_S) {
                 if (ins->src1.type == OPERAND_VREG && ins->src1.vreg == pvreg) {
                     only_read = false;
                 }

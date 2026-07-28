@@ -427,6 +427,8 @@ typedef struct {
   uint8_t is_tensor;
   uint32_t tensor_rows;
   uint32_t tensor_cols;
+  /* §4.6: arena nesting depth when this local was defined (0 = outside). */
+  uint8_t arena_depth;
 } symbol_entry_t;
 
 typedef struct {
@@ -549,6 +551,8 @@ typedef struct {
    * instead of emitting Q_RET.  Zero = not in map context. */
   uint32_t map_arr_vreg;
   uint8_t in_map_expr;
+  /* §4.6: nesting depth of `arena:` / `arena NAME:` blocks. */
+  uint8_t arena_depth;
 } lower_ctx_t;
 
 /* ═══════════════════════════════════════════════════════
