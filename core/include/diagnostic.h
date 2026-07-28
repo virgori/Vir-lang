@@ -152,6 +152,7 @@ typedef enum {
 #define E8001 8001  /* Use after move                            */
 #define E8002 8002  /* Overlapping mutable borrow                */
 #define E8003 8003  /* Borrow outlives owner                     */
+#define E8004 8004  /* Arena value escapes its block (§4.6)      */
 
 /* ICE */
 #define E9001 9001  /* Lowering invariant violated               */

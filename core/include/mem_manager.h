@@ -1,6 +1,6 @@
 /*
  * mem_manager.h – Memory Manager for Vir Runtime
- * Phase 3 – H2
+ * Phase 3 – H2 + Arena v2 (page-chain, watermark, child, TL pool)
  */
 
 #ifndef VIR_MEM_MANAGER_H
@@ -13,14 +13,33 @@
 extern "C" {
 #endif
 
-/* Arena allocator */
+/* ── Arena v2 ─────────────────────────────────────────── */
 int    vir_arena_create(size_t size);
+int    vir_arena_create_child(int parent_id, size_t size);
 void  *vir_arena_alloc(int arena_id, size_t size);
+void  *vir_arena_alloc_aligned(int arena_id, size_t size, size_t align);
 void   vir_arena_reset(int arena_id);
 void   vir_arena_destroy(int arena_id);
 size_t vir_arena_used(int arena_id);
+size_t vir_arena_page_count(int arena_id);
+size_t vir_arena_save(int arena_id);
+void   vir_arena_restore(int arena_id, size_t watermark);
+void   vir_arena_set_alignment(int arena_id, size_t align);
+void   vir_arena_set_growth_factor(int arena_id, double factor);
 
-/* Reference counting */
+/* Thread-local current / pooled arenas (§4.6 sub-arena support) */
+void   vir_tl_arena_pool_init(void);
+int    vir_tl_arena_get(void);
+void  *vir_tl_arena_alloc(size_t size);
+void   vir_tl_arena_release(void);
+size_t vir_tl_arena_pool_size(void);
+void   vir_tl_arena_pool_drain(void);
+/* Push/pop current TL arena (language `arena:` / named blocks). */
+int    vir_tl_arena_push(int arena_id);
+int    vir_tl_arena_pop(void);
+int    vir_tl_arena_current(void);
+
+/* Reference counting (legacy — borrow+arena path preferred) */
 void *vir_rc_alloc(size_t size);
 int   vir_rc_retain(void *ptr);
 int   vir_rc_release(void *ptr);

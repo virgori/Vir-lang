@@ -9,6 +9,8 @@
 #include "lir_regalloc.h"
 #include "hir.h"
 #include "ir_lower.h"
+#include "borrow_check.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -94,4 +96,35 @@ int pipeline_lower_func_body(lower_ctx_t *ctx, const ast_node_t *body_ast,
     return -1;
 
   return pipeline_lower_block(ctx, body_ast, func_id);
+}
+
+int pipeline_borrow_check(lower_ctx_t *ctx) {
+  if (!ctx)
+    return -1;
+  if (getenv("VIR_NO_BORROW_CHECK") != NULL)
+    return 0;
+
+  borrow_ctx_t bctx;
+  borrow_ctx_init(&bctx);
+  borrow_enable_nll(&bctx);
+  borrow_enable_polychrome(&bctx);
+
+  int err = borrow_check_module_ipa(&bctx, &ctx->module);
+  if (err > 0) {
+    borrow_print_errors(&bctx);
+    snprintf(ctx->last_error, sizeof(ctx->last_error),
+             "borrow check failed (%d error%s)", err, err == 1 ? "" : "s");
+    ctx->error_count += err;
+    return -1;
+  }
+
+  /* Phase C: insert deterministic drops at NLL death points. */
+  for (uint32_t i = 0; i < ctx->module.func_count; i++) {
+    borrow_ctx_t fctx;
+    borrow_ctx_init(&fctx);
+    borrow_enable_nll(&fctx);
+    if (borrow_check_function(&fctx, &ctx->module.functions[i]) == 0)
+      borrow_insert_drops(&fctx, &ctx->module.functions[i]);
+  }
+  return 0;
 }

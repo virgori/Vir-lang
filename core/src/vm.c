@@ -1876,21 +1876,57 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     }
     case Q_ARENA_NEW: {
         int64_t sz = operand_value(vm, &instr->src1);
-        if (sz <= 0) sz = 4096;
+        if (sz <= 0) sz = 64 * 1024;
         int aid = vir_arena_create((size_t)sz);
         set_dest(vm, &instr->dest, (int64_t)aid);
         break;
     }
     case Q_ARENA_ALLOC: {
+        /* Prefer explicit aid; src1 < 0 → current TL / default arena. */
         int64_t aid = operand_value(vm, &instr->src1);
         int64_t sz  = operand_value(vm, &instr->src2);
-        void *p = (sz > 0) ? vir_arena_alloc((int)aid, (size_t)sz) : NULL;
+        void *p = NULL;
+        if (sz > 0) {
+            if (aid < 0) {
+                p = vir_tl_arena_alloc((size_t)sz);
+            } else {
+                p = vir_arena_alloc((int)aid, (size_t)sz);
+            }
+        }
         set_dest(vm, &instr->dest, (int64_t)(intptr_t)p);
         break;
     }
     case Q_ARENA_FREE: {
         int64_t aid = operand_value(vm, &instr->src1);
         vir_arena_destroy((int)aid);
+        set_dest(vm, &instr->dest, 0);
+        break;
+    }
+    case Q_ARENA_ENTER: {
+        int64_t aid = operand_value(vm, &instr->src1);
+        vir_tl_arena_push((int)aid);
+        set_dest(vm, &instr->dest, 0);
+        break;
+    }
+    case Q_ARENA_LEAVE: {
+        vir_tl_arena_pop();
+        set_dest(vm, &instr->dest, 0);
+        break;
+    }
+    case Q_ARENA_SAVE: {
+        /* src1=NONE → thread-local current arena (auto when/loop watermark). */
+        int aid = (instr->src1.type == OPERAND_NONE)
+                      ? vir_tl_arena_get()
+                      : (int)operand_value(vm, &instr->src1);
+        set_dest(vm, &instr->dest, (int64_t)vir_arena_save(aid));
+        break;
+    }
+    case Q_ARENA_RESTORE: {
+        int aid = (instr->src1.type == OPERAND_NONE)
+                      ? vir_tl_arena_get()
+                      : (int)operand_value(vm, &instr->src1);
+        int64_t wm = operand_value(vm, &instr->src2);
+        vir_arena_restore(aid, (size_t)wm);
         set_dest(vm, &instr->dest, 0);
         break;
     }

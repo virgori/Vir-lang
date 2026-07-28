@@ -93,10 +93,14 @@ typedef enum {
     Q_ARR_CAP       = 0x95,   /* dest = array_cap(src1)        */
     Q_ARR_COMPACT   = 0x96,   /* dest = new_array(filter nonzero of src1) */
 
-    /* §4.7 Arena allocator API */
+    /* §4.7 Arena allocator API + §4.6 sub-arena enter/leave */
     Q_ARENA_NEW     = 0x85,   /* dest = vir_arena_create(src1=size)        */
     Q_ARENA_ALLOC   = 0x86,   /* dest = vir_arena_alloc(src1=aid, src2=sz) */
     Q_ARENA_FREE    = 0x87,   /* vir_arena_destroy(src1=aid), dest = 0     */
+    Q_ARENA_ENTER   = 0x88,   /* vir_tl_arena_push(src1=aid); dest = 0     */
+    Q_ARENA_LEAVE   = 0x89,   /* vir_tl_arena_pop(); dest = 0              */
+    Q_ARENA_SAVE    = 0x8A,   /* dest = vir_arena_save(src1=aid|NONE→TL)   */
+    Q_ARENA_RESTORE = 0x8B,   /* restore(src1=aid|NONE→TL, src2=wm)        */
 
     /* §20 Dict operations.
      * Variants _I / _S indicate int-key vs string-key at compile time

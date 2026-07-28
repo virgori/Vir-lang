@@ -144,10 +144,22 @@ static int match_list_sep(vir_parser_t *p, int allow_comma) {
 static int is_var_group_cont(vir_parser_t *p) {
   if (!check(p, TOK_IDENT))
     return 0;
+  const char *nm = peek(p)->str.buf;
   uint32_t peek_pos = p->pos + 1;
   if (peek_pos >= p->token_count)
     return 0;
   vir_tok_t t2 = p->tokens[peek_pos].type;
+  /* Soft block keywords: `arena:`, `infer:`, … must not continue a var group. */
+  if (t2 == TOK_COLON && nm &&
+      (strcmp(nm, "arena") == 0 || strcmp(nm, "infer") == 0 ||
+       strcmp(nm, "train") == 0 || strcmp(nm, "isolate") == 0))
+    return 0;
+  /* `arena NAME:` — IDENT IDENT COLON */
+  if (t2 == TOK_IDENT && nm && strcmp(nm, "arena") == 0) {
+    uint32_t peek_pos3 = p->pos + 2;
+    if (peek_pos3 < p->token_count && p->tokens[peek_pos3].type == TOK_COLON)
+      return 0;
+  }
   return t2 == TOK_ASSIGN || t2 == TOK_COLON || t2 == TOK_SEMICOLON ||
          t2 == TOK_NEWLINE || t2 == TOK_END || t2 == TOK_EOF;
 }
@@ -2936,24 +2948,74 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
           ast_add_child(n, e);
         return n;
       }
-      /* §4.5 `arena NAME: body end` — scoped arena block.
-       * Desugar to: NAME = arena_new(4096); body; arena_free(NAME). */
-      if (strcmp(t->str.buf, "arena") == 0 && t2->type == TOK_IDENT) {
-        const vir_token_t *t3 =
-            (p->pos + 2 < p->token_count) ? &p->tokens[p->pos + 2] : NULL;
-        if (t3 && t3->type == TOK_COLON) {
-          advance(p);                         /* arena */
-          const vir_token_t *nm = advance(p); /* NAME */
-          advance(p);                         /* : */
+      /* §4.6 Sub-arena:
+       *   arena: body end
+       *   arena(capacity: N): body end
+       *   arena NAME: body end
+       * Lowering: create → push current → body → pop → destroy. */
+      if (strcmp(t->str.buf, "arena") == 0) {
+        /* arena: … end  (anonymous sub-arena, default 64KB) */
+        if (t2->type == TOK_COLON) {
+          advance(p); /* arena */
+          advance(p); /* : */
           ast_node_t *n = ast_new(AST_ARENA_BLOCK);
           n->line = t->line;
-          strncpy(n->name, nm->str.buf, AST_NAME_LEN - 1);
+          n->name[0] = '\0';
+          n->int_val = 64 * 1024;
           ast_node_t *body = parse_block(p);
           if (body)
             ast_add_child(n, body);
           expect(p, TOK_END, "expected 'end' to close arena block");
           match(p, TOK_DOT);
           return n;
+        }
+        /* arena(capacity: N): … end */
+        if (t2->type == TOK_LPAREN) {
+          const vir_token_t *t3 =
+              (p->pos + 2 < p->token_count) ? &p->tokens[p->pos + 2] : NULL;
+          if (t3 && t3->type == TOK_IDENT &&
+              strcmp(t3->str.buf, "capacity") == 0) {
+            advance(p); /* arena */
+            advance(p); /* ( */
+            advance(p); /* capacity */
+            expect(p, TOK_COLON, "expected ':' after capacity");
+            const vir_token_t *nv = advance(p);
+            int64_t cap = 64 * 1024;
+            if (nv && nv->type == TOK_INT)
+              cap = nv->int_val;
+            expect(p, TOK_RPAREN, "expected ')' after arena capacity");
+            expect(p, TOK_COLON, "expected ':' after arena(...)");
+            ast_node_t *n = ast_new(AST_ARENA_BLOCK);
+            n->line = t->line;
+            n->name[0] = '\0';
+            n->int_val = cap > 0 ? cap : 64 * 1024;
+            ast_node_t *body = parse_block(p);
+            if (body)
+              ast_add_child(n, body);
+            expect(p, TOK_END, "expected 'end' to close arena block");
+            match(p, TOK_DOT);
+            return n;
+          }
+        }
+        /* arena NAME: … end */
+        if (t2->type == TOK_IDENT) {
+          const vir_token_t *t3 =
+              (p->pos + 2 < p->token_count) ? &p->tokens[p->pos + 2] : NULL;
+          if (t3 && t3->type == TOK_COLON) {
+            advance(p);                         /* arena */
+            const vir_token_t *nm = advance(p); /* NAME */
+            advance(p);                         /* : */
+            ast_node_t *n = ast_new(AST_ARENA_BLOCK);
+            n->line = t->line;
+            strncpy(n->name, nm->str.buf, AST_NAME_LEN - 1);
+            n->int_val = 64 * 1024;
+            ast_node_t *body = parse_block(p);
+            if (body)
+              ast_add_child(n, body);
+            expect(p, TOK_END, "expected 'end' to close arena block");
+            match(p, TOK_DOT);
+            return n;
+          }
         }
       }
       /* §26.3 `infer: body end` / §26.4 `train: body end`

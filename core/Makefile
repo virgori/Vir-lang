@@ -106,6 +106,7 @@ C_SRCS := src/q_ir.c \
           src/lir_verify.c \
           src/lir_to_qir.c \
           src/compiler_pipeline.c \
+          src/borrow_check.c \
           src/mach_isel.c \
           src/mach_ir.c \
           src/mach_encode.c \
@@ -204,6 +205,9 @@ $(LIB_DIR):
 TEST_SRC := tests/test_native.c
 TEST_BIN := $(BUILD_DIR)/test_native
 
+BORROW_TEST_SRC := tests/test_borrow.c
+BORROW_TEST_BIN := $(BUILD_DIR)/test_borrow
+
 # Volatile I/O segfault bug condition exploration test
 VOLATILE_IO_TEST_SRC := tests/test_volatile_io_segfault.c
 VOLATILE_IO_TEST_BIN := $(BUILD_DIR)/test_volatile_io_segfault
@@ -223,6 +227,13 @@ REACTIVE_VAR_PRES_TEST_BIN := $(BUILD_DIR)/test_reactive_var_preservation
 test: $(STATIC_PATH) $(TEST_BIN)
 	@echo "═══ Running native tests ═══"
 	./$(TEST_BIN)
+
+test-borrow: $(BORROW_TEST_BIN)
+	@echo "═══ Running borrow checker tests ═══"
+	./$(BORROW_TEST_BIN)
+
+$(BORROW_TEST_BIN): $(BORROW_TEST_SRC) $(STATIC_PATH) | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $< $(STATIC_PATH) $(EXTRA_LDFLAGS)
 
 test-volatile-io: $(STATIC_PATH) $(VOLATILE_IO_TEST_BIN)
 	@echo "═══ Running volatile I/O segfault exploration test ═══"

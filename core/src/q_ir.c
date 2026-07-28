@@ -334,9 +334,13 @@ const char* q_opcode_name(q_opcode_t op)
         case Q_ARR_PUSH:     return "Q_ARR_PUSH";
         case Q_ARR_CAP:      return "Q_ARR_CAP";
         case Q_ARR_COMPACT:  return "Q_ARR_COMPACT";
-        case Q_ARENA_NEW:    return "Q_ARENA_NEW";
-        case Q_ARENA_ALLOC:  return "Q_ARENA_ALLOC";
-        case Q_ARENA_FREE:   return "Q_ARENA_FREE";
+        case Q_ARENA_NEW:     return "Q_ARENA_NEW";
+        case Q_ARENA_ALLOC:   return "Q_ARENA_ALLOC";
+        case Q_ARENA_FREE:    return "Q_ARENA_FREE";
+        case Q_ARENA_ENTER:   return "Q_ARENA_ENTER";
+        case Q_ARENA_LEAVE:   return "Q_ARENA_LEAVE";
+        case Q_ARENA_SAVE:    return "Q_ARENA_SAVE";
+        case Q_ARENA_RESTORE: return "Q_ARENA_RESTORE";
         case Q_DICT_NEW:     return "Q_DICT_NEW";
         case Q_DICT_SET_I:   return "Q_DICT_SET_I";
         case Q_DICT_SET_S:   return "Q_DICT_SET_S";
