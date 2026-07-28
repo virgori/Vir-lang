@@ -7,7 +7,7 @@
 
 ## Table of Contents
 
-1. [Overview](#1-overview) — includes [§1.0 Separator](#10-separator----or-newline), [§1.1 Language / Compiler / Library Separation](#11-language--compiler--library-separation)
+1. [Overview](#1-overview) — includes [§1.0 Separator](#10-separator----or-newline), [§1.1 Block openers](#11-block-openers--do--loop--), [§1.2 Language / Compiler / Library Separation](#12-language--compiler--library-separation)
 2. [Comments](#2-comments)
 3. [Module System](#3-module-system)
 4. [Types](#4-types)
@@ -31,11 +31,13 @@
 22. [Async / Task](#22-async--task)
 23. [Port — Inter-worker Signal Coordination](#23-port--inter-worker-signal-coordination)
 24. [GPU, SIMD & Atomic Primitives](#24-gpu-simd--atomic-primitives)
-25. [System Intrinsics](#25-system-intrinsics)
-26. [Multilingual Support](#26-multilingual-support)
-27. [Keyword Reference](#27-keyword-reference)
-28. [Operator Precedence Table](#28-operator-precedence-table)
-29. [Changes from v1.2](#29-changes-from-v12)
+25. [UI / Reactive](#25-ui--reactive)
+26. [AI / Machine Learning](#26-ai--machine-learning)
+27. [System Intrinsics](#27-system-intrinsics)
+28. [Multilingual Support](#28-multilingual-support)
+29. [Keyword Reference](#29-keyword-reference)
+30. [Operator Precedence Table](#30-operator-precedence-table)
+31. [Changes from v1.2](#31-changes-from-v12)
 
 ---
 
@@ -48,9 +50,10 @@ Vir is a compiled, structured, block-scoped systems programming language. It com
   - **Definitions / declarations** (`func`, `async func`, `entity`, `method`, `enum`, `register`, `mold`, `@bind` stubs, …) → close with **`end.`**
   - **Control-flow / statement blocks** (`if` / `eif` / `else`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, `isolate`, …) → close with **`end`**
 - **Separator — one concept** (see §1.0): every list (statements, declaration groups, named-args, `case` arms, …) is separated by **`;` or newline (`NEWLINE`)**. Multiple items on the **same line** require `;`
-- Definition blocks open with `:`. `if` / `eif` / `for` open with `do`; `when` opens its body with `loop`; many other blocks (`try`, `arena`, `map`, …) open with `:`
+- **Block openers — two principles** (see §1.1): (1) only an independent block gets an opener; continuations (`else`, `ensure`, `revert`, …) take no `:` — (2) expression before the body → `do`/`loop`; otherwise → `:`
 - Colon `:` is also used for type annotation and key-value mapping (dict, case, map)
-- `out` replaces `return`, `eif` replaces `elif`, `skip` replaces `continue`
+- `out` has **one** meaning: send a result outward (replaces `return`); destinations differ by context — see §6.1
+- `eif` replaces `elif`, `skip` replaces `continue`
 - `when ... loop` replaces `while`
 
 ```vir
@@ -113,7 +116,125 @@ The same rule applies to `var` / `in` / `ref` / `out` groups, named args, and `c
 
 > **Note:** `,` remains for other flat lists (positional `f(a, b)`, list/mold elements, etc.) — that is not the block/group separator above.
 
-### 1.1 Language / Compiler / Library Separation
+### 1.1 Block openers — `do` / `loop` / `:`
+
+Canonical: `docs/vir_language_spec_v2.0_vi.md` §1.1.
+
+#### Principle 1 — independent block vs continuation
+
+**Only a construct that opens its own independent block and closes with `end` / `end.` needs a block opener (`:` or `do` / `loop`). Continuation clauses do not open a new block — they do not use `:`.**
+
+**Independent blocks** (paired with `end` / `end.`):
+
+```vir
+try:
+    ...
+end
+
+isolate:
+    ...
+end
+
+func foo:
+    ...
+end.
+```
+
+```vir
+if cond do
+    ...
+end
+
+when cond loop
+    ...
+end
+
+map x in xs:
+    out x
+end
+```
+
+These create a new statement/block and finish with `end` (or `end.` for definitions).
+
+**Continuations — no new independent block:**
+
+```vir
+if cond do
+    ...
+else
+    ...
+end
+```
+
+`else` / `eif` have no private `end` and are not standalone statements — they only switch branches inside the same `if`.
+
+```vir
+try:
+    ...
+ensure
+    ...
+revert
+    ...
+end.
+```
+
+(Function-level `ensure` / `revert` close with the function’s `end.`; local `ensure` / `revert` inside `try` close with that `try`’s `end`.)
+
+`ensure` and `revert` do not exist outside the enclosing `try` / function — they are clauses, not independent block openers.
+
+```text
+IfStatement
+├── if-clause
+├── eif-clause* (optional)
+├── else-clause (optional)
+└── end
+
+TryStatement  /  MapStatement  /  FuncDef
+└── independent, self-closed with end / end.
+```
+
+Readers can predict future keywords: **independent block → needs an opener; continuation → no `:`.** No exception list to memorize.
+
+#### Principle 2 — choose `do` / `loop` or `:`
+
+Among constructs that **do** open an independent block, pick the opener from whether an expression precedes the body:
+
+| Situation | Opener | Why |
+|-----------|--------|-----|
+| **Complex expression before the body** | Dedicated keyword: `do`, `loop` | Clear end of expression; any number of `:` inside the expression cannot be confused with the opener |
+| **No expression before the body** | `:` | Short; `:` does not compete with an expression |
+
+**Expression first — use `do` / `loop`:**
+
+```vir
+if expr do
+    ...
+end
+
+when expr loop
+    ...
+end
+
+for i in 0..10 do
+    ...
+end
+```
+
+If the grammar were `if expr:` / `when expr:`, the parser would have to decide which `:` belongs to the expression (type annotation, pattern, label, …) and which opens the block. Tokens `do` / `loop` separate the expression boundary from the body.
+
+**No leading expression — use `:`:**
+
+```text
+try ":" block
+isolate ":" block
+arena ":" block
+map … ":" block
+func name ":" … end.
+```
+
+The two principles complement each other: (1) only independent blocks get an opener; (2) that opener is `do`/`loop` or `:` depending on whether an `<expr>` precedes the body — not arbitrary.
+
+### 1.2 Language / Compiler / Library Separation
 
 Vir **does not** bind the language to a single execution runtime (unlike Go, Erlang, and similar). Concurrency and allocator strategies must be replaceable **without changing the language**, and unused machinery must **not** appear in the binary.
 
@@ -383,8 +504,11 @@ end.
 "Hello $name"     # interpolated string
 true / false      # boolean
 none              # null
-[1, 2, 3]         # array literal
+[1, 2, 3]         # array (list)
+["a": 1, "b": 2]  # dict (has : → dict)
 ```
+
+**List vs Dict rule:** Both use `[]`. If an element has `:`, it is a Dict; otherwise it is a List.
 
 ### 4.4 Type Annotations
 
@@ -413,7 +537,7 @@ Vir uses three memory regions with no garbage collector:
 - No per-object deallocation — the entire arena is freed at once
 - Each `main` function (or large scope) creates a default arena
 - No GC, no reference counting
-- **ArenaPool / backing allocation strategy (mmap, malloc, …)** belong to libraries — the compiler only sees Arena (§1.1)
+- **ArenaPool / backing allocation strategy (mmap, malloc, …)** belong to libraries — the compiler only sees Arena (§1.2)
 
 **String:**
 - Immutable — all concatenation/interpolation creates a new string
@@ -421,8 +545,10 @@ Vir uses three memory regions with no garbage collector:
 - String literals → Static region (zero-cost, no runtime allocation)
 - Interpolated / concatenated strings → allocated in Arena
 
-**No ownership/borrow:**
-Vir does not have Rust-style ownership or borrow checking. Instead, it relies on **arena-scoped lifetime** — all objects live until the arena that owns them is freed. This eliminates use-after-free and double-free without runtime overhead.
+**Arena + borrow (complementary, not alternatives):**
+- **Runtime:** arena-scoped lifetime — bump allocate, reclaim by scope / `arena:` / reset; no GC, no RC (§4.6–4.7; architecture: `MUST_READ_CONTEXT/PLAN/07_Arena_Borrow_Checker.md`)
+- **Compile-time:** borrow checker (§4.8) tracks ownership, `&` / `&mut`, moves, and inserts drops — memory safety **without** runtime RC
+- For FFI or bare-metal manual management: `ptr` + `malloc`/`free` via `@bind(c)`
 
 ### 4.6 Sub-arena Block — `arena:`
 
@@ -633,12 +759,12 @@ Same rule as parameter groups (see [§14](#14-parameter-blocks--in--ref--out)).
 ### 5.2 Constants
 
 ```vir
-const PI: 3.14159;
-const MAX_SIZE: 1024;
-const BANNER: "Hello Vir";
+const PI = 3.14159
+const MAX_SIZE = 1024
+const BANNER = "Hello Vir"
 ```
 
-Constants are evaluated at compile time and cannot be reassigned.
+Constants use `=` for the value (same as variables). They are evaluated at compile time and cannot be reassigned.
 
 ### 5.3 Module-level State
 
@@ -679,10 +805,19 @@ end.
 ```
 
 - `func <name>(<params>):` — defines a function
-- `out <expr>` — returns a value (replaces `return`)
+- `out` — **one meaning: send a result outward.** Only the **destination** changes, not the keyword’s sense:
+  - `out <expr>` in a function body → return value (replaces `return`)
+  - `out` parameter group (§14) → write results into caller-facing output slots
+  - `out <expr>` inside `map` (§20) → put an element into the result array
 - `end.` — closes the function body (definition block)
 
+This is **keyword reuse with a unified semantic**, not three unrelated meanings of `out`.
+
 ### 6.2 Typed Parameters — exactly two forms
+
+Both **paren `()`** and **`in` / `ref` / `out` group blocks** are valid — developers choose. The language does **not** require one form.
+
+**Vir source convention** (`virc_*.vri`, aligned stdlib): keep it readable — prefer `()` for **1–2 parameters**; use an `in` block for **≥ 3 parameters**. Style only; the other form is not a compile error.
 
 **Wrong** — do not put the group keyword `in` inside `()` (`in` is the default; nobody writes `in` in parentheses):
 
@@ -744,8 +879,14 @@ end.
 
 ### 6.3 Multi-parameter
 
+Three or more parameters — Vir’s own sources use an `in` block (user code may still write `func clamp(value, lo, hi):`):
+
 ```vir
-func clamp(value, lo, hi):
+func clamp:
+    in
+        value
+        lo
+        hi
     if value < lo do
         out lo
     end
@@ -760,19 +901,38 @@ end.
 
 Unified separator (§1.0): `;` or newline between named args. Same line → `;` required.
 
+**Style:** a few short args → **one line** with `;`. Break lines only for long lists / per-arg comments — then put `;` after each arg (except the last); bare newlines are legal but harder to read.
+
 ```vir
-sum(a=5; b=10)
+sum(a = 5; b = 10)
 
+# long / annotated
 sum(
-    a = 5
-    b = 10
-)
-
-sum(
-    a = 5;
-    b = 10
+    timeout = 30;
+    retry = true;
+    path = "/tmp/out"
 )
 ```
+
+**Do not confuse with entity field initializers.** These are two different grammars — by design:
+
+| | Entity / literal | Function call (named-arg) |
+|--|------------------|---------------------------|
+| Meaning | Initialize a **field** | Bind **argument → parameter** |
+| Syntax | `IDENT : expr` | `IDENT = expr` |
+| List | field list → `,` | argument list → separator §1.0 (`;` \| `NEWLINE`) |
+| Example | `User(name: "A", age: 30)` | `f(a = 1; b = 2)` |
+
+```text
+field_initializer := IDENT ":" expr     # name → field value association
+named_argument    := IDENT "=" expr     # pass value to a parameter
+```
+
+`:` is association (same family as `x: Int`, `name: "Alice"`).  
+`=` is assigning/passing a value to a parameter (`timeout = 10`).  
+Treating both as one “named assignment” merges two distinct concepts and wrongly concludes inconsistency.
+
+Canonical: `docs/vir_language_spec_v2.0_vi.md` §6.4.
 
 ### 6.5 Forward Declaration
 
@@ -835,6 +995,8 @@ var u = User(name: "Alice", age: 30)
 print u.name          # field access
 u.age = 31            # field assignment
 ```
+
+This is a **field initializer** (`name: expr`), not a named argument. See the distinction from `f(a = 1)` in §6.4.
 
 **Internal layout:** Arena-allocated, fields addressed by slot index.
 
@@ -966,6 +1128,8 @@ for i in 0..10 do
 end
 ```
 
+Here `in` is part of the `for` syntax (“iterate in”), **not** the parameter-group section keyword. Distinction from §14 `in`: see the note at the start of §14.
+
 ### 9.4 Loop (infinite)
 
 ```vir
@@ -983,6 +1147,18 @@ loop 5:
     print 7         # prints 7 five times
 end
 ```
+
+**`loop` — one meaning, related loop productions (not an overload):**
+
+In every form, `loop` means: **what follows is repeated.** Differences are in **condition / count**, not in the keyword’s sense.
+
+| Form | Meaning |
+|------|---------|
+| `loop … end` | Unconditional loop (until `break`) — like `for (;;)` / Rust `loop` |
+| `when cond loop … end` | Loop while the condition holds — `when` supplies the condition; `loop` opens the body |
+| `loop N: … end` | Repeat exactly N times |
+
+Not treated as a confusing multi-meaning keyword — the same word in related loop grammar rules. Canonical: VI §9.2–9.5.
 
 ### 9.6 Break / Skip
 
@@ -1055,8 +1231,12 @@ skip         # skip to next iteration (replaces 'continue')
 
 ```vir
 x = 10               # simple assignment
-x = x + 1            # compound (no += syntax — explicit is better)
+x = x + 1            # assignment from expression
+x += 1               # compound assignment (same as x = x + 1)
+x -= 1
 ```
+
+Compound forms (`+=`, `-=`, …) are valid. Especially used in atomic RMW: `lock x += 1`, `x!! += 1` (§24.4).
 
 ---
 
@@ -1239,7 +1419,7 @@ var list = [10, 20, 30]
 print("Bad:  $list[0]")          # → prints list value + literal "[0]"
 print("Good: $(list[0])")        # → prints "10"
 
-var m = dict[string, int] "a": 1 end
+var m = ["a": 1]
 print("Bad:  $m[a]")             # → prints m value + literal "[a]"
 print("Good: $(m[\"a\"])")       # → prints "1"
 ```
@@ -1481,7 +1661,18 @@ The compiler emits a **warning** if `resume retry` is used and the `revert` bloc
 
 **`isolate` — automatic snapshot & restore:**
 
-`isolate` is a `try` parameter that declares a list of external variables the compiler automatically **snapshots onto the stack** on `try` entry and **restores** before each `resume retry`. This eliminates the need to manually reset dirty state in `revert`.
+**Isolation** = create an **execution context independent** of the current context.
+
+Both `isolate` forms share that root; they differ in the **attached policy**:
+
+| Form | Syntax | Execution context + |
+|------|--------|---------------------|
+| Block `isolate` | `isolate: … end` | **sandbox policy** (VI §25.5; security sandbox) |
+| `try(isolate:)` | `try(isolate: […]):` | **snapshot / retry policy** (this section) |
+
+`try(isolate:)` declares external variables the compiler automatically **snapshots onto the stack** on `try` entry and **restores** before each `resume retry`. This eliminates manually resetting dirty state in `revert`.
+
+Canonical: `docs/vir_language_spec_v2.0_vi.md` §13.7 / §25.5.
 
 ```vir
 try(isolate: [retry_limit, partial_result]):
@@ -1636,7 +1827,7 @@ The `erx` keyword reads the current error code (the value passed to `throw`). Av
 
 ## 14. Parameter Blocks — in / ref / out
 
-Vir has **exactly two** parameter declaration forms.
+Vir has **exactly two** parameter declaration forms — free choice, neither required.
 
 Canonical rules follow the Vietnamese spec (`docs/vir_language_spec_v2.0_vi.md` §6.2, §14).
 
@@ -1645,7 +1836,23 @@ Canonical rules follow the Vietnamese spec (`docs/vir_language_spec_v2.0_vi.md` 
 | **1. Parentheses** | `func name(…):` | **`ref name` allowed**; do **not** write `in` (pass-by-value is default). `out` uses group-block form. |
 | **2. Group blocks** | `func name:` | `in` / `ref` / `out` before the body |
 
+**Vir source style:** ≥ 3 parameters → form 2 (`in`); 1–2 → form 1 is usually finer. See §6.2.
+
 Default is pass-by-value. `ref` is by-reference (allowed in both `()` and group blocks).
+
+**`in` is not a confusing overload:** the same token appears in **two different productions**; parser and readers disambiguate from the preceding context:
+
+| Role | Example | Kind |
+|------|---------|------|
+| **Section keyword** | `func add:` then `in` / `a: Int` | Opens the input-parameter group |
+| **Part of `for`** | `for x in range do` | “iterate in” a collection/range (§9.3) |
+
+```text
+func … → in …     # section
+for  … → in …     # for grammar
+```
+
+No production forces the parser to guess between the two. Like many languages reusing keywords across productions (Python `import` / `in`, SQL `IN`, …). **Not treated as a syntax inconsistency.**
 
 ### 14.1 Form 1 — parentheses `()`
 
@@ -2129,21 +2336,26 @@ Dict is a key-value data structure (hash table).
 #### 20.1.1 Declaration
 
 ```vir
-var ages = dict[string, int]
-    "Alice": 30;
-    "Bob": 25
-end
+var ages = ["Alice": 30, "Bob": 25]
 ```
 
-- `dict[K, V]` — `K` is the key type, `V` is the value type
-- If `[K, V]` is omitted, the compiler infers types from the first element
+Explicit type annotation:
+
+```vir
+var ages: dict[string, int] = ["Alice": 30, "Bob": 25]
+```
+
+- `[key: value, ...]` — dict literal; the compiler infers types from the first element
+- `dict[K, V]` type annotation is optional
 - Built-in key types: `int`, `string`, `bool`, `ptr`
 - Entity keys require a `hash` method (see §20.1.4)
+
+Canonical: `docs/vir_language_spec_v2.0_vi.md` §20.1.
 
 #### 20.1.2 Operations
 
 ```vir
-var m = dict[string, int] end      # empty dict
+var m: dict[string, int] = []      # empty dict (type annotation required for empty dict)
 
 m["Alice"] = 30                    # set
 print m["Alice"]                   # get → 30
@@ -2156,15 +2368,15 @@ print len(m)                       # element count
 #### 20.1.3 Iteration
 
 ```vir
-for k, v in ages:
+for k, v in ages do
     print("$k: $v")
 end
 
-for k in keys(ages):
+for k in keys(ages) do
     print k
 end
 
-for v in values(ages):
+for v in values(ages) do
     print v
 end
 ```
@@ -2187,14 +2399,12 @@ entity Point:
     x: int
     y: int
 
-    method hash -> int:
+    method hash -> int
         out this.x * 31 + this.y
     end.
 end.
 
-var grid = dict[Point, string]
-    Point(x: 0, y: 0): "origin"
-end
+var grid: dict[Point, string] = [Point(x: 0, y: 0): "origin"]
 ```
 
 #### 20.1.5 Internals
@@ -2230,7 +2440,8 @@ end
 
 - `<var>` — loop variable bound to each element
 - `<iterable>` — any iterable (array, range, keys/values of a dict)
-- `out <expression>` — the transformed value for the output array
+- `out <expression>` — emit an element into the result array (same `out` as §6.1: result outward; destination = map sequence)
+
 - Result type is `array` whose element type is inferred from `<expression>`
 
 **With index:**
@@ -2296,15 +2507,15 @@ end
 **Rules:**
 - `case <expr>` then arms `pattern: …`
 - Between arms: `;` or `NEWLINE` (§1.0)
-- Default arm: `else: …`
+- Default arm: `else …` — `else` is a **continuation** (§1.1), **no** colon (same as `else` in `if`)
 - Close with `end`
-- A new arm starts when the next item is `pattern:` / `else:` — multiple statements in the same arm also use the same separator until the next arm
+- A new arm starts when the next item is `pattern:` / `else` — multiple statements in the same arm also use the same separator until the next arm
 
 ```vir
 case color
     "red": log("stop", 1); out 1
     "green": log("go", 2); out 2
-    else: log("unknown", 0); out 0
+    else log("unknown", 0); out 0
 end
 ```
 
@@ -2353,7 +2564,7 @@ var r1 = wait t1
 var r2 = wait t2
 ```
 
-Tasks run concurrently — not in parallel unless the program `include`s a thread-pool / work-stealing library (see §1.1).
+Tasks run concurrently — not in parallel unless the program `include`s a thread-pool / work-stealing library (see §1.2).
 
 ### 22.5 Scheduler Model
 
@@ -2363,7 +2574,7 @@ Tasks run concurrently — not in parallel unless the program `include`s a threa
 | Context switch | At each `await` or `await pass` |
 | Event loop | Provided by a **library** when included — not baked into every binary |
 | Thread pool / work-steal | Optional via `include` (POSIX, win32, spin, none, …) |
-| Overhead when unused | **None** — a minimal binary contains no scheduler (§1.1) |
+| Overhead when unused | **None** — a minimal binary contains no scheduler (§1.2) |
 
 The compiler lowers `async` / `await` / `task` to a state machine and suspension points. The **compiler does not know** that a Scheduler, Worker, or ArenaPool exists — how those points are driven is a library choice (single-thread polling, thread pool, work-stealing, or serial on embedded). See [`VIR_EXECUTION_MODEL.md`](VIR_EXECUTION_MODEL.md) §7.
 
@@ -2759,7 +2970,213 @@ end.
 
 ---
 
-## 24. System Intrinsics
+## 25. UI / Reactive
+
+Vir provides language-level primitives for reactive UI and resource packaging — with no external UI framework runtime.
+
+Canonical: `docs/vir_language_spec_v2.0_vi.md` §25.
+
+### 25.1 State variables — `reactive`
+
+```vir
+reactive var count: i32 = 0
+reactive var username: string = ""
+```
+
+`reactive` declares a state variable. When its value changes, the compiler automatically emits updates for every dependent view/component — no manual refresh, no observable wrapper.
+
+**Rules:**
+- `reactive` is valid only at module scope or inside an `entity`
+- Ordinary assignment (`count = count + 1`) triggers propagation
+- Reading a `reactive` from an `infer` / `train` block does not trigger propagation
+
+### 25.2 Struct-to-UI mapping — `morph`
+
+```vir
+entity UserCard:
+    name: string
+    score: i32
+end.
+
+morph UserCard -> Panel:
+    Label(text: name)
+    ProgressBar(value: score, max: 100)
+end
+```
+
+`morph` declares a static mapping from an entity/struct to UI components. The compiler generates bindings at compile time — no runtime reflection, no hidden heap allocation. When an entity field changes, only the corresponding component re-renders.
+
+**Semantics:**
+
+| Property | Description |
+|----------|-------------|
+| Timing | Compile-time binding generation |
+| Updates | Granular — only components affected by the changed field |
+| DOM/layout | Platform backend (native widget, WebAssembly DOM, GPU canvas) |
+
+### 25.3 Embed resources — `bundle`
+
+```vir
+bundle icon_png:   u8[]   = embed "assets/icon.png"
+bundle shader_src: string = embed "shaders/main.vert"
+bundle config:     u8[]   = embed "config/default.toml"
+```
+
+`bundle` embeds a resource file into the binary at compile time. The result is a constant slice (`u8[]` or `string`) — zero-overhead access, no runtime I/O, no filesystem required.
+
+**Rules:**
+- Paths are relative to the declaring `.vri` file
+- Type `u8[]` for binary data; `string` for UTF-8 text
+- File size is checked at compile time
+
+### 25.4 Export API — `expose`
+
+```vir
+expose func get_user(id: u64) -> UserInfo:
+    out db.lookup(id)
+end.
+
+expose func update_score(id: u64, delta: i32):
+    db.users[id].score += delta
+end.
+```
+
+`expose` annotates a function so the compiler generates ABI endpoint glue. The endpoint target is selected by build flag: REST (HTTP handler), gRPC (stub), IPC (message handler), or WASM export.
+
+**Type constraints:**
+- Parameters and return types must be serializable: entity, sized integers, `string`, `bool`
+- Not allowed: `ptr`, `&mut`, raw `deck`, `flux` (non-serializable)
+- `expose async func` generates an async endpoint (streaming / SSE)
+
+### 25.5 Security sandbox — `isolate` (block)
+
+**Isolation** = create an **execution context independent** of the current context.
+
+Both `isolate` forms share that root; they differ in the **attached policy**:
+
+| Form | Syntax | Execution context + |
+|------|--------|---------------------|
+| Block `isolate` | `isolate: … end` | **sandbox policy** (this section) |
+| `try(isolate:)` | `try(isolate: […]):` | **snapshot / retry policy** (§13.7) |
+
+```vir
+isolate:
+    var result = untrusted_plugin.run(input)
+    out result
+end
+```
+
+A block `isolate` runs code in a sandbox with a restricted capability set: no access to memory outside the block except passed parameters, no direct I/O, no calls unless `expose`d into the sandbox.
+
+Not two unrelated meanings of `isolate` — one Isolation concept, two productions / two policies.
+
+---
+
+## 26. AI / Machine Learning
+
+Vir integrates language-level AI/ML primitives: aligned tensors, native matmul, autodiff, and quantization — with no external ML library dependency.
+
+Canonical: `docs/vir_language_spec_v2.0_vi.md` §26.
+
+### 26.1 Tensor type — `tensor<T>[S...]`
+
+```vir
+var weights: tensor<f32>[784, 128]
+var input:   tensor<f32>[1, 784]
+var output:  tensor<f32>[1, 128]
+```
+
+`tensor<T>[S...]` declares an N-dimensional array with NPU/GPU-friendly alignment. Memory is aligned automatically; layout is row-major. The compiler emits aligned SIMD loads/stores.
+
+**Element types T:** `f32`, `f16`, `i8`, `u8` (quantized), `i32` (accumulator)  
+**Rank:** any D ≥ 1; sizes checked at compile time
+
+| Property | Description |
+|----------|-------------|
+| Memory | Heap-allocated, 64-byte aligned (cache line) |
+| Semantics | Move (tensor handle); elements are Copy |
+| Lifetime | Ownership-managed — no GC |
+| Access | `weights[i, j]` (multi-index) |
+
+### 26.2 Matrix multiply — `**` and `><`
+
+```vir
+var output = weights ** input          # standard matmul: [M,K] ** [K,N] → [M,N]
+var fused  = a >< b                    # fused multiply-accumulate (FMA)
+```
+
+`**` maps to the platform’s native tensor-core/SIMD ops: **ARM NEON FMMLA**, **x86 AVX-512 DPBF16**, **WASM simd128** dot product.
+
+`><` is **fused multiply-accumulate** — multiply then accumulate in one hardware instruction, avoiding intermediate round-off; used in optimized dot-product loops.
+
+**Matmul type check:**
+
+```
+tensor<T>[M, K]  **  tensor<T>[K, N]  →  tensor<T>[M, N]
+```
+
+Shape mismatch is a **compile-time type error** — no runtime panic.
+
+**Operator precedence:** `**` and `><` at level 22 (above `*`/`/` at 20).
+
+### 26.3 Gradient-free inference — `infer`
+
+```vir
+infer:
+    var pred = model.forward(input)
+    out pred
+end
+```
+
+An `infer` block **disables all gradient tracking**: no autodiff buffers, no activations kept for backward. ~50% less RAM than `train` mode. Use for deployment / production serving.
+
+**Semantics:**
+- All `tensor` / `**` ops inside are optimized for forward-only
+- `.backward()` is not allowed inside or on values produced by `infer`
+- `infer` and `train` must not nest
+
+### 26.4 Training with native autodiff — `train`
+
+```vir
+train:
+    var pred = model.forward(input)
+    var loss = cross_entropy(pred, label)
+    loss.backward()
+    optimizer.step(model)
+end
+```
+
+A `train` block enables **native autodiff**: tensor ops are traced automatically; `.backward()` computes gradients over the full compute graph. No external library required.
+
+**`infer` vs `train`:**
+
+| | `infer` | `train` |
+|---|---|---|
+| Gradient tracking | Off | On |
+| RAM overhead | Lowest | ~2–3× vs infer |
+| Speed | Fastest | Slower due to tracing |
+| `.backward()` | Not allowed | Yes |
+| Purpose | Deployment / serving | Model training |
+
+### 26.5 Precision compression — `quantize`
+
+```vir
+var model_q8 = quantize(model, bits: 8)    # INT8 — 75% RAM reduction
+var model_q4 = quantize(model, bits: 4)    # INT4 — 87.5% RAM (needs native NPU)
+```
+
+`quantize` converts `f32`/`f16` tensors to a compact form for faster inference and lower RAM. The compiler inserts dequantize at the matching `infer` site — transparent to logic code.
+
+| Level | Storage | RAM cut | Notes |
+|-------|---------|---------|-------|
+| `bits: 32` | `f32` | 0% | Full precision |
+| `bits: 16` | `f16` | 50% | Small loss — fine for most models |
+| `bits: 8`  | `i8`  | 75% | Enough for production inference |
+| `bits: 4`  | INT4  | 87.5% | Needs NPU with native INT4 |
+
+---
+
+## 27. System Intrinsics
 
 Vir provides low-level intrinsics for systems programming (available without `@bind(c)`):
 
@@ -2781,7 +3198,7 @@ Vir provides low-level intrinsics for systems programming (available without `@b
 
 ---
 
-## 25. Multilingual Support
+## 28. Multilingual Support
 
 Vir supports programming in multiple natural languages through the SubLib adapter system:
 
@@ -2789,7 +3206,7 @@ Vir supports programming in multiple natural languages through the SubLib adapte
 |----------|------|--------|-------|-------|
 | English | `if` | `func` | `out` | `eif` |
 | Vietnamese | `nếu` | `hàm` | `trả về` | `còn nếu` |
-| Chinese | `如果` | `函数` | `返回` | `否则如果` |
+| Chinese | `若` | `函数` | `歸` | `又若` |
 | Japanese | `もし` | `関数` | `返す` | `それ以外もし` |
 | Korean | `만약` | `함수` | `반환` | `아니면 만약` |
 
@@ -2797,7 +3214,7 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 
 ---
 
-## 26. Keyword Reference
+## 29. Keyword Reference
 
 ### Core
 
@@ -2806,7 +3223,7 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 | `func` | Define a function |
 | `end.` | Close a definition / declaration block (`func`, `entity`, `method`, `enum`, `register`, `mold`, `@bind` stubs, …) — see §1 |
 | `end` | Close a control-flow / statement block (`if`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, …) — see §1 |
-| `out` | Return a value from function |
+| `out` | Send a result outward — return / `out` params / `map` element (one meaning; destinations differ — §6.1) |
 | `var` | Mutable variable declaration |
 | `let` | Immutable variable binding |
 | `const` | Compile-time constant |
@@ -2821,7 +3238,7 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 | `else` | Default branch |
 | `when ... loop` | While loop |
 | `for ... in` | Range-based for loop |
-| `loop` | Infinite or counted loop |
+| `loop` | What follows is repeated — bare / after `when` / `loop N` (§9.2–9.5); one meaning |
 | `break` | Exit loop |
 | `skip` | Continue to next iteration |
 | `case` | Switch/match expression |
@@ -2884,7 +3301,7 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 | `erx` | Read the thrown error code (error register) |
 | `emit` | Structured event/log emission |
 | `timeout` | Parameter for `try` — automatic abort after duration |
-| `isolate` | Parameter for `try` — declare variables for auto-snapshot & restore on retry |
+| `isolate` | Isolation: independent execution context — `try(isolate:)` = snapshot/retry (§13.7); block = sandbox (VI §25.5) |
 | `resume retry` | Inside local `revert` — restart current try block |
 | `resume revert` | Inside local `revert` — propagate to function-level revert |
 
@@ -2892,9 +3309,9 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 
 | Keyword | Purpose |
 |---------|---------|
-| `in` | Input parameter group (read-only, default) |
+| `in` | (1) Input parameter-group section §14 — (2) part of `for … in` §9.3; two productions, non-competing |
 | `ref` | Reference parameter group (read-write, affects caller) |
-| `out` | Output parameter group (callee writes, caller receives) |
+| `out` | Output parameter group — `out` destination is the caller-facing slot (§6.1, §14) |
 | `this` | Implicit self in entity methods; UFCS convention for first param |
 
 ### FFI & System
@@ -2924,6 +3341,27 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 | `send` | Enqueue a message to a port: `send port <- value` (non-blocking) (§23.2) |
 | `recv` | Dequeue from a port: suspends until message arrives or timeout (§23.3) |
 
+### UI / Reactive
+
+| Keyword | Purpose |
+|---------|---------|
+| `reactive` | State variable that auto-updates dependent UI — no manual refresh (§25.1) |
+| `morph` | Compile-time static map from entity/struct to UI components (§25.2) |
+| `bundle` | Embed a resource file into the binary; constant slice — no runtime I/O (§25.3) |
+| `expose` | Annotate a function for compiler-generated API endpoint glue (§25.4) |
+| `isolate` (block) | Isolation + sandbox policy — same root as `try(isolate:)` (§13.7, §25.5) |
+
+### AI / Machine Learning
+
+| Keyword / operator | Purpose |
+|---------|---------|
+| `tensor<T>[S...]` | N-D NPU/GPU-aligned array — row-major, 64-byte aligned (§26.1) |
+| `**` | Matmul — maps to SIMD/tensor-core (§26.2) |
+| `><` | Fused multiply-accumulate (FMA) (§26.2) |
+| `infer` | Gradient-free inference block — autodiff off, lower RAM (§26.3) |
+| `train` | Training block with native autodiff — `.backward()` (§26.4) |
+| `quantize` | Compress tensor precision (INT8/INT4) for inference (§26.5) |
+
 ### Other
 
 | Keyword | Purpose |
@@ -2937,7 +3375,7 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 
 ---
 
-## 27. Operator Precedence Table
+## 30. Operator Precedence Table
 
 From highest to lowest:
 
@@ -2948,6 +3386,7 @@ From highest to lowest:
 | 38 | `!!` (atomic postfix) | Left |
 | 28 | `!` `-` (unary) | Right |
 | 30 | `^` | Right |
+| 22 | `**` `><` | Left |
 | 20 | `*` `/` | Left |
 | 18 | `%` `mod` | Left |
 | 12 | `>>` `shl` `shr` `as` | Left |
@@ -2961,7 +3400,7 @@ From highest to lowest:
 
 ---
 
-## 28. Changes from v1.2
+## 31. Changes from v1.2
 
 | Feature | v1.2 | v2.0 |
 |---------|------|------|
@@ -2983,7 +3422,7 @@ From highest to lowest:
 | resume | — | `resume retry` / `resume revert` — flow control inside local revert |
 | erx | — | Error register — reads thrown error code |
 | Return type arrow | `func f(): int` | `func f() -> int:` |
-| dict (was map) | `map[K,V]` | `dict[K,V]` — key-value dictionary |
+| dict (was map) | `map[K,V]` | Type `dict[K,V]` + literal `[key: value, ...]` — same `[]` syntax; presence of `:` means dict |
 | Map expression | — | `map x in list: out expr end` — transformation |
 | Sized types | `int`, `float`, `string`, `bool` | + `i8`–`i64`, `u8`–`u64`, `ptr` |
 | Include paths | `include math;` | + `include net.http;` (dot-path directory mapping) |
@@ -2994,12 +3433,12 @@ From highest to lowest:
 | `&` / `&mut` | — | Shared / mutable borrow syntax — no move, validated by borrow checker |
 | Move semantics | — | Non-copy types move on assignment; old binding invalidated (§4.8) |
 | arena block | — | `arena: ... end` scoped sub-arena for loop memory reclamation (§4.6) |
-| Runtime separation | — | Hard Language / Compiler / Library split; compiler must not know schedulers; zero-cost = unused code absent from the binary (§1.1, `VIR_EXECUTION_MODEL.md`) |
+| Runtime separation | — | Hard Language / Compiler / Library split; compiler must not know schedulers; zero-cost = unused code absent from the binary (§1.2, `VIR_EXECUTION_MODEL.md`) |
 | arr_compact | — | `arr_compact(arr)` — reclaim array resize dead space (§19.4) |
 | Callable field | — | UFCS step 2: `x.callback()` calls function-pointer field (§11) |
 | Interpolation boundary | — | `$ident` stops at non-identifier chars; use `$(expr)` for `[]` access (§12.6) |
 | Semicolon / separator | — | Unified list separator `;` \| `NEWLINE` (§1.0); compiler detects orphan parameters in group blocks (§14.2) |
-| isolate | — | `try(isolate: [x, y]):` auto-snapshot & restore on retry; W302 warning for unprotected mutations (§13.7) |
+| isolate | — | Isolation = independent execution context; `try(isolate:)` = snapshot/retry; block `isolate` = sandbox (VI §13.7, §25.5) |
 | resume retry safety | — | Compiler emits W302 if variable mutated in try body, block uses `resume retry`, and variable not in `isolate` list or reset in `revert` (§13.7) |
 | `await pass` | — | Explicit yield point — prevents CPU hogging in cooperative async loops (§22.6) |
 | `cancel` | — | Cooperative task cancellation — delivered at next `await` (§22.7) |
@@ -3010,6 +3449,20 @@ From highest to lowest:
 | Swizzle `~` | — | `v~xyz` — postfix channel reorder/replicate for `flux` (§24.2) |
 | `deck` | — | `deck name: Type[size]` — shared CPU-GPU buffer (§24.3) |
 | `lock` / `!!` | — | Atomic read-modify-write: `lock x += 1` or `x!! += 1` (§24.4) |
+| `atomic` (var) | — | Variable modifier for retry logic — mutations survive `resume retry`, suppress W302 (§13.7) |
+| `lazy include` | — | Deferred type-only import — allows cyclic `entity`/`enum` deps between modules (§3.8) |
+| Swizzle write-mask | — | `v~xy = flux(a, b)` — selective channel write; omitted channels unchanged (§24.2) |
+| `reactive` | — | UI state variable with compile-time propagation — no runtime refresh (§25.1) |
+| `morph` | — | Static entity/struct → UI component map — compile-time bindings (§25.2) |
+| `bundle` | — | Embed resources into the binary at compile time — constant slice, no I/O (§25.3) |
+| `expose` | — | Annotate a function as an API endpoint — compiler emits REST/IPC/WASM glue (§25.4) |
+| `isolate` (block) | `try(isolate:)` (snapshot/retry) | Same Isolation: block = sandbox policy; try = snapshot/retry (§13.7, §25.5) |
+| `tensor<T>[S...]` | — | N-D NPU/GPU-aligned array — row-major, 64-byte aligned, sizes checked at compile time (§26.1) |
+| `**` | — | Matmul — `[M,K]**[K,N]→[M,N]`; NEON FMMLA / AVX-512 / WASM simd128 (§26.2) |
+| `><` | — | Fused multiply-accumulate (FMA) — multiply+accumulate in one instruction (§26.2) |
+| `infer` | — | Gradient-free inference block — autodiff off, ~50% less RAM than train (§26.3) |
+| `train` | — | Native autodiff training block — `.backward()` (§26.4) |
+| `quantize` | — | Compress tensor precision INT8/INT4 — faster inference, less RAM (§26.5) |
 | `port` | — | `port name: T` — typed MPSC signal port for inter-worker coordination (§23) |
 | `send` / `recv` | — | `send port <- v` (non-blocking); `recv port` (async-suspending) (§23.2–23.3) |
 

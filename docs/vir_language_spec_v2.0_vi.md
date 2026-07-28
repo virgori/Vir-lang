@@ -7,7 +7,7 @@
 
 ## Mục lục
 
-1. [Tổng quan](#1-tổng-quan) — gồm [§1.0 Separator](#10-separator----hoặc-xuống-dòng), [§1.1 Phân tầng Language / Compiler / Library](#11-phân-tầng-language--compiler--library)
+1. [Tổng quan](#1-tổng-quan) — gồm [§1.0 Separator](#10-separator----hoặc-xuống-dòng), [§1.1 Mở khối](#11-mở-khối--do--loop--), [§1.2 Phân tầng Language / Compiler / Library](#12-phân-tầng-language--compiler--library)
 2. [Chú thích (Comments)](#2-chú-thích-comments)
 3. [Hệ thống Module](#3-hệ-thống-module)
 4. [Kiểu dữ liệu](#4-kiểu-dữ-liệu)
@@ -50,9 +50,10 @@ Vir là một ngôn ngữ lập trình hệ thống biên dịch trực tiếp, 
   - **Định nghĩa / khai báo** (`func`, `async func`, `entity`, `method`, `enum`, `register`, `mold`, stub `@bind`, …) → đóng bằng **`end.`**
   - **Luồng điều khiển / khối câu lệnh** (`if` / `eif` / `else`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, `isolate`, …) → đóng bằng **`end`**
 - **Separator — một khái niệm duy nhất** (xem §1.0): mọi danh sách (statement, khai báo nhóm, named-arg, nhánh `case`, …) tách bằng **`;` hoặc xuống dòng (`NEWLINE`)**. Nhiều phần tử **cùng một dòng** → bắt buộc `;`
-- Khối định nghĩa mở bằng `:` (sau chữ ký). Khối `if` / `eif` / `for` mở bằng `do`; `when` mở thân bằng `loop`; nhiều khối khác (`try`, `arena`, `map`, …) mở bằng `:`
+- **Mở khối — hai nguyên tắc** (xem §1.1): (1) chỉ block độc lập mới có opener; continuation (`else`, `ensure`, `revert`, …) không `:` — (2) có `<expr>` trước thân → `do`/`loop`; không → `:`
 - Dấu hai chấm `:` cũng dùng cho khai báo kiểu và ánh xạ key-value (dict, case, map)
-- `out` thay `return`, `eif` thay `elif`, `skip` thay `continue`
+- `out` mang **một** nghĩa: đưa kết quả ra ngoài (thay `return`); đích đến khác nhau theo ngữ cảnh — xem §6.1
+- `eif` thay `elif`, `skip` thay `continue`
 - `when ... loop` thay `while`
 
 ```vir
@@ -113,7 +114,123 @@ Cùng luật cho nhóm `var` / `in` / `ref` / `out`, named-arg, và nhánh `case
 
 > **Lưu ý:** `,` vẫn dùng cho **danh sách phẳng khác** (tham số positional một dòng `f(a, b)`, phần tử list/mold, v.v.) — đó không phải separator khối/nhóm ở trên.
 
-### 1.1 Phân tầng Language / Compiler / Library
+### 1.1 Mở khối — `do` / `loop` / `:`
+
+#### Nguyên tắc 1 — block độc lập vs continuation
+
+**Chỉ construct nào tự mở một block độc lập và tự đóng bằng `end` / `end.` mới cần ký hiệu mở block (`:` hoặc `do` / `loop`). Continuation clause không mở block mới — không dùng `:`.**
+
+**Mở block độc lập** (có `end` / `end.` tương ứng):
+
+```vir
+try:
+    ...
+end
+
+isolate:
+    ...
+end
+
+func foo:
+    ...
+end.
+```
+
+```vir
+if cond do
+    ...
+end
+
+when cond loop
+    ...
+end
+
+map x in xs:
+    out x
+end
+```
+
+Những construct này tạo một statement/block mới và kết thúc bằng `end` (hoặc `end.` với định nghĩa).
+
+**Continuation — không mở block mới:**
+
+```vir
+if cond do
+    ...
+else
+    ...
+end
+```
+
+`else` / `eif` không có `end` riêng, không phải statement độc lập — chỉ chuyển nhánh trong cùng một `if`.
+
+```vir
+try:
+    ...
+ensure
+    ...
+revert
+    ...
+end.
+```
+
+(`ensure` / `revert` cấp hàm đóng bằng `end.` của hàm; `ensure` / `revert` cục bộ trong `try` đóng bằng `end` của `try`.)
+
+`ensure` và `revert` không tồn tại ngoài `try` / hàm bao — chúng là clause, không phải construct mở block độc lập.
+
+```text
+IfStatement
+├── if-clause
+├── eif-clause* (optional)
+├── else-clause (optional)
+└── end
+
+TryStatement  /  MapStatement  /  FuncDef
+└── độc lập, tự đóng bằng end / end.
+```
+
+Người đọc suy ra được từ khóa mới trong tương lai: **mở block độc lập → cần opener; continuation → không `:`.** Không cần nhớ danh sách ngoại lệ.
+
+#### Nguyên tắc 2 — chọn `do` / `loop` hay `:`
+
+Trong các construct **đã** mở block độc lập, chọn opener theo biểu thức đứng trước thân:
+
+| Tình huống | Opener | Lý do |
+|------------|--------|--------|
+| **Có biểu thức phức tạp trước thân** | Keyword riêng: `do`, `loop` | Kết thúc expression rõ ràng; biểu thức chứa bao nhiêu `:` cũng không nhập nhằng với opener |
+| **Không có biểu thức trước thân** | `:` | Ngắn; `:` không cạnh tranh với expression |
+
+**Có expression trước — dùng `do` / `loop`:**
+
+```vir
+if expr do
+    ...
+end
+
+when expr loop
+    ...
+end
+
+for i in 0..10 do
+    ...
+end
+```
+
+Nếu dùng `if expr:` / `when expr:` thì parser phải phân biệt `:` thuộc expression (type annotation, pattern, label, …) với `:` mở block. Token `do` / `loop` tách ranh giới expression khỏi thân khối.
+
+**Không có expression trước — dùng `:`:**
+
+```text
+try ":" block
+isolate ":" block
+arena ":" block
+map … ":" block
+func name ":" … end.
+```
+
+Hai nguyên tắc bổ sung nhau: (1) chỉ block độc lập mới có opener; (2) opener là `do`/`loop` hay `:` tùy có `<expr>` trước thân hay không — không tùy hứng.
+
+### 1.2 Phân tầng Language / Compiler / Library
 
 Vir **không** gắn ngôn ngữ vào một runtime thực thi duy nhất (khác Go, Erlang, …). Mục tiêu là thay được mô hình concurrency / allocator mà **không đổi ngôn ngữ**, và chương trình không dùng thì **không mang** chi phí đó trong binary.
 
@@ -412,7 +529,7 @@ Vir sử dụng ba vùng nhớ, không có garbage collector:
 - Không giải phóng từng đối tượng — giải phóng toàn bộ arena cùng lúc
 - Mỗi hàm `main` (hoặc scope lớn) tạo một arena mặc định
 - Không cần GC, không cần reference counting
-- **ArenaPool / chiến lược cấp phát nền (mmap, malloc, …)** thuộc thư viện — compiler chỉ thấy Arena (§1.1)
+- **ArenaPool / chiến lược cấp phát nền (mmap, malloc, …)** thuộc thư viện — compiler chỉ thấy Arena (§1.2)
 
 **String:**
 - Immutable — mọi thao tác nối/nội suy tạo string mới
@@ -420,8 +537,10 @@ Vir sử dụng ba vùng nhớ, không có garbage collector:
 - String literal → vùng Static (zero-cost, không cấp phát runtime)
 - Nội suy / nối chuỗi → cấp phát trong Arena
 
-**Không có ownership/borrow:**
-Vir không có hệ thống ownership/borrow như Rust. Arena đảm bảo mọi đối tượng sống đến cuối scope. Cho FFI hoặc bare-metal cần quản lý thủ công, dùng `ptr` + `malloc`/`free` qua `@bind(c)`.
+**Arena + borrow (bổ sung nhau, không loại trừ):**
+- **Runtime:** arena-scoped lifetime — bump allocate, thu hồi theo scope/`arena:`/reset; không GC, không RC (§4.6–4.7; kiến trúc: `MUST_READ_CONTEXT/PLAN/07_Arena_Borrow_Checker.md`)
+- **Compile-time:** borrow checker (§4.8) theo dõi ownership, `&` / `&mut`, move, và chèn drop — an toàn bộ nhớ **không** dựa RC runtime
+- Cho FFI hoặc bare-metal cần quản lý thủ công: `ptr` + `malloc`/`free` qua `@bind(c)`
 
 ### 4.6 Khối Sub-arena — `arena:`
 
@@ -665,10 +784,19 @@ end.
 ```
 
 - `func <tên>(<tham số>):` — định nghĩa hàm
-- `out <biểu thức>` — trả về giá trị (thay thế `return`)
+- `out` — **một nghĩa duy nhất: đưa kết quả ra ngoài.** Khác nhau chỉ ở **đích đến**, không đổi nghĩa từ khoá:
+  - `out <biểu_thức>` trong thân hàm → giá trị trả về (thay `return`)
+  - nhóm tham số `out` (§14) → ghi kết quả vào slot đầu ra cho bên gọi
+  - `out <biểu_thức>` trong `map` (§20) → phần tử đưa vào chuỗi/mảng kết quả
 - `end.` — đóng thân hàm (khối định nghĩa)
 
+Đây là **keyword reuse với ngữ nghĩa thống nhất**, không phải ba nghĩa `out` tách rời.
+
 ### 6.2 Tham số có kiểu — hai dạng (chỉ hai)
+
+Cả **dạng ngoặc `()`** và **dạng khối `in` / `ref` / `out`** đều hợp lệ — dev chọn theo ngữ cảnh. Ngôn ngữ **không** bắt buộc một trong hai.
+
+**Quy ước mã nguồn Vir** (`virc_*.vri`, stdlib khi đồng bộ): trình bày rõ — **1–2 tham số** ưu tiên `()`; **≥ 3 tham số** dùng khối `in` (hoặc `ref` / `out` khi cần). Đây là style nội bộ, không phải lỗi biên dịch nếu user viết ngược lại.
 
 **Sai** — không đặt từ khoá nhóm `in` bên trong `()` (`in` là mặc định; không ai khai báo `in` trong ngoặc):
 
@@ -730,8 +858,14 @@ end.
 
 ### 6.3 Nhiều tham số
 
+Ba tham số trở lên — trong mã nguồn Vir dùng khối `in` (user code vẫn được viết `func clamp(value, lo, hi):` nếu muốn):
+
 ```vir
-func clamp(value, lo, hi):
+func clamp:
+    in
+        value
+        lo
+        hi
     if value < lo do
         out lo
     end
@@ -746,19 +880,36 @@ end.
 
 Separator thống nhất (§1.0): `;` hoặc xuống dòng giữa các named-arg. Cùng dòng → bắt buộc `;`.
 
+**Khuyến nghị:** vài arg ngắn → **một dòng** với `;`. Chỉ xuống dòng khi danh sách dài / cần chú thích từng arg — khi đó ghi `;` sau mỗi arg (trừ cuối); chỉ newline không `;` vẫn hợp lệ nhưng khó đọc.
+
 ```vir
-sum(a=5; b=10)
+sum(a = 5; b = 10)
 
+# dài / cần chú thích từng dòng
 sum(
-    a = 5
-    b = 10
-)
-
-sum(
-    a = 5;
-    b = 10
+    timeout = 30;
+    retry = true;
+    path = "/tmp/out"
 )
 ```
+
+**Không nhầm với khởi tạo field entity.** Hai grammar khác nhau — có chủ đích:
+
+| | Entity / literal | Lời gọi hàm (named-arg) |
+|--|------------------|-------------------------|
+| Ngữ nghĩa | Khởi tạo **field** | Bind **argument → parameter** |
+| Cú pháp | `IDENT : expr` | `IDENT = expr` |
+| Danh sách | field list → `,` (hoặc xuống dòng trong ngoặc, theo list phẳng) | argument list → separator §1.0 (`;` \| `NEWLINE`) |
+| Ví dụ | `User(name: "A", age: 30)` | `f(a = 1; b = 2)` |
+
+```text
+field_initializer := IDENT ":" expr     # association tên → giá trị field
+named_argument    := IDENT "=" expr     # truyền giá trị cho parameter
+```
+
+`:` mang nghĩa association (cùng họ `x: Int`, `name: "Alice"`).  
+`=` mang nghĩa gán/truyền giá trị cho tham số (`timeout = 10`).  
+Không gộp hai khái niệm này thành một “gán theo tên” rồi kết luận bất nhất.
 
 ### 6.5 Khai báo trước
 
@@ -821,6 +972,8 @@ var u = User(name: "Alice", age: 30)
 print(u.name)          # truy cập field
 u.age = 31             # gán field
 ```
+
+Đây là **field initializer** (`name: expr`), không phải named-arg. Xem phân biệt với `f(a = 1)` ở §6.4.
 
 **Bố trí nội bộ:** Arena-allocated, field được đánh địa chỉ theo chỉ mục slot.
 
@@ -968,6 +1121,8 @@ for i in 0..10 do
 end
 ```
 
+`in` ở đây là thành phần cú pháp `for` (“duyệt trong”), **không** phải section keyword nhóm tham số. Phân biệt với `in` §14: xem ghi chú đầu §14.
+
 ### 9.4 Vòng Loop (vô hạn)
 
 ```vir
@@ -985,6 +1140,18 @@ loop 5:
     print 7         # in 7 năm lần
 end
 ```
+
+**`loop` — một nghĩa, nhiều production liên quan vòng lặp (không phải overload):**
+
+Ở mọi dạng, `loop` chỉ nói: **phần sau sẽ được lặp.** Khác nhau nằm ở **điều kiện / số lần**, không đổi nghĩa từ khoá.
+
+| Dạng | Ý nghĩa |
+|------|---------|
+| `loop … end` | Lặp vô điều kiện (đến `break`) — như `for (;;)` / Rust `loop` |
+| `when cond loop … end` | Lặp khi điều kiện còn đúng — `when` cung cấp điều kiện; `loop` mở thân |
+| `loop N: … end` | Lặp đúng N lần |
+
+Không coi `loop` là keyword đa nghĩa gây nhầm — cùng keyword trong các quy tắc ngữ pháp vòng lặp có liên quan.
 
 ### 9.6 Break / Skip
 
@@ -1057,8 +1224,12 @@ skip         # nhảy sang vòng tiếp theo (thay thế 'continue')
 
 ```vir
 x = 10               # gán đơn giản
-x = x + 1            # phép gán rõ ràng (không có += — tường minh tốt hơn)
+x = x + 1            # gán từ biểu thức
+x += 1               # compound assignment (tương đương x = x + 1)
+x -= 1
 ```
+
+Compound (`+=`, `-=`, …) hợp lệ. Đặc biệt dùng trong RMW nguyên tử: `lock x += 1`, `x!! += 1` (§24.4).
 
 ---
 
@@ -1450,7 +1621,16 @@ Compiler phát **cảnh báo** nếu `resume retry` được dùng mà khối `r
 
 **`isolate` — snapshot & khôi phục tự động:**
 
-`isolate` là tham số của `try` cho phép khai báo tường minh danh sách biến bên ngoài mà Compiler tự động **snapshot lên Stack** khi vào `try` và **khôi phục** trước mỗi `resume retry`. Điều này loại bỏ nhu cầu reset thủ công trạng thái bẩn trong `revert`.
+**Isolation** = tạo một **execution context độc lập** với context hiện tại.
+
+Hai dạng `isolate` cùng gốc Isolation, khác **chính sách** gắn kèm:
+
+| Dạng | Cú pháp | Execution context + |
+|------|---------|---------------------|
+| Block `isolate` | `isolate: … end` | **sandbox policy** (§25.5) |
+| `try(isolate:)` | `try(isolate: […]):` | **snapshot / retry policy** (mục này) |
+
+Dạng `try(isolate:)`: tham số của `try` khai báo danh sách biến bên ngoài mà Compiler tự động **snapshot lên Stack** khi vào `try` và **khôi phục** trước mỗi `resume retry`. Điều này loại bỏ nhu cầu reset thủ công trạng thái bẩn trong `revert`.
 
 ```vir
 try(isolate: [retry_limit, partial_result]):
@@ -1635,14 +1815,30 @@ Từ khoá `erx` đọc mã lỗi hiện tại (giá trị truyền cho `throw`)
 
 ## 14. Tham số — in / ref / out
 
-Vir có **đúng hai** cách khai báo tham số.
+Vir có **đúng hai** cách khai báo tham số — **tự do chọn**, không bắt buộc.
 
 | Dạng | Chữ ký | Trong `()` / khối |
 |------|--------|-------------------|
 | **1. Ngoặc** | `func tên(…):` | Được **`ref tên`**; **không** viết `in` (mặc định theo giá trị). `out` dùng dạng khối nhóm. |
 | **2. Khối nhóm** | `func tên:` | `in` / `ref` / `out` trước thân hàm |
 
+**Style mã nguồn Vir:** ≥ 3 tham số → dạng 2 (`in`); 1–2 tham số → dạng 1 thường gọn hơn. Chi tiết §6.2.
+
 Mặc định truyền **theo giá trị**. `ref` = tham chiếu (được phép cả trong `()` lẫn khối nhóm).
+
+**`in` không phải overload gây nhầm:** cùng token xuất hiện ở **hai production khác nhau**, parser và người đọc phân biệt bằng ngữ cảnh trước:
+
+| Vai trò | Ví dụ | Loại |
+|---------|--------|------|
+| **Section keyword** | `func add:` rồi `in` / `a: Int` | Mở nhóm tham số đầu vào |
+| **Thành phần `for`** | `for x in range do` | “duyệt trong” collection/range (§9.3) |
+
+```text
+func … → in …     # section
+for  … → in …     # for grammar
+```
+
+Không có production nào bắt parser đoán giữa hai nghĩa. Giống nhiều ngôn ngữ dùng lại từ khóa ở production khác nhau (`import` / `in` trong Python, `IN` trong SQL, …). **Không coi đây là bất nhất cú pháp.**
 
 ### 14.1 Dạng 1 — ngoặc `()`
 
@@ -2219,7 +2415,7 @@ end
 
 - `<biến>` — biến lặp gắn với từng phần tử
 - `<iterable>` — bất kỳ iterable nào (array, range, keys/values của dict)
-- `out <biểu_thức>` — giá trị đã biến đổi cho mảng kết quả
+- `out <biểu_thức>` — đưa phần tử ra mảng kết quả (cùng nghĩa `out` §6.1: kết quả ra ngoài; đích = chuỗi map)
 - Kiểu kết quả là `array`, kiểu phần tử suy luận từ `<biểu_thức>`
 
 **Với chỉ số (index):**
@@ -2283,15 +2479,15 @@ end
 **Quy tắc:**
 - `case <biểu_thức>` rồi các nhánh `mẫu: …`
 - Giữa các nhánh: `;` hoặc `NEWLINE` (§1.0)
-- Nhánh mặc định: `else: …`
+- Nhánh mặc định: `else …` — `else` là **continuation** (§1.1), **không** có dấu hai chấm (giống `else` trong `if`)
 - Đóng khối bằng `end`
-- Nhánh mới bắt đầu khi phần tử tiếp theo là `mẫu:` / `else:` — nhiều câu lệnh trong cùng nhánh cũng dùng cùng separator (`;` / xuống dòng) cho đến khi gặp nhánh mới
+- Nhánh mới bắt đầu khi phần tử tiếp theo là `mẫu:` / `else` — nhiều câu lệnh trong cùng nhánh cũng dùng cùng separator (`;` / xuống dòng) cho đến khi gặp nhánh mới
 
 ```vir
 case color
     "red": log("stop", 1); out 1
     "green": log("go", 2); out 2
-    else: log("unknown", 0); out 0
+    else log("unknown", 0); out 0
 end
 ```
 
@@ -2340,7 +2536,7 @@ var r1 = wait t1
 var r2 = wait t2
 ```
 
-Task chạy đồng thời (concurrent) — không song song (parallel) trừ khi chương trình `include` một thư viện thread pool / work-stealing (xem §1.1).
+Task chạy đồng thời (concurrent) — không song song (parallel) trừ khi chương trình `include` một thư viện thread pool / work-stealing (xem §1.2).
 
 ### 22.5 Mô hình Scheduler
 
@@ -2350,7 +2546,7 @@ Task chạy đồng thời (concurrent) — không song song (parallel) trừ kh
 | Chuyển ngữ cảnh | Tại mỗi `await` hoặc `await pass` |
 | Event loop | Do **thư viện** cung cấp khi được include — không nhúng sẵn vào mọi binary |
 | Thread pool / work-steal | Tuỳ chọn qua `include` (POSIX, win32, spin, none, …) |
-| Overhead khi không dùng | **Không** — binary tối giản không chứa scheduler (§1.1) |
+| Overhead khi không dùng | **Không** — binary tối giản không chứa scheduler (§1.2) |
 
 Compiler hạ `async`/`await`/`task` xuống state machine và điểm tạm dừng. **Compiler không biết** Scheduler / Worker / ArenaPool tồn tại — ai chạy các điểm đó do thư viện quyết định (polling đơn luồng, thread pool, work-stealing, hoặc serial trên embedded). Xem [`VIR_EXECUTION_MODEL.md`](VIR_EXECUTION_MODEL.md) §7.
 
@@ -2842,6 +3038,15 @@ end.
 
 ### 25.5 Sandbox bảo mật — `isolate` (block)
 
+**Isolation** = tạo một **execution context độc lập** với context hiện tại.
+
+Hai dạng `isolate` cùng gốc Isolation, khác **chính sách** gắn kèm:
+
+| Dạng | Cú pháp | Execution context + |
+|------|---------|---------------------|
+| Block `isolate` | `isolate: … end` | **sandbox policy** (mục này) |
+| `try(isolate:)` | `try(isolate: […]):` | **snapshot / retry policy** (§13.7) |
+
 ```vir
 isolate:
     var result = untrusted_plugin.run(input)
@@ -2849,14 +3054,9 @@ isolate:
 end
 ```
 
-`isolate` (dạng block độc lập) chạy code trong sandbox với tập quyền hạn chế: không truy cập bộ nhớ ngoài block trừ tham số được truyền vào, không I/O trực tiếp, không gọi hàm trừ khi được `expose` vào sandbox.
+Block `isolate` chạy code trong sandbox với tập quyền hạn chế: không truy cập bộ nhớ ngoài block trừ tham số được truyền vào, không I/O trực tiếp, không gọi hàm trừ khi được `expose` vào sandbox.
 
-**Phân biệt hai dạng `isolate`:**
-
-| Dạng | Cú pháp | Mục đích |
-|------|---------|---------|
-| Variable snapshot | `try(isolate: [x, y]):` | Snapshot biến để retry an toàn (§13.7) |
-| Security sandbox | `isolate: ... end` | Block sandbox — giới hạn quyền truy cập bộ nhớ/I/O |
+Không phải hai nghĩa `isolate` tách rời — cùng Isolation, hai production / hai policy.
 
 ---
 
@@ -3009,7 +3209,7 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 | `func` | Định nghĩa hàm |
 | `end.` | Đóng khối định nghĩa / khai báo (`func`, `entity`, `method`, `enum`, `register`, `mold`, stub `@bind`, …) — xem §1 |
 | `end` | Đóng khối điều khiển / câu lệnh (`if`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, …) — xem §1 |
-| `out` | Trả về giá trị từ hàm |
+| `out` | Đưa kết quả ra ngoài — return / tham số `out` / phần tử `map` (một nghĩa; đích khác nhau — §6.1) |
 | `var` | Khai báo biến có thể thay đổi |
 | `let` | Ràng buộc biến bất biến |
 | `const` | Hằng số biên dịch |
@@ -3023,7 +3223,7 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 | `else` | Nhánh mặc định |
 | `when ... loop` | Vòng while |
 | `for ... in` | Vòng for phạm vi |
-| `loop` | Vòng vô hạn hoặc đếm |
+| `loop` | Phần sau được lặp — vô điều kiện / sau `when` / `loop N` (§9.2–9.5); một nghĩa |
 | `break` | Thoát vòng lặp |
 | `skip` | Nhảy vòng tiếp |
 | `case` | Biểu thức switch/match |
@@ -3087,7 +3287,7 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 | `erx` | Đọc mã lỗi đã throw (thanh ghi lỗi) |
 | `emit` | Ghi sự kiện/log có cấu trúc |
 | `timeout` | Tham số cho `try` — tự động huỷ sau thời hạn |
-| `isolate` | Tham số cho `try` — khai báo biến cần snapshot & khôi phục tự động khi retry |
+| `isolate` | Isolation: execution context độc lập — `try(isolate:)` = snapshot/retry (§13.7); block = sandbox (§25.5) |
 | `atomic` (var) | Bổ ngữ biến — cho phép mutation xuyên retry mà không khôi phục, tắt W302 (§13.7) |
 | `resume retry` | Trong `revert` cục bộ — khởi lại khối try hiện tại |
 | `resume revert` | Trong `revert` cục bộ — lan truyền đến revert cấp hàm |
@@ -3096,9 +3296,9 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 
 | Từ khoá | Mục đích |
 |---------|---------|
-| `in` | Nhóm tham số đầu vào (chỉ đọc, mặc định) |
+| `in` | (1) Section nhóm tham số đầu vào §14 — (2) thành phần `for … in` §9.3; hai production, không cạnh tranh |
 | `ref` | Nhóm tham số tham chiếu (đọc-ghi, ảnh hưởng bên gọi) |
-| `out` | Nhóm tham số đầu ra (hàm nhận ghi, bên gọi nhận) |
+| `out` | Nhóm tham số đầu ra — đích `out` là slot cho bên gọi (§6.1, §14) |
 | `this` | Tham số ngầm trong method; quy ước tham số đầu cho UFCS |
 
 ### FFI & Hệ thống
@@ -3138,7 +3338,7 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 | `morph` | Ánh xạ tĩnh từ entity/struct sang component UI tại thời biên dịch (§25.2) |
 | `bundle` | Nhúng file tài nguyên vào binary lúc biên dịch; trả về slice hằng — không I/O runtime (§25.3) |
 | `expose` | Chú thích hàm để compiler sinh API endpoint (REST, IPC, WASM export) (§25.4) |
-| `isolate` (block) | Block sandbox bảo mật — giới hạn quyền truy cập bộ nhớ/I/O; phân biệt với `try(isolate:)` (§14.7) (§25.5) |
+| `isolate` (block) | Isolation + sandbox policy — giới hạn bộ nhớ/I/O; cùng gốc với `try(isolate:)` (§13.7) (§25.5) |
 
 ### AI / Học máy
 
@@ -3209,7 +3409,7 @@ Từ cao đến thấp:
 | emit | — | `emit LOG_INFO(...)` ghi sự kiện/log có cấu trúc |
 | timeout | — | `try(timeout: 5s):` tự động huỷ sau thời hạn |
 | resume | — | `resume retry` / `resume revert` — điều khiển luồng trong revert cục bộ |
-| isolate | — | `try(isolate: [x, y]):` snapshot & khôi phục tự động khi retry; cảnh báo W302 cho mutation chưa bảo vệ (§13.7) |
+| isolate | — | Isolation = execution context độc lập; `try(isolate:)` = snapshot/retry; block = sandbox (§13.7, §25.5) |
 | resume retry an toàn | — | Compiler phát W302 nếu biến bị đột biến trong try, khối có `resume retry`, và biến không trong `isolate` hoặc chưa reset trong `revert` (§13.7) |
 | `await pass` | — | Điểm nhường quyền tường minh — chống chiếm CPU trong vòng lặp async hợp tác (§22.6) |
 | `cancel` | — | Huỷ tác vụ hợp tác — gửi tại `await` tiếp theo (§22.7) |
@@ -3229,7 +3429,7 @@ Từ cao đến thấp:
 | `morph` | — | Ánh xạ tĩnh entity/struct → component UI — binding sinh tại biên dịch, không reflection (§25.2) |
 | `bundle` | — | Nhúng tài nguyên vào binary lúc biên dịch — slice hằng, zero-overhead, không I/O (§25.3) |
 | `expose` | — | Chú thích hàm thành API endpoint — compiler sinh REST/IPC/WASM glue code (§25.4) |
-| `isolate` (block) | `try(isolate:)` (snapshot) | Block sandbox bảo mật — giới hạn quyền truy cập bộ nhớ/I/O; phân biệt với §13.7 (§25.5) |
+| `isolate` (block) | `try(isolate:)` (snapshot/retry) | Cùng Isolation: block = sandbox policy; try = snapshot/retry policy (§13.7, §25.5) |
 | `tensor<T>[S...]` | — | Mảng N chiều NPU/GPU-aligned — row-major, aligned 64-byte, kiểm tra kích thước tại biên dịch (§26.1) |
 | `**` | — | Matmul — `[M,K]**[K,N]→[M,N]`; ánh xạ NEON FMMLA / AVX-512 / WASM simd128 (§26.2) |
 | `><` | — | Fused multiply-accumulate (FMA) — nhân + cộng tích lũy một lệnh, tránh round-off (§26.2) |
@@ -3241,7 +3441,7 @@ Từ cao đến thấp:
 | `&` / `&mut` | — | Cú pháp shared / mutable borrow — kiểm tra bởi borrow checker (§4.8) |
 | Move semantics | — | Kiểu non-copy move khi gán; ràng buộc cũ bị vô hiệu hoá (§4.8) |
 | arena block | — | `arena: ... end` sub-arena có phạm vi cho thu hồi bộ nhớ vòng lặp (§4.6) |
-| Phân tầng runtime | — | Language / Compiler / Library tách cứng; compiler không biết scheduler; zero-cost = không dùng thì không có trong binary (§1.1, `VIR_EXECUTION_MODEL.md`) |
+| Phân tầng runtime | — | Language / Compiler / Library tách cứng; compiler không biết scheduler; zero-cost = không dùng thì không có trong binary (§1.2, `VIR_EXECUTION_MODEL.md`) |
 | callable field | — | Bước UFCS 2: `x.callback()` gọi field con trỏ hàm (§11) |
 | Quy tắc biên lexer nội suy | — | `$ident` dừng tại `[`, toán tử; dùng `$(expr)` cho biểu thức phức tạp (§12.6) |
 | arr_compact | — | `arr_compact(arr)` — thu hồi dead space resize mảng (§19.4) |

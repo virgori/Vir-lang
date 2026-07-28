@@ -1804,11 +1804,32 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
       if (!check(p, TOK_RPAREN)) {
         for (;;) {
           skip_newlines(p);
+          /* §14.2 block `in` (no paren): stop at body / next group keyword. */
+          if (!has_paren &&
+              (check(p, TOK_OUT) || check(p, TOK_VAR) || check(p, TOK_IF) ||
+               check(p, TOK_WHEN) || check(p, TOK_FOR) || check(p, TOK_END) ||
+               check(p, TOK_PRINT) || check(p, TOK_LOOP) || check(p, TOK_CASE) ||
+               check(p, TOK_TRY)))
+            break;
+          /* Statement starts: `name(`, `name =`, `name.`, `name[`,
+           * `extern func`, `export …` — not a param. */
+          if (!has_paren && check(p, TOK_IDENT) &&
+              p->pos + 1 < p->token_count) {
+            vir_tok_t nxt = p->tokens[p->pos + 1].type;
+            if (nxt == TOK_LPAREN || nxt == TOK_ASSIGN || nxt == TOK_DOT ||
+                nxt == TOK_LBRACKET || nxt == TOK_FUNC || nxt == TOK_EXPORT)
+              break;
+            if (strcmp(peek(p)->str.buf, "extern") == 0 ||
+                strcmp(peek(p)->str.buf, "export") == 0)
+              break;
+          }
           int is_ref_param = 0;
           if (check(p, TOK_IDENT) && strcmp(peek(p)->str.buf, "ref") == 0) {
             advance(p); /* consume 'ref' */
             is_ref_param = 1;
           }
+          if (!has_paren && !check(p, TOK_IDENT))
+            break;
           const vir_token_t *param_tok =
               expect_name(p, "expected parameter name");
           if (!param_tok)
@@ -1884,12 +1905,29 @@ static ast_node_t *parse_func_def(vir_parser_t *p) {
             }
           }
         }
-      } else if (match(p, TOK_OUT)) {
-        if (match(p, TOK_LPAREN)) {
-            while (!check(p, TOK_RPAREN) && !check(p, TOK_EOF)) advance(p);
-            match(p, TOK_RPAREN);
-        } else if (check(p, TOK_IDENT)) {
-            advance(p);
+      } else if (check(p, TOK_OUT)) {
+        /* §14.2 out-param group vs body `out <expr>`.
+         * Param group only when `out name:`. `out (` is always an expression. */
+        uint32_t save_out = p->pos;
+        advance(p); /* out */
+        skip_newlines(p);
+        if (check(p, TOK_IDENT)) {
+          advance(p);
+          if (match(p, TOK_COLON)) {
+            /* Typed out-param — skip type tokens until body/group ends. */
+            while (!check(p, TOK_EOF) && !check(p, TOK_NEWLINE) &&
+                   !check(p, TOK_SEMICOLON) && !check(p, TOK_VAR) &&
+                   !check(p, TOK_IF) && !check(p, TOK_WHEN) &&
+                   !check(p, TOK_FOR) && !check(p, TOK_OUT) &&
+                   !check(p, TOK_END))
+              advance(p);
+          } else {
+            /* Body: `out expr` — rewind to `out`. */
+            p->pos = save_out;
+          }
+        } else {
+          /* `out (…)` / `out 1` / … — body statement. */
+          p->pos = save_out;
         }
       }
       skip_newlines(p);
