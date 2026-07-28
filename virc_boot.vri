@@ -5389,6 +5389,10 @@ var g_boot_name_cell = 0;   # heap i64[2]: [0]=var_name, [1]=print_name (native)
 var g_boot_nvreg_cell = 0;  # native next-vreg counter (LowerCtx.next_vreg unreliable)
 var g_boot_label_cell = 0;  # native next-label counter (LowerCtx.label_counter unreliable)
 var g_boot_loop_depth = 0;  # native loop nest (LowerCtx.loop_* unreliable)
+var g_boot_loop_depth_max = 0;
+var g_boot_blk_depth_max = 0;
+var g_boot_blk_push_n = 0;
+var g_boot_blk_pop_n = 0;
 var g_boot_loop_starts = 0;
 var g_boot_loop_ends = 0;
 
@@ -7066,7 +7070,8 @@ var g_boot_blk_stack_inits = 0;
 var g_boot_blk_stack_lhs = 0;
 var g_boot_blk_stack_rhs = 0;
 var g_boot_blk_stack_counts = 0;
-var g_boot_blk_depth = 0;
+var g_boot_blk_depth = 0;          # mirror only — C-VM StoreGlobal on this is unreliable
+var g_boot_blk_depth_cell = 0;     # authoritative nest depth (native i64)
 # Last finished parse_block — survives pop_scope so boot_func_blk_snap_at
 # (called after parse_block returns) still sees the body just parsed.
 var g_boot_fin_types = 0;
@@ -7088,15 +7093,47 @@ func boot_blk_stack_ensure:
     end
 end.
 
+func boot_blk_depth_ensure:
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if g_boot_blk_depth_cell == 0 do
+        g_boot_blk_depth_cell = heap_alloc(16);
+        native_write_i64(g_boot_blk_depth_cell, 0, 0);
+    end
+end.
+
+func boot_blk_depth_get:
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    boot_blk_depth_ensure();
+    out native_read_i64(g_boot_blk_depth_cell, 0);
+end.
+
+func boot_blk_depth_set:
+    in(v: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    boot_blk_depth_ensure();
+    native_write_i64(g_boot_blk_depth_cell, 0, v);
+    g_boot_blk_depth = v;
+end.
+
 func boot_blk_push_scope:
     # Save the caller's (enclosing block's) current staging before a nested
     # parse_block() call resets/overwrites the shared g_boot_blk_* globals.
+    # Depth lives in a native cell — Vir globals do not persist StoreGlobal on C-VM
+    # (push_n==pop_n but depth drifted to hundreds).
     extern func native_write_i64(addr: int, offset: int, val: int);
     extern func native_read_i64(addr: int, offset: int) -> int;
     boot_blk_stack_ensure();
-    let d = g_boot_blk_depth;
-    if d < 0 or d >= 64 do
-        g_boot_blk_depth = d + 1;
+    g_boot_blk_push_n = g_boot_blk_push_n + 1;
+    let d = boot_blk_depth_get();
+    if d < 0 do
+        d = 0;
+    end
+    if d >= 64 do
+        # Hard cap: still bump so imbalance stays visible in diagnostics.
+        boot_blk_depth_set(d + 1);
+        if d + 1 > g_boot_blk_depth_max do
+            g_boot_blk_depth_max = d + 1;
+        end
         out;
     end
     let n = g_boot_blk_count;
@@ -7117,7 +7154,10 @@ func boot_blk_push_scope:
         native_write_i64(g_boot_blk_stack_rhs, base + i * 8, native_read_i64(g_boot_blk_rhs, i * 8));
         i = i + 1;
     end
-    g_boot_blk_depth = d + 1;
+    boot_blk_depth_set(d + 1);
+    if d + 1 > g_boot_blk_depth_max do
+        g_boot_blk_depth_max = d + 1;
+    end
 end.
 
 func boot_blk_pop_scope:
@@ -7126,11 +7166,13 @@ func boot_blk_pop_scope:
     # at the correct indices.
     extern func native_write_i64(addr: int, offset: int, val: int);
     extern func native_read_i64(addr: int, offset: int) -> int;
-    if g_boot_blk_depth <= 0 do
+    let cur = boot_blk_depth_get();
+    if cur <= 0 do
         out;
     end
-    let d = g_boot_blk_depth - 1;
-    g_boot_blk_depth = d;
+    g_boot_blk_pop_n = g_boot_blk_pop_n + 1;
+    let d = cur - 1;
+    boot_blk_depth_set(d);
     if d < 0 or d >= 64 do
         out;
     end
@@ -7411,6 +7453,7 @@ func parse_block:
     # Save the enclosing (caller) block's staging BEFORE resetting — this
     # call may itself be a nested if/while/when/loop body parse triggered
     # from inside the caller's own in-progress parse_block loop.
+    let scope0 = boot_blk_depth_get();
     boot_blk_push_scope();
     boot_blk_reset();
     boot_parse_vconst_reset();
@@ -7513,6 +7556,10 @@ func parse_block:
             if rt_strlen(p.error_msg) > 0 do
                 boot_blk_finish_snapshot();
                 boot_blk_pop_scope();
+                # Defensive: restore exact entry depth (C-VM StoreGlobal drift).
+                when boot_blk_depth_get() > scope0 loop
+                    boot_blk_pop_scope();
+                end
                 out (p, block);
             end
             var (p_semi, _) = match_tok(p, TokType.Semicolon);
@@ -7526,6 +7573,9 @@ func parse_block:
     boot_blk_snap_copy();
     boot_blk_finish_snapshot();
     boot_blk_pop_scope();
+    when boot_blk_depth_get() > scope0 loop
+        boot_blk_pop_scope();
+    end
     out (p, block);
 end.
 
@@ -8939,6 +8989,9 @@ enum QOp:
     ArgCount        = 95;
     SetArg          = 96;
     LoadFuncAddr    = 97;
+    # §4.6 auto when/while watermark (match C-core 0x8A/0x8B)
+    ArenaSave       = 138;
+    ArenaRestore    = 139;
 end.
 
 
@@ -9354,9 +9407,32 @@ func boot_bd_push_setarg:
     g_bd_total = ix + 1;
 end.
 
+func boot_bd_push_arena_wm:
+    # 138=ArenaSave (dv=mark vreg)  139=ArenaRestore (s1v=mark vreg)
+    in(opc: int, dv: int, mark_v: int)
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    if boot_bd_dump_on() == 0 do
+        out;
+    end
+    boot_body_dump_init();
+    let ix = g_bd_total;
+    if ix >= boot_bd_cap() do
+        out;
+    end
+    native_write_i64(g_bd_opc, ix * 8, opc);
+    native_write_i64(g_bd_dv, ix * 8, dv);
+    native_write_i64(g_bd_di, ix * 8, 0);
+    native_write_i64(g_bd_s1t, ix * 8, 1);
+    native_write_i64(g_bd_s1v, ix * 8, mark_v);
+    native_write_i64(g_bd_s1i, ix * 8, 0);
+    native_write_i64(g_bd_s2v, ix * 8, 0);
+    g_bd_total = ix + 1;
+end.
+
 func boot_bd_push_rtcall:
     # opc: 94=GetArg 95=ArgCount 85=Slurp 86=SlurpLen 87=WriteFile
     #      50=Alloc 52=LoadByte 53=StoreByte 54=LoadWord 55=StoreWord 90=Exit
+    #      138=ArenaSave 139=ArenaRestore
     # dv=dest vreg (-1 if void); s1v/s2v = arg vregs; di = 3rd arg vreg
     in(opc: int, dv: int, a0: int, a1: int, a2: int)
     extern func native_write_i64(addr: int, offset: int, val: int);
@@ -10224,6 +10300,7 @@ end.
 func boot_loop_reset:
     boot_loop_stack_ensure();
     g_boot_loop_depth = 0;
+    # Do not clear *_max here — parse peaks accumulate before lower calls reset.
 end.
 
 func boot_loop_push:
@@ -10240,6 +10317,9 @@ func boot_loop_push:
     native_write_i64(g_boot_loop_starts, d * 8, start_lbl);
     native_write_i64(g_boot_loop_ends, d * 8, end_lbl);
     g_boot_loop_depth = d + 1;
+    if g_boot_loop_depth > g_boot_loop_depth_max do
+        g_boot_loop_depth_max = g_boot_loop_depth;
+    end
 end.
 
 func boot_loop_pop:
@@ -11420,7 +11500,19 @@ func lower_stmt:
 
         boot_loop_push(loop_lbl, end_lbl);
 
+        # §4.6 auto sub-arena: watermark bump around body (no `arena:` syntax).
+        wm_r = fresh_vreg(ctx);
+        ir_emit(ctx, q_instr(QOp.ArenaSave, q_vreg(wm_r), q_none(), q_none()));
+        if boot_bd_dump_on() != 0 do
+            boot_bd_push_arena_wm(138, wm_r, 0);
+        end
+
         lower_stmt(ctx, vec_get_rt(stmt.children, 1));
+
+        ir_emit(ctx, q_instr(QOp.ArenaRestore, q_none(), q_vreg(wm_r), q_none()));
+        if boot_bd_dump_on() != 0 do
+            boot_bd_push_arena_wm(139, 0 - 1, wm_r);
+        end
 
         boot_loop_pop();
 
@@ -11727,27 +11819,44 @@ func lower_stmt:
         out 0;
     end
 
-    # when-cond loop (while): same shape as LoopStmt children [cond, body]
+    # when-cond loop — same shape as WhileStmt + §4.6 auto watermark
     if stmt.node_type == AstType.WhenStmt do
+        loop_lbl = fresh_label(ctx);
+        end_lbl = fresh_label(ctx);
+        ir_emit(ctx, q_instr(QOp.Label, q_label(loop_lbl), q_none(), q_none()));
+        if boot_bd_dump_on() != 0 do
+            boot_bd_push_label(loop_lbl);
+        end
         cond_r = lower_expr(ctx, vec_get_rt(stmt.children, 0));
         if cond_r < 0 do
             out 0;
         end
-        loop_lbl = fresh_label(ctx);
-        end_lbl = fresh_label(ctx);
-        ir_emit(ctx, q_instr(QOp.Label, q_label(loop_lbl), q_none(), q_none()));
-        # re-eval condition each iteration — use JumpIfNot on first cond then body then jump back
-        # Standard while: label; cond; jump_if_not end; body; jump loop; end
         ir_emit(ctx, q_instr(QOp.JumpIfNot, q_none(), q_vreg(cond_r as int), q_label(end_lbl)));
+        if boot_bd_dump_on() != 0 do
+            boot_bd_push_jumpifnot(cond_r as int, end_lbl);
+        end
+        boot_loop_push(loop_lbl, end_lbl);
+        wm_r = fresh_vreg(ctx);
+        ir_emit(ctx, q_instr(QOp.ArenaSave, q_vreg(wm_r), q_none(), q_none()));
+        if boot_bd_dump_on() != 0 do
+            boot_bd_push_arena_wm(138, wm_r, 0);
+        end
         if vec_len_rt(stmt.children) > 1 do
             lower_stmt(ctx, vec_get_rt(stmt.children, 1));
         end
-        # recompute condition for next iteration
-        cond2 = lower_expr(ctx, vec_get_rt(stmt.children, 0));
-        if cond2 >= 0 do
-            ir_emit(ctx, q_instr(QOp.JumpIf, q_none(), q_vreg(cond2 as int), q_label(loop_lbl)));
+        ir_emit(ctx, q_instr(QOp.ArenaRestore, q_none(), q_vreg(wm_r), q_none()));
+        if boot_bd_dump_on() != 0 do
+            boot_bd_push_arena_wm(139, 0 - 1, wm_r);
+        end
+        boot_loop_pop();
+        ir_emit(ctx, q_instr(QOp.Jump, q_none(), q_label(loop_lbl), q_none()));
+        if boot_bd_dump_on() != 0 do
+            boot_bd_push_jump(loop_lbl);
         end
         ir_emit(ctx, q_instr(QOp.Label, q_label(end_lbl), q_none(), q_none()));
+        if boot_bd_dump_on() != 0 do
+            boot_bd_push_label(end_lbl);
+        end
         out 0;
     end
 
@@ -15509,6 +15618,8 @@ enum QOp:
     ArgCount        = 95;
     SetArg          = 96;
     LoadFuncAddr    = 97;
+    ArenaSave       = 138;
+    ArenaRestore    = 139;
 end.
 
 # ═══════════════════════════════════════════════════════
@@ -16546,7 +16657,8 @@ func emit_runtime_arm64:
         let ad0 = (al_init - al_cbz) / 4;
         cb = codebuf_patch_u32(cb, al_cbz, 0xB4000001 | ((ad0 bit_and 0x7FFFF) shl 5));
         cb = arm64_mov_imm16(cb, 0, 0);
-        cb = codebuf_emit_u32(cb, 0xD2A00021);
+        # MOVZ X1, #0x10, LSL#16 (= 1MB). Was 64KB — Stage-1 self-host OOM/SEGV.
+        cb = codebuf_emit_u32(cb, 0xD2A00201);
         cb = arm64_mov_imm16(cb, 2, 3);
         cb = arm64_mov_imm16(cb, 3, 0x1002);
         cb = codebuf_emit_u32(cb, 0x92800004);
@@ -16985,6 +17097,16 @@ func codegen_emit_module:
                 gidx = ins.src1.imm_val + 1;
                 cb = arm64_movz_imm64(cb, 17, gidx as int);
                 cb = arm64_str_reg(cb, vreg_to_arm(ins.src2.vreg), 15, 17);
+                handled = 1;
+            end
+            if ins.opcode == QOp.ArenaSave do
+                # dest = heap watermark at [X15,#0] (boot bump) / also used as mark vreg
+                cb = arm64_ldr_imm(cb, vreg_to_arm(ins.dest.vreg), 15, 0);
+                handled = 1;
+            end
+            if ins.opcode == QOp.ArenaRestore do
+                # [X15,#0] = src1 (reclaim bump since save)
+                cb = arm64_str_imm(cb, vreg_to_arm(ins.src1.vreg), 15, 0);
                 handled = 1;
             end
             if ins.opcode == QOp.Alloc do
@@ -18003,6 +18125,11 @@ func boot_do_read:
 end.
 
 func boot_do_tokenize:
+    g_boot_loop_depth_max = 0;
+    g_boot_blk_depth_max = 0;
+    g_boot_blk_push_n = 0;
+    g_boot_blk_pop_n = 0;
+    boot_blk_depth_set(0);
     print_ln("virc: tokenizing...");
     let src = g_read_src;
     let lex = lexer_new(src);
@@ -18046,6 +18173,10 @@ func boot_do_parse:
     end
     g_dbg_ast_kids = g_snap_ast_kids;
     print_ln("virc: parse done");
+    print_ln("virc: nest after parse (blk_depth / blk_max / loop_max)");
+    print(g_boot_blk_depth);
+    print(g_boot_blk_depth_max);
+    print(g_boot_loop_depth_max);
 end.
 
 func boot_emit_print_int:
@@ -19742,6 +19873,21 @@ func boot_codegen_emit_mod_min:
                     boot_cg_str_fp0();
                 end
             end
+            # §4.6 ArenaSave/Restore — mod_min is the Stage-1 emit path
+            if opc == 138 do
+                g_emit_word = 0xF9400F68;
+                boot_cg_emit_word0();
+                g_cg_off = boot_cg_slot_off(dv);
+                g_cg_rd = 8;
+                boot_cg_str_fp0();
+            end
+            if opc == 139 do
+                g_cg_off = boot_cg_slot_off(s1v);
+                g_cg_rd = 8;
+                boot_cg_ldr_fp0();
+                g_emit_word = 0xF9000F68;
+                boot_cg_emit_word0();
+            end
             if opc == 52 do
                 g_cg_off = boot_cg_slot_off(s1v);
                 g_cg_rd = 0;
@@ -20923,6 +21069,10 @@ func boot_do_lower:
         end
     end
     print_ln("virc: done! wrote output");
+    # Nest peaks vs caps (loop≤64 blk≤64) — rule out parser stack overflow.
+    print_ln("virc: nest peaks (loop_max / blk_max / caps 64/64)");
+    print(g_boot_loop_depth_max);
+    print(g_boot_blk_depth_max);
 end.
 
 
@@ -21539,6 +21689,9 @@ func q_opc_to_mir_opc(opc: int)
     if opc == 94 or opc == 95 do out 21 end
     if opc == 96 do out 21 end
     if opc == 97 do out 2 end
+    # §4.6 ArenaSave/Restore — keep non-zero so MIR map does not flag drop;
+    # bd/raw emit still keys off qopc 138/139.
+    if opc == 138 or opc == 139 do out 2 end
     out 0
 end.
 
@@ -21729,6 +21882,10 @@ func boot_mir_qopc_is_barrier:
     if qopc == 33 or qopc == 34 or qopc == 35 do
         out 1
     end
+    # §4.6 ArenaRestore rewinds heap — treat as side-effect barrier
+    if qopc == 139 do
+        out 1
+    end
     out 0
 end.
 
@@ -21754,6 +21911,10 @@ func boot_mir_qopc_defines:
         out 1
     end
     if qopc >= 70 and qopc <= 75 do
+        out 1
+    end
+    # §4.6 ArenaSave writes mark vreg
+    if qopc == 138 do
         out 1
     end
     out 0
@@ -22387,6 +22548,22 @@ func boot_codegen_from_lir_multifn:
                         boot_cg_str_fp0();
                     end
                 end
+                # §4.6 ArenaSave: LDR X8,[X27,#24]; STR to fp slot dv
+                if opc == 138 do
+                    g_emit_word = 0xF9400F68;
+                    boot_cg_emit_word0();
+                    g_cg_off = boot_cg_slot_off(dv);
+                    g_cg_rd = 8;
+                    boot_cg_str_fp0();
+                end
+                # §4.6 ArenaRestore: LDR X8 from fp s1v; STR X8,[X27,#24]
+                if opc == 139 do
+                    g_cg_off = boot_cg_slot_off(s1v);
+                    g_cg_rd = 8;
+                    boot_cg_ldr_fp0();
+                    g_emit_word = 0xF9000F68;
+                    boot_cg_emit_word0();
+                end
                 if opc == 52 do
                     g_cg_off = boot_cg_slot_off(s1v);
                     g_cg_rd = 0;
@@ -22864,6 +23041,11 @@ func virc_compile:
         sys_exit(1);
     end
     print_ln("virc: parse done");
+    print_ln("virc: nest after parse (blk_depth / blk_max / push_n / pop_n)");
+    print(boot_blk_depth_get());
+    print(g_boot_blk_depth_max);
+    print(g_boot_blk_push_n);
+    print(g_boot_blk_pop_n);
 
     boot_do_lower();
     out 0;
