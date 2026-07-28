@@ -94,6 +94,14 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             case OP_MUL: op = MIR_MUL; break;
             case OP_DIV: op = MIR_DIV; break;
             case OP_MOD: op = MIR_MOD; break;
+            case OP_PERCENT: {
+              /* Spec §10.1: lower a % b as (a * b) / 100 */
+              mir_operand_t prod = {MIR_OPND_VREG, {alloc_vreg(func)}};
+              mir_append_instr(*current_block, MIR_MUL, prod, arg1, arg2);
+              mir_operand_t c100 = {MIR_OPND_IMM, {.imm = 100}};
+              mir_append_instr(*current_block, MIR_DIV, dst, prod, c100);
+              return dst;
+            }
             case OP_AND: op = MIR_AND; break;
             case OP_OR:  op = MIR_OR;  break;
             case OP_XOR: op = MIR_XOR; break;

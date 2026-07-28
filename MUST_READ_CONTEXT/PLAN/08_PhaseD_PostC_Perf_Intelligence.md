@@ -21,6 +21,12 @@ Lý do:
 - Ít rủi ro nhất so với ML scheduling.
 - Tạo nền IR/machine pattern ổn định cho PGO và Superopt.
 
+### Ưu tiên P0b — **RA soft: LIR clean → Briggs → George–Appel coalesce**
+Song song / ngay sau self-host ổn định trên soft LIR:
+- Không thay Linear Scan bootstrap bằng IRC đầy đủ một phát.
+- Clean LIR trước; Chaitin–Briggs gán/spill; George–Appel chỉ coalescing còn lại.
+- Spec: [`MUST_READ_CONTEXT/REGISTER_ALLOCATION_ARCHITECTURE.md`](../REGISTER_ALLOCATION_ARCHITECTURE.md).
+
 ### Ưu tiên P1 — **PGO (instrument + feedback compile)**
 - Tập trung vào hot path thực tế của `virc.vri`, `ir_optimizer.vri`, `codegen.vri`, runtime string/vec/io.
 

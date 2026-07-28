@@ -1144,6 +1144,10 @@ static int precomp_fold(const ast_node_t *e, int64_t *out) {
       }
       *out = a % b;
       return 1;
+    case OP_PERCENT:
+      /* Spec §10.1: percent — binary form a % b ≈ (a * b) / 100 */
+      *out = (a * b) / 100;
+      return 1;
     case OP_SHL:
       *out = (int64_t)((uint64_t)a << (b & 63));
       return 1;
@@ -1453,6 +1457,16 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     case OP_MOD:
       op = Q_MOD;
       break;
+    case OP_PERCENT: {
+      /* Spec §10.1: a % b → (a * b) / 100 */
+      uint32_t prod = fresh_vreg(ctx);
+      uint32_t c100 = fresh_vreg(ctx);
+      emit(ctx, q_instr(Q_MUL, q_vreg(prod), q_vreg((uint32_t)lhs),
+                        q_vreg((uint32_t)rhs)));
+      emit(ctx, q_instr(Q_LOAD, q_vreg(c100), q_imm(100), q_none()));
+      emit(ctx, q_instr(Q_DIV, q_vreg(rd), q_vreg(prod), q_vreg(c100)));
+      return (int)rd;
+    }
     case OP_AND:
       op = Q_AND;
       break;

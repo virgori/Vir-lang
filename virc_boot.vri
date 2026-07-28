@@ -3453,7 +3453,7 @@ end.
  *   - Multi-char operators (?=, ?., :~, shr , ||, ->, ..)
  *   - Block comments
  *   - Hex literal support (0x...)
- *   - Paren-depth tracking (suppress newlines inside parens)
+ *   - Paren-depth tracking (brackets / grouping; NEWLINE still emitted for §1.0)
  *   - String escape sequences (\n, \t, \\, \", \')
  ##
 
@@ -4861,11 +4861,11 @@ func tokenize_full:
 
         c = lex_peek(lex);
 
-        # Newline (statement separator)
+        # Newline (statement / list separator, §1.0) — emit inside parens too
         if c == 10 do
             var (lex2, _) = lex_advance(lex);
             lex = lex2;
-            if not prev_was_newline and g_lx_paren == 0 do
+            if not prev_was_newline do
                 g_lx_tokens = vec_push_rt(g_lx_tokens, token_new(TokType.Newline, g_lx_line, g_lx_col));
                 prev_was_newline = true;
             end
@@ -6064,6 +6064,58 @@ func skip_newlines:
     out p;
 end.
 
+# §1.0 list separator: ";" | NEWLINE (+ optional ",")
+func match_list_sep:
+    in(p: Parser, allow_comma: bool)
+    got = false;
+    if allow_comma do
+        var (p2, m) = match_tok(p, TokType.Comma);
+        p = p2;
+        if m do
+            got = true;
+        end
+    end
+    if not got do
+        var (p3, m2) = match_tok(p, TokType.Semicolon);
+        p = p3;
+        if m2 do
+            got = true;
+        end
+    end
+    if not got do
+        if check(p, TokType.Newline) do
+            got = true;
+        end
+    end
+    if not got do
+        out (p, false);
+    end
+    p = skip_newlines(p);
+    # Extra trailing ;/, — use flag loop (break may not unwind on boot VM)
+    more = true;
+    when more loop
+        ate = false;
+        var (p4, m3) = match_tok(p, TokType.Semicolon);
+        p = p4;
+        if m3 do
+            ate = true;
+        end
+        if not ate and allow_comma do
+            var (p5, m4) = match_tok(p, TokType.Comma);
+            p = p5;
+            if m4 do
+                ate = true;
+            end
+        end
+        if ate do
+            p = skip_newlines(p);
+        else
+            more = false;
+        end
+    end
+    out (p, true);
+end.
+
 func is_stmt_start:
     in(t: TokType)
     out t == TokType.Var or t == TokType.Const or t == TokType.If or t == TokType.Loop or t == TokType.While or t == TokType.When or t == TokType.For or t == TokType.Out or t == TokType.Print or t == TokType.Input or t == TokType.Ident or t == TokType.Int or t == TokType.Float or t == TokType.Str or t == TokType.LParen or t == TokType.Minus or t == TokType.Not or t == TokType.CheckCpu or t == TokType.Patch or t == TokType.Func or t == TokType.Break or t == TokType.Skip or t == TokType.True or t == TokType.False or t == TokType.LBracket or t == TokType.Enum or t == TokType.Entity or t == TokType.Import or t == TokType.From or t == TokType.Module or t == TokType.Export or t == TokType.Include;
@@ -6210,15 +6262,16 @@ func parse_primary:
                 call.name = id_tok.str_val;
                 call.line = id_tok.line;
                 var (p3, _) = advance(p)  # consume '(';
+                p3 = skip_newlines(p3);
                 if not check(p3, TokType.RParen) do
                     var (p4, arg) = parse_expr(p3);
                     p3 = p4;
                     call = ast_add_child(call, arg);
                     should_loop = true;
                     when should_loop loop
-                        var (p5, matched) = match_tok(p3, TokType.Comma);
+                        var (p5, matched) = match_list_sep(p3, true);
                         p3 = p5;
-                        if not matched do
+                        if not matched or check(p3, TokType.RParen) do
                             should_loop = false;
                         else
                             var (p6, arg2) = parse_expr(p3);
@@ -6236,24 +6289,17 @@ func parse_primary:
             call.name = id_tok.str_val;
             call.line = id_tok.line;
             var (p3, _) = advance(p)  # consume '(';
+            p3 = skip_newlines(p3);
             if not check(p3, TokType.RParen) do
                 var (p4, arg) = parse_call_arg(p3);
                 p3 = p4;
                 call = ast_add_child(call, arg);
                 should_loop = true;
                 when should_loop loop
-                    var (p5, matched) = match_tok(p3, TokType.Comma);
+                    var (p5, matched) = match_list_sep(p3, true);
                     p3 = p5;
-                    if not matched do
-                        var (p5b, matched2) = match_tok(p3, TokType.Semicolon);
-                        p3 = p5b;
-                        if not matched2 do
-                            should_loop = false;
-                        else
-                            var (p6b, arg3) = parse_call_arg(p3);
-                            p3 = p6b;
-                            call = ast_add_child(call, arg3);
-                        end
+                    if not matched or check(p3, TokType.RParen) do
+                        should_loop = false;
                     else
                         var (p6, arg2) = parse_call_arg(p3);
                         p3 = p6;
@@ -6446,6 +6492,8 @@ end.
 
 func parse_unary:
     in(p: Parser)
+    # Allow `a +\n b` / multiline args inside () once lexer emits NEWLINE (§1.0).
+    p = skip_newlines(p);
     # Unary minus
     if check(p, TokType.Minus) do
         var (p2, t) = advance(p);
@@ -7809,10 +7857,13 @@ func parse_if_stmt:
         out (p5, if_node);
     end
 
-    # Handle else
+    # Handle else — continuation (§1.1): no ':' / do
     var (p4, has_else) = match_tok(p3, TokType.Else);
     if has_else do
-        p4 = match_block_open(p4);
+        if check(p4, TokType.Colon) do
+            var (p_err, _, _) = expect_tok(p4, TokType.Ident, "'else' does not take ':' (§1.1)");
+            p4 = p_err;
+        end
         p4 = skip_newlines(p4);
         var (p5, else_block) = parse_block(p4);
         if_node = ast_add_child(if_node, else_block);
@@ -7967,12 +8018,15 @@ func parse_case_stmt:
 
         arm = ast_new(AstType.PatternMatch);
         arm.line = peek(p2).line;
+        is_else_arm = false;
 
         if check(p2, TokType.Else) do
+            # §1.1 / §21: else is a continuation — no ':'.
             var (pb, _) = advance(p2);
             p2 = pb;
             arm.name = "_";
             arm.int_val = 0 - 1;
+            is_else_arm = true;
         eif check(p2, TokType.Int) do
             var (pc, it) = advance(p2);
             p2 = pc;
@@ -8006,8 +8060,16 @@ func parse_case_stmt:
             out (p2, cnode);
         end
 
-        var (pj, _, _) = expect_tok(p2, TokType.Colon, "expected ':' after pattern");
-        p2 = pj;
+        # Pattern arms need ':'; else continuation does not (§1.1 / §21).
+        if is_else_arm do
+            if check(p2, TokType.Colon) do
+                var (pj, _, _) = expect_tok(p2, TokType.Ident, "'else' does not take ':' (§1.1 / §21)");
+                p2 = pj;
+            end
+        else
+            var (pj, _, _) = expect_tok(p2, TokType.Colon, "expected ':' after pattern");
+            p2 = pj;
+        end
         p2 = skip_newlines(p2);
 
         armloop = true;
@@ -8032,9 +8094,9 @@ func parse_case_stmt:
         cnode = ast_add_child(cnode, arm);
     end
 
+    # §21: control block closes with `end` (not `end.`).
     var (pm, _, _) = expect_tok(p2, TokType.End, "expected 'end' after case");
-    var (pn, _) = match_tok(pm, TokType.Dot);
-    out (pn, cnode);
+    out (pm, cnode);
 end.
 
 
@@ -8052,6 +8114,7 @@ func parse_func_def:
     # Parse parameters (optional parens — `func name` and `func name(...)` both valid)
     if check(p2, TokType.LParen) do
         var (p3, _) = advance(p2);
+        p3 = skip_newlines(p3);
 
         # Parse parameters
         if not check(p3, TokType.RParen) do
@@ -8067,23 +8130,12 @@ func parse_func_def:
                 var (p_skip, _) = advance(p3);
                 p3 = skip_type_annot(p_skip);
             end
-            # Handle semicolon-separated params (VIR style: `a:int; b:int`)
+            # §1.0: param separator is "," | ";" | NEWLINE
             should_loop = true;
             when should_loop loop
-                has_sep = false;
-                var (p5, matched_comma) = match_tok(p3, TokType.Comma);
+                var (p5, has_sep) = match_list_sep(p3, true);
                 p3 = p5;
-                if matched_comma do
-                    has_sep = true;
-                end
-                if not has_sep do
-                    var (p5b, matched_semi) = match_tok(p3, TokType.Semicolon);
-                    p3 = p5b;
-                    if matched_semi do
-                        has_sep = true;
-                    end
-                end
-                if not has_sep do
+                if not has_sep or check(p3, TokType.RParen) do
                     should_loop = false;
                 else
                     var (p6, pt, ok3) = expect_tok(p3, TokType.Ident, "expected parameter name");
@@ -8124,6 +8176,7 @@ func parse_func_def:
         if check(p2, TokType.LParen) do
             var (p_lp, _) = advance(p2);
             p2 = p_lp;
+            p2 = skip_newlines(p2);
             if not check(p2, TokType.RParen) do
                 var (p_p1, param_tok, okp) = expect_tok(p2, TokType.Ident, "expected parameter name");
                 p2 = p_p1;
@@ -8136,20 +8189,25 @@ func parse_func_def:
                     var (p_sk, _) = advance(p2);
                     p2 = skip_type_annot(p_sk);
                 end
-                when check(p2, TokType.Comma) or check(p2, TokType.Semicolon) loop
-                    var (p_sep, _) = advance(p2);
+                # §1.0: in-param separator is "," | ";" | NEWLINE
+                more_in = true;
+                when more_in loop
+                    var (p_sep, has_sep) = match_list_sep(p2, true);
                     p2 = p_sep;
-                    p2 = skip_newlines(p2);
-                    var (p_p2, pt2, okp2) = expect_tok(p2, TokType.Ident, "expected parameter name");
-                    p2 = p_p2;
-                    if okp2 do
-                        param2 = ast_new(AstType.Identifier);
-                        param2.name = pt2.str_val;
-                        fn_node = ast_add_child(fn_node, param2);
-                    end
-                    if check(p2, TokType.Colon) do
-                        var (p_sk3, _) = advance(p2);
-                        p2 = skip_type_annot(p_sk3);
+                    if not has_sep or check(p2, TokType.RParen) do
+                        more_in = false;
+                    else
+                        var (p_p2, pt2, okp2) = expect_tok(p2, TokType.Ident, "expected parameter name");
+                        p2 = p_p2;
+                        if okp2 do
+                            param2 = ast_new(AstType.Identifier);
+                            param2.name = pt2.str_val;
+                            fn_node = ast_add_child(fn_node, param2);
+                        end
+                        if check(p2, TokType.Colon) do
+                            var (p_sk3, _) = advance(p2);
+                            p2 = skip_type_annot(p_sk3);
+                        end
                     end
                 end
             end
@@ -11789,18 +11847,39 @@ func lower_func_def:
     vec_set_rt(funcs, fidx, f);
     g_mod_funcs_acc = funcs;
 
-    # Self-host: dump-safe stub bodies (real AST Calls unlowered helpers).
+    # Self-host: dump-safe stub bodies (real AST Call lowering SIGSEGVs on C-VM).
     extern func native_read_i64(addr: int, offset: int) -> int;
     let stub_main = 0;
     let stub_ping = 0;
+    let stub_compile = 0;
     let did_stub = 0;
     if g_boot_name_cell != 0 do
         stub_main = native_read_i64(g_boot_name_cell, 216);
         stub_ping = native_read_i64(g_boot_name_cell, 248);
+        stub_compile = native_read_i64(g_boot_name_cell, 352);
     end
     if stub_ping != 0 and boot_bd_dump_on() != 0 do
         print_ln("virc: lower stub ping body (self-host dump-safe)");
         boot_bd_push_printstr("ping");
+        boot_bd_push_ret_imm(0);
+        did_stub = 1;
+    end
+    # boot_stage1_compile: Call double/choose + prints (same semantics as thin AST body).
+    if did_stub == 0 and stub_compile != 0 and boot_bd_dump_on() != 0 do
+        print_ln("virc: lower stub compile body (self-host dump-safe)");
+        let dbl_fi = native_read_i64(g_boot_name_cell, 344);
+        let ch_fi = native_read_i64(g_boot_name_cell, 384);
+        if dbl_fi >= 0 do
+            let r1 = fresh_vreg(ctx);
+            boot_bd_push_call(r1, dbl_fi);
+            boot_bd_push_print(r1);
+        end
+        if ch_fi >= 0 do
+            let r2 = fresh_vreg(ctx);
+            boot_bd_push_call(r2, ch_fi);
+            boot_bd_push_print(r2);
+        end
+        boot_bd_push_printstr("virc-boot self-host ok; use virc_stage1 for compile");
         boot_bd_push_ret_imm(0);
         did_stub = 1;
     end
@@ -13318,7 +13397,7 @@ func lower_program:
                         early_lower_done = 1;
                     end
                     if str_eq(sn, "boot_stage1_compile") do
-                        print_ln("virc: lower compile early (setup+boot_do_lower)");
+                        print_ln("virc: lower compile early");
                         native_write_i64(g_boot_name_cell, 352, 1);
                         native_write_i64(g_boot_name_cell, 328, si);
                         g_boot_var_name = sn;
@@ -20726,19 +20805,7 @@ func boot_stage1_setup:
         end
     end
     init_keywords();
-    let src = read_file_str(g_input_path);
-    g_read_src = src;
-    g_source_raw = src;
-    if src != 0 do
-        g_snap_src_len = boot_file_size(g_input_path);
-        g_source_len = g_snap_src_len;
-        let lex = lexer_new(src);
-        lex = boot_tokenize_scan(lex);
-        g_compile_tokens = g_lx_tokens;
-        let parser = parser_new(g_compile_tokens);
-        var (parser2, ast) = parse_program(parser);
-        g_compile_ast = ast;
-    end
+    # Lex/parse only in virc_compile — avoid double pipeline (C-VM clobber/SIGSEGV).
     out 0;
 end.
 func boot_stage1_ping:
