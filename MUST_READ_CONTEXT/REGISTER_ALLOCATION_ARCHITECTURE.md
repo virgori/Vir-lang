@@ -43,11 +43,18 @@ George–Appel **không** thay bước B; nó chạy **sau** khi LIR đã sạch
 
 **Không** ghi George–Appel vào language spec. Chỉ soft/compiler docs + module `lir_*`.
 
-### Soft path gap (2026-07-30)
+### Soft path RA (2026-07-30) — landed
 
-`compile_pipeline` chạy Chaitin–Briggs và nhận `(lf2, phys_map, stack_map)`, nhưng `emit_lir_module_arm64` hiện gọi `emit_lir_arm64_into(..., assigned_phys: -1, ...)` — tức **identity** vreg→phys. Hệ quả quan sát được: nhiều vreg bị emit như `x0` (`add x0, x0, x0` thay vì `add x0, x0, #1`), làm sai `cg_call`/`cg_var` dù live intervals trông hợp lý.
+| Piece | Status |
+|-------|--------|
+| Typed liveness / interference / rewrite | **Done** — accessors take `LirInstr`/`LirOperand` so field offsets are not ambiguous with MIR |
+| `MIR_INTR_PARAM` | **Done** — each param is a real DEF: `dst ← X[abi]` before body uses it |
+| Color → phys | **Done** — colors 0..7 map to **X19..X26** (callee-saved); prologue/epilogue save/restore |
+| Operand rewrite | **Done** — `lir_allocate_registers_color` rebuilds whole `LirInstr` with PhysReg/StackMem |
+| Spill emit (`StackMem`) | **Not yet** — spill slots assigned but emitter ignores them |
+| Call-clobber on X0–X7 | **Mitigated** by callee-saved pool (print/call no longer wipe live locals) |
 
-**Next:** rewrite operand sang PhysReg trước emit, hoặc truyền `phys_map` vào emitter và tôn trọng nó trong `resolve_reg`.
+**Next:** StackMem reload/store in `lir_codegen`; George–Appel coalesce; fix soft `JmpCond`/`when`/`if` (still empty stdout on `cg_if`/`cg_when`).
 
 ---
 
