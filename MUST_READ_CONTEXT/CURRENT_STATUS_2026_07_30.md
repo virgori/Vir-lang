@@ -45,8 +45,10 @@ Soft compiler (`stdlib/vir/compiler/virc.vri` qua `./core/build/vir run`) **ch�
 | Soft `_start` gọi nhầm hàm đầu | **Fixed** — tìm `main` bằng fat-string name; typed accessor vì bare `vec_get_rt` mất record type |
 | Soft `main` treo sau print | **Fixed** — fall-through epilogue khi không có `out` |
 | Soft params / locals không khớp tên | **Fixed** — `name_hash_bucket` + `fat_str_eq` (hash nội dung, không pointer) |
-| Soft `cg_arith` | **PASS** → `30\n90\n` |
-| Soft `cg_call` / `cg_var` | Partial — in số nhưng sai (2/40 thay vì 42/30): regalloc dồn nhiều vreg → `x0` |
+| Soft RA (PARAM + X19..X26 + typed rewrite) | **Done** — see REGISTER_ALLOCATION_ARCHITECTURE.md |
+| Soft `cg_arith` / `cg_mul` / `cg_var` / `cg_assign` | **PASS** |
+| Soft `cg_call` / `cg_multiparam` | **PASS** → `42` |
+| Soft `cg_if` / `cg_when` / `cg_let_call_arg` | **Still open** |
 
 **Đo bằng** `tests/bootstrap_codegen/manifest.json` (+ `codesign -s - -f a.out`).  
 `run_tests.sh` **không** phải nguồn sự thật (expected stdout lệch nội dung file, ví dụ `test_hello.vri` = `print 42`).
@@ -60,21 +62,21 @@ Soft compiler (`stdlib/vir/compiler/virc.vri` qua `./core/build/vir run`) **ch�
 | `core/src/parser.c` | Nested `a.b.c = expr` → `AST_FIELD_ASSIGN` |
 | `core/src/borrow_check.c` | Không gắn `is_alloc` cho alias MOVE khi src còn live |
 
-#### Soft compiler fixes
+#### Soft compiler / RA fixes
 
 | File | Fix |
 |------|-----|
-| `lir_codegen.vri` | `emit_lir_rt_print_stub`; `_start` → `main`; typed `lir_func_name`; fall-through epilogue |
-| `virc.vri` | Chỉ gọi một emitter theo arch (không gọi thin rồi soft) |
+| `lir_codegen.vri` | print stub; `_start`→`main`; `MIR_INTR_PARAM`; save **X19..X26** |
+| `lir_regalloc_color.vri` | Typed rewrite; colors → **X19..X26** (callee-saved) |
+| `lir_liveness.vri` / `lir_interference.vri` | Typed accessors; `[i64]` matrix |
+| `ast_to_mir.vri` | `MIR_INTR_PARAM` DEF; fat-string name hash/eq |
+| `virc.vri` | Một emitter theo arch |
 | `scope_tree.vri` | Container types + `vec_push_rt` write-back |
-| `ast_to_mir.vri` | Fat-string name hash/eq; `var mir_funcs` |
-| `lir.vri` / `mir.vri` | `[LirBlock]` / `[MirInstr]` annotations |
-| `string_rt.vri` | `rt_itoa`: `%` → `mod` (percent ≠ modulo) |
-| `lexer.vri` | Fat-string wrap sau `sb_to_string` cho keywords |
+| `mir.vri` | `MIR_INTR_PARAM = 100` |
 
 #### Soft next blocker
 
-Regalloc / emit wiring: pipeline tính `phys_map` nhưng `emit_lir_module_arm64` đang truyền `assigned_phys = -1` (identity vreg→phys). Kết quả típ: `add x0, x0, x0` thay vì `add x0, x0, #1`. Xem [`REGISTER_ALLOCATION_ARCHITECTURE.md`](REGISTER_ALLOCATION_ARCHITECTURE.md) § soft path notes.
+Control flow (`cg_if` / `cg_when`) and `cg_let_call_arg`. Spill `StackMem` emit still missing.
 
 ---
 
@@ -105,8 +107,8 @@ Regression thin so sánh **unsigned** outputs giữa các stage; ký bằng `-i 
 | Stdlib include style | **2026-07-30:** slash → **dot-path** (`math.tensor`, `vir.rt.alloc`, …) per spec §3.2 |
 | Soft lex → parse → MIR/LIR | **OK** |
 | Soft emit Mach-O under C-VM | **OK** (pipeline hoàn tất; print stub sống) |
-| Soft correctness (params/arith via RA) | **Partial** — next: wire phys_map into emit / fix coloring rewrite |
-| Full MIR/LIR soft → thay `core/build/vir` | **Next** — đúng codegen rồi mới cố định stage2/stage3 soft |
+| Soft correctness (params/arith via RA) | **OK** for straight-line + calls; control-flow next |
+| Full MIR/LIR soft → thay `core/build/vir` | **Next** — broaden bootstrap_codegen pass rate |
 
 ### Include canonical (spec §3.2)
 
@@ -120,10 +122,10 @@ Không dùng `include math/tensor;` hay `include "stdlib/vir/...vri"` trên surf
 
 ### Next milestones
 
-1. Soft ARM64: dùng `phys_map` từ Chaitin–Briggs khi emit (hoặc rewrite operands trước emit).
-2. Spot-check → pass phần lớn `tests/bootstrap_codegen/manifest.json` qua soft `virc`.
-3. Flatten/subset driver (lexer+parser thin) biên dịch multi-file lớn hơn cone hiện tại.
-4. Fixed-point **stdlib** stage2/stage3 → mới tới Stage-4 kill C.
+1. Soft `JmpCond` / `if` / `when` + `cg_let_call_arg`.
+2. Spill `StackMem` load/store in soft emit; George–Appel coalesce.
+3. Pass phần lớn `tests/bootstrap_codegen/manifest.json` qua soft `virc`.
+4. Fixed-point **stdlib** stage2/stage3 → Stage-4 kill C.
 
 ---
 
