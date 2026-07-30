@@ -1,98 +1,637 @@
 ##
- * vir/compiler/lir_codegen.vri — LIR to Machine Code
+ * vir/compiler/lir_codegen.vri — LIR to Machine Code (ARM64)
  * ==============================================================
- * Maps LirInstr to ARM64 Machine Code.
+ * AAPCS64 soft ABI:
+ *   SetArg 0..7 → MOV X0..X7
+ *   SetArg ≥8  → push 16-byte slots; Call pops them
+ *   Call       → BL patched to func offs / RT unresolved
+ *   Intrinsic  → marker/payload inline; else BL → RT stub[kind]
+ *   Pow/ML     → BL → RT stub[61..63]
+ *
+ * Module: emit_lir_module_arm64 — funcs + RT stubs + BL patch + _start.
  ##
 
-include types;
-include vec_rt;
-import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt;
-include lir;
-import LirOp, LirOperandType, LirFunc from lir;
-include codegen;
-import codebuf_new, codebuf_emit_u32, TargetArch from codegen;
-import arm64_add_rrr, arm64_sub_rrr, arm64_mul_rrr, arm64_sdiv_rrr, arm64_mov_rr, arm64_movz_imm64, arm64_ldr_post, arm64_str_pre, arm64_ret from codegen;
+include types
+include vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt
+include string_rt
+import rt_streq, fat_str_eq, fat_str_new from string_rt
+include compiler.lir
+import LirOp, LirOperandType, LirOperand, LirInstr, LirFunc, LIR_CMP_EQ, LIR_CMP_NE, LIR_CMP_GT, LIR_CMP_LT, LIR_CMP_GE, LIR_CMP_LE, LIR_JMP_IF, LIR_JMP_IFNOT, LIR_RT_UNRESOLVED, LIR_RT_POW, LIR_RT_MATMUL, LIR_RT_FMA, LIR_RT_STUB_COUNT from compiler.lir
+include compiler.mir
+import MIR_INTR_PRINT, MIR_INTR_ADDR_OF, MIR_INTR_CAST, MIR_INTR_NOP_MARKER, MIR_INTR_DECL, MIR_INTR_QUIET, MIR_INTR_CHECK_CPU, MIR_INTR_PATCH_POINT, MIR_INTR_PRECOMP, MIR_INTR_EXPOSE, MIR_INTR_ASYNC, MIR_INTR_ATOMIC_VAR, MIR_INTR_TIMEOUT, MIR_INTR_ISOLATE, MIR_INTR_PTR, MIR_INTR_AWAIT_PASS, MIR_INTR_ENSURE, MIR_INTR_REVERT, MIR_INTR_STR_LIT, MIR_INTR_INTERP, MIR_INTR_ENUM, MIR_INTR_ERROR, MIR_INTR_EXIST, MIR_INTR_BUILTIN from compiler.mir
+include compiler.codegen
+import codebuf_new, codebuf_emit_u32, codebuf_offset, codebuf_patch_u32, TargetArch, CodeBuf from compiler.codegen
+import arm64_add_rrr, arm64_sub_rrr, arm64_mul_rrr, arm64_sdiv_rrr, arm64_msub_rrrr, arm64_mov_rr, arm64_movz_imm64, arm64_mov_from_sp, arm64_ldr_post, arm64_str_pre, arm64_ret, arm64_nop, arm64_cmp_rr, arm64_cset_eq, arm64_cset_ne, arm64_cset_gt, arm64_cset_lt, arm64_cset_ge, arm64_cset_le, arm64_b_imm26, arm64_beq_imm19, arm64_bne_imm19, arm64_bl_imm26, arm64_add_imm, arm64_sub_imm, arm64_and_rrr, arm64_orr_rrr, arm64_eor_rrr, arm64_lsl_rrr, arm64_lsr_rrr, arm64_mvn_rr, arm64_stp_pre, arm64_ldp_post, arm64_svc, arm64_mov_imm16, arm64_str_uoff, arm64_ldr_uoff, arm64_strb_reg, arm64_cmp_imm0 from compiler.codegen
 
-func emit_lir_arm64(func_obj: LirFunc, assigned_phys: i64, assigned_stack: i64)
-    cb = codebuf_new(TargetArch.ARM64);
-    
-    # Prologue: allocate stack
-    stack_size = func_obj.stack_size;
-    # Align stack to 16 bytes
-    if (stack_size % 16) != 0 do
-        stack_size = stack_size + (16 - (stack_size % 16))
+entity LirFixup:
+    at_off: i64,
+    target_block: i64,
+    kind: i64
+end.
+
+# target_kind: 0 = user func index, 1 = RT stub index
+entity LirCallFixup:
+    at_off: i64,
+    target_kind: i64,
+    target_id: i64
+end.
+
+func resolve_reg(opnd: LirOperand, assigned_phys: i64)
+    if opnd.op_type == LirOperandType.VRegInt do
+        if assigned_phys >= 0 do
+            out vec_get_rt(assigned_phys, opnd.vreg)
+        end
+        out opnd.vreg
+    eif opnd.op_type == LirOperandType.PhysReg do
+        out opnd.phys_reg
     end
-    if stack_size > 0 do
-        # SUB SP, SP, #stack_size
-        cb = arm64_sub_rrr(cb, 31, 31, 0) # Placeholder for sub sp, sp, imm
+    out -1
+end.
+
+func resolve_or_imm(cb: CodeBuf, opnd: LirOperand, assigned_phys: i64, scratch: i64)
+    r = resolve_reg(opnd, assigned_phys)
+    if r >= 0 do
+        out (cb, r)
     end
-    n_blocks = vec_len_rt(func_obj.blocks);
-    b_idx = 0;
+    if opnd.op_type == LirOperandType.Imm do
+        cb2 = arm64_movz_imm64(cb, scratch as int, opnd.imm as int)
+        out (cb2, scratch)
+    end
+    out (cb, -1)
+end.
+
+func emit_cmp_cset(cb: CodeBuf, rd: i64, rs1: i64, rs2: i64, pred: i64)
+    cb = arm64_cmp_rr(cb, rs1 as int, rs2 as int)
+    if pred == LIR_CMP_EQ do
+        out arm64_cset_eq(cb, rd as int)
+    eif pred == LIR_CMP_NE do
+        out arm64_cset_ne(cb, rd as int)
+    eif pred == LIR_CMP_GT do
+        out arm64_cset_gt(cb, rd as int)
+    eif pred == LIR_CMP_LT do
+        out arm64_cset_lt(cb, rd as int)
+    eif pred == LIR_CMP_GE do
+        out arm64_cset_ge(cb, rd as int)
+    eif pred == LIR_CMP_LE do
+        out arm64_cset_le(cb, rd as int)
+    end
+    out arm64_cset_eq(cb, rd as int)
+end.
+
+func lir_intr_is_marker(kind: i64)
+    if kind == MIR_INTR_NOP_MARKER do out true end
+    if kind == MIR_INTR_DECL do out true end
+    if kind == MIR_INTR_QUIET do out true end
+    if kind == MIR_INTR_CHECK_CPU do out true end
+    if kind == MIR_INTR_PATCH_POINT do out true end
+    if kind == MIR_INTR_PRECOMP do out true end
+    if kind == MIR_INTR_EXPOSE do out true end
+    if kind == MIR_INTR_ASYNC do out true end
+    if kind == MIR_INTR_ATOMIC_VAR do out true end
+    if kind == MIR_INTR_TIMEOUT do out true end
+    if kind == MIR_INTR_ISOLATE do out true end
+    if kind == MIR_INTR_ENSURE do out true end
+    if kind == MIR_INTR_REVERT do out true end
+    out false
+end.
+
+func lir_intr_is_payload(kind: i64)
+    if kind == MIR_INTR_CAST do out true end
+    if kind == MIR_INTR_ADDR_OF do out true end
+    if kind == MIR_INTR_PTR do out true end
+    if kind == MIR_INTR_AWAIT_PASS do out true end
+    if kind == MIR_INTR_STR_LIT do out true end
+    if kind == MIR_INTR_INTERP do out true end
+    if kind == MIR_INTR_ENUM do out true end
+    if kind == MIR_INTR_ERROR do out true end
+    if kind == MIR_INTR_EXIST do out true end
+    if kind == MIR_INTR_BUILTIN do out true end
+    out false
+end.
+
+func lir_intr_is_identity(kind: i64)
+    out lir_intr_is_payload(kind)
+end.
+
+func patch_bl_site(cb: CodeBuf, at_off: i64, dest_off: i64)
+    rel = (dest_off - at_off) as int
+    imm26 = (rel shr 2) & 0x03FFFFFF
+    word = 0x94000000 | imm26
+    out codebuf_patch_u32(cb, at_off as int, word)
+end.
+
+func emit_bl_fixup(cb: CodeBuf, call_fixups: i64, target_kind: i64, target_id: i64, rd: i64)
+    at = codebuf_offset(cb) as i64
+    cb = arm64_bl_imm26(cb, 0)
+    call_fixups = vec_push_rt(call_fixups, LirCallFixup (
+        at_off: at,
+        target_kind: target_kind,
+        target_id: target_id
+    ))
+    if rd >= 0 and rd != 0 do
+        cb = arm64_mov_rr(cb, rd as int, 0)
+    end
+    out (cb, call_fixups)
+end.
+
+func emit_to_x0(cb: CodeBuf, opnd: LirOperand, assigned_phys: i64, scratch: i64)
+    var (cb2, r) = resolve_or_imm(cb, opnd, assigned_phys, scratch)
+    if r >= 0 and r != 0 do
+        out arm64_mov_rr(cb2, 0, r as int)
+    end
+    out cb2
+end.
+
+func emit_lir_setarg(cb: CodeBuf, ins: LirInstr, assigned_phys: i64, pending_stk: i64)
+    SCR = 9
+    ai = ins.aux
+    var (cb2, rval) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR)
+    if rval < 0 do
+        var (cb3, r1) = resolve_or_imm(cb2, ins.src1, assigned_phys, SCR)
+        cb2 = cb3
+        rval = r1
+    end
+    if rval < 0 do
+        out (cb2, pending_stk)
+    end
+    if ai >= 0 and ai < 8 do
+        if rval != ai do
+            cb2 = arm64_mov_rr(cb2, ai as int, rval as int)
+        end
+        out (cb2, pending_stk)
+    end
+    cb2 = arm64_str_pre(cb2, rval as int, 31, 0 - 16)
+    out (cb2, pending_stk + 1)
+end.
+
+func emit_lir_intrinsic(cb: CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assigned_phys: i64, call_fixups: i64)
+    kind = ins.aux
+    SCR = 9
+    if lir_intr_is_marker(kind) do
+        out (arm64_nop(cb), call_fixups)
+    end
+    if lir_intr_is_payload(kind) do
+        if rd >= 0 do
+            if ins.src1.op_type == LirOperandType.Imm do
+                out (arm64_movz_imm64(cb, rd as int, ins.src1.imm as int), call_fixups)
+            eif rs1 >= 0 do
+                out (arm64_mov_rr(cb, rd as int, rs1 as int), call_fixups)
+            end
+        end
+        out (arm64_nop(cb), call_fixups)
+    end
+    cb = emit_to_x0(cb, ins.src1, assigned_phys, SCR)
+    stub = kind
+    if stub < 1 or stub >= LIR_RT_STUB_COUNT do
+        stub = LIR_RT_UNRESOLVED
+    end
+    out emit_bl_fixup(cb, call_fixups, 1, stub, rd)
+end.
+
+# Typed accessor: a bare vec_get_rt result has no record type, so `.name`
+# would resolve against the wrong layout and read LirFunc.id instead.
+func lir_func_name(f: LirFunc)
+    out f.name
+end.
+
+# Names reaching LIR come from the AST, i.e. fat strings {data, len, len}
+# rt_streq would compare the 24-byte headers instead of the text.
+func lir_find_func_index(lir_funcs: i64, name: string)
+    n = vec_len_rt(lir_funcs)
+    var i = 0
+    when i < n loop
+        lf = vec_get_rt(lir_funcs, i)
+        if fat_str_eq(lir_func_name(lf), name) == 1 do
+            out i
+        end
+        i = i + 1
+    end
+    out -1
+end.
+
+func emit_lir_call(cb: CodeBuf, ins: LirInstr, rd: i64, func_obj: LirFunc, lir_funcs: i64, call_fixups: i64, pending_stk: i64)
+    sid = ins.aux
+    target_kind = 1
+    target_id = LIR_RT_UNRESOLVED
+    if func_obj.strings >= 0 and sid >= 0 and sid < vec_len_rt(func_obj.strings) do
+        cname = vec_get_rt(func_obj.strings, sid)
+        fi = lir_find_func_index(lir_funcs, cname)
+        if fi >= 0 do
+            target_kind = 0
+            target_id = fi
+        end
+    end
+    var (cb2, fix2) = emit_bl_fixup(cb, call_fixups, target_kind, target_id, rd)
+    if pending_stk > 0 do
+        bytes = pending_stk * 16
+        if bytes <= 4095 do
+            cb2 = arm64_add_imm(cb2, 31, 31, bytes as int)
+        end
+    end
+    out (cb2, fix2, 0)
+end.
+
+# print(i64) — decimal digits + '\n' via write(1, buf, len).
+# X0 holds the value; every other register the allocator may use (X1..X7, X16)
+# is saved in the 128-byte frame: x1..x6 at 0..40, x16 at 48, digits at 96..127.
+func emit_lir_rt_print_stub(cb: CodeBuf)
+    cb = arm64_sub_imm(cb, 31, 31, 128)
+    cb = arm64_str_uoff(cb, 1, 31, 0)
+    cb = arm64_str_uoff(cb, 2, 31, 8)
+    cb = arm64_str_uoff(cb, 3, 31, 16)
+    cb = arm64_str_uoff(cb, 4, 31, 24)
+    cb = arm64_str_uoff(cb, 5, 31, 32)
+    cb = arm64_str_uoff(cb, 6, 31, 40)
+    cb = arm64_str_uoff(cb, 16, 31, 48)
+
+    cb = arm64_mov_from_sp(cb, 5)
+    cb = arm64_add_imm(cb, 4, 5, 128);      # x4 = one past the digit buffer
+
+    # Absolute value, remembering the sign in x6.
+    cb = arm64_movz_imm64(cb, 6, 0)
+    cb = arm64_cmp_imm0(cb, 0)
+    cb = codebuf_emit_u32(cb, 0x5400006A);  # b.ge +12 → skip negate
+    cb = arm64_sub_rrr(cb, 0, 31, 0)
+    cb = arm64_movz_imm64(cb, 6, 1)
+
+    # Trailing newline occupies the highest byte.
+    cb = arm64_movz_imm64(cb, 1, 10)
+    cb = arm64_sub_imm(cb, 4, 4, 1)
+    cb = arm64_strb_reg(cb, 1, 4, 31)
+
+    # Digits, least significant first. Post-tested so 0 still emits "0".
+    cb = arm64_movz_imm64(cb, 2, 10)
+    cb = arm64_sdiv_rrr(cb, 1, 0, 2)
+    cb = arm64_msub_rrrr(cb, 3, 1, 2, 0)
+    cb = arm64_add_imm(cb, 3, 3, 48)
+    cb = arm64_sub_imm(cb, 4, 4, 1)
+    cb = arm64_strb_reg(cb, 3, 4, 31)
+    cb = arm64_mov_rr(cb, 0, 1)
+    cb = arm64_cmp_imm0(cb, 0)
+    cb = arm64_bne_imm19(cb, 0 - 28)
+
+    cb = arm64_cmp_imm0(cb, 6)
+    cb = arm64_beq_imm19(cb, 16);           # no sign → skip the '-'
+    cb = arm64_movz_imm64(cb, 3, 45)
+    cb = arm64_sub_imm(cb, 4, 4, 1)
+    cb = arm64_strb_reg(cb, 3, 4, 31)
+
+    cb = arm64_add_imm(cb, 2, 5, 128)
+    cb = arm64_sub_rrr(cb, 2, 2, 4);        # len = end - ptr
+    cb = arm64_mov_rr(cb, 1, 4)
+    cb = arm64_movz_imm64(cb, 0, 1);        # fd = stdout
+    cb = arm64_movz_imm64(cb, 16, 4);       # SYS_write
+    cb = arm64_svc(cb, 0x80)
+
+    cb = arm64_ldr_uoff(cb, 1, 31, 0)
+    cb = arm64_ldr_uoff(cb, 2, 31, 8)
+    cb = arm64_ldr_uoff(cb, 3, 31, 16)
+    cb = arm64_ldr_uoff(cb, 4, 31, 24)
+    cb = arm64_ldr_uoff(cb, 5, 31, 32)
+    cb = arm64_ldr_uoff(cb, 6, 31, 40)
+    cb = arm64_ldr_uoff(cb, 16, 31, 48)
+    cb = arm64_add_imm(cb, 31, 31, 128)
+    out arm64_ret(cb)
+end.
+
+# RT stubs 0..63 — every BL site patches here; no dangling BL#0.
+func emit_lir_rt_stubs(cb: CodeBuf)
+    offs = vec_new_rt()
+    var k = 0
+    when k < LIR_RT_STUB_COUNT loop
+        offs = vec_push_rt(offs, codebuf_offset(cb) as i64)
+        if k == LIR_RT_UNRESOLVED do
+            cb = arm64_movz_imm64(cb, 0, 0)
+            cb = arm64_ret(cb)
+        eif k == MIR_INTR_PRINT do
+            cb = emit_lir_rt_print_stub(cb)
+        eif k == LIR_RT_POW do
+            # Soft: return base in X0 (full pow in later rt lib)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_MATMUL do
+            cb = arm64_movz_imm64(cb, 0, 0)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_FMA do
+            cb = arm64_add_rrr(cb, 0, 0, 1)
+            cb = arm64_ret(cb)
+        else
+            # MIR_INTR_* : passthrough X0
+            cb = arm64_ret(cb)
+        end
+        k = k + 1
+    end
+    out (cb, offs)
+end.
+
+func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir_funcs: i64, call_fixups: i64)
+    cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+    cb = arm64_mov_from_sp(cb, 29)
+
+    stack_size = func_obj.stack_size
+    if (stack_size mod 16) != 0 do
+        stack_size = stack_size + (16 - (stack_size mod 16))
+    end
+    if stack_size > 0 and stack_size <= 4095 do
+        cb = arm64_sub_imm(cb, 31, 31, stack_size as int)
+    end
+
+    n_blocks = vec_len_rt(func_obj.blocks)
+    block_off = vec_new_rt()
+    var bi = 0
+    when bi < n_blocks loop
+        block_off = vec_push_rt(block_off, 0 - 1)
+        bi = bi + 1
+    end
+    fixups = vec_new_rt()
+    pending_stk = 0
+    SCR = 9
+    SCR2 = 10
+    SCRQ = 11
+
+    b_idx = 0
     when b_idx < n_blocks loop
-        b = vec_get_rt(func_obj.blocks, b_idx);
-        instrs = b.instrs;
-        n_instrs = vec_len_rt(instrs);
-        
-        i_idx = 0;
+        vec_set_rt(block_off, b_idx, codebuf_offset(cb) as i64)
+        b = vec_get_rt(func_obj.blocks, b_idx)
+        instrs = b.instrs
+        n_instrs = vec_len_rt(instrs)
+        i_idx = 0
         when i_idx < n_instrs loop
-            ins = vec_get_rt(instrs, i_idx);
-            
-            # Resolve physical registers
-            rd = -1;
-            rs1 = -1;
-            rs2 = -1;
-            
-            if ins.dst.op_type == LirOperandType.VRegInt do
-                rd = vec_get_rt(assigned_phys, ins.dst.vreg)
-            eif ins.dst.op_type == LirOperandType.PhysReg do
-                rd = ins.dst.phys_reg
-            end
-            if ins.src1.op_type == LirOperandType.VRegInt do
-                rs1 = vec_get_rt(assigned_phys, ins.src1.vreg)
-            eif ins.src1.op_type == LirOperandType.PhysReg do
-                rs1 = ins.src1.phys_reg
-            end
-            if ins.src2.op_type == LirOperandType.VRegInt do
-                rs2 = vec_get_rt(assigned_phys, ins.src2.vreg)
-            eif ins.src2.op_type == LirOperandType.PhysReg do
-                rs2 = ins.src2.phys_reg
-            end
-            # Emit instruction
-            if ins.op == LirOp.Add do
-                if rd >= 0 and rs1 >= 0 and rs2 >= 0 do
-                    cb = arm64_add_rrr(cb, rd, rs1, rs2)
+            ins = vec_get_rt(instrs, i_idx)
+            rd = resolve_reg(ins.dst, assigned_phys)
+            rs1 = resolve_reg(ins.src1, assigned_phys)
+            rs2 = resolve_reg(ins.src2, assigned_phys)
+
+            if ins.op == LirOp.Nop do
+                cb = arm64_nop(cb)
+            eif ins.op == LirOp.Add do
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_add_rrr(cb, rd as int, a as int, breg as int)
                 end
             eif ins.op == LirOp.Sub do
-                if rd >= 0 and rs1 >= 0 and rs2 >= 0 do
-                    cb = arm64_sub_rrr(cb, rd, rs1, rs2)
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_sub_rrr(cb, rd as int, a as int, breg as int)
                 end
             eif ins.op == LirOp.Mul do
-                if rd >= 0 and rs1 >= 0 and rs2 >= 0 do
-                    cb = arm64_mul_rrr(cb, rd, rs1, rs2)
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_mul_rrr(cb, rd as int, a as int, breg as int)
                 end
             eif ins.op == LirOp.Div do
-                if rd >= 0 and rs1 >= 0 and rs2 >= 0 do
-                    cb = arm64_sdiv_rrr(cb, rd, rs1, rs2)
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_sdiv_rrr(cb, rd as int, a as int, breg as int)
                 end
+            eif ins.op == LirOp.Rem do
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_sdiv_rrr(cb, SCRQ, a as int, breg as int)
+                    cb = arm64_msub_rrrr(cb, rd as int, SCRQ, breg as int, a as int)
+                end
+            eif ins.op == LirOp.And do
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_and_rrr(cb, rd as int, a as int, breg as int)
+                end
+            eif ins.op == LirOp.Or do
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_orr_rrr(cb, rd as int, a as int, breg as int)
+                end
+            eif ins.op == LirOp.Xor do
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_eor_rrr(cb, rd as int, a as int, breg as int)
+                end
+            eif ins.op == LirOp.Shl do
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_lsl_rrr(cb, rd as int, a as int, breg as int)
+                end
+            eif ins.op == LirOp.Shr do
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_lsr_rrr(cb, rd as int, a as int, breg as int)
+                end
+            eif ins.op == LirOp.Not do
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                if rd >= 0 and a >= 0 do
+                    cb = arm64_mvn_rr(cb, rd as int, a as int)
+                end
+            eif ins.op == LirOp.Pow do
+                var (cb, call_fixups) = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_POW, rd)
+            eif ins.op == LirOp.MatMul do
+                var (cb, call_fixups) = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_MATMUL, rd)
+            eif ins.op == LirOp.Fma do
+                var (cb, call_fixups) = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_FMA, rd)
             eif ins.op == LirOp.Mov do
                 if rd >= 0 do
                     if ins.src1.op_type == LirOperandType.Imm do
-                        cb = arm64_movz_imm64(cb, rd, ins.src1.imm)
+                        cb = arm64_movz_imm64(cb, rd as int, ins.src1.imm as int)
                     eif rs1 >= 0 do
-                        cb = arm64_mov_rr(cb, rd, rs1)
+                        cb = arm64_mov_rr(cb, rd as int, rs1 as int)
                     end
                 end
-            eif ins.op == LirOp.Ret do
-                if stack_size > 0 do
-                    # ADD SP, SP, #stack_size (placeholder)
-                    cb = arm64_add_rrr(cb, 31, 31, 0)
+            eif ins.op == LirOp.Cmp do
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                var (cb, breg) = resolve_or_imm(cb, ins.src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = emit_cmp_cset(cb, rd, a, breg, ins.aux)
                 end
+            eif ins.op == LirOp.Load do
+                if rd >= 0 and rs1 >= 0 do
+                    cb = codebuf_emit_u32(cb, 0xF9400000 | ((rs1 as int & 0x1F) << 5) | (rd as int & 0x1F))
+                end
+            eif ins.op == LirOp.Store do
+                if rs1 >= 0 and rs2 >= 0 do
+                    cb = codebuf_emit_u32(cb, 0xF9000000 | ((rs2 as int & 0x1F) << 5) | (rs1 as int & 0x1F))
+                end
+            eif ins.op == LirOp.Push do
+                var (cb, rval) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                if rval >= 0 do
+                    cb = arm64_str_pre(cb, rval as int, 31, 0 - 16)
+                end
+            eif ins.op == LirOp.SetArg do
+                var (cb, pending_stk) = emit_lir_setarg(cb, ins, assigned_phys, pending_stk)
+            eif ins.op == LirOp.Pop do
+                if rd >= 0 do
+                    cb = arm64_ldr_post(cb, rd as int, 31, 16)
+                end
+            eif ins.op == LirOp.Call do
+                var (cb, call_fixups, pending_stk) = emit_lir_call(cb, ins, rd, func_obj, lir_funcs, call_fixups, pending_stk)
+            eif ins.op == LirOp.Intrinsic do
+                var (cb, call_fixups) = emit_lir_intrinsic(cb, ins, rd, rs1, assigned_phys, call_fixups)
+            eif ins.op == LirOp.Jmp do
+                tgt = -1
+                if ins.src1.op_type == LirOperandType.Label do
+                    tgt = ins.src1.label_id
+                eif ins.src1.op_type == LirOperandType.Imm do
+                    tgt = ins.src1.imm
+                end
+                if tgt >= 0 do
+                    at = codebuf_offset(cb) as i64
+                    cb = arm64_b_imm26(cb, 0)
+                    fixups = vec_push_rt(fixups, LirFixup ( at_off: at, target_block: tgt, kind: 0 ))
+                end
+            eif ins.op == LirOp.JmpCond do
+                tgt = -1
+                if ins.src2.op_type == LirOperandType.Label do
+                    tgt = ins.src2.label_id
+                eif ins.src2.op_type == LirOperandType.Imm do
+                    tgt = ins.src2.imm
+                end
+                var (cb, a) = resolve_or_imm(cb, ins.src1, assigned_phys, SCR)
+                if a >= 0 do
+                    cb = codebuf_emit_u32(cb, 0xF100001F | ((a as int & 0x1F) << 5))
+                end
+                if tgt >= 0 do
+                    at = codebuf_offset(cb) as i64
+                    kind = 2
+                    if ins.aux == LIR_JMP_IFNOT do
+                        kind = 1
+                    end
+                    if kind == 1 do
+                        cb = arm64_beq_imm19(cb, 0)
+                    else
+                        cb = arm64_bne_imm19(cb, 0)
+                    end
+                    fixups = vec_push_rt(fixups, LirFixup ( at_off: at, target_block: tgt, kind: kind ))
+                end
+            eif ins.op == LirOp.Ret do
+                if ins.src1.op_type == LirOperandType.Imm do
+                    cb = arm64_movz_imm64(cb, 0, ins.src1.imm as int)
+                eif rs1 >= 0 and rs1 != 0 do
+                    cb = arm64_mov_rr(cb, 0, rs1 as int)
+                end
+                if stack_size > 0 and stack_size <= 4095 do
+                    cb = arm64_add_imm(cb, 31, 31, stack_size as int)
+                end
+                cb = arm64_ldp_post(cb, 29, 30, 31, 16)
                 cb = arm64_ret(cb)
             end
             i_idx = i_idx + 1
         end
         b_idx = b_idx + 1
     end
+
+    # Fall-through epilogue: a body without a trailing `out` (e.g. main) would
+    # otherwise run into whatever was emitted next and return to a stale LR.
+    if stack_size > 0 and stack_size <= 4095 do
+        cb = arm64_add_imm(cb, 31, 31, stack_size as int)
+    end
+    cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+    cb = arm64_ret(cb)
+
+    nf = vec_len_rt(fixups)
+    var fxi = 0
+    when fxi < nf loop
+        fx = vec_get_rt(fixups, fxi)
+        if fx.target_block >= 0 and fx.target_block < n_blocks do
+            dest = vec_get_rt(block_off, fx.target_block)
+            if dest >= 0 do
+                rel = (dest - fx.at_off) as int
+                if fx.kind == 0 do
+                    imm26 = (rel shr 2) & 0x03FFFFFF
+                    word = 0x14000000 | imm26
+                    cb = codebuf_patch_u32(cb, fx.at_off as int, word)
+                eif fx.kind == 1 do
+                    imm19 = (rel shr 2) & 0x7FFFF
+                    word = 0x54000000 | (imm19 << 5)
+                    cb = codebuf_patch_u32(cb, fx.at_off as int, word)
+                eif fx.kind == 2 do
+                    imm19 = (rel shr 2) & 0x7FFFF
+                    word = 0x54000001 | (imm19 << 5)
+                    cb = codebuf_patch_u32(cb, fx.at_off as int, word)
+                end
+            end
+        end
+        fxi = fxi + 1
+    end
+
+    out (cb, call_fixups)
+end.
+
+func emit_lir_module_arm64(lir_funcs: i64)
+    cb = codebuf_new(TargetArch.ARM64)
+    n_funcs = vec_len_rt(lir_funcs)
+    func_offs = vec_new_rt()
+    call_fixups = vec_new_rt()
+
+    var fi = 0
+    when fi < n_funcs loop
+        func_offs = vec_push_rt(func_offs, codebuf_offset(cb) as i64)
+        lf = vec_get_rt(lir_funcs, fi)
+        var (cb, call_fixups) = emit_lir_arm64_into(cb, lf, -1, lir_funcs, call_fixups)
+        fi = fi + 1
+    end
+
+    var (cb, rt_offs) = emit_lir_rt_stubs(cb)
+
+    nf = vec_len_rt(call_fixups)
+    var ci = 0
+    when ci < nf loop
+        fx = vec_get_rt(call_fixups, ci)
+        dest = -1
+        if fx.target_kind == 0 do
+            if fx.target_id >= 0 and fx.target_id < n_funcs do
+                dest = vec_get_rt(func_offs, fx.target_id)
+            end
+        else
+            if fx.target_id >= 0 and fx.target_id < LIR_RT_STUB_COUNT do
+                dest = vec_get_rt(rt_offs, fx.target_id)
+            end
+        end
+        if dest < 0 do
+            dest = vec_get_rt(rt_offs, LIR_RT_UNRESOLVED)
+        end
+        cb = patch_bl_site(cb, fx.at_off, dest)
+        ci = ci + 1
+    end
+
+    cb.start_offset = codebuf_offset(cb)
+    cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+    cb = arm64_mov_from_sp(cb, 29)
+    if n_funcs > 0 do
+        # Entry is `main`, wherever it sits in the module; index 0 only as
+        # a fallback for single-function fragments without a main.
+        main_idx = lir_find_func_index(lir_funcs, fat_str_new("main"))
+        if main_idx < 0 do
+            main_idx = 0
+        end
+        at = codebuf_offset(cb) as i64
+        cb = arm64_bl_imm26(cb, 0)
+        main_off = vec_get_rt(func_offs, main_idx)
+        cb = patch_bl_site(cb, at, main_off)
+    end
+    cb = arm64_mov_imm16(cb, 0, 0)
+    cb = arm64_mov_imm16(cb, 16, 1)
+    cb = codebuf_emit_u32(cb, 0xF2A04010)
+    cb = arm64_svc(cb, 0x80)
+    cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+    cb = arm64_ret(cb)
     out cb
 end.
-export emit_lir_arm64;
+
+# Single-func helper → module path.
+func emit_lir_arm64(func_obj: LirFunc, assigned_phys: i64, assigned_stack: i64)
+    funcs = vec_new_rt()
+    funcs = vec_push_rt(funcs, func_obj)
+    out emit_lir_module_arm64(funcs)
+end.
+
+export emit_lir_arm64, emit_lir_module_arm64, emit_lir_arm64_into
+export emit_lir_intrinsic, emit_lir_setarg, emit_lir_rt_stubs
+export lir_intr_is_marker, lir_intr_is_identity, lir_intr_is_payload
+export patch_bl_site, lir_find_func_index

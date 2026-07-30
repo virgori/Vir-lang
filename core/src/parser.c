@@ -4138,7 +4138,8 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
       return sw;
     }
     if (check(p, TOK_DOT)) {
-      /* Field assign: IDENT '.' FIELD_NAME '=' expr */
+      /* Field assign: IDENT ('.' FIELD_NAME)+ '=' expr */
+      uint32_t dot_pos = p->pos;
       advance(p); /* consume '.' */
       const vir_token_t *field = expect_name(p, "expected field name");
       if (field && check(p, TOK_ASSIGN)) {
@@ -4151,6 +4152,44 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
         if (val)
           ast_add_child(fa, val);
         return fa;
+      }
+      /* Nested target: a.b.c = expr — everything before the last field name
+       * forms the base expression, which is lowered to a pointer. */
+      if (field && check(p, TOK_DOT)) {
+        ast_node_t *base = ast_new(AST_IDENTIFIER);
+        strncpy(base->name, t->str.buf, AST_NAME_LEN - 1);
+        base->line = t->line;
+        const vir_token_t *pending = field;
+        int nested_ok = 1;
+        while (check(p, TOK_DOT)) {
+          advance(p); /* consume '.' */
+          const vir_token_t *next = expect_name(p, "expected field name");
+          if (!next) {
+            nested_ok = 0;
+            break;
+          }
+          ast_node_t *acc = ast_new(AST_FIELD_ACCESS);
+          strncpy(acc->name, pending->str.buf, AST_NAME_LEN - 1);
+          acc->line = pending->line;
+          ast_add_child(acc, base);
+          base = acc;
+          pending = next;
+        }
+        if (nested_ok && check(p, TOK_ASSIGN)) {
+          advance(p); /* consume '=' */
+          ast_node_t *val = parse_expr(p);
+          ast_node_t *fa = ast_new(AST_FIELD_ASSIGN);
+          strncpy(fa->name, t->str.buf, AST_NAME_LEN - 1);
+          strncpy(fa->name2, pending->str.buf, AST_NAME_LEN - 1);
+          fa->line = t->line;
+          if (val)
+            ast_add_child(fa, val);
+          ast_add_child(fa, base); /* children[1] = base pointer expr */
+          return fa;
+        }
+        /* Not an assignment after all — reparse the whole chain as an expr. */
+        p->pos = dot_pos - 1;
+        return parse_expr(p);
       }
       /* Not field assign - back up to before '.' and parse as expr */
       p->pos -= 3; /* back before 'c', '.', and 'inc' */
