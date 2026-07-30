@@ -2347,8 +2347,8 @@ var ages: dict[string, int] = ["Alice": 30, "Bob": 25]
 
 - `[key: value, ...]` — dict literal; the compiler infers types from the first element
 - `dict[K, V]` type annotation is optional
-- Built-in key types: `int`, `string`, `bool`, `ptr`
-- Entity keys require a `hash` method (see §20.1.4)
+- Key type `K` must satisfy **`Hashable`** (see §20.1.4): built-ins are provided; entities define their own
+- Key identity uses **equality** (`equals` / `operator ==`), not hash alone
 
 Canonical: `docs/vir_language_spec_v2.0_vi.md` §20.1.
 
@@ -2383,29 +2383,69 @@ end
 
 Iteration order is **not guaranteed** (hash table does not preserve insertion order).
 
-#### 20.1.4 Hash Function
+#### 20.1.4 Hashable — Hash & Equality
 
-Vir uses built-in hashes for primitive types. Entity keys must define a `hash` method:
+`dict[K, V]` accepts only `K: Hashable`. Hash selects the bucket; **key identity** requires equality to return true (same hash does not imply same key).
 
-| Key type | Hash |
-|----------|------|
-| `int`, `i32`, `u64`, ... | Identity hash (mod bucket count) |
-| `string` | FNV-1a |
-| `bool` | 0 or 1 |
-| Entity with `method hash -> int` | User-defined |
+##### Contract
+
+```vir
+interface Hashable:
+    method hash -> u64
+    method equals(other: Self) -> bool
+end.
+```
+
+| Rule | Detail |
+|------|--------|
+| `hash` return type | Always **`u64`** — never `int` (no negative hashes; independent of `int` width; fits FNV / SipHash / xxHash) |
+| `equals` | Required for entity keys (`Self` = same type) |
+| `operator ==` | If the type defines `operator ==(a: T, b: T) -> bool`, `dict` may use `==` instead of `equals` (same semantics) |
+| Compile-time constraint | `dict[K, V]` is a type error unless `K` is `Hashable` |
+
+Built-in types are treated as already implementing `Hashable` (no explicit `interface` declaration required).
+
+##### Default hash table
+
+| Key type | Hash (`-> u64`) |
+|----------|-----------------|
+| Integer (`int`, `i32`, `i64`, `u32`, `u64`, …) | Identity (zero-extend / bit-cast to `u64`, then mod bucket count) |
+| `bool` | `0` / `1` |
+| `string` | FNV-1a (result `u64`) |
+| Entity / type implementing `Hashable` | User-defined `hash() -> u64` |
+
+Built-in equality: value comparison. Entities: **only** via `equals` or `operator ==` — no silent field-by-field synthesis.
+
+##### Entity key example
 
 ```vir
 entity Point:
     x: int
     y: int
 
-    method hash -> int
-        out this.x * 31 + this.y
+    method hash -> u64
+        out (this.x as u64) * 31 + (this.y as u64)
+    end.
+
+    method equals(other: Point) -> bool
+        out this.x == other.x and this.y == other.y
     end.
 end.
 
 var grid: dict[Point, string] = [Point(x: 0, y: 0): "origin"]
 ```
+
+Equality via operator (if using `==` instead of `equals`):
+
+```vir
+operator ==(a: Point, b: Point) -> bool
+    out a.x == b.x and a.y == b.y
+end.
+```
+
+> **Implementation note:** A poorly distributed `hash` only hurts performance (more probes); incorrect `equals`/`==` breaks lookup semantics.
+
+Canonical: `docs/vir_language_spec_v2.0_vi.md` §20.1.4.
 
 #### 20.1.5 Internals
 
@@ -2414,7 +2454,8 @@ var grid: dict[Point, string] = [Point(x: 0, y: 0): "origin"]
 | **Collision** | Open addressing, linear probing |
 | **Load factor** | Resize at 75% |
 | **Allocation** | Arena-allocated bucket array |
-| **Equality** | Primitive: value comparison. Entity: field-by-field comparison |
+| **Lookup** | Bucket ← `hash(key) mod capacity` |
+| **Equality** | Primitive: value comparison. Entity / `Hashable`: `equals` or `operator ==` after hash match |
 
 ### 20.2 Map — Transformation Expression
 
@@ -3423,6 +3464,7 @@ From highest to lowest:
 | erx | — | Error register — reads thrown error code |
 | Return type arrow | `func f(): int` | `func f() -> int:` |
 | dict (was map) | `map[K,V]` | Type `dict[K,V]` + literal `[key: value, ...]` — same `[]` syntax; presence of `:` means dict |
+| `Hashable` / dict key | `method hash -> int`; field-by-field entity eq | `interface Hashable`: `hash -> u64` + `equals` (or `operator ==`); `dict[K,V]` requires `K: Hashable` (§20.1.4) |
 | Map expression | — | `map x in list: out expr end` — transformation |
 | Sized types | `int`, `float`, `string`, `bool` | + `i8`–`i64`, `u8`–`u64`, `ptr` |
 | Include paths | `include math;` | + `include net.http;` (dot-path directory mapping) |

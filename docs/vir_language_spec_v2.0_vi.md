@@ -2324,8 +2324,8 @@ var ages: dict[string, int] = ["Alice": 30, "Bob": 25]
 
 - `[key: value, ...]` — dict literal, compiler suy luận kiểu từ phần tử đầu tiên
 - Chú thích kiểu `dict[K, V]` tuỳ chọn
-- Kiểu khoá nguyên thuỷ: `int`, `string`, `bool`, `ptr`
-- Khoá entity cần phương thức `hash` (xem §20.1.4)
+- Kiểu khoá `K` phải thỏa **`Hashable`** (xem §20.1.4): nguyên thuỷ có sẵn; entity tự định nghĩa
+- Khoá trùng được xác định bằng **so sánh bằng** (`equals` / `operator ==`), không chỉ bằng hash
 
 #### 20.1.2 Thao tác
 
@@ -2358,29 +2358,67 @@ end
 
 Thứ tự duyệt **không đảm bảo** (hash table không giữ thứ tự chèn).
 
-#### 20.1.4 Hash Function
+#### 20.1.4 Hashable — Hash & Equality
 
-Vir dùng hash nội bộ cho các kiểu nguyên thuỷ. Khoá entity cần định nghĩa phương thức `hash`:
+`dict[K, V]` chỉ chấp nhận `K: Hashable`. Hash chọn bucket; **khóa trùng** chỉ khi so sánh bằng trả về true (hai khóa cùng hash chưa chắc cùng khóa).
 
-| Kiểu khoá | Hash |
-|-----------|------|
-| `int`, `i32`, `u64`, ... | Identity hash (mod bucket count) |
-| `string` | FNV-1a |
-| `bool` | 0 hoặc 1 |
-| Entity với `method hash -> int` | Do người dùng định nghĩa |
+##### Contract
+
+```vir
+interface Hashable:
+    method hash -> u64
+    method equals(other: Self) -> bool
+end.
+```
+
+| Quy tắc | Chi tiết |
+|---------|----------|
+| Kiểu trả về của `hash` | Luôn **`u64`** — không dùng `int` (tránh hash âm; không phụ thuộc `int` 32/64-bit; khớp FNV / SipHash / xxHash) |
+| `equals` | Bắt buộc cho khóa entity (cùng kiểu `Self`) |
+| `operator ==` | Nếu kiểu định nghĩa `operator ==(a: T, b: T) -> bool`, `dict` được dùng `==` thay cho `equals` (cùng semantics) |
+| Ràng buộc compile-time | `dict[K, V]` lỗi kiểu nếu `K` không phải `Hashable` |
+
+Nguyên thuỷ được coi là đã triển khai `Hashable` sẵn (không cần khai báo `interface`).
+
+##### Bảng hash mặc định
+
+| Kiểu khoá | Hash (`-> u64`) |
+|-----------|-----------------|
+| Integer (`int`, `i32`, `i64`, `u32`, `u64`, …) | Identity (zero-extend / bit-cast sang `u64`, rồi mod bucket count) |
+| `bool` | `0` / `1` |
+| `string` | FNV-1a (kết quả `u64`) |
+| Entity / kiểu triển khai `Hashable` | `hash() -> u64` do người dùng định nghĩa |
+
+So sánh bằng mặc định cho nguyên thuỷ: so giá trị. Entity: **chỉ** qua `equals` hoặc `operator ==` — không suy diễn âm thầm theo từng trường.
+
+##### Ví dụ entity khóa
 
 ```vir
 entity Point:
     x: int
     y: int
 
-    method hash -> int
-        out this.x * 31 + this.y
+    method hash -> u64
+        out (this.x as u64) * 31 + (this.y as u64)
+    end.
+
+    method equals(other: Point) -> bool
+        out this.x == other.x and this.y == other.y
     end.
 end.
 
 var grid: dict[Point, string] = [Point(x: 0, y: 0): "origin"]
 ```
+
+Tương đương equality bằng toán tử (nếu dùng `==` thay `equals`):
+
+```vir
+operator ==(a: Point, b: Point) -> bool
+    out a.x == b.x and a.y == b.y
+end.
+```
+
+> **Lưu ý triển khai:** `hash` kém phân tán chỉ ảnh hưởng hiệu năng (nhiều probe), không được phép làm sai semantics — sai `equals`/`==` mới làm sai lookup.
 
 #### 20.1.5 Nội bộ
 
@@ -2389,7 +2427,8 @@ var grid: dict[Point, string] = [Point(x: 0, y: 0): "origin"]
 | **Va chạm** | Open addressing, linear probing |
 | **Load factor** | Resize khi 75% |
 | **Cấp phát** | Bucket array trong Arena |
-| **So sánh** | Nguyên thuỷ: so giá trị. Entity: so từng trường |
+| **Lookup** | Bucket ← `hash(key) mod capacity` |
+| **So sánh** | Nguyên thuỷ: so giá trị. Entity / `Hashable`: `equals` hoặc `operator ==` sau khi hash khớp |
 
 ### 20.2 Map — Biểu thức biến đổi
 
@@ -3447,6 +3486,7 @@ Từ cao đến thấp:
 | arr_compact | — | `arr_compact(arr)` — thu hồi dead space resize mảng (§19.4) |
 | Kiểu mũi tên trả về | `func f(): int` | `func f() -> int:` |
 | dict (thay map) | `map[K,V]` | Kiểu `dict[K,V]` + literal `[key: value, ...]` — cùng cú pháp `[]`, có `:` là dict |
+| `Hashable` / dict key | `method hash -> int`; entity so field-by-field | `interface Hashable`: `hash -> u64` + `equals` (hoặc `operator ==`); `dict[K,V]` yêu cầu `K: Hashable` (§20.1.4) |
 | Map biểu thức | — | `map x in list: out expr end` — biến đổi |
 | Kiểu có kích thước | `int`, `float`, `string`, `bool` | + `i8`–`i64`, `u8`–`u64`, `ptr` |
 | Include đường dẫn | `include math;` | + `include net.http;` (ánh xạ thư mục) |
