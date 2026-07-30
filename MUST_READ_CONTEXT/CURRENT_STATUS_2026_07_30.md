@@ -78,6 +78,8 @@ Soft compiler (`stdlib/vir/compiler/virc.vri` qua `./core/build/vir run`) **ch�
 
 Control flow (`cg_if` / `cg_when`) and `cg_let_call_arg`. Spill `StackMem` emit still missing.
 
+**Handoff cho AI tiếp:** [`SOFT_PATH_DEBUG_HANDOFF_2026_07_30.md`](SOFT_PATH_DEBUG_HANDOFF_2026_07_30.md) — quy trình viết, test, rollback, playbook debug.
+
 ---
 
 ## Verify
