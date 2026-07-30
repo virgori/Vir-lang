@@ -215,9 +215,11 @@ static void track_moves(borrow_ctx_t *ctx, const q_function_t *func) {
             dst->state    = OWN_OWNED;
             dst->is_alloc = src->is_alloc;
         } else {
-            /* Source continues to be used → treat as copy (shared) */
-            dst->state      = OWN_OWNED;
-            dst->is_alloc   = src->is_alloc;
+            /* Source continues to be used → dst is a shared alias, not the
+             * owner. Leave is_alloc clear so compute_drops never frees the
+             * allocation through the alias while the source is still live
+             * (entity field reads lower to MOVE tmp, base + LOAD_WORD). */
+            dst->state = OWN_OWNED;
         }
     }
 }

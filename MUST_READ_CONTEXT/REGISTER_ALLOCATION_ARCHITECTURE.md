@@ -1,6 +1,6 @@
 # Register Allocation Architecture (Vir)
 
-Updated: 2026-07-28
+Updated: 2026-07-30
 
 **Language spec** (`vir_language_spec` §16 `register`) chỉ mô tả ánh xạ bit phần cứng — **không** quy định thuật toán RA. Tài liệu này là **spec compiler** cho allocation / coalescing.
 
@@ -42,6 +42,12 @@ George–Appel **không** thay bước B; nó chạy **sau** khi LIR đã sạch
 | Stage-1 thin (`virc_stage1.vri`) | **Experiment (2026-07-28):** Linear Scan locals → x19–x22 + mini `let a=b;` mov; rest fp | Giữ experiment; nâng Stage-2 trước full GA |
 
 **Không** ghi George–Appel vào language spec. Chỉ soft/compiler docs + module `lir_*`.
+
+### Soft path gap (2026-07-30)
+
+`compile_pipeline` chạy Chaitin–Briggs và nhận `(lf2, phys_map, stack_map)`, nhưng `emit_lir_module_arm64` hiện gọi `emit_lir_arm64_into(..., assigned_phys: -1, ...)` — tức **identity** vreg→phys. Hệ quả quan sát được: nhiều vreg bị emit như `x0` (`add x0, x0, x0` thay vì `add x0, x0, #1`), làm sai `cg_call`/`cg_var` dù live intervals trông hợp lý.
+
+**Next:** rewrite operand sang PhysReg trước emit, hoặc truyền `phys_map` vào emitter và tôn trọng nó trong `resolve_reg`.
 
 ---
 

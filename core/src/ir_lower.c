@@ -927,6 +927,16 @@ static void symbol_infer_record_type_from_expr(lower_ctx_t *ctx,
   if (record_type_for_expr(ctx, expr, &type_name) && type_name && type_name[0]) {
     strncpy(ent->type_name, type_name, AST_NAME_LEN - 1);
     ent->type_name[AST_NAME_LEN - 1] = '\0';
+    return;
+  }
+  /* Container types `[T]` are not record types, but carrying them keeps the
+   * element type available for `vec_get_rt(container, i).field` chains. */
+  char arr_type[AST_NAME_LEN];
+  char elem[AST_NAME_LEN];
+  if (copy_expr_type_name(ctx, expr, arr_type, sizeof(arr_type)) &&
+      copy_array_element_type_name(arr_type, elem, sizeof(elem))) {
+    strncpy(ent->type_name, arr_type, AST_NAME_LEN - 1);
+    ent->type_name[AST_NAME_LEN - 1] = '\0';
   }
 }
 
@@ -3753,10 +3763,20 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
       for (uint32_t i = 0; i < stmt->child_count - 1; i++) {
         ast_node_t *ident = stmt->children[i];
         if (strcmp(ident->name, "_") == 0) continue;
-        
-        uint32_t r = fresh_vreg(ctx);
-        sym_define(&ctx->symbols, ident->name, r, VIR_TYPE_I64);
-        
+
+        /* Same policy as the scalar decl below: a name already bound in the
+         * current function (local or param) is updated in place, so reads
+         * after a nested `var (cb, x) = ...` still see the live value. */
+        uint32_t r = 0;
+        uint32_t existing_idx = 0;
+        if (sym_lookup_both(ctx, ident->name, &existing_idx) == 0) {
+          r = existing_idx;
+        } else {
+          r = fresh_vreg(ctx);
+          sym_define(&ctx->symbols, ident->name, r, VIR_TYPE_I64);
+        }
+
+
         if (expr_vreg >= 0) {
           uint32_t idx_r = fresh_vreg(ctx);
           emit(ctx, q_instr(Q_LOAD, q_vreg(idx_r), q_imm(i), q_none()));
@@ -4799,9 +4819,38 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
   }
 
   case AST_FIELD_ASSIGN: {
-    /* name = variable name, name2 = field name, children[0] = value */
+    /* name = variable name, name2 = field name, children[0] = value,
+     * children[1] (optional) = base pointer expr for nested targets
+     * such as `a.b.c = v`. */
     if (stmt->child_count < 1)
       return -1;
+
+    if (stmt->child_count >= 2 && stmt->children[1]) {
+      const ast_node_t *base_expr = stmt->children[1];
+      const record_type_t *base_rt = record_type_for_expr(ctx, base_expr, NULL);
+      int offset = base_rt ? record_field_offset(base_rt, stmt->name2) : -1;
+      if (offset < 0) {
+        if (lowering_strict_fields()) {
+          char buf[128];
+          snprintf(buf, sizeof(buf), "unknown field: %s", stmt->name2);
+          lower_error(ctx, stmt, buf);
+          return -1;
+        }
+        return 0;
+      }
+      int base_r = lower_expr(ctx, base_expr);
+      if (base_r < 0)
+        return -1;
+      int val = lower_expr(ctx, stmt->children[0]);
+      if (val < 0)
+        return -1;
+      uint32_t off_r = fresh_vreg(ctx);
+      emit(ctx,
+           q_instr(Q_LOAD, q_vreg(off_r), q_imm((int64_t)offset), q_none()));
+      emit(ctx, q_instr(Q_STORE_WORD, q_vreg((uint32_t)val),
+                        q_vreg((uint32_t)base_r), q_vreg(off_r)));
+      return 0;
+    }
 
     /* §16 register/mold field write: RMW on the variable's vreg. */
     {

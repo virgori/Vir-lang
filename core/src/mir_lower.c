@@ -23,13 +23,22 @@ static mir_operand_t lower_mir_call_by_name(
     if (fidx < 0)
         return none;
 
-    for (uint32_t i = 0; i < argc && i < Q_MAX_PARAMS; i++) {
+    /* Park every argument in a fresh vreg first: an argument may itself be a
+     * call, which clobbers the ABI slots (vreg 0..n) and the R0 return slot. */
+    uint32_t nargs = argc < Q_MAX_PARAMS ? argc : Q_MAX_PARAMS;
+    mir_operand_t staged[Q_MAX_PARAMS];
+    for (uint32_t i = 0; i < nargs; i++) {
         mir_operand_t arg = lower_hir_node_to_mir(
             func, current_block, loop_hdr, loop_end, args[i], lctx);
         if (arg.type == MIR_OPND_NONE)
             return none;
+        mir_operand_t tmp = { MIR_OPND_VREG, {alloc_vreg(func)} };
+        mir_append_instr(*current_block, MIR_MOVE, tmp, arg, none);
+        staged[i] = tmp;
+    }
+    for (uint32_t i = 0; i < nargs; i++) {
         mir_operand_t slot = { MIR_OPND_VREG, {i} };
-        mir_append_instr(*current_block, MIR_MOVE, slot, arg, none);
+        mir_append_instr(*current_block, MIR_MOVE, slot, staged[i], none);
     }
 
     mir_operand_t fidx_op = { MIR_OPND_IMM, {(int64_t)fidx} };
@@ -246,12 +255,23 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
             if (fidx < 0)
                 return none;
 
-            for (uint32_t i = 0; i < hir->as.call.argc && i < Q_MAX_PARAMS; i++) {
+            /* Same ABI hazard as lower_mir_call_by_name: stage into fresh
+             * vregs first, then fill slots 0..n-1 right before the call. */
+            uint32_t nargs = hir->as.call.argc < Q_MAX_PARAMS
+                                 ? hir->as.call.argc
+                                 : Q_MAX_PARAMS;
+            mir_operand_t staged[Q_MAX_PARAMS];
+            for (uint32_t i = 0; i < nargs; i++) {
                 mir_operand_t arg = lower_hir_node_to_mir(
                     func, current_block, loop_hdr, loop_end, hir->as.call.args[i],
                     lctx);
+                mir_operand_t tmp = { MIR_OPND_VREG, {alloc_vreg(func)} };
+                mir_append_instr(*current_block, MIR_MOVE, tmp, arg, none);
+                staged[i] = tmp;
+            }
+            for (uint32_t i = 0; i < nargs; i++) {
                 mir_operand_t slot = { MIR_OPND_VREG, {i} };
-                mir_append_instr(*current_block, MIR_MOVE, slot, arg, none);
+                mir_append_instr(*current_block, MIR_MOVE, slot, staged[i], none);
             }
 
             mir_operand_t fidx_op = { MIR_OPND_IMM, {(int64_t)fidx} };
