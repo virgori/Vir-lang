@@ -327,6 +327,8 @@ static const builtin_map_t builtins[] = {
     {"__ctz",         BUILTIN_CTZ},
     {"__popcnt",      BUILTIN_POPCNT},
     {"__bswap",       BUILTIN_BSWAP},
+    {"__not",         BUILTIN_BITNOT},
+    {"bnot",          BUILTIN_BITNOT},
     {"__atomic_load", BUILTIN_ATOMIC_LOAD},
     {"__atomic_store",BUILTIN_ATOMIC_STORE},
     {"__atomic_add",  BUILTIN_ATOMIC_ADD},
@@ -862,7 +864,7 @@ static ast_node_t *parse_unary(vir_parser_t *p) {
    * `&` in prefix position = borrow; in infix position = logical AND.
    * parse_unary is only called at the start of an operand, so `&` here
    * is unambiguously a borrow. */
-  if (check(p, TOK_AND)) {
+  if (check(p, TOK_AND) || check(p, TOK_BIT_AND)) {
     const vir_token_t *t = advance(p);
     int is_mut = 0;
     if (check(p, TOK_IDENT) && strcmp(peek(p)->str.buf, "mut") == 0) {
@@ -1399,11 +1401,13 @@ static ast_node_t *parse_expr(vir_parser_t *p) { return parse_or_expr(p); }
 static ast_node_t *parse_block(vir_parser_t *p) {
   ast_node_t *block = ast_new(AST_BLOCK);
 
-  skip_newlines(p);
-
-  while (!check(p, TOK_END) && !check(p, TOK_ELSE) && !check(p, TOK_ELIF) &&
-         !check(p, TOK_EIF) && !check(p, TOK_REVERT) && !check(p, TOK_ENSURE) &&
-         !check(p, TOK_EOF)) {
+  while (1) {
+    skip_newlines(p);
+    if (check(p, TOK_END) || check(p, TOK_ELSE) || check(p, TOK_ELIF) ||
+        check(p, TOK_EIF) || check(p, TOK_REVERT) || check(p, TOK_ENSURE) ||
+        check(p, TOK_EOF)) {
+        break;
+    }
     ast_node_t *stmt = parse_statement(p);
     if (stmt) {
       ast_add_child(block, stmt);
