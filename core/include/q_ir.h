@@ -287,7 +287,7 @@ typedef struct {
     uint32_t         label_map_len;
 } q_function_t;
 
-#define Q_MAX_FUNCTIONS  1024
+#define Q_MAX_FUNCTIONS  4096
 #define Q_MAX_STRINGS    16384
 
 typedef struct {

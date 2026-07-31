@@ -988,6 +988,11 @@ static void intr_popcnt(vir_intrinsic_ctx_t *ctx) {
 #endif
 }
 
+static void intr_bitnot(vir_intrinsic_ctx_t *ctx) {
+    uint64_t v = (uint64_t)ctx->args[0];
+    *ctx->ret = ~v;
+}
+
 static void intr_bswap(vir_intrinsic_ctx_t *ctx) {
     uint64_t v = (uint64_t)ctx->args[0];
 #if defined(__GNUC__) || defined(__clang__)
@@ -1092,6 +1097,9 @@ vir_intr_desc_t vir_intr_table[VIR_MAX_INTRINSICS] = {
     /* ID21 */ { intr_native_write_u8, 3, INTR_IMPURE,        "native_write_u8" },
     /* ID22 */ { intr_native_read_i64, 2, INTR_PURE,          "native_read_i64" },
     /* ID23 */ { intr_native_write_i64,3, INTR_IMPURE,        "native_write_i64" },
+    /* ID36 */ { intr_memcpy,  3, INTR_IMPURE,          "native_mem_copy" },
+    /* ID37 */ { intr_memcpy,  3, INTR_IMPURE,          "native_memcpy" },
+    /* ID38 */ { intr_memcpy,  3, INTR_IMPURE,          "native_memmove" },
     /* ID24 */ { intr_native_read_u8,  2, INTR_PURE,          "read_byte" },
     /* ID25 */ { intr_native_read_u8,  2, INTR_PURE,          "read_u8" },
     /* virc_boot extern syscall shims (empty body → name dispatch) */
@@ -1106,6 +1114,9 @@ vir_intr_desc_t vir_intr_table[VIR_MAX_INTRINSICS] = {
     /* ID33 */ { intr_native_file_read,  3, INTR_IMPURE,     "native_file_read" },
     /* ID34 */ { intr_native_file_write, 3, INTR_IMPURE,     "native_file_write" },
     /* ID35 */ { intr_native_errno,      0, INTR_PURE,       "native_errno" },
+    /* unused 36-39 (used by memcpy shims earlier) */
+    /* ID39 */ { NULL, 0, 0, NULL },
+    /* ID40 */ { intr_bitnot, 1, INTR_PURE,                  "bitnot"     },
 };
 
 
@@ -1670,6 +1681,8 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         int64_t src = operand_value(vm, &instr->src1);
         int64_t len = operand_value(vm, &instr->src2);
         if (dst && src && len > 0) {
+            if (len == 48) { printf("VM Q_MEM_COPY: dst=%lld src=%lld len=%lld\n", dst, src, len); }
+
             memcpy((void *)(intptr_t)dst, (const void *)(intptr_t)src, (size_t)len);
         }
         break;
@@ -2039,7 +2052,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     }
     case Q_PRINT_STR: {
         const char *s = (const char *)(intptr_t)operand_value(vm, &instr->src1);
-        fprintf(stderr, "[Q_PRINT_STR] s=%p val='%s'\n", s, s ? s : "(null)");
+        fprintf(stderr, "[Q_PRINT_STR] s=%p hex=%02x%02x%02x%02x\n", s, s?s[0]&0xff:0, s?s[1]&0xff:0, s?s[2]&0xff:0, s?s[3]&0xff:0);
         if (s) { fputs(s, stdout); fflush(stdout); }
         break;
     }
