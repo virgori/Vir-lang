@@ -7,7 +7,7 @@
 
 ## Table of Contents
 
-1. [Overview](#1-overview) — includes [§1.0 Separator](#10-separator----or-newline), [§1.1 Block openers](#11-block-openers--do--loop--), [§1.2 Language / Compiler / Library Separation](#12-language--compiler--library-separation)
+1. [Overview](#1-overview) — includes [§1.0 Separator](#10-separator----or-newline), [§1.1 Block openers](#11-block-openers--do--loop--), [§1.2 Language / Compiler / Library Separation](#12-language--compiler--library-separation) (includes [compiler IR pipeline](#compiler-ir-pipeline-hir--mir--lir))
 2. [Comments](#2-comments)
 3. [Module System](#3-module-system)
 4. [Types](#4-types)
@@ -245,6 +245,26 @@ Vir **does not** bind the language to a single execution runtime (unlike Go, Erl
 | **Language** | Syntax, type system, ownership, lifetime, memory model |
 | **Compiler** | Analysis, optimization, codegen |
 | **Library** | Threads, async executors, schedulers, actors, work stealing, ArenaPool |
+
+#### Compiler IR pipeline (HIR → MIR → LIR)
+
+The Vir compiler uses **one** official IR chain. Source of truth: soft modules `hir.vri`, `mir.vri`, `lir.vri` (and their lowerers/codegen). The Spec does not enumerate every opcode; it fixes order and roles:
+
+```text
+AST
+ ↓
+HIR   — near-source semantics (after parse / before full SSA)
+ ↓
+MIR   — CFG / SSA, mid-level optimization
+ ↓
+LIR   — near-machine: virtual/physical regs, stack, RT stubs
+ ↓
+Optimizer passes (on the appropriate tier)
+ ↓
+Codegen → machine code (ARM64, …)
+```
+
+Borrow checking and ownership analyses run on this pipeline (typically once a CFG-capable IR exists — see §4.8). Historical names **Q-IR** / **QIR-H/M/L** are not the official architecture.
 
 #### Principle: the compiler must not know that a scheduler exists
 
@@ -617,7 +637,7 @@ For FFI or bare-metal scenarios requiring manual management, use `ptr` + `malloc
 
 ### 4.8 Ownership, Borrow Checker, and Move Semantics
 
-Vir has a **compile-time borrow checker** that enforces memory safety without garbage collection or reference counting. The borrow checker runs as a compiler pass after IR lowering, before codegen.
+Vir has a **compile-time borrow checker** that enforces memory safety without garbage collection or reference counting. The borrow checker runs as a compiler pass on the IR pipeline (after appropriate HIR/MIR lowering), before codegen.
 
 #### Ownership Rules
 
@@ -698,7 +718,7 @@ print(r[0])              # r is still in scope here → conflict
 
 #### Auto-drop and arena scoping
 
-Arena-allocated objects (`array`, `entity`, `string`, `dict`) are dropped automatically when their owner leaves scope. The borrow checker inserts `Q_FREE` drop instructions at the computed death point — no `free()` calls needed.
+Arena-allocated objects (`array`, `entity`, `string`, `dict`) are dropped automatically when their owner leaves scope. The borrow checker inserts drop points at the computed death point — no `free()` calls needed.
 
 ```vir
 func example:
@@ -716,13 +736,15 @@ Objects that **escape** to the caller (via `out` or move-return) are promoted to
 #### Borrow checker pipeline position
 
 ```
-AST → ir_lower → Q-IR → TCO pass → ★ Borrow Check ★ → Optimizer → Codegen
-                                         │
-                                         ├── Ownership inference
-                                         ├── Borrow conflict validation
-                                         ├── Lifetime analysis
-                                         └── Drop point insertion (Q_FREE)
+AST → HIR → MIR → ★ Borrow Check ★ → LIR → Optimizer → Codegen
+                        │
+                        ├── Ownership inference
+                        ├── Borrow conflict validation
+                        ├── Lifetime analysis
+                        └── Drop point insertion
 ```
+
+(Opcode/pass details: see compiler modules and [`ARCHITECTURE.md`](ARCHITECTURE.md). A flat “Q-IR” pipeline is no longer the standard.)
 
 **Compile-time cost:** +5–10% compile time for the borrow check pass. Zero runtime overhead — all checks are resolved at compile time.
 
@@ -1215,6 +1237,8 @@ skip         # skip to next iteration (replaces 'continue')
 | `xor` | Bitwise XOR | 2 |
 | `shl` | Shift left | 12 |
 | `shr` | Shift right | 12 |
+| `bnot(x)` | Bitwise NOT (unary, prefix call) | — |
+| `__not(x)` | Bitwise NOT — alias of `bnot`, kept for compiler compatibility | — |
 
 ### 10.5 Special
 
@@ -3231,7 +3255,7 @@ Vir provides low-level intrinsics for systems programming (available without `@b
 | `__popcnt(x)` | Population count |
 | `__bswap(x)` | Byte swap |
 | `__neg(x)` | Negate |
-| `__not(x)` | Bitwise NOT |
+| `__not(x)` / `bnot(x)` | Bitwise NOT — `bnot` is canonical; `__not` is legacy alias |
 | `__fence()` | Memory fence (barrier) |
 | `__trap()` | Trigger hardware trap |
 | `volatile_read(addr)` | Volatile load + barrier |
@@ -3413,6 +3437,7 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 | `mod` | Modulo operator |
 | `xor` / `shl` / `shr` | Bitwise operators |
 | `and` / `or` | Bitwise AND / OR |
+| `bnot(x)` / `__not(x)` | Bitwise NOT — `bnot` is the canonical form; `__not` is a legacy alias |
 
 ---
 

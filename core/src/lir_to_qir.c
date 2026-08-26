@@ -41,6 +41,8 @@ static q_opcode_t map_lir_op(lir_op_t op) {
         return Q_JUMP_IF;
     case LIR_RET:
         return Q_RET;
+    case LIR_EXIT:
+        return Q_EXIT;
     case LIR_LOAD:
         return Q_LOAD;
     case LIR_STORE:

@@ -17,8 +17,9 @@ Updated: 2026-07-26
 
 ## Coverage
 
+**Official IR spine:** AST → **HIR** → **MIR** → **LIR** → Codegen (Spec §1.2). Soft may still emit AST→MIR until HIR is wired.  
 **Do not conflate:** Syntax (lex/parse) ≠ IR contract (`MirOp`/`MIR_INTR_*`) ≠ Lowering (`ast_to_mir`).  
-Measurable gap vs Spec §29–§30: [`SPEC_IR_SURFACE_ROADMAP.md`](SPEC_IR_SURFACE_ROADMAP.md) (Spec→AST→MIR→LIR→Codegen→Runtime + P0/P1/P2).  
+Measurable gap vs Spec §29–§30: [`SPEC_IR_SURFACE_ROADMAP.md`](SPEC_IR_SURFACE_ROADMAP.md) (Spec→AST→HIR→MIR→LIR→Codegen→Runtime + P0/P1/P2).  
 **Soft lexer:** Spec §29 keywords **75/75**.  
 **Soft parser:** all keyword + op `TokType` → AST.  
 **Soft ast_to_mir:** all **95 AstTypes** + **24 OpTypes** lowered (roadmap §1–2). `MIR_INTR_*` **1–60**.

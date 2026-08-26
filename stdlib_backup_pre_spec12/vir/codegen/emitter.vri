@@ -1,0 +1,262 @@
+/*
+ * vir/codegen/emitter.vri — Backend Emitter Framework
+ * =====================================================
+ * Step 2: Write Backend Emitter in Vir
+ *
+ * Orchestrates code generation from QIR-L nodes to platform assembly.
+ * Uses rule-based optimization ranking (Grade S/A/B) for instruction selection.
+ *
+ * Architecture:
+ *   QIR-L Node -> KernelPattern match -> Grade ranking -> Emit instructions
+ *
+ * Supported targets:
+ *   - ARM64 (macOS) via vir/codegen/arm64.vri
+ *   - Future: x86_64, WASM
+ */
+
+import "vir/core/types" use all
+import "vir/core/result" use Result, Ok, Err
+import "vir/core/option" use Option, Some, None
+import "vir/str/string" use String, str_new, str_concat, str_eq
+import "vir/collections/vec" use Vec, vec_new, vec_push, vec_len, vec_get
+import "vir/collections/map" use Map, map_new, map_set, map_get
+import "vir/io/stdio" use println
+import "vir/codegen/arm64" use all
+
+# ═══════════════════════════════════════════════════════
+# QIR-L Op Codes (mirror of Python QIRLOp)
+# ═══════════════════════════════════════════════════════
+
+enum LowOp
+    TileLoop      = 0
+    VectorLoop    = 1
+    ParallelFor   = 2
+    KernelCall    = 3
+    MicroGemm     = 4
+    MicroEW       = 5
+    MicroReduce   = 6
+    Prefetch      = 7
+    CacheFlush    = 8
+    Barrier       = 9
+    ScalarOp      = 10
+end
+
+# ═══════════════════════════════════════════════════════
+# Kernel Pattern — describes a code generation template
+# ═══════════════════════════════════════════════════════
+
+entity KernelPattern
+    name:           String
+    op:             LowOp
+    grade:          Grade          # S/A/B ranking
+    vector_width:   i32
+    tile_m:         i32
+    tile_n:         i32
+    tile_k:         i32
+end
+
+# ═══════════════════════════════════════════════════════
+# Emitter Context — tracks state during code generation
+# ═══════════════════════════════════════════════════════
+
+entity EmitterCtx
+    asm:            AsmEmitter
+    target:         String         # "arm64" | "x86_64"
+    patterns:       Vec<KernelPattern>
+    stats_grade_s:  i32
+    stats_grade_a:  i32
+    stats_grade_b:  i32
+end
+
+func ctx_new(target: String) -> EmitterCtx
+    out EmitterCtx {
+        asm: emitter_new(),
+        target: target,
+        patterns: vec_new(),
+        stats_grade_s: 0,
+        stats_grade_a: 0,
+        stats_grade_b: 0
+    }
+end
+
+# ═══════════════════════════════════════════════════════
+# Pattern Registry
+# ═══════════════════════════════════════════════════════
+
+func register_pattern(ctx: EmitterCtx, pat: KernelPattern) -> EmitterCtx
+    vec_push(ctx.patterns, pat)
+    out ctx
+end
+
+func register_default_arm64_patterns(ctx: EmitterCtx) -> EmitterCtx
+    # Grade S: NEON micro-GEMM 4x4
+    var em = register_pattern(ctx, KernelPattern {
+        name: str_new("gemm_neon_4x4"),
+        op: LowOp::MicroGemm,
+        grade: Grade::S,
+        vector_width: 4,
+        tile_m: 4, tile_n: 4, tile_k: 4
+    })
+
+    # Grade S: NEON elementwise add
+    em = register_pattern(em, KernelPattern {
+        name: str_new("ew_add_neon"),
+        op: LowOp::MicroEW,
+        grade: Grade::S,
+        vector_width: 4,
+        tile_m: 0, tile_n: 0, tile_k: 0
+    })
+
+    # Grade S: NEON ReLU
+    em = register_pattern(em, KernelPattern {
+        name: str_new("relu_neon"),
+        op: LowOp::MicroEW,
+        grade: Grade::S,
+        vector_width: 4,
+        tile_m: 0, tile_n: 0, tile_k: 0
+    })
+
+    # Grade B: Scalar fallback
+    em = register_pattern(em, KernelPattern {
+        name: str_new("scalar_fallback"),
+        op: LowOp::ScalarOp,
+        grade: Grade::B,
+        vector_width: 1,
+        tile_m: 1, tile_n: 1, tile_k: 1
+    })
+
+    out em
+end
+
+# ═══════════════════════════════════════════════════════
+# Pattern Selection (Rule-based ranking)
+# ═══════════════════════════════════════════════════════
+
+func select_best_pattern(ctx: EmitterCtx, op: LowOp, vw: i32) -> Option<KernelPattern>
+    var best: Option<KernelPattern> = None
+    var best_grade = 99
+
+    var i = 0
+    while i < vec_len(ctx.patterns)
+        var pat = vec_get(ctx.patterns, i)
+        if pat.op == op
+            var g = 0
+            if pat.grade == Grade::S
+                g = 0
+            end
+            if pat.grade == Grade::A
+                g = 1
+            end
+            if pat.grade == Grade::B
+                g = 2
+            end
+
+            if g < best_grade
+                # Prefer matching vector width
+                if pat.vector_width == vw or vw == 0
+                    best = Some(pat)
+                    best_grade = g
+                end
+            end
+        end
+        i = i + 1
+    end
+    out best
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Emit QIR-L Node
+# ═══════════════════════════════════════════════════════
+
+func emit_l_node(ctx: EmitterCtx, op: LowOp, kernel_family: String,
+                vw: i32, tile_m: i32, tile_n: i32, tile_k: i32) -> EmitterCtx
+    var pat_opt = select_best_pattern(ctx, op, vw)
+
+    # Emit based on best matching pattern
+    if op == LowOp::MicroGemm
+        emit_comment(ctx.asm, format("MICRO_GEMM tile={}x{}x{} vw={}",
+            tile_m, tile_n, tile_k, vw))
+        ctx.asm = emit_micro_gemm_4x4(ctx.asm, x(0), x(1), x(2), x(3))
+        ctx.stats_grade_s = ctx.stats_grade_s + 1
+        out ctx
+    end
+
+    if op == LowOp::MicroEW
+        if str_eq(kernel_family, str_new("add"))
+            emit_comment(ctx.asm, str_new("MICRO_EW: add"))
+            ctx.asm = emit_ew_add_neon(ctx.asm, x(0), x(1), x(2), x(3))
+            ctx.stats_grade_s = ctx.stats_grade_s + 1
+            out ctx
+        end
+        if str_eq(kernel_family, str_new("relu"))
+            emit_comment(ctx.asm, str_new("MICRO_EW: relu"))
+            ctx.asm = emit_relu_neon(ctx.asm, x(0), x(1), x(2))
+            ctx.stats_grade_s = ctx.stats_grade_s + 1
+            out ctx
+        end
+        # Grade A: generic elementwise (not fused)
+        emit_comment(ctx.asm, format("MICRO_EW: {} (Grade A fallback)", kernel_family))
+        ctx.asm = emit_bl(ctx.asm, format("_vir_{}_f32", kernel_family))
+        ctx.stats_grade_a = ctx.stats_grade_a + 1
+        out ctx
+    end
+
+    if op == LowOp::MicroReduce
+        emit_comment(ctx.asm, format("MICRO_REDUCE: {}", kernel_family))
+        ctx.asm = emit_bl(ctx.asm, format("_vir_{}_f32", kernel_family))
+        ctx.stats_grade_a = ctx.stats_grade_a + 1
+        out ctx
+    end
+
+    # Grade B: scalar fallback
+    emit_comment(ctx.asm, format("SCALAR_OP: {} (Grade B)", kernel_family))
+    ctx.asm = emit_bl(ctx.asm, format("_vir_{}_scalar", kernel_family))
+    ctx.stats_grade_b = ctx.stats_grade_b + 1
+    out ctx
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Grade Report
+# ═══════════════════════════════════════════════════════
+
+func grade_report(ctx: EmitterCtx) -> String
+    var total = ctx.stats_grade_s + ctx.stats_grade_a + ctx.stats_grade_b
+    if total == 0
+        out str_new("No instructions emitted.")
+    end
+    out format(
+        "Grade Report: S={} ({:.0}%) A={} ({:.0}%) B={} ({:.0}%)",
+        ctx.stats_grade_s,
+        ctx.stats_grade_s * 100 / total,
+        ctx.stats_grade_a,
+        ctx.stats_grade_a * 100 / total,
+        ctx.stats_grade_b,
+        ctx.stats_grade_b * 100 / total
+    )
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Complete Module Emission
+# ═══════════════════════════════════════════════════════
+
+func emit_vir_kernel_module(name: String) -> String
+    var ctx = ctx_new(str_new("arm64"))
+    ctx = register_default_arm64_patterns(ctx)
+
+    # Emit module header
+    ctx.asm = emit_macos_header(ctx.asm)
+
+    # Emit kernel function
+    ctx.asm = emit_global_func(ctx.asm, name)
+    ctx.asm = emit_prologue(ctx.asm, 0)
+
+    # The actual kernel body would be emitted by walking QIR-L nodes
+    emit_comment(ctx.asm, str_new("kernel body goes here"))
+
+    ctx.asm = emit_epilogue(ctx.asm, 0)
+
+    out emitter_output(ctx.asm)
+end

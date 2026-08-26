@@ -153,6 +153,8 @@ static void *arena_alloc_raw(vir_arena_t *a, size_t size, size_t align) {
 
     if (!a->pages) {
         a->pages = np;
+    } else if (a->current) {
+        a->current->next = np;
     } else {
         arena_page_t *tail = a->pages;
         while (tail->next) tail = tail->next;

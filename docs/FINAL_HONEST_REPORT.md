@@ -1,5 +1,8 @@
 # Vir — Báo cáo Kỹ thuật Trung thực v3.0
 
+> **Status:** Historical. **QIR-H/M/L** claims superseded by **HIR → MIR → LIR**  
+> (Spec §1.2, `ARCHITECTURE.md` §0).
+
 ## "Fixing the Hype" — Phiên bản đã sửa sau peer review
 
 *Phiên bản này đã được điều chỉnh sau khi nhận phản biện kỹ thuật nghiêm túc. Mọi con số đã được kiểm chứng lại (re-benchmark). Mọi claim đã được cân nhắc lại với thuật ngữ chính xác.*

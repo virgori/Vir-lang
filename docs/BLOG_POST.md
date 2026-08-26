@@ -1,5 +1,8 @@
 # Vir: Lean AI Compiler — 3,055 LOC cho Precision-Critical CPU Computing
 
+> **Status:** Historical. Mentions of **QIR-H/M/L** are superseded by **HIR → MIR → LIR**  
+> (Spec §1.2, `ARCHITECTURE.md` §0).
+
 *Phân tích kỹ thuật v3.0 — đã sửa sau peer review. Mọi claim đã được kiểm chứng lại.*
 
 ---

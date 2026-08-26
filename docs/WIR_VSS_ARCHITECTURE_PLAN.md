@@ -1,5 +1,8 @@
 # W-IR + VSS — Kế Hoạch Kiến Trúc
 
+> **Status:** Historical / draft plan. References to **QIR-H/M/L** as the compiler spine are superseded by **HIR → MIR → LIR**  
+> (Spec §1.2, `ARCHITECTURE.md` §0). W-IR ideas may be revisited against that spine later.
+
 > **Phiên bản**: Draft 1.0 — 17/03/2026  
 > **Mục tiêu**: Thêm tầng IR song song (W-IR) cho WebAssembly target + hệ thống VSS (Vir Style Sheets)
 

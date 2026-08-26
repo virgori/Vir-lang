@@ -1,5 +1,7 @@
 # Tiến Độ Phát Triển Vir - Báo Cáo Thực Trạng (21/06/2026)
 
+> **Note:** Snapshot 21/06 — Phase 4 kickoff for **HIR + MIR**. That decision aligns with today’s official **HIR → MIR → LIR** spine (Spec §1.2). Numbers/status in this file are historical.
+
 ## 1. Các Tính Năng Đã Hoàn Thành (Phase 3 & Phase 9.1)
 
 ### 1.1. Intrinsic Registry (Phase 3)

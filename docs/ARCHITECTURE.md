@@ -1,12 +1,38 @@
 # Vir – Architecture Specification
 
-> **Virgori-Core Engine v1.2** – English standard keywords • Self-hosting compiler • Self-patching JIT
->
-> **Updated:** 9/3/2026 – Phase 4 "The Purest Build" complete
+> **Updated:** 2026-07-31 — canonical IR = **HIR → MIR → LIR**  
+> **Source of truth (IR):** `stdlib/vir/compiler/hir.vri`, `mir.vri`, `lir.vri` (+ lowerers / codegen)  
+> **Language Spec:** `docs/vir_language_spec_v2.0_*.md` §1.2  
+> Sections below that still describe Python `src/*`, flat **Q-IR**, or **QIR-H/M/L** are **historical** unless marked current.
+
+## 0. Canonical compiler pipeline (current)
+
+```text
+Source (.vri)
+  → Lexer / Parser → AST
+  → HIR
+  → MIR          (CFG / SSA, mid opts)
+  → Borrow / other analysis passes (as applicable)
+  → LIR          (near-machine, RA)
+  → Optimizer (tier-appropriate)
+  → Codegen → machine code (ARM64, …) → Mach-O / ELF
+```
+
+| Tier | Role | Soft module |
+|------|------|-------------|
+| **HIR** | Near-source semantics after parse | `hir.vri` |
+| **MIR** | CFG / SSA, mid-level opts | `mir.vri`, `ast_to_mir.vri`, … |
+| **LIR** | Phys/vreg, stack, RT stubs | `lir.vri`, `lir_lower.vri`, `lir_codegen.vri` |
+
+**Not official:** flat bootstrap **Q-IR** opcode stream; tensor **QIR-H/M/L** (see [`archive/QIR_ARCHITECTURE.md`](archive/QIR_ARCHITECTURE.md)).
+
+**Implementation note:** soft `virc` may still lower AST→MIR while HIR wiring catches up; the *architecture* remains HIR→MIR→LIR.
 
 ---
 
 ## 1. Tầng Giao diện Ngôn ngữ (The Multilingual Frontend)
+
+> **Historical (Python frontend).** Live soft path: `stdlib/vir/compiler/lexer.vri` + `parser.vri`.
 
 ### 1.0. lib – English Standard Keywords (`src/lib/keywords.py`)
 
@@ -106,6 +132,8 @@ Recursive-descent parser tạo AST với các node types:
 ---
 
 ## 2. Tầng Máy trừu tượng (The Virtual Machine – Q-IR)
+
+> **Historical.** Official IR is HIR/MIR/LIR (§0). “Q-IR” below is the old flat opcode / Python VM model.
 
 ### 2.1. Tập lệnh Q-IR (`src/ir/instructions/q_ir.py`)
 
@@ -589,28 +617,30 @@ Threshold = 3 (configurable)
 
 ## 11. Vir-in-Vir Compiler (`stdlib/vir/compiler/`)
 
-> Phase 4 — "The Purest Build" (9/3/2026)
-> All 4 core C compiler modules translated to pure Vir.
-> 7,183 LOC C → 5,335 LOC Vir.
+> **Current.** Soft self-host path under C-VM: `virc.vri`.  
+> Canonical IR: **HIR → MIR → LIR** (§0). Older “Purest Build” tables that only list lexer/parser/Q-IR/codegen are incomplete.
 
-### 11.1. Module Overview
+### 11.1. Module Overview (IR spine)
 
-| Module | Source | Lines | Translated From |
-|--------|--------|-------|-----------------|
-| `lexer.vri` | `stdlib/vir/compiler/lexer.vri` | 905 | `core/src/lexer.c` (807L) |
-| `parser.vri` | `stdlib/vir/compiler/parser.vri` | 1,319 | `core/src/parser.c` (1,164L) |
-| `ir_optimizer.vri` | `stdlib/vir/compiler/ir_optimizer.vri` | 1,448 | `core/src/ir_lower.c` (1,804L) |
-| `codegen.vri` | `stdlib/vir/compiler/codegen.vri` | 1,663 | `core/src/codegen.c` (3,408L) |
+| Module | Role |
+|--------|------|
+| `hir.vri` | HIR entities / helpers |
+| `mir.vri` | MIR ops, intrinsics, string pool |
+| `ast_to_mir.vri` | AST → MIR (HIR wiring may be inserted before this) |
+| `lir.vri` / `lir_lower.vri` | MIR → LIR |
+| `lir_*regalloc*`, `lir_codegen.vri` | RA + ARM64 emit |
+| `codegen.vri` | `CodeBuf` + machine encoders (library for LIR emit) |
+| `lexer.vri` / `parser.vri` | Frontend |
+
+Legacy Q-IR helpers (`ir_optimizer.vri`, flat `QOp` emit) may still exist for bootstrap; they are not the official spine.
 
 ### 11.2. Compiler Pipeline (Vir-native)
 
 ```
-┌──────────┐    ┌──────────────┐    ┌──────────────┐    ┌────────────────┐    ┌──────────────┐
-│ .vri src │───→│ lexer.vri    │───→│ parser.vri   │───→│ir_optimizer.vri│───→│ codegen.vri  │
-│ (UTF-8)  │    │ (tokenizer)  │    │ (AST builder)│    │ (Q-IR + alloc) │    │ (machine code)│
-└──────────┘    └──────────────┘    └──────────────┘    └────────────────┘    └──────────────┘
-  English         TokType enum       AstNode tree        QModule/QFunction     CodeBuf bytes
-  keywords        (90+ types)        (50+ node types)    (95+ opcodes)         (x86_64 + ARM64)
+┌────────┐   ┌─────────┐   ┌─────┐   ┌─────┐   ┌─────┐   ┌──────────┐   ┌─────────┐
+│ .vri   │──→│ lexer / │──→│ HIR │──→│ MIR │──→│ LIR │──→│ codegen  │──→│ Mach-O  │
+│ source │   │ parser  │   │     │   │     │   │ +RA │   │ (ARM64)  │   │ / ELF   │
+└────────┘   └─────────┘   └─────┘   └─────┘   └─────┘   └──────────┘   └─────────┘
 ```
 
 ### 11.3. lexer.vri — Tokenizer

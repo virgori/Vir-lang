@@ -25,6 +25,9 @@ Soft `virc` **đã** lex→parse→semantic→MIR→LIR→RA→ARM64→Mach-O v�
 
 ## 1. Kiến trúc hai đường (đừng nhầm)
 
+**Official IR (một mô hình):** `AST → HIR → MIR → LIR → Codegen`  
+(Spec §1.2, `docs/ARCHITECTURE.md` §0; SoT: `hir.vri` / `mir.vri` / `lir.vri`). Soft hôm nay có thể còn AST→MIR trực tiếp — gap wiring HIR, không phải kiến trúc thứ hai. Không dùng QIR-H/M/L / flat Q-IR làm chuẩn.
+
 ```
 Thin (đã PROD-ish bootstrap):
   virc_boot.vri → dist/virc-stage1 → stage2/stage3 fixed-point

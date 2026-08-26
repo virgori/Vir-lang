@@ -1,5 +1,8 @@
 # VIR CODEBASE AUDIT — 10/03/2026
 
+> **Status:** Historical audit. **QIR-H** / tensor-IR claims superseded by **HIR → MIR → LIR**  
+> (Spec §1.2, `ARCHITECTURE.md` §0).
+
 > Tài liệu đối soát toàn diện codebase Vir, trả lời 6 câu hỏi kỹ thuật cốt lõi.
 
 ---

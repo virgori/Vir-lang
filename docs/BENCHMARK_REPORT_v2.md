@@ -1,5 +1,8 @@
 # Vir Language — Comprehensive Cross-Language Benchmark Report
 
+> **Status:** Historical. **QIR-H/M/L** / three-level IR narrative superseded by **HIR → MIR → LIR**  
+> (Spec §1.2, `ARCHITECTURE.md` §0). Benchmark numbers are not an architecture authority.
+
 **Date:** 2025-07-09
 **Platform:** Apple Silicon (arm64-apple-darwin25.3.0)
 **Compilers:** clang++ 17.0.0 (-O3 -march=native) | rustc 1.94.0 (-O) | go 1.26.1 | Mojo 0.26.1.0 | Python 3.13.7 + numpy (BLAS)

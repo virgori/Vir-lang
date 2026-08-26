@@ -1,0 +1,484 @@
+/*
+ * vir/regex/regex.vri — Regular Expression Engine
+ * ==================================================
+ * Inspired by Python: re
+ * Triển khai: NFA-based (Thompson's construction) — no backtracking
+ *
+ * Hỗ trợ: literal, ., *, +, ?, |, [], [^], (), ^, $, \d, \w, \s
+ * Compiler use: pattern matching in lexer, SubLib syntax.
+ */
+
+import "vir/core/types" use all
+import "vir/core/option" use Option, Some, None
+import "vir/core/result" use Result, Ok, Err
+import "vir/str/string" use String, str_new, str_byte_at, str_byte_len, str_slice_bytes, str_eq
+import "vir/str/char" use is_digit, is_alpha, is_alnum, is_space
+import "vir/collections/vec" use Vec, vec_new, vec_push, vec_len, vec_get, vec_contains
+
+# ═══════════════════════════════════════════════════════
+# NFA State Machine
+# ═══════════════════════════════════════════════════════
+
+enum NfaType
+    Literal    = 1    # Match single byte
+    Dot        = 2    # Match any byte (except \n)
+    CharClass  = 3    # Match one of byte set
+    NegClass   = 4    # Match NOT in byte set
+    Split      = 5    # Epsilon split -> out1, out2
+    Match      = 6    # Accept state
+    Anchor_BOL = 7    # ^ (beginning of line)
+    Anchor_EOL = 8    # $ (end of line)
+end
+
+entity NfaState
+    tag:     NfaType
+    ch:      u8           # for Literal
+    chars:   Vec<u8>      # for CharClass / NegClass
+    out1:    i32          # next state index (-1 = none)
+    out2:    i32          # second output for Split
+end
+
+entity Regex
+    pattern: String
+    states:  Vec<NfaState>
+    start:   i32
+end
+
+entity Match
+    start:  usize
+    end:    usize
+    text:   String
+end
+
+# ═══════════════════════════════════════════════════════
+# Compile pattern -> NFA
+# ═══════════════════════════════════════════════════════
+
+func regex_compile(pattern: String) -> Result<Regex, String>
+    var states = vec_new()
+    var pos: usize = 0
+    var len = str_byte_len(pattern)
+    
+    var start_result = _compile_expr(&states, pattern, &pos, len)
+    chọn start_result
+        case Err(e) out Err(e)
+        case Ok(start_idx)
+            # Thêm match state
+            var match_idx = vec_len(states)
+            vec_push(&states, NfaState {
+                tag = NfaType.Match, ch = 0, chars = vec_new(),
+                out1 = -1, out2 = -1
+            })
+            # Nối cuối string tới match
+            _patch_dangling(&states, start_idx, match_idx)
+            
+            out Ok(Regex { pattern = pattern, states = states, start = start_idx })
+    end
+end
+
+# ─── NFA Construction Helpers ─────────────────────────
+
+func _new_state(states: &Vec<NfaState>, tag: NfaType, ch: u8) -> i32
+    var idx = vec_len(*states)
+    vec_push(states, NfaState {
+        tag = tag, ch = ch, chars = vec_new(),
+        out1 = -1, out2 = -1
+    })
+    out idx
+end
+
+func _new_split(states: &Vec<NfaState>, out1: i32, out2: i32) -> i32
+    var idx = vec_len(*states)
+    vec_push(states, NfaState {
+        tag = NfaType.Split, ch = 0, chars = vec_new(),
+        out1 = out1, out2 = out2
+    })
+    out idx
+end
+
+func _patch_dangling(states: &Vec<NfaState>, from: i32, to: i32)
+    # Nối tất cả dangling out1 = -1 tới to
+    var s = vec_get(*states, from)
+    if s.out1 == -1 and s.tag != NfaType.Split
+        s.out1 = to
+        vec_set(states, from, s)
+    end
+end
+
+func _compile_expr(states: &Vec<NfaState>, pat: String, pos: &usize, len: usize) -> Result<i32, String>
+    # Compile alternation: expr '|' expr
+    var left_result = _compile_seq(states, pat, pos, len)
+    var left: i32
+    chọn left_result
+        case Err(e) out Err(e)
+        case Ok(l) left = l
+    end
+    
+    if *pos < len and str_byte_at(pat, *pos) == 0x7C # |
+        *pos = *pos + 1
+        var right_result = _compile_expr(states, pat, pos, len)
+        var right: i32
+        chọn right_result
+            case Err(e) out Err(e)
+            case Ok(r) right = r
+        end
+        var split = _new_split(states, left, right)
+        out Ok(split)
+    end
+    
+    out Ok(left)
+end
+
+func _compile_seq(states: &Vec<NfaState>, pat: String, pos: &usize, len: usize) -> Result<i32, String>
+    # Compile sequence of atoms with quantifiers
+    var first: i32 = -1
+    var prev: i32 = -1
+    
+    lặp_khi *pos < len
+        var ch = str_byte_at(pat, *pos)
+        # Stop at | or )
+        if ch == 0x7C or ch == 0x29 thoát end
+        
+        var atom_result = _compile_atom(states, pat, pos, len)
+        var atom: i32
+        chọn atom_result
+            case Err(e) out Err(e)
+            case Ok(a) atom = a
+        end
+        
+        # Check for quantifier: *, +, ?
+        var quantified = atom
+        if *pos < len
+            var qch = str_byte_at(pat, *pos)
+            if qch == 0x2A # *
+                *pos = *pos + 1
+                var split = _new_split(states, atom, -1)
+                _patch_dangling(states, atom, split)
+                quantified = split
+            eif qch == 0x2B # +
+                *pos = *pos + 1
+                var split = _new_split(states, atom, -1)
+                _patch_dangling(states, atom, split)
+                quantified = atom
+            eif qch == 0x3F # ?
+                *pos = *pos + 1
+                var split = _new_split(states, atom, -1)
+                quantified = split
+            end
+        end
+        
+        if first == -1 first = quantified end
+        if prev != -1
+            _patch_dangling(states, prev, quantified)
+        end
+        prev = quantified
+    end
+    
+    if first == -1
+        # Empty expression -> epsilon
+        first = _new_state(states, NfaType.Split, 0)
+    end
+    out Ok(first)
+end
+
+func _compile_atom(states: &Vec<NfaState>, pat: String, pos: &usize, len: usize) -> Result<i32, String>
+    var ch = str_byte_at(pat, *pos)
+    
+    if ch == 0x2E # .
+        *pos = *pos + 1
+        out Ok(_new_state(states, NfaType.Dot, 0))
+    end
+    
+    if ch == 0x5E # ^
+        *pos = *pos + 1
+        out Ok(_new_state(states, NfaType.Anchor_BOL, 0))
+    end
+    
+    if ch == 0x24 # $
+        *pos = *pos + 1
+        out Ok(_new_state(states, NfaType.Anchor_EOL, 0))
+    end
+    
+    if ch == 0x28 # (
+        *pos = *pos + 1
+        var inner = _compile_expr(states, pat, pos, len)
+        if *pos >= len or str_byte_at(pat, *pos) != 0x29
+            out Err(str_new("unmatched '('"))
+        end
+        *pos = *pos + 1   # skip )
+        out inner
+    end
+    
+    if ch == 0x5B # [
+        out _compile_charclass(states, pat, pos, len)
+    end
+    
+    if ch == 0x5C # backslash
+        *pos = *pos + 1
+        if *pos >= len out Err(str_new("trailing backslash")) end
+        var esc = str_byte_at(pat, *pos)
+        *pos = *pos + 1
+        
+        # \d \w \s shortcuts
+        if esc == 0x64 # \d -> [0-9]
+            var idx = _new_state(states, NfaType.CharClass, 0)
+            var s = vec_get(*states, idx)
+            var d: u8 = 0x30
+            lặp_khi d <= 0x39
+                vec_push(&s.chars, d)
+                d = d + 1
+            end
+            vec_set(states, idx, s)
+            out Ok(idx)
+        end
+        if esc == 0x77 # \w -> [a-zA-Z0-9_]
+            var idx = _new_state(states, NfaType.CharClass, 0)
+            var s = vec_get(*states, idx)
+            var c: u8 = 0x61
+            lặp_khi c <= 0x7A vec_push(&s.chars, c); c = c + 1 end
+            c = 0x41
+            lặp_khi c <= 0x5A vec_push(&s.chars, c); c = c + 1 end
+            c = 0x30
+            lặp_khi c <= 0x39 vec_push(&s.chars, c); c = c + 1 end
+            vec_push(&s.chars, 0x5F)   # _
+            vec_set(states, idx, s)
+            out Ok(idx)
+        end
+        if esc == 0x73 # \s -> [ \t\n\r\f]
+            var idx = _new_state(states, NfaType.CharClass, 0)
+            var s = vec_get(*states, idx)
+            vec_push(&s.chars, 0x20)
+            vec_push(&s.chars, 0x09)
+            vec_push(&s.chars, 0x0A)
+            vec_push(&s.chars, 0x0D)
+            vec_push(&s.chars, 0x0C)
+            vec_set(states, idx, s)
+            out Ok(idx)
+        end
+        
+        # Literal escaped char
+        out Ok(_new_state(states, NfaType.Literal, esc))
+    end
+    
+    # Plain literal
+    *pos = *pos + 1
+    out Ok(_new_state(states, NfaType.Literal, ch))
+end
+
+func _compile_charclass(states: &Vec<NfaState>, pat: String, pos: &usize, len: usize) -> Result<i32, String>
+    *pos = *pos + 1   # skip [
+    
+    var negated = false
+    if *pos < len and str_byte_at(pat, *pos) == 0x5E # ^
+        negated = true
+        *pos = *pos + 1
+    end
+    
+    var tag = if negated NfaType.NegClass else NfaType.CharClass end
+    var idx = _new_state(states, tag, 0)
+    var s = vec_get(*states, idx)
+    
+    lặp_khi *pos < len and str_byte_at(pat, *pos) != 0x5D # ]
+        var c = str_byte_at(pat, *pos)
+        *pos = *pos + 1
+        
+        # Range: a-z
+        if *pos + 1 < len and str_byte_at(pat, *pos) == 0x2D and str_byte_at(pat, *pos + 1) != 0x5D
+            *pos = *pos + 1   # skip -
+            var end_c = str_byte_at(pat, *pos)
+            *pos = *pos + 1
+            var r = c
+            lặp_khi r <= end_c
+                vec_push(&s.chars, r)
+                r = r + 1
+            end
+        else
+            vec_push(&s.chars, c)
+        end
+    end
+    
+    if *pos >= len out Err(str_new("unterminated character class")) end
+    *pos = *pos + 1   # skip ]
+    
+    vec_set(states, idx, s)
+    out Ok(idx)
+end
+
+# ═══════════════════════════════════════════════════════
+# NFA Simulation (Thompson's algorithm)
+# ═══════════════════════════════════════════════════════
+
+func _add_state(states: Vec<NfaState>, current: &Vec<i32>, idx: i32, visited: &Vec<bool>)
+    if idx < 0 out end
+    if vec_get(*visited, idx) out end
+    vec_set(visited, idx, true)
+    
+    var s = vec_get(states, idx)
+    if s.tag == NfaType.Split
+        _add_state(states, current, s.out1, visited)
+        _add_state(states, current, s.out2, visited)
+    else
+        vec_push(current, idx)
+    end
+end
+
+func _step(states: Vec<NfaState>, current: Vec<i32>, ch: u8, next: &Vec<i32>, visited: &Vec<bool>)
+    var i: usize = 0
+    lặp_khi i < vec_len(current)
+        var idx = vec_get(current, i)
+        var s = vec_get(states, idx)
+        
+        var matched = false
+        chọn s.tag
+            case NfaType.Literal
+                matched = (ch == s.ch)
+            case NfaType.Dot
+                matched = (ch != 0x0A)   # . not match \n
+            case NfaType.CharClass
+                matched = vec_contains(s.chars, ch)
+            case NfaType.NegClass
+                matched = !vec_contains(s.chars, ch)
+            mặc_định {}
+        end
+        
+        if matched
+            _add_state(states, next, s.out1, visited)
+        end
+        i = i + 1
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Public Match API
+# ═══════════════════════════════════════════════════════
+
+func regex_is_match(re: Regex, text: String) -> bool
+    out is_some(regex_find(re, text))
+end
+
+func regex_find(re: Regex, text: String) -> Option<Match>
+    # Tìm match đầu tiên in text.
+    var text_len = str_byte_len(text)
+    var n_states = vec_len(re.states)
+    
+    var start_pos: usize = 0
+    lặp_khi start_pos <= text_len
+        var current = vec_new()
+        var visited = vec_filled(false, n_states)
+        _add_state(re.states, &current, re.start, &visited)
+        
+        var pos = start_pos
+        var last_match: i32 = -1
+        
+        # Kiểm tra match tại vị trí hiện tại
+        var j: usize = 0
+        lặp_khi j < vec_len(current)
+            var s = vec_get(re.states, vec_get(current, j))
+            if s.tag == NfaType.Match last_match = pos end
+            j = j + 1
+        end
+        
+        lặp_khi pos < text_len and vec_len(current) > 0
+            var ch = str_byte_at(text, pos)
+            var next = vec_new()
+            var next_visited = vec_filled(false, n_states)
+            _step(re.states, current, ch, &next, &next_visited)
+            pos = pos + 1
+            current = next
+            
+            # Kiểm tra match
+            j = 0
+            lặp_khi j < vec_len(current)
+                var s = vec_get(re.states, vec_get(current, j))
+                if s.tag == NfaType.Match last_match = pos end
+                j = j + 1
+            end
+        end
+        
+        if last_match >= 0
+            out Some(Match {
+                start = start_pos,
+                end = last_match,
+                text = str_slice_bytes(text, start_pos, last_match)
+            })
+        end
+        
+        start_pos = start_pos + 1
+    end
+    
+    out None
+end
+
+func regex_find_all(re: Regex, text: String) -> Vec<Match>
+    var matches = vec_new()
+    var pos: usize = 0
+    var text_len = str_byte_len(text)
+    
+    lặp_khi pos <= text_len
+        var sub = str_slice_bytes(text, pos, text_len)
+        var m = regex_find(re, sub)
+        chọn m
+            case None thoát
+            case Some(found)
+                vec_push(&matches, Match {
+                    start = pos + found.start,
+                    end = pos + found.end,
+                    text = found.text
+                })
+                # Advance past this match
+                var advance = found.end
+                if advance == found.start advance = advance + 1 end  # zero-width
+                pos = pos + advance
+        end
+    end
+    
+    out matches
+end
+
+func regex_replace(re: Regex, text: String, replacement: String) -> String
+    var sb = sb_new()
+    var pos: usize = 0
+    var text_len = str_byte_len(text)
+    
+    lặp_khi pos < text_len
+        var sub = str_slice_bytes(text, pos, text_len)
+        var m = regex_find(re, sub)
+        chọn m
+            case None
+                sb_append(&sb, str_slice_bytes(text, pos, text_len))
+                thoát
+            case Some(found)
+                # Thêm phần trước match
+                if found.start > 0
+                    sb_append(&sb, str_slice_bytes(sub, 0, found.start))
+                end
+                sb_append(&sb, replacement)
+                pos = pos + found.end
+                if found.end == found.start pos = pos + 1 end
+        end
+    end
+    
+    out sb_build(sb)
+end
+
+func regex_split(re: Regex, text: String) -> Vec<String>
+    var parts = vec_new()
+    var pos: usize = 0
+    var text_len = str_byte_len(text)
+    
+    lặp_khi pos <= text_len
+        var sub = str_slice_bytes(text, pos, text_len)
+        var m = regex_find(re, sub)
+        chọn m
+            case None
+                vec_push(&parts, sub)
+                thoát
+            case Some(found)
+                vec_push(&parts, str_slice_bytes(sub, 0, found.start))
+                pos = pos + found.end
+                if found.end == found.start pos = pos + 1 end
+        end
+    end
+    
+    out parts
+end

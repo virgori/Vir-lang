@@ -1,0 +1,314 @@
+/*
+ * vir/archive/archive.vri — Archive (tar) + Compression (zlib/gzip)
+ * ===================================================================
+ * Inspired by Python: tarfile, zipfile, gzip, zlib
+ *
+ * Phase C — tar read/write + deflate/inflate
+ */
+
+import "vir/core/types" use all
+import "vir/core/option" use Option, Some, None
+import "vir/core/result" use Result, Ok, Err
+import "vir/str/string" use String, str_new
+import "vir/collections/vec" use Vec, vec_new, vec_push, vec_len
+import "vir/io/file" use File, file_open, file_read_all, file_write_all, file_close
+
+# ═══════════════════════════════════════════════════════
+# Compression: Deflate / Inflate (zlib wrapper)
+# ═══════════════════════════════════════════════════════
+
+enum CompressLevel
+    None    = 0
+    Fast    = 1
+    Default = 6
+    Best    = 9
+end
+
+func ngoài native_deflate(src: ptr, src_len: usize, dst: ptr, dst_cap: usize, level: i32) -> i64
+func ngoài native_inflate(src: ptr, src_len: usize, dst: ptr, dst_cap: usize) -> i64
+
+func compress(data: &[u8], len: usize, level: CompressLevel) -> Result<Vec<u8>, String>
+    # Allocate worst-case output (input + 12 + input/1000)
+    var cap = len + 64 + len / 100
+    var out: Vec<u8> = vec_with_capacity(cap)
+    var n = native_deflate(data, len, vec_ptr(&out), cap, level)
+    if n < 0 out Err(str_new("compression failed")) end
+    vec_set_len(&out, n)
+    out Ok(out)
+end
+
+func decompress(data: &[u8], len: usize, max_output: usize) -> Result<Vec<u8>, String>
+    var out: Vec<u8> = vec_with_capacity(max_output)
+    var n = native_inflate(data, len, vec_ptr(&out), max_output)
+    if n < 0 out Err(str_new("decompression failed")) end
+    vec_set_len(&out, n)
+    out Ok(out)
+end
+
+# ═══════════════════════════════════════════════════════
+# Gzip: compress/decompress files (RFC 1952)
+# ═══════════════════════════════════════════════════════
+
+func ngoài native_gzip_compress(src: ptr, src_len: usize, dst: ptr, dst_cap: usize) -> i64
+func ngoài native_gzip_decompress(src: ptr, src_len: usize, dst: ptr, dst_cap: usize) -> i64
+
+func gzip_compress(data: &[u8], len: usize) -> Result<Vec<u8>, String>
+    var cap = len + 64 + len / 100
+    var out = vec_with_capacity(cap)
+    var n = native_gzip_compress(data, len, vec_ptr(&out), cap)
+    if n < 0 out Err(str_new("gzip compress failed")) end
+    vec_set_len(&out, n)
+    out Ok(out)
+end
+
+func gzip_decompress(data: &[u8], len: usize, max_output: usize) -> Result<Vec<u8>, String>
+    var out = vec_with_capacity(max_output)
+    var n = native_gzip_decompress(data, len, vec_ptr(&out), max_output)
+    if n < 0 out Err(str_new("gzip decompress failed")) end
+    vec_set_len(&out, n)
+    out Ok(out)
+end
+
+func gzip_compress_file(src_path: String, dst_path: String) -> Result<void, String>
+    var data_result = file_read_all(src_path)
+    var data: Vec<u8>
+    chọn data_result
+        case Err(e) out Err(e)
+        case Ok(d) data = d
+    end
+    var compressed = gzip_compress(vec_ptr(&data), vec_len(data))
+    chọn compressed
+        case Err(e) out Err(e)
+        case Ok(out)
+            out file_write_all(dst_path, vec_ptr(&out), vec_len(out))
+    end
+end
+
+# ═══════════════════════════════════════════════════════
+# Tar Archive (POSIX ustar format)
+# ═══════════════════════════════════════════════════════
+
+enum TarEntryType
+    RegFile   = 0x30   # '0'
+    Directory = 0x35   # '5'
+    Symlink   = 0x32   # '2'
+end
+
+entity TarEntry
+    name:     String
+    size:     usize
+    mode:     u32
+    mtime:    u64
+    kind:     TarEntryType
+    linkname: String
+    data:     Vec<u8>
+end
+
+entity TarArchive
+    entries: Vec<TarEntry>
+end
+
+func tar_new() -> TarArchive
+    out TarArchive { entries = vec_new() }
+end
+
+func tar_add_file(ar: &TarArchive, name: String, data: Vec<u8>, mode: u32)
+    vec_push(&ar.entries, TarEntry {
+        name = name,
+        size = vec_len(data),
+        mode = mode,
+        mtime = 0,
+        kind = TarEntryType.RegFile,
+        linkname = str_new(""),
+        data = data
+    })
+end
+
+func tar_add_dir(ar: &TarArchive, name: String, mode: u32)
+    vec_push(&ar.entries, TarEntry {
+        name = name,
+        size = 0,
+        mode = mode,
+        mtime = 0,
+        kind = TarEntryType.Directory,
+        linkname = str_new(""),
+        data = vec_new()
+    })
+end
+
+func tar_write(ar: TarArchive, path: String) -> Result<void, String>
+    var buf = vec_new()
+    var i: usize = 0
+    lặp_khi i < vec_len(ar.entries)
+        var entry = vec_get(ar.entries, i)
+        _tar_write_header(&buf, entry)
+        # Write data (padded to 512-byte blocks)
+        var j: usize = 0
+        lặp_khi j < entry.size
+            vec_push(&buf, vec_get(entry.data, j))
+            j = j + 1
+        end
+        # Pad to 512
+        var pad = (512 - (entry.size % 512)) % 512
+        j = 0
+        lặp_khi j < pad vec_push(&buf, 0); j = j + 1 end
+        i = i + 1
+    end
+    # Two zero blocks = end of archive
+    var k: usize = 0
+    lặp_khi k < 1024 vec_push(&buf, 0); k = k + 1 end
+    
+    out file_write_all(path, vec_ptr(&buf), vec_len(buf))
+end
+
+func _tar_write_header(buf: &Vec<u8>, entry: TarEntry)
+    # 512-byte header: name(100) + mode(8) + uid(8) + gid(8) + size(12) + mtime(12)
+    #   + checksum(8) + typeflag(1) + linkname(100) + magic(6) + version(2) + ...
+    var hdr: [u8; 512] = [0; 512]
+    
+    # Name (bytes 0-99)
+    _write_str(&hdr, 0, entry.name, 100)
+    # Mode (bytes 100-107) — octal
+    _write_octal(&hdr, 100, entry.mode, 8)
+    # UID (108-115)
+    _write_octal(&hdr, 108, 0, 8)
+    # GID (116-123)
+    _write_octal(&hdr, 116, 0, 8)
+    # Size (124-135) — octal
+    _write_octal(&hdr, 124, entry.size, 12)
+    # Mtime (136-147)
+    _write_octal(&hdr, 136, entry.mtime, 12)
+    # Checksum placeholder (148-155) — spaces
+    var c: usize = 148
+    lặp_khi c < 156 hdr[c] = 0x20; c = c + 1 end
+    # Typeflag (156)
+    hdr[156] = entry.kind
+    # Linkname (157-256)
+    _write_str(&hdr, 157, entry.linkname, 100)
+    # Magic (257-262)
+    hdr[257] = 0x75; hdr[258] = 0x73; hdr[259] = 0x74
+    hdr[260] = 0x61; hdr[261] = 0x72; hdr[262] = 0x00  # "ustar\0"
+    # Version (263-264)
+    hdr[263] = 0x30; hdr[264] = 0x30   # "00"
+    
+    # Compute checksum
+    var sum: u32 = 0
+    var i: usize = 0
+    lặp_khi i < 512 sum = sum + hdr[i]; i = i + 1 end
+    _write_octal(&hdr, 148, sum, 7)
+    hdr[155] = 0x00
+    
+    # Append to buffer
+    i = 0
+    lặp_khi i < 512 vec_push(buf, hdr[i]); i = i + 1 end
+end
+
+func _write_str(hdr: &[u8], off: usize, s: String, max: usize)
+    var len = str_byte_len(s)
+    if len > max len = max end
+    var i: usize = 0
+    lặp_khi i < len hdr[off + i] = str_byte_at(s, i); i = i + 1 end
+end
+
+func _write_octal(hdr: &[u8], off: usize, val: u64, width: usize)
+    # Write octal string right-justified, null-terminated
+    var buf: [u8; 16]
+    var v = val
+    var i: i32 = width - 2
+    lặp_khi i >= 0
+        buf[i] = 0x30 + (v % 8)
+        v = v / 8
+        i = i - 1
+    end
+    var j: usize = 0
+    lặp_khi j < width - 1 hdr[off + j] = buf[j]; j = j + 1 end
+    hdr[off + width - 1] = 0x00
+end
+
+# ═══════════════════════════════════════════════════════
+# Tar Reader
+# ═══════════════════════════════════════════════════════
+
+func tar_read(path: String) -> Result<TarArchive, String>
+    var data_result = file_read_all(path)
+    var data: Vec<u8>
+    chọn data_result
+        case Err(e) out Err(e)
+        case Ok(d) data = d
+    end
+    
+    var entries = vec_new()
+    var pos: usize = 0
+    var total = vec_len(data)
+    
+    lặp_khi pos + 512 <= total
+        # Kiểm tra zero block (end of archive)
+        var all_zero = true
+        var c: usize = 0
+        lặp_khi c < 512
+            if vec_get(data, pos + c) != 0 all_zero = false; thoát end
+            c = c + 1
+        end
+        if all_zero thoát end
+        
+        # Parse header
+        var name = _read_tar_str(data, pos, 100)
+        var size = _read_tar_octal(data, pos + 124, 12)
+        var typeflag = vec_get(data, pos + 156)
+        var linkname = _read_tar_str(data, pos + 157, 100)
+        
+        var kind = chọn typeflag
+            case 0x35 TarEntryType.Directory
+            case 0x32 TarEntryType.Symlink
+            mặc_định TarEntryType.RegFile
+        end
+        
+        pos = pos + 512  # past header
+        
+        # Read data
+        var entry_data = vec_new()
+        var d: usize = 0
+        lặp_khi d < size
+            vec_push(&entry_data, vec_get(data, pos + d))
+            d = d + 1
+        end
+        
+        vec_push(&entries, TarEntry {
+            name = name, size = size, mode = 0o644,
+            mtime = 0, kind = kind, linkname = linkname,
+            data = entry_data
+        })
+        
+        # Skip data + padding
+        var blocks = (size + 511) / 512
+        pos = pos + blocks * 512
+    end
+    
+    out Ok(TarArchive { entries = entries })
+end
+
+func _read_tar_str(data: Vec<u8>, off: usize, maxlen: usize) -> String
+    var sb = sb_new()
+    var i: usize = 0
+    lặp_khi i < maxlen
+        var b = vec_get(data, off + i)
+        if b == 0 thoát end
+        sb_push_byte(&sb, b)
+        i = i + 1
+    end
+    out sb_build(sb)
+end
+
+func _read_tar_octal(data: Vec<u8>, off: usize, width: usize) -> usize
+    var val: usize = 0
+    var i: usize = 0
+    lặp_khi i < width
+        var b = vec_get(data, off + i)
+        if b == 0 or b == 0x20 thoát end
+        if b >= 0x30 and b <= 0x37
+            val = val * 8 + (b - 0x30)
+        end
+        i = i + 1
+    end
+    out val
+end

@@ -1,0 +1,187 @@
+/*
+ * vir/str/encode.vri — String Encoding Conversion
+ * ==================================================
+ * Inspired by Python: codecs
+ * Inspired by C23: <uchar.h> mbrtoc16/c32
+ *
+ * Chuyển đổi giữa UTF-8, UTF-16, UTF-32.
+ * Vir default sử dụng UTF-8 nội bộ.
+ */
+
+import "vir/core/types" use all
+import "vir/core/result" use Result, Ok, Err
+import "vir/str/unicode" use utf8_decode, utf8_encode, utf8_encode_len, is_valid_codepoint, is_surrogate
+import "vir/mem/alloc" use alloc, free
+import "vir/mem/buffer" use Buffer, buffer_new, buffer_push_u8, buffer_push_u16, buffer_push_u32, buffer_as_slice, buffer_free
+
+# ═══════════════════════════════════════════════════════
+# UTF-8 -> UTF-16 (Little Endian)
+# ═══════════════════════════════════════════════════════
+
+entity Utf16Result
+    data: ptr       # u16 array
+    len:  usize     # number of u16 units
+end
+
+func utf8_to_utf16(src: ptr, byte_len: usize) -> Result<Utf16Result, String>
+    var buf = buffer_new()
+    var i: usize = 0
+    
+    lặp_khi i < byte_len
+        var cp_len: usize = 0
+        var cp = utf8_decode(src, i, &cp_len)
+        
+        if !is_valid_codepoint(cp)
+            buffer_free(&buf)
+            out Err(str_new("invalid codepoint in UTF-8"))
+        end
+        
+        if cp <= 0xFFFF
+            # BMP: single u16
+            buffer_push_u16(&buf, cp)
+        else
+            # Supplementary: surrogate pair
+            var adjusted = cp - 0x10000
+            var high = 0xD800 + (adjusted >> 10)
+            var low  = 0xDC00 + (adjusted & 0x3FF)
+            buffer_push_u16(&buf, high)
+            buffer_push_u16(&buf, low)
+        end
+        
+        i = i + cp_len
+    end
+    
+    var slice = buffer_as_slice(buf)
+    out Ok(Utf16Result { data = slice.data, len = buf.len / 2 })
+end
+
+# ═══════════════════════════════════════════════════════
+# UTF-16 -> UTF-8
+# ═══════════════════════════════════════════════════════
+
+func utf16_to_utf8(src: ptr, unit_count: usize) -> Result<Utf8Result, String>
+    var buf = buffer_new()
+    var i: usize = 0
+    var tmp: byte[4]
+    
+    lặp_khi i < unit_count
+        var u = native_load_u16(src, i)
+        var cp: u32
+        
+        if u >= 0xD800 and u <= 0xDBFF
+            # High surrogate — cần low surrogate
+            if i + 1 >= unit_count
+                buffer_free(&buf)
+                out Err(str_new("truncated surrogate pair"))
+            end
+            var low = native_load_u16(src, i + 1)
+            if !(low >= 0xDC00 and low <= 0xDFFF)
+                buffer_free(&buf)
+                out Err(str_new("invalid low surrogate"))
+            end
+            cp = 0x10000 + ((u - 0xD800) << 10) + (low - 0xDC00)
+            i = i + 2
+        eif u >= 0xDC00 and u <= 0xDFFF
+            buffer_free(&buf)
+            out Err(str_new("unexpected low surrogate"))
+        else
+            cp = u
+            i = i + 1
+        end
+        
+        # Encode cp as UTF-8 vào buf
+        var enc_len = utf8_encode(cp, &tmp, 0)
+        var j: usize = 0
+        lặp_khi j < enc_len
+            buffer_push_u8(&buf, tmp[j])
+            j = j + 1
+        end
+    end
+    
+    var slice = buffer_as_slice(buf)
+    out Ok(Utf8Result { data = slice.data, byte_len = buf.len })
+end
+
+entity Utf8Result
+    data:     ptr
+    byte_len: usize
+end
+
+# ═══════════════════════════════════════════════════════
+# UTF-8 -> UTF-32 (simplest: 1 codepoint = 1 u32)
+# ═══════════════════════════════════════════════════════
+
+entity Utf32Result
+    data: ptr       # u32 array
+    len:  usize     # number of codepoints
+end
+
+func utf8_to_utf32(src: ptr, byte_len: usize) -> Utf32Result
+    var buf = buffer_new()
+    var i: usize = 0
+    
+    lặp_khi i < byte_len
+        var cp_len: usize = 0
+        var cp = utf8_decode(src, i, &cp_len)
+        buffer_push_u32(&buf, cp)
+        i = i + cp_len
+    end
+    
+    var slice = buffer_as_slice(buf)
+    out Utf32Result { data = slice.data, len = buf.len / 4 }
+end
+
+func utf32_to_utf8(src: ptr, count: usize) -> Result<Utf8Result, String>
+    var buf = buffer_new()
+    var tmp: byte[4]
+    var i: usize = 0
+    
+    lặp_khi i < count
+        var cp = native_load_u32(src, i)
+        if !is_valid_codepoint(cp)
+            buffer_free(&buf)
+            out Err(str_new("invalid codepoint"))
+        end
+        var enc_len = utf8_encode(cp, &tmp, 0)
+        var j: usize = 0
+        lặp_khi j < enc_len
+            buffer_push_u8(&buf, tmp[j])
+            j = j + 1
+        end
+        i = i + 1
+    end
+    
+    var slice = buffer_as_slice(buf)
+    out Ok(Utf8Result { data = slice.data, byte_len = buf.len })
+end
+
+# ═══════════════════════════════════════════════════════
+# ASCII Conversion
+# ═══════════════════════════════════════════════════════
+
+func is_ascii_string(data: ptr, len: usize) -> bool
+    var i: usize = 0
+    lặp_khi i < len
+        if native_load_u8(data, i) > 0x7F out false end
+        i = i + 1
+    end
+    out true
+end
+
+func utf8_to_ascii_lossy(data: ptr, byte_len: usize) -> Utf8Result
+    # Thay thế non-ASCII bytes bằng '?'
+    var buf = buffer_new()
+    var i: usize = 0
+    lặp_khi i < byte_len
+        var cp_len: usize = 0
+        var cp = utf8_decode(data, i, &cp_len)
+        if cp <= 0x7F
+            buffer_push_u8(&buf, cp)
+        else
+            buffer_push_u8(&buf, 0x3F)   # '?'
+        end
+        i = i + cp_len
+    end
+    var slice = buffer_as_slice(buf)
+    out Utf8Result { data = slice.data, byte_len = buf.len }
+end

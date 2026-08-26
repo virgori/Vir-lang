@@ -35,6 +35,7 @@ typedef enum {
     LIR_JMP_COND,
     LIR_CMP,
     LIR_RET,
+    LIR_EXIT,
     LIR_LOAD,    // Load from memory
     LIR_LOAD_STRING,
     LIR_STORE,   // Store to memory

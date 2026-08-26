@@ -1,0 +1,336 @@
+/*
+ * vir/collections/map.vri — Hash Map
+ * =====================================
+ * Inspired by Python: dict
+ * Inspired by Rust: HashMap
+ * Triển khai: Open addressing + Robin Hood hashing
+ *
+ * Compiler use: symbol table, type registry, string interning.
+ */
+
+import "vir/core/types" use all
+import "vir/core/option" use Option, Some, None
+import "vir/mem/alloc" use alloc, alloc_zeroed, free
+import "vir/mem/copy" use mem_set
+import "vir/collections/vec" use Vec, vec_new, vec_push
+
+# ═══════════════════════════════════════════════════════
+# Hash Function — FNV-1a (simple, fast for small keys)
+# ═══════════════════════════════════════════════════════
+
+hằng_số FNV_OFFSET: u64 = 14695981039346656037
+hằng_số FNV_PRIME:  u64 = 1099511628211
+
+func hash_bytes(data: ptr, len: usize) -> u64
+    var h: u64 = FNV_OFFSET
+    var i: usize = 0
+    lặp_khi i < len
+        h = h ^ native_load_u8(data, i)
+        h = h * FNV_PRIME
+        i = i + 1
+    end
+    out h
+end
+
+func hash_i64(val: i64) -> u64
+    var h: u64 = FNV_OFFSET
+    h = h ^ (val & 0xFF)
+    h = h * FNV_PRIME
+    h = h ^ ((val >> 8) & 0xFF)
+    h = h * FNV_PRIME
+    h = h ^ ((val >> 16) & 0xFF)
+    h = h * FNV_PRIME
+    h = h ^ ((val >> 24) & 0xFF)
+    h = h * FNV_PRIME
+    h = h ^ ((val >> 32) & 0xFF)
+    h = h * FNV_PRIME
+    h = h ^ ((val >> 40) & 0xFF)
+    h = h * FNV_PRIME
+    h = h ^ ((val >> 48) & 0xFF)
+    h = h * FNV_PRIME
+    h = h ^ ((val >> 56) & 0xFF)
+    h = h * FNV_PRIME
+    out h
+end
+
+func hash_string(s: String) -> u64
+    out hash_bytes(s.data, s.byte_len)
+end
+
+# ═══════════════════════════════════════════════════════
+# Entry State
+# ═══════════════════════════════════════════════════════
+
+hằng_số ENTRY_EMPTY:     u8 = 0
+hằng_số ENTRY_OCCUPIED:  u8 = 1
+hằng_số ENTRY_TOMBSTONE: u8 = 2
+
+entity MapEntry<K, V>
+    state: u8
+    hash:  u64
+    key:   K
+    value: V
+end
+
+# ═══════════════════════════════════════════════════════
+# Map<K, V> — Open Addressing Hash Map
+# ═══════════════════════════════════════════════════════
+
+entity Map<K, V>
+    entries:   ptr         # MapEntry<K,V> array
+    cap:       usize       # slot count (always power of 2)
+    len:       usize       # number of occupied entries
+    tombstones: usize      # number of tombstones
+    hash_fn:   func(K) -> u64
+    eq_fn:     func(K, K) -> bool
+end
+
+hằng_số MAP_LOAD_FACTOR_NUM: usize = 3
+hằng_số MAP_LOAD_FACTOR_DEN: usize = 4   # 75%
+
+# ─── Constructor ──────────────────────────────────────
+
+func map_new(hash_fn: func(K) -> u64, eq_fn: func(K, K) -> bool) -> Map<K, V>
+    out Map<K, V> {
+        entries = null,
+        cap = 0, len = 0, tombstones = 0,
+        hash_fn = hash_fn, eq_fn = eq_fn
+    }
+end
+
+func map_with_cap(cap: usize, hash_fn: func(K) -> u64, eq_fn: func(K, K) -> bool) -> Map<K, V>
+    var real_cap = _next_pow2(cap)
+    if real_cap < 16 real_cap = 16 end
+    var entry_size = size_of<MapEntry<K, V>>()
+    out Map<K, V> {
+        entries = alloc_zeroed(real_cap * entry_size),
+        cap = real_cap, len = 0, tombstones = 0,
+        hash_fn = hash_fn, eq_fn = eq_fn
+    }
+end
+
+# ─── Internal ─────────────────────────────────────────
+
+func _map_mask(m: Map<K, V>) -> usize
+    out m.cap - 1
+end
+
+func _map_needs_grow(m: Map<K, V>) -> bool
+    out (m.len + m.tombstones) * MAP_LOAD_FACTOR_DEN >= m.cap * MAP_LOAD_FACTOR_NUM
+end
+
+func _map_entry_ptr(m: Map<K, V>, idx: usize) -> ptr
+    out m.entries + idx * size_of<MapEntry<K, V>>()
+end
+
+func _map_grow(m: &Map<K, V>)
+    var old_entries = m.entries
+    var old_cap = m.cap
+    
+    var new_cap = m.cap * 2
+    if new_cap < 16 new_cap = 16 end
+    var entry_size = size_of<MapEntry<K, V>>()
+    m.entries = alloc_zeroed(new_cap * entry_size)
+    m.cap = new_cap
+    m.len = 0
+    m.tombstones = 0
+    
+    # Rehash tất cả entries
+    if old_entries != null
+        var i: usize = 0
+        lặp_khi i < old_cap
+            var e = native_load_struct<MapEntry<K, V>>(old_entries, i)
+            if e.state == ENTRY_OCCUPIED
+                _map_insert_internal(m, e.hash, e.key, e.value)
+            end
+            i = i + 1
+        end
+        free(old_entries)
+    end
+end
+
+func _map_insert_internal(m: &Map<K, V>, h: u64, key: K, val: V)
+    var mask = m.cap - 1
+    var idx = h & mask
+    
+    loop
+        var e = native_load_struct<MapEntry<K, V>>(m.entries, idx)
+        if e.state != ENTRY_OCCUPIED
+            native_store_struct<MapEntry<K, V>>(m.entries, idx, MapEntry<K, V> {
+                state = ENTRY_OCCUPIED, hash = h, key = key, value = val
+            })
+            m.len = m.len + 1
+            out
+        end
+        idx = (idx + 1) & mask
+    end
+end
+
+# ─── Public API ───────────────────────────────────────
+
+func map_insert(m: &Map<K, V>, key: K, val: V) -> Option<V>
+    # Chèn key-value pair. Returns value cũ if key already exists.
+    if _map_needs_grow(*m) _map_grow(m) end
+    
+    var h = m.hash_fn(key)
+    var mask = m.cap - 1
+    var idx = h & mask
+    
+    loop
+        var e = native_load_struct<MapEntry<K, V>>(m.entries, idx)
+        
+        if e.state == ENTRY_EMPTY or e.state == ENTRY_TOMBSTONE
+            native_store_struct<MapEntry<K, V>>(m.entries, idx, MapEntry<K, V> {
+                state = ENTRY_OCCUPIED, hash = h, key = key, value = val
+            })
+            if e.state == ENTRY_TOMBSTONE
+                m.tombstones = m.tombstones - 1
+            end
+            m.len = m.len + 1
+            out None
+        end
+        
+        if e.hash == h and m.eq_fn(e.key, key)
+            # Key already exists — thay thế value
+            var old_val = e.value
+            native_store_struct<MapEntry<K, V>>(m.entries, idx, MapEntry<K, V> {
+                state = ENTRY_OCCUPIED, hash = h, key = key, value = val
+            })
+            out Some(old_val)
+        end
+        
+        idx = (idx + 1) & mask
+    end
+end
+
+func map_get(m: Map<K, V>, key: K) -> Option<V>
+    if m.cap == 0 out None end
+    
+    var h = m.hash_fn(key)
+    var mask = m.cap - 1
+    var idx = h & mask
+    
+    loop
+        var e = native_load_struct<MapEntry<K, V>>(m.entries, idx)
+        
+        if e.state == ENTRY_EMPTY out None end
+        
+        if e.state == ENTRY_OCCUPIED and e.hash == h and m.eq_fn(e.key, key)
+            out Some(e.value)
+        end
+        
+        idx = (idx + 1) & mask
+    end
+end
+
+func map_contains(m: Map<K, V>, key: K) -> bool
+    out is_some(map_get(m, key))
+end
+
+func map_remove(m: &Map<K, V>, key: K) -> Option<V>
+    if m.cap == 0 out None end
+    
+    var h = m.hash_fn(key)
+    var mask = m.cap - 1
+    var idx = h & mask
+    
+    loop
+        var e = native_load_struct<MapEntry<K, V>>(m.entries, idx)
+        
+        if e.state == ENTRY_EMPTY out None end
+        
+        if e.state == ENTRY_OCCUPIED and e.hash == h and m.eq_fn(e.key, key)
+            var old_val = e.value
+            native_store_struct<MapEntry<K, V>>(m.entries, idx, MapEntry<K, V> {
+                state = ENTRY_TOMBSTONE, hash = 0, key = e.key, value = e.value
+            })
+            m.len = m.len - 1
+            m.tombstones = m.tombstones + 1
+            out Some(old_val)
+        end
+        
+        idx = (idx + 1) & mask
+    end
+end
+
+# ─── Info ─────────────────────────────────────────────
+
+func map_len(m: Map<K, V>) -> usize
+    out m.len
+end
+
+func map_is_empty(m: Map<K, V>) -> bool
+    out m.len == 0
+end
+
+# ─── Iteration ────────────────────────────────────────
+
+entity MapPair<K, V>
+    key: K
+    value: V
+end
+
+func map_keys(m: Map<K, V>) -> Vec<K>
+    var keys = vec_new()
+    var i: usize = 0
+    lặp_khi i < m.cap
+        var e = native_load_struct<MapEntry<K, V>>(m.entries, i)
+        if e.state == ENTRY_OCCUPIED
+            vec_push(&keys, e.key)
+        end
+        i = i + 1
+    end
+    out keys
+end
+
+func map_values(m: Map<K, V>) -> Vec<V>
+    var values = vec_new()
+    var i: usize = 0
+    lặp_khi i < m.cap
+        var e = native_load_struct<MapEntry<K, V>>(m.entries, i)
+        if e.state == ENTRY_OCCUPIED
+            vec_push(&values, e.value)
+        end
+        i = i + 1
+    end
+    out values
+end
+
+func map_pairs(m: Map<K, V>) -> Vec<MapPair<K, V>>
+    var pairs = vec_new<MapPair<K, V>>()
+    var i: usize = 0
+    lặp_khi i < m.cap
+        var e = native_load_struct<MapEntry<K, V>>(m.entries, i)
+        if e.state == ENTRY_OCCUPIED
+            vec_push<MapPair<K, V>>(&pairs, MapPair { key = e.key, value = e.value })
+        end
+        i = i + 1
+    end
+    out pairs
+end
+
+# ─── Utility ──────────────────────────────────────────
+
+func map_clear(m: &Map<K, V>)
+    if m.entries != null
+        mem_set(m.entries, 0, m.cap * size_of<MapEntry<K, V>>())
+    end
+    m.len = 0
+    m.tombstones = 0
+end
+
+func map_free(m: &Map<K, V>)
+    if m.entries != null free(m.entries) end
+    m.entries = null
+    m.cap = 0
+    m.len = 0
+    m.tombstones = 0
+end
+
+# ═══════════════════════════════════════════════════════
+# Convenience: String->V map
+# ═══════════════════════════════════════════════════════
+
+func string_map_new() -> Map<String, V>
+    out map_new(hash_string, str_eq)
+end
