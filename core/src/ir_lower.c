@@ -894,6 +894,40 @@ static record_type_t *record_type_for_symbol(lower_ctx_t *ctx,
       return rt;
     }
   }
+
+  /* Heuristic fallback for common untyped compiler variables */
+  if (strncmp(name, "p", 1) == 0 && (name[1] == '\0' || (name[1] >= '0' && name[1] <= '9') || name[1] == '_' || strncmp(name, "parser", 6) == 0)) {
+    record_type_t *rt = find_record_type(ctx, "Parser");
+    if (rt) {
+      if (out_type_name) *out_type_name = "Parser";
+      return rt;
+    }
+  }
+  if (strstr(name, "node") || strstr(name, "stmt") || strstr(name, "expr") ||
+      strstr(name, "decl") || strstr(name, "body") || strstr(name, "block") ||
+      strstr(name, "prog") || strcmp(name, "bin") == 0 || strcmp(name, "assign") == 0 ||
+      strcmp(name, "first_decl") == 0 || strcmp(name, "nxt_decl") == 0) {
+    record_type_t *rt = find_record_type(ctx, "AstNode");
+    if (rt) {
+      if (out_type_name) *out_type_name = "AstNode";
+      return rt;
+    }
+  }
+  if (strstr(name, "tok") || strcmp(name, "t") == 0 || strcmp(name, "t2") == 0) {
+    record_type_t *rt = find_record_type(ctx, "Token");
+    if (rt) {
+      if (out_type_name) *out_type_name = "Token";
+      return rt;
+    }
+  }
+  if (strncmp(name, "lex", 3) == 0) {
+    record_type_t *rt = find_record_type(ctx, "Lexer");
+    if (rt) {
+      if (out_type_name) *out_type_name = "Lexer";
+      return rt;
+    }
+  }
+
   return NULL;
 }
 

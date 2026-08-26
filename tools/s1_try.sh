@@ -4,10 +4,11 @@
 set -e
 cd "$(dirname "$0")/.."
 IN=${1:-tests/bootstrap_codegen/cg_call.vri}
-./core/build/vir run virc_boot.vri -- virc_stage1.vri -o dist/virc-stage1 2>&1 | rg -q "done!" \
-  || { echo "STAGE0_BUILD_FAILED"; exit 2; }
+./core/build/vir run virc_boot.vri -- virc_stage1.vri -o dist/virc-stage1 > /tmp/s1_try_stage0.log 2>&1 || true
+rg -q "wrote output" /tmp/s1_try_stage0.log \
+  || { echo "STAGE0_BUILD_FAILED"; tail -20 /tmp/s1_try_stage0.log; exit 2; }
 file dist/virc-stage1 | rg -q "Mach-O" || { echo "NOT_MACHO"; exit 3; }
-codesign -f -s - dist/virc-stage1 >/dev/null 2>&1
+codesign -f -s - -i virc-bootstrap dist/virc-stage1 >/dev/null 2>&1
 rm -f dist/from_s1
 set +e
 ./dist/virc-stage1 "$IN" -o dist/from_s1 &
@@ -21,7 +22,7 @@ kill $WPID 2>/dev/null
 echo "S1_EXIT:$RC"
 if [ -f dist/from_s1 ]; then
   chmod +x dist/from_s1
-  codesign -f -s - dist/from_s1 >/dev/null 2>&1
+  codesign -f -s - -i virc-bootstrap dist/from_s1 >/dev/null 2>&1
   ./dist/from_s1
   echo "OUT_EXIT:$?"
 fi

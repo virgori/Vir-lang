@@ -1,7 +1,13 @@
 # Pipeline Mapping Tables
 
-**Soft / canonical path:**  
+**Official architecture (Spec §1.2 / ARCHITECTURE §0):**  
+`AST` → **HIR** → **MIR** → **LIR** → Optimizer → Codegen  
+
+**Soft implementation (today):**  
 `AST` → `ast_to_mir` → MIR → (`mir_ssa` / `mir_opt`) → `lir_lower` → **LIR clean** → (`lir_liveness` / `lir_regalloc_color` / **George–Appel coalesce**) → `lir_codegen` → ARM64  
+
+HIR module exists (`hir.vri`); soft `virc` may still skip an explicit AST→HIR pass until wired — that is an implementation gap, not a second architecture.  
+**Not official:** flat Q-IR; QIR-H/M/L (see `docs/archive/QIR_ARCHITECTURE.md`).
 
 **Live Stage-0/1 path (today):** flat MIR in `virc_boot.vri` → Mach-O (không đi hết soft LIR codegen).  
 
@@ -14,7 +20,7 @@
 
 **Status:** `OK` | `PARTIAL` | `TODO` | `—` (không áp dụng) | `LIVE` (chỉ boot flat emit)
 
-Updated: 2026-07-28 (RA architecture: clean LIR → Briggs/LS → George–Appel coalesce)
+Updated: 2026-07-31 (official IR = HIR→MIR→LIR; soft may still AST→MIR)
 
 ---
 

@@ -1,4 +1,7 @@
 # Vir Engine — Báo cáo Tiến độ & Thực trạng
+
+> **Status:** Historical snapshot (2026-06-20). IR naming (QIR-High/Mid/Low) superseded by **HIR → MIR → LIR**.
+
 **Ngày:** 20/6/2026  
 **Người thực hiện:** AI Pair Programmer (Antigravity)  
 **Cập nhật từ:** `COMPLETION_STATUS.md` (10/3/2026)

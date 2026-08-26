@@ -738,28 +738,8 @@ static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
     case 199: result = lseek((int)r1, (off_t)r2, (int)r3);                    break;
     default:  result = -1;                                                      break;
     }
-    FILE *dbg = vm_dbg_file();
-    if (dbg && (result < 0 || (s == 4 && result != r3))) {
-        vm_state_t *vm = ctx->vm;
-        fprintf(dbg, "syscall %lld args=(%lld,%lld,%lld,%lld,%lld) -> %lld errno=%d func=%s depth=%u save_top=%u reg_count=%u\n",
-                (long long)s, (long long)r1, (long long)r2, (long long)r3,
-                (long long)r4, (long long)r5, (long long)result, errno,
-                vm && vm->current_func ? vm->current_func->name : "?",
-                vm ? vm->func_depth : 0,
-                vm ? vm->reg_save_top : 0,
-                vm ? vm->reg_count : 0);
-        for (uint32_t d = 0; vm && d < vm->func_depth; d++) {
-            fprintf(dbg, "  frame[%u] func=%s ip=%u saved=%u base=%u crc=%u\n",
-                    d, vm->func_stack[d].func ? vm->func_stack[d].func->name : "?",
-                    vm->func_stack[d].ip, vm->func_stack[d].saved_reg_count,
-                    vm->func_stack[d].saved_base,
-                    vm->func_stack[d].caller_reg_count);
-        }
-        fflush(dbg);
-    }
     *ctx->ret = result;
 }
-
 
 static void intr_sys_read(vir_intrinsic_ctx_t *ctx) {
     *ctx->ret = (int64_t)read((int)ctx->args[0],
@@ -835,7 +815,7 @@ static void intr_memset(vir_intrinsic_ctx_t *ctx) {
 /* Raw memory access for virc_boot `extern func native_*` shims (Stage-0 VM). */
 static int vm_host_ptr_ok(int64_t base)
 {
-    if (base == 0)
+    if (base <= 0)
         return 0;
     if (base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE)
         return 1;
@@ -1654,7 +1634,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         int64_t base = operand_value(vm, &instr->src1);
         int64_t off  = operand_value(vm, &instr->src2);
         /* Null/invalid pointer guard: address 0 or below page boundary */
-        if (base == 0 || (base > 0 && base < 4096 &&
+        if (base <= 0 || (base > 0 && base < 4096 &&
             !(base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE))) {
             set_dest(vm, &instr->dest, 0);
             break;
@@ -1668,7 +1648,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         int64_t off  = operand_value(vm, &instr->src2);
         int64_t val  = operand_value(vm, &instr->dest);
         /* Null/invalid pointer guard */
-        if (base == 0 || (base > 0 && base < 4096 &&
+        if (base <= 0 || (base > 0 && base < 4096 &&
             !(base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE))) {
             break;  /* silently ignore write to null/invalid ptr */
         }
@@ -1680,9 +1660,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         int64_t dst = operand_value(vm, &instr->dest);
         int64_t src = operand_value(vm, &instr->src1);
         int64_t len = operand_value(vm, &instr->src2);
-        if (dst && src && len > 0) {
-            if (len == 48) { printf("VM Q_MEM_COPY: dst=%lld src=%lld len=%lld\n", dst, src, len); }
-
+        if (dst > 0 && src > 0 && len > 0) {
             memcpy((void *)(intptr_t)dst, (const void *)(intptr_t)src, (size_t)len);
         }
         break;
@@ -1691,7 +1669,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         int64_t dst = operand_value(vm, &instr->dest);
         int64_t val = operand_value(vm, &instr->src1);
         int64_t len = operand_value(vm, &instr->src2);
-        if (dst && len > 0) {
+        if (dst > 0 && len > 0) {
             memset((void *)(intptr_t)dst, (int)val, (size_t)len);
         }
         break;
@@ -1707,15 +1685,17 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
                      total < slots ? vm->mmio_region[total] : 0);
         } else {
             /* Null/invalid pointer guard */
-            if (base == 0 || (base > 0 && base < 4096)) {
+            if (base <= 0 || (base > 0 && base < 4096)) {
                 set_dest(vm, &instr->dest, 0);
                 break;
             }
-            int64_t *ptr = (int64_t *)((char *)(intptr_t)base + idx);
-            int64_t v = ptr ? *ptr : 0;
-            if (ptr) {
-
+            uintptr_t target_addr = (uintptr_t)((char *)(intptr_t)base + idx);
+            if (target_addr < 4096 || target_addr > 0x7fffffffffffULL) {
+                set_dest(vm, &instr->dest, 0);
+                break;
             }
+            int64_t v = 0;
+            memcpy(&v, (const void *)target_addr, sizeof(v));
             set_dest(vm, &instr->dest, v);
         }
         break;
@@ -1731,14 +1711,14 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
             if (total < slots) vm->mmio_region[total] = val;
         } else {
             /* Null/invalid pointer guard */
-            if (base == 0 || (base > 0 && base < 4096)) {
+            if (base <= 0 || (base > 0 && base < 4096)) {
                 break;  /* silently ignore write to null/invalid ptr */
             }
-            int64_t *ptr = (int64_t *)((char *)(intptr_t)base + idx);
-            if (ptr) {
-                *ptr = val;
-
+            uintptr_t target_addr = (uintptr_t)((char *)(intptr_t)base + idx);
+            if (target_addr < 4096 || target_addr > 0x7fffffffffffULL) {
+                break;
             }
+            memcpy((void *)target_addr, &val, sizeof(val));
         }
         break;
     }

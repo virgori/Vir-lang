@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Compile and execute the Stage-1 bootstrap regression manifest."""
+"""Compile and execute the Stage-1 bootstrap regression manifest.
+
+Compares unsigned compiler outputs across --compiler stages (pre-codesign).
+For bit-identical bootstrap binaries, use tools/bootstrap_fixed_point.sh
+(codesign -i virc-bootstrap).
+"""
 
 from __future__ import annotations
 
@@ -85,7 +90,7 @@ def main() -> int:
                 unsigned_outputs.append(binary.read_bytes())
                 os.chmod(binary, 0o755)
                 signed = run(
-                    ["codesign", "-s", "-", "-f", str(binary)],
+                    ["codesign", "-s", "-", "-f", "-i", "virc-bootstrap", str(binary)],
                     timeout=args.timeout,
                 )
                 if signed.returncode != 0:

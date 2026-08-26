@@ -28,7 +28,7 @@
 - [x] Porting **Constant Folding Pass** sang Vir (v1.2).
 - [x] Porting **Dead Code Elimination (DCE)** sang Vir.
 - [x] Viết lại toàn bộ 12-pass Optimizer bằng Vir (~5,000 LOC).
-- [x] Porting QIR-H/M/L pipeline sang Vir native.
+- [x] Porting QIR-H/M/L pipeline sang Vir native. *(historical claim — superseded by HIR→MIR→LIR)*
 - [x] Chuyển đổi mã nguồn `Virgex` (Regex) sang thuần Vir.
 - [x] Chuyển đổi hệ thống Testing (`pytest`) sang `vtest.vri`.
 
@@ -49,7 +49,7 @@
 - Stage 1 hiện đã có optimizer tự-host 12-pass trong Vir.
 - Optimizer Vir hiện đã được nối thành pipeline 12-pass: Copy Propagation, Constant Folding, CSE, Inlining, Strength Reduction, LICM, BCE, Escape Analysis, Deterministic Free, Loop Unroll, Vectorize, DCE.
 - Trong 12 pass trên, `BCE` và `Escape Analysis` hiện đã có transform thật trong self-hosted layer: BCE phát hiện canonical loop, chứng minh bounds an toàn, và elide `Q_BOUNDS_CHECK` instructions. Escape Analysis detect non-escaping allocations, rewrite `Alloc → StackAlloc`, và remove `Free → Nop` cho promoted allocations.
-- Lexer, Parser, Codegen bản Vir đã hiện diện trong `stdlib/vir/compiler`; `virc.vri` hiện đã đi qua wrapper chính thức `QIR-H` → `QIR-M` → `QIR-L` thay vì đường lắp tay cũ.
+- Lexer, Parser, Codegen bản Vir đã hiện diện trong `stdlib/vir/compiler`. **Official spine:** `HIR → MIR → LIR` (Spec §1.2). Older checklist text claiming `QIR-H → QIR-M → QIR-L` is historical / inaccurate for soft `virc`.
 - `Virgex` không còn là khoảng trống trắng: engine regex thuần Vir đã hiện diện trong `stdlib/vir/regex/regex.vri`; nợ còn lại là tích hợp/compiler adoption.
 - `Virgex` đã có đường chính thức thuần Vir tại `stdlib/vir/pattern/virgex.vri` với API compile pattern (`virgex_compile`) + tái sử dụng compiled pattern (`virgex_pattern_*`), giảm đường phụ thuộc Python ở lớp integration API.
 - Hạ tầng test bản Vir đã hoàn chỉnh trong `stdlib/vir/test` (vtest.vri + test.vri + parallel.vri + mock.vri + snapshot.vri + fixtures.vri + proptest.vri + fuzz.vri + coverage.vri). 9 vtest suites (168 tests tổng) thay thế toàn bộ 46 pytest files (~215 test functions).

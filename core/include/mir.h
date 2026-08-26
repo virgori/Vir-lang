@@ -24,6 +24,7 @@ typedef enum {
     MIR_JUMP,
     MIR_JUMP_IF,
     MIR_RETURN,
+    MIR_EXIT,
     MIR_PRINT,
     MIR_CMP_GT,
     MIR_CMP_LT,

@@ -70,6 +70,8 @@ static lir_op_t map_mir_op(mir_op_t m) {
             return LIR_JMP_COND;
         case MIR_RETURN:
             return LIR_RET;
+        case MIR_EXIT:
+            return LIR_EXIT;
         case MIR_PRINT:
             return LIR_PRINT;
         case MIR_MOD:

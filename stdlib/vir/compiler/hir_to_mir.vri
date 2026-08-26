@@ -1,0 +1,467 @@
+##
+ * vir/compiler/hir_to_mir.vri — HIR to MIR Lowering (Vir v2.0)
+ * =============================================================
+ * Lowers canonical High-Level IR into SSA Mid-Level IR functions.
+ ##
+
+include types;
+include vec_rt;
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt, vec_set_rt from vec_rt;
+
+include string_rt;
+import fat_str_eq, fat_str_len, native_read_i64, native_write_i64 from string_rt;
+
+include parser;
+import OpType, AstType from parser;
+
+include hir;
+import HirKind, HirNode, HirFunc from hir;
+
+include mir;
+import MirOp, MirOperandType, MirOperand, MirInstr, MirBlock, MirFunc, mir_opnd_none, mir_opnd_vreg, mir_opnd_imm, mir_create_func, mir_create_block, MIR_INTR_STR_LIT, MIR_INTR_PRINT, MIR_INTR_PRINT_STR, MIR_INTR_PARAM, MIR_INTR_BUILTIN, MIR_INTR_INDEX, MIR_INTR_FIELD, MIR_INTR_INDEX_STORE, MIR_INTR_FIELD_STORE, MIR_INTR_ARRAY, MIR_INTR_ENTITY, MIR_INTR_TUPLE from mir;
+
+include ast_to_mir;
+import MirBuilder, builder_new, builder_func, builder_set_func, builder_new_vreg, builder_intern, builder_add_block, builder_set_current_block, builder_add_instr, builder_add_edge, get_var_vreg, set_var_vreg, emit_jump, emit_jump_if, emit_set_arg, emit_intrinsic, emit_move, emit_load, emit_store, find_field_index, is_register_field, get_register_field_start, get_register_field_width from ast_to_mir;
+
+func hir_op_to_mirop(op: int):
+    if op == 0 do out MirOp.Add end
+    if op == 1 do out MirOp.Sub end
+    if op == 2 do out MirOp.Mul end
+    if op == 3 do out MirOp.Div end
+    if op == 4 do out MirOp.Mod end
+    if op == 10 do out MirOp.CmpEq end
+    if op == 11 do out MirOp.CmpNe end
+    if op == 12 do out MirOp.CmpGt end
+    if op == 13 do out MirOp.CmpLt end
+    if op == 14 do out MirOp.CmpGe end
+    if op == 15 do out MirOp.CmpLe end
+    if op == 20 do out MirOp.And end
+    if op == 21 do out MirOp.Or end
+    if op == 22 do out MirOp.Xor end
+    if op == 23 do out MirOp.Shl end
+    if op == 24 do out MirOp.Shr end
+    if op == 25 do out MirOp.Pow end
+    if op == 28 do out MirOp.MatMul end
+    if op == 29 do out MirOp.Fma end
+    if op == 33 do out MirOp.Mod end
+    out MirOp.Add
+end.
+
+func lower_hir_expr(b: MirBuilder, node: HirNode):
+    if (node as i64) == 0 do
+        out (b, mir_opnd_none())
+    end
+    k = node.kind;
+
+    # 1. Const
+    if k == HirKind.Const do
+        out (b, mir_opnd_imm(node.imm_val))
+    end
+
+    # 2. String Literal
+    if k == HirKind.StrLit do
+        var (b1, sid) = builder_intern(b, node.name);
+        var (b2, dst) = builder_new_vreg(b1);
+        b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(dst), mir_opnd_imm(sid));
+        out (b2, mir_opnd_vreg(dst))
+    end
+
+    # 3. Variable Load
+    if k == HirKind.Load do
+        v = get_var_vreg(b, node.name);
+        if v >= 0 do
+            out (b, mir_opnd_vreg(v))
+        end
+        out (b, mir_opnd_none())
+    end
+
+    # 4. Binary Op
+    if k == HirKind.BinOp do
+        var (b1, l_opnd) = lower_hir_expr(b, node.left_node as HirNode);
+        var (b2, r_opnd) = lower_hir_expr(b1, node.right_node as HirNode);
+        var (b3, dst) = builder_new_vreg(b2);
+        m_op = hir_op_to_mirop(node.op as int);
+        ins = mir_instr_new(m_op, mir_opnd_vreg(dst), l_opnd, r_opnd);
+        b3 = builder_add_instr(b3, ins);
+        out (b3, mir_opnd_vreg(dst))
+    end
+
+    # 5. Unary Op
+    if k == HirKind.UnaryOp do
+        var (b1, child_opnd) = lower_hir_expr(b, node.left_node as HirNode);
+        var (b2, dst) = builder_new_vreg(b1);
+        if node.op == 25 do
+            b2 = emit_intrinsic(b2, MIR_INTR_ADDR_OF, mir_opnd_vreg(dst), child_opnd);
+            out (b2, mir_opnd_vreg(dst))
+        end
+        if node.op == 27 do
+            ins = mir_instr_new(MirOp.Not, mir_opnd_vreg(dst), child_opnd, mir_opnd_none());
+            b2 = builder_add_instr(b2, ins);
+            out (b2, mir_opnd_vreg(dst))
+        end
+        ins = mir_instr_new(MirOp.Sub, mir_opnd_vreg(dst), mir_opnd_imm(0), child_opnd);
+        b2 = builder_add_instr(b2, ins);
+        out (b2, mir_opnd_vreg(dst))
+    end
+
+    # 6. Function Call & Builtin Call
+    if k == HirKind.Call or k == HirKind.BuiltinCall do
+        n = vec_len_rt(node.args);
+        b_mut = b;
+        staged = vec_new_rt();
+        var i = 0;
+        when i < n loop
+            arg_h = vec_get_rt(node.args, i) as HirNode;
+            var (b_next, arg_opnd) = lower_hir_expr(b_mut, arg_h);
+            var (b_stage, tv) = builder_new_vreg(b_next);
+            b_stage = emit_move(b_stage, tv, arg_opnd);
+            staged = vec_push_rt(staged, tv);
+            b_mut = b_stage;
+            i = i + 1
+        end
+        var j = 0;
+        when j < vec_len_rt(staged) loop
+            tv = vec_get_rt(staged, j);
+            b_mut = emit_set_arg(b_mut, j, mir_opnd_vreg(tv));
+            j = j + 1
+        end
+        if rt_streq(node.name, "__mir_throw") do
+            var (b2, dst) = builder_new_vreg(b_mut);
+            if n > 0 do
+                tv0 = vec_get_rt(staged, 0);
+                b_mut = emit_intrinsic(b_mut, MIR_INTR_THROW, mir_opnd_none(), mir_opnd_vreg(tv0));
+            else
+                b_mut = emit_intrinsic(b_mut, MIR_INTR_THROW, mir_opnd_none(), mir_opnd_none());
+            end
+            out (b_mut, mir_opnd_vreg(dst))
+        end
+        if rt_streq(node.name, "__mir_resume") do
+            var (b1, rid) = builder_intern(b_mut, node.name2);
+            var (b2, dst) = builder_new_vreg(b1);
+            b2 = emit_intrinsic(b2, MIR_INTR_RESUME, mir_opnd_none(), mir_opnd_imm(rid));
+            out (b2, mir_opnd_vreg(dst))
+        end
+        if rt_streq(node.name, "__mir_emit") do
+            var (b2, dst) = builder_new_vreg(b_mut);
+            if n > 0 do
+                tv0 = vec_get_rt(staged, 0);
+                b_mut = emit_intrinsic(b_mut, MIR_INTR_EMIT, mir_opnd_none(), mir_opnd_vreg(tv0));
+            else
+                b_mut = emit_intrinsic(b_mut, MIR_INTR_EMIT, mir_opnd_none(), mir_opnd_none());
+            end
+            out (b_mut, mir_opnd_vreg(dst))
+        end
+        if rt_streq(node.name, "__mir_ensure") do
+            var (b2, dst) = builder_new_vreg(b_mut);
+            b2 = emit_intrinsic(b2, MIR_INTR_ENSURE, mir_opnd_none(), mir_opnd_none());
+            out (b2, mir_opnd_vreg(dst))
+        end
+        if rt_streq(node.name, "__mir_revert") do
+            var (b2, dst) = builder_new_vreg(b_mut);
+            b2 = emit_intrinsic(b2, MIR_INTR_REVERT, mir_opnd_none(), mir_opnd_none());
+            out (b2, mir_opnd_vreg(dst))
+        end
+        if rt_streq(node.name, "__mir_try") do
+            var (b2, dst) = builder_new_vreg(b_mut);
+            b2 = emit_intrinsic(b2, MIR_INTR_TRY, mir_opnd_none(), mir_opnd_none());
+            out (b2, mir_opnd_vreg(dst))
+        end
+        if rt_streq(node.name, "__mir_arena_enter") do
+            var (b2, mark_vreg) = builder_new_vreg(b_mut);
+            b2 = emit_intrinsic(b2, MIR_INTR_ARENA, mir_opnd_vreg(mark_vreg), mir_opnd_none());
+            out (b2, mir_opnd_vreg(mark_vreg))
+        end
+        if rt_streq(node.name, "__mir_arena_exit") do
+            var (b2, dst) = builder_new_vreg(b_mut);
+            b2 = emit_intrinsic(b2, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_none());
+            out (b2, mir_opnd_vreg(dst))
+        end
+        if k == HirKind.BuiltinCall do
+            var (b2, dst) = builder_new_vreg(b_mut);
+            b2 = emit_intrinsic(b2, MIR_INTR_BUILTIN, mir_opnd_vreg(dst), mir_opnd_imm(node.imm_val));
+            out (b2, mir_opnd_vreg(dst))
+        else
+            var (b1, sid) = builder_intern(b_mut, node.name);
+            var (b2, dst) = builder_new_vreg(b1);
+            ins = mir_instr_new(MirOp.Call, mir_opnd_vreg(dst), mir_opnd_imm(n), mir_opnd_imm(sid));
+            b2 = builder_add_instr(b2, ins);
+            out (b2, mir_opnd_vreg(dst))
+        end
+    end
+
+    # 7. Field Access
+    if k == HirKind.FieldAccess do
+        var (b1, base) = lower_hir_expr(b, node.left_node as HirNode);
+        fname = node.name;
+        if is_register_field(fname) == 1 do
+            start_bit = get_register_field_start(fname);
+            width = get_register_field_width(fname);
+            var (b2, v1) = builder_new_vreg(b1);
+            ins1 = mir_instr_new(MirOp.Shr, mir_opnd_vreg(v1), base, mir_opnd_imm(start_bit));
+            b2 = builder_add_instr(b2, ins1);
+            var mask = 1;
+            var mi = 0;
+            when mi < width loop
+                mask = mask * 2;
+                mi = mi + 1
+            end
+            mask = mask - 1;
+            var (b3, dst) = builder_new_vreg(b2);
+            ins2 = mir_instr_new(MirOp.And, mir_opnd_vreg(dst), mir_opnd_vreg(v1), mir_opnd_imm(mask));
+            b3 = builder_add_instr(b3, ins2);
+            out (b3, mir_opnd_vreg(dst))
+        end
+        var (b2, dst) = builder_new_vreg(b1);
+        fid = find_field_index(fname);
+        b2 = emit_set_arg(b2, 0, mir_opnd_imm(fid));
+        b2 = emit_intrinsic(b2, MIR_INTR_FIELD, mir_opnd_vreg(dst), base);
+        out (b2, mir_opnd_vreg(dst))
+    end
+
+    # 8. Index Access
+    if k == HirKind.IndexAccess do
+        b1 = b;
+        base = mir_opnd_none();
+        if (node.left_node as i64) != 0 do
+            var (b_l, base_opnd) = lower_hir_expr(b, node.left_node as HirNode);
+            b1 = b_l;
+            base = base_opnd;
+        else
+            bv = get_var_vreg(b, node.name);
+            if bv >= 0 do
+                base = mir_opnd_vreg(bv);
+            end
+        end
+        var (b2, idx) = lower_hir_expr(b1, node.right_node as HirNode);
+        var (b3, dst) = builder_new_vreg(b2);
+        b3 = emit_set_arg(b3, 0, idx);
+        b3 = emit_intrinsic(b3, MIR_INTR_INDEX, mir_opnd_vreg(dst), base);
+        out (b3, mir_opnd_vreg(dst))
+    end
+
+    # 9. Aggregate (Entity, Array, Tuple)
+    if k == HirKind.Aggregate do
+        n = vec_len_rt(node.args);
+        b_mut = b;
+        var i = 0;
+        when i < n loop
+            elem_h = vec_get_rt(node.args, i) as HirNode;
+            var (b_next, elem_opnd) = lower_hir_expr(b_mut, elem_h);
+            b_mut = emit_set_arg(b_next, i, elem_opnd);
+            i = i + 1
+        end
+        var (b1, dst) = builder_new_vreg(b_mut);
+        intr_kind = MIR_INTR_ARRAY;
+        if node.imm_val == (AstType.EntityLiteral as i64) do
+            intr_kind = MIR_INTR_ENTITY;
+            var (b_ent, tid) = builder_intern(b1, node.name);
+            b1 = emit_set_arg(b_ent, n, mir_opnd_imm(tid));
+        eif node.imm_val == (AstType.TupleExpr as i64) do
+            intr_kind = MIR_INTR_TUPLE;
+        end
+        b1 = emit_intrinsic(b1, intr_kind, mir_opnd_vreg(dst), mir_opnd_imm(n));
+        out (b1, mir_opnd_vreg(dst))
+    end
+
+    out (b, mir_opnd_none())
+end.
+
+func lower_hir_stmt(b: MirBuilder, node: HirNode):
+    if (node as i64) == 0 do
+        out b
+    end
+    k = node.kind;
+
+    # 1. Block
+    if k == HirKind.Block do
+        if rt_streq(node.name, "__mir_arena_block") do
+            var (b_mark, mark_vreg) = builder_new_vreg(b);
+            b_mark = emit_intrinsic(b_mark, MIR_INTR_ARENA, mir_opnd_vreg(mark_vreg), mir_opnd_none());
+            n = vec_len_rt(node.body);
+            b_mut = b_mark;
+            var i = 0;
+            when i < n loop
+                s_h = vec_get_rt(node.body, i) as HirNode;
+                b_mut = lower_hir_stmt(b_mut, s_h);
+                i = i + 1
+            end
+            out emit_intrinsic(b_mut, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mark_vreg))
+        end
+        n = vec_len_rt(node.body);
+        b_mut = b;
+        var i = 0;
+        when i < n loop
+            s_h = vec_get_rt(node.body, i) as HirNode;
+            b_mut = lower_hir_stmt(b_mut, s_h);
+            i = i + 1
+        end
+        out b_mut
+    end
+
+    # 2. Variable Declaration / Store
+    if k == HirKind.VarDecl or k == HirKind.Store do
+        var (b1, val_opnd) = lower_hir_expr(b, node.left_node as HirNode);
+        var (b2, dst) = builder_new_vreg(b1);
+        b2 = emit_move(b2, dst, val_opnd);
+        out set_var_vreg(b2, node.name, dst)
+    end
+
+    # 3. Field Store (obj.field = val)
+    if k == HirKind.FieldStore do
+        bv = get_var_vreg(b, node.name);
+        var (b1, val_opnd) = lower_hir_expr(b, node.left_node as HirNode);
+        fname = node.name2;
+        if is_register_field(fname) == 1 and bv >= 0 do
+            start_bit = get_register_field_start(fname);
+            width = get_register_field_width(fname);
+            var mask = 1;
+            var mi = 0;
+            when mi < width loop
+                mask = mask * 2;
+                mi = mi + 1
+            end
+            mask = mask - 1;
+            var (b2, v_masked) = builder_new_vreg(b1);
+            ins1 = mir_instr_new(MirOp.And, mir_opnd_vreg(v_masked), val_opnd, mir_opnd_imm(mask));
+            b2 = builder_add_instr(b2, ins1);
+            var (b3, v_shifted) = builder_new_vreg(b2);
+            ins2 = mir_instr_new(MirOp.Shl, mir_opnd_vreg(v_shifted), mir_opnd_vreg(v_masked), mir_opnd_imm(start_bit));
+            b3 = builder_add_instr(b3, ins2);
+            var shifted_mask = mask;
+            var si = 0;
+            when si < start_bit loop
+                shifted_mask = shifted_mask * 2;
+                si = si + 1
+            end
+            var inv_mask = (0 - 1) xor shifted_mask;
+            var (b4, reg_cleared) = builder_new_vreg(b3);
+            ins3 = mir_instr_new(MirOp.And, mir_opnd_vreg(reg_cleared), mir_opnd_vreg(bv), mir_opnd_imm(inv_mask));
+            b4 = builder_add_instr(b4, ins3);
+            var (b5, reg_updated) = builder_new_vreg(b4);
+            ins4 = mir_instr_new(MirOp.Or, mir_opnd_vreg(reg_updated), mir_opnd_vreg(reg_cleared), mir_opnd_vreg(v_shifted));
+            b5 = builder_add_instr(b5, ins4);
+            b5 = emit_move(b5, bv, mir_opnd_vreg(reg_updated));
+            out b5
+        end
+        if bv >= 0 do
+            fid = find_field_index(fname);
+            b1 = emit_set_arg(b1, 0, mir_opnd_imm(fid));
+            b1 = emit_set_arg(b1, 1, val_opnd);
+            b1 = emit_intrinsic(b1, MIR_INTR_FIELD_STORE, mir_opnd_none(), mir_opnd_vreg(bv));
+        end
+        out b1
+    end
+
+    # 4. Index Store (arr[idx] = val)
+    if k == HirKind.IndexStore do
+        bv = get_var_vreg(b, node.name);
+        var (b1, idx_opnd) = lower_hir_expr(b, node.left_node as HirNode);
+        var (b2, val_opnd) = lower_hir_expr(b1, node.right_node as HirNode);
+        if bv >= 0 do
+            b2 = emit_set_arg(b2, 0, idx_opnd);
+            b2 = emit_set_arg(b2, 1, val_opnd);
+            b2 = emit_intrinsic(b2, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(bv));
+        end
+        out b2
+    end
+
+    # 5. If Statement
+    if k == HirKind.If do
+        var (b1, cond_opnd) = lower_hir_expr(b, node.cond_node as HirNode);
+        has_else = (node.else_block as i64) != 0;
+        var (b2, then_id) = builder_add_block(b1);
+        var else_id = 0;
+        var b3 = b2;
+        if has_else do
+            var (b3_2, else_id_2) = builder_add_block(b2);
+            b3 = b3_2;
+            else_id = else_id_2;
+        end
+        var (b4, end_id) = builder_add_block(b3);
+        if has_else == false do
+            else_id = end_id;
+        end
+        b4 = emit_jump_if(b4, cond_opnd, then_id, else_id);
+        b4 = builder_set_current_block(b4, then_id);
+        b4 = lower_hir_stmt(b4, node.then_block as HirNode);
+        b4 = emit_jump(b4, end_id);
+        if has_else do
+            b4 = builder_set_current_block(b4, else_id);
+            b4 = lower_hir_stmt(b4, node.else_block as HirNode);
+            b4 = emit_jump(b4, end_id);
+        end
+        out builder_set_current_block(b4, end_id)
+    end
+
+    # 6. Loop Statement
+    if k == HirKind.Loop do
+        var (b1, header_id) = builder_add_block(b);
+        var (b2, body_id) = builder_add_block(b1);
+        var (b3, end_id) = builder_add_block(b2);
+        b3 = emit_jump(b3, header_id);
+        b3 = builder_set_current_block(b3, header_id);
+        var (b4, cond_opnd) = lower_hir_expr(b3, node.cond_node as HirNode);
+        b4 = emit_jump_if(b4, cond_opnd, body_id, end_id);
+        b4 = builder_set_current_block(b4, body_id);
+        b4 = lower_hir_stmt(b4, node.then_block as HirNode);
+        b4 = emit_jump(b4, header_id);
+        out builder_set_current_block(b4, end_id)
+    end
+
+    # 7. Return Statement
+    if k == HirKind.Return do
+        var (b1, val_opnd) = lower_hir_expr(b, node.left_node as HirNode);
+        ins = mir_instr_new(MirOp.Return, mir_opnd_none(), val_opnd, mir_opnd_none());
+        out builder_add_instr(b1, ins)
+    end
+
+    # 8. Print Statement
+    if k == HirKind.Print do
+        child_h = node.left_node as HirNode;
+        var (b1, val_opnd) = lower_hir_expr(b, child_h);
+        if (child_h as i64) != 0 do
+            if child_h.kind == HirKind.StrLit do
+                out emit_intrinsic(b1, MIR_INTR_PRINT_STR, mir_opnd_none(), val_opnd)
+            end
+        end
+        out emit_intrinsic(b1, MIR_INTR_PRINT, mir_opnd_none(), val_opnd)
+    end
+
+    # 9. Expression as Statement
+    var (b_expr, _) = lower_hir_expr(b, node);
+    out b_expr
+end.
+
+func hir_lower_func(hfunc: HirFunc):
+    b = builder_new(hfunc.id as int, hfunc.name);
+    # Bind ABI parameters X0..Xn
+    pn = vec_len_rt(hfunc.params);
+    var pi = 0;
+    when pi < pn loop
+        param = vec_get_rt(hfunc.params, pi) as HirNode;
+        var (b2, pv) = builder_new_vreg(b);
+        b2 = emit_intrinsic(b2, MIR_INTR_PARAM, mir_opnd_vreg(pv), mir_opnd_imm(pi));
+        b = set_var_vreg(b2, param.name, pv);
+        pi = pi + 1
+    end
+    b = lower_hir_stmt(b, hfunc.body);
+    f = builder_func(b);
+    vc = native_read_i64(b as i64, 8);
+    native_write_i64(f as i64, 16, vc);
+    out f
+end.
+
+func hir_to_mir_program(hir_funcs: i64):
+    mir_funcs = vec_new_rt();
+    n = vec_len_rt(hir_funcs);
+    var i = 0;
+    when i < n loop
+        hf = vec_get_rt(hir_funcs, i) as HirFunc;
+        mf = hir_lower_func(hf);
+        mir_funcs = vec_push_rt(mir_funcs, mf as i64);
+        i = i + 1
+    end
+    out mir_funcs
+end.
+
+export lower_hir_expr, lower_hir_stmt, hir_lower_func, hir_to_mir_program

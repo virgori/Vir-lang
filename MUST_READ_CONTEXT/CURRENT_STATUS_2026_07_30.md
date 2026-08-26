@@ -2,6 +2,8 @@
 **Ngày:** 2026-07-30  
 **Branch:** `recovered_stash`
 
+**IR (official, 2026-07-31):** `AST → HIR → MIR → LIR → Codegen` — Spec §1.2 / `ARCHITECTURE.md` §0. Soft session below may still say MIR/LIR only (HIR wiring gap).
+
 ---
 
 ## Done this session

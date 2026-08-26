@@ -367,7 +367,7 @@ cd Vir && ./core/build/vir run stdlib/vir/compiler/virc.vri -- <test>.vri && ./a
 - [ ] PGO (Profile-Guided Optimization)
 - [ ] Superoptimization templates
 - [ ] x86_64 backend (active pipeline — currently only ARM64 in main.vri)
-- [ ] Port QIR-H/M/L 3-level pipeline from Python prototype to Vir
+- [ ] ~~Port QIR-H/M/L 3-level pipeline from Python prototype to Vir~~ **Superseded** — official IR is HIR→MIR→LIR (`hir.vri`/`mir.vri`/`lir.vri`); QIR-H/M/L archived
 - [ ] Full GELU approximation for FusedBiasGelu (currently bias-add only)
 
 ## 7) QOp Canonical Enum (82 opcodes, ir_optimizer.vri)

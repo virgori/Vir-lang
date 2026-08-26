@@ -276,6 +276,7 @@ typedef enum {
   BUILTIN_CTZ,         /* __ctz(n) → count trailing zeros         */
   BUILTIN_POPCNT,      /* __popcnt(n) → popcount                  */
   BUILTIN_BSWAP,       /* __bswap(n) → byte swap                  */
+  BUILTIN_BITNOT,      /* __not(n) / bnot(n) → bitwise NOT        */
   BUILTIN_ATOMIC_LOAD, /* __atomic_load(addr)                     */
   BUILTIN_ATOMIC_STORE,/* __atomic_store(addr, val)               */
   BUILTIN_ATOMIC_ADD,  /* __atomic_add(addr, val)                 */
@@ -338,7 +339,7 @@ typedef struct {
  * ═══════════════════════════════════════════════════════ */
 
 #define RECORD_MAX_FIELDS 128
-#define RECORD_MAX_TYPES 4096
+#define RECORD_MAX_TYPES 8192
 
 typedef struct {
   char name[AST_NAME_LEN]; /* field name */
@@ -520,7 +521,7 @@ typedef struct {
   uint32_t include_search_path_count;
 
   /* Track included files to prevent double-include */
-#define INCLUDE_MAX 64
+#define INCLUDE_MAX 1024
   char included_files[INCLUDE_MAX][256];
   uint32_t included_file_count;
 
@@ -533,7 +534,7 @@ typedef struct {
 
   /* Error tracking */
   int error_count;
-  char last_error[256];
+  char last_error[4096];
 
   /* §4.8 NLL: transient borrow claims emitted during the current
    * lower_stmt. A binder (var_decl / assign) may claim the most

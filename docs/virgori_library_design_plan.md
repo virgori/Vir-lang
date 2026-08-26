@@ -1,5 +1,8 @@
 # Virgori/Vir Library Design Plan (Master Blueprint v2 -> Execution)
 
+> **Status:** Historical plan. **Q-IR Spine (QIR-H/M/L)** superseded by **HIR → MIR → LIR**  
+> (Spec §1.2, `ARCHITECTURE.md` §0).
+
 ## 1. Muc tieu va pham vi
 
 Tai lieu nay chuyen Master Blueprint v2 thanh ke hoach thiet ke va trien khai thu vien cho workspace `AI/Vir`.

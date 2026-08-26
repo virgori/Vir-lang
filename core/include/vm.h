@@ -88,8 +88,9 @@ typedef enum {
     VIR_INTR_ATOMIC_STORE   = 17, /* R0=addr, R1=val             */
     VIR_INTR_ATOMIC_ADD     = 18, /* R0=addr, R1=val             */
     VIR_INTR_ATOMIC_SUB     = 19, /* R0=addr, R1=val             */
+    VIR_INTR_BITNOT         = 40, /* R0=val                      */
 
-    VIR_INTR_COUNT          = 20  /* sentinel – size of table    */
+    VIR_INTR_COUNT          = 41  /* sentinel – size of table    */
 } vir_intrinsic_id_t;
 
 /* Execution context passed to every intrinsic handler */

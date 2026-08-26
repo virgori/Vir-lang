@@ -7,7 +7,7 @@
 
 ## Mục lục
 
-1. [Tổng quan](#1-tổng-quan) — gồm [§1.0 Separator](#10-separator----hoặc-xuống-dòng), [§1.1 Mở khối](#11-mở-khối--do--loop--), [§1.2 Phân tầng Language / Compiler / Library](#12-phân-tầng-language--compiler--library)
+1. [Tổng quan](#1-tổng-quan) — gồm [§1.0 Separator](#10-separator----hoặc-xuống-dòng), [§1.1 Mở khối](#11-mở-khối--do--loop--), [§1.2 Phân tầng Language / Compiler / Library](#12-phân-tầng-language--compiler--library) (gồm [pipeline IR](#pipeline-ir-của-compiler-hir--mir--lir))
 2. [Chú thích (Comments)](#2-chú-thích-comments)
 3. [Hệ thống Module](#3-hệ-thống-module)
 4. [Kiểu dữ liệu](#4-kiểu-dữ-liệu)
@@ -241,6 +241,26 @@ Vir **không** gắn ngôn ngữ vào một runtime thực thi duy nhất (khác
 | **Language** | Cú pháp, type system, ownership, lifetime, memory model |
 | **Compiler** | Phân tích, tối ưu, codegen |
 | **Library** | Thread, async executor, scheduler, actor, work stealing, ArenaPool |
+
+#### Pipeline IR của compiler (HIR → MIR → LIR)
+
+Compiler Vir dùng **một** chuỗi IR chính thức. Nguồn sự thật là các module soft: `hir.vri`, `mir.vri`, `lir.vri` (và lowerer/codegen tương ứng). Spec không quy định opcode từng tầng; chỉ cố định thứ tự và vai trò:
+
+```text
+AST
+ ↓
+HIR   — ngữ nghĩa gần nguồn (sau parse / trước SSA đầy đủ)
+ ↓
+MIR   — CFG / SSA, tối ưu trung gian
+ ↓
+LIR   — gần máy: thanh ghi ảo / vật lý, stack, stub RT
+ ↓
+Optimizer passes (trên tầng phù hợp)
+ ↓
+Codegen → mã máy (ARM64, …)
+```
+
+Borrow check và các phân tích ownership chạy trên pipeline này (thường sau khi đã có dạng IR có CFG — xem §4.8). Tên lịch sử **Q-IR** / **QIR-H/M/L** không còn là kiến trúc chính thức.
 
 #### Nguyên tắc: Compiler không được biết scheduler tồn tại
 
@@ -599,7 +619,7 @@ arena_free(scratch)                    # giải phóng toàn bộ
 
 ### 4.8 Ownership, Borrow Checker và Move Semantics
 
-Vir có một **borrow checker thời biên dịch** đảm bảo an toàn bộ nhớ mà không cần garbage collector hay reference counting. Borrow checker chạy như một compiler pass sau IR lowering, trước codegen.
+Vir có một **borrow checker thời biên dịch** đảm bảo an toàn bộ nhớ mà không cần garbage collector hay reference counting. Borrow checker chạy như một compiler pass trên pipeline IR (sau HIR/MIR lowering phù hợp), trước codegen.
 
 #### Quy tắc Ownership
 
@@ -680,7 +700,7 @@ print(r[0])                     # r vẫn trong scope → xung đột
 
 #### Auto-drop và phạm vi arena
 
-Đối tượng cấp phát trong arena (`array`, `entity`, `string`, `dict`) được drop tự động khi owner thoát khỏi scope. Borrow checker chèn lệnh drop `Q_FREE` tại đúng vị trí — không cần gọi `free()`.
+Đối tượng cấp phát trong arena (`array`, `entity`, `string`, `dict`) được drop tự động khi owner thoát khỏi scope. Borrow checker chèn điểm drop tại đúng vị trí — không cần gọi `free()`.
 
 ```vir
 func vi_du:
@@ -698,13 +718,15 @@ end.                          # arr bị drop ở đây (function arena reset)
 #### Vị trí borrow checker trong pipeline
 
 ```
-AST → ir_lower → Q-IR → TCO pass → ★ Borrow Check ★ → Optimizer → Codegen
-                                          │
-                                          ├── Suy luận ownership
-                                          ├── Kiểm tra xung đột borrow
-                                          ├── Phân tích lifetime
-                                          └── Chèn điểm drop (Q_FREE)
+AST → HIR → MIR → ★ Borrow Check ★ → LIR → Optimizer → Codegen
+                        │
+                        ├── Suy luận ownership
+                        ├── Kiểm tra xung đột borrow
+                        ├── Phân tích lifetime
+                        └── Chèn điểm drop
 ```
+
+(Chi tiết opcode/pass: xem module compiler và [`ARCHITECTURE.md`](ARCHITECTURE.md); không còn pipeline “Q-IR” phẳng làm chuẩn.)
 
 **Chi phí biên dịch:** +5–10% thời gian biên dịch cho borrow check pass. Không có runtime overhead — tất cả kiểm tra được giải quyết tại thời điểm biên dịch.
 

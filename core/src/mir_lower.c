@@ -130,6 +130,18 @@ static mir_operand_t lower_hir_node_to_mir(mir_func_t* func, mir_block_t** curre
         case HIR_INTRINSIC_CALL: {
             uint32_t bid = hir->as.intrinsic_call.intrinsic_id;
             mir_operand_t dst = { MIR_OPND_VREG, {alloc_vreg(func)} };
+            if (bid == BUILTIN_EXIT) {
+                mir_operand_t arg = none;
+                if (hir->as.intrinsic_call.argc > 0) {
+                    arg = lower_hir_node_to_mir(
+                        func, current_block, loop_hdr, loop_end,
+                        hir->as.intrinsic_call.args[0], lctx);
+                    if (arg.type == MIR_OPND_NONE)
+                        return none;
+                }
+                mir_append_instr(*current_block, MIR_EXIT, dst, arg, none);
+                return dst;
+            }
             if (bid == BUILTIN_ARG_COUNT) {
                 mir_append_instr(*current_block, MIR_ARG_COUNT, dst, none, none);
                 return dst;

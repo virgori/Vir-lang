@@ -759,7 +759,7 @@ Sprint 6 (7C — Modules & Types):
 ## Tham chiếu tài liệu
 
 - Language Spec v1.2: `docs/vir_language_spec_v1.2.md`
-- QIR Architecture: `docs/QIR_ARCHITECTURE.md`
+- QIR Architecture (historical): `docs/archive/QIR_ARCHITECTURE.md` — superseded by HIR→MIR→LIR
 - Self-Hosting Spec: `docs/SELF_HOSTING_SPEC.md`
 - Module System: `docs/MODULE_INCLUDE_SYSTEM.md`
 - Phase 6 Status: `MUST_READ_CONTEXT/CURRENT_STATUS_2026_03_30.md`
