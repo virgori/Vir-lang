@@ -17,22 +17,24 @@ echo "=== Vir Native Test Suite ==="
 echo "Using compiler: $VIRC ($(stat -f%z "$VIRC") bytes)"
 echo ""
 
-# Run all 102 bootstrap tests
+# Run all bootstrap tests
 for t in tests/bootstrap_codegen/cg_*.vri; do
-    name=$(basename "$t")
-    if ! "$VIRC" "$t" -o "$TMP_BIN" >/dev/null 2>&1; then
-        echo "FAIL (compile): $name"
+    name=$(basename "$t" .vri)
+    test_bin="/tmp/vtest_${name}"
+    if ! "$VIRC" "$t" -o "$test_bin" >/dev/null 2>&1; then
+        echo "FAIL (compile): ${name}.vri"
         FAIL=$((FAIL+1))
         continue
     fi
-    codesign -s - -f "$TMP_BIN" >/dev/null 2>&1 || true
-    if "$TMP_BIN" >/dev/null 2>&1; then
-        echo "PASS: $name"
+    codesign -s - -f "$test_bin" >/dev/null 2>&1 || true
+    if "$test_bin" >/dev/null 2>&1; then
+        echo "PASS: ${name}.vri"
         PASS=$((PASS+1))
     else
-        echo "FAIL (exec): $name"
+        echo "FAIL (exec): ${name}.vri"
         FAIL=$((FAIL+1))
     fi
+    rm -f "$test_bin"
 done
 
 echo ""
