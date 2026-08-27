@@ -25,6 +25,8 @@ codesign -s - -f /tmp/smoke_test >/dev/null 2>&1 || true
 
 echo "Step 4: Installing new binary to bin/virc..."
 cp dist/virc-next bin/virc
+codesign -s - -f bin/virc >/dev/null 2>&1 || true
+chmod +x bin/virc
 
 echo "Step 5: Verifying full test suite with new bin/virc..."
 bash tools/test_native.sh
