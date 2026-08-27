@@ -3,9 +3,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VIRC="./bin/virc"
+VIRC="${1:-./bin/virc}"
 if [ ! -f "$VIRC" ]; then
-    echo "Compiler $VIRC not found. Run: cp dist/virc-stage2 bin/virc"
+    echo "Compiler $VIRC not found."
     exit 1
 fi
 
