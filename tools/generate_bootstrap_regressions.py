@@ -236,12 +236,12 @@ end.
 case("cg_mem_loop_pattern.vri", 45, """
 func main:
     let p = alloc(10);
-    let i = 0;
+    var i = 0;
     when i < 10 loop
         write_byte(p, i, i);
         i = i + 1;
     end
-    let sum = 0;
+    var sum = 0;
     i = 0;
     when i < 10 loop
         sum = sum + read_byte(p, i);
@@ -317,12 +317,12 @@ func main:
 end.
 """)
 loop_cases = [
-    ("cg_ctrl_when_eq.vri", 1, "let i = 0;", "i == 0", "i = 1"),
-    ("cg_ctrl_when_ne.vri", 3, "let i = 0;", "i != 3", "i = i + 1"),
-    ("cg_ctrl_when_lt.vri", 4, "let i = 0;", "i < 4", "i = i + 1"),
-    ("cg_ctrl_when_le.vri", 4, "let i = 0;", "i <= 3", "i = i + 1"),
-    ("cg_ctrl_when_gt.vri", 0, "let i = 4;", "i > 0", "i = i - 1"),
-    ("cg_ctrl_when_ge.vri", 0, "let i = 4;", "i >= 1", "i = i - 1"),
+    ("cg_ctrl_when_eq.vri", 1, "var i = 0;", "i == 0", "i = 1"),
+    ("cg_ctrl_when_ne.vri", 3, "var i = 0;", "i != 3", "i = i + 1"),
+    ("cg_ctrl_when_lt.vri", 4, "var i = 0;", "i < 4", "i = i + 1"),
+    ("cg_ctrl_when_le.vri", 4, "var i = 0;", "i <= 3", "i = i + 1"),
+    ("cg_ctrl_when_gt.vri", 0, "var i = 4;", "i > 0", "i = i - 1"),
+    ("cg_ctrl_when_ge.vri", 0, "var i = 4;", "i >= 1", "i = i - 1"),
 ]
 for name, expected, init, condition, update in loop_cases:
     case(name, expected, f"""
@@ -345,14 +345,14 @@ end.
 """)
 case("cg_local_assign_chain.vri", 42, """
 func main:
-    let a = 1; let b = 2;
+    var a = 1; var b = 2;
     a = b; b = 40; a = a + b;
     print(a); out 0;
 end.
 """)
 case("cg_local_loop_accum.vri", 55, """
 func main:
-    let i = 1; let sum = 0;
+    var i = 1; var sum = 0;
     when i <= 10 loop sum = sum + i; i = i + 1; end
     print(sum); out 0;
 end.
@@ -396,7 +396,7 @@ def generate() -> None:
         "# Globals are not in the Stage-1 subset; verify local reassignment instead.\n"
         "# EXPECT: 7\n"
         "func main:\n"
-        "    let x = 0;\n"
+        "    var x = 0;\n"
         "    x = 7;\n"
         "    print(x);\n"
         "    out 0;\n"
