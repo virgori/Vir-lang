@@ -19,7 +19,7 @@ codesign -s - -f dist/virc-next >/dev/null 2>&1 || true
 chmod +x dist/virc-next
 
 echo "Step 3: Smoke testing dist/virc-next..."
-dist/virc-next tests/vri/test_hello.vri -o /tmp/smoke_test
+dist/virc-next tests/bootstrap_codegen/cg_arith.vri -o /tmp/smoke_test
 codesign -s - -f /tmp/smoke_test >/dev/null 2>&1 || true
 /tmp/smoke_test >/dev/null 2>&1
 
