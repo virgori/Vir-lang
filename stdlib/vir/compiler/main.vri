@@ -942,12 +942,35 @@ func g_inc_init:
     g_inc_err = 0
 end.
 
+func g_inc_norm_key(name: string):
+    # Canonicalize a module key: drop directory prefix and a trailing ".vri"
+    # so `include "dir/foo.vri"` and `import ... from foo` map to the same key.
+    d = native_read_i64(name, 0);
+    ln = native_read_i64(name, 8);
+    if ln >= 4 and native_read_u8(d, ln - 4) == 46 and native_read_u8(d, ln - 3) == 118 and native_read_u8(d, ln - 2) == 114 and native_read_u8(d, ln - 1) == 105 do
+        ln = ln - 4
+    end
+    start = 0;
+    i = 0;
+    when i < ln loop
+        if native_read_u8(d, i) == 47 do
+            start = i + 1
+        end
+        i = i + 1
+    end
+    if ln - start <= 0 do
+        out name
+    end
+    out text_fat_from_range(d, start, ln - start)
+end.
+
 func g_inc_has(name: string):
+    key = g_inc_norm_key(name);
     n = native_read_i64(g_inc_tab, 0);
     i = 0;
     when i < n loop
         en = native_read_i64(g_inc_tab, 8 + i * 8);
-        if fat_str_eq(en, name) do
+        if fat_str_eq(en, key) do
             out 1
         end
         i = i + 1
@@ -956,11 +979,12 @@ func g_inc_has(name: string):
 end.
 
 func g_inc_mark(name: string):
+    key = g_inc_norm_key(name);
     n = native_read_i64(g_inc_tab, 0);
     if n >= G_INC_MAX do
         out 0
     end
-    native_write_i64(g_inc_tab, 8 + n * 8, fat_str_concat(name, fat_str_new("")));
+    native_write_i64(g_inc_tab, 8 + n * 8, fat_str_concat(key, fat_str_new("")));
     native_write_i64(g_inc_tab, 0, n + 1);
     out 1
 end.
@@ -1990,6 +2014,23 @@ func text_parse_import_at(source: string, at: int):
         if i <= ms do out 0 end
         g_imp_mod = text_fat_from_range(data, ms, i - ms)
     end
+    # Optional trailing "as <alias>" (Vir form: import <sym> from <mod> as <alias>).
+    when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+        i = i + 1
+    end
+    if g_imp_sym_count == 1 and i + 3 <= n and native_read_u8(data, i) == 97 and native_read_u8(data, i + 1) == 115 and (native_read_u8(data, i + 2) == 32 or native_read_u8(data, i + 2) == 9) do
+        i = i + 2;
+        when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+            i = i + 1
+        end
+        as0 = i;
+        when i < n and text_is_ident_char(native_read_u8(data, i)) == 1 loop
+            i = i + 1
+        end
+        if i > as0 do
+            g_imp_aliases = text_fat_from_range(data, as0, i - as0)
+        end
+    end
     out 1
 end.
 
@@ -2007,9 +2048,14 @@ func text_skip_import_stmt(source: string, at: int):
     out n
 end.
 
-func text_build_import_body(mod_body: string):
+func text_build_import_body(mod_body: string, alias_only: int):
     # If g_imp_sym_count == 0 → whole module. Else extract each exported func.
+    # alias_only=1 → emit only symbols that are renamed (alias != name); used when
+    # the module was already brought in via `include` and we just need alias shims.
     if g_imp_sym_count == 0 do
+        if alias_only == 1 do
+            out 0
+        end
         out mod_body
     end
     sd = native_read_i64(g_imp_syms, 0);
@@ -2035,35 +2081,41 @@ func text_build_import_body(mod_body: string):
             if ap > a0 do
                 alias_name = text_fat_from_range(ad, a0, ap - a0);
             end
-            if text_has_export(mod_body, fname) == 0 do
-                g_inc_err = 3;
-                out 0
+            var skip_sym = 0;
+            if alias_only == 1 and fat_str_eq(fname, alias_name) == 1 do
+                skip_sym = 1
             end
-            chunk = text_extract_func(mod_body, fname);
-            if chunk == 0 do
-                g_inc_err = 3;
-                out 0
+            if skip_sym == 0 do
+                if text_has_export(mod_body, fname) == 0 do
+                    g_inc_err = 3;
+                    out 0
+                end
+                chunk = text_extract_func(mod_body, fname);
+                if chunk == 0 do
+                    g_inc_err = 3;
+                    out 0
+                end
+                if fat_str_eq(fname, alias_name) == 0 do
+                    chunk = text_rename_func_chunk(chunk, fname, alias_name);
+                end
+                cd = native_read_i64(chunk, 0);
+                cl = native_read_i64(chunk, 8);
+                nb = vir_alloc(out_len + cl + 2);
+                a = 0;
+                when a < out_len loop
+                    native_write_u8(nb, a, native_read_u8(out_buf, a));
+                    a = a + 1
+                end
+                b = 0;
+                when b < cl loop
+                    native_write_u8(nb, out_len + b, native_read_u8(cd, b));
+                    b = b + 1
+                end
+                native_write_u8(nb, out_len + cl, 10);
+                native_write_u8(nb, out_len + cl + 1, 0);
+                out_buf = nb;
+                out_len = out_len + cl + 1
             end
-            if not rt_streq(fname, alias_name) do
-                chunk = text_rename_func_chunk(chunk, fname, alias_name);
-            end
-            cd = native_read_i64(chunk, 0);
-            cl = native_read_i64(chunk, 8);
-            nb = vir_alloc(out_len + cl + 2);
-            a = 0;
-            when a < out_len loop
-                native_write_u8(nb, a, native_read_u8(out_buf, a));
-                a = a + 1
-            end
-            b = 0;
-            when b < cl loop
-                native_write_u8(nb, out_len + b, native_read_u8(cd, b));
-                b = b + 1
-            end
-            native_write_u8(nb, out_len + cl, 10);
-            native_write_u8(nb, out_len + cl + 1, 0);
-            out_buf = nb;
-            out_len = out_len + cl + 1
         end
         if p < sl and native_read_u8(sd, p) == 10 do
             p = p + 1
@@ -2092,18 +2144,30 @@ func expand_imports_text(source: string):
             out source
         end
         end_at = text_skip_import_stmt(source, at);
-        # Already pulled in via include — drop the import line (symbols in scope).
+        # Already pulled in via include — the exported names are already in scope,
+        # so we only need to splice rename shims for any aliased imports (import … as X).
         if g_inc_has(g_imp_mod) == 1 do
-            ebuf = vir_alloc(1);
-            native_write_u8(ebuf, 0, 0);
-            source = text_splice_at(source, at, end_at, str_from_cstr(ebuf))
+            var shim = 0;
+            abody = read_include_source(g_imp_mod);
+            if abody != 0 do
+                shim = text_build_import_body(abody, 1)
+            end
+            if g_inc_err == 3 do
+                g_inc_err = 0
+            end
+            if shim == 0 do
+                ebuf = vir_alloc(1);
+                native_write_u8(ebuf, 0, 0);
+                shim = str_from_cstr(ebuf)
+            end
+            source = text_splice_at(source, at, end_at, shim)
         else
             body = read_include_source(g_imp_mod);
             if body == 0 do
                 g_inc_err = 1;
                 out source
             end
-            piece = text_build_import_body(body);
+            piece = text_build_import_body(body, 0);
             if piece == 0 do
                 # No export list (stdlib modules): splice whole module once.
                 if g_inc_err == 3 do
@@ -2251,7 +2315,7 @@ end.
 # Main Entry Point
 # ═══════════════════════════════════════════════════════
 
-func main:
+func compiler_legacy_main:
     print "╔══════════════════════════════════════════════╗";
     print "║  virc — Vir Self-Hosting Compiler v2.0      ║";
     print "║  Phase 5: Bootstrap Binary                   ║";
