@@ -193,7 +193,28 @@ C / Libc Dependencies     : 0 (ZERO)
 
 ---
 
-## PHẦN IV: CÁC BƯỚC PHÁT TRIỂN HỆ SINH THÁI TIẾP THEO
+## PHẦN IV: MULTI-PASS IR OPTIMIZER ENGINE (KIẾN TRÚC TỐI ƯU HOÁ ĐA TẦNG)
+
+Trình biên dịch Vir đã chính thức tích hợp và kiểm thử toàn diện **10 Thuật Toán Tối Ưu Hoá Trọng Tâm** theo Đặc Tả Vir v2.0 (Pillar 6 & Spec §10/§18):
+
+1. **Constant Folding & Propagation**: Gập hằng số đại số ở thời gian biên dịch (`+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `<<`, `>>`) và triệt tiêu hằng đẳng thức (`x + 0 -> x`, `x * 1 -> x`, `x * 0 -> 0`, `x ^ x -> 0`, `x & 0 -> 0`).
+2. **Peephole Strength Reduction**: Thay thế phép nhân/chia lũy thừa 2 thành phép dịch bit (`x * 2^k -> x << k`, `x / 2^k -> x >> k`, `x % 2^k -> x & (2^k - 1)`).
+3. **Common Subexpression Elimination (CSE)**: Đánh số giá trị cục bộ/toàn cục để tái sử dụng biểu thức tính toán trùng lặp.
+4. **Dead Code Elimination (DCE)**: Quét biến sống (liveness analysis) và loại bỏ các lệnh gán biến chết / mã không bao giờ chạm tới.
+5. **Loop Invariant Code Motion (LICM)**: Phân tích thân vòng lặp và dời các tính toán bất biến ra khối tiền thân (Preheader).
+6. **Induction Variable Strength Reduction (IVSR)**: Chuyển đổi phép nhân biến đếm `i * Stride` trong vòng lặp thành chuỗi phép cộng tích luỹ liên tục `acc += Stride`.
+7. **Loop Unrolling Engine**: Tự động duỗi vòng lặp 2-way và 4-way kèm vòng lặp vô hướng vét cạn (Scalar Epilogue).
+8. **Bounds Check Elimination (BCE)**: Lan truyền miền giá trị để loại bỏ kiểm tra biên mảng dư thừa khi chỉ số đã được chứng minh an toàn.
+9. **Escape Analysis & Stack/Arena Promotion**: Phân tích thoát của con trỏ để chuyển đổi bộ nhớ heap `alloc()` sang stack hoặc linear arena.
+10. **Multi-Pass Pipeline Orchestrator**: Trình điều phối chạy lặp hội tụ theo các mức tối ưu hoá `O1`, `O2`, `O3`.
+
+Kiểm thử xác minh:
+- [`cg_optimizer_engine.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_engine.vri): **100% PASS**
+- [`cg_optimizer_loops.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_loops.vri): **100% PASS**
+
+---
+
+## PHẦN V: CÁC BƯỚC PHÁT TRIỂN HỆ SINH THÁI TIẾP THEO
 
 1. **Hoàn thiện CLI Tools Độc Lập**:
    - `viron`: Package Manager binary chính thức.
