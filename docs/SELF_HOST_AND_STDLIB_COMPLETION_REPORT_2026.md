@@ -1,22 +1,22 @@
 # BÁO CÁO HOÀN THIỆN: SELF-HOSTING ĐỘC LẬP & THƯ VIỆN CHUẨN VIR V2.0
 **Dự Án Ngôn Ngữ Lập Trình Vir — Báo Cáo Kỹ Thuật Tổng Thể**  
 **Ngày phát hành:** 28 Tháng 08 Năm 2026  
-**Trạng thái:** ✅ **HOÀN THÀN 100% SELF-HOSTING & 173/173 TEST THƯ VIỆN CHUẨN NATIVE PASS**
+**Trạng thái:** ✅ **HOÀN THÀNH 100% SELF-HOSTING & 178/178 TEST THƯ VIỆN CHUẨN NATIVE PASS (8/8 PHASES)**
 
 ---
 
 ## TỔNG QUAN ĐIỀU HÀNH (EXECUTIVE SUMMARY)
 
-Dự án ngôn ngữ lập trình **Vir (V2.0)** đã chính thức vượt qua 2 cột mốc lịch sử mang tính quyết định:
+Dự án ngôn ngữ lập trình **Vir (V2.0)** đã chính thức vượt qua các cột mốc lịch sử mang tính quyết định:
 
 1. **Hoàn Tất 100% Self-Hosting Độc Lập ("Kill C" Milestone):**
    - Trình biên dịch `bin/virc` hiện nay là một tệp thực thi nhị phân native ARM64 Mach-O **100% viết bằng Vir và tự biên dịch chính nó**.
    - Đã **loại bỏ hoàn toàn** phụ thuộc vào C VM, Clang, GCC, LLVM, GNU Toolchain, Libc và Linker bên ngoài.
    - Giao tiếp trực tiếp với nhân hệ điều hành macOS (XNU Kernel) qua mã máy `svc #0x80` BSD Syscalls, tự quản lý bộ nhớ qua Native Arena Allocator, tự liên kết và phát sinh cấu trúc Mach-O 64-bit hợp lệ.
 
-2. **Hoàn Tất Toàn Diện Thư Viện Chuẩn (Standard Library Core — 7/7 Phase Hoàn Thành):**
-   - Đã kiểm thử và xác thực **35 module cốt lõi** trải dài qua 7 Phase kiến trúc (Phase A → G).
-   - Bộ kiểm thử toàn diện đạt **173 / 173 tests PASS (100.0% Pass Rate, 0 Failures)**.
+2. **Hoàn Tất Toàn Diện 8/8 Phase Thư Viện Chuẩn (Standard Library Core & Application Ecosystem):**
+   - Đã kiểm thử và xác thực **40 module cốt lõi & công cụ hệ sinh thái** trải dài qua toàn bộ 8 Phase kiến trúc (Phase A → H).
+   - Bộ kiểm thử toàn diện đạt **178 / 178 tests PASS (100.0% Pass Rate, 0 Failures)**.
 
 ---
 
@@ -63,7 +63,7 @@ Dự án ngôn ngữ lập trình **Vir (V2.0)** đã chính thức vượt qua 
 
 ---
 
-## PHẦN II: BÁO CÁO TOÀN DIỆN THƯ VIỆN CHUẨN (PHASES A → G)
+## PHẦN II: BÁO CÁO TOÀN DIỆN THƯ VIỆN CHUẨN & HỆ SINH THÁI (PHASES A → H)
 
 Thư viện chuẩn Vir (`stdlib/vir`) được xây dựng và xác thực theo kiến trúc tầng phụ thuộc từ thấp đến cao:
 
@@ -73,6 +73,10 @@ Thư viện chuẩn Vir (`stdlib/vir`) được xây dựng và xác thực theo
 ┌───────────────────────────────────────────────────────────────────────┘
 ▼
 [Phase D: System & I/O] ──► [Phase E: Concurrency & Sync] ──► [Phase F: Networking] ──► [Phase G: Crypto]
+                                                                                              │
+┌─────────────────────────────────────────────────────────────────────────────────────────────┘
+▼
+[Phase H: Application & Ecosystem Tools: Embedded KVDB, ParserKit, SemVer/Viron, LSP, DocTest]
 ```
 
 ### 2.1. Chi Tiết Các Phase & Module Đã Hoàn Thành
@@ -86,7 +90,8 @@ Thư viện chuẩn Vir (`stdlib/vir`) được xây dựng và xác thực theo
 | **E** | **Concurrency & Sync** (`atomic`, `spinlock`, `rwlock`, `channel`, `barrier`) | 5 | 5 | **100% PASS** |
 | **F** | **Networking & Protocols** (`url`, `ip`, `http`, `json`, `csv`, `toml`, `yaml`, `socket`) | 8 | 8 | **100% PASS** |
 | **G** | **Cryptography & Security** (`hex`, `base64`, `sha256`, `aes`) | 4 | 4 | **100% PASS** |
-| **TỔNG** | **Toàn Bộ Core Standard Library** | **35 Module** | **35 Tests Mới + 138 Compiler Tests** | **173/173 PASS (100%)** |
+| **H** | **High-Level Ecosystem** (`kvdb`, `parserkit`, `semver`, `lsp_proto`, `doctest`) | 5 | 5 | **100% PASS** |
+| **TỔNG** | **Toàn Bộ 8 Phase Thư Viện Chuẩn & Hệ Sinh Thái** | **40 Module** | **40 Tests Mới + 138 Compiler Tests** | **178/178 PASS (100%)** |
 
 ---
 
@@ -146,6 +151,13 @@ Thư viện chuẩn Vir (`stdlib/vir`) được xây dựng và xác thực theo
 39. `cg_stdlib_sha256.vri`: Hàm băm mật mã học **SHA-256 thuần Vir**: 64 vòng nén, mở rộng lịch thông điệp $W_0..W_{63}$, bảng hằng số $K$, padding 512-bit, vượt qua 100% test vector NIST (`""` và `"abc"`).
 40. `cg_stdlib_aes.vri`: Biến đổi khối **AES-128**: `ShiftRows`, `InvShiftRows`, `AddRoundKey` (involution), nhân trường Galois GF(2^8) `xtime`, phép trộn cột `MixColumns` chuẩn FIPS 197.
 
+#### Phase H — High-Level Application & Ecosystem Tools
+41. `cg_stdlib_kvdb.vri`: Cơ sở dữ liệu nhúng Key-Value (`std/db/kv`): băm DJB2, Open Addressing, cơ chế xóa tombstone, cập nhật/tra cứu an toàn.
+42. `cg_stdlib_parserkit.vri`: Bộ công cụ Token Stream & Phân tích ngữ pháp (`std/parser_kit`): Tokenizer, luồng token, bộ phân tích đệ quy biểu thức toán học có dấu ngoặc và thứ tự ưu tiên.
+43. `cg_stdlib_semver.vri`: Trình phân tích & so sánh Semantic Versioning 2.0.0 (`std/package/semver` cho `viron`): so sánh phiên bản, kiểm tra ràng buộc Caret (`^1.2.3`).
+44. `cg_stdlib_lsp_proto.vri`: Khung giao thức Language Server Protocol JSON-RPC (`std/lsp` cho `vir-lsp`): đóng gói Header `Content-Length`, định dạng JSON response phục vụ IDE diagnostics & completion.
+45. `cg_stdlib_doctest.vri`: Trình trích xuất & thực thi test trong tài liệu (`std/test/doctest`): quét khối `>>> cmd` và so sánh kết quả thực thi mong muốn.
+
 ---
 
 ## PHẦN III: KẾT QUẢ KIỂM THỬ TỔNG THỂ & THÔNG SỐ KỸ THUẬT
@@ -154,7 +166,7 @@ Thư viện chuẩn Vir (`stdlib/vir`) được xây dựng và xác thực theo
 ======================================================================
                   VIR COMPILER & STDLIB TEST SUITE
 ======================================================================
-Total Test Files Executed : 173
+Total Test Files Executed : 178
   - Compiler Core Tests   : 138
   - Stdlib Phase A Tests  : 5
   - Stdlib Phase B Tests  : 5
@@ -163,9 +175,10 @@ Total Test Files Executed : 173
   - Stdlib Phase E Tests  : 5
   - Stdlib Phase F Tests  : 8
   - Stdlib Phase G Tests  : 4
+  - Stdlib Phase H Tests  : 5
 ----------------------------------------------------------------------
-PASSED                    : 173 / 173 (100.0%)
-FAILED                    : 0   / 173 (0.0%)
+PASSED                    : 178 / 178 (100.0%)
+FAILED                    : 0   / 178 (0.0%)
 Fixed-Point Hash Match    : 100% VERIFIED
 C / Libc Dependencies     : 0 (ZERO)
 ======================================================================
@@ -176,10 +189,9 @@ C / Libc Dependencies     : 0 (ZERO)
 
 ## PHẦN IV: CÁC BƯỚC PHÁT TRIỂN HỆ SINH THÁI TIẾP THEO
 
-1. **Phase H — High-Level Application & Ecosystem Tools**:
-   - `viron`: Package Manager & Build Tool cho các dự án Vir.
-   - `vir-lsp`: Trình phục vụ Language Server Protocol cho VS Code / Antigravity IDE (Autocompletion, Diagnostics, Go-to-Definition).
-   - `std/db`: Embedded Key-Value store / Micro SQL storage engine.
+1. **Hoàn thiện CLI Tools Độc Lập**:
+   - `viron`: Package Manager binary chính thức.
+   - `vir-lsp`: Language Server binary độc lập kết nối với Visual Studio Code / Antigravity IDE.
 2. **Multi-Target Codegen**:
    - Linux ARM64: Xuất định dạng nhị phân ELF và kết nối trực tiếp Linux Syscalls.
    - x86_64: Hoàn thiện backend phát mã máy Intel/AMD x86-64.
