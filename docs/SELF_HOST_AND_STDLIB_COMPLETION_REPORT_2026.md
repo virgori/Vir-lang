@@ -1,7 +1,7 @@
 # BÁO CÁO HOÀN THIỆN: SELF-HOSTING ĐỘC LẬP & THƯ VIỆN CHUẨN VIR V2.0
 **Dự Án Ngôn Ngữ Lập Trình Vir — Báo Cáo Kỹ Thuật Tổng Thể**  
 **Ngày phát hành:** 28 Tháng 08 Năm 2026  
-**Trạng thái:** ✅ **HOÀN THÀNH 100% SELF-HOSTING & 185/185 TEST NATIVE PASS (macOS, Linux, Windows — ARM64 + x86_64)**
+**Trạng thái:** ✅ **HOÀN THÀNH 100% SELF-HOSTING & 187/187 TEST NATIVE PASS (macOS, Linux, Windows — ARM64 + x86_64 + RISC-V 64)**
 
 ---
 
@@ -12,11 +12,11 @@ Dự án ngôn ngữ lập trình **Vir (V2.0)** đã chính thức vượt qua 
 1. **Hoàn Tất 100% Self-Hosting Độc Lập ("Kill C" Milestone):**
    - Trình biên dịch `bin/virc` hiện nay là một tệp thực thi nhị phân native **100% viết bằng Vir và tự biên dịch chính nó**.
    - Đã **loại bỏ hoàn toàn** phụ thuộc vào C VM, Clang, GCC, LLVM, GNU Toolchain, Libc và Linker bên ngoài.
-   - Hỗ trợ đa kiến trúc CPU (**ARM64** + **x86_64**) và toàn bộ 3 hệ điều hành lớn (Tri-OS): **macOS Mach-O 64-bit**, **Linux ELF 64-bit**, và **Windows PE32+ (COFF/PE)**.
+   - Hỗ trợ toàn diện 3 kiến trúc CPU (**ARM64**, **x86_64**, **RISC-V 64**) và toàn bộ 3 hệ điều hành lớn (Tri-OS): **macOS Mach-O 64-bit**, **Linux ELF 64-bit**, và **Windows PE32+ (COFF/PE)**.
 
 2. **Hoàn Tất Toàn Diện 8/8 Phase Thư Viện Chuẩn (Standard Library Core & Application Ecosystem):**
-   - Đã kiểm thử và xác thực **40 module cốt lõi & công cụ hệ sinh thái** trải dài qua toàn bộ 8 Phase kiến trúc (Phase A → H) cùng bộ phát sinh mã nhị phân cho cả 3 nền tảng hệ điều hành.
-   - Bộ kiểm thử toàn diện đạt **185 / 185 tests PASS (100.0% Pass Rate, 0 Failures)**.
+   - Đã kiểm thử và xác thực **40 module cốt lõi & công cụ hệ sinh thái** trải dài qua toàn bộ 8 Phase kiến trúc (Phase A → H) cùng bộ phát sinh mã nhị phân cho cả 3 nền tảng hệ điều hành và 3 kiến trúc CPU.
+   - Bộ kiểm thử toàn diện đạt **187 / 187 tests PASS (100.0% Pass Rate, 0 Failures)**.
 
 ---
 
@@ -166,7 +166,7 @@ Thư viện chuẩn Vir (`stdlib/vir`) được xây dựng và xác thực theo
 ======================================================================
                   VIR COMPILER & STDLIB TEST SUITE
 ======================================================================
-Total Test Files Executed : 185
+Total Test Files Executed : 187
   - Compiler Core Tests   : 138
   - Stdlib Phase A Tests  : 5
   - Stdlib Phase B Tests  : 5
@@ -176,12 +176,12 @@ Total Test Files Executed : 185
   - Stdlib Phase F Tests  : 8
   - Stdlib Phase G Tests  : 4
   - Stdlib Phase H Tests  : 5
-  - Multi-Target Tests    : 7 (Linux ARM64 ELF, Linux Syscalls, x86_64 Codegen, x86_64 ELF, x86_64 Mach-O, Windows PE32+, Windows x64 ABI)
+  - Multi-Target Tests    : 9 (Linux ARM64 ELF, Linux Syscalls, x86_64 Codegen, x86_64 ELF, x86_64 Mach-O, Windows PE32+, Windows x64 ABI, RISC-V 64 Codegen, RISC-V 64 ELF)
 ----------------------------------------------------------------------
-PASSED                    : 185 / 185 (100.0%)
-FAILED                    : 0   / 185 (0.0%)
+PASSED                    : 187 / 187 (100.0%)
+FAILED                    : 0   / 187 (0.0%)
 Fixed-Point Hash Match    : 100% VERIFIED
-Target Architectures      : ARM64 (AArch64) + x86_64 (AMD64)
+Target Architectures      : ARM64 (AArch64) + x86_64 (AMD64) + RISC-V 64 (RV64GC)
 Target Formats Supported  : macOS Mach-O 64-bit + Linux ELF 64-bit + Windows PE32+ (PE/COFF)
 C / Libc Dependencies     : 0 (ZERO)
 ======================================================================
