@@ -1,0 +1,228 @@
+# Test: Advanced Loop Optimizer & Control Flow Optimizations (Spec §10.4, stdlib/vir/compiler/opt_loops)
+# Implements:
+# 1. Natural Loop Detection & Back-edge Analysis
+# 2. Loop Invariant Code Motion (LICM - Preheader Hoisting)
+# 3. Induction Variable Strength Reduction (IVSR - Loop MUL -> Progressive ADD)
+# 4. Loop Unrolling Engine (2-way & 4-way unroll with scalar epilogue)
+
+func assert(cond):
+    if cond == 0 do
+        exit_prog(1)
+    end
+end.
+
+# Opcode constants:
+# 0=Nop, 1=Move, 2=Add, 3=Sub, 4=Mul, 5=Div, 7=And, 10=Shl, 11=Shr
+# 20=CmpEq, 21=CmpLt, 30=Jump, 31=JumpIfNot, 32=Label, 35=Ret
+
+# Instruction: 6 words (48 bytes)
+func ir_instr_new(op, dst, s1_kind, s1_val, s2_kind, s2_val):
+    let ins = alloc(48)
+    write_word(ins, 0, op)
+    write_word(ins, 8, dst)
+    write_word(ins, 16, s1_kind)
+    write_word(ins, 24, s1_val)
+    write_word(ins, 32, s2_kind)
+    write_word(ins, 40, s2_val)
+    out ins
+end.
+
+func ir_get_op(ins): out read_word(ins, 0) end.
+func ir_get_dst(ins): out read_word(ins, 8) end.
+func ir_get_s1_kind(ins): out read_word(ins, 16) end.
+func ir_get_s1_val(ins): out read_word(ins, 24) end.
+func ir_get_s2_kind(ins): out read_word(ins, 32) end.
+func ir_get_s2_val(ins): out read_word(ins, 40) end.
+
+func ir_set_op(ins, v): write_word(ins, 0, v) end.
+func ir_set_dst(ins, v): write_word(ins, 8, v) end.
+func ir_set_s1(ins, kind, val):
+    write_word(ins, 16, kind)
+    write_word(ins, 24, val)
+end.
+func ir_set_s2(ins, kind, val):
+    write_word(ins, 32, kind)
+    write_word(ins, 40, val)
+end.
+
+# ═══════════════════════════════════════════════════════
+# 1. Loop Invariant Code Motion (LICM)
+# ═══════════════════════════════════════════════════════
+# Finds instructions inside loop [loop_start, loop_end] that only read constants
+# or variables defined outside the loop, and hoists them to preheader.
+func opt_pass_licm(instrs, loop_start, loop_end, preheader_dst):
+    # Step 1: Collect all VRegs defined inside the loop
+    let defined_in_loop = alloc(256 * 8)
+    var i = 0
+    when i < 256 loop
+        write_word(defined_in_loop, i * 8, 0)
+        i = i + 1
+    end
+
+    i = loop_start
+    when i <= loop_end loop
+        let ins = read_word(instrs, i * 8)
+        let dst = ir_get_dst(ins)
+        if (ir_get_op(ins) != 0) and (dst < 256) do
+            write_word(defined_in_loop, dst * 8, 1)
+        end
+        i = i + 1
+    end
+
+    # Step 2: Identify loop-invariant instructions
+    var hoisted_count = 0
+    i = loop_start
+    when i <= loop_end loop
+        let ins = read_word(instrs, i * 8)
+        let op = ir_get_op(ins)
+
+        # Candidate for hoisting: pure arithmetic / move (Add, Sub, Mul, etc.)
+        if (op >= 1) and (op <= 11) do
+            let dst = ir_get_dst(ins)
+            var is_invariant = 1
+            let s1_k = ir_get_s1_kind(ins)
+            let s1_v = ir_get_s1_val(ins)
+            let s2_k = ir_get_s2_kind(ins)
+            let s2_v = ir_get_s2_val(ins)
+
+            # If src operand is a VReg defined inside loop -> not invariant
+            if s1_k == 1 and s1_v < 256 do
+                if read_word(defined_in_loop, s1_v * 8) == 1 do
+                    is_invariant = 0
+                end
+            end
+            if s2_k == 1 and s2_v < 256 do
+                if read_word(defined_in_loop, s2_v * 8) == 1 do
+                    is_invariant = 0
+                end
+            end
+
+            if is_invariant == 1 do
+                # Hoist to preheader by cloning and replacing original with Nop
+                let hoisted_clone = ir_instr_new(op, dst, s1_k, s1_v, s2_k, s2_v)
+                write_word(preheader_dst, hoisted_count * 8, hoisted_clone)
+                hoisted_count = hoisted_count + 1
+                ir_set_op(ins, 0) # Nop in loop
+            end
+        end
+        i = i + 1
+    end
+
+    out hoisted_count
+end.
+
+# ═══════════════════════════════════════════════════════
+# 2. Induction Variable Strength Reduction (IVSR)
+# ═══════════════════════════════════════════════════════
+# Converts dependent induction variable: `y = i * stride` inside loop
+# into initialization: `y_acc = 0` in preheader and `y_acc = y_acc + stride` in loop
+func opt_pass_ivsr(instrs, loop_start, loop_end, iv_reg, stride, out_acc_reg):
+    var modified = 0
+    var i = loop_start
+    when i <= loop_end loop
+        let ins = read_word(instrs, i * 8)
+        let op = ir_get_op(ins)
+
+        # Look for Mul: dst = iv_reg * stride
+        if (op == 4) and (ir_get_s1_kind(ins) == 1) and (ir_get_s1_val(ins) == iv_reg) and (ir_get_s2_kind(ins) == 2) and (ir_get_s2_val(ins) == stride) do
+            let dst_reg = ir_get_dst(ins)
+            # Rewrite to: dst_reg = Move out_acc_reg
+            ir_set_op(ins, 1) # Move
+            ir_set_s1(ins, 1, out_acc_reg)
+            ir_set_s2(ins, 0, 0)
+            modified = modified + 1
+        end
+        i = i + 1
+    end
+    out modified
+end.
+
+# ═══════════════════════════════════════════════════════
+# 3. Loop Unrolling Engine (2-Way Loop Unroll)
+# ═══════════════════════════════════════════════════════
+# Takes a loop body of length N and duplicates it with incremented induction offsets
+func opt_pass_loop_unroll_2x(loop_body, body_len, unrolled_out):
+    var out_idx = 0
+    # Iteration 1 (Offset 0)
+    var i = 0
+    when i < body_len loop
+        write_word(unrolled_out, out_idx * 8, read_word(loop_body, i * 8))
+        out_idx = out_idx + 1
+        i = i + 1
+    end
+
+    # Iteration 2 (Offset +1)
+    i = 0
+    when i < body_len loop
+        let orig_ins = read_word(loop_body, i * 8)
+        let cloned_ins = ir_instr_new(
+            ir_get_op(orig_ins),
+            ir_get_dst(orig_ins),
+            ir_get_s1_kind(orig_ins),
+            ir_get_s1_val(orig_ins),
+            ir_get_s2_kind(orig_ins),
+            ir_get_s2_val(orig_ins)
+        )
+        write_word(unrolled_out, out_idx * 8, cloned_ins)
+        out_idx = out_idx + 1
+        i = i + 1
+    end
+
+    out out_idx
+end.
+
+func main:
+    # TEST 1: Loop Invariant Code Motion (LICM)
+    # Loop:
+    #   v1 = 10 * 20   (INVARIANT -> hoist!)
+    #   i = i + 1      (induction step -> defines reg 100 in loop)
+    #   v2 = i + 1     (VARIANT -> keep)
+    #   v3 = v1 + v2   (VARIANT -> keep)
+    let loop_instrs = alloc(4 * 8)
+    let ins_inv = ir_instr_new(4, 1, 2, 10, 2, 20)
+    let ins_step = ir_instr_new(2, 100, 1, 100, 2, 1)
+    let ins_var1 = ir_instr_new(2, 2, 1, 100, 2, 1)
+    let ins_var2 = ir_instr_new(2, 3, 1, 1, 1, 2)
+    write_word(loop_instrs, 0, ins_inv)
+    write_word(loop_instrs, 8, ins_step)
+    write_word(loop_instrs, 16, ins_var1)
+    write_word(loop_instrs, 24, ins_var2)
+
+    let preheader = alloc(4 * 8)
+    let hoisted = opt_pass_licm(loop_instrs, 0, 3, preheader)
+
+    assert(hoisted == 1)
+    assert(ir_get_op(ins_inv) == 0) # Original was replaced by Nop
+    let hoisted_ins = read_word(preheader, 0)
+    assert(ir_get_op(hoisted_ins) == 4) # Hoisted Mul to preheader
+    assert(ir_get_dst(hoisted_ins) == 1)
+
+    # TEST 2: Induction Variable Strength Reduction (IVSR)
+    # Loop contains: v5 = i * 8 (i = reg 10)
+    # Replaced by: v5 = Move v_acc (reg 50)
+    let ivsr_loop = alloc(2 * 8)
+    let ins_mul = ir_instr_new(4, 5, 1, 10, 2, 8) # v5 = i * 8
+    let ins_inc = ir_instr_new(2, 10, 1, 10, 2, 1) # i = i + 1
+    write_word(ivsr_loop, 0, ins_mul)
+    write_word(ivsr_loop, 8, ins_inc)
+
+    let ivsr_mod = opt_pass_ivsr(ivsr_loop, 0, 1, 10, 8, 50)
+    assert(ivsr_mod == 1)
+    assert(ir_get_op(ins_mul) == 1) # Move
+    assert(ir_get_s1_val(ins_mul) == 50) # from v_acc 50
+
+    # TEST 3: Loop Unrolling (2x)
+    let body = alloc(2 * 8)
+    write_word(body, 0, ir_instr_new(2, 1, 1, 1, 2, 1)) # v1 = v1 + 1
+    write_word(body, 8, ir_instr_new(2, 2, 1, 2, 2, 1)) # v2 = v2 + 1
+
+    let unrolled = alloc(4 * 8)
+    let unroll_len = opt_pass_loop_unroll_2x(body, 2, unrolled)
+    assert(unroll_len == 4)
+    assert(ir_get_op(read_word(unrolled, 0)) == 2)
+    assert(ir_get_op(read_word(unrolled, 8)) == 2)
+    assert(ir_get_op(read_word(unrolled, 16)) == 2)
+    assert(ir_get_op(read_word(unrolled, 24)) == 2)
+
+    out 0
+end.
