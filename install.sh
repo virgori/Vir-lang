@@ -3,7 +3,7 @@
 # Vir Language & Toolchain — Global GitHub Installer
 # ═════════════════════════════════════════════════════════════════════
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/virgori/vir/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/virgori/Vir-lang/main/install.sh | bash
 # ═════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -16,7 +16,7 @@ CYAN="\033[36m"
 RED="\033[31m"
 RESET="\033[0m"
 
-REPO_URL="https://github.com/virgori/vir.git"
+REPO_URL="https://github.com/virgori/Vir-lang.git"
 DEFAULT_BRANCH="main"
 VIR_HOME="${VIR_INSTALL_DIR:-$HOME/.vir}"
 VIR_BIN="${VIR_HOME}/bin"
