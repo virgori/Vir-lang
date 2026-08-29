@@ -31,7 +31,7 @@ Vir compiles directly to standalone native machine code (**macOS Mach-O 64-bit**
 Install the Vir toolchain on macOS or Linux with a single command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/virgori/vir/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/virgori/Vir-lang/main/install.sh | bash
 ```
 
 Activate the environment:
