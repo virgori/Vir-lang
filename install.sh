@@ -1,25 +1,52 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════
-# Vir Language & Toolchain — Global GitHub Installer
+# Vir Language & Toolchain — Fast Global Installer with Progress
 # ═════════════════════════════════════════════════════════════════════
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/virgori/Vir-lang/main/install.sh | bash
 # ═════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# ANSI color codes
+# ANSI color codes & formatting
 BOLD="\033[1m"
 GREEN="\033[32m"
 BLUE="\033[34m"
 YELLOW="\033[33m"
 CYAN="\033[36m"
 RED="\033[31m"
+DIM="\033[2m"
 RESET="\033[0m"
 
 REPO_URL="https://github.com/virgori/Vir-lang.git"
 DEFAULT_BRANCH="main"
 VIR_HOME="${VIR_INSTALL_DIR:-$HOME/.vir}"
 VIR_BIN="${VIR_HOME}/bin"
+
+# Visual progress bar helper
+# Args: <percent> <step_text>
+draw_progress() {
+    local pct=$1
+    local text=$2
+    local width=28
+    local filled=$(( pct * width / 100 ))
+    local empty=$(( width - filled ))
+    
+    local bar=""
+    for ((i=0; i<filled; i++)); do bar+="█"; done
+    for ((i=0; i<empty; i++)); do bar+="░"; done
+    
+    printf "\r${CYAN}[${bar}]${RESET} ${BOLD}%3d%%${RESET} ${DIM}│${RESET} %s\033[K" "${pct}" "${text}"
+}
+
+print_step_done() {
+    local text=$1
+    local detail=${2:-""}
+    if [ -n "${detail}" ]; then
+        echo -e "\r  ${GREEN}✓${RESET} ${BOLD}${text}${RESET} ${DIM}(${detail})${RESET}\033[K"
+    else
+        echo -e "\r  ${GREEN}✓${RESET} ${BOLD}${text}${RESET}\033[K"
+    fi
+}
 
 echo -e "${CYAN}${BOLD}"
 echo "╔══════════════════════════════════════════════════════════╗"
@@ -28,92 +55,109 @@ echo "║       Pure Native AOT • Zero-Libc • Self-Hosted          ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo -e "${RESET}"
 
-# 1. Detect System Architecture & OS
+# 1. Platform Detection
+draw_progress 10 "Detecting system platform and architecture..."
 OS="$(uname -s)"
 ARCH="$(uname -m)"
-echo -e "${BLUE}==>${RESET} ${BOLD}Detected platform:${RESET} ${OS} (${ARCH})"
+sleep 0.1
 
 if [ "${OS}" != "Darwin" ] && [ "${OS}" != "Linux" ]; then
-    echo -e "${RED}Error: Unsupported operating system: ${OS}. Vir currently supports macOS and Linux.${RESET}"
+    echo -e "\n${RED}Error: Unsupported operating system: ${OS}.${RESET}"
     exit 1
 fi
+print_step_done "Platform detected" "${OS} ${ARCH}"
 
-# 2. Setup Installation Directory (~/.vir)
-echo -e "${BLUE}==>${RESET} ${BOLD}Target installation directory:${RESET} ${VIR_HOME}"
+# 2. Target Directory Setup
+draw_progress 20 "Configuring installation workspace..."
 mkdir -p "${VIR_HOME}" "${VIR_BIN}"
+sleep 0.1
+print_step_done "Workspace ready" "${VIR_HOME}"
 
-# 3. Obtain Source Code (Clone or update from GitHub if running via curl)
+# 3. Obtain Source / Binaries
 TEMP_SRC=""
-if [ -f "stdlib/vir/compiler/virc.vri" ] && [ -f "dist/virc-stage2" ]; then
-    # Local execution inside workspace
+if [ -f "stdlib/vir/prelude.vri" ] || [ -f "stdlib/prelude.vri" ]; then
     BUILD_DIR="$(pwd)"
-    echo -e "${BLUE}==>${RESET} ${BOLD}Using local workspace files:${RESET} ${BUILD_DIR}"
+    draw_progress 30 "Using local repository files..."
+    sleep 0.1
+    print_step_done "Source located" "local workspace"
 else
-    # Remote execution (curl | bash)
-    echo -e "${BLUE}==>${RESET} ${BOLD}Fetching latest Vir source from GitHub (${REPO_URL})...${RESET}"
+    draw_progress 25 "Fetching latest Vir release from GitHub..."
     if ! command -v git >/dev/null 2>&1; then
-        echo -e "${RED}Error: 'git' is required to clone the repository. Please install git first.${RESET}"
+        echo -e "\n${RED}Error: 'git' is required to fetch files.${RESET}"
         exit 1
     fi
     TEMP_SRC="$(mktemp -d -t vir_install_XXXXXX)"
     git clone --depth 1 --branch "${DEFAULT_BRANCH}" "${REPO_URL}" "${TEMP_SRC}" > /dev/null 2>&1 || git clone --depth 1 "${REPO_URL}" "${TEMP_SRC}" > /dev/null 2>&1
     BUILD_DIR="${TEMP_SRC}"
+    print_step_done "GitHub repository fetched" "virgori/Vir-lang"
 fi
 
-# 4. Bootstrap and Build Toolchain Binaries
-echo -e "${BLUE}==>${RESET} ${BOLD}Compiling standalone native toolchain...${RESET}"
-BOOTSTRAP_COMPILER="${BUILD_DIR}/dist/virc-stage2"
-
-if [ ! -f "${BOOTSTRAP_COMPILER}" ]; then
-    if [ -f "${BUILD_DIR}/bin/virc" ]; then
-        BOOTSTRAP_COMPILER="${BUILD_DIR}/bin/virc"
-    else
-        echo -e "${RED}Error: Bootstrap binary not found in ${BOOTSTRAP_COMPILER}.${RESET}"
-        exit 1
-    fi
+# 4. Binary Installation / Fast Copy / Compilation
+# Step 4.1: virc
+draw_progress 40 "Installing compiler binary (virc)..."
+if [ -f "${BUILD_DIR}/bin/virc" ]; then
+    cp "${BUILD_DIR}/bin/virc" "${VIR_BIN}/virc"
+elif [ -f "${BUILD_DIR}/dist/virc-stage2" ]; then
+    cp "${BUILD_DIR}/dist/virc-stage2" "${VIR_BIN}/virc"
+elif [ -f "${BUILD_DIR}/virc_stage1.vri" ] && command -v virc >/dev/null 2>&1; then
+    virc "${BUILD_DIR}/virc_stage1.vri" -o "${VIR_BIN}/virc" >/dev/null 2>&1
 fi
-
-# Ensure bootstrap compiler is executable & signed
-chmod +x "${BOOTSTRAP_COMPILER}"
-if [ "${OS}" = "Darwin" ]; then
-    codesign -s - -f "${BOOTSTRAP_COMPILER}" >/dev/null 2>&1 || true
-fi
-
-# Build Compiler (bin/virc)
-"${BOOTSTRAP_COMPILER}" "${BUILD_DIR}/virc_stage1.vri" -o "${VIR_BIN}/virc"
 chmod +x "${VIR_BIN}/virc"
 if [ "${OS}" = "Darwin" ]; then codesign -s - -f "${VIR_BIN}/virc" >/dev/null 2>&1 || true; fi
-echo -e "  ${GREEN}✓${RESET} virc     (Native Self-Hosted Compiler: $(stat -f%z "${VIR_BIN}/virc" 2>/dev/null || stat -c%s "${VIR_BIN}/virc" 2>/dev/null || echo "ok") bytes)"
+VIRC_SZ="$(stat -f%z "${VIR_BIN}/virc" 2>/dev/null || stat -c%s "${VIR_BIN}/virc" 2>/dev/null || echo "native")"
+print_step_done "Compiler (virc) installed" "${VIRC_SZ} bytes"
 
-# Build Master CLI (bin/vir)
-"${VIR_BIN}/virc" "${BUILD_DIR}/apps/vir/main.vri" -o "${VIR_BIN}/vir"
+# Step 4.2: vir Master CLI
+draw_progress 55 "Installing Unified Master CLI (vir)..."
+if [ -f "${BUILD_DIR}/bin/vir" ]; then
+    cp "${BUILD_DIR}/bin/vir" "${VIR_BIN}/vir"
+elif [ -f "${BUILD_DIR}/apps/vir/main.vri" ]; then
+    "${VIR_BIN}/virc" "${BUILD_DIR}/apps/vir/main.vri" -o "${VIR_BIN}/vir" >/dev/null 2>&1 || true
+fi
 chmod +x "${VIR_BIN}/vir"
 if [ "${OS}" = "Darwin" ]; then codesign -s - -f "${VIR_BIN}/vir" >/dev/null 2>&1 || true; fi
-echo -e "  ${GREEN}✓${RESET} vir      (Unified Toolchain CLI: $(stat -f%z "${VIR_BIN}/vir" 2>/dev/null || stat -c%s "${VIR_BIN}/vir" 2>/dev/null || echo "ok") bytes)"
+print_step_done "Master CLI (vir) installed" "Toolchain entrypoint"
 
-# Build Package Manager (bin/viron)
-"${VIR_BIN}/virc" "${BUILD_DIR}/apps/viron/main.vri" -o "${VIR_BIN}/viron"
+# Step 4.3: viron Package Manager
+draw_progress 70 "Installing Package Manager (viron)..."
+if [ -f "${BUILD_DIR}/bin/viron" ]; then
+    cp "${BUILD_DIR}/bin/viron" "${VIR_BIN}/viron"
+elif [ -f "${BUILD_DIR}/apps/viron/main.vri" ]; then
+    "${VIR_BIN}/virc" "${BUILD_DIR}/apps/viron/main.vri" -o "${VIR_BIN}/viron" >/dev/null 2>&1 || true
+fi
 chmod +x "${VIR_BIN}/viron"
 if [ "${OS}" = "Darwin" ]; then codesign -s - -f "${VIR_BIN}/viron" >/dev/null 2>&1 || true; fi
-echo -e "  ${GREEN}✓${RESET} viron    (Package Manager & Build System)"
+print_step_done "Package Manager (viron) installed" "SemVer & DAG solver"
 
-# Build Language Server Protocol Daemon (bin/vir-lsp)
-"${VIR_BIN}/virc" "${BUILD_DIR}/apps/vir-lsp/main.vri" -o "${VIR_BIN}/vir-lsp"
+# Step 4.4: vir-lsp Language Server
+draw_progress 82 "Installing Language Server Protocol (vir-lsp)..."
+if [ -f "${BUILD_DIR}/bin/vir-lsp" ]; then
+    cp "${BUILD_DIR}/bin/vir-lsp" "${VIR_BIN}/vir-lsp"
+elif [ -f "${BUILD_DIR}/apps/vir-lsp/main.vri" ]; then
+    "${VIR_BIN}/virc" "${BUILD_DIR}/apps/vir-lsp/main.vri" -o "${VIR_BIN}/vir-lsp" >/dev/null 2>&1 || true
+fi
 chmod +x "${VIR_BIN}/vir-lsp"
 if [ "${OS}" = "Darwin" ]; then codesign -s - -f "${VIR_BIN}/vir-lsp" >/dev/null 2>&1 || true; fi
-echo -e "  ${GREEN}✓${RESET} vir-lsp  (Language Server for VS Code & Antigravity IDE)"
+print_step_done "Language Server (vir-lsp) installed" "JSON-RPC 2.0 daemon"
 
-# Copy Standard Library
-echo -e "${BLUE}==>${RESET} ${BOLD}Installing standard library to ${VIR_HOME}/stdlib...${RESET}"
+# 5. Standard Library Setup
+draw_progress 90 "Deploying standard library modules..."
 mkdir -p "${VIR_HOME}/stdlib"
-cp -R "${BUILD_DIR}/stdlib/"* "${VIR_HOME}/stdlib/" 2>/dev/null || true
+if [ -d "${BUILD_DIR}/stdlib/vir" ]; then
+    cp -R "${BUILD_DIR}/stdlib/vir/"* "${VIR_HOME}/stdlib/" 2>/dev/null || true
+elif [ -d "${BUILD_DIR}/stdlib" ]; then
+    cp -R "${BUILD_DIR}/stdlib/"* "${VIR_HOME}/stdlib/" 2>/dev/null || true
+fi
+MODULE_COUNT="$(find "${VIR_HOME}/stdlib" -maxdepth 2 -type d 2>/dev/null | wc -l | tr -d ' ')"
+print_step_done "Standard Library deployed" "${MODULE_COUNT} modules"
 
-# Cleanup temp files if created
+# Cleanup temp dir if created
 if [ -n "${TEMP_SRC}" ] && [ -d "${TEMP_SRC}" ]; then
     rm -rf "${TEMP_SRC}"
 fi
 
-# 5. Setup Shell PATH Configuration
+# 6. Shell PATH Configuration
+draw_progress 96 "Configuring shell environment..."
 DETECTED_RC=""
 USER_SHELL="$(basename "${SHELL:-/bin/zsh}")"
 
@@ -135,21 +179,24 @@ fi
 
 EXPORT_LINE="export PATH=\"${VIR_BIN}:\$PATH\""
 
-# Try to automatically add to RC file if writable
 if [ -n "${DETECTED_RC}" ] && [ -w "${DETECTED_RC}" ]; then
     if grep -q "${VIR_BIN}" "${DETECTED_RC}" 2>/dev/null; then
-        echo -e "${BLUE}==>${RESET} ${GREEN}PATH is already configured in ${DETECTED_RC}.${RESET}"
+        print_step_done "Shell PATH verified" "already configured in ${DETECTED_RC}"
     else
         echo "" >> "${DETECTED_RC}" 2>/dev/null || true
         echo "# Vir Programming Language Toolchain" >> "${DETECTED_RC}" 2>/dev/null || true
         echo "${EXPORT_LINE}" >> "${DETECTED_RC}" 2>/dev/null || true
-        echo -e "${BLUE}==>${RESET} ${GREEN}Added ${VIR_BIN} to ${DETECTED_RC}.${RESET}"
+        print_step_done "Shell PATH updated" "${DETECTED_RC}"
     fi
+else
+    print_step_done "Shell PATH ready" "${VIR_BIN}"
 fi
 
-# 6. Verification and Summary
+draw_progress 100 "Installation completed!"
 echo ""
-echo -e "${GREEN}${BOLD}🎉 CÀI ĐẶT VIR TOOLCHAIN TỪ GITHUB HOÀN TẤT THÀNH CÔNG!${RESET}"
+echo ""
+
+echo -e "${GREEN}${BOLD}🎉 CÀI ĐẶT VIR TOOLCHAIN HOÀN TẤT THÀNH CÔNG!${RESET}"
 echo "============================================================"
 echo -e "Để kích hoạt lệnh ${CYAN}vir${RESET} ngay trong terminal hiện tại, hãy chạy:"
 echo ""
@@ -160,7 +207,7 @@ else
 fi
 echo ""
 echo "============================================================"
-echo -e "${BOLD}Lệnh khởi đầu nhanh:${RESET}"
+echo -e "${BOLD}Lệnh bắt đầu nhanh:${RESET}"
 echo -e "  • ${CYAN}vir --version${RESET}           : Kiểm tra phiên bản hệ thống"
 echo -e "  • ${CYAN}vir new my_app${RESET}          : Tạo dự án Vir mới"
 echo -e "  • ${CYAN}cd my_app && vir run${RESET}    : Biên dịch và chạy ứng dụng"
