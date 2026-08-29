@@ -1,0 +1,2386 @@
+##
+ * vir/compiler/main.vri — Vir Self-Hosting Compiler Driver
+ * =========================================================
+ * Phase 5: Bootstrap — Vir compiles itself to a standalone binary.
+ *
+ * Pipeline
+ *   source.vri → lex → parse → HIR → MIR → LIR → Q-IR → codegen → Mach-O
+ *
+ * Produces a standalone Mach-O ARM64 executable that uses direct
+ * BSD syscalls — no Python, no C library, no external linker needed.
+ *
+ * Usage (Stage 1 — bootstrapped via C runtime)
+ *   vir jit stdlib/vir/compiler/main.vri <input.vri> [-o output]
+ *
+ * Usage (Stage 2 — self-hosted)
+ *   ./virc <input.vri> [-o output]
+ *
+ * Date: 9/3/2026
+ ##
+
+include lexer;
+include parser;
+import AstNode, AstType, parse_program, parser_new, ast_new, ast_add_child from parser;
+include pipeline;
+import compile_pipeline from pipeline;
+include ir_optimizer;
+import QOp, QModule, OperandType, func_body_len, func_count, func_name_at,
+       func_instr_op, func_instr_d_ty, func_instr_d_vr, func_instr_d_im,
+       func_instr_s1_ty, func_instr_s1_vr, func_instr_s1_im,
+       func_instr_s2_ty, func_instr_s2_vr, func_instr_s2_im, func_instr_patch from ir_optimizer;
+include codegen;
+include binary;
+import Arch, ByteBuffer, buf_new, buf_write_u8, buf_write_u32_le, buf_write_u64_le, buf_write_zeros, buf_write_string_padded, buf_write_cstr_padded, buf_write_bytes, buf_size, buf_align, buf_get_u8 from binary;
+include linker;
+import link_single_kernel from linker;
+include file;
+import File, FileMode, file_read_all, file_create, file_write_all, file_close from file;
+include slice;
+import Slice, slice_new from slice;
+include "stdlib/vir/rt/alloc.vri";
+import vir_alloc from "stdlib/vir/rt/alloc.vri";
+include "stdlib/vir/rt/string_rt.vri";
+import fat_str_new, fat_str_len, fat_str_byte_at, fat_cstr_eq, fat_str_concat, fat_str_eq, rt_streq, str_from_cstr, rt_strlen from "stdlib/vir/rt/string_rt.vri";
+include "stdlib/vir/rt/vec_rt.vri";
+import bvec_len, bvec_get, vec_len_rt, vec_get_rt, vec_new_rt, vec_push_rt from "stdlib/vir/rt/vec_rt.vri";
+include "stdlib/vir/rt/io.vri";
+import read_file_str from "stdlib/vir/rt/io.vri";
+
+extern func native_read_i64(addr: int, offset: int) -> int;
+extern func native_write_i64(addr: int, offset: int, val: int);
+extern func native_read_u8(addr: int, offset: int) -> int;
+extern func native_write_u8(addr: int, offset: int, val: int);
+extern func native_file_open(data: int, len: int, mode: int) -> int;
+extern func native_file_read(fd: int, buf: int, buflen: int) -> int;
+extern func native_file_close(fd: int) -> int;
+
+
+const MACHO_MAGIC: 0xFEEDFACF;
+const CPU_ARM64: 0x0100000C;
+const CPU_SUB_ALL: 0x00000000;
+const MH_EXECUTE: 2;
+const MH_FLAGS: 0x00200085    # PIE | TWOLEVEL | DYLDLINK;
+const LC_SEGMENT_64: 0x19;
+const LC_SYMTAB: 0x02;
+const LC_DYSYMTAB: 0x0B;
+const LC_LOAD_DYLIB: 0x0C;
+const LC_LOAD_DYLINKER: 0x0E;
+const LC_UUID: 0x1B;
+const LC_MAIN: 0x80000028;
+const LC_DYLD_CHAINED_FIXUPS: 0x80000034;
+const TEXT_BASE: 0x100000000;
+const PAGE_SIZE: 0x4000;
+
+# macOS BSD syscall numbers (add 0x2000000 for BSD layer)
+const SYS_EXIT: 0x2000001;
+const SYS_WRITE: 0x2000004;
+const SYS_CHMOD: 0x200000F;
+
+
+# ═══════════════════════════════════════════════════════
+# Module-Level Code Emission
+# ═══════════════════════════════════════════════════════
+# Emits all functions from a Q-IR module into a single
+# code buffer with cross-function call resolution.
+
+entity FuncLayout:
+    name:       string,
+        offset:     int    # byte offset in the code buffer,
+        size:       int
+end.
+# Emit the ARM64 runtime stubs that compiled programs need
+#   offset 0: _rt_print_i64  — print integer to stdout + newline
+#   offset N: _rt_exit       — exit process
+# Returns (cb, print_offset, exit_offset, total_runtime_size)
+
+func emit_runtime_arm64(cb: CodeBuf):
+
+    print_offset = codebuf_offset(cb);
+
+    # ── _rt_print_i64: X0 = value to print ──
+    # Prologue: save frame + callee-saved registers
+    cb = arm64_stp_pre(cb, 29, 30, 31, -96)    # STP X29, X30, [SP, #-96]!;
+    cb = arm64_mov_from_sp(cb, 29)              # MOV X29, SP;
+    cb = arm64_mov_rr(cb, 19, 0)               # MOV X19, X0 (save value);
+
+    # Buffer at SP+16, X20 = buffer base, X21 = position
+    # ADD X20, SP, #16  →  0x91000000 | (imm12<<10) | (Rn<<5) | Rd
+    cb = codebuf_emit_u32(cb, 0x91000000 | (16 << 10) | (31 << 5) | 20);
+    cb = arm64_mov_imm16(cb, 21, 0)            # MOV X21, #0 (position);
+    cb = arm64_mov_imm16(cb, 22, 0)            # MOV X22, #0 (is_neg);
+
+    # Handle negative: if X19 < 0
+    # CMP X19, #0
+    cb = arm64_cmp_imm0(cb, 19);
+    # B.GE +3 instructions (skip negate)
+    # B.GE is B.cond with cond=0b1010=10, imm19 = 3
+    cb = codebuf_emit_u32(cb, 0x5400006A)   # B.GE +3*4;
+    # NEG X19, X19 → SUB X19, XZR, X19
+    cb = codebuf_emit_u32(cb, 0xCB1303F3)   # SUB X19, XZR, X19;
+    # MOV X22, #1 (is_neg = true)
+    cb = arm64_mov_imm16(cb, 22, 1);
+
+    # Handle zero: CBZ X19, .is_zero → 4 instructions forward to .is_zero
+    # CBZ X19 = 0xB4000000 | (imm19 << 5) | 19
+    # .is_zero is after the digit loop, need forward ref
+    # Use placeholder, will back-patch
+    zero_check_patch = codebuf_offset(cb);
+    cb = codebuf_emit_u32(cb, 0xB4000013)       # CBZ X19, placeholder;
+
+    # Digit conversion loop
+    cb = arm64_mov_imm16(cb, 23, 10)             # MOV X23, #10;
+    digit_loop = codebuf_offset(cb);
+    digits_done_patch = codebuf_offset(cb);
+    cb = codebuf_emit_u32(cb, 0xB4000013)       # CBZ X19, placeholder;
+
+    # UDIV X24, X19, X23  = 0x9AC00800 | (Rm<<16) | (Rn<<5) | Rd
+    cb = codebuf_emit_u32(cb, 0x9AC00800 | (23 << 16) | (19 << 5) | 24);
+    # MSUB X25, X24, X23, X19  → X25 = X19 - X24*X23
+    cb = codebuf_emit_u32(cb, 0x9B008000 | (23 << 16) | (19 << 10) | (24 << 5) | 25);
+    # ADD X25, X25, #48 ('0')
+    cb = codebuf_emit_u32(cb, 0x91000000 | (48 << 10) | (25 << 5) | 25);
+    # STRB W25, [X20, X21]  = 0x38206800 | (Rm<<16) | (Rn<<5) | Rt
+    cb = codebuf_emit_u32(cb, 0x38206800 | (21 << 16) | (20 << 5) | 25);
+    # ADD X21, X21, #1
+    cb = codebuf_emit_u32(cb, 0x91000000 | (1 << 10) | (21 << 5) | 21);
+    cb = arm64_mov_rr(cb, 19, 24);
+    back = (digit_loop - codebuf_offset(cb)) / 4;
+    cb = codebuf_emit_u32(cb, 0x14000000 | (back & 0x03FFFFFF));
+    skip_zero_patch = codebuf_offset(cb);
+    cb = codebuf_emit_u32(cb, 0x14000000)        # B placeholder;
+
+    # .is_zero: store '0'
+    is_zero = codebuf_offset(cb);
+    cb = arm64_mov_imm16(cb, 25, 48)             # MOV X25, #'0';
+    cb = codebuf_emit_u32(cb, 0x38206800 | (21 << 16) | (20 << 5) | 25);
+    cb = codebuf_emit_u32(cb, 0x91000000 | (1 << 10) | (21 << 5) | 21);
+
+    # .digits_done / .reverse
+    reverse_start = codebuf_offset(cb);
+
+    # Patch zero_check_patch → .is_zero
+    zc_off = (is_zero - zero_check_patch) / 4;
+    cb = codebuf_patch_u32(cb, zero_check_patch,
+        0xB4000013 | ((zc_off & 0x7FFFF) << 5));
+
+    # Patch digits_done_patch → reverse_start
+    dd_off = (reverse_start - digits_done_patch) / 4;
+    cb = codebuf_patch_u32(cb, digits_done_patch,
+        0xB4000013 | ((dd_off & 0x7FFFF) << 5));
+
+    # Patch skip_zero_patch → reverse_start
+    sz_off = (reverse_start - skip_zero_patch) / 4;
+    cb = codebuf_patch_u32(cb, skip_zero_patch,
+        0x14000000 | (sz_off & 0x03FFFFFF));
+
+    # Add '-' if negative
+    # CBZ X22, .skip_minus
+    skip_minus_patch = codebuf_offset(cb);
+    cb = codebuf_emit_u32(cb, 0xB4000016)       # CBZ X22, placeholder;
+    cb = arm64_mov_imm16(cb, 25, 45)            # MOV X25, #'-';
+    cb = codebuf_emit_u32(cb, 0x38206800 | (21 << 16) | (20 << 5) | 25);
+    cb = codebuf_emit_u32(cb, 0x91000000 | (1 << 10) | (21 << 5) | 21);
+    # .skip_minus
+    skip_minus = codebuf_offset(cb);
+    sm_off = (skip_minus - skip_minus_patch) / 4;
+    cb = codebuf_patch_u32(cb, skip_minus_patch,
+        0xB4000016 | ((sm_off & 0x7FFFF) << 5));
+
+    # Reverse the digit string in-place
+    cb = arm64_mov_imm16(cb, 23, 0)             # X23 = left = 0;
+    cb = arm64_mov_rr(cb, 24, 21)               # X24 = right = len;
+    cb = codebuf_emit_u32(cb, 0xD1000000 | (1 << 10) | (24 << 5) | 24);  # SUB X24, X24, #1;
+
+    # .rev_loop
+    rev_loop = codebuf_offset(cb);
+    # CMP X23, X24
+    cb = codebuf_emit_u32(cb, 0xEB00001F | (24 << 16) | (23 << 5));
+    # B.GE .rev_done
+    rev_done_patch = codebuf_offset(cb);
+    cb = codebuf_emit_u32(cb, 0x5400000A)       # B.GE placeholder;
+
+    # LDRB W25, [X20, X23]
+    cb = codebuf_emit_u32(cb, 0x38776A99)       # LDRB W25, [X20, X23];
+    # LDRB W26, [X20, X24]
+    cb = codebuf_emit_u32(cb, 0x38786A9A)       # LDRB W26, [X20, X24];
+    # STRB W26, [X20, X23]
+    cb = codebuf_emit_u32(cb, 0x38376A9A)       # STRB W26, [X20, X23];
+    # STRB W25, [X20, X24]
+    cb = codebuf_emit_u32(cb, 0x38386A99)       # STRB W25, [X20, X24];
+    # ADD X23, X23, #1
+    cb = codebuf_emit_u32(cb, 0x910006F7)       # ADD X23, X23, #1;
+    # SUB X24, X24, #1
+    cb = codebuf_emit_u32(cb, 0xD1000718)       # SUB X24, X24, #1;
+    # B .rev_loop
+    rv_off = (rev_loop - codebuf_offset(cb)) / 4;
+    cb = codebuf_emit_u32(cb, 0x14000000 | (rv_off & 0x03FFFFFF));
+
+    # .rev_done
+    rev_done = codebuf_offset(cb);
+    rd_off = (rev_done - rev_done_patch) / 4;
+    cb = codebuf_patch_u32(cb, rev_done_patch,
+        0x5400000A | ((rd_off & 0x7FFFF) << 5))
+
+    # Append newline: '\n' = 10
+    cb = arm64_mov_imm16(cb, 25, 10);
+    cb = codebuf_emit_u32(cb, 0x38206800 | (21 << 16) | (20 << 5) | 25);
+    cb = codebuf_emit_u32(cb, 0x91000000 | (1 << 10) | (21 << 5) | 21);
+
+    # syscall write(1, X20, X21)
+    cb = arm64_mov_imm16(cb, 0, 1)              # fd = stdout;
+    cb = arm64_mov_rr(cb, 1, 20)                # buf;
+    cb = arm64_mov_rr(cb, 2, 21)                # len;
+    # MOV X16, #0x2000004 (SYS_WRITE with BSD offset)
+    cb = arm64_mov_imm16(cb, 16, 4)             # low 16 bits;
+    cb = codebuf_emit_u32(cb, 0xF2A04010)       # MOVK X16, #0x200, LSL#16;
+
+    cb = arm64_svc(cb, 0x80)                     # SVC #0x80;
+
+    # Epilogue
+    cb = arm64_ldp_post(cb, 29, 30, 31, 96)     # LDP X29, X30, [SP], #96;
+    cb = arm64_ret(cb);
+
+    print_size = codebuf_offset(cb) - print_offset;
+
+    # ── _rt_exit: X0 = exit code (already in X0) ──
+    exit_offset = codebuf_offset(cb);
+    # MOV X16, #0x2000001 (SYS_EXIT with BSD offset)
+    cb = arm64_mov_imm16(cb, 16, 1)             # low bits;
+    cb = codebuf_emit_u32(cb, 0xF2A04010)       # MOVK X16, #0x200, LSL#16;
+    cb = arm64_svc(cb, 0x80)                     # SVC #0x80;
+
+    # ── _rt_alloc: X0 = size → X0 = ptr (mmap anonymous) ──
+    # mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANON, -1, 0)
+    alloc_offset = codebuf_offset(cb);
+    cb = arm64_mov_rr(cb, 1, 0)                 # X1 = len;
+    cb = arm64_mov_imm16(cb, 0, 0)              # X0 = addr NULL;
+    cb = arm64_mov_imm16(cb, 2, 3)              # X2 = PROT_READ|PROT_WRITE;
+    cb = arm64_mov_imm16(cb, 3, 0x1002)         # X3 = MAP_PRIVATE|MAP_ANON;
+    # MOVN X4, #0 → X4 = -1 (fd). (ADD/SUB Rn=31 is SP, not XZR.)
+    cb = codebuf_emit_u32(cb, 0x92800004);
+    cb = arm64_mov_imm16(cb, 5, 0)              # X5 = offset 0;
+    cb = arm64_mov_imm16(cb, 16, 0xC5)          # SYS_mmap = 197;
+    cb = codebuf_emit_u32(cb, 0xF2A04010)       # MOVK X16, #0x200, LSL#16;
+    cb = arm64_svc(cb, 0x80);
+    cb = arm64_ret(cb);
+
+    out (cb, print_offset, exit_offset, alloc_offset)
+end.
+# ═══════════════════════════════════════════════════════
+# Module Codegen
+# ═══════════════════════════════════════════════════════
+# Emits all functions in a QModule into a single CodeBuf.
+# Cross-function calls are resolved via the FuncLayout table.
+
+func codegen_emit_module(m: QModule, arch: TargetArch):
+
+    # Phase 1: Emit runtime stubs + all functions
+    cb = codebuf_new(arch);
+    func_offs = vec_new();     # code offset per function index
+    fixup_offs = vec_new();    # BL patch sites for CallFunc
+    fixup_idxs = vec_new();    # target function indices
+    main_idx = -1;
+    main_code_off = -1;
+
+    # Emit runtime stubs first
+    var (cb2, rt_print_off, rt_exit_off, rt_alloc_off) = emit_runtime_arm64(cb);
+    cb = cb2;
+    runtime_size = codebuf_offset(cb);
+
+    # Emit each function (use hard name/body registry — soft m.functions shrinks)
+    nfuncs = func_count();
+    fi = 0;
+    when fi < nfuncs loop
+        func_start = codebuf_offset(cb);
+        func_offs = vec_push(func_offs, func_start);
+
+        # Track main function (name is a fat-string under C-core)
+        fname = func_name_at(fi);
+        if fat_cstr_eq(fname, "main") or fat_cstr_eq(fname, "__main__") do
+            main_idx = fi;
+            main_code_off = func_start
+        end
+
+        # Detect frame needs: calls, or callee-saved locals (vreg >= 19).
+        needs_frame = 0;
+        save_callee = 0;
+        body_n = func_body_len(fi);
+        ii = 0;
+        when ii < body_n loop
+            op = func_instr_op(fi, ii);
+            if op == QOp.Call or op == QOp.CallFunc or op == QOp.Print or op == QOp.ArrNew or op == QOp.Alloc do
+                needs_frame = 1
+            end
+            d_vr = func_instr_d_vr(fi, ii);
+            s1_vr = func_instr_s1_vr(fi, ii);
+            s2_vr = func_instr_s2_vr(fi, ii);
+            if d_vr >= 19 or s1_vr >= 19 or s2_vr >= 19 do
+                needs_frame = 1;
+                save_callee = 1
+            end
+            ii = ii + 1
+        end
+
+        # Emit prologue
+        # Layout when save_callee: [x29,x30][x19,x20]...[x27,x28] = 96 bytes
+        frame_size = 16;
+        if save_callee == 1 do
+            frame_size = 96
+        end
+        if needs_frame == 1 do
+            cb = arm64_stp_pre(cb, 29, 30, 31, 0 - frame_size);
+            cb = arm64_mov_from_sp(cb, 29);
+            if save_callee == 1 do
+                cb = arm64_stp_off(cb, 19, 20, 31, 16);
+                cb = arm64_stp_off(cb, 21, 22, 31, 32);
+                cb = arm64_stp_off(cb, 23, 24, 31, 48);
+                cb = arm64_stp_off(cb, 25, 26, 31, 64);
+                cb = arm64_stp_off(cb, 27, 28, 31, 80)
+            end
+        end
+
+        # Emit instructions from packed IR words (no soft QInstr reconstruct).
+        ps = patch_new();
+        j = 0;
+        when j < body_n loop
+            op = func_instr_op(fi, j);
+            d_ty = func_instr_d_ty(fi, j);
+            d_vr = func_instr_d_vr(fi, j);
+            d_im = func_instr_d_im(fi, j);
+            s1_ty = func_instr_s1_ty(fi, j);
+            s1_vr = func_instr_s1_vr(fi, j);
+            s1_im = func_instr_s1_im(fi, j);
+            s2_ty = func_instr_s2_ty(fi, j);
+            s2_vr = func_instr_s2_vr(fi, j);
+            s2_im = func_instr_s2_im(fi, j);
+            pid = func_instr_patch(fi, j);
+
+            if op == QOp.Nop do
+                cb = arm64_nop(cb)
+
+            eif op == QOp.Load do
+                rd = vreg_to_arm(d_vr);
+                if s1_ty == OperandType.Immediate do
+                    cb = arm64_movz_imm64(cb, rd, s1_im as i64)
+                end
+
+            eif op == QOp.Move do
+                cb = arm64_mov_rr(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr))
+
+            eif op == QOp.Add do
+                cb = arm64_add_rrr(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.Sub do
+                cb = arm64_sub_rrr(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.Mul do
+                cb = arm64_mul_rrr(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.Div do
+                cb = arm64_sdiv_rrr(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.Mod do
+                rd = vreg_to_arm(d_vr);
+                rs1 = vreg_to_arm(s1_vr);
+                rs2 = vreg_to_arm(s2_vr);
+                cb = arm64_sdiv_rrr(cb, 17, rs1, rs2);
+                msub = 0x9B008000 | (rs2 << 16) | (rs1 << 10) | (17 << 5) | rd;
+                cb = codebuf_emit_u32(cb, msub)
+
+            eif op == QOp.CmpEq do
+                cb = arm64_cmp_rr(cb, vreg_to_arm(s1_vr), vreg_to_arm(s2_vr));
+                cb = arm64_cset_eq(cb, vreg_to_arm(d_vr))
+
+            eif op == QOp.CmpGt do
+                cb = arm64_cmp_rr(cb, vreg_to_arm(s1_vr), vreg_to_arm(s2_vr));
+                cb = arm64_cset_gt(cb, vreg_to_arm(d_vr))
+
+            eif op == QOp.CmpLt do
+                cb = arm64_cmp_rr(cb, vreg_to_arm(s1_vr), vreg_to_arm(s2_vr));
+                cb = arm64_cset_lt(cb, vreg_to_arm(d_vr))
+
+            eif op == QOp.CmpGe do
+                cb = arm64_cmp_rr(cb, vreg_to_arm(s1_vr), vreg_to_arm(s2_vr));
+                cb = arm64_cset_ge(cb, vreg_to_arm(d_vr))
+
+            eif op == QOp.CmpLe do
+                cb = arm64_cmp_rr(cb, vreg_to_arm(s1_vr), vreg_to_arm(s2_vr));
+                cb = arm64_cset_le(cb, vreg_to_arm(d_vr))
+
+            eif op == QOp.And do
+                cb = arm64_and_rrr(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.Or do
+                cb = arm64_orr_rrr(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.Xor do
+                cb = arm64_eor_rrr(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.Shl do
+                cb = arm64_lsl_rrr(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.Shr do
+                cb = arm64_asr_rrr(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.Label do
+                # Label id in dest.vreg (preferred) or legacy patch_id word.
+                lid = d_vr;
+                if lid == 0 and pid != 0 do
+                    lid = pid
+                end
+                ps = patch_add_label(ps, lid, codebuf_offset(cb))
+
+            eif op == QOp.Jump do
+                if s1_ty == OperandType.LabelRef do
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), s1_vr, 0)
+                eif d_ty == OperandType.LabelRef do
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), d_vr, 0)
+                end
+                cb = arm64_b_imm26(cb, 0)
+
+            eif op == QOp.JumpIf do
+                if s1_ty == OperandType.VReg do
+                    cb = arm64_cmp_imm0(cb, vreg_to_arm(s1_vr))
+                end
+                if s2_ty == OperandType.LabelRef do
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), s2_vr, 1)
+                end
+                cb = arm64_bne_imm19(cb, 0)
+
+            eif op == QOp.JumpIfNot do
+                if s1_ty == OperandType.VReg do
+                    cb = arm64_cmp_imm0(cb, vreg_to_arm(s1_vr))
+                end
+                if s2_ty == OperandType.LabelRef do
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), s2_vr, 1)
+                end
+                cb = arm64_beq_imm19(cb, 0)
+
+            eif op == QOp.Call or op == QOp.CallFunc do
+                if s1_ty == OperandType.LabelRef do
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), s1_vr, 0)
+                eif s1_ty == OperandType.FuncIdx do
+                    fixup_offs = vec_push(fixup_offs, codebuf_offset(cb));
+                    fixup_idxs = vec_push(fixup_idxs, s1_vr)
+                end
+                cb = arm64_bl_imm26(cb, 0)
+
+            eif op == QOp.Ret do
+                if s1_ty == OperandType.VReg and vreg_to_arm(s1_vr) != 0 do
+                    cb = arm64_mov_rr(cb, 0, vreg_to_arm(s1_vr))
+                end
+                if needs_frame == 1 do
+                    if save_callee == 1 do
+                        cb = arm64_ldp_off(cb, 19, 20, 31, 16);
+                        cb = arm64_ldp_off(cb, 21, 22, 31, 32);
+                        cb = arm64_ldp_off(cb, 23, 24, 31, 48);
+                        cb = arm64_ldp_off(cb, 25, 26, 31, 64);
+                        cb = arm64_ldp_off(cb, 27, 28, 31, 80)
+                    end
+                    cb = arm64_ldp_post(cb, 29, 30, 31, frame_size)
+                end
+                cb = arm64_ret(cb)
+
+            eif op == QOp.Print do
+                if s1_ty == OperandType.VReg do
+                    cb = arm64_mov_rr(cb, 0, vreg_to_arm(s1_vr))
+                end
+                print_bl_off = codebuf_offset(cb);
+                delta = (rt_print_off - print_bl_off) / 4;
+                cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF))
+
+            eif op == QOp.Exit do
+                if s1_ty == OperandType.VReg do
+                    cb = arm64_mov_rr(cb, 0, vreg_to_arm(s1_vr))
+                end
+                exit_bl_off = codebuf_offset(cb);
+                delta = (rt_exit_off - exit_bl_off) / 4;
+                cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF))
+
+            eif op == QOp.ArrNew do
+                # Layout: [len:i64][cap:i64][data...] ; s1=cap, dest=ptr
+                rs_cap = vreg_to_arm(s1_vr);
+                rd = vreg_to_arm(d_vr);
+                # size = cap*8 + 16
+                cb = arm64_lsl_imm(cb, 16, rs_cap, 3);
+                cb = arm64_add_imm(cb, 0, 16, 16);
+                alloc_bl_off = codebuf_offset(cb);
+                delta = (rt_alloc_off - alloc_bl_off) / 4;
+                cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF));
+                # X0 = ptr; init header
+                cb = arm64_str_xzr_uoff(cb, 0, 0);
+                cb = arm64_str_uoff(cb, rs_cap, 0, 8);
+                if rd != 0 do
+                    cb = arm64_mov_rr(cb, rd, 0)
+                end
+
+            eif op == QOp.ArrPush do
+                # s1=arr, s2=elem
+                ra = vreg_to_arm(s1_vr);
+                re = vreg_to_arm(s2_vr);
+                cb = arm64_ldr_uoff(cb, 16, ra, 0)       # X16 = len;
+                cb = arm64_add_imm(cb, 17, ra, 16)       # X17 = data;
+                cb = arm64_str_reg(cb, re, 17, 16)       # data[len] = elem;
+                cb = arm64_add_imm(cb, 16, 16, 1)        # len++;
+                cb = arm64_str_uoff(cb, 16, ra, 0)
+
+            eif op == QOp.ArrGet do
+                # dest=val, s1=arr, s2=idx
+                rd = vreg_to_arm(d_vr);
+                ra = vreg_to_arm(s1_vr);
+                ri = vreg_to_arm(s2_vr);
+                cb = arm64_add_imm(cb, 17, ra, 16)       # X17 = data;
+                cb = arm64_ldr_reg(cb, rd, 17, ri)
+
+            eif op == QOp.ArrSet do
+                # dest=val, s1=arr, s2=idx
+                rv = vreg_to_arm(d_vr);
+                ra = vreg_to_arm(s1_vr);
+                ri = vreg_to_arm(s2_vr);
+                cb = arm64_add_imm(cb, 17, ra, 16);
+                cb = arm64_str_reg(cb, rv, 17, ri)
+
+            eif op == QOp.ArrLen do
+                rd = vreg_to_arm(d_vr);
+                ra = vreg_to_arm(s1_vr);
+                cb = arm64_ldr_uoff(cb, rd, ra, 0)
+
+            eif op == QOp.Alloc do
+                # s1 = size bytes → dest = ptr via _rt_alloc
+                rs = vreg_to_arm(s1_vr);
+                rd = vreg_to_arm(d_vr);
+                if rs != 0 do
+                    cb = arm64_mov_rr(cb, 0, rs)
+                end
+                alloc_bl_off = codebuf_offset(cb);
+                delta = (rt_alloc_off - alloc_bl_off) / 4;
+                cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF));
+                if rd != 0 do
+                    cb = arm64_mov_rr(cb, rd, 0)
+                end
+
+            eif op == QOp.Halt do
+                cb = arm64_mov_imm16(cb, 0, 0);
+                cb = arm64_ret(cb)
+
+            eif op == QOp.LoadByte do
+                cb = arm64_ldrb_reg(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.StoreByte do
+                cb = arm64_strb_reg(cb, vreg_to_arm(d_vr), vreg_to_arm(s1_vr), vreg_to_arm(s2_vr))
+
+            eif op == QOp.LoadWord do
+                # Byte offset (entity fields): [base + off], not index<<3
+                rd = vreg_to_arm(d_vr);
+                rb = vreg_to_arm(s1_vr);
+                if s2_ty == OperandType.Immediate do
+                    cb = arm64_ldr_uoff(cb, rd, rb, s2_im)
+                else
+                    ro = vreg_to_arm(s2_vr);
+                    cb = arm64_add_rrr(cb, 17, rb, ro);
+                    cb = arm64_ldr_uoff(cb, rd, 17, 0)
+                end
+
+            eif op == QOp.StoreWord do
+                rv = vreg_to_arm(d_vr);
+                rb = vreg_to_arm(s1_vr);
+                if s2_ty == OperandType.Immediate do
+                    cb = arm64_str_uoff(cb, rv, rb, s2_im)
+                else
+                    ro = vreg_to_arm(s2_vr);
+                    cb = arm64_add_rrr(cb, 17, rb, ro);
+                    cb = arm64_str_uoff(cb, rv, 17, 0)
+                end
+
+            eif op == QOp.PatchPoint do
+                cb = arm64_nop(cb)
+
+            else
+                cb = arm64_nop(cb)
+            end
+
+            j = j + 1
+        end
+
+        # If function has no explicit RET, add one
+        if body_n == 0 or func_instr_op(fi, body_n - 1) != QOp.Ret do
+            if needs_frame == 1 do
+                if save_callee == 1 do
+                    cb = arm64_ldp_off(cb, 19, 20, 31, 16);
+                    cb = arm64_ldp_off(cb, 21, 22, 31, 32);
+                    cb = arm64_ldp_off(cb, 23, 24, 31, 48);
+                    cb = arm64_ldp_off(cb, 25, 26, 31, 64);
+                    cb = arm64_ldp_off(cb, 27, 28, 31, 80)
+                end
+                cb = arm64_ldp_post(cb, 29, 30, 31, frame_size)
+            end
+            cb = arm64_ret(cb)
+        end
+
+        # Back-patch intra-function jumps
+        cb = backpatch_arm64(cb, ps);
+
+        fi = fi + 1
+    end
+
+    # Phase 2: Resolve cross-function calls
+    fxi = 0;
+    when fxi < vec_len(fixup_offs) loop
+        patch_at = vec_get(fixup_offs, fxi);
+        target_idx = vec_get(fixup_idxs, fxi);
+        if target_idx >= 0 and target_idx < vec_len(func_offs) do
+            target_off = vec_get(func_offs, target_idx);
+            byte_offset = target_off - patch_at;
+            imm26 = (byte_offset / 4) & 0x03FFFFFF;
+            cb = codebuf_patch_u32(cb, patch_at, 0x94000000 | imm26)
+        end
+        fxi = fxi + 1
+    end
+
+    # Phase 3: Emit _start entry point
+    # _start calls main(), then exits with return value
+    start_offset = codebuf_offset(cb);
+    cb.start_offset = start_offset;
+    # STP X29, X30, [SP, #-16]!
+    cb = arm64_stp_pre(cb, 29, 30, 31, -16);
+    cb = arm64_mov_from_sp(cb, 29);
+
+    if main_code_off >= 0 do
+        # BL to main function
+        main_bl = codebuf_offset(cb);
+        delta = (main_code_off - main_bl) / 4;
+        cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF))
+    else
+        # No main found — return 0
+        cb = arm64_mov_imm16(cb, 0, 0)
+    end
+
+    # Exit: BL _rt_exit
+    exit_bl = codebuf_offset(cb);
+    exit_delta = (rt_exit_off - exit_bl) / 4;
+    cb = codebuf_emit_u32(cb, 0x94000000 | (exit_delta & 0x03FFFFFF));
+
+    # LDP + RET (fallback, shouldn't reach)
+    cb = arm64_ldp_post(cb, 29, 30, 31, 16);
+    cb = arm64_ret(cb);
+
+    out cb
+end.
+# ═══════════════════════════════════════════════════════
+# Mach-O Executable Emitter
+# ═══════════════════════════════════════════════════════
+# Produces a minimal Mach-O ARM64 executable
+#   __PAGEZERO + __TEXT (code) + LC_MAIN + LC_SYMTAB
+
+func emit_macho_executable(code: CodeBuf):
+
+    out_buf = buf_new();
+    code_size = codebuf_offset(code) as i64;
+
+    # Full dyld-linked layout (codesign / kernel require __LINKEDIT):
+    #   PAGEZERO(72) + TEXT+sect(152) + LINKEDIT(72)
+    #   + CHAINED_FIXUPS(16) + SYMTAB(24) + DYSYMTAB(80)
+    #   + LOAD_DYLINKER(32) + UUID(24) + MAIN(24) + LOAD_DYLIB(56)
+    # = 10 cmds, 552 bytes
+    ncmds = 10 as i64;
+    cmds_size = 552 as i64;
+    header_end = 32 + cmds_size;
+    code_offset = header_end + 32;
+
+    entry_in_code = code.start_offset;
+    if entry_in_code < 0 do
+        entry_in_code = 0
+    end
+    if entry_in_code >= code_size do
+        entry_in_code = 0
+    end
+    entryoff = code_offset + entry_in_code;
+
+    text_raw = code_offset + code_size;
+    text_filesize = ((text_raw + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+
+    chained_fixups_size = 48 as i64;
+    string_table_size = 4 as i64;
+    linkedit_data_size = chained_fixups_size + string_table_size;
+    linkedit_fileoff = text_filesize;
+    linkedit_vmaddr = TEXT_BASE + text_filesize;
+    strtab_off = linkedit_fileoff + chained_fixups_size;
+
+    # ── Mach-O Header (32 bytes) ──
+    out_buf = buf_write_u8(out_buf, 0xCF);
+    out_buf = buf_write_u8(out_buf, 0xFA);
+    out_buf = buf_write_u8(out_buf, 0xED);
+    out_buf = buf_write_u8(out_buf, 0xFE);
+    out_buf = buf_write_u8(out_buf, 0x0C);
+    out_buf = buf_write_u8(out_buf, 0x00);
+    out_buf = buf_write_u8(out_buf, 0x00);
+    out_buf = buf_write_u8(out_buf, 0x01);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 2);
+    out_buf = buf_write_u32_le(out_buf, ncmds);
+    out_buf = buf_write_u32_le(out_buf, cmds_size);
+    out_buf = buf_write_u32_le(out_buf, MH_FLAGS);
+    out_buf = buf_write_u32_le(out_buf, 0);
+
+    # ── 1. __PAGEZERO ──
+    out_buf = buf_write_u32_le(out_buf, LC_SEGMENT_64);
+    out_buf = buf_write_u32_le(out_buf, 72);
+    out_buf = buf_write_cstr_padded(out_buf, "__PAGEZERO", 16);
+    out_buf = buf_write_u64_le(out_buf, 0);
+    out_buf = buf_write_u64_le(out_buf, TEXT_BASE);
+    out_buf = buf_write_u64_le(out_buf, 0);
+    out_buf = buf_write_u64_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+
+    # ── 2. __TEXT + __text ──
+    out_buf = buf_write_u32_le(out_buf, LC_SEGMENT_64);
+    out_buf = buf_write_u32_le(out_buf, 152);
+    out_buf = buf_write_cstr_padded(out_buf, "__TEXT", 16);
+    out_buf = buf_write_u64_le(out_buf, TEXT_BASE);
+    out_buf = buf_write_u64_le(out_buf, text_filesize);
+    out_buf = buf_write_u64_le(out_buf, 0);
+    out_buf = buf_write_u64_le(out_buf, text_filesize);
+    out_buf = buf_write_u32_le(out_buf, 5);
+    out_buf = buf_write_u32_le(out_buf, 5);
+    out_buf = buf_write_u32_le(out_buf, 1);
+    out_buf = buf_write_u32_le(out_buf, 0);
+
+    out_buf = buf_write_cstr_padded(out_buf, "__text", 16);
+    out_buf = buf_write_cstr_padded(out_buf, "__TEXT", 16);
+    out_buf = buf_write_u64_le(out_buf, TEXT_BASE + code_offset);
+    out_buf = buf_write_u64_le(out_buf, code_size);
+    out_buf = buf_write_u32_le(out_buf, code_offset);
+    out_buf = buf_write_u32_le(out_buf, 2);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0x80000400);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+
+    # ── 3. __LINKEDIT ──
+    out_buf = buf_write_u32_le(out_buf, LC_SEGMENT_64);
+    out_buf = buf_write_u32_le(out_buf, 72);
+    out_buf = buf_write_cstr_padded(out_buf, "__LINKEDIT", 16);
+    out_buf = buf_write_u64_le(out_buf, linkedit_vmaddr);
+    out_buf = buf_write_u64_le(out_buf, PAGE_SIZE);
+    out_buf = buf_write_u64_le(out_buf, linkedit_fileoff);
+    out_buf = buf_write_u64_le(out_buf, linkedit_data_size);
+    out_buf = buf_write_u32_le(out_buf, 1);
+    out_buf = buf_write_u32_le(out_buf, 1);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+
+    # ── 4. LC_DYLD_CHAINED_FIXUPS ──
+    out_buf = buf_write_u32_le(out_buf, LC_DYLD_CHAINED_FIXUPS);
+    out_buf = buf_write_u32_le(out_buf, 16);
+    out_buf = buf_write_u32_le(out_buf, linkedit_fileoff);
+    out_buf = buf_write_u32_le(out_buf, chained_fixups_size);
+
+    # ── 5. LC_SYMTAB ──
+    out_buf = buf_write_u32_le(out_buf, LC_SYMTAB);
+    out_buf = buf_write_u32_le(out_buf, 24);
+    out_buf = buf_write_u32_le(out_buf, strtab_off);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, strtab_off);
+    out_buf = buf_write_u32_le(out_buf, string_table_size);
+
+    # ── 6. LC_DYSYMTAB (80 bytes) ──
+    out_buf = buf_write_u32_le(out_buf, LC_DYSYMTAB);
+    out_buf = buf_write_u32_le(out_buf, 80);
+    dsi = 0;
+    when dsi < 18 loop
+        out_buf = buf_write_u32_le(out_buf, 0);
+        dsi = dsi + 1
+    end
+
+    # ── 7. LC_LOAD_DYLINKER ──
+    out_buf = buf_write_u32_le(out_buf, LC_LOAD_DYLINKER);
+    out_buf = buf_write_u32_le(out_buf, 32);
+    out_buf = buf_write_u32_le(out_buf, 12);
+    out_buf = buf_write_cstr_padded(out_buf, "/usr/lib/dyld", 20);
+
+    # ── 8. LC_UUID ──
+    out_buf = buf_write_u32_le(out_buf, LC_UUID);
+    out_buf = buf_write_u32_le(out_buf, 24);
+    ui = 1;
+    when ui <= 16 loop
+        out_buf = buf_write_u8(out_buf, ui);
+        ui = ui + 1
+    end
+
+    # ── 9. LC_MAIN ──
+    out_buf = buf_write_u32_le(out_buf, LC_MAIN);
+    out_buf = buf_write_u32_le(out_buf, 24);
+    out_buf = buf_write_u64_le(out_buf, entryoff);
+    out_buf = buf_write_u64_le(out_buf, 0);
+
+    # ── 10. LC_LOAD_DYLIB (libSystem) ──
+    out_buf = buf_write_u32_le(out_buf, LC_LOAD_DYLIB);
+    out_buf = buf_write_u32_le(out_buf, 56);
+    out_buf = buf_write_u32_le(out_buf, 24);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0x00010000);
+    out_buf = buf_write_u32_le(out_buf, 0x00010000);
+    out_buf = buf_write_cstr_padded(out_buf, "/usr/lib/libSystem.B.dylib", 32);
+
+    # ── Pad to code_offset (fixed layout — do not use buf_size) ──
+    pad_i = 0;
+    pad_n = code_offset - (32 + cmds_size);
+    when pad_i < pad_n loop
+        out_buf = buf_write_u8(out_buf, 0);
+        pad_i = pad_i + 1
+    end
+
+    # ── Code ──
+    ci = 0;
+    when ci < code_size loop
+        b = bvec_get(code.data, ci);
+        out_buf = buf_write_u8(out_buf, b);
+        ci = ci + 1
+    end
+
+    # ── Pad __TEXT to page ──
+    code_pad = text_filesize - code_offset - code_size;
+    if code_pad > 0 do
+        out_buf = buf_write_zeros(out_buf, code_pad as i64)
+    end
+
+    # ── LINKEDIT: chained fixups (48) + strtab (4) ──
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 28);
+    out_buf = buf_write_u32_le(out_buf, 44);
+    out_buf = buf_write_u32_le(out_buf, 44);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 1);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 3);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+    out_buf = buf_write_u32_le(out_buf, 0);
+
+    out out_buf
+end.
+
+# Emit with known _start offset
+func emit_macho_with_entry(code: CodeBuf, start_offset: int):
+
+    out_buf = emit_macho_executable(code);
+
+    # Patch LC_MAIN entryoff
+    # LC_MAIN is at offset: 32 (header) + 72 (PAGEZERO) + 152 (TEXT+sect) + 8 (cmd+cmdsize)
+    # = 264
+    lc_main_entryoff = 264 as i64;
+    # Entry offset in file = header_plus_cmds + start_offset
+    header_plus_cmds = 304 as i64       # 32 + 72 + 152 + 24 + 24 = 304;
+
+    # The entryoff field is at byte 264 (after cmd and cmdsize)
+    # Entryoff = file offset relative to __TEXT vmaddr mapping
+    # Since __TEXT maps from file offset 0 with vmaddr TEXT_BASE,
+    # entryoff = header_plus_cmds + start_offset
+    # No — LC_MAIN.entryoff is relative to __TEXT file offset which is 0
+    # So entryoff = offset of _start code in the file = header_plus_cmds + start_offset
+
+    # Actually looking at Apple docs: LC_MAIN.entryoff is the file offset
+    # of the entry point from the start of the __TEXT segment.
+    # __TEXT segment starts at file offset 0, so entryoff = header_plus_cmds + start_offset
+
+    # Patch the entry offset in the output buffer
+    # LC_MAIN starts at offset 256 (32+72+152), entryoff is at +8
+    entry_patch_off = 32 + 72 + 152 + 8;
+    entryoff_val = header_plus_cmds + start_offset;
+
+    # Write little-endian u64 at entry_patch_off
+    out_buf.data = vec_set_at(out_buf.data, entry_patch_off, (entryoff_val & 0xFF) as i64);
+    out_buf.data = vec_set_at(out_buf.data, entry_patch_off + 1, ((entryoff_val shr 8) & 0xFF) as i64);
+    out_buf.data = vec_set_at(out_buf.data, entry_patch_off + 2, ((entryoff_val shr 16) & 0xFF) as i64);
+    out_buf.data = vec_set_at(out_buf.data, entry_patch_off + 3, ((entryoff_val shr 24) & 0xFF) as i64);
+    out_buf.data = vec_set_at(out_buf.data, entry_patch_off + 4, 0);
+    out_buf.data = vec_set_at(out_buf.data, entry_patch_off + 5, 0);
+    out_buf.data = vec_set_at(out_buf.data, entry_patch_off + 6, 0);
+    out_buf.data = vec_set_at(out_buf.data, entry_patch_off + 7, 0);
+
+    out out_buf
+end.
+# ═══════════════════════════════════════════════════════
+# Compile Pipeline
+# ═══════════════════════════════════════════════════════
+
+# Write ByteBuffer bytes to an already-opened builtin file handle.
+func write_buf_to_file(f: int, buf: ByteBuffer):
+    wi = 0;
+    n = buf_size(buf);
+    when wi < n loop
+        b = buf_get_u8(buf, wi);
+        file_write_byte(f, b);
+        wi = wi + 1
+    end
+end.
+
+# ── include resolution (physical splice, mirrors C lower_resolve_includes) ──
+const G_INC_MAX = 512;
+var g_inc_tab = 0;
+var g_inc_base = 0;   # C-string directory of the main source file
+var g_inc_err = 0;    # 1 = cannot read, 3 = import symbol/export missing
+var g_inc_last_dir = 0;
+var g_imp_mod = 0;
+var g_imp_syms = 0;
+var g_imp_aliases = 0;
+var g_imp_sym_count = 0;
+var g_imp_alias = 0;  # optional rename for single-symbol import … as X
+
+func g_inc_init:
+    if g_inc_tab == 0 do
+        g_inc_tab = vir_alloc(8 + G_INC_MAX * 8)
+    end
+    native_write_i64(g_inc_tab, 0, 0);
+    g_inc_err = 0
+end.
+
+func g_inc_norm_key(name: string):
+    # Canonicalize a module key: drop directory prefix and a trailing ".vri"
+    # so `include "dir/foo.vri"` and `import ... from foo` map to the same key.
+    d = native_read_i64(name, 0);
+    ln = native_read_i64(name, 8);
+    if ln >= 4 and native_read_u8(d, ln - 4) == 46 and native_read_u8(d, ln - 3) == 118 and native_read_u8(d, ln - 2) == 114 and native_read_u8(d, ln - 1) == 105 do
+        ln = ln - 4
+    end
+    start = 0;
+    i = 0;
+    when i < ln loop
+        if native_read_u8(d, i) == 47 do
+            start = i + 1
+        end
+        i = i + 1
+    end
+    if ln - start <= 0 do
+        out name
+    end
+    out text_fat_from_range(d, start, ln - start)
+end.
+
+func g_inc_has(name: string):
+    key = g_inc_norm_key(name);
+    n = native_read_i64(g_inc_tab, 0);
+    i = 0;
+    when i < n loop
+        en = native_read_i64(g_inc_tab, 8 + i * 8);
+        if fat_str_eq(en, key) do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func g_inc_mark(name: string):
+    key = g_inc_norm_key(name);
+    n = native_read_i64(g_inc_tab, 0);
+    if n >= G_INC_MAX do
+        out 0
+    end
+    native_write_i64(g_inc_tab, 8 + n * 8, fat_str_concat(key, fat_str_new("")));
+    native_write_i64(g_inc_tab, 0, n + 1);
+    out 1
+end.
+
+func fat_ends_with_vri(s: string):
+    n = fat_str_len(s);
+    if n < 4 do
+        out 0
+    end
+    if fat_str_byte_at(s, n - 4) == 46 and fat_str_byte_at(s, n - 3) == 118 and fat_str_byte_at(s, n - 2) == 114 and fat_str_byte_at(s, n - 1) == 105 do
+        out 1
+    end
+    out 0
+end.
+
+func fat_has_slash(s: string):
+    i = 0;
+    n = fat_str_len(s);
+    when i < n loop
+        if fat_str_byte_at(s, i) == 47 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func module_to_relpath(name: string):
+    # "math" → "math.vri"; keep paths that already look like files.
+    # Snapshot fat fields with natives first — nested CALLs clobber R0 params.
+    data = native_read_i64(name, 0);
+    n = native_read_i64(name, 8);
+    if n >= 4 do
+        if native_read_u8(data, n - 4) == 46 and native_read_u8(data, n - 3) == 118 and native_read_u8(data, n - 2) == 114 and native_read_u8(data, n - 1) == 105 do
+            out name
+        end
+    end
+    i = 0;
+    when i < n loop
+        if native_read_u8(data, i) == 47 do
+            out name
+        end
+        i = i + 1
+    end
+    buf = vir_alloc(n + 5);
+    i = 0;
+    when i < n loop
+        native_write_u8(buf, i, native_read_u8(data, i));
+        i = i + 1
+    end
+    native_write_u8(buf, n, 46);
+    native_write_u8(buf, n + 1, 118);
+    native_write_u8(buf, n + 2, 114);
+    native_write_u8(buf, n + 3, 105);
+    native_write_u8(buf, n + 4, 0);
+    out str_from_cstr(buf)
+end.
+
+func join_dir_file(dir_cstr: int, rel: string):
+    # dir_cstr may be 0 → just rel
+    if dir_cstr == 0 do
+        out rel
+    end
+    # Snapshot before CALLs (R0 return clobber).
+    d = dir_cstr;
+    rdata = native_read_i64(rel, 0);
+    rlen = native_read_i64(rel, 8);
+    dlen = rt_strlen(d);
+    buf = vir_alloc(dlen + 1 + rlen + 1);
+    i = 0;
+    when i < dlen loop
+        native_write_u8(buf, i, native_read_u8(d, i));
+        i = i + 1
+    end
+    native_write_u8(buf, dlen, 47);
+    j = 0;
+    when j < rlen loop
+        native_write_u8(buf, dlen + 1 + j, native_read_u8(rdata, j));
+        j = j + 1
+    end
+    native_write_u8(buf, dlen + 1 + rlen, 0);
+    out str_from_cstr(buf)
+end.
+
+func try_read_file(path_fat: string):
+    cstr = native_read_i64(path_fat, 0);
+    plen = native_read_i64(path_fat, 8);
+    if cstr == 0 or plen <= 0 do
+        out 0
+    end
+    raw = read_file_str(cstr);
+    if raw == 0 do
+        out 0
+    end
+    out str_from_cstr(raw)
+end.
+
+func try_read_under_prefix(prefix: string, rel: string):
+    # Build prefix + "/" + rel (prefix has no trailing slash).
+    pdata = native_read_i64(prefix, 0);
+    plen = native_read_i64(prefix, 8);
+    rdata = native_read_i64(rel, 0);
+    rlen = native_read_i64(rel, 8);
+    buf = vir_alloc(plen + 1 + rlen + 1);
+    j = 0;
+    when j < plen loop
+        native_write_u8(buf, j, native_read_u8(pdata, j));
+        j = j + 1
+    end
+    native_write_u8(buf, plen, 47);
+    j = 0;
+    when j < rlen loop
+        native_write_u8(buf, plen + 1 + j, native_read_u8(rdata, j));
+        j = j + 1
+    end
+    native_write_u8(buf, plen + 1 + rlen, 0);
+    out try_read_file(str_from_cstr(buf))
+end.
+
+func read_include_source(mod_name: string):
+    # Soft preludes for modules that need case/panic soft support later.
+    # Snapshot paths before CALLs — nested fat_str_new clobber R0.
+    nd = native_read_i64(mod_name, 0);
+    nl = native_read_i64(mod_name, 8);
+    pref_dir = fat_str_new("stdlib/vir/compiler");
+    if nl == 5 and native_read_u8(nd, 0) == 116 and native_read_u8(nd, 1) == 121 and native_read_u8(nd, 2) == 112 and native_read_u8(nd, 3) == 101 and native_read_u8(nd, 4) == 115 do
+        pref_file = fat_str_new("types_prelude.vri");
+        pref = try_read_under_prefix(pref_dir, pref_file);
+        if pref != 0 do
+            out pref
+        end
+    end
+    if nl == 6 and native_read_u8(nd, 0) == 111 and native_read_u8(nd, 1) == 112 and native_read_u8(nd, 2) == 116 and native_read_u8(nd, 3) == 105 and native_read_u8(nd, 4) == 111 and native_read_u8(nd, 5) == 110 do
+        pref_file = fat_str_new("option_prelude.vri");
+        pref = try_read_under_prefix(pref_dir, pref_file);
+        if pref != 0 do
+            out pref
+        end
+    end
+    if nl == 6 and native_read_u8(nd, 0) == 114 and native_read_u8(nd, 1) == 101 and native_read_u8(nd, 2) == 115 and native_read_u8(nd, 3) == 117 and native_read_u8(nd, 4) == 108 and native_read_u8(nd, 5) == 116 do
+        pref_file = fat_str_new("result_prelude.vri");
+        pref = try_read_under_prefix(pref_dir, pref_file);
+        if pref != 0 do
+            out pref
+        end
+    end
+    if nl == 5 and native_read_u8(nd, 0) == 97 and native_read_u8(nd, 1) == 108 and native_read_u8(nd, 2) == 108 and native_read_u8(nd, 3) == 111 and native_read_u8(nd, 4) == 99 do
+        pref_file = fat_str_new("alloc_prelude.vri");
+        pref = try_read_under_prefix(pref_dir, pref_file);
+        if pref != 0 do
+            out pref
+        end
+    end
+    if nl == 7 and native_read_u8(nd, 0) == 115 and native_read_u8(nd, 1) == 121 and native_read_u8(nd, 2) == 115 and native_read_u8(nd, 3) == 99 and native_read_u8(nd, 4) == 97 and native_read_u8(nd, 5) == 108 and native_read_u8(nd, 6) == 108 do
+        pref_file = fat_str_new("syscall_prelude.vri");
+        pref = try_read_under_prefix(pref_dir, pref_file);
+        if pref != 0 do
+            out pref
+        end
+    end
+    if nl == 3 and native_read_u8(nd, 0) == 118 and native_read_u8(nd, 1) == 101 and native_read_u8(nd, 2) == 99 do
+        pref_file = fat_str_new("vec_prelude.vri");
+        pref = try_read_under_prefix(pref_dir, pref_file);
+        if pref != 0 do
+            out pref
+        end
+    end
+    # bare string_rt
+    if nl == 9 and native_read_u8(nd, 0) == 115 and native_read_u8(nd, 1) == 116 and native_read_u8(nd, 2) == 114 and native_read_u8(nd, 3) == 105 and native_read_u8(nd, 4) == 110 and native_read_u8(nd, 5) == 103 and native_read_u8(nd, 6) == 95 and native_read_u8(nd, 7) == 114 and native_read_u8(nd, 8) == 116 do
+        pref_file = fat_str_new("string_rt_prelude.vri");
+        pref = try_read_under_prefix(pref_dir, pref_file);
+        if pref != 0 do
+            out pref
+        end
+    end
+    # Dotted module → slash path: vir.mem.copy → vir/mem/copy
+    data0 = native_read_i64(mod_name, 0);
+    n0 = native_read_i64(mod_name, 8);
+    has_dot = 0;
+    di = 0;
+    when di < n0 loop
+        if native_read_u8(data0, di) == 46 do
+            has_dot = 1
+        end
+        di = di + 1
+    end
+    name = mod_name;
+    if has_dot == 1 do
+        # Only rewrite if it does not already look like a .vri file path.
+        is_vri = 0;
+        if n0 >= 4 do
+            if native_read_u8(data0, n0 - 4) == 46 and native_read_u8(data0, n0 - 3) == 118 and native_read_u8(data0, n0 - 2) == 114 and native_read_u8(data0, n0 - 1) == 105 do
+                is_vri = 1
+            end
+        end
+        if is_vri == 0 do
+            bufd = vir_alloc(n0 + 1);
+            di = 0;
+            when di < n0 loop
+                ch = native_read_u8(data0, di);
+                if ch == 46 do
+                    native_write_u8(bufd, di, 47)
+                else
+                    native_write_u8(bufd, di, ch)
+                end
+                di = di + 1
+            end
+            native_write_u8(bufd, n0, 0);
+            name = str_from_cstr(bufd)
+        end
+    end
+
+    rel = module_to_relpath(name);
+    # Path-based soft preludes (quoted includes like "stdlib/vir/rt/alloc.vri")
+    rlen = native_read_i64(rel, 8);
+    rdata = native_read_i64(rel, 0);
+    # ends with "alloc.vri" (9 chars)
+    if rlen >= 9 and native_read_u8(rdata, rlen - 9) == 97 and native_read_u8(rdata, rlen - 8) == 108 and native_read_u8(rdata, rlen - 7) == 108 and native_read_u8(rdata, rlen - 6) == 111 and native_read_u8(rdata, rlen - 5) == 99 and native_read_u8(rdata, rlen - 4) == 46 do
+        pref = try_read_file(fat_str_new("stdlib/vir/compiler/alloc_prelude.vri"));
+        if pref != 0 do
+            out pref
+        end
+    end
+    # ends with "string_rt.vri" (13 chars)
+    if rlen >= 13 and native_read_u8(rdata, rlen - 13) == 115 and native_read_u8(rdata, rlen - 12) == 116 and native_read_u8(rdata, rlen - 11) == 114 and native_read_u8(rdata, rlen - 10) == 105 and native_read_u8(rdata, rlen - 9) == 110 and native_read_u8(rdata, rlen - 8) == 103 and native_read_u8(rdata, rlen - 7) == 95 and native_read_u8(rdata, rlen - 6) == 114 and native_read_u8(rdata, rlen - 5) == 116 and native_read_u8(rdata, rlen - 4) == 46 do
+        pref = try_read_file(fat_str_new("stdlib/vir/compiler/string_rt_prelude.vri"));
+        if pref != 0 do
+            out pref
+        end
+    end
+    # ends with "syscall.vri" (11 chars)
+    if rlen >= 11 and native_read_u8(rdata, rlen - 11) == 115 and native_read_u8(rdata, rlen - 10) == 121 and native_read_u8(rdata, rlen - 9) == 115 and native_read_u8(rdata, rlen - 8) == 99 and native_read_u8(rdata, rlen - 7) == 97 and native_read_u8(rdata, rlen - 6) == 108 and native_read_u8(rdata, rlen - 5) == 108 and native_read_u8(rdata, rlen - 4) == 46 do
+        pref = try_read_file(fat_str_new("stdlib/vir/compiler/syscall_prelude.vri"));
+        if pref != 0 do
+            out pref
+        end
+    end
+    src = try_read_file(rel);
+    if src != 0 do
+        out src
+    end
+    if g_inc_base != 0 do
+        joined = join_dir_file(g_inc_base, rel);
+        src = try_read_file(joined);
+        if src != 0 do
+            last_slash = 0 - 1;
+            jdata = native_read_i64(joined, 0);
+            jlen = native_read_i64(joined, 8);
+            ji = 0;
+            when ji < jlen loop
+                if native_read_u8(jdata, ji) == 47 do
+                    last_slash = ji;
+                end
+                ji = ji + 1;
+            end
+            if last_slash >= 0 do
+                dbuf = vir_alloc(last_slash + 1);
+                ji = 0;
+                when ji < last_slash loop
+                    native_write_u8(dbuf, ji, native_read_u8(jdata, ji));
+                    ji = ji + 1;
+                end
+                native_write_u8(dbuf, last_slash, 0);
+                g_inc_last_dir = dbuf;
+            end
+            out src
+        end
+    end
+    if g_inc_last_dir != 0 do
+        joined_last = join_dir_file(g_inc_last_dir, rel);
+        src = try_read_file(joined_last);
+        if src != 0 do
+            out src
+        end
+    end
+    # Mirror C-core vir_include_reader cwd_subs (repo-root relative).
+    src = try_read_under_prefix(fat_str_new("stdlib/vir/compiler"), rel);
+    if src != 0 do
+        out src
+    end
+    src = try_read_under_prefix(fat_str_new("stdlib/vir/rt"), rel);
+    if src != 0 do
+        out src
+    end
+    src = try_read_under_prefix(fat_str_new("stdlib/vir/mem"), rel);
+    if src != 0 do
+        out src
+    end
+    src = try_read_under_prefix(fat_str_new("stdlib/vir/collections"), rel);
+    if src != 0 do
+        out src
+    end
+    src = try_read_under_prefix(fat_str_new("stdlib/vir/str"), rel);
+    if src != 0 do
+        out src
+    end
+    src = try_read_under_prefix(fat_str_new("stdlib/vir/io"), rel);
+    if src != 0 do
+        out src
+    end
+    src = try_read_under_prefix(fat_str_new("stdlib/vir/error"), rel);
+    if src != 0 do
+        out src
+    end
+    src = try_read_under_prefix(fat_str_new("stdlib/vir/core"), rel);
+    if src != 0 do
+        out src
+    end
+    src = try_read_under_prefix(fat_str_new("stdlib/vir/embedded"), rel);
+    if src != 0 do
+        out src
+    end
+    src = try_read_under_prefix(fat_str_new("stdlib/vir/sync"), rel);
+    if src != 0 do
+        out src
+    end
+    src = try_read_under_prefix(fat_str_new("stdlib/vir"), rel);
+    if src != 0 do
+        out src
+    end
+    # "./" + rel
+    rdata = native_read_i64(rel, 0);
+    rlen = native_read_i64(rel, 8);
+    buf2 = vir_alloc(2 + rlen + 1);
+    native_write_u8(buf2, 0, 46);
+    native_write_u8(buf2, 1, 47);
+    j = 0;
+    when j < rlen loop
+        native_write_u8(buf2, 2 + j, native_read_u8(rdata, j));
+        j = j + 1
+    end
+    native_write_u8(buf2, 2 + rlen, 0);
+    out try_read_file(str_from_cstr(buf2))
+end.
+
+# ── Text-level include splice (avoids nested parse_program depth bugs) ──
+
+func text_find_include(source: string):
+    # Returns byte index of "include " or -1. Scans for line-start include.
+    data = native_read_i64(source, 0);
+    n = native_read_i64(source, 8);
+    i = 0;
+    at_line = 1;
+    when i + 8 <= n loop
+        if at_line == 1 do
+            if native_read_u8(data, i) == 105 and native_read_u8(data, i + 1) == 110 and native_read_u8(data, i + 2) == 99 and native_read_u8(data, i + 3) == 108 and native_read_u8(data, i + 4) == 117 and native_read_u8(data, i + 5) == 100 and native_read_u8(data, i + 6) == 101 and native_read_u8(data, i + 7) == 32 do
+                out i
+            end
+        end
+        ch = native_read_u8(data, i);
+        if ch == 10 do
+            at_line = 1
+        else
+            if ch != 32 and ch != 9 do
+                at_line = 0
+            end
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func text_parse_include_name(source: string, at: int):
+    # after "include ", read ident or "quoted/path.vri" until ; or newline.
+    data = native_read_i64(source, 0);
+    n = native_read_i64(source, 8);
+    i = at + 8;
+    when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+        i = i + 1
+    end
+    # Quoted path: include "stdlib/vir/rt/alloc.vri";
+    if i < n and native_read_u8(data, i) == 34 do
+        i = i + 1;
+        start = i;
+        when i < n and native_read_u8(data, i) != 34 loop
+            i = i + 1
+        end
+        len = i - start;
+        if len <= 0 do
+            out 0
+        end
+        buf = vir_alloc(len + 1);
+        j = 0;
+        when j < len loop
+            native_write_u8(buf, j, native_read_u8(data, start + j));
+            j = j + 1
+        end
+        native_write_u8(buf, len, 0);
+        out str_from_cstr(buf)
+    end
+    start = i;
+    done = 0;
+    when i < n and done == 0 loop
+        c = native_read_u8(data, i);
+        if c == 59 or c == 10 or c == 13 or c == 32 or c == 9 do
+            done = 1
+        else
+            i = i + 1
+        end
+    end
+    len = i - start;
+    if len <= 0 do
+        out 0
+    end
+    buf = vir_alloc(len + 1);
+    j = 0;
+    when j < len loop
+        native_write_u8(buf, j, native_read_u8(data, start + j));
+        j = j + 1
+    end
+    native_write_u8(buf, len, 0);
+    out str_from_cstr(buf)
+end.
+
+func text_skip_include_stmt(source: string, at: int):
+    # Return index just past the include statement (after ; or newline).
+    data = native_read_i64(source, 0);
+    n = native_read_i64(source, 8);
+    i = at;
+    when i < n loop
+        c = native_read_u8(data, i);
+        i = i + 1;
+        if c == 59 or c == 10 do
+            out i
+        end
+    end
+    out n
+end.
+
+func text_splice_at(source: string, at: int, end_at: int, insert: string):
+    sdata = native_read_i64(source, 0);
+    slen = native_read_i64(source, 8);
+    idata = native_read_i64(insert, 0);
+    ilen = native_read_i64(insert, 8);
+    total = at + ilen + (slen - end_at);
+    buf = vir_alloc(total + 1);
+    i = 0;
+    when i < at loop
+        native_write_u8(buf, i, native_read_u8(sdata, i));
+        i = i + 1
+    end
+    j = 0;
+    when j < ilen loop
+        native_write_u8(buf, at + j, native_read_u8(idata, j));
+        j = j + 1
+    end
+    k = end_at;
+    when k < slen loop
+        native_write_u8(buf, at + ilen + (k - end_at), native_read_u8(sdata, k));
+        k = k + 1
+    end
+    native_write_u8(buf, total, 0);
+    out str_from_cstr(buf)
+end.
+
+func text_strip_func_defs(source: string):
+    # Drop top-level `func … end.` blocks; keep type/const/enum.
+    data = native_read_i64(source, 0);
+    n = native_read_i64(source, 8);
+    buf = vir_alloc(n + 1);
+    out_i = 0;
+    i = 0;
+    at_line = 1;
+    in_func = 0;
+    when i < n loop
+        if in_func == 0 and at_line == 1 and i + 5 <= n and native_read_u8(data, i) == 102 and native_read_u8(data, i + 1) == 117 and native_read_u8(data, i + 2) == 110 and native_read_u8(data, i + 3) == 99 and native_read_u8(data, i + 4) == 32 do
+            in_func = 1
+        end
+        if in_func == 1 do
+            if at_line == 1 and i + 4 <= n and native_read_u8(data, i) == 101 and native_read_u8(data, i + 1) == 110 and native_read_u8(data, i + 2) == 100 and native_read_u8(data, i + 3) == 46 do
+                i = i + 4;
+                if i < n and native_read_u8(data, i) == 10 do
+                    i = i + 1;
+                    at_line = 1
+                end
+                in_func = 0
+            else
+                ch = native_read_u8(data, i);
+                i = i + 1;
+                if ch == 10 do
+                    at_line = 1
+                else
+                    if ch != 32 and ch != 9 do
+                        at_line = 0
+                    end
+                end
+            end
+        else
+            ch = native_read_u8(data, i);
+            native_write_u8(buf, out_i, ch);
+            out_i = out_i + 1;
+            i = i + 1;
+            if ch == 10 do
+                at_line = 1
+            else
+                if ch != 32 and ch != 9 do
+                    at_line = 0
+                end
+            end
+        end
+    end
+    native_write_u8(buf, out_i, 0);
+    out str_from_cstr(buf)
+end.
+
+func text_ascii_sanitize(source: string):
+    # Soft lexer mishandles UTF-8 in comments (emdash, box-drawing). Replace
+    # non-ASCII bytes with space so include splice stays parseable.
+    data = native_read_i64(source, 0);
+    n = native_read_i64(source, 8);
+    buf = vir_alloc(n + 1);
+    i = 0;
+    when i < n loop
+        b = native_read_u8(data, i);
+        if b >= 128 do
+            native_write_u8(buf, i, 32)
+        else
+            native_write_u8(buf, i, b)
+        end
+        i = i + 1
+    end
+    native_write_u8(buf, n, 0);
+    out str_from_cstr(buf)
+end.
+
+func expand_includes_text(source: string):
+    g_inc_init();
+    guard = 0;
+    when guard < 256 loop
+        guard = guard + 1;
+        at = text_find_include(source);
+        if at < 0 do
+            out source
+        end
+        iname = text_parse_include_name(source, at);
+        if iname == 0 do
+            g_inc_err = 1;
+            out source
+        end
+        if g_inc_has(iname) == 1 do
+            # Already expanded — drop the duplicate include line.
+            end_at = text_skip_include_stmt(source, at);
+            ebuf = vir_alloc(1);
+            native_write_u8(ebuf, 0, 0);
+            empty = str_from_cstr(ebuf);
+            source = text_splice_at(source, at, end_at, empty)
+        else
+            g_inc_mark(iname);
+            body = read_include_source(iname);
+            if body == 0 do
+                print "virc: include fail";
+                g_inc_err = 1;
+                out source
+            end
+            body = text_ascii_sanitize(body);
+            end_at = text_skip_include_stmt(source, at);
+            source = text_splice_at(source, at, end_at, body)
+        end
+    end
+    out source
+end.
+
+# ── Text-level import splice: import add from math → splice func add ──
+
+func text_find_import(source: string):
+    # Line-start "import " (7 letters + space) or "from " (5 letters + space).
+    data = native_read_i64(source, 0);
+    n = native_read_i64(source, 8);
+    i = 0;
+    at_line = 1;
+    when i < n loop
+        if at_line == 1 do
+            if i + 7 <= n and native_read_u8(data, i) == 105 and native_read_u8(data, i + 1) == 109 and native_read_u8(data, i + 2) == 112 and native_read_u8(data, i + 3) == 111 and native_read_u8(data, i + 4) == 114 and native_read_u8(data, i + 5) == 116 and native_read_u8(data, i + 6) == 32 do
+                out i
+            end
+            if i + 5 <= n and native_read_u8(data, i) == 102 and native_read_u8(data, i + 1) == 114 and native_read_u8(data, i + 2) == 111 and native_read_u8(data, i + 3) == 109 and native_read_u8(data, i + 4) == 32 do
+                out i
+            end
+        end
+        ch = native_read_u8(data, i);
+        if ch == 10 do
+            at_line = 1
+        else
+            if ch != 32 and ch != 9 do
+                at_line = 0
+            end
+        end
+        i = i + 1
+    end
+    out (0 - 1)
+end.
+
+func text_is_ident_char(c: int):
+    if c >= 97 and c <= 122 do
+        out 1
+    end
+    if c >= 65 and c <= 90 do
+        out 1
+    end
+    if c >= 48 and c <= 57 do
+        out 1
+    end
+    if c == 95 do
+        out 1
+    end
+    out 0
+end.
+
+func text_fat_from_range(data: int, start: int, len: int):
+    if len <= 0 do
+        out 0
+    end
+    buf = vir_alloc(len + 1);
+    j = 0;
+    when j < len loop
+        native_write_u8(buf, j, native_read_u8(data, start + j));
+        j = j + 1
+    end
+    native_write_u8(buf, len, 0);
+    out str_from_cstr(buf)
+end.
+
+func text_eq_ident(data: int, start: int, len: int, name: string):
+    nd = native_read_i64(name, 0);
+    nl = native_read_i64(name, 8);
+    if len != nl do
+        out 0
+    end
+    j = 0;
+    when j < len loop
+        if native_read_u8(data, start + j) != native_read_u8(nd, j) do
+            out 0
+        end
+        j = j + 1
+    end
+    out 1
+end.
+
+func text_has_export(body: string, fname: string):
+    # True if body contains line-start "export <fname>" or "export ..., <fname>, ..."
+    data = native_read_i64(body, 0);
+    n = native_read_i64(body, 8);
+    fl = native_read_i64(fname, 8);
+    i = 0;
+    at_line = 1;
+    when i + 7 <= n loop
+        if at_line == 1 do
+            if native_read_u8(data, i) == 101 and native_read_u8(data, i + 1) == 120 and native_read_u8(data, i + 2) == 112 and native_read_u8(data, i + 3) == 111 and native_read_u8(data, i + 4) == 114 and native_read_u8(data, i + 5) == 116 and native_read_u8(data, i + 6) == 32 do
+                j = i + 7;
+                when j < n and native_read_u8(data, j) != 10 loop
+                    when j < n and (native_read_u8(data, j) == 32 or native_read_u8(data, j) == 9 or native_read_u8(data, j) == 44) loop
+                        j = j + 1
+                    end
+                    sym_start = j;
+                    when j < n and text_is_ident_char(native_read_u8(data, j)) == 1 loop
+                        j = j + 1
+                    end
+                    sym_len = j - sym_start;
+                    if sym_len > 0 and text_eq_ident(data, sym_start, sym_len, fname) == 1 do
+                        out 1
+                    end
+                end
+            end
+        end
+        ch = native_read_u8(data, i);
+        if ch == 10 do
+            at_line = 1
+        else
+            if ch != 32 and ch != 9 do
+                at_line = 0
+            end
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func text_extract_func(body: string, fname: string):
+    # Slice "func <fname> ... end." / "entity <fname> ... end." / "enum <fname> ... end." / "const <fname> ..." from body.
+    data = native_read_i64(body, 0);
+    n = native_read_i64(body, 8);
+    fl = native_read_i64(fname, 8);
+    i = 0;
+    at_line = 1;
+    when i + fl <= n loop
+        if at_line == 1 do
+            pref_len = 0;
+            is_const = 0;
+            if i + 5 <= n and native_read_u8(data, i) == 102 and native_read_u8(data, i + 1) == 117 and native_read_u8(data, i + 2) == 110 and native_read_u8(data, i + 3) == 99 and native_read_u8(data, i + 4) == 32 do
+                pref_len = 5;
+            end
+            if i + 7 <= n and native_read_u8(data, i) == 101 and native_read_u8(data, i + 1) == 110 and native_read_u8(data, i + 2) == 116 and native_read_u8(data, i + 3) == 105 and native_read_u8(data, i + 4) == 116 and native_read_u8(data, i + 5) == 121 and native_read_u8(data, i + 6) == 32 do
+                pref_len = 7;
+            end
+            if i + 5 <= n and native_read_u8(data, i) == 101 and native_read_u8(data, i + 1) == 110 and native_read_u8(data, i + 2) == 117 and native_read_u8(data, i + 3) == 109 and native_read_u8(data, i + 4) == 32 do
+                pref_len = 5;
+            end
+            if i + 6 <= n and native_read_u8(data, i) == 99 and native_read_u8(data, i + 1) == 111 and native_read_u8(data, i + 2) == 110 and native_read_u8(data, i + 3) == 115 and native_read_u8(data, i + 4) == 116 and native_read_u8(data, i + 5) == 32 do
+                pref_len = 6;
+                is_const = 1;
+            end
+            if pref_len > 0 do
+                j = i + pref_len;
+                when j < n and (native_read_u8(data, j) == 32 or native_read_u8(data, j) == 9) loop
+                    j = j + 1
+                end
+                if text_eq_ident(data, j, fl, fname) == 1 do
+                    after = j + fl;
+                    if after >= n or text_is_ident_char(native_read_u8(data, after)) == 0 do
+                        if is_const == 1 do
+                            k = after;
+                            when k < n and native_read_u8(data, k) != 10 loop
+                                k = k + 1
+                            end
+                            if k < n and native_read_u8(data, k) == 10 do
+                                k = k + 1
+                            end
+                            out text_fat_from_range(data, i, k - i)
+                        else
+                            k = after;
+                            when k + 4 <= n loop
+                                if native_read_u8(data, k) == 101 and native_read_u8(data, k + 1) == 110 and native_read_u8(data, k + 2) == 100 and native_read_u8(data, k + 3) == 46 do
+                                    after_end = k + 4;
+                                    if after_end >= n or native_read_u8(data, after_end) == 10 or native_read_u8(data, after_end) == 32 or native_read_u8(data, after_end) == 9 or native_read_u8(data, after_end) == 13 do
+                                        out text_fat_from_range(data, i, after_end - i)
+                                    end
+                                end
+                                k = k + 1
+                            end
+                            out 0
+                        end
+                    end
+                end
+            end
+        end
+        ch = native_read_u8(data, i);
+        if ch == 10 do
+            at_line = 1
+        else
+            if ch != 32 and ch != 9 do
+                at_line = 0
+            end
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func text_fat_append_nl_sym(list: string, sym: string):
+    # list + "\n" + sym
+    ad = native_read_i64(list, 0);
+    al = native_read_i64(list, 8);
+    sd = native_read_i64(sym, 0);
+    sl = native_read_i64(sym, 8);
+    nb = vir_alloc(al + 1 + sl + 1);
+    i = 0;
+    when i < al loop
+        native_write_u8(nb, i, native_read_u8(ad, i));
+        i = i + 1
+    end
+    native_write_u8(nb, al, 10);
+    j = 0;
+    when j < sl loop
+        native_write_u8(nb, al + 1 + j, native_read_u8(sd, j));
+        j = j + 1
+    end
+    native_write_u8(nb, al + 1 + sl, 0);
+    out str_from_cstr(nb)
+end.
+
+func text_rename_func_chunk(chunk: string, old_name: string, new_name: string):
+    # Rewrite leading "func <old>" → "func <new>" inside extracted chunk.
+    cd = native_read_i64(chunk, 0);
+    cl = native_read_i64(chunk, 8);
+    od = native_read_i64(old_name, 0);
+    ol = native_read_i64(old_name, 8);
+    nd = native_read_i64(new_name, 0);
+    nl = native_read_i64(new_name, 8);
+    # Expect "func " at 0
+    if cl < 5 + ol do
+        out chunk
+    end
+    if native_read_u8(cd, 0) != 102 do
+        out chunk
+    end
+    # Skip "func " and spaces to name start
+    j = 5;
+    when j < cl and (native_read_u8(cd, j) == 32 or native_read_u8(cd, j) == 9) loop
+        j = j + 1
+    end
+    if text_eq_ident(cd, j, ol, old_name) == 0 do
+        out chunk
+    end
+    # prefix = chunk[0..j), then new_name, then chunk[j+ol..)
+    prefix_len = j;
+    suffix_start = j + ol;
+    suffix_len = cl - suffix_start;
+    nb = vir_alloc(prefix_len + nl + suffix_len + 1);
+    a = 0;
+    when a < prefix_len loop
+        native_write_u8(nb, a, native_read_u8(cd, a));
+        a = a + 1
+    end
+    b = 0;
+    when b < nl loop
+        native_write_u8(nb, prefix_len + b, native_read_u8(nd, b));
+        b = b + 1
+    end
+    c = 0;
+    when c < suffix_len loop
+        native_write_u8(nb, prefix_len + nl + c, native_read_u8(cd, suffix_start + c));
+        c = c + 1
+    end
+    native_write_u8(nb, prefix_len + nl + suffix_len, 0);
+    out str_from_cstr(nb)
+end.
+
+func text_parse_import_at(source: string, at: int):
+    data = native_read_i64(source, 0);
+    n = native_read_i64(source, 8);
+    i = at;
+    g_imp_alias = 0;
+    g_imp_syms = 0;
+    g_imp_aliases = 0;
+    g_imp_sym_count = 0;
+    g_imp_mod = 0;
+
+    # Check if starting with "from " (102, 114, 111, 109, 32)
+    if i + 5 <= n and native_read_u8(data, i) == 102 and native_read_u8(data, i + 1) == 114 and native_read_u8(data, i + 2) == 111 and native_read_u8(data, i + 3) == 109 and native_read_u8(data, i + 4) == 32 do
+        i = i + 5;
+        when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+            i = i + 1
+        end
+        # Read module name
+        if i < n and native_read_u8(data, i) == 34 do
+            i = i + 1;
+            ms = i;
+            when i < n and native_read_u8(data, i) != 34 loop
+                i = i + 1
+            end
+            if i <= ms do out 0 end
+            g_imp_mod = text_fat_from_range(data, ms, i - ms);
+            if i < n and native_read_u8(data, i) == 34 do i = i + 1 end
+        else
+            ms = i;
+            when i < n and (text_is_ident_char(native_read_u8(data, i)) == 1 or native_read_u8(data, i) == 46 or native_read_u8(data, i) == 47) loop
+                i = i + 1
+            end
+            if i <= ms do out 0 end
+            g_imp_mod = text_fat_from_range(data, ms, i - ms)
+        end
+        when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+            i = i + 1
+        end
+        # Require "import" (6 letters: 105, 109, 112, 111, 114, 116)
+        if i + 6 > n or native_read_u8(data, i) != 105 or native_read_u8(data, i + 1) != 109 or native_read_u8(data, i + 2) != 112 or native_read_u8(data, i + 3) != 111 or native_read_u8(data, i + 4) != 114 or native_read_u8(data, i + 5) != 116 do
+            out 0
+        end
+        i = i + 6;
+        when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+            i = i + 1
+        end
+        # Collect symbols: sym [as alias], sym2 [as alias2]
+        var looping = 1;
+        when looping == 1 loop
+            ss = i;
+            when i < n and text_is_ident_char(native_read_u8(data, i)) == 1 loop
+                i = i + 1
+            end
+            if i <= ss do out 0 end
+            sym = text_fat_from_range(data, ss, i - ss);
+            when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+                i = i + 1
+            end
+            # Check for "as <alias>"
+            var alias = sym;
+            if i + 3 <= n and native_read_u8(data, i) == 97 and native_read_u8(data, i + 1) == 115 and (native_read_u8(data, i + 2) == 32 or native_read_u8(data, i + 2) == 9) do
+                i = i + 2;
+                when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+                    i = i + 1
+                end
+                as0 = i;
+                when i < n and text_is_ident_char(native_read_u8(data, i)) == 1 loop
+                    i = i + 1
+                end
+                if i > as0 do
+                    alias = text_fat_from_range(data, as0, i - as0);
+                end
+                when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+                    i = i + 1
+                end
+            end
+            if g_imp_sym_count == 0 do
+                g_imp_syms = sym;
+                g_imp_aliases = alias;
+            else
+                g_imp_syms = text_fat_append_nl_sym(g_imp_syms, sym);
+                g_imp_aliases = text_fat_append_nl_sym(g_imp_aliases, alias);
+            end
+            g_imp_sym_count = g_imp_sym_count + 1;
+            if i < n and native_read_u8(data, i) == 44 do
+                i = i + 1;
+                when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+                    i = i + 1
+                end
+            else
+                looping = 0;
+            end
+        end
+        out 1
+    end
+
+    # Otherwise expect "import " (105, 109, 112, 111, 114, 116, 32)
+    i = at + 7;
+    when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+        i = i + 1
+    end
+    # First ident / path
+    start = i;
+    when i < n and (text_is_ident_char(native_read_u8(data, i)) == 1 or native_read_u8(data, i) == 46 or native_read_u8(data, i) == 47) loop
+        i = i + 1
+    end
+    if i <= start do out 0 end
+    first = text_fat_from_range(data, start, i - start);
+    when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+        i = i + 1
+    end
+    # Check if first has optional "as alias" before "from" or at end
+    var first_alias = first;
+    if i + 3 <= n and native_read_u8(data, i) == 97 and native_read_u8(data, i + 1) == 115 and (native_read_u8(data, i + 2) == 32 or native_read_u8(data, i + 2) == 9) do
+        i = i + 2;
+        when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+            i = i + 1
+        end
+        as0 = i;
+        when i < n and text_is_ident_char(native_read_u8(data, i)) == 1 loop
+            i = i + 1
+        end
+        if i > as0 do
+            first_alias = text_fat_from_range(data, as0, i - as0);
+        end
+        when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+            i = i + 1
+        end
+    end
+
+    # Check if this is selective: "from ..." or comma
+    is_sel = 0;
+    if i + 4 <= n and native_read_u8(data, i) == 102 and native_read_u8(data, i + 1) == 114 and native_read_u8(data, i + 2) == 111 and native_read_u8(data, i + 3) == 109 do
+        is_sel = 1
+    end
+    if i < n and native_read_u8(data, i) == 44 do
+        is_sel = 1
+    end
+    if is_sel == 0 do
+        # import mod [as alias];
+        g_imp_mod = first;
+        if not rt_streq(first_alias, first) do
+            g_imp_alias = first_alias;
+        end
+        out 2
+    end
+
+    # Collect symbols starting with first
+    g_imp_syms = first;
+    g_imp_aliases = first_alias;
+    g_imp_sym_count = 1;
+    when i < n and native_read_u8(data, i) == 44 loop
+        i = i + 1;
+        when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+            i = i + 1
+        end
+        ss = i;
+        when i < n and text_is_ident_char(native_read_u8(data, i)) == 1 loop
+            i = i + 1
+        end
+        if i <= ss do out 0 end
+        sym = text_fat_from_range(data, ss, i - ss);
+        when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+            i = i + 1
+        end
+        var sym_alias = sym;
+        if i + 3 <= n and native_read_u8(data, i) == 97 and native_read_u8(data, i + 1) == 115 and (native_read_u8(data, i + 2) == 32 or native_read_u8(data, i + 2) == 9) do
+            i = i + 2;
+            when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+                i = i + 1
+            end
+            as0 = i;
+            when i < n and text_is_ident_char(native_read_u8(data, i)) == 1 loop
+                i = i + 1
+            end
+            if i > as0 do
+                sym_alias = text_fat_from_range(data, as0, i - as0);
+            end
+            when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+                i = i + 1
+            end
+        end
+        g_imp_syms = text_fat_append_nl_sym(g_imp_syms, sym);
+        g_imp_aliases = text_fat_append_nl_sym(g_imp_aliases, sym_alias);
+        g_imp_sym_count = g_imp_sym_count + 1;
+    end
+
+    # Require "from"
+    if i + 4 > n or native_read_u8(data, i) != 102 or native_read_u8(data, i + 1) != 114 or native_read_u8(data, i + 2) != 111 or native_read_u8(data, i + 3) != 109 do
+        out 0
+    end
+    i = i + 4;
+    when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+        i = i + 1
+    end
+    # Module: bare ident or "quoted/path.vri"
+    if i < n and native_read_u8(data, i) == 34 do
+        i = i + 1;
+        ms = i;
+        when i < n and native_read_u8(data, i) != 34 loop
+            i = i + 1
+        end
+        if i <= ms do out 0 end
+        g_imp_mod = text_fat_from_range(data, ms, i - ms);
+        if i < n and native_read_u8(data, i) == 34 do i = i + 1 end
+    else
+        ms = i;
+        when i < n and (text_is_ident_char(native_read_u8(data, i)) == 1 or native_read_u8(data, i) == 46 or native_read_u8(data, i) == 47) loop
+            i = i + 1
+        end
+        if i <= ms do out 0 end
+        g_imp_mod = text_fat_from_range(data, ms, i - ms)
+    end
+    # Optional trailing "as <alias>" (Vir form: import <sym> from <mod> as <alias>).
+    when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+        i = i + 1
+    end
+    if g_imp_sym_count == 1 and i + 3 <= n and native_read_u8(data, i) == 97 and native_read_u8(data, i + 1) == 115 and (native_read_u8(data, i + 2) == 32 or native_read_u8(data, i + 2) == 9) do
+        i = i + 2;
+        when i < n and (native_read_u8(data, i) == 32 or native_read_u8(data, i) == 9) loop
+            i = i + 1
+        end
+        as0 = i;
+        when i < n and text_is_ident_char(native_read_u8(data, i)) == 1 loop
+            i = i + 1
+        end
+        if i > as0 do
+            g_imp_aliases = text_fat_from_range(data, as0, i - as0)
+        end
+    end
+    out 1
+end.
+
+func text_skip_import_stmt(source: string, at: int):
+    data = native_read_i64(source, 0);
+    n = native_read_i64(source, 8);
+    i = at;
+    when i < n loop
+        c = native_read_u8(data, i);
+        i = i + 1;
+        if c == 59 or c == 10 do
+            out i
+        end
+    end
+    out n
+end.
+
+func text_build_import_body(mod_body: string, alias_only: int):
+    # If g_imp_sym_count == 0 → whole module. Else extract each exported func.
+    # alias_only=1 → emit only symbols that are renamed (alias != name); used when
+    # the module was already brought in via `include` and we just need alias shims.
+    if g_imp_sym_count == 0 do
+        if alias_only == 1 do
+            out 0
+        end
+        out mod_body
+    end
+    sd = native_read_i64(g_imp_syms, 0);
+    sl = native_read_i64(g_imp_syms, 8);
+    ad = native_read_i64(g_imp_aliases, 0);
+    al = native_read_i64(g_imp_aliases, 8);
+    out_buf = 0;
+    out_len = 0;
+    p = 0;
+    var ap = 0;
+    when p < sl loop
+        s0 = p;
+        when p < sl and native_read_u8(sd, p) != 10 loop
+            p = p + 1
+        end
+        a0 = ap;
+        when ap < al and native_read_u8(ad, ap) != 10 loop
+            ap = ap + 1
+        end
+        if p > s0 do
+            fname = text_fat_from_range(sd, s0, p - s0);
+            var alias_name = fname;
+            if ap > a0 do
+                alias_name = text_fat_from_range(ad, a0, ap - a0);
+            end
+            var skip_sym = 0;
+            if alias_only == 1 and fat_str_eq(fname, alias_name) == 1 do
+                skip_sym = 1
+            end
+            if skip_sym == 0 do
+                if text_has_export(mod_body, fname) == 0 do
+                    g_inc_err = 3;
+                    out 0
+                end
+                chunk = text_extract_func(mod_body, fname);
+                if chunk == 0 do
+                    g_inc_err = 3;
+                    out 0
+                end
+                if fat_str_eq(fname, alias_name) == 0 do
+                    chunk = text_rename_func_chunk(chunk, fname, alias_name);
+                end
+                cd = native_read_i64(chunk, 0);
+                cl = native_read_i64(chunk, 8);
+                nb = vir_alloc(out_len + cl + 2);
+                a = 0;
+                when a < out_len loop
+                    native_write_u8(nb, a, native_read_u8(out_buf, a));
+                    a = a + 1
+                end
+                b = 0;
+                when b < cl loop
+                    native_write_u8(nb, out_len + b, native_read_u8(cd, b));
+                    b = b + 1
+                end
+                native_write_u8(nb, out_len + cl, 10);
+                native_write_u8(nb, out_len + cl + 1, 0);
+                out_buf = nb;
+                out_len = out_len + cl + 1
+            end
+        end
+        if p < sl and native_read_u8(sd, p) == 10 do
+            p = p + 1
+        end
+        if ap < al and native_read_u8(ad, ap) == 10 do
+            ap = ap + 1
+        end
+    end
+    if out_len <= 0 or out_buf == 0 do
+        out 0
+    end
+    out str_from_cstr(out_buf)
+end.
+
+func expand_imports_text(source: string):
+    guard = 0;
+    when guard < 256 loop
+        guard = guard + 1;
+        at = text_find_import(source);
+        if at < 0 do
+            out source
+        end
+        kind = text_parse_import_at(source, at);
+        if kind == 0 or g_imp_mod == 0 do
+            g_inc_err = 1;
+            out source
+        end
+        end_at = text_skip_import_stmt(source, at);
+        # Already pulled in via include — the exported names are already in scope,
+        # so we only need to splice rename shims for any aliased imports (import … as X).
+        if g_inc_has(g_imp_mod) == 1 do
+            var shim = 0;
+            abody = read_include_source(g_imp_mod);
+            if abody != 0 do
+                shim = text_build_import_body(abody, 1)
+            end
+            if g_inc_err == 3 do
+                g_inc_err = 0
+            end
+            if shim == 0 do
+                ebuf = vir_alloc(1);
+                native_write_u8(ebuf, 0, 0);
+                shim = str_from_cstr(ebuf)
+            end
+            source = text_splice_at(source, at, end_at, shim)
+        else
+            body = read_include_source(g_imp_mod);
+            if body == 0 do
+                g_inc_err = 1;
+                out source
+            end
+            piece = text_build_import_body(body, 0);
+            if piece == 0 do
+                # No export list (stdlib modules): splice whole module once.
+                if g_inc_err == 3 do
+                    g_inc_err = 0;
+                    g_inc_mark(g_imp_mod);
+                    piece = body
+                else
+                    if g_inc_err == 0 do
+                        g_inc_err = 3
+                    end
+                    out source
+                end
+            end
+            g_inc_mark(g_imp_mod);
+            source = text_splice_at(source, at, end_at, piece)
+        end
+    end
+    out source
+end.
+
+func append_prog_children(dst: AstNode, src: AstNode):
+    if src.node_type != AstType.Program do
+        out dst
+    end
+    i = 0;
+    when i < vec_len_rt(src.children) loop
+        dst = ast_add_child(dst, vec_get_rt(src.children, i));
+        i = i + 1
+    end
+    out dst
+end.
+
+func resolve_includes(prog: AstNode):
+    # Includes are expanded at text level (expand_includes_text) before parse.
+    out prog
+end.
+
+func compile(source: string, output_path: string):
+
+    # Step 0: Expand includes + imports as text (physical splice)
+    print "virc: resolving includes...";
+    g_imp_mod = 0;
+    g_imp_syms = 0;
+    g_imp_sym_count = 0;
+    g_imp_alias = 0;
+    source = text_ascii_sanitize(source);
+    source = expand_includes_text(source);
+    if g_inc_err != 0 do
+        print "virc: include cannot read module";
+        out 1
+    end
+    source = expand_imports_text(source);
+    if g_inc_err == 1 do
+        print "virc: include cannot read module";
+        out 1
+    end
+    if g_inc_err == 3 do
+        print "virc: import symbol not exported";
+        out 1
+    end
+    if g_inc_err != 0 do
+        print "virc: include cannot read module";
+        out 1
+    end
+
+    # Step 1: Tokenize
+    print "virc: tokenizing...";
+    lex = lexer_new(source);
+    lex = tokenize(lex);
+
+    if fat_str_len(lex.error_msg) > 0 do
+        print "virc: lex error";
+        out 1
+    end
+
+    tok_count = vec_len(lex.tokens);
+
+    # Parser expects rt-vec of token pointers; lexer uses collections Vec.
+    tok_rt = vec_new_rt();
+    ti = 0;
+    when ti < tok_count loop
+        tok = vec_get(lex.tokens, ti);
+        tok_rt = vec_push_rt(tok_rt, tok);
+        ti = ti + 1
+    end
+
+    # Step 2: Parse
+    print "virc: parsing...";
+    parser = parser_new(tok_rt);
+    var (parser2, ast) = parse_program(parser);
+
+    if ast.node_type == AstType.Program and vec_len_rt(ast.children) == 0 do
+        print "virc: parse produced empty program";
+        out 1
+    end
+
+    # Step 2b: AST include resolve is a no-op (text expand above)
+    ast = resolve_includes(ast);
+
+    # Step 3: Lower
+    print "virc: lowering...";
+    ctx = compile_pipeline("", ast, 0);
+
+    if ctx.error_count > 0 do
+        print "virc: lower error";
+        out 1
+    end
+
+    func_count = vec_len(ctx.prog.functions);
+    if func_count == 0 do
+        print "virc: no functions lowered";
+        out 1
+    end
+
+    # Step 4: Optimize (identity under C-core bootstrap)
+    print "virc: optimizing...";
+    ctx.prog = optimize_module(ctx.prog);
+
+    # Step 5: Code generation (ARM64)
+    print "virc: generating ARM64 machine code...";
+    code = codegen_emit_module(ctx.prog, TargetArch.ARM64);
+    code_size = codebuf_offset(code);
+
+    # Step 6: Link into Mach-O executable
+    print "virc: linking Mach-O ARM64 executable...";
+    binary = emit_macho_executable(code);
+
+    # Step 7: Write output (C-core: output_path is a C string from get_arg)
+    print "virc: writing...";
+    f = file_open(output_path, "w");
+    if f == 0 do
+        print "virc: error_msg: cannot create output file";
+        out 1
+    end
+
+    file_size = buf_size(binary);
+    write_buf_to_file(f, binary);
+    file_close(f);
+
+    print "virc: done";
+    print file_size;
+    out 0
+end.
+# ═══════════════════════════════════════════════════════
+# Main Entry Point
+# ═══════════════════════════════════════════════════════
+
+func compiler_legacy_main:
+    print "╔══════════════════════════════════════════════╗";
+    print "║  virc — Vir Self-Hosting Compiler v2.0      ║";
+    print "║  Phase 5: Bootstrap Binary                   ║";
+    print "╚══════════════════════════════════════════════╝";
+
+    if arg_count() < 1 do
+        print "Usage: virc <input.vri> [-o output]";
+        print "";
+        print "Compiles a Vir source file to a standalone";
+        print "Mach-O ARM64 binary. No Python, no C runtime.";
+        out 1
+    end
+
+    input_path = get_arg(0);
+    output_path = "a.out";
+
+    # Parse -o flag
+    if arg_count() >= 3 do
+        if rt_streq(get_arg(1), "-o") do
+            output_path = get_arg(2)
+        end
+    end
+
+    # Directory of main source (for relative includes)
+    g_inc_base = 0;
+    plen = rt_strlen(input_path);
+    last_slash = 0 - 1;
+    pi = 0;
+    when pi < plen loop
+        if native_read_u8(input_path, pi) == 47 do
+            last_slash = pi
+        end
+        pi = pi + 1
+    end
+    if last_slash >= 0 do
+        dbuf = vir_alloc(last_slash + 1);
+        pi = 0;
+        when pi < last_slash loop
+            native_write_u8(dbuf, pi, native_read_u8(input_path, pi));
+            pi = pi + 1
+        end
+        native_write_u8(dbuf, last_slash, 0);
+        g_inc_base = dbuf
+    end
+
+    # Read source file (C-core: get_arg returns C strings; use builtin file I/O)
+    print "virc: reading...";
+    f = file_open(input_path, "r");
+    if f == 0 do
+        print "virc: error_msg: cannot open input";
+        out 1
+    end
+
+    source_cstr = file_read(f);
+    file_close(f);
+
+    if source_cstr == 0 do
+        out 1
+    end
+
+    # Builtin file_read returns a C string; lexer expects .byte_len via str_from_cstr.
+    source = str_from_cstr(source_cstr);
+
+    # Compile!
+    result = compile(source, output_path);
+    out result
+end.
+export compile, main, codegen_emit_module, emit_runtime_arm64, emit_macho_executable, emit_macho_with_entry, FuncLayout, expand_includes_text, expand_imports_text, text_ascii_sanitize, g_inc_base, g_inc_err;

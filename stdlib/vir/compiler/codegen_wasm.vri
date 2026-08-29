@@ -1,0 +1,892 @@
+##
+ * vir/compiler/codegen_wasm.vri — Q-IR → WebAssembly Backend
+ * ============================================================
+ * Self-hosted Vir implementation of WASM code generation.
+ * Ported from Python codegen_wasm.py → pure Vir.
+ *
+ * Emits WebAssembly MVP binary
+ *   Module header → Type → Import → Function → Memory → Export → Code
+ *
+ * Strategy: Q-IR VRegs → WASM locals;
+ *           Q-IR ops   → push operands, stack op, pop to dest.
+ ##
+
+module vir.compiler.codegen_wasm;
+
+include vir.compiler.codegen;
+import QOp, QInstr, Operand, OpndType, opnd_none from codegen;
+include vir.wasm.wasm;
+import ValType, WasmOp, WasmModule, SEC_TYPE, SEC_IMPORT, SEC_FUNCTION,
+       SEC_MEMORY, SEC_EXPORT, SEC_CODE,
+       WASM_MAGIC_0, WASM_MAGIC_1, WASM_MAGIC_2, WASM_MAGIC_3,
+       WASM_VERSION from "stdlib/vir/wasm/wasm.vri";
+
+
+# ═══════════════════════════════════════════════════════
+# WASM Binary Constants
+# ═══════════════════════════════════════════════════════
+
+const W_I32:       0x7F;
+const W_I64:       0x7E;
+const W_F32:       0x7D;
+const W_F64:       0x7C;
+
+const W_FUNCTYPE:  0x60;
+
+const EXP_FUNC:    0x00;
+const EXP_TABLE:   0x01;
+const EXP_MEMORY:  0x02;
+const EXP_GLOBAL:  0x03;
+
+# WASM opcodes (binary encoding)
+const OP_UNREACHABLE:         0x00;
+const OP_NOP:                 0x01;
+const OP_BLOCK:               0x02;
+const OP_LOOP:                0x03;
+const OP_IF:                  0x04;
+const OP_ELSE:                0x05;
+const OP_END:                 0x0B;
+const OP_BR:                  0x0C;
+const OP_BR_IF:               0x0D;
+const OP_RETURN:              0x0F;
+const OP_CALL:                0x10;
+const OP_DROP:                0x1A;
+const OP_LOCAL_GET:           0x20;
+const OP_LOCAL_SET:           0x21;
+const OP_LOCAL_TEE:           0x22;
+const OP_I32_LOAD:            0x28;
+const OP_I64_LOAD:            0x29;
+const OP_I32_STORE:           0x36;
+const OP_I64_STORE:           0x37;
+const OP_I32_CONST:           0x41;
+const OP_I64_CONST:           0x42;
+const OP_F64_CONST:           0x44;
+const OP_I64_EQZ:             0x50;
+const OP_I64_EQ:              0x51;
+const OP_I64_NE:              0x52;
+const OP_I64_LT_S:            0x53;
+const OP_I64_GT_S:            0x55;
+const OP_I64_LE_S:            0x57;
+const OP_I64_GE_S:            0x59;
+const OP_F64_EQ:              0x61;
+const OP_F64_LT:              0x63;
+const OP_F64_GT:              0x64;
+const OP_I64_ADD:             0x7C;
+const OP_I64_SUB:             0x7D;
+const OP_I64_MUL:             0x7E;
+const OP_I64_DIV_S:           0x7F;
+const OP_I64_REM_S:           0x81;
+const OP_F64_ADD:             0xA0;
+const OP_F64_SUB:             0xA1;
+const OP_F64_MUL:             0xA2;
+const OP_F64_DIV:             0xA3;
+const OP_I64_EXTEND_I32_S:    0xAC;
+const OP_I64_TRUNC_F64_S:     0xB0;
+const OP_F64_CONVERT_I64_S:   0xB9;
+
+
+# ═══════════════════════════════════════════════════════
+# LEB128 Encoding (pure Vir — replaces extern stubs)
+# ═══════════════════════════════════════════════════════
+
+func wasm_uleb128(value: int, buf: Vec<int>):
+    let v = value;
+    loop
+        let byte = v & 0x7F;
+        v = v shr 7;
+        if v != 0 do
+            byte = byte | 0x80
+        end
+        buf = vec_push<int>(buf, byte);
+        if v == 0 do break end
+    end
+    out buf
+end.
+func wasm_sleb128(value: int, buf: Vec<int>):
+    let v = value;
+    let more = true;
+    when more loop
+        let byte = v & 0x7F;
+        v = v shr 7;
+        if (v == 0 and (byte & 0x40) == 0) or (v == -1 and (byte & 0x40) != 0) do
+            more = false
+        else
+            byte = byte | 0x80
+        end
+        buf = vec_push<int>(buf, byte)
+    end
+    out buf
+end.
+func wasm_encode_string(s: string, buf: Vec<int>):
+    let slen = str_byte_len(s);
+    buf = wasm_uleb128(slen, buf);
+    let i = 0;
+    when i < slen loop
+        buf = vec_push<int>(buf, str_byte_at(s, i));
+        i = i + 1
+    end
+    out buf
+end.
+# ═══════════════════════════════════════════════════════
+# WASM Function Builder
+# ═══════════════════════════════════════════════════════
+
+entity WasmFunc:
+    name:         string,
+        param_count:  int,
+        local_count:  int,
+        has_result:   bool,
+        body:         Vec<int>
+end.
+func wasm_func_new(name: string, param_count: int):
+    out WasmFunc (
+        name:        name,
+        param_count: param_count,
+        local_count: 0,
+        has_result:  true,
+        body:        vec_new<int>()
+    )
+end.
+func wf_emit(wf: WasmFunc, opcode: int):
+    wf.body = vec_push<int>(wf.body, opcode);
+    out wf
+end.
+func wf_emit_i64_const(wf: WasmFunc, value: int):
+    wf.body = vec_push<int>(wf.body, OP_I64_CONST);
+    wf.body = wasm_sleb128(value, wf.body);
+    out wf
+end.
+func wf_emit_f64_const(wf: WasmFunc, value: float):
+    wf.body = vec_push<int>(wf.body, OP_F64_CONST);
+    # Emit 8 bytes little-endian IEEE 754
+    let bits = float_to_bits(value);
+    let i = 0;
+    when i < 8 loop
+        wf.body = vec_push<int>(wf.body, (bits shr (i * 8)) & 0xFF);
+        i = i + 1
+    end
+    out wf
+end.
+func wf_emit_local_get(wf: WasmFunc, idx: int):
+    wf.body = vec_push<int>(wf.body, OP_LOCAL_GET);
+    wf.body = wasm_uleb128(idx, wf.body);
+    out wf
+end.
+func wf_emit_local_set(wf: WasmFunc, idx: int):
+    wf.body = vec_push<int>(wf.body, OP_LOCAL_SET);
+    wf.body = wasm_uleb128(idx, wf.body);
+    out wf
+end.
+func wf_emit_call(wf: WasmFunc, func_idx: int):
+    wf.body = vec_push<int>(wf.body, OP_CALL);
+    wf.body = wasm_uleb128(func_idx, wf.body);
+    out wf
+end.
+func wf_emit_br(wf: WasmFunc, depth: int):
+    wf.body = vec_push<int>(wf.body, OP_BR);
+    wf.body = wasm_uleb128(depth, wf.body);
+    out wf
+end.
+func wf_emit_br_if(wf: WasmFunc, depth: int):
+    wf.body = vec_push<int>(wf.body, OP_BR_IF);
+    wf.body = wasm_uleb128(depth, wf.body);
+    out wf
+end.
+func wf_encode_body(wf: WasmFunc):
+    let body = vec_new<int>();
+
+    # Locals declaration
+    if wf.local_count > 0 do
+        body = wasm_uleb128(1, body);             # 1 entry
+        body = wasm_uleb128(wf.local_count, body); # count
+        body = vec_push<int>(body, W_I64)         # type i64
+    else
+        body = wasm_uleb128(0, body)             # 0 entries
+    end
+
+    # Copy body bytes
+    let i = 0;
+    let n = vec_len<int>(wf.body);
+    when i < n loop
+        body = vec_push<int>(body, vec_get<int>(wf.body, i));
+        i = i + 1
+    end
+
+    # End opcode
+    body = vec_push<int>(body, OP_END);
+
+    # Wrap with size prefix
+    let result = vec_new<int>();
+    result = wasm_uleb128(vec_len<int>(body), result);
+    let j = 0;
+    let m = vec_len<int>(body);
+    when j < m loop
+        result = vec_push<int>(result, vec_get<int>(body, j));
+        j = j + 1
+    end
+    out result
+end.
+# ═══════════════════════════════════════════════════════
+# WASM Code Generator
+# ═══════════════════════════════════════════════════════
+
+entity WasmCodegen:
+    functions:     Vec<WasmFunc>,
+        func_names:    Map<string, int>,
+        import_count:  int,
+        strings:       Vec<string>
+end.
+func wasm_codegen_new:
+    out WasmCodegen (
+        functions:    vec_new<WasmFunc>(),
+        func_names:   map_new<string, int>(),
+        import_count: 0,
+        strings:      vec_new<string>()
+    )
+end.
+# ═══════════════════════════════════════════════════════
+# Operand Push Helpers
+# ═══════════════════════════════════════════════════════
+
+func wf_push_operand(wf: WasmFunc, op: Operand):
+    if op.kind == OpndType.VReg do
+        wf = wf_emit_local_get(wf, op.vreg)
+    eif op.kind == OpndType.Imm do
+        wf = wf_emit_i64_const(wf, op.imm)
+    end
+    out wf
+end.
+func wf_pop_to_dest(wf: WasmFunc, op: Operand):
+    if op.kind == OpndType.VReg do
+        wf = wf_emit_local_set(wf, op.vreg)
+    end
+    out wf
+end.
+# ═══════════════════════════════════════════════════════
+# Instruction Compilation
+# ═══════════════════════════════════════════════════════
+
+func wasm_compile_instr:
+    in  cg: WasmCodegen;
+        wf: WasmFunc;
+        instr: QInstr
+    let op = instr.opcode;
+
+    # ── Data Movement ──────────────────────────────────
+    if op == QOp.Load or op == QOp.Move do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.LoadString do
+        let idx = instr.str_idx;
+        wf = wf_emit_i64_const(wf, idx);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    # ── Integer Arithmetic ─────────────────────────────
+    if op == QOp.Add do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_ADD);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.Sub do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_SUB);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.Mul do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_MUL);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.Div do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_DIV_S);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.Mod do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_REM_S);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    # ── Comparison ─────────────────────────────────────
+    if op == QOp.CmpEq do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_EQ);
+        wf = wf_emit(wf, OP_I64_EXTEND_I32_S);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.CmpNe do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_NE);
+        wf = wf_emit(wf, OP_I64_EXTEND_I32_S);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.CmpGt do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_GT_S);
+        wf = wf_emit(wf, OP_I64_EXTEND_I32_S);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.CmpLt do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_LT_S);
+        wf = wf_emit(wf, OP_I64_EXTEND_I32_S);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.CmpGe do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_GE_S);
+        wf = wf_emit(wf, OP_I64_EXTEND_I32_S);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.CmpLe do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_I64_LE_S);
+        wf = wf_emit(wf, OP_I64_EXTEND_I32_S);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    # ── Floating-point Arithmetic ──────────────────────
+    if op == QOp.FAdd do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_F64_ADD);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.FSub do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_F64_SUB);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.FMul do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_F64_MUL);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.FDiv do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_push_operand(wf, instr.src2);
+        wf = wf_emit(wf, OP_F64_DIV);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.FCvtI2F do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit(wf, OP_F64_CONVERT_I64_S);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.FCvtF2I do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit(wf, OP_I64_TRUNC_F64_S);
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    # ── Control Flow ───────────────────────────────────
+    if op == QOp.Label do
+        # Labels handled via WASM block structure; no-op at byte level
+        out wf
+    end
+
+    if op == QOp.Jump do
+        wf = wf_emit_br(wf, 0);
+        out wf
+    end
+
+    if op == QOp.JumpIf do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit(wf, OP_I64_EQZ);
+        wf = wf_emit(wf, OP_I64_EQZ);      # double eqz → "is not zero"
+        wf = wf_emit_br_if(wf, 0);
+        out wf
+    end
+
+    if op == QOp.JumpIfNot do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit(wf, OP_I64_EQZ);
+        wf = wf_emit_br_if(wf, 0);
+        out wf
+    end
+
+    if op == QOp.Call do
+        # Push argument
+        wf = wf_push_operand(wf, instr.src1);
+        # Look up function index by label
+        let func_idx = 0;
+        let found = map_get(cg.func_names, instr.label_name);
+        case found
+            Some(idx): func_idx = idx
+            None: func_idx = 0
+        end
+        wf = wf_emit_call(wf, func_idx);
+        out wf
+    end
+
+    if op == QOp.Ret do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit(wf, OP_RETURN);
+        out wf
+    end
+
+    # ── I/O ────────────────────────────────────────────
+    if op == QOp.Print do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit_call(wf, 0);  # import[0] = env.print
+        out wf
+    end
+
+    if op == QOp.Input do
+        wf = wf_emit_call(wf, 1);  # import[1] = env.input
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    # ── NOP / HALT ─────────────────────────────────────
+    if op == QOp.Nop do
+        wf = wf_emit(wf, OP_NOP);
+        out wf
+    end
+
+    if op == QOp.Halt do
+        wf = wf_emit(wf, OP_UNREACHABLE);
+        out wf
+    end
+
+    # ── Phase 7: New opcodes (WASM stubs) ──────────────
+
+    if op == QOp.CLZ do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit(wf, 0x79);  # i64.clz
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.CTZ do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit(wf, 0x7A);  # i64.ctz
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.PopCnt do
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit(wf, 0x7B);  # i64.popcnt
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.Not do
+        # i64.xor with -1
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit(wf, 0x42);  # i64.const
+        wf = wf_emit_sleb128(wf, -1);
+        wf = wf_emit(wf, 0x85);  # i64.xor
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.Neg do
+        # 0 - src1
+        wf = wf_emit(wf, 0x42);  # i64.const
+        wf = wf_emit_sleb128(wf, 0);
+        wf = wf_push_operand(wf, instr.src1);
+        wf = wf_emit(wf, 0x7D);  # i64.sub
+        wf = wf_pop_to_dest(wf, instr.dest);
+        out wf
+    end
+
+    if op == QOp.Fence do
+        # WASM has no explicit memory fence; semantics guarantee sequential consistency
+        wf = wf_emit(wf, OP_NOP);
+        out wf
+    end
+
+    if op == QOp.Trap do
+        wf = wf_emit(wf, OP_UNREACHABLE);
+        out wf
+    end
+
+    if op == QOp.Unreachable do
+        wf = wf_emit(wf, OP_UNREACHABLE);
+        out wf
+    end
+
+    # Stubs for opcodes without direct WASM mapping
+    if op == QOp.Syscall or op == QOp.MemCopy or op == QOp.MemSet do
+        wf = wf_emit(wf, OP_NOP);  # stub — requires WASM host import
+        out wf
+    end
+
+    if op == QOp.BSwap or op == QOp.AlignPtr do
+        wf = wf_emit(wf, OP_NOP);  # stub
+        out wf
+    end
+
+    if op == QOp.AtomicLoad or op == QOp.AtomicStore or op == QOp.AtomicCas or op == QOp.AtomicAdd or op == QOp.AtomicSub do
+        wf = wf_emit(wf, OP_NOP);  # stub — WASM atomics require shared memory
+        out wf
+    end
+
+    # Unknown opcode → nop
+    out wf
+end.
+# ═══════════════════════════════════════════════════════
+# Function Compilation
+# ═══════════════════════════════════════════════════════
+
+func wasm_compile_function:
+    in  cg: WasmCodegen;
+        name: string;
+        params: int;
+        body: Vec<QInstr>
+    let wf = wasm_func_new(name, params);
+
+    # Count max VReg index used → allocate locals
+    let max_reg = params - 1;
+    let i = 0;
+    let n = vec_len<QInstr>(body);
+    when i < n loop
+        let instr = vec_get<QInstr>(body, i);
+        if instr.dest.kind == OpndType.VReg and instr.dest.vreg > max_reg do
+            max_reg = instr.dest.vreg
+        end
+        if instr.src1.kind == OpndType.VReg and instr.src1.vreg > max_reg do
+            max_reg = instr.src1.vreg
+        end
+        if instr.src2.kind == OpndType.VReg and instr.src2.vreg > max_reg do
+            max_reg = instr.src2.vreg
+        end
+        i = i + 1
+    end
+
+    if max_reg + 1 > params do wf.local_count = max_reg + 1 - params; else wf.local_count = 0; end
+
+    # Compile each instruction
+    let j = 0;
+    when j < n loop
+        let instr = vec_get<QInstr>(body, j);
+        wf = wasm_compile_instr(cg, wf, instr);
+        j = j + 1
+    end
+
+    out wf
+end.
+# ═══════════════════════════════════════════════════════
+# Section Builder Helpers
+# ═══════════════════════════════════════════════════════
+
+func wasm_append_section:
+    in  out_buf: Vec<int>;
+        sec_id: int;
+        content: Vec<int>
+    out_buf = vec_push<int>(out_buf, sec_id);
+    out_buf = wasm_uleb128(vec_len<int>(content), out_buf);
+    let i = 0;
+    let n = vec_len<int>(content);
+    when i < n loop
+        out_buf = vec_push<int>(out_buf, vec_get<int>(content, i));
+        i = i + 1
+    end
+    out out_buf
+end.
+func wasm_append_vec(dst: Vec<int>, src: Vec<int>):
+    let i = 0;
+    let n = vec_len<int>(src);
+    when i < n loop
+        dst = vec_push<int>(dst, vec_get<int>(src, i));
+        i = i + 1
+    end
+    out dst
+end.
+# ═══════════════════════════════════════════════════════
+# Binary Module Emitter
+# ═══════════════════════════════════════════════════════
+
+entity TypeSig:
+    params:  Vec<int>,
+        results: Vec<int>
+end.
+func wasm_emit_binary(cg: WasmCodegen):
+    let out_buf = vec_new<int>();
+
+    # ── Magic + Version ────────────────────────────────
+    out_buf = vec_push<int>(out_buf, WASM_MAGIC_0);  # \0
+    out_buf = vec_push<int>(out_buf, WASM_MAGIC_1);  # a
+    out_buf = vec_push<int>(out_buf, WASM_MAGIC_2);  # s
+    out_buf = vec_push<int>(out_buf, WASM_MAGIC_3);  # m
+    out_buf = vec_push<int>(out_buf, 1);  # version
+    out_buf = vec_push<int>(out_buf, 0);
+    out_buf = vec_push<int>(out_buf, 0);
+    out_buf = vec_push<int>(out_buf, 0);
+
+    # ── Collect type signatures ────────────────────────
+    let type_sigs = vec_new<TypeSig>();
+
+    # Import types: env.print(i64) → void, env.input() → i64
+    let sig0_p = vec_new<int>();
+    sig0_p = vec_push<int>(sig0_p, W_I64);
+    let sig0_r = vec_new<int>();
+    type_sigs = vec_push<TypeSig>(type_sigs, TypeSig ( params: sig0_p, results: sig0_r ));
+
+    let sig1_p = vec_new<int>();
+    let sig1_r = vec_new<int>();
+    sig1_r = vec_push<int>(sig1_r, W_I64);
+    type_sigs = vec_push<TypeSig>(type_sigs, TypeSig ( params: sig1_p, results: sig1_r ));
+
+    # User function types: i64^N → i64
+    let fi = 0;
+    let fn_count = vec_len<WasmFunc>(cg.functions);
+    when fi < fn_count loop
+        let wf = vec_get<WasmFunc>(cg.functions, fi);
+        let sig_idx = _find_or_add_sig(type_sigs, wf.param_count, wf.has_result);
+        if sig_idx == -1 do
+            # New sig needed
+            let sp = vec_new<int>();
+            let pi = 0;
+            when pi < wf.param_count loop
+                sp = vec_push<int>(sp, W_I64);
+                pi = pi + 1
+            end
+            let sr = vec_new<int>();
+            if wf.has_result do
+                sr = vec_push<int>(sr, W_I64)
+            end
+            type_sigs = vec_push<TypeSig>(type_sigs, TypeSig ( params: sp, results: sr ))
+        end
+        fi = fi + 1
+    end
+
+    # ── Type Section ───────────────────────────────────
+    let type_content = vec_new<int>();
+    let num_types = vec_len<TypeSig>(type_sigs);
+    type_content = wasm_uleb128(num_types, type_content);
+    let ti = 0;
+    when ti < num_types loop
+        let sig = vec_get<TypeSig>(type_sigs, ti);
+        type_content = vec_push<int>(type_content, W_FUNCTYPE);
+        let np = vec_len<int>(sig.params);
+        type_content = wasm_uleb128(np, type_content);
+        let pi = 0;
+        when pi < np loop
+            type_content = vec_push<int>(type_content, vec_get<int>(sig.params, pi));
+            pi = pi + 1
+        end
+        let nr = vec_len<int>(sig.results);
+        type_content = wasm_uleb128(nr, type_content);
+        let ri = 0;
+        when ri < nr loop
+            type_content = vec_push<int>(type_content, vec_get<int>(sig.results, ri));
+            ri = ri + 1
+        end
+        ti = ti + 1
+    end
+    out_buf = wasm_append_section(out_buf, SEC_TYPE, type_content);
+
+    # ── Import Section ─────────────────────────────────
+    let import_content = vec_new<int>();
+    import_content = wasm_uleb128(2, import_content);   # 2 imports
+    # env.print(i64) → void  (type index 0)
+    import_content = wasm_encode_string("env", import_content);
+    import_content = wasm_encode_string("print", import_content);
+    import_content = vec_push<int>(import_content, 0x00);  # functype
+    import_content = wasm_uleb128(0, import_content);       # type idx 0
+    # env.input() → i64  (type index 1)
+    import_content = wasm_encode_string("env", import_content);
+    import_content = wasm_encode_string("input", import_content);
+    import_content = vec_push<int>(import_content, 0x00);  # functype
+    import_content = wasm_uleb128(1, import_content);       # type idx 1
+    out_buf = wasm_append_section(out_buf, SEC_IMPORT, import_content);
+
+    # ── Function Section ───────────────────────────────
+    let func_content = vec_new<int>();
+    func_content = wasm_uleb128(fn_count, func_content);
+    let fj = 0;
+    when fj < fn_count loop
+        let wf = vec_get<WasmFunc>(cg.functions, fj);
+        let tidx = _find_sig_idx(type_sigs, wf.param_count, wf.has_result);
+        func_content = wasm_uleb128(tidx, func_content);
+        fj = fj + 1
+    end
+    out_buf = wasm_append_section(out_buf, SEC_FUNCTION, func_content);
+
+    # ── Memory Section (1 page = 64 KB) ───────────────
+    let mem_content = vec_new<int>();
+    mem_content = wasm_uleb128(1, mem_content);   # 1 memory
+    mem_content = vec_push<int>(mem_content, 0x00);  # no max
+    mem_content = wasm_uleb128(1, mem_content);   # initial 1 page
+    out_buf = wasm_append_section(out_buf, SEC_MEMORY, mem_content);
+
+    # ── Export Section ─────────────────────────────────
+    let export_content = vec_new<int>();
+    let export_count = fn_count + 1;  # all functions + memory
+    export_content = wasm_uleb128(export_count, export_content);
+    let ej = 0;
+    when ej < fn_count loop
+        let wf = vec_get<WasmFunc>(cg.functions, ej);
+        export_content = wasm_encode_string(wf.name, export_content);
+        export_content = vec_push<int>(export_content, EXP_FUNC);
+        export_content = wasm_uleb128(cg.import_count + ej, export_content);
+        ej = ej + 1
+    end
+    # Export memory
+    export_content = wasm_encode_string("memory", export_content);
+    export_content = vec_push<int>(export_content, EXP_MEMORY);
+    export_content = wasm_uleb128(0, export_content);
+    out_buf = wasm_append_section(out_buf, SEC_EXPORT, export_content);
+
+    # ── Code Section ───────────────────────────────────
+    let code_content = vec_new<int>();
+    code_content = wasm_uleb128(fn_count, code_content);
+    let ck = 0;
+    when ck < fn_count loop
+        let wf = vec_get<WasmFunc>(cg.functions, ck);
+        let encoded = wf_encode_body(wf);
+        code_content = wasm_append_vec(code_content, encoded);
+        ck = ck + 1
+    end
+    out_buf = wasm_append_section(out_buf, SEC_CODE, code_content);
+
+    out out_buf
+end.
+# ═══════════════════════════════════════════════════════
+# Type Signature Lookup
+# ═══════════════════════════════════════════════════════
+
+func _find_or_add_sig:
+    in  sigs: Vec<TypeSig>;
+        param_count: int;
+        has_result: bool
+    let i = 0;
+    let n = vec_len<TypeSig>(sigs);
+    when i < n loop
+        let s = vec_get<TypeSig>(sigs, i);
+        let np = vec_len<int>(s.params);
+        let nr = vec_len<int>(s.results);
+        var expect_r = 0;
+        if has_result do expect_r = 1 end
+        if np == param_count and nr == expect_r do
+            let all_i64 = true;
+            let j = 0;
+            when j < np loop
+                if vec_get<int>(s.params, j) != W_I64 do all_i64 = false end
+                j = j + 1
+            end
+            if all_i64 do
+                out i   # found existing
+            end
+        end
+        i = i + 1
+    end
+    out -1  # not found
+end.
+func _find_sig_idx:
+    in  sigs: Vec<TypeSig>;
+        param_count: int;
+        has_result: bool
+    let idx = _find_or_add_sig(sigs, param_count, has_result);
+    if idx == -1 do out 0 end  # fallback
+    out idx
+end.
+# ═══════════════════════════════════════════════════════
+# Public API
+# ═══════════════════════════════════════════════════════
+
+# Compile a list of QIR functions to WASM binary bytes.
+# Each QIRFunc has: name: string, param_count: int, body: Vec<QInstr>.
+entity QIRFunc:
+    name:         string,
+        param_count:  int,
+        body:         Vec<QInstr>
+end.
+func wasm_compile_module(funcs: Vec<QIRFunc>):
+    let cg = wasm_codegen_new();
+    cg.import_count = 2;  # env.print, env.input
+
+    let i = 0;
+    let n = vec_len<QIRFunc>(funcs);
+
+    # First pass: register names
+    when i < n loop
+        let f = vec_get<QIRFunc>(funcs, i);
+        map_set(cg.func_names, f.name, cg.import_count + i);
+        i = i + 1
+    end
+
+    # Second pass: compile bodies
+    let j = 0;
+    when j < n loop
+        let f = vec_get<QIRFunc>(funcs, j);
+        let wf = wasm_compile_function(cg, f.name, f.param_count, f.body);
+        cg.functions = vec_push<WasmFunc>(cg.functions, wf);
+        j = j + 1
+    end
+
+    out wasm_emit_binary(cg)
+end.
+func wasm_write_module(funcs: Vec<QIRFunc>, path: string):
+
+    let bytes = wasm_compile_module(funcs);
+    write_bytes_to_file(path, bytes)
+end.
+# ═══════════════════════════════════════════════════════
+# Exports
+# ═══════════════════════════════════════════════════════
+
+export WasmCodegen, WasmFunc, QIRFunc, TypeSig;
+export wasm_codegen_new, wasm_func_new;
+export wf_emit, wf_emit_i64_const, wf_emit_f64_const;
+export wf_emit_local_get, wf_emit_local_set, wf_emit_call;
+export wf_emit_br, wf_emit_br_if, wf_encode_body;
+export wf_push_operand, wf_pop_to_dest;
+export wasm_compile_instr, wasm_compile_function;
+export wasm_compile_module, wasm_write_module;
+export wasm_emit_binary;
+export wasm_uleb128, wasm_sleb128, wasm_encode_string;
+export wasm_append_section, wasm_append_vec;
