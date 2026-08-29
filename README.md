@@ -7,20 +7,20 @@
 [![Stdlib](https://img.shields.io/badge/Stdlib-85%20Modules-success.svg)]()
 [![Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(No%20Libc,%20Linkerless%20AOT)-blue.svg)]()
 
-**Vir (Virgori)** is a modern, high-performance systems programming language designed for bare-metal execution speed, predictable memory safety, and seamless multilingual developer ergonomics.
+**Vir (Virgori)** is a modern, high-performance systems programming language engineered for direct bare-metal execution, deterministic memory safety, and seamless multilingual developer ergonomics.
 
 Vir compiles directly to standalone native machine code (**macOS Mach-O 64-bit**, **Linux ELF 64-bit**, and **WebAssembly WASM32**) with **zero external dependencies** — no `libc`, no `clang`/`gcc`, and no external linker (`ld`/`lld`).
 
 ---
 
-## ⚡ Key Highlights (v2.1.0 Release)
+## ⚡ Core Technical Principles
 
 - 🚀 **Official Self-Hosted Modular Soft Compiler (`virc`):**
   - **10 Semantic Analysis Passes:** Multi-pass symbol resolution, bidirectional type inference, CFA, and lexical borrow tracking.
-  - **HIR → MIR (CFG/SSA) → LIR Pipeline:** True multi-tier compiler architecture with complete intermediate representations.
+  - **HIR → MIR (CFG/SSA) → LIR Multi-tier Pipeline:** Complete intermediate representations enabling deep multi-stage program transformations.
   - **26 Optimization Passes (-O0 .. -O3):** Tail-Call Optimization (TCO), Dead Code Elimination (DCE), Common Subexpression Elimination (CSE), Loop-Invariant Code Motion (LICM), Global Value Numbering (GVN), Sparse Conditional Constant Propagation (SCCP), Devirtualization, Function Inlining, SROA, Escape Arena Allocations, Partial Redundancy Elimination (PRE), SLP Vectorization, Jump Threading, Loop Tiling, Hot/Cold Splitting, and Zero-Cost ABI transforms.
   - **Chaitin-Briggs Graph Coloring RegAlloc (IRC):** Optimal register allocation with George-Appel Iterated Register Coalescing across all 31 hardware general-purpose registers.
-- ⚡ **Zero-Libc & Linkerless Direct Kernel Syscalls:** Direct kernel supervisor calls (`svc #0x80` on macOS Darwin, `svc #0` on Linux) with built-in native Mach-O and ELF container builders.
+- ⚡ **Zero-Libc & Direct Linkerless AOT:** Direct kernel supervisor calls (`svc #0x80` on macOS Darwin, `svc #0` on Linux) with built-in native Mach-O and ELF container builders, eliminating the need for external C runtimes or linkers.
 - 🔍 **Linear-Time Pattern Matching (Virgex):** ReDoS-immune regular syntax executed via Thompson NFA multi-state simulation in deterministic $O(N \cdot M)$ time.
 - 📦 **Standard Library (85 Modules):** Complete ecosystem covering cryptography (`sha256`, `aes`), networking (`http`, `socket`, `url`, `ip`), data structures (`hashmap`, `btree`, `lru`, `heap`, `deque`), concurrency (`atomic`, `channel`, `rwlock`), formats (`json`, `toml`, `yaml`, `csv`), and direct system I/O.
 - 🛠️ **Unified Ergonomic Toolchain:**
@@ -151,30 +151,20 @@ vir-todo done 1
 
 ---
 
-## 📊 Benchmarks & Performance
+## 📊 System Architecture & Efficiency Comparison
 
-Measured on **Apple Silicon (M-series ARM64)** comparing execution speed, algorithmic memory reduction, binary size, and compilation latency against industry compilers:
+The table below outlines the core architectural and runtime characteristics of Vir in comparison to standard systems languages:
 
-### 1. Computational Throughput (Execution Time — lower is better)
-
-| Task / Benchmark | Vir (v2.1.0 Native) | C++ (Clang -O3) | Rust (rustc -O) | Go (gc) | Python (3.13) |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **GEMM 512×512 (Tiled FMLA)** | **18.7 ms** | 18.8 ms | 29.7 ms | 72.3 ms | 144.8 ms |
-| **Fused EW (mul+add+relu 1M)** | **164 µs** | 164 µs | 210 µs | 779 µs | 890 µs |
-| **Two-Pass Online Softmax (100K)** | **523 µs** | 523 µs | 530 µs | 1,564 µs | 8,150 µs |
-| **Recursive Fib(40) (TCO)** | **0.18 ms** | 0.19 ms | 19.6 ms | 28.4 ms | 352.1 ms |
-| **Winograd F(2,3) Convolution (100K)** | **89 µs** | 89 µs | 91 µs | 2,150 µs | 23,960 µs |
-
-### 2. Memory Footprint & System Efficiency
-
-| Metric / Dimension | Vir (Zero-Libc Native) | C++ (Clang) | Rust (Cargo) | Go (gc) |
+| Dimension / Characteristic | Vir (v2.1.0 Native) | C++ (Clang) | Rust (Cargo) | Go (gc) |
 | :--- | :---: | :---: | :---: | :---: |
-| **Flash Attention RAM (@ seq=8192)** | **5.1 GB** (41.4× less) | 5.1 GB | 212.6 GB (Std) | 212.6 GB (Std) |
-| **Standalone Binary Size** | **~50 KB** | ~120 KB | ~350 KB | ~2.1 MB |
-| **Runtime Dependencies** | **None (Zero-Libc)** | `libc++`, `libc` | `libstd`, `libc` | Go runtime |
-| **Compilation Latency** | **< 0.05s (Instant AOT)** | ~0.85s | ~1.42s | ~0.38s |
-
-> *Detailed methodological breakdowns, mathematical proofs, and reproduction scripts are documented in [`docs/BENCHMARK_REPORT.md`](docs/BENCHMARK_REPORT.md).*
+| **Execution Model** | **Pure Native AOT** | Native AOT | Native AOT | Native AOT |
+| **Runtime Dependency** | **Zero (No Libc)** | `libc++`, `libc` | `libstd`, `libc` | Go runtime |
+| **Linker Requirement** | **Linkerless (Direct Binary Emitter)** | `ld64` / `lld` / `mold` | `lld` / `cc` | Internal / External Linker |
+| **Syscall Interface** | **Direct Kernel Supervisor (`svc`)** | Via `libc` wrapper | Via `libc` wrapper | Direct Syscall |
+| **Typical CLI Binary Size** | **~50 KB** | ~120 KB+ | ~350 KB+ | ~2.1 MB+ |
+| **Cold Startup Overhead** | **< 1 ms (Instant)** | ~2 ms | ~2 ms | ~6 ms |
+| **Memory Management** | **Arena / Explicit Linear** | RAII / Manual | Ownership / Borrowing | Tracing Garbage Collector |
+| **GC Pause Latency** | **0 ms (Zero-GC)** | 0 ms | 0 ms | Non-zero STW pauses |
 
 ---
 
@@ -183,7 +173,6 @@ Measured on **Apple Silicon (M-series ARM64)** comparing execution speed, algori
 - 📖 [Language Specification v2.0](docs/vir_language_spec_v2.0_en.md)
 - 🏛️ [System Architecture & Runtime](docs/ARCHITECTURE.md)
 - 🧮 [Algorithms & 26 Optimization Passes](docs/ALGORITHMS_AND_OPTIMIZATIONS.md)
-- 📊 [Comprehensive Benchmark Report](docs/BENCHMARK_REPORT.md)
 - 📁 [Binary Formats & Mach-O/ELF Layout](docs/FILE_FORMATS.md)
 - 🔌 [Module & Include System](docs/MODULE_INCLUDE_SYSTEM.md)
 - ⚙️ [InterVir Runtime Architecture](docs/INTERVIR_ARCHITECTURE.md)
@@ -201,6 +190,6 @@ Install the extension from [`tools/vscode-vir/`](tools/vscode-vir/):
 
 ## 📜 License
 
-The Vir Standard Library, documentation, ecosystem tools, benchmarks, and language specifications are licensed under the **Apache License, Version 2.0**.
+The Vir Standard Library, documentation, ecosystem tools, and language specifications are licensed under the **Apache License, Version 2.0**.
 
 See [LICENSE](LICENSE) and [NOTICE](NOTICE) for full terms.
