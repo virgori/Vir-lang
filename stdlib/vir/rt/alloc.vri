@@ -1,0 +1,329 @@
+##
+ * vir/rt/alloc.vri — Memory Allocator (Pure Vir, No libc)
+ * ========================================================
+ * Bump allocator + free-list allocator built on raw mmap syscalls.
+ * Zero C library. Zero malloc. Zero free. Pure kernel syscalls.
+ *
+ * Strategy
+ *   - Arena (bump) allocator for fast sequential allocation
+ *   - Free-list allocator for general-purpose alloc/dealloc
+ *   - Page allocator (mmap/munmap) as the backing layer
+ *
+ * Memory block layout
+ *   [size:i64] [flags:i64] [user data...]
+ *   ^-- block_ptr         ^-- returned to user (block_ptr + 16)
+ ##
+
+module vir.rt.alloc;
+
+include types;
+include syscall;
+import sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS from syscall;
+
+# ═══════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════
+
+const PAGE_SIZE:        16384;        # 16KB (macOS ARM64)
+const MIN_ARENA_SIZE:   1048576;      # 1MB
+const BLOCK_HEADER:     16;           # 8 bytes size + 8 bytes flags
+const BLOCK_FREE:       0x0;
+const BLOCK_USED:       0x1;
+const ALIGNMENT:        16;           # 16-byte alignment for ARM64
+
+# ═══════════════════════════════════════════════════════
+# Low-Level Page Allocation (mmap/munmap)
+# ═══════════════════════════════════════════════════════
+
+func page_alloc(size: int):
+
+    # Round up to page boundary
+    let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let actual = pages * PAGE_SIZE;
+
+    let ptr = sys_mmap(0, actual,
+                       PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS,
+                       -1, 0);
+    if ptr < 0 do
+        out 0   # allocation failed
+    end
+    out ptr
+end.
+func page_free(ptr: int, size: int):
+
+    let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    let actual = pages * PAGE_SIZE;
+    sys_munmap(ptr, actual)
+end.
+# ═══════════════════════════════════════════════════════
+# Arena Allocator — Fast Bump Allocation
+# ═══════════════════════════════════════════════════════
+# Allocates by bumping a pointer forward.
+# Entire arena freed at once (no individual free).
+# Perfect for compiler phases (lex, parse, IR).
+
+entity Arena:
+    base:       int;      # mmap'd base address
+    capacity:   int;      # total bytes
+    offset:     int      # current bump position
+end.
+func arena_new(size: int):
+
+    let actual = size;
+    if actual < MIN_ARENA_SIZE do
+        actual = MIN_ARENA_SIZE
+    end
+    let base = page_alloc(actual);
+    if base == 0 do
+        out Arena ( base: 0, capacity: 0, offset: 0 )
+    end
+    out Arena ( base: base, capacity: actual, offset: 0 )
+end.
+func arena_alloc(arena: Arena, size: int):
+
+    # Align to ALIGNMENT boundary
+    let aligned = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+
+    if arena.offset + aligned > arena.capacity do
+        out 0   # out of space
+    end
+
+    let ptr = arena.base + arena.offset;
+    arena.offset = arena.offset + aligned;
+    out ptr
+end.
+func arena_reset(arena: Arena):
+
+    arena.offset = 0;
+    out arena
+end.
+func arena_destroy(arena: Arena):
+
+    if arena.base != 0 do
+        page_free(arena.base, arena.capacity)
+    end
+end.
+# ═══════════════════════════════════════════════════════
+# Free-List Allocator — General Purpose
+# ═══════════════════════════════════════════════════════
+# Each block: [size:i64][flags:i64][user data...]
+# Free list is a singly-linked list through free blocks.
+# Coalescing on free to reduce fragmentation.
+
+entity FreeNode:
+    size:       int;      # total block size (including header)
+    next_ptr:   int      # pointer to next FreeNode, or 0
+end.
+entity Heap:
+    base:       int;      # mmap'd region base
+    capacity:   int;      # total region size
+    free_head:  int;      # pointer to first FreeNode
+    used:       int      # bytes currently allocated
+end.
+# Heap state (module-level singleton)
+var g_heap = Heap ( base: 0, capacity: 0, free_head: 0, used: 0 );
+
+func heap_init(size: int):
+
+    let actual = size;
+    if actual < MIN_ARENA_SIZE do
+        actual = MIN_ARENA_SIZE
+    end
+    let base = page_alloc(actual);
+    if base == 0 do
+        out false
+    end
+
+    # Initialize entire region as one big free block
+    extern func native_write_i64(addr: int, offset: int, val: int);
+    native_write_i64(base, 0, actual);       # size
+    native_write_i64(base, 8, 0);            # next = null (byte offset)
+
+    g_heap = Heap ( base: base, capacity: actual, free_head: base, used: 0 );
+    out true
+end.
+func heap_alloc(size: int):
+
+    let needed = size + BLOCK_HEADER;
+    # Align
+    needed = (needed + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
+
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+
+    # First-fit search through free list
+    let prev_ptr = 0;
+    let cur = g_heap.free_head;
+
+    when cur != 0 loop
+        let block_size = native_read_i64(cur, 0);
+        let next = native_read_i64(cur, 8);
+
+        if block_size >= needed do
+            # Found a fit! Split if remainder is big enough
+            let remainder = block_size - needed;
+
+            if remainder >= (BLOCK_HEADER + ALIGNMENT) do
+                # Split: shrink this block, create new free block after
+                native_write_i64(cur, 0, needed);    # resize current
+                let new_free = cur + needed;
+                native_write_i64(new_free, 0, remainder);   # size
+                native_write_i64(new_free, 8, next);         # next
+
+                # Patch prev or head to point to new_free
+                if prev_ptr == 0 do
+                    g_heap.free_head = new_free
+                else
+                    native_write_i64(prev_ptr, 8, new_free)
+                end
+            else
+                # Use whole block
+                needed = block_size;
+                if prev_ptr == 0 do
+                    g_heap.free_head = next
+                else
+                    native_write_i64(prev_ptr, 8, next)
+                end
+            end
+
+            # Mark as used
+            native_write_i64(cur, 0, needed);
+            native_write_i64(cur, 8, BLOCK_USED);
+            g_heap.used = g_heap.used + needed;
+
+            out cur + BLOCK_HEADER   # return user pointer
+        end
+
+        prev_ptr = cur;
+        cur = next
+    end
+
+    # No fit found — grow heap
+    let grow = needed;
+    if grow < MIN_ARENA_SIZE do
+        grow = MIN_ARENA_SIZE
+    end
+    let new_region = page_alloc(grow);
+    if new_region == 0 do
+        out 0   # OOM
+    end
+
+    # Set up new region as allocated block + remainder as free
+    native_write_i64(new_region, 0, needed);
+    native_write_i64(new_region, 8, BLOCK_USED);
+
+    let remainder = grow - needed;
+    if remainder >= (BLOCK_HEADER + ALIGNMENT) do
+        let new_free = new_region + needed;
+        native_write_i64(new_free, 0, remainder);
+        native_write_i64(new_free, 8, g_heap.free_head);
+        g_heap.free_head = new_free
+    end
+
+    g_heap.used = g_heap.used + needed;
+    g_heap.capacity = g_heap.capacity + grow;
+    out new_region + BLOCK_HEADER
+end.
+
+func heap_free(ptr: int):
+    if ptr == 0 do
+        out 0
+    end
+
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+
+    let block = ptr - BLOCK_HEADER;
+    let block_size = native_read_i64(block, 0);
+
+    # Coalescing: merge with immediate next free block if contiguous
+    let next_block = block + block_size;
+    if next_block == g_heap.free_head do
+        let next_size = native_read_i64(next_block, 0);
+        let next_next = native_read_i64(next_block, 8);
+        block_size = block_size + next_size;
+        native_write_i64(block, 0, block_size);
+        native_write_i64(block, 8, next_next);
+        g_heap.free_head = block;
+        g_heap.used = g_heap.used - block_size;
+        out 0
+    end
+
+    # Mark as free, add to free list head
+    native_write_i64(block, 0, block_size);
+    native_write_i64(block, 8, g_heap.free_head);
+    g_heap.free_head = block;
+    g_heap.used = g_heap.used - block_size;
+    out 0
+end.
+
+func heap_realloc(ptr: int, new_size: int):
+    if ptr == 0 do
+        out heap_alloc(new_size)
+    end
+
+    extern func native_read_i64(addr: int, offset: int) -> int;
+    extern func native_write_i64(addr: int, offset: int, val: int);
+
+    let block = ptr - BLOCK_HEADER;
+    let old_size = native_read_i64(block, 0) - BLOCK_HEADER;
+
+    # In-place shrink / reuse: no reallocation or copy needed!
+    if new_size <= old_size do
+        out ptr
+    end
+
+    # Allocate new, copy words, free old
+    let new_ptr = heap_alloc(new_size);
+    if new_ptr == 0 do
+        out 0
+    end
+
+    let copy_len = old_size;
+    if new_size < copy_len do
+        copy_len = new_size
+    end
+
+    let ci = 0;
+    when ci + 8 <= copy_len loop
+        let word = native_read_i64(ptr, ci);
+        native_write_i64(new_ptr, ci, word);
+        ci = ci + 8
+    end
+    when ci < copy_len loop
+        extern func native_read_u8(addr: int, offset: int) -> int;
+        extern func native_write_u8(addr: int, offset: int, val: int);
+        let byte_val = native_read_u8(ptr, ci);
+        native_write_u8(new_ptr, ci, byte_val);
+        ci = ci + 1
+    end
+    heap_free(ptr);
+    out new_ptr
+end.
+
+# ═══════════════════════════════════════════════════════
+# Global Allocator API (drop-in replacement for malloc)
+# ═══════════════════════════════════════════════════════
+
+var g_initialized = false;
+
+func vir_alloc(size: int):
+    if g_initialized == false do
+        heap_init(MIN_ARENA_SIZE * 4);   # 4MB initial heap
+        g_initialized = true
+    end
+    out heap_alloc(size)
+end.
+
+func vir_free(ptr: int):
+    heap_free(ptr)
+end.
+
+func vir_realloc(ptr: int, new_size: int):
+    if g_initialized == false do
+        heap_init(MIN_ARENA_SIZE * 4);
+        g_initialized = true
+    end
+    out heap_realloc(ptr, new_size)
+end.

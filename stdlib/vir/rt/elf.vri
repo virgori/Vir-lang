@@ -1,0 +1,418 @@
+##
+ * vir/rt/elf.vri — ELF Executable Emitter (Pure Vir)
+ * ====================================================
+ * Emits a complete ELF 64-bit executable for Linux ARM64
+ * and x86-64. No external assembler or linker needed.
+ *
+ * Produces a statically-linked, no-libc binary that the
+ * kernel can exec directly via _start + raw syscalls.
+ *
+ * Layout: ELF Header → Program Headers → .text → .data
+ ##
+
+module vir.rt.elf;
+
+include types;
+include vec_rt;
+import bvec_new, bvec_push, bvec_push_u16_le, bvec_push_u32_le,
+       bvec_push_u64_le, bvec_len, bvec_get, bvec_data_ptr, bvec_free from vec_rt;
+include io;
+import write_file_bytes from io;
+
+# ═══════════════════════════════════════════════════════
+# ELF Constants
+# ═══════════════════════════════════════════════════════
+
+# ELF identification
+const ELFMAG0:      0x7F;
+const ELFMAG1:      0x45;      # 'E'
+const ELFMAG2:      0x4C;      # 'L'
+const ELFMAG3:      0x46;      # 'F'
+const ELFCLASS64:   2;
+const ELFDATA2LSB:  1;         # Little-endian
+const EV_CURRENT:   1;
+const ELFOSABI_NONE: 0;
+
+# ELF type
+const ET_EXEC:      2;
+
+# Machine types
+const EM_X86_64:    62;
+const EM_AARCH64:   183;
+
+# Program header types
+const PT_LOAD:      1;
+const PT_NOTE:      4;
+
+# Flags
+const PF_R:         4;
+const PF_W:         2;
+const PF_X:         1;
+
+# Section header types
+const SHT_NULL:     0;
+const SHT_PROGBITS: 1;
+const SHT_STRTAB:   3;
+
+const SHF_ALLOC:    2;
+const SHF_EXECINSTR: 4;
+const SHF_WRITE:    1;
+
+# Standard addresses
+const ELF_BASE:     0x400000;
+const ELF_PAGE:     0x1000;    # 4KB pages for x86_64
+
+# Header sizes
+const ELF_HEADER_SIZE: 64;
+const PHDR_SIZE:    56;
+const SHDR_SIZE:    64;
+
+# ═══════════════════════════════════════════════════════
+# ELF Builder
+# ═══════════════════════════════════════════════════════
+
+entity ElfBuilder:
+    buf:            int;        # bvec byte buffer
+    arch:           int;        # 0=ARM64, 1=x86_64
+    text_code:      int;        # bvec with machine code
+    data_bytes:     int;        # bvec with data section
+    entry_offset:   int        # offset of _start in .text
+end.
+func elf_new(arch: int):
+
+    out ElfBuilder (
+        buf: bvec_new(),
+        arch: arch,
+        text_code: bvec_new(),
+        data_bytes: bvec_new(),
+        entry_offset: 0
+    )
+end.
+# ═══════════════════════════════════════════════════════
+# Write ELF Header (64 bytes)
+# ═══════════════════════════════════════════════════════
+
+func elf_write_header:
+    in  b: ElfBuilder;
+        entry: int;
+        phoff: int;
+        shoff: int;
+        phnum: int;
+        shnum: int;
+        shstrndx: int
+    let buf = b.buf;
+
+    # e_ident (16 bytes)
+    buf = bvec_push(buf, ELFMAG0);
+    buf = bvec_push(buf, ELFMAG1);
+    buf = bvec_push(buf, ELFMAG2);
+    buf = bvec_push(buf, ELFMAG3);
+    buf = bvec_push(buf, ELFCLASS64);
+    buf = bvec_push(buf, ELFDATA2LSB);
+    buf = bvec_push(buf, EV_CURRENT);
+    buf = bvec_push(buf, ELFOSABI_NONE);
+    # 8 bytes padding
+    let i = 0;
+    when i < 8 loop
+        buf = bvec_push(buf, 0);
+        i = i + 1
+    end
+
+    # e_type
+    buf = bvec_push_u16_le(buf, ET_EXEC);
+
+    # e_machine
+    if b.arch == 0 do
+        buf = bvec_push_u16_le(buf, EM_AARCH64)
+    else
+        buf = bvec_push_u16_le(buf, EM_X86_64)
+    end
+
+    # e_version
+    buf = bvec_push_u32_le(buf, EV_CURRENT);
+
+    # e_entry
+    buf = bvec_push_u64_le(buf, entry);
+
+    # e_phoff
+    buf = bvec_push_u64_le(buf, phoff);
+
+    # e_shoff
+    buf = bvec_push_u64_le(buf, shoff);
+
+    # e_flags
+    buf = bvec_push_u32_le(buf, 0);
+
+    # e_ehsize
+    buf = bvec_push_u16_le(buf, ELF_HEADER_SIZE);
+
+    # e_phentsize
+    buf = bvec_push_u16_le(buf, PHDR_SIZE);
+
+    # e_phnum
+    buf = bvec_push_u16_le(buf, phnum);
+
+    # e_shentsize
+    buf = bvec_push_u16_le(buf, SHDR_SIZE);
+
+    # e_shnum
+    buf = bvec_push_u16_le(buf, shnum);
+
+    # e_shstrndx
+    buf = bvec_push_u16_le(buf, shstrndx);
+
+    b.buf = buf;
+    out b
+end.
+# ═══════════════════════════════════════════════════════
+# Write Program Header (56 bytes)
+# ═══════════════════════════════════════════════════════
+
+func elf_write_phdr:
+    in  b: ElfBuilder;
+        p_type: int;
+        p_flags: int;
+        p_offset: int;
+        p_vaddr: int;
+        p_paddr: int;
+        p_filesz: int;
+        p_memsz: int;
+        p_align: int
+    let buf = b.buf;
+
+    buf = bvec_push_u32_le(buf, p_type);
+    buf = bvec_push_u32_le(buf, p_flags);
+    buf = bvec_push_u64_le(buf, p_offset);
+    buf = bvec_push_u64_le(buf, p_vaddr);
+    buf = bvec_push_u64_le(buf, p_paddr);
+    buf = bvec_push_u64_le(buf, p_filesz);
+    buf = bvec_push_u64_le(buf, p_memsz);
+    buf = bvec_push_u64_le(buf, p_align);
+
+    b.buf = buf;
+    out b
+end.
+# ═══════════════════════════════════════════════════════
+# Write Section Header (64 bytes)
+# ═══════════════════════════════════════════════════════
+
+func elf_write_shdr:
+    in  b: ElfBuilder;
+        sh_name: int;
+        sh_type: int;
+        sh_flags: int;
+        sh_addr: int;
+        sh_offset: int;
+        sh_size: int;
+        sh_link: int;
+        sh_info: int;
+        sh_addralign: int;
+        sh_entsize: int
+    let buf = b.buf;
+
+    buf = bvec_push_u32_le(buf, sh_name);
+    buf = bvec_push_u32_le(buf, sh_type);
+    buf = bvec_push_u64_le(buf, sh_flags);
+    buf = bvec_push_u64_le(buf, sh_addr);
+    buf = bvec_push_u64_le(buf, sh_offset);
+    buf = bvec_push_u64_le(buf, sh_size);
+    buf = bvec_push_u32_le(buf, sh_link);
+    buf = bvec_push_u32_le(buf, sh_info);
+    buf = bvec_push_u64_le(buf, sh_addralign);
+    buf = bvec_push_u64_le(buf, sh_entsize);
+
+    b.buf = buf;
+    out b
+end.
+# ═══════════════════════════════════════════════════════
+# Emit Complete ELF Executable
+# ═══════════════════════════════════════════════════════
+
+func elf_emit(b: ElfBuilder):
+
+
+    let code_size = bvec_len(b.text_code);
+    let data_size = bvec_len(b.data_bytes);
+    let page = ELF_PAGE;
+
+    let has_data = 0;
+    if data_size > 0 do
+        has_data = 1
+    end
+
+    # Program headers: PT_LOAD for .text, PT_LOAD for .data (if any)
+    let phnum = 1 + has_data;
+
+    # Section headers: NULL + .text + .data (opt) + .shstrtab
+    let shnum = 2 + has_data + 1;
+    let shstrndx = 1 + has_data + 1;    # last section = .shstrtab
+
+    # Layout calculation
+    let headers_size = ELF_HEADER_SIZE + phnum * PHDR_SIZE;
+
+    # Text starts at next page
+    let text_offset = page;
+    let text_vaddr = ELF_BASE + text_offset;
+
+    # Align text size to page
+    let text_pad_size = ((code_size + page - 1) / page) * page;
+
+    # Data follows text
+    let data_offset = text_offset + text_pad_size;
+    let data_vaddr = ELF_BASE + data_offset;
+    let data_pad_size = 0;
+    if has_data == 1 do
+        data_pad_size = ((data_size + page - 1) / page) * page
+    end
+
+    # Section headers at end
+    let shoff = data_offset + data_pad_size;
+
+    # Shstrtab content:  \0 .text \0 .data \0 .shstrtab \0
+    let strtab_offset = shoff + shnum * SHDR_SIZE;
+
+    # Entry point
+    let entry = text_vaddr + b.entry_offset;
+
+    # ── ELF Header ──
+    b = elf_write_header(b, entry, ELF_HEADER_SIZE, shoff, phnum, shnum, shstrndx);
+
+    # ── Program Headers ──
+
+    # PT_LOAD: .text (RX)
+    b = elf_write_phdr(b, PT_LOAD, PF_R | PF_X,
+                       text_offset, text_vaddr, text_vaddr,
+                       code_size, code_size, page);
+
+    # PT_LOAD: .data (RW)
+    if has_data == 1 do
+        b = elf_write_phdr(b, PT_LOAD, PF_R | PF_W,
+                           data_offset, data_vaddr, data_vaddr,
+                           data_size, data_size, page)
+    end
+
+    # ── Pad to text_offset ──
+    let current = bvec_len(b.buf);
+    when current < text_offset loop
+        b.buf = bvec_push(b.buf, 0);
+        current = current + 1
+    end
+
+    # ── Write .text ──
+    let i = 0;
+    when i < code_size loop
+        b.buf = bvec_push(b.buf, bvec_get(b.text_code, i));
+        i = i + 1
+    end
+
+    # ── Pad to page ──
+    current = bvec_len(b.buf);
+    let text_end = text_offset + text_pad_size;
+    when current < text_end loop
+        b.buf = bvec_push(b.buf, 0);
+        current = current + 1
+    end
+
+    # ── Write .data ──
+    if has_data == 1 do
+        i = 0;
+        when i < data_size loop
+            b.buf = bvec_push(b.buf, bvec_get(b.data_bytes, i));
+            i = i + 1
+        end
+
+        current = bvec_len(b.buf);
+        let data_end = data_offset + data_pad_size;
+        when current < data_end loop
+            b.buf = bvec_push(b.buf, 0);
+            current = current + 1
+        end
+    end
+
+    # ── Section Headers ──
+
+    # SHT_NULL (index 0)
+    b = elf_write_shdr(b, 0, SHT_NULL, 0, 0, 0, 0, 0, 0, 0, 0);
+
+    # .text (index 1) — name offset 1 in shstrtab
+    b = elf_write_shdr(b, 1, SHT_PROGBITS,
+                       SHF_ALLOC | SHF_EXECINSTR,
+                       text_vaddr, text_offset, code_size,
+                       0, 0, 16, 0);
+
+    # .data (index 2, if present) — name offset 7 in shstrtab
+    if has_data == 1 do
+        b = elf_write_shdr(b, 7, SHT_PROGBITS,
+                           SHF_ALLOC | SHF_WRITE,
+                           data_vaddr, data_offset, data_size,
+                           0, 0, 8, 0)
+    end
+
+    # .shstrtab (last section)
+    let shstrtab_name_off = 7;
+    if has_data == 1 do
+        shstrtab_name_off = 13
+    end
+    # Build shstrtab: \0.text\0.data\0.shstrtab\0
+    let strtab_start = bvec_len(b.buf);
+    let strtab_size = 0;
+    if has_data == 1 do
+        # \0 .text\0 .data\0 .shstrtab\0
+        strtab_size = 23
+    else
+        # \0 .text\0 .shstrtab\0
+        strtab_size = 17
+    end
+
+    b = elf_write_shdr(b, shstrtab_name_off, SHT_STRTAB,
+                       0, 0, strtab_start + SHDR_SIZE, strtab_size,
+                       0, 0, 1, 0);
+
+    # ── Write .shstrtab content ──
+    # \0
+    b.buf = bvec_push(b.buf, 0);
+
+    # .text
+    b.buf = bvec_push(b.buf, 0x2E);   # '.'
+    b.buf = bvec_push(b.buf, 0x74);   # 't'
+    b.buf = bvec_push(b.buf, 0x65);   # 'e'
+    b.buf = bvec_push(b.buf, 0x78);   # 'x'
+    b.buf = bvec_push(b.buf, 0x74);   # 't'
+    b.buf = bvec_push(b.buf, 0);
+
+    if has_data == 1 do
+        # .data
+        b.buf = bvec_push(b.buf, 0x2E);   # '.'
+        b.buf = bvec_push(b.buf, 0x64);   # 'd'
+        b.buf = bvec_push(b.buf, 0x61);   # 'a'
+        b.buf = bvec_push(b.buf, 0x74);   # 't'
+        b.buf = bvec_push(b.buf, 0x61);   # 'a'
+        b.buf = bvec_push(b.buf, 0)
+    end
+
+    # .shstrtab
+    b.buf = bvec_push(b.buf, 0x2E);   # '.'
+    b.buf = bvec_push(b.buf, 0x73);   # 's'
+    b.buf = bvec_push(b.buf, 0x68);   # 'h'
+    b.buf = bvec_push(b.buf, 0x73);   # 's'
+    b.buf = bvec_push(b.buf, 0x74);   # 't'
+    b.buf = bvec_push(b.buf, 0x72);   # 'r'
+    b.buf = bvec_push(b.buf, 0x74);   # 't'
+    b.buf = bvec_push(b.buf, 0x61);   # 'a'
+    b.buf = bvec_push(b.buf, 0x62);   # 'b'
+    b.buf = bvec_push(b.buf, 0);
+
+    out b
+end.
+# ═══════════════════════════════════════════════════════
+# Write to disk
+# ═══════════════════════════════════════════════════════
+
+func elf_write_to_file(b: ElfBuilder, path: int):
+
+    b = elf_emit(b);
+    let data = bvec_data_ptr(b.buf);
+    let size = bvec_len(b.buf);
+    write_file_bytes(path, data, size, 0o755);
+    out true
+end.

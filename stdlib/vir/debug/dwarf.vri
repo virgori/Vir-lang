@@ -1,0 +1,279 @@
+##
+ * vir/debug/dwarf.vri — DWARF Debug Information Generation
+ * ===========================================================
+ * Inspired by: DWARF 5 specification
+ *
+ * Generates .debug_info, .debug_abbrev, .debug_line sections
+ * for source-level debugging of compiled Vir programs.
+ ##
+
+include types;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include string_builder;
+import StringBuilder, sb_new, sb_append, sb_append_byte, sb_build from string_builder;
+
+# ═══════════════════════════════════════════════════════
+# DWARF tag constants (DW_TAG_*)
+# ═══════════════════════════════════════════════════════
+
+const DW_TAG_compile_unit    = 0x11;
+const DW_TAG_subprogram      = 0x2E;
+const DW_TAG_variable        = 0x34;
+const DW_TAG_formal_parameter = 0x05;
+const DW_TAG_base_type       = 0x24;
+const DW_TAG_structure_type  = 0x13;
+const DW_TAG_member          = 0x0D;
+const DW_TAG_enumeration_type = 0x04;
+const DW_TAG_enumerator      = 0x28;
+const DW_TAG_lexical_block   = 0x0B;
+
+# ═══════════════════════════════════════════════════════
+# DWARF attribute constants (DW_AT_*)
+# ═══════════════════════════════════════════════════════
+
+const DW_AT_name             = 0x03;
+const DW_AT_comp_dir         = 0x1B;
+const DW_AT_language         = 0x13;
+const DW_AT_low_pc           = 0x11;
+const DW_AT_high_pc          = 0x12;
+const DW_AT_type             = 0x49;
+const DW_AT_byte_size        = 0x0B;
+const DW_AT_encoding         = 0x3E;
+const DW_AT_decl_file        = 0x3A;
+const DW_AT_decl_line        = 0x3B;
+const DW_AT_location         = 0x02;
+
+# ═══════════════════════════════════════════════════════
+# DWARF form constants (DW_FORM_*)
+# ═══════════════════════════════════════════════════════
+
+const DW_FORM_addr    = 0x01;
+const DW_FORM_data1   = 0x0B;
+const DW_FORM_data2   = 0x05;
+const DW_FORM_data4   = 0x06;
+const DW_FORM_string  = 0x08;
+const DW_FORM_udata   = 0x0F;
+
+# Language: Vir (use user lang range)
+const DW_LANG_vir = 0x8000;
+
+# ═══════════════════════════════════════════════════════
+# Abbreviation table entry
+# ═══════════════════════════════════════════════════════
+
+entity AbbrevAttr:
+    at:    int;     # DW_AT_*
+    form:  int;     # DW_FORM_*
+end.
+entity AbbrevEntry:
+    code:         int;      # abbreviation code (1-based)
+    tag:          int;      # DW_TAG_*
+    has_children: bool,
+        attrs:        Vec;      # Vec<AbbrevAttr>
+end.
+entity AbbrevTable:
+    entries: Vec;    # Vec<AbbrevEntry>
+end.
+func abbrev_table_new:
+    out AbbrevTable ( entries: vec_new() );
+end.
+func abbrev_add:
+    in  table: AbbrevTable;
+        tag: int;
+        has_children: bool;
+        attrs: Vec
+    code = vec_len(table.entries) + 1;
+    entry = AbbrevEntry (
+        code: code, tag: tag,
+        has_children: has_children, attrs: attrs
+    );
+    vec_push(table.entries, entry);
+    out code;
+end.
+# ═══════════════════════════════════════════════════════
+# LEB128 encoding
+# ═══════════════════════════════════════════════════════
+
+func encode_uleb128(value: int):
+    result = vec_new();
+    v = value;
+    done = false;
+    when !done loop
+        byte = v & 0x7F;
+        v = v >> 7;
+        if v != 0 do
+            byte = byte | 0x80;
+        else
+            done = true;
+        end
+        vec_push(result, byte);
+    end
+    out result;
+end.
+func encode_sleb128(value: int):
+    result = vec_new();
+    v = value;
+    more = true;
+    when more loop
+        byte = v & 0x7F;
+        v = v >> 7;
+        if (v == 0 && (byte & 0x40) == 0) || (v == -1 && (byte & 0x40) != 0) do
+            more = false;
+        else
+            byte = byte | 0x80;
+        end
+        vec_push(result, byte);
+    end
+    out result;
+end.
+# ═══════════════════════════════════════════════════════
+# Debug info entry (DIE)
+# ═══════════════════════════════════════════════════════
+
+entity DieAttr:
+    at:     int,
+        form:   int,
+        int_val: int,
+        str_val: string;
+end.
+entity DebugInfoEntry:
+    abbrev_code: int,
+        attrs:       Vec;        # Vec<DieAttr>
+    children:    Vec;        # Vec<DebugInfoEntry>
+end.
+func die_new(abbrev_code: int):
+    out DebugInfoEntry (
+        abbrev_code: abbrev_code,
+        attrs: vec_new(), children: vec_new()
+    );
+end.
+func die_add_str:
+    in  die: DebugInfoEntry;
+        at: int;
+        value: string
+    vec_push(die.attrs, DieAttr (
+        at: at, form: DW_FORM_string,
+        int_val: 0, str_val: value
+    ));
+end.
+func die_add_int:
+    in  die: DebugInfoEntry;
+        at: int;
+        form: int;
+        value: int
+    vec_push(die.attrs, DieAttr (
+        at: at, form: form,
+        int_val: value, str_val: ""
+    ));
+end.
+func die_add_child(parent: DebugInfoEntry, child: DebugInfoEntry):
+    vec_push(parent.children, child);
+end.
+# ═══════════════════════════════════════════════════════
+# Line number program
+# ═══════════════════════════════════════════════════════
+
+entity LineEntry:
+    address:  int,
+        file_idx: int,
+        line:     int,
+        column:   int;
+end.
+entity LineProgram:
+    files:    Vec;      # Vec<string> file names
+    entries:  Vec;      # Vec<LineEntry>
+end.
+func lineprogram_new:
+    out LineProgram ( files: vec_new(), entries: vec_new() );
+end.
+func lp_add_file(lp: LineProgram, filename: string):
+    vec_push(lp.files, filename);
+    out vec_len(lp.files);    # 1-based file index
+end.
+func lp_add_entry:
+    in  lp: LineProgram;
+        addr: int;
+        file_idx: int;
+        line: int;
+        col: int
+    vec_push(lp.entries, LineEntry (
+        address: addr, file_idx: file_idx,
+        line: line, column: col
+    ));
+end.
+# ═══════════════════════════════════════════════════════
+# DWARF section builder
+# ═══════════════════════════════════════════════════════
+
+entity DwarfBuilder:
+    abbrevs:     AbbrevTable,
+        compile_unit: DebugInfoEntry,
+        line_prog:   LineProgram,
+        source_file: string,
+        comp_dir:    string;
+end.
+func dwarf_builder_new(source_file: string, comp_dir: string):
+    table = abbrev_table_new();
+
+    # Abbrev 1: compile_unit
+    cu_attrs = vec_new();
+    vec_push(cu_attrs, AbbrevAttr ( at: DW_AT_name, form: DW_FORM_string ));
+    vec_push(cu_attrs, AbbrevAttr ( at: DW_AT_comp_dir, form: DW_FORM_string ));
+    vec_push(cu_attrs, AbbrevAttr ( at: DW_AT_language, form: DW_FORM_data2 ));
+    vec_push(cu_attrs, AbbrevAttr ( at: DW_AT_low_pc, form: DW_FORM_addr ));
+    vec_push(cu_attrs, AbbrevAttr ( at: DW_AT_high_pc, form: DW_FORM_addr ));
+    cu_code = abbrev_add(table, DW_TAG_compile_unit, true, cu_attrs);
+
+    cu = die_new(cu_code);
+    die_add_str(cu, DW_AT_name, source_file);
+    die_add_str(cu, DW_AT_comp_dir, comp_dir);
+    die_add_int(cu, DW_AT_language, DW_FORM_data2, DW_LANG_vir);
+
+    out DwarfBuilder (
+        abbrevs: table, compile_unit: cu,
+        line_prog: lineprogram_new(),
+        source_file: source_file, comp_dir: comp_dir
+    );
+end.
+func dwarf_add_function:
+    in  db: DwarfBuilder;
+        name: string;
+        low_pc: int;
+        high_pc: int;
+        file_idx: int;
+        line: int
+    # Add abbrev for subprogram if needed
+    sp_attrs = vec_new();
+    vec_push(sp_attrs, AbbrevAttr ( at: DW_AT_name, form: DW_FORM_string ));
+    vec_push(sp_attrs, AbbrevAttr ( at: DW_AT_low_pc, form: DW_FORM_addr ));
+    vec_push(sp_attrs, AbbrevAttr ( at: DW_AT_high_pc, form: DW_FORM_addr ));
+    vec_push(sp_attrs, AbbrevAttr ( at: DW_AT_decl_file, form: DW_FORM_udata ));
+    vec_push(sp_attrs, AbbrevAttr ( at: DW_AT_decl_line, form: DW_FORM_udata ));
+    sp_code = abbrev_add(db.abbrevs, DW_TAG_subprogram, false, sp_attrs);
+
+    die = die_new(sp_code);
+    die_add_str(die, DW_AT_name, name);
+    die_add_int(die, DW_AT_low_pc, DW_FORM_addr, low_pc);
+    die_add_int(die, DW_AT_high_pc, DW_FORM_addr, high_pc);
+    die_add_int(die, DW_AT_decl_file, DW_FORM_udata, file_idx);
+    die_add_int(die, DW_AT_decl_line, DW_FORM_udata, line);
+    die_add_child(db.compile_unit, die);
+end.
+func dwarf_add_variable:
+    in  db: DwarfBuilder;
+        name: string;
+        file_idx: int;
+        line: int
+    v_attrs = vec_new();
+    vec_push(v_attrs, AbbrevAttr ( at: DW_AT_name, form: DW_FORM_string ));
+    vec_push(v_attrs, AbbrevAttr ( at: DW_AT_decl_file, form: DW_FORM_udata ));
+    vec_push(v_attrs, AbbrevAttr ( at: DW_AT_decl_line, form: DW_FORM_udata ));
+    v_code = abbrev_add(db.abbrevs, DW_TAG_variable, false, v_attrs);
+
+    die = die_new(v_code);
+    die_add_str(die, DW_AT_name, name);
+    die_add_int(die, DW_AT_decl_file, DW_FORM_udata, file_idx);
+    die_add_int(die, DW_AT_decl_line, DW_FORM_udata, line);
+    die_add_child(db.compile_unit, die);
+end.

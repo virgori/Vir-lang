@@ -1,0 +1,329 @@
+##
+ * vir/http/http.vri — HTTP/1.1 Client & Server
+ * ===============================================
+ * Inspired by Python: http.client, http.server, urllib
+ *
+ * Phase C — minimal HTTP built on vir/net/net
+ ##
+
+include types;
+include option;
+import Option, Some, None from option;
+include result;
+import Result, Ok, Err from result;
+include string;
+import String, str_new, str_concat, str_contains, str_find, str_slice_bytes, str_byte_len, str_eq from string;
+include builder;
+import StringBuilder, sb_new, sb_append, sb_build from builder;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include map;
+import Map, map_new, map_set, map_get, map_keys from map;
+include net;
+import TcpStream, tcp_connect, tcp_read, tcp_write_all, tcp_close, SocketAddr, socket_addr, dns_resolve from net;
+
+# ═══════════════════════════════════════════════════════
+# HTTP Method & Status
+# ═══════════════════════════════════════════════════════
+
+enum Method:
+    GET     = 1;
+    POST    = 2;
+    PUT     = 3;
+    DELETE  = 4;
+    PATCH   = 5;
+    HEAD    = 6;
+    OPTIONS = 7;
+end.
+func method_to_string(m: Method):
+    case m;
+        case Method.GET     out str_new("GET")
+        case Method.POST    out str_new("POST")
+        case Method.PUT     out str_new("PUT")
+        case Method.DELETE  out str_new("DELETE")
+        case Method.PATCH   out str_new("PATCH")
+        case Method.HEAD    out str_new("HEAD")
+        case Method.OPTIONS out str_new("OPTIONS")
+    end
+end.
+entity StatusCode:
+    code:   int,
+        reason: string;
+end.
+func status(code: int, reason: string):
+    out StatusCode ( code = code, reason = reason );
+end.
+func status_ok:
+func status_not_found:
+func status_internal_error:
+# Headers = Map<String, String>
+func headers_new:
+    out map_new<string, string>();
+end.
+# ═══════════════════════════════════════════════════════
+# HTTP Request
+# ═══════════════════════════════════════════════════════
+
+entity Request:
+    method:  Method,
+        url:     string,
+        headers: Map<string, string>,
+        body:    Option<string>;
+end.
+func request_new(method: Method, url: string):
+    out Request (;
+        method = method,
+        url = url,
+        headers = headers_new(),
+        body = None
+    );
+end.
+func request_header:
+    in  req: Request;
+        key: string;
+        value: string
+    map_set<string, string>(&req.headers, key, value);
+    out req;
+end.
+func request_body(req: Request, body: string):
+    req.body = Some(body);
+    out req;
+end.
+# ═══════════════════════════════════════════════════════
+# HTTP Response
+# ═══════════════════════════════════════════════════════
+
+entity Response:
+    status:  StatusCode,
+        headers: Map<string, string>,
+        body:    string;
+end.
+# ═══════════════════════════════════════════════════════
+# URL Parsing (minimal)
+# ═══════════════════════════════════════════════════════
+
+entity Url:
+    scheme: string     # "http" | "https",
+        host:   string,
+        port:   int,
+        path:   string;
+end.
+func parse_url(raw: string):
+    scheme = str_new("http");
+    rest = raw;
+    default_port = 80;
+    
+    if str_starts_with(raw, str_new("https do //")) do
+        scheme = str_new("https");
+        rest = str_slice_bytes(raw, 8, str_byte_len(raw));
+        default_port = 443;
+    eif str_starts_with(raw, str_new("http do //")) do
+        rest = str_slice_bytes(raw, 7, str_byte_len(raw));
+    end
+    
+    # Tìm path
+    slash_idx = str_find(rest, str_new("/"));
+    var host_part:string;
+    var path:string;
+    case slash_idx;
+        Some(idx):
+            host_part = str_slice_bytes(rest, 0, idx);
+            path = str_slice_bytes(rest, idx, str_byte_len(rest));
+        None:
+            host_part = rest;
+            path = str_new("/");
+    end
+    
+    # Tìm port
+    port = default_port;
+    colon_idx = str_find(host_part, str_new(":"));
+    var host:string;
+    case colon_idx;
+        Some(idx):
+            host = str_slice_bytes(host_part, 0, idx);
+            port_str = str_slice_bytes(host_part, idx + 1, str_byte_len(host_part));
+            port = str_to_u16(port_str);
+        None:
+            host = host_part;
+    end
+    
+    out Ok(Url ( scheme = scheme, host = host, port = port, path = path ));
+end.
+# ═══════════════════════════════════════════════════════
+# HTTP Client
+# ═══════════════════════════════════════════════════════
+
+func http_send(req: Request):
+    # Parse URL
+    url_result = parse_url(req.url);
+    var url:Url;
+    case url_result;
+        Err(e): out Err(e);
+        case Ok(u) url = u
+    end
+    
+    # DNS resolve
+    addrs_result = dns_resolve(url.host);
+    var addrs:Vec<IpAddr>;
+    case addrs_result;
+        Err(e): out Err(e);
+        case Ok(a) addrs = a
+    end
+    
+    if vec_len(addrs) == 0 do
+        out Err(str_new("no addresses found"));
+    end
+    
+    # Connect
+    addr = socket_addr(vec_get(addrs, 0), url.port);
+    stream_result = tcp_connect(addr);
+    var stream:TcpStream;
+    case stream_result;
+        Err(e): out Err(e);
+        case Ok(s) stream = s
+    end
+    
+    # Build HTTP/1.1 request
+    sb = sb_new();
+    sb_append(&sb, method_to_string(req.method));
+    sb_append(&sb, str_new(" "));
+    sb_append(&sb, url.path);
+    sb_append(&sb, str_new(" HTTP/1.1\r\n"));
+    sb_append(&sb, str_new("Host: "));
+    sb_append(&sb, url.host);
+    sb_append(&sb, str_new("\r\n"));
+    
+    # Default headers
+    if !map_contains(&req.headers, str_new("Connection")) do
+        sb_append(&sb, str_new("Connection: close\r\n"));
+    end
+    if !map_contains(&req.headers, str_new("User-Agent")) do
+        sb_append(&sb, str_new("User-Agent: vir-http/0.1\r\n"));
+    end
+    
+    # User headers
+    keys = map_keys<string, string>(req.headers);
+    i = 0;
+    when i < vec_len<String>(keys) loop
+        k = vec_get<string>(keys, i);
+        v = map_get<string, string>(req.headers, k);
+        case v;
+        Some(val):
+                sb_append(&sb, k);
+                sb_append(&sb, str_new(": "));
+                sb_append(&sb, val);
+                sb_append(&sb, str_new("\r\n"));
+            case None ()
+        end
+        i = i + 1;
+    end
+    
+    # Body
+    case req.body;
+        Some(body):
+            sb_append(&sb, str_new("Content-Length: "));
+            sb_append(&sb, int_to_string(str_byte_len(body)));
+            sb_append(&sb, str_new("\r\n\r\n"));
+            sb_append(&sb, body);
+        None:
+            sb_append(&sb, str_new("\r\n"));
+    end
+    
+    raw_req = sb_build(sb);
+    send_result = tcp_write_all(&stream, str_ptr(raw_req), str_byte_len(raw_req));
+    case send_result;
+        Err(e):
+            tcp_close(&stream);
+            out Err(e);
+        case Ok(_) ()
+    end
+    
+    # Read response — dynamic buffer (no fixed-size limit)
+    resp_sb = sb_new();
+    var chunk_buf: [int; 8192];
+    loop
+        n_result = tcp_read(&stream, &chunk_buf[0], 8192);
+        case n_result;
+            case Err(_) break
+        Ok(n):
+                if n == 0 do break end
+                sb_append(&resp_sb, str_from_bytes(&chunk_buf, n));
+        end
+    end
+    tcp_close(&stream);
+    
+    raw_resp = sb_build(resp_sb);
+    out _parse_response(raw_resp);
+end.
+func _parse_response(raw: string):
+    # Find header/body separator
+    sep_idx = str_find(raw, str_new("\r\n\r\n"));
+    var header_end:int;
+    var body_start:int;
+    case sep_idx;
+        Some(idx):
+            header_end = idx;
+            body_start = idx + 4;
+        None: out Err(str_new("malformed HTTP response"));;
+    end
+    
+    header_part = str_slice_bytes(raw, 0, header_end);
+    body = str_slice_bytes(raw, body_start, str_byte_len(raw));
+    
+    # Parse status line: "HTTP/1.1 200 OK"
+    first_line_end = str_find(header_part, str_new("\r\n"));
+    var status_line:string;
+    var headers_rest:string;
+    case first_line_end;
+        Some(idx):
+            status_line = str_slice_bytes(header_part, 0, idx);
+            headers_rest = str_slice_bytes(header_part, idx + 2, str_byte_len(header_part));
+        None:
+            status_line = header_part;
+            headers_rest = str_new("");
+    end
+    
+    # Extract status code (bytes 9-12)
+    code_str = str_slice_bytes(status_line, 9, 12);
+    code = str_to_u16(code_str);
+    reason = str_slice_bytes(status_line, 13, str_byte_len(status_line));
+    
+    # Parse headers
+    headers = headers_new();
+    lines = str_split(headers_rest, str_new("\r\n"));
+    i = 0;
+    when i < vec_len<String>(lines) loop
+        line = vec_get<string>(lines, i);
+        colon = str_find(line, str_new(": "));
+        case colon;
+        Some(idx):
+                key = str_slice_bytes(line, 0, idx);
+                val = str_slice_bytes(line, idx + 2, str_byte_len(line));
+                map_set<string, string>(&headers, key, val);
+            case None ()
+        end
+        i = i + 1;
+    end
+    
+    out Ok(Response (;
+        status = StatusCode ( code = code, reason = reason ),
+        headers = headers,
+        body = body
+    ));
+end.
+# ═══════════════════════════════════════════════════════
+# Convenience: GET/POST
+# ═══════════════════════════════════════════════════════
+
+func http_get(url: string):
+    out http_send(request_new(Method.GET, url));
+end.
+func http_post:
+    in  url: string;
+        body: string;
+        content_type: string
+    req = request_new(Method.POST, url);
+    request_header(&req, str_new("Content-Type"), content_type);
+    request_body(&req, body);
+    out http_send(req);
+end.

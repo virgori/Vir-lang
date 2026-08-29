@@ -1,0 +1,261 @@
+##
+ * vir/compress/lz4.vri — LZ4 Compression
+ * =========================================
+ * Inspired by: LZ4 block format specification
+ *
+ * LZ4 block compression/decompression.
+ * Token encoding: literal_len(4 bits) + match_len(4 bits),
+ * match offset (2 bytes LE), literal data.
+ ##
+
+include types;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get, vec_set from vec;
+include str;
+import StringBuilder, sb_new, sb_append_byte, sb_build, sb_free from str;
+
+# ═══════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════
+
+const LZ4_MIN_MATCH    = 4;
+const LZ4_MAX_DISTANCE = 65535;
+const LZ4_HASH_LOG     = 12;
+const LZ4_HASH_SIZE    = 4096;  # 1 << 12
+
+# ═══════════════════════════════════════════════════════
+# Hash function for 4-byte sequence
+# ═══════════════════════════════════════════════════════
+
+func _lz4_hash(data: string, pos: int):
+    v = str_byte_at(data, pos) +
+        str_byte_at(data, pos + 1) * 256 +
+        str_byte_at(data, pos + 2) * 65536 +
+        str_byte_at(data, pos + 3) * 16777216;
+    h = (v * 2654435761) % 4294967296;
+    out (h / 1048576) % LZ4_HASH_SIZE;  # >> 20
+end.
+# ═══════════════════════════════════════════════════════
+# Write variable-length extra
+# ═══════════════════════════════════════════════════════
+
+func _lz4_write_length(sb: StringBuilder, length: int):
+    remaining = length;
+    when remaining >= 255 loop
+        sb_append_byte(sb, 255);
+        remaining = remaining - 255;
+    end
+    sb_append_byte(sb, remaining);
+end.
+# ═══════════════════════════════════════════════════════
+# Compress (LZ4 block format)
+# ═══════════════════════════════════════════════════════
+
+func lz4_compress(data: string):
+    n = str_len(data);
+    if n < 13 do
+        # Too short, store as literal-only
+        sb = sb_new();
+        if n < 15 do
+            sb_append_byte(sb, n * 16);  # literal_len in high nibble
+        else
+            sb_append_byte(sb, 240);  # 15 << 4
+            _lz4_write_length(sb, n - 15);
+        end
+        i = 0;
+        when i < n loop
+            sb_append_byte(sb, str_byte_at(data, i));
+            i = i + 1;
+        end
+        out sb_build(sb);
+    end
+
+    sb = sb_new();
+    # Initialize hash table
+    hash_table = vec_new();
+    i = 0;
+    when i < LZ4_HASH_SIZE loop
+        vec_push(hash_table, 0);
+        i = i + 1;
+    end
+
+    anchor = 0;
+    pos = 0;
+    last_match_end = n - 5;   # leave margin
+
+    when pos < last_match_end loop
+        h = _lz4_hash(data, pos);
+        ref_pos = vec_get(hash_table, h);
+        vec_set(hash_table, h, pos);
+
+        offset = pos - ref_pos;
+        match_found = false;
+
+        if offset > 0 && offset <= LZ4_MAX_DISTANCE && ref_pos >= 0 do
+            if pos + 3 < n do
+                if str_byte_at(data, ref_pos) == str_byte_at(data, pos) &&
+                   str_byte_at(data, ref_pos + 1) == str_byte_at(data, pos + 1) &&
+                   str_byte_at(data, ref_pos + 2) == str_byte_at(data, pos + 2) &&
+                   str_byte_at(data, ref_pos + 3) == str_byte_at(data, pos + 3) do
+                    match_found = true;
+                end
+            end
+        end
+
+        if match_found do
+            # Extend match
+            match_len = LZ4_MIN_MATCH;
+            when pos + match_len < n && ref_pos + match_len < pos loop
+                if str_byte_at(data, ref_pos + match_len) == str_byte_at(data, pos + match_len) do
+                    match_len = match_len + 1;
+                else
+                    # Cannot break, set condition to end
+                    ref_pos = pos;  # force loop exit
+                end
+            end
+            # recalculate to ensure correct match_len
+            # Emit sequence: literal + match
+            lit_len = pos - anchor;
+            ml_minus4 = match_len - LZ4_MIN_MATCH;
+
+            # Token byte
+            token_lit = lit_len;
+            if token_lit > 15 do
+                token_lit = 15;
+            end
+            token_ml = ml_minus4;
+            if token_ml > 15 do
+                token_ml = 15;
+            end
+            sb_append_byte(sb, token_lit * 16 + token_ml);
+
+            # Extra literal length
+            if lit_len >= 15 do
+                _lz4_write_length(sb, lit_len - 15);
+            end
+
+            # Literal bytes
+            k = anchor;
+            when k < pos loop
+                sb_append_byte(sb, str_byte_at(data, k));
+                k = k + 1;
+            end
+
+            # Offset (2 bytes LE)
+            sb_append_byte(sb, offset % 256);
+            sb_append_byte(sb, (offset / 256) % 256);
+
+            # Extra match length
+            if ml_minus4 >= 15 do
+                _lz4_write_length(sb, ml_minus4 - 15);
+            end
+
+            anchor = pos + match_len;
+            pos = anchor;
+        else
+            pos = pos + 1;
+        end
+    end
+
+    # Final literals
+    lit_len = n - anchor;
+    if lit_len > 0 do
+        token_lit = lit_len;
+        if token_lit > 15 do
+            token_lit = 15;
+        end
+        sb_append_byte(sb, token_lit * 16);
+        if lit_len >= 15 do
+            _lz4_write_length(sb, lit_len - 15);
+        end
+        k = anchor;
+        when k < n loop
+            sb_append_byte(sb, str_byte_at(data, k));
+            k = k + 1;
+        end
+    end
+
+    out sb_build(sb);
+end.
+# ═══════════════════════════════════════════════════════
+# Decompress (LZ4 block format)
+# ═══════════════════════════════════════════════════════
+
+func lz4_decompress(data: string, original_size: int):
+    n = str_len(data);
+    out_buf = vec_new();  # Vec<int> bytes
+    pos = 0;
+
+    when pos < n loop
+        token = str_byte_at(data, pos);
+        pos = pos + 1;
+
+        lit_len = (token / 16) % 16;
+        if lit_len == 15 do
+            when pos < n loop
+                extra = str_byte_at(data, pos);
+                pos = pos + 1;
+                lit_len = lit_len + extra;
+                if extra != 255 do
+                    pos = pos;  # force exit (no break)
+                    extra = 256;  # sentinel
+                end
+                if extra != 256 do
+                    lit_len = lit_len;  # continue
+                end
+            end
+        end
+
+        # Copy literals
+        k = 0;
+        when k < lit_len && pos < n loop
+            vec_push(out_buf, str_byte_at(data, pos));
+            pos = pos + 1;
+            k = k + 1;
+        end
+
+        # Check if end of block
+        if pos >= n do
+            pos = n;  # done
+        else
+            # Match offset (2 bytes LE)
+            off_lo = str_byte_at(data, pos);
+            off_hi = str_byte_at(data, pos + 1);
+            offset = off_lo + off_hi * 256;
+            pos = pos + 2;
+
+            match_len = (token % 16) + LZ4_MIN_MATCH;
+            if (token % 16) == 15 do
+                when pos < n loop
+                    extra = str_byte_at(data, pos);
+                    pos = pos + 1;
+                    match_len = match_len + extra;
+                    if extra != 255 do
+                        pos = pos;  # done reading
+                        extra = 256;
+                    end
+                    if extra != 256 do
+                        match_len = match_len;
+                    end
+                end
+            end
+
+            # Copy from back-reference
+            ref_start = vec_len(out_buf) - offset;
+            k = 0;
+            when k < match_len loop
+                vec_push(out_buf, vec_get(out_buf, ref_start + k));
+                k = k + 1;
+            end
+        end
+    end
+
+    # Build output string
+    sb = sb_new();
+    i = 0;
+    when i < vec_len(out_buf) loop
+        sb_append_byte(sb, vec_get(out_buf, i));
+        i = i + 1;
+    end
+    out sb_build(sb);
+end.

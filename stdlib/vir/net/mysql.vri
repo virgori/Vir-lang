@@ -1,0 +1,293 @@
+##
+ * vir/net/mysql.vri — MySQL Wire Protocol
+ * =========================================
+ * Inspired by: MySQL Client/Server Protocol (COM_QUERY, etc.)
+ *
+ * Packet framing, handshake, authentication,
+ * COM_QUERY, result set parsing, prepared statements.
+ ##
+
+include types;
+include option;
+import Option, Some, None from option;
+include result;
+import Result, Ok, Err from result;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include str;
+import StringBuilder, sb_new, sb_append, sb_append_byte, sb_build, sb_free from str;
+
+# ═══════════════════════════════════════════════════════
+# Command bytes
+# ═══════════════════════════════════════════════════════
+
+const MY_COM_QUIT          = 1;
+const MY_COM_INIT_DB       = 2;
+const MY_COM_QUERY         = 3;
+const MY_COM_FIELD_LIST    = 4;
+const MY_COM_PING          = 14;
+const MY_COM_STMT_PREPARE  = 22;
+const MY_COM_STMT_EXECUTE  = 23;
+const MY_COM_STMT_CLOSE    = 25;
+const MY_COM_STMT_RESET    = 26;
+
+# ═══════════════════════════════════════════════════════
+# Field types
+# ═══════════════════════════════════════════════════════
+
+const MY_TYPE_DECIMAL    = 0;
+const MY_TYPE_TINY       = 1;
+const MY_TYPE_SHORT      = 2;
+const MY_TYPE_LONG       = 3;
+const MY_TYPE_FLOAT      = 4;
+const MY_TYPE_DOUBLE     = 5;
+const MY_TYPE_NULL       = 6;
+const MY_TYPE_TIMESTAMP  = 7;
+const MY_TYPE_LONGLONG   = 8;
+const MY_TYPE_DATE       = 10;
+const MY_TYPE_TIME       = 11;
+const MY_TYPE_DATETIME   = 12;
+const MY_TYPE_VARCHAR    = 15;
+const MY_TYPE_JSON       = 245;
+const MY_TYPE_BLOB       = 252;
+const MY_TYPE_STRING     = 254;
+
+# ═══════════════════════════════════════════════════════
+# Capability flags
+# ═══════════════════════════════════════════════════════
+
+const MY_CAP_LONG_PASSWORD     = 1;
+const MY_CAP_FOUND_ROWS        = 2;
+const MY_CAP_LONG_FLAG         = 4;
+const MY_CAP_CONNECT_WITH_DB   = 8;
+const MY_CAP_PROTOCOL_41       = 512;
+const MY_CAP_SECURE_CONNECTION = 32768;
+const MY_CAP_PLUGIN_AUTH       = 524288;
+
+# ═══════════════════════════════════════════════════════
+# Entities
+# ═══════════════════════════════════════════════════════
+
+entity MyPacket:
+    seq_id:  int,
+        payload: string;
+end.
+entity MyHandshake:
+    protocol_version: int,
+        server_version:   string,
+        connection_id:    int,
+        auth_plugin_data: string,
+        capability_flags: int,
+        charset:          int,
+        status_flags:     int,
+        auth_plugin_name: string;
+end.
+entity MyColumn:
+    catalog:   string,
+        schema:    string,
+        table:     string,
+        name:      string,
+        charset:   int,
+        length:    int,
+        col_type:  int,
+        flags:     int,
+        decimals:  int;
+end.
+entity MyRow:
+    values: Vec;  # Vec<Option<string>>
+end.
+entity MyConnParams:
+    host:     string,
+        port:     int,
+        user:     string,
+        password: string,
+        database: string;
+end.
+entity MyResult:
+    columns:      Vec;  # Vec<MyColumn>
+    rows:         Vec;  # Vec<MyRow>
+    affected:     int,
+        last_insert:  int;
+end.
+
+# ═══════════════════════════════════════════════════════
+# Wire helpers
+# ═══════════════════════════════════════════════════════
+
+func _my_put_u24(sb: StringBuilder, val: int):
+    sb_append_byte(sb, val % 256);
+    sb_append_byte(sb, (val / 256) % 256);
+    sb_append_byte(sb, (val / 65536) % 256);
+end.
+func _my_put_u32(sb: StringBuilder, val: int):
+    sb_append_byte(sb, val % 256);
+    sb_append_byte(sb, (val / 256) % 256);
+    sb_append_byte(sb, (val / 65536) % 256);
+    sb_append_byte(sb, (val / 16777216) % 256);
+end.
+func _my_read_u24(data: string, offset: int):
+    b0 = str_byte_at(data, offset);
+    b1 = str_byte_at(data, offset + 1);
+    b2 = str_byte_at(data, offset + 2);
+    out b0 + b1 * 256 + b2 * 65536;
+end.
+func _my_read_u32(data: string, offset: int):
+    b0 = str_byte_at(data, offset);
+    b1 = str_byte_at(data, offset + 1);
+    b2 = str_byte_at(data, offset + 2);
+    b3 = str_byte_at(data, offset + 3);
+    out b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+end.
+# ═══════════════════════════════════════════════════════
+# Length-encoded integer
+# ═══════════════════════════════════════════════════════
+
+func _my_read_lenenc(data: string, offset: int):
+    # Returns [value, new_offset]
+    first = str_byte_at(data, offset);
+    if first < 251 do
+        out first;
+    end
+    if first == 252 do
+        out str_byte_at(data, offset + 1) + str_byte_at(data, offset + 2) * 256;
+    end
+    if first == 253 do
+        out _my_read_u24(data, offset + 1);
+    end
+    out _my_read_u32(data, offset + 1);
+end.
+func _my_lenenc_size(data: string, offset: int):
+    first = str_byte_at(data, offset);
+    if first < 251 do
+        out 1;
+    end
+    if first == 252 do
+        out 3;
+    end
+    if first == 253 do
+        out 4;
+    end
+    out 9;
+end.
+func _my_put_lenenc(sb: StringBuilder, val: int):
+    if val < 251 do
+        sb_append_byte(sb, val);
+    eif val < 65536 do
+        sb_append_byte(sb, 252);
+        sb_append_byte(sb, val % 256);
+        sb_append_byte(sb, (val / 256) % 256);
+    eif val < 16777216 do
+        sb_append_byte(sb, 253);
+        _my_put_u24(sb, val);
+    else
+        sb_append_byte(sb, 254);
+        _my_put_u32(sb, val);
+        _my_put_u32(sb, 0);
+    end
+end.
+# ═══════════════════════════════════════════════════════
+# Packet framing
+# ═══════════════════════════════════════════════════════
+
+func my_encode_packet(seq_id: int, payload: string):
+    sb = sb_new();
+    _my_put_u24(sb, str_len(payload));
+    sb_append_byte(sb, seq_id % 256);
+    sb_append(sb, payload);
+    out sb_build(sb);
+end.
+func my_decode_packet(data: string, offset: int):
+    plen = _my_read_u24(data, offset);
+    seq = str_byte_at(data, offset + 3);
+    payload = str_slice(data, offset + 4, offset + 4 + plen);
+    out MyPacket ( seq_id: seq, payload: payload );
+end.
+# ═══════════════════════════════════════════════════════
+# COM_QUERY
+# ═══════════════════════════════════════════════════════
+
+func my_query_packet(sql: string, seq_id: int):
+    sb = sb_new();
+    sb_append_byte(sb, MY_COM_QUERY);
+    sb_append(sb, sql);
+    payload = sb_build(sb);
+    out my_encode_packet(seq_id, payload);
+end.
+# ═══════════════════════════════════════════════════════
+# COM_STMT_PREPARE
+# ═══════════════════════════════════════════════════════
+
+func my_prepare_packet(sql: string, seq_id: int):
+    sb = sb_new();
+    sb_append_byte(sb, MY_COM_STMT_PREPARE);
+    sb_append(sb, sql);
+    payload = sb_build(sb);
+    out my_encode_packet(seq_id, payload);
+end.
+# ═══════════════════════════════════════════════════════
+# COM_QUIT / COM_PING
+# ═══════════════════════════════════════════════════════
+
+func my_quit_packet(seq_id: int):
+    sb = sb_new();
+    sb_append_byte(sb, MY_COM_QUIT);
+    out my_encode_packet(seq_id, sb_build(sb));
+end.
+func my_ping_packet(seq_id: int):
+    sb = sb_new();
+    sb_append_byte(sb, MY_COM_PING);
+    out my_encode_packet(seq_id, sb_build(sb));
+end.
+# ═══════════════════════════════════════════════════════
+# Result helpers
+# ═══════════════════════════════════════════════════════
+
+func my_result_new():
+    out MyResult (
+        columns: vec_new(), rows: vec_new(),
+        affected: 0, last_insert: 0
+    );
+end.
+func my_row_get(row: MyRow, col_idx: int):
+    out vec_get(row.values, col_idx);
+end.
+func my_result_column_index(result: MyResult, name: string):
+    i = 0;
+    when i < vec_len(result.columns) loop
+        col = vec_get(result.columns, i);
+        if col.name == name do
+            out Some(i);
+        end
+        i = i + 1;
+    end
+    out None;
+end.
+# ═══════════════════════════════════════════════════════
+# Handshake parsing (initial greeting from server)
+# ═══════════════════════════════════════════════════════
+
+func my_parse_handshake(payload: string):
+    proto = str_byte_at(payload, 0);
+    # Read null-terminated server version
+    off = 1;
+    when str_byte_at(payload, off) != 0 loop
+        off = off + 1;
+    end
+    version = str_slice(payload, 1, off);
+    off = off + 1;
+    conn_id = _my_read_u32(payload, off);
+    off = off + 4;
+    # auth-plugin-data-part-1 (8 bytes)
+    auth1 = str_slice(payload, off, off + 8);
+    off = off + 8 + 1;  # +1 filler
+    cap_low = str_byte_at(payload, off) + str_byte_at(payload, off + 1) * 256;
+    out MyHandshake (
+        protocol_version: proto,
+        server_version: version,
+        connection_id: conn_id,
+        auth_plugin_data: auth1,
+        capability_flags: cap_low,
+        charset: 0, status_flags: 0,
+        auth_plugin_name: "mysql_native_password"
+    );
+end.
