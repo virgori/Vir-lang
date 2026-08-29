@@ -17,7 +17,7 @@ def run_cmd(cmd, cwd=BASE_DIR):
 
 def compile_all():
     print("=== Compiling all 7 benchmark targets ===")
-    virc_bin = os.path.join(ROOT_DIR, "dist/virc-stage2")
+    virc_bin = os.path.join(ROOT_DIR, "bin/virc")
     bench_names = ["fib", "sieve", "matmul", "qsort", "kahan_dot", "fusion"]
     
     for name in bench_names:

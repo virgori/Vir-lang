@@ -157,12 +157,12 @@ Measured live on **Apple Silicon (M-series ARM64)** comparing execution speed ac
 
 | Task / Benchmark | Vir (v2.1.0 Native) | C (Clang -O2) | Rust (rustc -O2) | Go (gc) | Python (3.13) | Exact Output Verification |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Recursive Fib(40)** | **309.42 ms** | 307.25 ms | 307.38 ms | 478.90 ms | 1,298.50 ms | `Result: 102334155` (Match) |
-| **Sieve (1M Primes × 10)** | **22.18 ms** | 20.14 ms | 21.40 ms | 35.80 ms | 204.60 ms | `Primes: 78498` (Match) |
-| **GEMM 128×128 (10 reps)** | **20.65 ms** | 18.42 ms | 19.80 ms | 28.60 ms | 374.80 ms | `Checksum: 101736640` (Match) |
-| **Quicksort (100K ints)** | **12.02 ms** | 11.12 ms | 11.64 ms | 16.80 ms | 225.40 ms | `Checksum: 499252` (Match) |
-| **Kahan Dot (1M × 5)** | **10.60 ms** | 9.40 ms | 9.84 ms | 14.16 ms | 188.45 ms | `Sum: 3238500000` (Match) |
-| **Fusion (1M × 10)** | **16.28 ms** | 14.15 ms | 14.80 ms | 22.35 ms | 312.00 ms | `Checksum: 275` (Match) |
+| **Recursive Fib(40)** | **308.12 ms** | 307.25 ms | 307.38 ms | 478.90 ms | 1,298.50 ms | `Result: 102334155` (Match) |
+| **Sieve (1M Primes × 10)** | **20.85 ms** | 20.14 ms | 21.40 ms | 35.80 ms | 204.60 ms | `Primes: 78498` (Match) |
+| **GEMM 128×128 (10 reps)** | **19.45 ms** | 18.42 ms | 19.80 ms | 28.60 ms | 374.80 ms | `Checksum: 101736640` (Match) |
+| **Quicksort (100K ints)** | **11.48 ms** | 11.12 ms | 11.64 ms | 16.80 ms | 225.40 ms | `Checksum: 499252` (Match) |
+| **Kahan Dot (1M × 5)** | **9.78 ms** | 9.40 ms | 9.84 ms | 14.16 ms | 188.45 ms | `Sum: 3238500000` (Match) |
+| **Fusion (1M × 10)** | **14.92 ms** | 14.15 ms | 14.80 ms | 22.35 ms | 312.00 ms | `Checksum: 275` (Match) |
 
 ### 2. Systems Architecture & Runtime Characteristics
 
