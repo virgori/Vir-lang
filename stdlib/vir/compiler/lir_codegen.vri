@@ -1,0 +1,2463 @@
+##
+ * vir/compiler/lir_codegen.vri — LIR to Machine Code (ARM64)
+ * ==============================================================
+ * AAPCS64 soft ABI:
+ *   SetArg 0..7 → MOV X0..X7
+ *   SetArg ≥8  → push 16-byte slots; Call pops them
+ *   Call       → BL patched to func offs / RT unresolved
+ *   Intrinsic  → marker/payload inline; else BL → RT stub[kind]
+ *   Pow/ML     → BL → RT stub[61..63]
+ *
+ * Module: emit_lir_module_arm64 — funcs + RT stubs + BL patch + _start.
+ ##
+
+include types
+include vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt
+include string_rt
+import rt_streq, fat_str_eq, fat_str_new, sb_new, sb_append, sb_append_int, sb_to_string, sb_free, native_read_i64, native_write_i64, native_read_u8 from string_rt
+include compiler.context
+import print_str, print_int from compiler.context
+include compiler.lir
+import LirOp, LirOperandType, LirOperand, LirInstr, LirBlock, LirFunc, lir_func_id, lir_func_name, lir_func_blocks, lir_func_stack_size, lir_func_strings, lir_block_id, lir_block_instrs, lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_aux, lir_instr_typ, lir_opnd_type, lir_opnd_vreg, lir_opnd_imm_val, lir_opnd_label_id, lir_opnd_phys_reg_val, lir_opnd_stack_offset, LIR_CMP_EQ, LIR_CMP_NE, LIR_CMP_GT, LIR_CMP_LT, LIR_CMP_GE, LIR_CMP_LE, LIR_JMP_IF, LIR_JMP_IFNOT, LIR_RT_UNRESOLVED, LIR_RT_POW, LIR_RT_MATMUL, LIR_RT_FMA, LIR_RT_ALLOC, LIR_RT_PRINT_STR, LIR_RT_GET_ARG, LIR_RT_ARG_COUNT, LIR_RT_NATIVE_READ_U8, LIR_RT_NATIVE_WRITE_U8, LIR_RT_NATIVE_READ_I64, LIR_RT_NATIVE_WRITE_I64, LIR_RT_VOLATILE_READ, LIR_RT_VOLATILE_WRITE, LIR_RT_VOLATILE_READ8, LIR_RT_VOLATILE_WRITE8, LIR_RT_DMB, LIR_RT_DSB, LIR_RT_ISB, LIR_RT_WFI, LIR_RT_WFE, LIR_RT_SEV, LIR_RT_NOP, LIR_RT_STUB_COUNT from compiler.lir
+include compiler.mir
+import MIR_INTR_PRINT, MIR_INTR_PRINT_STR, MIR_INTR_PARAM, MIR_INTR_ADDR_OF, MIR_INTR_CAST, MIR_INTR_NOP_MARKER, MIR_INTR_DECL, MIR_INTR_QUIET, MIR_INTR_CHECK_CPU, MIR_INTR_PATCH_POINT, MIR_INTR_PRECOMP, MIR_INTR_EXPOSE, MIR_INTR_ASYNC, MIR_INTR_ATOMIC_VAR, MIR_INTR_TIMEOUT, MIR_INTR_ISOLATE, MIR_INTR_PTR, MIR_INTR_AWAIT_PASS, MIR_INTR_ENSURE, MIR_INTR_REVERT, MIR_INTR_STR_LIT, MIR_INTR_INTERP, MIR_INTR_ENUM, MIR_INTR_ERROR, MIR_INTR_EXIST, MIR_INTR_BUILTIN, MIR_INTR_INDEX, MIR_INTR_INDEX_STORE, MIR_INTR_FIELD, MIR_INTR_FIELD_STORE, MIR_INTR_ARRAY, MIR_INTR_ENTITY, MIR_INTR_TUPLE, MIR_INTR_BUNDLE, MIR_INTR_INFER, MIR_INTR_TRAIN, MIR_INTR_REACTIVE, MIR_INTR_MORPH, MIR_INTR_QUANTIZE from compiler.mir
+include compiler.codegen
+import codebuf_new, codebuf_emit_u32, codebuf_emit_byte, codebuf_offset, codebuf_patch_u32, TargetArch, CodeBuf from compiler.codegen
+import arm64_add_rrr, arm64_sub_rrr, arm64_mul_rrr, arm64_sdiv_rrr, arm64_msub_rrrr, arm64_mov_rr, arm64_movz_imm64, arm64_mov_from_sp, arm64_ldr_post, arm64_str_pre, arm64_ret, arm64_nop, arm64_cmp_rr, arm64_cset_eq, arm64_cset_ne, arm64_cset_gt, arm64_cset_lt, arm64_cset_ge, arm64_cset_le, arm64_b_imm26, arm64_beq_imm19, arm64_bne_imm19, arm64_bl_imm26, arm64_add_imm, arm64_sub_imm, arm64_and_rrr, arm64_orr_rrr, arm64_eor_rrr, arm64_lsl_rrr, arm64_lsr_rrr, arm64_lsl_imm, arm64_mvn_rr, arm64_stp_pre, arm64_ldp_post, arm64_svc, arm64_mov_imm16, arm64_str_uoff, arm64_ldr_uoff, arm64_strb_reg, arm64_ldrb_reg, arm64_strb_uoff, arm64_ldrb_uoff, arm64_cmp_imm0, arm64_ubfx, arm64_bfi, arm64_dmb_ishld, arm64_dmb_ishst, arm64_dmb_sy, arm64_dsb_sy, arm64_isb, arm64_wfi, arm64_wfe, arm64_sev, arm64_clz, arm64_rbit, arm64_rev, arm64_brk, arm64_ror_imm32, arm64_eor_lsr32, arm64_eor_lsr64 from compiler.codegen
+
+func vec_new_cap_rt(cap: int):
+    base = alloc(16 + cap * 8)
+    data = base + 16
+    native_write_i64(base, 0, cap as i64)
+    native_write_i64(base, 8, 0)
+    out data
+end.
+
+func lir_fixup_new(at_off: i64, target_block: i64, kind: i64):
+    p = alloc(24)
+    native_write_i64(p, 0, at_off)
+    native_write_i64(p, 8, target_block)
+    native_write_i64(p, 16, kind)
+    out p
+end.
+
+func lir_fixup_at_off(fx: LirFixup): out native_read_i64(fx as i64, 0) end.
+func lir_fixup_target_block(fx: LirFixup): out native_read_i64(fx as i64, 8) end.
+func lir_fixup_kind(fx: LirFixup): out native_read_i64(fx as i64, 16) end.
+
+func lir_call_fixup_new(at_off: i64, target_kind: i64, target_id: i64):
+    p = alloc(24)
+    native_write_i64(p, 0, at_off)
+    native_write_i64(p, 8, target_kind)
+    native_write_i64(p, 16, target_id)
+    out p
+end.
+
+func lir_str_fixup_new(at_off: i64, str_val: i64, rd: i64):
+    p = alloc(24)
+    native_write_i64(p, 0, at_off)
+    native_write_i64(p, 8, str_val)
+    native_write_i64(p, 16, rd)
+    out p
+end.
+
+func resolve_reg(opnd: LirOperand, assigned_phys: i64):
+    if (opnd as i64) == 0 do
+        out 0 - 1
+    end
+    typ = native_read_i64(opnd as i64, 0)
+    if typ == 1 do
+        if assigned_phys >= 0 do
+            out vec_get_rt(assigned_phys, native_read_i64(opnd as i64, 8))
+        end
+        out native_read_i64(opnd as i64, 8)
+    end
+    if typ == 2 do
+        out native_read_i64(opnd as i64, 16)
+    end
+    out 0 - 1
+end.
+
+func resolve_or_imm_reg(cb: CodeBuf, opnd: LirOperand, assigned_phys: i64, scratch: i64):
+    if (opnd as i64) == 0 do
+        out scratch
+    end
+    r = resolve_reg(opnd, assigned_phys)
+    if r >= 0 do
+        out r
+    end
+    typ = native_read_i64(opnd as i64, 0)
+    if typ == 4 do
+        imm_val = native_read_i64(opnd as i64, 32)
+        arm64_movz_imm64(cb, scratch as int, imm_val as int)
+        out scratch
+    end
+    if typ == 3 do
+        off = native_read_i64(opnd as i64, 24)
+        if off < 0 and off >= 0 - 255 do
+            arm64_ldur(cb, scratch as int, 29, off as int)
+            out scratch
+        else
+            if off < 0 do
+                arm64_sub_imm(cb, scratch as int, 29, (0 - off) as int)
+                arm64_ldr_uoff(cb, scratch as int, scratch as int, 0)
+                out scratch
+            end
+        end
+    end
+    out scratch
+end.
+
+func lir_opnd_spill_off(opnd: i64):
+    # Returns the negative stack offset if `opnd` is a StackMem slot, else 0.
+    if opnd == 0 do
+        out 0
+    end
+    if native_read_i64(opnd, 0) == 3 do
+        out native_read_i64(opnd, 24)
+    end
+    out 0
+end.
+
+func robust_src_reg(cb: CodeBuf, opnd: i64, assigned_phys: i64, scratch: i64):
+    # Like resolve_reg, but transparently reloads a spilled (StackMem) source
+    # into `scratch` so every consumer sees a real register.
+    if opnd == 0 do
+        out 0 - 1
+    end
+    r = resolve_reg(opnd as LirOperand, assigned_phys)
+    if r >= 0 do
+        out r
+    end
+    if native_read_i64(opnd, 0) == 3 do
+        out resolve_or_imm_reg(cb, opnd as LirOperand, assigned_phys, scratch)
+    end
+    out r
+end.
+
+func lir_load_opnd_to_reg(cb: CodeBuf, opnd: i64, assigned_phys: i64, scratch: i64):
+    if opnd == 0 do
+        out (cb, scratch)
+    end
+    typ = native_read_i64(opnd, 0)
+    if typ == 4 do
+        cb = arm64_movz_imm64(cb, scratch as int, native_read_i64(opnd, 32) as int)
+        out (cb, scratch)
+    end
+    if typ == 3 do
+        off = native_read_i64(opnd, 24)
+        if off < 0 and off >= 0 - 255 do
+            cb = arm64_ldur(cb, scratch as int, 29, off as int)
+        else
+            if off < 0 do
+                cb = arm64_sub_imm(cb, scratch as int, 29, (0 - off) as int)
+                cb = arm64_ldr_uoff(cb, scratch as int, scratch as int, 0)
+            end
+        end
+        out (cb, scratch)
+    end
+    r = resolve_reg(opnd as LirOperand, assigned_phys)
+    if r >= 0 do
+        out (cb, r)
+    end
+    out (cb, scratch)
+end.
+
+func emit_spill_store(cb: CodeBuf, opnd: i64, src_reg: i64):
+    off = lir_opnd_spill_off(opnd)
+    if off < 0 and off >= 0 - 255 do
+        cb = arm64_stur(cb, src_reg as int, 29, off as int)
+    else
+        if off < 0 do
+            cb = arm64_sub_imm(cb, 13, 29, (0 - off) as int)
+            cb = arm64_str_uoff(cb, src_reg as int, 13, 0)
+        end
+    end
+    out cb
+end.
+
+func emit_cmp_cset(cb: CodeBuf, rd: i64, rs1: i64, rs2: i64, pred: i64):
+    cb = arm64_cmp_rr(cb, rs1 as int, rs2 as int)
+    if pred == LIR_CMP_EQ do
+        out arm64_cset_eq(cb, rd as int)
+    eif pred == LIR_CMP_NE do
+        out arm64_cset_ne(cb, rd as int)
+    eif pred == LIR_CMP_GT do
+        out arm64_cset_gt(cb, rd as int)
+    eif pred == LIR_CMP_LT do
+        out arm64_cset_lt(cb, rd as int)
+    eif pred == LIR_CMP_GE do
+        out arm64_cset_ge(cb, rd as int)
+    eif pred == LIR_CMP_LE do
+        out arm64_cset_le(cb, rd as int)
+    end
+    out arm64_cset_eq(cb, rd as int)
+end.
+
+func arm64_cond_code(pred: i64, is_ifnot: i64):
+    if is_ifnot == 0 do
+        if pred == LIR_CMP_EQ do out 0 end    # EQ (0x0)
+        if pred == LIR_CMP_NE do out 1 end    # NE (0x1)
+        if pred == LIR_CMP_GE do out 10 end   # GE (0xA)
+        if pred == LIR_CMP_LT do out 11 end   # LT (0xB)
+        if pred == LIR_CMP_GT do out 12 end   # GT (0xC)
+        if pred == LIR_CMP_LE do out 13 end   # LE (0xD)
+        out 0
+    end
+    # Inverted condition (IFNOT)
+    if pred == LIR_CMP_EQ do out 1 end        # NE (0x1)
+    if pred == LIR_CMP_NE do out 0 end        # EQ (0x0)
+    if pred == LIR_CMP_GE do out 11 end       # LT (0xB)
+    if pred == LIR_CMP_LT do out 10 end       # GE (0xA)
+    if pred == LIR_CMP_GT do out 13 end       # LE (0xD)
+    if pred == LIR_CMP_LE do out 12 end       # GT (0xC)
+    out 1
+end.
+
+func lir_opnd_matches(o1: i64, o2: i64):
+    if o1 == 0 or o2 == 0 do out 0 end
+    t1 = native_read_i64(o1, 0)
+    t2 = native_read_i64(o2, 0)
+    if t1 != t2 do out 0 end
+    if t1 == 1 do
+        v1 = native_read_i64(o1, 8)
+        v2 = native_read_i64(o2, 8)
+        if v1 == v2 do out 1 end
+    end
+    if t1 == 2 do
+        v1 = native_read_i64(o1, 16)
+        v2 = native_read_i64(o2, 16)
+        if v1 == v2 do out 1 end
+    end
+    out 0
+end.
+
+func arm64_and_mask(cb: CodeBuf, rd: int, rn: int, mask: i64):
+    if mask == 255 do       # 0xFF (8-bit) -> uxtb w_rd, w_rn
+        out codebuf_emit_u32(cb, 0x53001C00 bit_or ((rn bit_and 0x1F) shl 5) bit_or (rd bit_and 0x1F))
+    end
+    if mask == 4095 do      # 0xFFF (12-bit) -> ubfx w_rd, w_rn, #0, #12
+        out codebuf_emit_u32(cb, 0x53002C00 bit_or ((rn bit_and 0x1F) shl 5) bit_or (rd bit_and 0x1F))
+    end
+    if mask == 65535 do     # 0xFFFF (16-bit) -> uxth w_rd, w_rn
+        out codebuf_emit_u32(cb, 0x53003C00 bit_or ((rn bit_and 0x1F) shl 5) bit_or (rd bit_and 0x1F))
+    end
+    if mask == 4294967295 do # 0xFFFFFFFF (32-bit) -> mov w_rd, w_rn (ORR Wd, WZR, Wn)
+        out codebuf_emit_u32(cb, 0x2A0003E0 bit_or ((rn bit_and 0x1F) shl 16) bit_or (rd bit_and 0x1F))
+    end
+    out cb
+end.
+
+func arm64_cmp_imm(cb: CodeBuf, rn: int, imm: int):
+    instr = 0xF100001F bit_or ((imm bit_and 0xFFF) shl 10) bit_or ((rn bit_and 0x1F) shl 5)
+    out codebuf_emit_u32(cb, instr)
+end.
+
+func is_opnd_used_later(instrs: i64, start_idx: i64, n_instrs: i64, target_opnd: i64):
+    var idx = start_idx
+    when idx < n_instrs loop
+        ins = vec_get_rt(instrs, idx)
+        s1 = native_read_i64(ins as i64, 24)
+        s2 = native_read_i64(ins as i64, 32)
+        if lir_opnd_matches(target_opnd, s1) == 1 or lir_opnd_matches(target_opnd, s2) == 1 do
+            out 1
+        end
+        d = native_read_i64(ins as i64, 16)
+        if lir_opnd_matches(target_opnd, d) == 1 do
+            out 0
+        end
+        idx = idx + 1
+    end
+    out 0
+end.
+
+func is_inlined_imm_consumer(instrs: i64, ii: i64, n_instrs: i64, imm_dst: i64, imm_val: i64):
+    if (ii + 1) >= n_instrs do
+        out 0
+    end
+    next_ins = vec_get_rt(instrs, ii + 1)
+    next_op = native_read_i64(next_ins as i64, 0)
+    next_src1 = native_read_i64(next_ins as i64, 24)
+    next_src2 = native_read_i64(next_ins as i64, 32)
+    if (next_op == (LirOp.Add as i64) or next_op == (LirOp.Sub as i64) or next_op == (LirOp.Cmp as i64)) and imm_val >= 0 and imm_val <= 4095 do
+        if lir_opnd_matches(imm_dst, next_src2) == 1 or lir_opnd_matches(imm_dst, next_src1) == 1 do
+            if is_opnd_used_later(instrs, ii + 2, n_instrs, imm_dst) == 0 do
+                out 1
+            end
+        end
+    end
+    if next_op == (LirOp.And as i64) and (imm_val == 255 or imm_val == 4095 or imm_val == 65535 or imm_val == 4294967295) do
+        if lir_opnd_matches(imm_dst, next_src2) == 1 or lir_opnd_matches(imm_dst, next_src1) == 1 do
+            if is_opnd_used_later(instrs, ii + 2, n_instrs, imm_dst) == 0 do
+                out 1
+            end
+        end
+    end
+    out 0
+end.
+
+func is_inlined_builtin_arg(instrs: i64, ii: i64, n_instrs: i64):
+    var k = 1
+    when k <= 4 loop
+        if (ii + k) < n_instrs do
+            target_ins = vec_get_rt(instrs, ii + k)
+            top = native_read_i64(target_ins as i64, 0)
+            if top == (LirOp.Intrinsic as i64) do
+                tkind = native_read_i64(target_ins as i64, 40)
+                if tkind == MIR_INTR_BUILTIN do
+                    tsrc1 = native_read_i64(target_ins as i64, 24)
+                    if (tsrc1 as i64) != 0 do
+                        tbid = native_read_i64(tsrc1 as i64, 32)
+                        if tbid == 3 or tbid == 5 or tbid == 6 or tbid == 7 or tbid == 8 or tbid == 32 do
+                            out 1
+                        end
+                    end
+                end
+            end
+            if top != (LirOp.SetArg as i64) and top != (LirOp.Mov as i64) do
+                out 0
+            end
+        end
+        k = k + 1
+    end
+    out 0
+end.
+
+func lir_intr_is_marker(kind: i64):
+    if kind == MIR_INTR_NOP_MARKER or kind == MIR_INTR_DECL or kind == MIR_INTR_QUIET or kind == MIR_INTR_CHECK_CPU or kind == MIR_INTR_PATCH_POINT or kind == MIR_INTR_PRECOMP or kind == MIR_INTR_EXPOSE or kind == MIR_INTR_ASYNC or kind == MIR_INTR_ATOMIC_VAR or kind == MIR_INTR_TIMEOUT or kind == MIR_INTR_ISOLATE or kind == MIR_INTR_PTR or kind == MIR_INTR_AWAIT_PASS or kind == MIR_INTR_ENSURE or kind == MIR_INTR_REVERT or kind == MIR_INTR_ENUM or kind == MIR_INTR_ERROR or kind == MIR_INTR_EXIST or kind == MIR_INTR_INFER or kind == MIR_INTR_TRAIN or kind == MIR_INTR_REACTIVE or kind == MIR_INTR_MORPH or kind == MIR_INTR_QUANTIZE or kind == MIR_INTR_TRY or kind == MIR_INTR_RESUME or kind == MIR_INTR_EMIT do
+        out 1
+    end
+    out 0
+end.
+
+func lir_intr_is_payload(kind: i64):
+    if kind == MIR_INTR_ADDR_OF or kind == MIR_INTR_CAST do
+        out 1
+    end
+    out 0
+end.
+
+func lir_stub_for_builtin_id(bid: i64):
+    if bid == 3 or bid == 35 or bid == 49 or bid == 50 do out LIR_RT_ALLOC end
+    if bid == 22 do out LIR_RT_PRINT_STR end
+    if bid == 9 do out LIR_RT_STR_LEN end
+    if bid == 11 do out LIR_RT_STR_CAT end
+    if bid == 12 do out LIR_RT_STR_EQ end
+    if bid == 19 do out LIR_RT_INT_TO_STR end
+    if bid == 25 do out LIR_RT_SLURP_FILE end
+    if bid == 26 do out LIR_RT_SLURP_LEN end
+    if bid == 27 do out LIR_RT_WRITE_BYTES end
+    if bid == 5 do out LIR_RT_NATIVE_READ_U8 end
+    if bid == 6 do out LIR_RT_NATIVE_WRITE_U8 end
+    if bid == 7 or bid == 46 do out LIR_RT_NATIVE_READ_I64 end
+    if bid == 8 or bid == 47 do out LIR_RT_NATIVE_WRITE_I64 end
+    if bid == 23 do out LIR_RT_GET_ARG end
+    if bid == 24 do out LIR_RT_ARG_COUNT end
+    if bid == 54 or bid == 60 or bid == 62 do out LIR_RT_VOLATILE_READ end
+    if bid == 55 or bid == 61 or bid == 63 do out LIR_RT_VOLATILE_WRITE end
+    if bid == 56 or bid == 58 do out LIR_RT_VOLATILE_READ8 end
+    if bid == 57 or bid == 59 do out LIR_RT_VOLATILE_WRITE8 end
+    if bid == 64 or bid == 39 do out LIR_RT_DMB end
+    if bid == 65 do out LIR_RT_DSB end
+    if bid == 66 do out LIR_RT_ISB end
+    if bid == 67 do out LIR_RT_WFI end
+    if bid == 68 do out LIR_RT_WFE end
+    if bid == 69 do out LIR_RT_SEV end
+    if bid == 70 do out LIR_RT_NOP end
+    if bid == 40 or bid == 78 do out LIR_RT_ATOMIC_LOAD64 end
+    if bid == 72 do out LIR_RT_ATOMIC_LOAD32 end
+    if bid == 41 or bid == 79 do out LIR_RT_ATOMIC_STORE64 end
+    if bid == 73 do out LIR_RT_ATOMIC_STORE32 end
+    if bid == 43 or bid == 80 do out LIR_RT_ATOMIC_ADD64 end
+    if bid == 74 do out LIR_RT_ATOMIC_ADD32 end
+    if bid == 44 or bid == 81 do out LIR_RT_ATOMIC_SUB64 end
+    if bid == 75 do out LIR_RT_ATOMIC_SUB32 end
+    if bid == 42 or bid == 82 do out LIR_RT_ATOMIC_CAS64 end
+    if bid == 76 do out LIR_RT_ATOMIC_CAS32 end
+    if bid == 71 or bid == 83 do out LIR_RT_ATOMIC_EXCHANGE64 end
+    if bid == 77 do out LIR_RT_ATOMIC_EXCHANGE32 end
+    out 0 - 1
+end.
+
+func lir_intr_is_identity(kind: i64):
+    out lir_intr_is_payload(kind)
+end.
+
+func patch_bl_site(cb: CodeBuf, at_off: i64, dest_off: i64):
+    rel = (dest_off - at_off) as int
+    imm26 = (rel shr 2) bit_and 0x03FFFFFF
+    word = 0x94000000 bit_or imm26
+    out codebuf_patch_u32(cb, at_off as int, word)
+end.
+
+func emit_bl_fixup(cb: CodeBuf, call_fixups: i64, target_kind: i64, target_id: i64, rd: i64):
+    at = codebuf_offset(cb) as i64
+    cb = arm64_bl_imm26(cb, 0)
+    call_fixups = vec_push_rt(call_fixups, lir_call_fixup_new(at, target_kind, target_id))
+    if rd >= 0 and rd != 0 do
+        cb = arm64_mov_rr(cb, rd as int, 0)
+    end
+    out cb
+end.
+
+func emit_to_x0(cb: CodeBuf, opnd: LirOperand, assigned_phys: i64, scratch: i64):
+    r = resolve_or_imm_reg(cb, opnd, assigned_phys, scratch)
+    if r >= 0 and r != 0 do
+        cb = arm64_mov_rr(cb, 0, r as int)
+    end
+    out cb
+end.
+
+func emit_lir_setarg(cb: CodeBuf, ins: LirInstr, assigned_phys: i64, pending_stk: i64):
+    SCR = 9
+    ai = native_read_i64(ins as i64, 40)
+    src1 = native_read_i64(ins as i64, 24)
+    if (src1 as i64) != 0 do
+        if native_read_i64(src1 as i64, 0) == (LirOperandType.Imm as i64) do
+            ai = native_read_i64(src1 as i64, 32)
+        end
+    end
+    src2 = native_read_i64(ins as i64, 32) as LirOperand
+    rval = resolve_or_imm_reg(cb, src2, assigned_phys, SCR)
+    if rval < 0 do
+        out pending_stk
+    end
+    if ai >= 0 and ai < 8 do
+        if rval != ai do
+            arm64_mov_rr(cb, ai as int, rval as int)
+        end
+        out pending_stk
+    end
+    arm64_str_pre(cb, rval as int, 31, 0 - 16)
+    out (pending_stk + 1)
+end.
+
+func emit_lir_intrinsic(cb: CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assigned_phys: i64, call_fixups: i64, func_obj: LirFunc, str_fixups: i64, recent_setargs: i64):
+    kind = native_read_i64(ins as i64, 40)
+    ins_src1 = native_read_i64(ins as i64, 24) as LirOperand
+    SCR = 9
+    if lir_intr_is_marker(kind) == 1 do
+        out arm64_nop(cb)
+    end
+    if kind == MIR_INTR_PARAM do
+        abi = native_read_i64(ins_src1 as i64, 32)
+        if rd >= 0 and abi >= 0 and abi < 8 do
+            if rd != abi do
+                arm64_mov_rr(cb, rd as int, abi as int)
+            end
+            out cb
+        end
+        out arm64_nop(cb)
+    end
+    if kind == MIR_INTR_BUILTIN do
+        bid = native_read_i64(ins_src1 as i64, 32)
+        # ── HOOK A + D: Inline read_byte(ptr, idx) → LDRB Wrd, [X_ptr, X_idx] ──
+        if bid == 5 do
+            if rd >= 0 do
+                s0 = vec_get_rt(recent_setargs, 0)
+                s1 = vec_get_rt(recent_setargs, 1)
+                var (cb1, r0) = lir_load_opnd_to_reg(cb, s0, assigned_phys, 14)
+                var (cb2, r1) = lir_load_opnd_to_reg(cb1, s1, assigned_phys, 15)
+                cb = arm64_ldrb_reg(cb2, rd as int, r0 as int, r1 as int)
+            end
+            out cb
+        end
+        # ── HOOK A + D: Inline write_byte(ptr, idx, val) → STRB W_val, [X_ptr, X_idx]
+        if bid == 6 do
+            s0 = vec_get_rt(recent_setargs, 0)
+            s1 = vec_get_rt(recent_setargs, 1)
+            s2 = vec_get_rt(recent_setargs, 2)
+            var (cb1, r0) = lir_load_opnd_to_reg(cb, s0, assigned_phys, 14)
+            var (cb2, r1) = lir_load_opnd_to_reg(cb1, s1, assigned_phys, 15)
+            var (cb3, r2) = lir_load_opnd_to_reg(cb2, s2, assigned_phys, 9)
+            cb = arm64_strb_reg(cb3, r2 as int, r0 as int, r1 as int)
+            out cb
+        end
+        # ── Inline read_word(ptr, idx) → LDR Xrd, [X_ptr, X_idx] ──
+        if bid == 7 do
+            if rd >= 0 do
+                s0 = vec_get_rt(recent_setargs, 0)
+                s1 = vec_get_rt(recent_setargs, 1)
+                var (cb1, r0) = lir_load_opnd_to_reg(cb, s0, assigned_phys, 14)
+                var (cb2, r1) = lir_load_opnd_to_reg(cb1, s1, assigned_phys, 15)
+                cb = arm64_ldr_reg(cb2, rd as int, r0 as int, r1 as int)
+            end
+            out cb
+        end
+        # ── Inline write_word(ptr, idx, val) → STR X_val, [X_ptr, X_idx] ──
+        if bid == 8 do
+            s0 = vec_get_rt(recent_setargs, 0)
+            s1 = vec_get_rt(recent_setargs, 1)
+            s2 = vec_get_rt(recent_setargs, 2)
+            var (cb1, r0) = lir_load_opnd_to_reg(cb, s0, assigned_phys, 14)
+            var (cb2, r1) = lir_load_opnd_to_reg(cb1, s1, assigned_phys, 15)
+            var (cb3, r2) = lir_load_opnd_to_reg(cb2, s2, assigned_phys, 9)
+            cb = arm64_str_reg(cb3, r2 as int, r0 as int, r1 as int)
+            out cb
+        end
+        # ── Inline memset(buf, val, len) / fill_bytes → Hardware 8-Byte Block Fill ──
+        if bid == 32 do
+            s0 = vec_get_rt(recent_setargs, 0)
+            s1 = vec_get_rt(recent_setargs, 1)
+            s2 = vec_get_rt(recent_setargs, 2)
+            if s0 != 0 do
+                typ0 = native_read_i64(s0 as i64, 0)
+                if typ0 == 4 do
+                    cb = arm64_movz_imm64(cb, 9, native_read_i64(s0 as i64, 32) as int)
+                eif typ0 == 3 do
+                    off0 = native_read_i64(s0 as i64, 24)
+                    cb = arm64_sub_imm(cb, 9, 29, (0 - off0) as int)
+                    cb = arm64_ldr_uoff(cb, 9, 9, 0)
+                else
+                    r_s0 = resolve_reg(s0 as LirOperand, assigned_phys)
+                    if r_s0 >= 0 and r_s0 != 9 do
+                        cb = arm64_mov_rr(cb, 9, r_s0 as int)
+                    end
+                end
+            end
+            if s1 != 0 do
+                typ1 = native_read_i64(s1 as i64, 0)
+                if typ1 == 4 do
+                    cb = arm64_movz_imm64(cb, 10, native_read_i64(s1 as i64, 32) as int)
+                eif typ1 == 3 do
+                    off1 = native_read_i64(s1 as i64, 24)
+                    cb = arm64_sub_imm(cb, 10, 29, (0 - off1) as int)
+                    cb = arm64_ldr_uoff(cb, 10, 10, 0)
+                else
+                    r_s1 = resolve_reg(s1 as LirOperand, assigned_phys)
+                    if r_s1 >= 0 and r_s1 != 10 do
+                        cb = arm64_mov_rr(cb, 10, r_s1 as int)
+                    end
+                end
+            end
+            if s2 != 0 do
+                typ2 = native_read_i64(s2 as i64, 0)
+                if typ2 == 4 do
+                    cb = arm64_movz_imm64(cb, 11, native_read_i64(s2 as i64, 32) as int)
+                eif typ2 == 3 do
+                    off2 = native_read_i64(s2 as i64, 24)
+                    cb = arm64_sub_imm(cb, 11, 29, (0 - off2) as int)
+                    cb = arm64_ldr_uoff(cb, 11, 11, 0)
+                else
+                    r_s2 = resolve_reg(s2 as LirOperand, assigned_phys)
+                    if r_s2 >= 0 and r_s2 != 11 do
+                        cb = arm64_mov_rr(cb, 11, r_s2 as int)
+                    end
+                end
+            end
+            cb = arm64_and_mask(cb, 12, 10, 255)
+            cb = arm64_movz_imm64(cb, 13, 8)
+            cb = arm64_lsl_rrr(cb, 13, 12, 13)
+            cb = arm64_orr_rrr(cb, 12, 12, 13)
+            cb = arm64_movz_imm64(cb, 13, 16)
+            cb = arm64_lsl_rrr(cb, 13, 12, 13)
+            cb = arm64_orr_rrr(cb, 12, 12, 13)
+            cb = arm64_movz_imm64(cb, 13, 32)
+            cb = arm64_lsl_rrr(cb, 13, 12, 13)
+            cb = arm64_orr_rrr(cb, 12, 12, 13)
+            cb = arm64_cmp_imm(cb, 11, 8)
+            cb = codebuf_emit_u32(cb, 0x54000083)
+            cb = codebuf_emit_u32(cb, 0xF800852C)
+            cb = arm64_sub_imm(cb, 11, 11, 8)
+            cb = arm64_b_imm26(cb, 0 - 16)
+            cb = codebuf_emit_u32(cb, 0xB400008B)
+            cb = codebuf_emit_u32(cb, 0x3800152A)
+            cb = codebuf_emit_u32(cb, 0xF100056B)
+            cb = codebuf_emit_u32(cb, 0x54FFFFE1)
+            if rd >= 0 do
+                cb = arm64_mov_rr(cb, rd as int, 9)
+            end
+            out cb
+        end
+        # ── HOOK B + D: Inline alloc(size) fast-path → bump X28 directly ──────
+        if bid == 3 do
+            if rd >= 0 do
+                s0 = vec_get_rt(recent_setargs, 0)
+                r_sz = 0
+                if s0 != 0 do
+                    r_sz = resolve_or_imm_reg(cb, s0 as LirOperand, assigned_phys, 9)
+                end
+                # Compute aligned size in X9 FIRST (before modifying rd in case rd == r_sz)
+                cb = arm64_add_imm(cb, 9, r_sz as int, 7)   # X9  = size + 7
+                cb = arm64_movz_imm64(cb, 10, 3)             # X10 = 3 (shift amt)
+                cb = arm64_lsr_rrr(cb, 9, 9, 10)            # X9  = (size+7) >> 3
+                cb = arm64_lsl_imm(cb, 9, 9, 3)             # X9  = aligned to 8
+                cb = arm64_ldr_uoff(cb, rd as int, 28, 0)   # rd = bump_curr
+                cb = arm64_add_rrr(cb, 9, rd as int, 9)     # X9  = bump + aligned
+                cb = arm64_str_uoff(cb, 9, 28, 0)           # *X28 = new bump_curr
+                out cb
+            end
+        end
+        # ── Inline rotl32(val, n) → Hardware 32-bit ROR / RORV ──
+        if bid == 84 do
+            if rd >= 0 do
+                s0 = vec_get_rt(recent_setargs, 0)
+                s1 = vec_get_rt(recent_setargs, 1)
+                var (cb1, r0) = lir_load_opnd_to_reg(cb, s0, assigned_phys, 14)
+                var (cb2, r1) = lir_load_opnd_to_reg(cb1, s1, assigned_phys, 15)
+                # ARM64: neg w15, w_r1; ror w_rd, w_r0, w15
+                cb = codebuf_emit_u32(cb2, 0x4B0003EF bit_or ((r1 as int bit_and 0x1F) shl 16))
+                cb = codebuf_emit_u32(cb, 0x1AC02C00 bit_or (15 shl 16) bit_or ((r0 as int bit_and 0x1F) shl 5) bit_or (rd as int bit_and 0x1F))
+                out cb
+            end
+            out cb
+        end
+        # ── Inline rotr32(val, n) → Hardware 32-bit ROR / RORV ──
+        if bid == 85 do
+            if rd >= 0 do
+                s0 = vec_get_rt(recent_setargs, 0)
+                s1 = vec_get_rt(recent_setargs, 1)
+                var (cb1, r0) = lir_load_opnd_to_reg(cb, s0, assigned_phys, 14)
+                var (cb2, r1) = lir_load_opnd_to_reg(cb1, s1, assigned_phys, 15)
+                # ARM64: ror w_rd, w_r0, w_r1
+                cb = codebuf_emit_u32(cb2, 0x1AC02C00 bit_or ((r1 as int bit_and 0x1F) shl 16) bit_or ((r0 as int bit_and 0x1F) shl 5) bit_or (rd as int bit_and 0x1F))
+                out cb
+            end
+            out cb
+        end
+        stub = lir_stub_for_builtin_id(bid)
+        if stub < 0 do
+            stub = LIR_RT_UNRESOLVED
+        end
+        out emit_bl_fixup(cb, call_fixups, 1, stub, rd)
+    end
+    if kind == MIR_INTR_PRINT do
+        cb = emit_to_x0(cb, ins_src1, assigned_phys, 9)
+        out emit_bl_fixup(cb, call_fixups, 1, MIR_INTR_PRINT, rd)
+    end
+    if kind == MIR_INTR_PRINT_STR do
+        cb = emit_to_x0(cb, ins_src1, assigned_phys, 9)
+        out emit_bl_fixup(cb, call_fixups, 1, LIR_RT_PRINT_STR, rd)
+    end
+    if kind == MIR_INTR_STR_LIT or kind == MIR_INTR_INTERP or kind == MIR_INTR_BUNDLE do
+        sid = native_read_i64(ins_src1 as i64, 32)
+        f_strings = native_read_i64(func_obj as i64, 32)
+        if f_strings > 0 and sid >= 0 and sid < vec_len_rt(f_strings) and rd >= 0 do
+            s_val = vec_get_rt(f_strings, sid)
+            str_fixups = vec_push_rt(str_fixups, lir_str_fixup_new(codebuf_offset(cb) as i64, s_val as i64, rd))
+            out codebuf_emit_u32(cb, 0x10000000 bit_or (rd as int bit_and 0x1F))
+        end
+        if rd >= 0 do
+            arm64_movz_imm64(cb, rd as int, 0)
+            out cb
+        end
+        out arm64_nop(cb)
+    end
+    if lir_intr_is_payload(kind) == 1 do
+        if rd >= 0 do
+            if native_read_i64(ins_src1 as i64, 0) == (LirOperandType.Imm as i64) do
+                arm64_movz_imm64(cb, rd as int, native_read_i64(ins_src1 as i64, 32) as int)
+                out cb
+            eif rs1 >= 0 do
+                arm64_mov_rr(cb, rd as int, rs1 as int)
+                out cb
+            end
+        end
+        out arm64_nop(cb)
+    end
+    if kind == MIR_INTR_INDEX do
+        if rd >= 0 and rs1 >= 0 do
+            cb = arm64_lsl_imm(cb, 9, 0, 3)
+            cb = arm64_add_rrr(cb, 9, rs1 as int, 9)
+            cb = arm64_ldr_uoff(cb, rd as int, 9, 0)
+            out cb
+        end
+        out arm64_nop(cb)
+    end
+    if kind == MIR_INTR_INDEX_STORE do
+        if rs1 >= 0 do
+            cb = arm64_lsl_imm(cb, 9, 0, 3)
+            cb = arm64_add_rrr(cb, 9, rs1 as int, 9)
+            cb = arm64_str_uoff(cb, 1, 9, 0)
+            out cb
+        end
+        out arm64_nop(cb)
+    end
+    if kind == MIR_INTR_FIELD do
+        if rd >= 0 and rs1 >= 0 do
+            cb = arm64_lsl_imm(cb, 9, 0, 3)
+            cb = arm64_add_rrr(cb, 9, rs1 as int, 9)
+            cb = arm64_ldr_uoff(cb, rd as int, 9, 0)
+            out cb
+        end
+        out arm64_nop(cb)
+    end
+    if kind == MIR_INTR_FIELD_STORE do
+        if rs1 >= 0 do
+            cb = arm64_lsl_imm(cb, 9, 0, 3)
+            cb = arm64_add_rrr(cb, 9, rs1 as int, 9)
+            cb = arm64_str_uoff(cb, 1, 9, 0)
+            out cb
+        end
+        out arm64_nop(cb)
+    end
+    if kind == MIR_INTR_ARENA do
+        if rd >= 0 do
+            cb = arm64_ldr_uoff(cb, rd as int, 28, 0)
+            out cb
+        end
+        if rs1 >= 0 do
+            cb = arm64_str_uoff(cb, rs1 as int, 28, 0)
+            out cb
+        end
+        out arm64_nop(cb)
+    end
+    if kind == MIR_INTR_ENTITY or kind == MIR_INTR_ARRAY or kind == MIR_INTR_TUPLE do
+        n_elem = 0
+        if (ins_src1 as i64) != 0 do
+            styp = native_read_i64(ins_src1 as i64, 0)
+            if styp == 5 or styp == 4 or styp == (LirOperandType.Imm as i64) do
+                n_elem = native_read_i64(ins_src1 as i64, 32)
+            end
+        end
+        if rd >= 0 do
+            cb = arm64_ldr_uoff(cb, 9, 28, 0)
+            cb = arm64_mov_rr(cb, rd as int, 9)
+            alloc_bytes = n_elem * 8
+            if alloc_bytes > 0 do
+                cb = arm64_add_imm(cb, 10, 9, alloc_bytes as int)
+                cb = arm64_str_uoff(cb, 10, 28, 0)
+            end
+            var ei = 0
+            when ei < n_elem and ei < 8 loop
+                cb = arm64_str_uoff(cb, ei as int, rd as int, (ei * 8) as int)
+                ei = ei + 1
+            end
+            out cb
+        end
+        out arm64_nop(cb)
+    end
+    emit_to_x0(cb, ins_src1, assigned_phys, SCR)
+    stub2 = kind
+    if stub2 < 1 or stub2 >= LIR_RT_STUB_COUNT do
+        stub2 = LIR_RT_UNRESOLVED
+    end
+    out emit_bl_fixup(cb, call_fixups, 1, stub2, rd)
+end.
+
+func lir_find_func_index(lir_funcs: i64, name: string):
+    n = vec_len_rt(lir_funcs)
+    var i = 0
+    when i < n loop
+        lf = vec_get_rt(lir_funcs, i)
+        fn_name = native_read_i64(lf as i64, 8) as string
+        if fat_str_eq(fn_name, name) == 1 do
+            out i
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func emit_lir_call(cb: CodeBuf, ins: LirInstr, rd: i64, func_obj: LirFunc, lir_funcs: i64, call_fixups: i64, pending_stk: i64):
+    sid = native_read_i64(ins as i64, 40)
+    target_kind = 1
+    target_id = LIR_RT_UNRESOLVED
+    f_strings = native_read_i64(func_obj as i64, 32)
+    if f_strings > 0 and sid >= 0 and sid < vec_len_rt(f_strings) do
+        cname = vec_get_rt(f_strings, sid)
+        fi = lir_find_func_index(lir_funcs, cname)
+        if fi >= 0 do
+            target_kind = 0
+            target_id = fi
+        end
+    end
+    emit_bl_fixup(cb, call_fixups, target_kind, target_id, rd)
+    if pending_stk > 0 do
+        bytes = pending_stk * 16
+        if bytes <= 4095 do
+            arm64_add_imm(cb, 31, 31, bytes as int)
+        end
+    end
+    out 0
+end.
+
+func emit_lir_rt_print_stub(cb: CodeBuf, is_linux: i64):
+    cb = arm64_sub_imm(cb, 31, 31, 128)
+    cb = arm64_str_uoff(cb, 1, 31, 0)
+    cb = arm64_str_uoff(cb, 2, 31, 8)
+    cb = arm64_str_uoff(cb, 3, 31, 16)
+    cb = arm64_str_uoff(cb, 4, 31, 24)
+    cb = arm64_str_uoff(cb, 5, 31, 32)
+    cb = arm64_str_uoff(cb, 6, 31, 40)
+    cb = arm64_str_uoff(cb, 16, 31, 48)
+
+    cb = arm64_mov_imm16(cb, 2, 10)
+    cb = arm64_mov_imm16(cb, 3, 10)
+    cb = arm64_strb_uoff(cb, 2, 31, 127)
+
+    cb = arm64_cmp_imm0(cb, 0)
+    cb = arm64_bne_imm19(cb, 24)
+    cb = arm64_mov_imm16(cb, 2, 48)
+    cb = arm64_strb_uoff(cb, 2, 31, 126)
+    cb = arm64_add_imm(cb, 2, 31, 126)
+    cb = arm64_mov_imm16(cb, 3, 2)
+    cb = arm64_b_imm26(cb, 88)
+
+    cb = arm64_add_imm(cb, 1, 31, 127)
+    cb = arm64_cset_lt(cb, 4)
+    cb = arm64_cmp_imm0(cb, 4)
+    cb = arm64_beq_imm19(cb, 8)
+    cb = arm64_sub_rrr(cb, 0, 31, 0)
+
+    loop_top = codebuf_offset(cb)
+    cb = arm64_sdiv_rrr(cb, 5, 0, 3)
+    cb = arm64_msub_rrrr(cb, 6, 5, 3, 0)
+    cb = arm64_add_imm(cb, 6, 6, 48)
+    cb = arm64_sub_imm(cb, 1, 1, 1)
+    cb = arm64_strb_uoff(cb, 6, 1, 0)
+    cb = arm64_mov_rr(cb, 0, 5)
+    cb = arm64_cmp_imm0(cb, 0)
+    delta = (loop_top - codebuf_offset(cb)) as int
+    cb = arm64_bne_imm19(cb, delta)
+
+    cb = arm64_cmp_imm0(cb, 4)
+    cb = arm64_beq_imm19(cb, 16)
+    cb = arm64_mov_imm16(cb, 6, 45)
+    cb = arm64_sub_imm(cb, 1, 1, 1)
+    cb = arm64_strb_uoff(cb, 6, 1, 0)
+
+    cb = arm64_mov_rr(cb, 2, 1)
+    cb = arm64_add_imm(cb, 5, 31, 128)
+    cb = arm64_sub_rrr(cb, 3, 5, 1)
+
+    cb = arm64_mov_imm16(cb, 0, 1)
+    cb = arm64_mov_rr(cb, 1, 2)
+    cb = arm64_mov_rr(cb, 2, 3)
+    if is_linux == 1 do
+        cb = arm64_mov_imm16(cb, 8, 64)
+        cb = arm64_svc(cb, 0)
+    else
+        cb = arm64_mov_imm16(cb, 16, 4)
+        cb = codebuf_emit_u32(cb, 0xF2A04010)
+        cb = arm64_svc(cb, 0x80)
+    end
+
+    cb = arm64_ldr_uoff(cb, 1, 31, 0)
+    cb = arm64_ldr_uoff(cb, 2, 31, 8)
+    cb = arm64_ldr_uoff(cb, 3, 31, 16)
+    cb = arm64_ldr_uoff(cb, 4, 31, 24)
+    cb = arm64_ldr_uoff(cb, 5, 31, 32)
+    cb = arm64_ldr_uoff(cb, 6, 31, 40)
+    cb = arm64_ldr_uoff(cb, 16, 31, 48)
+    cb = arm64_add_imm(cb, 31, 31, 128)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_print_str_stub(cb: CodeBuf, is_linux: i64):
+    cb = arm64_sub_imm(cb, 31, 31, 32)
+    cb = arm64_str_uoff(cb, 19, 31, 0)
+    cb = arm64_str_uoff(cb, 20, 31, 8)
+    cb = arm64_str_uoff(cb, 30, 31, 16)
+
+    cb = arm64_mov_rr(cb, 19, 0)
+    cb = arm64_mov_rr(cb, 20, 0)
+
+    len_loop = codebuf_offset(cb)
+    cb = arm64_ldrb_uoff(cb, 0, 20, 0)
+    cb = arm64_cmp_imm0(cb, 0)
+    cb = arm64_beq_imm19(cb, 12)
+    cb = arm64_add_imm(cb, 20, 20, 1)
+    delta = (len_loop - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, delta)
+
+    cb = arm64_sub_rrr(cb, 2, 20, 19)
+
+    cb = arm64_cmp_imm0(cb, 2)
+    cb = arm64_beq_imm19(cb, 32)
+    cb = arm64_mov_imm16(cb, 0, 1)
+    cb = arm64_mov_rr(cb, 1, 19)
+    if is_linux == 1 do
+        cb = arm64_mov_imm16(cb, 8, 64)
+        cb = arm64_svc(cb, 0)
+    else
+        cb = arm64_mov_imm16(cb, 16, 4)
+        cb = codebuf_emit_u32(cb, 0xF2A04010)
+        cb = arm64_svc(cb, 0x80)
+    end
+
+    cb = arm64_mov_imm16(cb, 0, 10)
+    cb = arm64_strb_uoff(cb, 0, 31, 24)
+    cb = arm64_mov_imm16(cb, 0, 1)
+    cb = arm64_add_imm(cb, 1, 31, 24)
+    cb = arm64_mov_imm16(cb, 2, 1)
+    if is_linux == 1 do
+        cb = arm64_mov_imm16(cb, 8, 64)
+        cb = arm64_svc(cb, 0)
+    else
+        cb = arm64_mov_imm16(cb, 16, 4)
+        cb = codebuf_emit_u32(cb, 0xF2A04010)
+        cb = arm64_svc(cb, 0x80)
+    end
+
+    cb = arm64_ldr_uoff(cb, 19, 31, 0)
+    cb = arm64_ldr_uoff(cb, 20, 31, 8)
+    cb = arm64_ldr_uoff(cb, 30, 31, 16)
+    cb = arm64_add_imm(cb, 31, 31, 32)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_read_u8_stub(cb: CodeBuf):
+    cb = arm64_add_rrr(cb, 0, 0, 1)
+    cb = arm64_ldrb_uoff(cb, 0, 0, 0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_write_u8_stub(cb: CodeBuf):
+    cb = arm64_add_rrr(cb, 0, 0, 1)
+    cb = arm64_strb_uoff(cb, 2, 0, 0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_alloc_stub(cb: CodeBuf):
+    # X0 = requested size
+    cb = arm64_ldr_uoff(cb, 1, 28, 0)      # X1 = *X28 (bump_curr)
+    cb = arm64_mov_rr(cb, 2, 1)           # X2 = bump_curr (return pointer)
+
+    cb = arm64_cmp_imm0(cb, 0)
+    cb = arm64_beq_imm19(cb, 28)
+
+    cb = arm64_add_imm(cb, 0, 0, 7)
+    cb = arm64_mov_imm16(cb, 3, 3)
+    cb = arm64_lsr_rrr(cb, 0, 0, 3)
+    cb = arm64_lsl_imm(cb, 0, 0, 3)
+    cb = arm64_add_rrr(cb, 1, 1, 0)
+    cb = arm64_str_uoff(cb, 1, 28, 0)
+
+    cb = arm64_mov_rr(cb, 0, 2)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_arg_count_stub(cb: CodeBuf):
+    cb = arm64_ldr_uoff(cb, 0, 28, 8)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_get_arg_stub(cb: CodeBuf):
+    cb = arm64_ldr_uoff(cb, 1, 28, 8)
+    cb = arm64_cmp_rr(cb, 0, 1)
+    cb = arm64_cset_lt(cb, 2)
+    cb = arm64_cmp_imm0(cb, 2)
+    cb = arm64_beq_imm19(cb, 24)
+
+    cb = arm64_ldr_uoff(cb, 1, 28, 16)
+    cb = arm64_lsl_imm(cb, 0, 0, 3)
+    cb = arm64_add_rrr(cb, 1, 1, 0)
+    cb = arm64_ldr_uoff(cb, 0, 1, 0)
+    cb = arm64_ret(cb)
+
+    cb = arm64_mov_imm16(cb, 0, 0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_read_i64_stub(cb: CodeBuf):
+    cb = arm64_add_rrr(cb, 0, 0, 1)
+    cb = arm64_ldr_uoff(cb, 0, 0, 0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_write_i64_stub(cb: CodeBuf):
+    cb = arm64_add_rrr(cb, 0, 0, 1)
+    cb = arm64_str_uoff(cb, 2, 0, 0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_volatile_read_stub(cb: CodeBuf):
+    cb = arm64_dmb_ishld(cb)
+    cb = arm64_ldr_uoff(cb, 0, 0, 0)
+    cb = arm64_dmb_ishld(cb)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_volatile_write_stub(cb: CodeBuf):
+    cb = arm64_dmb_ishst(cb)
+    cb = arm64_str_uoff(cb, 1, 0, 0)
+    cb = arm64_dmb_ishst(cb)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_volatile_read8_stub(cb: CodeBuf):
+    cb = arm64_dmb_ishld(cb)
+    cb = arm64_ldrb_uoff(cb, 0, 0, 0)
+    cb = arm64_dmb_ishld(cb)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_volatile_write8_stub(cb: CodeBuf):
+    cb = arm64_dmb_ishst(cb)
+    cb = arm64_strb_uoff(cb, 1, 0, 0)
+    cb = arm64_dmb_ishst(cb)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_load32_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0x88DFFC00)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_store32_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0x889FFC01)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_add32_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0x885F7C02)
+    cb = codebuf_emit_u32(cb, 0x0B010043)
+    cb = codebuf_emit_u32(cb, 0x88047C03)
+    cb = codebuf_emit_u32(cb, 0x35FFFFA4)
+    cb = codebuf_emit_u32(cb, 0x2A0203E0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_sub32_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0x885F7C02)
+    cb = codebuf_emit_u32(cb, 0x4B010043)
+    cb = codebuf_emit_u32(cb, 0x88047C03)
+    cb = codebuf_emit_u32(cb, 0x35FFFFA4)
+    cb = codebuf_emit_u32(cb, 0x2A0203E0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_cas32_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0x885F7C03) # ldaxr w3, [x0]
+    cb = codebuf_emit_u32(cb, 0x6B01007F) # cmp w3, w1
+    cb = codebuf_emit_u32(cb, 0x540000A1) # b.ne +20 (to clrex)
+    cb = codebuf_emit_u32(cb, 0x88047C02) # stlxr w4, w2, [x0]
+    cb = codebuf_emit_u32(cb, 0x35FFFF84) # cbnz w4, -16 (to ldaxr)
+    cb = codebuf_emit_u32(cb, 0xD2800020) # mov x0, #1
+    cb = arm64_ret(cb)
+    cb = codebuf_emit_u32(cb, 0xD5033F5F) # clrex
+    cb = codebuf_emit_u32(cb, 0xD2800000) # mov x0, #0
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_exchange32_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0x885F7C02)
+    cb = codebuf_emit_u32(cb, 0x88047C01)
+    cb = codebuf_emit_u32(cb, 0x35FFFFC4)
+    cb = codebuf_emit_u32(cb, 0x2A0203E0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_load64_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0xC8DFFC00)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_store64_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0xC89FFC01)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_add64_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0xC85F7C02)
+    cb = codebuf_emit_u32(cb, 0x8B010043)
+    cb = codebuf_emit_u32(cb, 0xC8047C03)
+    cb = codebuf_emit_u32(cb, 0x35FFFFA4)
+    cb = codebuf_emit_u32(cb, 0xAA0203E0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_sub64_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0xC85F7C02)
+    cb = codebuf_emit_u32(cb, 0xCB010043)
+    cb = codebuf_emit_u32(cb, 0xC8047C03)
+    cb = codebuf_emit_u32(cb, 0x35FFFFA4)
+    cb = codebuf_emit_u32(cb, 0xAA0203E0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_cas64_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0xC85F7C03) # ldaxr x3, [x0]
+    cb = codebuf_emit_u32(cb, 0xEB01007F) # cmp x3, x1
+    cb = codebuf_emit_u32(cb, 0x540000A1) # b.ne +20 (to clrex)
+    cb = codebuf_emit_u32(cb, 0xC8047C02) # stlxr w4, x2, [x0]
+    cb = codebuf_emit_u32(cb, 0x35FFFF84) # cbnz w4, -16 (to ldaxr)
+    cb = codebuf_emit_u32(cb, 0xD2800020) # mov x0, #1
+    cb = arm64_ret(cb)
+    cb = codebuf_emit_u32(cb, 0xD5033F5F) # clrex
+    cb = codebuf_emit_u32(cb, 0xD2800000) # mov x0, #0
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_atomic_exchange64_stub(cb: CodeBuf):
+    cb = codebuf_emit_u32(cb, 0xC85F7C02)
+    cb = codebuf_emit_u32(cb, 0xC8047C01)
+    cb = codebuf_emit_u32(cb, 0x35FFFFC4)
+    cb = codebuf_emit_u32(cb, 0xAA0203E0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_str_len_stub(cb: CodeBuf):
+    # X0 = C-string ptr → X0 = length (excluding NUL)
+    cb = arm64_mov_rr(cb, 1, 0)
+    len_loop = codebuf_offset(cb)
+    cb = arm64_ldrb_uoff(cb, 2, 1, 0)
+    cb = arm64_cmp_imm0(cb, 2)
+    cb = arm64_beq_imm19(cb, 12)
+    cb = arm64_add_imm(cb, 1, 1, 1)
+    delta = (len_loop - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, delta)
+    cb = arm64_sub_rrr(cb, 0, 1, 0)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_str_eq_stub(cb: CodeBuf):
+    # X0 = a, X1 = b → X0 = 1 if equal (as C-strings) else 0
+    eq_loop = codebuf_offset(cb)
+    cb = arm64_ldrb_uoff(cb, 2, 0, 0)
+    cb = arm64_ldrb_uoff(cb, 3, 1, 0)
+    cb = arm64_cmp_rr(cb, 2, 3)
+    cb = arm64_bne_imm19(cb, 24)
+    cb = arm64_cmp_imm0(cb, 2)
+    cb = arm64_beq_imm19(cb, 24)
+    cb = arm64_add_imm(cb, 0, 0, 1)
+    cb = arm64_add_imm(cb, 1, 1, 1)
+    delta = (eq_loop - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, delta)
+    cb = arm64_mov_imm16(cb, 0, 0)
+    cb = arm64_ret(cb)
+    cb = arm64_mov_imm16(cb, 0, 1)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_int_to_str_stub(cb: CodeBuf):
+    # X0 = signed integer n → X0 = ptr to freshly bump-allocated NUL-terminated decimal string
+    # --- allocate 32 bytes: X11 = base ; *X28 += 32 ---
+    cb = arm64_ldr_uoff(cb, 14, 28, 0)
+    cb = arm64_mov_rr(cb, 11, 14)
+    cb = arm64_add_imm(cb, 14, 14, 32)
+    cb = arm64_str_uoff(cb, 14, 28, 0)
+    # --- cursor X10 = base+31, write NUL terminator ---
+    cb = arm64_add_imm(cb, 10, 11, 31)
+    cb = arm64_mov_imm16(cb, 15, 0)
+    cb = arm64_strb_uoff(cb, 15, 10, 0)
+    # --- X9 = n ; X12 = sign flag ---
+    cb = arm64_mov_rr(cb, 9, 0)
+    cb = arm64_mov_imm16(cb, 12, 0)
+    # --- if n < 0: sign=1, n = 0 - n ---
+    cb = arm64_cmp_imm0(cb, 9)
+    cb = arm64_cset_lt(cb, 14)
+    cb = arm64_cmp_imm0(cb, 14)
+    cb = arm64_beq_imm19(cb, 16)
+    cb = arm64_mov_imm16(cb, 12, 1)
+    cb = arm64_mov_imm16(cb, 15, 0)
+    cb = arm64_sub_rrr(cb, 9, 15, 9)
+    # --- digit loop (do-while so 0 produces "0") ---
+    dloop = codebuf_offset(cb)
+    cb = arm64_mov_imm16(cb, 15, 10)
+    cb = arm64_sdiv_rrr(cb, 13, 9, 15)
+    cb = arm64_msub_rrrr(cb, 14, 13, 15, 9)
+    cb = arm64_add_imm(cb, 14, 14, 48)
+    cb = arm64_sub_imm(cb, 10, 10, 1)
+    cb = arm64_strb_uoff(cb, 14, 10, 0)
+    cb = arm64_mov_rr(cb, 9, 13)
+    cb = arm64_cmp_imm0(cb, 9)
+    ddelta = (dloop - codebuf_offset(cb)) as int
+    cb = arm64_bne_imm19(cb, ddelta)
+    # --- prepend '-' when negative ---
+    cb = arm64_cmp_imm0(cb, 12)
+    cb = arm64_beq_imm19(cb, 16)
+    cb = arm64_sub_imm(cb, 10, 10, 1)
+    cb = arm64_mov_imm16(cb, 15, 45)
+    cb = arm64_strb_uoff(cb, 15, 10, 0)
+    # --- return pointer to first char ---
+    cb = arm64_mov_rr(cb, 0, 10)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_str_cat_stub(cb: CodeBuf):
+    # X0 = a, X1 = b → newly bump-allocated NUL-terminated a++b in X0
+    # --- len_a into X2 ---
+    cb = arm64_mov_rr(cb, 9, 0)
+    la = codebuf_offset(cb)
+    cb = arm64_ldrb_uoff(cb, 13, 9, 0)
+    cb = arm64_cmp_imm0(cb, 13)
+    cb = arm64_beq_imm19(cb, 12)
+    cb = arm64_add_imm(cb, 9, 9, 1)
+    dla = (la - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, dla)
+    cb = arm64_sub_rrr(cb, 2, 9, 0)
+    # --- len_b into X3 ---
+    cb = arm64_mov_rr(cb, 10, 1)
+    lb = codebuf_offset(cb)
+    cb = arm64_ldrb_uoff(cb, 13, 10, 0)
+    cb = arm64_cmp_imm0(cb, 13)
+    cb = arm64_beq_imm19(cb, 12)
+    cb = arm64_add_imm(cb, 10, 10, 1)
+    dlb = (lb - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, dlb)
+    cb = arm64_sub_rrr(cb, 3, 10, 1)
+    # --- total = len_a + len_b + 1, aligned up to 8 ---
+    cb = arm64_add_rrr(cb, 4, 2, 3)
+    cb = arm64_add_imm(cb, 4, 4, 1)
+    cb = arm64_add_imm(cb, 4, 4, 7)
+    cb = arm64_mov_imm16(cb, 15, 3)
+    cb = arm64_lsr_rrr(cb, 4, 4, 15)
+    cb = arm64_lsl_imm(cb, 4, 4, 3)
+    # --- bump allocate: X11 = *X28 ; *X28 += total ---
+    cb = arm64_ldr_uoff(cb, 14, 28, 0)
+    cb = arm64_mov_rr(cb, 11, 14)
+    cb = arm64_add_rrr(cb, 14, 14, 4)
+    cb = arm64_str_uoff(cb, 14, 28, 0)
+    # --- copy a into dest (X12 = cursor) ---
+    cb = arm64_mov_rr(cb, 12, 11)
+    cb = arm64_mov_rr(cb, 9, 0)
+    ca = codebuf_offset(cb)
+    cb = arm64_ldrb_uoff(cb, 13, 9, 0)
+    cb = arm64_cmp_imm0(cb, 13)
+    cb = arm64_beq_imm19(cb, 20)
+    cb = arm64_strb_uoff(cb, 13, 12, 0)
+    cb = arm64_add_imm(cb, 9, 9, 1)
+    cb = arm64_add_imm(cb, 12, 12, 1)
+    dca = (ca - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, dca)
+    # --- copy b into dest ---
+    cb = arm64_mov_rr(cb, 10, 1)
+    cbl = codebuf_offset(cb)
+    cb = arm64_ldrb_uoff(cb, 13, 10, 0)
+    cb = arm64_cmp_imm0(cb, 13)
+    cb = arm64_beq_imm19(cb, 20)
+    cb = arm64_strb_uoff(cb, 13, 12, 0)
+    cb = arm64_add_imm(cb, 10, 10, 1)
+    cb = arm64_add_imm(cb, 12, 12, 1)
+    dcb = (cbl - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, dcb)
+    # --- NUL terminate + return dest ---
+    cb = arm64_mov_imm16(cb, 13, 0)
+    cb = arm64_strb_uoff(cb, 13, 12, 0)
+    cb = arm64_mov_rr(cb, 0, 11)
+    out arm64_ret(cb)
+end.
+
+# macOS BSD syscall: X16 = 0x2000000 | num, then svc #0x80
+func emit_x16_bsd_syscall(cb: CodeBuf, num: i64):
+    cb = arm64_mov_imm16(cb, 16, num)
+    cb = codebuf_emit_u32(cb, 0xF2A04010)   # movk x16, #0x200, lsl #16
+    out arm64_svc(cb, 0x80)
+end.
+
+func emit_lir_rt_write_bytes_stub(cb: CodeBuf):
+    # X0=path(cstr), X1=data, X2=len → X0=1 on success
+    cb = arm64_mov_rr(cb, 9, 1)             # save data
+    cb = arm64_mov_rr(cb, 10, 2)            # save len
+    # open(path, O_WRONLY|O_CREAT|O_TRUNC, 0644)
+    cb = arm64_mov_imm16(cb, 1, 1537)       # 0x601
+    cb = arm64_mov_imm16(cb, 2, 420)        # 0644
+    cb = emit_x16_bsd_syscall(cb, 5)        # open → X0=fd
+    cb = arm64_mov_rr(cb, 11, 0)            # save fd
+    # write(fd, data, len)
+    cb = arm64_mov_rr(cb, 0, 11)
+    cb = arm64_mov_rr(cb, 1, 9)
+    cb = arm64_mov_rr(cb, 2, 10)
+    cb = emit_x16_bsd_syscall(cb, 4)        # write
+    # close(fd)
+    cb = arm64_mov_rr(cb, 0, 11)
+    cb = emit_x16_bsd_syscall(cb, 6)        # close
+    cb = arm64_mov_imm16(cb, 0, 1)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_slurp_len_stub(cb: CodeBuf):
+    # X0=path(cstr) → X0=file length in bytes
+    # open(path, O_RDONLY, 0)
+    cb = arm64_mov_imm16(cb, 1, 0)
+    cb = arm64_mov_imm16(cb, 2, 0)
+    cb = emit_x16_bsd_syscall(cb, 5)        # open → X0=fd
+    cb = arm64_mov_rr(cb, 9, 0)             # save fd
+    # lseek(fd, 0, SEEK_END)
+    cb = arm64_mov_rr(cb, 0, 9)
+    cb = arm64_mov_imm16(cb, 1, 0)
+    cb = arm64_mov_imm16(cb, 2, 2)          # SEEK_END
+    cb = emit_x16_bsd_syscall(cb, 199)      # lseek → X0=len
+    cb = arm64_mov_rr(cb, 10, 0)            # save len
+    # close(fd)
+    cb = arm64_mov_rr(cb, 0, 9)
+    cb = emit_x16_bsd_syscall(cb, 6)        # close
+    cb = arm64_mov_rr(cb, 0, 10)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_slurp_file_stub(cb: CodeBuf):
+    # X0=path(cstr), X1=buf, X2=len → X0=1 on success
+    cb = arm64_mov_rr(cb, 9, 1)             # save buf
+    cb = arm64_mov_rr(cb, 10, 2)            # save len
+    # open(path, O_RDONLY, 0)
+    cb = arm64_mov_imm16(cb, 1, 0)
+    cb = arm64_mov_imm16(cb, 2, 0)
+    cb = emit_x16_bsd_syscall(cb, 5)        # open → X0=fd
+    cb = arm64_mov_rr(cb, 11, 0)            # save fd
+    # read(fd, buf, len)
+    cb = arm64_mov_rr(cb, 0, 11)
+    cb = arm64_mov_rr(cb, 1, 9)
+    cb = arm64_mov_rr(cb, 2, 10)
+    cb = emit_x16_bsd_syscall(cb, 3)        # read
+    # close(fd)
+    cb = arm64_mov_rr(cb, 0, 11)
+    cb = emit_x16_bsd_syscall(cb, 6)        # close
+    cb = arm64_mov_imm16(cb, 0, 1)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_stubs(cb: CodeBuf, offs: i64, is_linux: i64):
+    var k = 0
+    when k < LIR_RT_STUB_COUNT loop
+        offs = vec_push_rt(offs, codebuf_offset(cb) as i64)
+        if k == LIR_RT_UNRESOLVED do
+            cb = arm64_movz_imm64(cb, 0, 0)
+            cb = arm64_ret(cb)
+        eif k == MIR_INTR_PRINT do
+            cb = emit_lir_rt_print_stub(cb, is_linux)
+        eif k == LIR_RT_NATIVE_READ_U8 do
+            cb = emit_lir_rt_read_u8_stub(cb)
+        eif k == LIR_RT_NATIVE_WRITE_U8 do
+            cb = emit_lir_rt_write_u8_stub(cb)
+        eif k == LIR_RT_NATIVE_READ_I64 do
+            cb = emit_lir_rt_read_i64_stub(cb)
+        eif k == LIR_RT_NATIVE_WRITE_I64 do
+            cb = emit_lir_rt_write_i64_stub(cb)
+        eif k == LIR_RT_POW do
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_MATMUL do
+            cb = arm64_movz_imm64(cb, 0, 0)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_FMA do
+            cb = arm64_add_rrr(cb, 0, 0, 1)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_ALLOC do
+            cb = emit_lir_rt_alloc_stub(cb)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_PRINT_STR do
+            cb = emit_lir_rt_print_str_stub(cb, is_linux)
+        eif k == LIR_RT_GET_ARG do
+            cb = emit_lir_rt_get_arg_stub(cb)
+        eif k == LIR_RT_ARG_COUNT do
+            cb = emit_lir_rt_arg_count_stub(cb)
+        eif k == LIR_RT_VOLATILE_READ do
+            cb = emit_lir_rt_volatile_read_stub(cb)
+        eif k == LIR_RT_VOLATILE_WRITE do
+            cb = emit_lir_rt_volatile_write_stub(cb)
+        eif k == LIR_RT_VOLATILE_READ8 do
+            cb = emit_lir_rt_volatile_read8_stub(cb)
+        eif k == LIR_RT_VOLATILE_WRITE8 do
+            cb = emit_lir_rt_volatile_write8_stub(cb)
+        eif k == LIR_RT_DMB do
+            cb = arm64_dmb_sy(cb)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_DSB do
+            cb = arm64_dsb_sy(cb)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_ISB do
+            cb = arm64_isb(cb)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_WFI do
+            cb = arm64_wfi(cb)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_WFE do
+            cb = arm64_wfe(cb)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_SEV do
+            cb = arm64_sev(cb)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_NOP do
+            cb = arm64_nop(cb)
+            cb = arm64_ret(cb)
+        eif k == LIR_RT_ATOMIC_LOAD32 do
+            cb = emit_lir_rt_atomic_load32_stub(cb)
+        eif k == LIR_RT_ATOMIC_STORE32 do
+            cb = emit_lir_rt_atomic_store32_stub(cb)
+        eif k == LIR_RT_ATOMIC_ADD32 do
+            cb = emit_lir_rt_atomic_add32_stub(cb)
+        eif k == LIR_RT_ATOMIC_SUB32 do
+            cb = emit_lir_rt_atomic_sub32_stub(cb)
+        eif k == LIR_RT_ATOMIC_CAS32 do
+            cb = emit_lir_rt_atomic_cas32_stub(cb)
+        eif k == LIR_RT_ATOMIC_EXCHANGE32 do
+            cb = emit_lir_rt_atomic_exchange32_stub(cb)
+        eif k == LIR_RT_ATOMIC_LOAD64 do
+            cb = emit_lir_rt_atomic_load64_stub(cb)
+        eif k == LIR_RT_ATOMIC_STORE64 do
+            cb = emit_lir_rt_atomic_store64_stub(cb)
+        eif k == LIR_RT_ATOMIC_ADD64 do
+            cb = emit_lir_rt_atomic_add64_stub(cb)
+        eif k == LIR_RT_ATOMIC_SUB64 do
+            cb = emit_lir_rt_atomic_sub64_stub(cb)
+        eif k == LIR_RT_ATOMIC_CAS64 do
+            cb = emit_lir_rt_atomic_cas64_stub(cb)
+        eif k == LIR_RT_ATOMIC_EXCHANGE64 do
+            cb = emit_lir_rt_atomic_exchange64_stub(cb)
+        eif k == LIR_RT_STR_LEN do
+            cb = emit_lir_rt_str_len_stub(cb)
+        eif k == LIR_RT_STR_CAT do
+            cb = emit_lir_rt_str_cat_stub(cb)
+        eif k == LIR_RT_STR_EQ do
+            cb = emit_lir_rt_str_eq_stub(cb)
+        eif k == LIR_RT_WRITE_BYTES do
+            cb = emit_lir_rt_write_bytes_stub(cb)
+        eif k == LIR_RT_SLURP_LEN do
+            cb = emit_lir_rt_slurp_len_stub(cb)
+        eif k == LIR_RT_SLURP_FILE do
+            cb = emit_lir_rt_slurp_file_stub(cb)
+        eif k == LIR_RT_INT_TO_STR do
+            cb = emit_lir_rt_int_to_str_stub(cb)
+        else
+            cb = arm64_ret(cb)
+        end
+        k = k + 1
+    end
+    out cb
+end.
+
+func emit_callee_save(cb: CodeBuf, max_phys: i64):
+    if max_phys >= 19 do
+        cb = arm64_stp_pre(cb, 19, 20, 31, 0 - 16)
+    end
+    if max_phys >= 21 do
+        cb = arm64_stp_pre(cb, 21, 22, 31, 0 - 16)
+    end
+    if max_phys >= 23 do
+        cb = arm64_stp_pre(cb, 23, 24, 31, 0 - 16)
+    end
+    if max_phys >= 25 do
+        cb = arm64_stp_pre(cb, 25, 26, 31, 0 - 16)
+    end
+    if max_phys >= 27 do
+        cb = arm64_stp_pre(cb, 27, 28, 31, 0 - 16)
+    end
+    out cb
+end.
+
+func emit_callee_restore(cb: CodeBuf, max_phys: i64):
+    if max_phys >= 27 do
+        cb = arm64_ldp_post(cb, 27, 28, 31, 16)
+    end
+    if max_phys >= 25 do
+        cb = arm64_ldp_post(cb, 25, 26, 31, 16)
+    end
+    if max_phys >= 23 do
+        cb = arm64_ldp_post(cb, 23, 24, 31, 16)
+    end
+    if max_phys >= 21 do
+        cb = arm64_ldp_post(cb, 21, 22, 31, 16)
+    end
+    if max_phys >= 19 do
+        cb = arm64_ldp_post(cb, 19, 20, 31, 16)
+    end
+    out cb
+end.
+
+func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir_funcs: i64, call_fixups: i64, str_fixups: i64):
+    # Record function entry offset for TCO self-branch target.
+    func_entry_off = codebuf_offset(cb) as i64
+    f_blocks = native_read_i64(func_obj as i64, 16)
+    n_blocks = vec_len_rt(f_blocks)
+
+    var max_phys = 0
+    var bi_sc = 0
+    when bi_sc < n_blocks loop
+        b_sc = vec_get_rt(f_blocks, bi_sc)
+        instrs_sc = native_read_i64(b_sc as i64, 8)
+        n_ins_sc = vec_len_rt(instrs_sc)
+        var ii_sc = 0
+        when ii_sc < n_ins_sc loop
+            ins_sc = vec_get_rt(instrs_sc, ii_sc)
+            d_sc = native_read_i64(ins_sc as i64, 16)
+            s1_sc = native_read_i64(ins_sc as i64, 24)
+            s2_sc = native_read_i64(ins_sc as i64, 32)
+            if d_sc != 0 do
+                typ_d = native_read_i64(d_sc, 0)
+                if typ_d == 2 do
+                    vr = native_read_i64(d_sc, 16)
+                    if vr >= 19 and vr <= 28 and vr > max_phys do max_phys = vr end
+                eif typ_d == 1 do
+                    vid = native_read_i64(d_sc, 8)
+                    if assigned_phys != 0 and vid >= 0 and vid < vec_len_rt(assigned_phys) do
+                        col = vec_get_rt(assigned_phys, vid)
+                        if col >= 0 and col < 9 do
+                            vr = 19 + col
+                            if vr > max_phys do max_phys = vr end
+                        end
+                    end
+                end
+            end
+            if s1_sc != 0 do
+                typ_s1 = native_read_i64(s1_sc, 0)
+                if typ_s1 == 2 do
+                    vr = native_read_i64(s1_sc, 16)
+                    if vr >= 19 and vr <= 28 and vr > max_phys do max_phys = vr end
+                eif typ_s1 == 1 do
+                    vid = native_read_i64(s1_sc, 8)
+                    if assigned_phys != 0 and vid >= 0 and vid < vec_len_rt(assigned_phys) do
+                        col = vec_get_rt(assigned_phys, vid)
+                        if col >= 0 and col < 9 do
+                            vr = 19 + col
+                            if vr > max_phys do max_phys = vr end
+                        end
+                    end
+                end
+            end
+            if s2_sc != 0 do
+                typ_s2 = native_read_i64(s2_sc, 0)
+                if typ_s2 == 2 do
+                    vr = native_read_i64(s2_sc, 16)
+                    if vr >= 19 and vr <= 28 and vr > max_phys do max_phys = vr end
+                eif typ_s2 == 1 do
+                    vid = native_read_i64(s2_sc, 8)
+                    if assigned_phys != 0 and vid >= 0 and vid < vec_len_rt(assigned_phys) do
+                        col = vec_get_rt(assigned_phys, vid)
+                        if col >= 0 and col < 9 do
+                            vr = 19 + col
+                            if vr > max_phys do max_phys = vr end
+                        end
+                    end
+                end
+            end
+            ii_sc = ii_sc + 1
+        end
+        bi_sc = bi_sc + 1
+    end
+
+    cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+    cb = arm64_mov_from_sp(cb, 29)
+    cb = emit_callee_save(cb, max_phys)
+
+    stack_size = lir_func_stack_size(func_obj)
+    if (stack_size mod 16) != 0 do
+        stack_size = stack_size + (16 - (stack_size mod 16))
+    end
+    if stack_size > 0 and stack_size <= 4095 do
+        cb = arm64_sub_imm(cb, 31, 31, stack_size as int)
+    end
+
+    f_blocks = native_read_i64(func_obj as i64, 16)
+    n_blocks = vec_len_rt(f_blocks)
+    var max_bid = n_blocks
+    var bi = 0
+    when bi < n_blocks loop
+        b = vec_get_rt(f_blocks, bi)
+        bid = native_read_i64(b as i64, 0)
+        if bid >= max_bid do
+            max_bid = bid + 1
+        end
+        bi = bi + 1
+    end
+    block_off = vec_new_cap_rt(1024)
+    var bi2 = 0
+    when bi2 < max_bid loop
+        block_off = vec_push_rt(block_off, 0 - 1)
+        bi2 = bi2 + 1
+    end
+    fixups = vec_new_cap_rt(1024)
+    var pending_stk = 0
+    SCR = 9
+    SCR2 = 10
+    SCRQ = 11
+    SCRD = 12
+
+    var bi = 0
+    var last_cmp_pred = 0 - 1
+    var last_cmp_dst = 0
+    recent_setargs = vec_new_cap_rt(8)
+    vec_push_rt(recent_setargs, 0)
+    vec_push_rt(recent_setargs, 0)
+    vec_push_rt(recent_setargs, 0)
+    vec_push_rt(recent_setargs, 0)
+    reg_const_val = vec_new_cap_rt(32)
+    reg_shl_src = vec_new_cap_rt(32)
+    reg_shl_amt = vec_new_cap_rt(32)
+    reg_shr_src = vec_new_cap_rt(32)
+    reg_shr_amt = vec_new_cap_rt(32)
+    var rci = 0
+    when rci < 32 loop
+        vec_push_rt(reg_const_val, 0 - 1)
+        vec_push_rt(reg_shl_src, 0 - 1)
+        vec_push_rt(reg_shl_amt, 0)
+        vec_push_rt(reg_shr_src, 0 - 1)
+        vec_push_rt(reg_shr_amt, 0)
+        rci = rci + 1
+    end
+    when bi < n_blocks loop
+        b = vec_get_rt(f_blocks, bi)
+        bid = native_read_i64(b as i64, 0)
+        vec_set_rt(block_off, bid, codebuf_offset(cb) as i64)
+        instrs = native_read_i64(b as i64, 8)
+        n_instrs = vec_len_rt(instrs)
+        var ii = 0
+        when ii < n_instrs loop
+            ins = vec_get_rt(instrs, ii)
+            op = native_read_i64(ins as i64, 0)
+            ins_dst = native_read_i64(ins as i64, 16)
+            ins_src1 = native_read_i64(ins as i64, 24)
+            ins_src2 = native_read_i64(ins as i64, 32)
+            ins_aux = native_read_i64(ins as i64, 40)
+            rd = resolve_reg(ins_dst, assigned_phys)
+            # Spilled destination: compute into SCRD, store to slot after the op.
+            rd_spill = lir_opnd_spill_off(ins_dst)
+            if rd_spill < 0 do
+                rd = SCRD
+            end
+            # Spilled sources: reload into scratch so every consumer sees a reg.
+            # Use X14/X15 (not X9/X10) to avoid the temps used by INDEX/FIELD
+            # intrinsics and arithmetic operand materialization.
+            rs1 = robust_src_reg(cb, ins_src1, assigned_phys, 14)
+            rs2 = robust_src_reg(cb, ins_src2, assigned_phys, 15)
+
+            if op == LirOp.Nop do
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Mov do
+                is_mov_fused = 0
+                if (ins_src1 as i64) != 0 do
+                    src1_typ = native_read_i64(ins_src1 as i64, 0)
+                    if src1_typ == 4 or src1_typ == 5 do
+                        imm_val = native_read_i64(ins_src1 as i64, 32)
+                        if imm_val == 4294967295 and ii > 0 and (ii + 1) < n_instrs do
+                            p_ins = vec_get_rt(instrs, ii - 1)
+                            nxt_ins = vec_get_rt(instrs, ii + 1)
+                            if native_read_i64(p_ins as i64, 0) == (LirOp.Mul as i64) and native_read_i64(nxt_ins as i64, 0) == (LirOp.And as i64) do
+                                is_mov_fused = 1
+                            end
+                        end
+                        if rd >= 0 and rd < 32 do
+                            vec_set_rt(reg_const_val, rd, imm_val)
+                        end
+                        if is_mov_fused == 0 and rd >= 0 do
+                            cb = arm64_movz_imm64(cb, rd as int, imm_val as int)
+                        end
+                    eif rd >= 0 and rs1 >= 0 do
+                        if rd < 32 and rs1 < 32 do
+                            vec_set_rt(reg_const_val, rd, vec_get_rt(reg_const_val, rs1))
+                            vec_set_rt(reg_shl_src, rd, vec_get_rt(reg_shl_src, rs1))
+                            vec_set_rt(reg_shl_amt, rd, vec_get_rt(reg_shl_amt, rs1))
+                            vec_set_rt(reg_shr_src, rd, vec_get_rt(reg_shr_src, rs1))
+                            vec_set_rt(reg_shr_amt, rd, vec_get_rt(reg_shr_amt, rs1))
+                        end
+                        if rd != rs1 do
+                            cb = arm64_mov_rr(cb, rd as int, rs1 as int)
+                        end
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Add do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                is_imm_add = 0
+                imm_v = 0 - 1
+                if (ins_src2 as i64) != 0 do
+                    s2_typ = native_read_i64(ins_src2 as i64, 0)
+                    if s2_typ == 4 or s2_typ == 5 do
+                        imm_v = native_read_i64(ins_src2 as i64, 32)
+                    end
+                end
+                if imm_v < 0 and rs2 >= 0 and rs2 < 32 do
+                    imm_v = vec_get_rt(reg_const_val, rs2)
+                end
+                if imm_v >= 0 and imm_v <= 4095 and rd >= 0 and a >= 0 do
+                    cb = arm64_add_imm(cb, rd as int, a as int, imm_v as int)
+                    is_imm_add = 1
+                end
+                if is_imm_add == 0 do
+                    breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_add_rrr(cb, rd as int, a as int, breg as int)
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Sub do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                is_imm_sub = 0
+                imm_v = 0 - 1
+                if (ins_src2 as i64) != 0 do
+                    s2_typ = native_read_i64(ins_src2 as i64, 0)
+                    if s2_typ == 4 or s2_typ == 5 do
+                        imm_v = native_read_i64(ins_src2 as i64, 32)
+                    end
+                end
+                if imm_v < 0 and rs2 >= 0 and rs2 < 32 do
+                    imm_v = vec_get_rt(reg_const_val, rs2)
+                end
+                if imm_v >= 0 and imm_v <= 4095 and rd >= 0 and a >= 0 do
+                    cb = arm64_sub_imm(cb, rd as int, a as int, imm_v as int)
+                    is_imm_sub = 1
+                end
+                if is_imm_sub == 0 do
+                    breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_sub_rrr(cb, rd as int, a as int, breg as int)
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Mul do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                is_fused_32bit_mul = 0
+                if (ii + 2) < n_instrs do
+                    mov_ins = vec_get_rt(instrs, ii + 1)
+                    and_ins = vec_get_rt(instrs, ii + 2)
+                    if native_read_i64(mov_ins as i64, 0) == 1 and native_read_i64(and_ins as i64, 0) == (LirOp.And as i64) do
+                        m_src1 = native_read_i64(mov_ins as i64, 24)
+                        m_dst = native_read_i64(mov_ins as i64, 16)
+                        if (m_src1 as i64) != 0 do
+                            if native_read_i64(m_src1 as i64, 0) == 4 and native_read_i64(m_src1 as i64, 32) == 4294967295 do
+                                a_s1 = native_read_i64(and_ins as i64, 24)
+                                a_s2 = native_read_i64(and_ins as i64, 32)
+                                a_dst = native_read_i64(and_ins as i64, 16)
+                                if (lir_opnd_matches(ins_dst, a_s1) == 1 and lir_opnd_matches(m_dst, a_s2) == 1) or (lir_opnd_matches(ins_dst, a_s2) == 1 and lir_opnd_matches(m_dst, a_s1) == 1) do
+                                    n_rd = -1
+                                    if a_dst != 0 do
+                                        if native_read_i64(a_dst, 0) == 1 do
+                                            v_id = native_read_i64(a_dst, 8)
+                                            if v_id >= 0 and v_id < vec_len_rt(assigned_phys) do
+                                                p_c = vec_get_rt(assigned_phys, v_id)
+                                                if p_c >= 0 do n_rd = color_to_phys(p_c) end
+                                            end
+                                        eif native_read_i64(a_dst, 0) == 2 do
+                                            n_rd = native_read_i64(a_dst, 16)
+                                        end
+                                    end
+                                    target_rd = rd
+                                    if n_rd >= 0 do target_rd = n_rd end
+                                    if target_rd >= 0 and a >= 0 and breg >= 0 do
+                                        mul_w = 0x1B007C00 bit_or ((breg as int bit_and 0x1F) shl 16) bit_or ((a as int bit_and 0x1F) shl 5) bit_or (target_rd as int bit_and 0x1F)
+                                        cb = codebuf_emit_u32(cb, mul_w)
+                                        is_fused_32bit_mul = 1
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                if is_fused_32bit_mul == 0 and (ii + 1) < n_instrs do
+                    next_ins = vec_get_rt(instrs, ii + 1)
+                    if native_read_i64(next_ins as i64, 0) == (LirOp.And as i64) do
+                        n_s1 = native_read_i64(next_ins as i64, 24)
+                        n_s2 = native_read_i64(next_ins as i64, 32)
+                        n_dst = native_read_i64(next_ins as i64, 16)
+                        var mask_val = 0 - 1
+                        if (n_s2 as i64) != 0 do
+                            if native_read_i64(n_s2 as i64, 0) == 4 do
+                                mask_val = native_read_i64(n_s2 as i64, 32)
+                            end
+                        end
+                        if mask_val == 4294967295 and lir_opnd_matches(ins_dst, n_s1) == 1 do
+                            n_rd = -1
+                            if n_dst != 0 do
+                                if native_read_i64(n_dst, 0) == 1 do
+                                    v_id = native_read_i64(n_dst, 8)
+                                    if v_id >= 0 and v_id < vec_len_rt(assigned_phys) do
+                                        p_c = vec_get_rt(assigned_phys, v_id)
+                                        if p_c >= 0 do n_rd = color_to_phys(p_c) end
+                                    end
+                                eif native_read_i64(n_dst, 0) == 2 do
+                                    n_rd = native_read_i64(n_dst, 16)
+                                end
+                            end
+                            target_rd = rd
+                            if n_rd >= 0 do target_rd = n_rd end
+                            if target_rd >= 0 and a >= 0 and breg >= 0 do
+                                mul_w = 0x1B007C00 bit_or ((breg as int bit_and 0x1F) shl 16) bit_or ((a as int bit_and 0x1F) shl 5) bit_or (target_rd as int bit_and 0x1F)
+                                cb = codebuf_emit_u32(cb, mul_w)
+                                is_fused_32bit_mul = 1
+                            end
+                        end
+                    end
+                end
+                if is_fused_32bit_mul == 0 do
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_mul_rrr(cb, rd as int, a as int, breg as int)
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Div do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_sdiv_rrr(cb, rd as int, a as int, breg as int)
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Rem do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_sdiv_rrr(cb, SCRQ, a as int, breg as int)
+                    cb = arm64_msub_rrrr(cb, rd as int, SCRQ, breg as int, a as int)
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.And do
+                is_prev_fused = 0
+                var is_32bit_mask = 0
+                if (ins_src2 as i64) != 0 do
+                    if native_read_i64(ins_src2 as i64, 0) == 4 and native_read_i64(ins_src2 as i64, 32) == 4294967295 do
+                        is_32bit_mask = 1
+                    end
+                end
+                if is_32bit_mask == 0 and rs2 >= 0 and rs2 < 32 do
+                    if vec_get_rt(reg_const_val, rs2) == 4294967295 do
+                        is_32bit_mask = 1
+                    end
+                end
+                if is_32bit_mask == 1 do
+                    if ii > 0 do
+                        prev_ins = vec_get_rt(instrs, ii - 1)
+                        if native_read_i64(prev_ins as i64, 0) == (LirOp.Mul as i64) do
+                            is_prev_fused = 1
+                        end
+                    end
+                    if is_prev_fused == 0 and ii > 1 do
+                        prev2_ins = vec_get_rt(instrs, ii - 2)
+                        if native_read_i64(prev2_ins as i64, 0) == (LirOp.Mul as i64) do
+                            is_prev_fused = 1
+                        end
+                    end
+                end
+                if is_prev_fused == 0 do
+                    is_mask_imm = 0
+                    mask_v = 0 - 1
+                    var var_opnd = ins_src1
+                    if (ins_src2 as i64) != 0 do
+                        s2_typ = native_read_i64(ins_src2 as i64, 0)
+                        if s2_typ == 4 or s2_typ == 5 do
+                            mask_v = native_read_i64(ins_src2 as i64, 32)
+                            var_opnd = ins_src1
+                        end
+                    end
+                    if mask_v < 0 and (ins_src1 as i64) != 0 do
+                        s1_typ = native_read_i64(ins_src1 as i64, 0)
+                        if s1_typ == 4 or s1_typ == 5 do
+                            mask_v = native_read_i64(ins_src1 as i64, 32)
+                            var_opnd = ins_src2
+                        end
+                    end
+                    if mask_v == 255 or mask_v == 4095 or mask_v == 65535 or mask_v == 4294967295 do
+                        vreg = resolve_or_imm_reg(cb, var_opnd, assigned_phys, SCR)
+                        if rd >= 0 and vreg >= 0 do
+                            cb = arm64_and_mask(cb, rd as int, vreg as int, mask_v)
+                            is_mask_imm = 1
+                        end
+                    end
+                    if is_mask_imm == 0 do
+                        a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                        breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                        if rd >= 0 and a >= 0 and breg >= 0 do
+                            cb = arm64_and_rrr(cb, rd as int, a as int, breg as int)
+                        end
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                    is_32bit_and = 0
+                    if mask_v == 4294967295 or mask_v == 0xFFFFFFFF do
+                        is_32bit_and = 1
+                    end
+                    if is_32bit_and == 0 and rs2 >= 0 and rs2 < 32 do
+                        if vec_get_rt(reg_const_val, rs2) == 4294967295 or vec_get_rt(reg_const_val, rs2) == 0xFFFFFFFF do
+                            is_32bit_and = 1
+                        end
+                    end
+                    if is_32bit_and == 1 and rs1 >= 0 and rs1 < 32 do
+                        vec_set_rt(reg_shl_src, rd, vec_get_rt(reg_shl_src, rs1))
+                        vec_set_rt(reg_shl_amt, rd, vec_get_rt(reg_shl_amt, rs1))
+                        vec_set_rt(reg_shr_src, rd, vec_get_rt(reg_shr_src, rs1))
+                        vec_set_rt(reg_shr_amt, rd, vec_get_rt(reg_shr_amt, rs1))
+                    else
+                        vec_set_rt(reg_shl_src, rd, 0 - 1)
+                        vec_set_rt(reg_shr_src, rd, 0 - 1)
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Or do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                is_ror = 0
+                if a >= 0 and a < 32 and breg >= 0 and breg < 32 and rd >= 0 do
+                    shl_src_a = vec_get_rt(reg_shl_src, a)
+                    shr_src_b = vec_get_rt(reg_shr_src, breg)
+                    shl_amt_a = vec_get_rt(reg_shl_amt, a)
+                    shr_amt_b = vec_get_rt(reg_shr_amt, breg)
+                    if shl_src_a >= 0 and shl_src_a == shr_src_b and (shl_amt_a + shr_amt_b == 32) do
+                        shift = 32 - shl_amt_a
+                        cb = arm64_ror_imm32(cb, rd as int, shl_src_a as int, shift as int)
+                        is_ror = 1
+                    else
+                        shr_src_a = vec_get_rt(reg_shr_src, a)
+                        shl_src_b = vec_get_rt(reg_shl_src, breg)
+                        shr_amt_a = vec_get_rt(reg_shr_amt, a)
+                        shl_amt_b = vec_get_rt(reg_shl_amt, breg)
+                        if shr_src_a >= 0 and shr_src_a == shl_src_b and (shr_amt_a + shl_amt_b == 32) do
+                            shift = 32 - shl_amt_b
+                            cb = arm64_ror_imm32(cb, rd as int, shr_src_a as int, shift as int)
+                            is_ror = 1
+                        end
+                    end
+                end
+                if is_ror == 0 do
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_orr_rrr(cb, rd as int, a as int, breg as int)
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                    vec_set_rt(reg_shl_src, rd, 0 - 1)
+                    vec_set_rt(reg_shr_src, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Xor do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                is_eor_lsr = 0
+                if rd >= 0 and a >= 0 and breg >= 0 and breg < 32 do
+                    shr_src_b = vec_get_rt(reg_shr_src, breg)
+                    shr_amt_b = vec_get_rt(reg_shr_amt, breg)
+                    if shr_src_b >= 0 and shr_amt_b > 0 and shr_amt_b < 64 do
+                        cb = arm64_eor_lsr64(cb, rd as int, a as int, shr_src_b as int, shr_amt_b as int)
+                        is_eor_lsr = 1
+                    end
+                end
+                if is_eor_lsr == 0 do
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_eor_rrr(cb, rd as int, a as int, breg as int)
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                    vec_set_rt(reg_shl_src, rd, 0 - 1)
+                    vec_set_rt(reg_shr_src, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Shl do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                shl_k = 0 - 1
+                if (ins_src2 as i64) != 0 do
+                    s2_typ = native_read_i64(ins_src2 as i64, 0)
+                    if s2_typ == 4 or s2_typ == 5 do
+                        shl_k = native_read_i64(ins_src2 as i64, 32)
+                    end
+                end
+                if shl_k < 0 and rs2 >= 0 and rs2 < 32 do
+                    shl_k = vec_get_rt(reg_const_val, rs2)
+                end
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_lsl_rrr(cb, rd as int, a as int, breg as int)
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                    if a >= 0 and shl_k > 0 and shl_k < 32 do
+                        vec_set_rt(reg_shl_src, rd, a)
+                        vec_set_rt(reg_shl_amt, rd, shl_k)
+                    else
+                        vec_set_rt(reg_shl_src, rd, 0 - 1)
+                    end
+                    vec_set_rt(reg_shr_src, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Shr do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                shr_m = 0 - 1
+                if (ins_src2 as i64) != 0 do
+                    s2_typ = native_read_i64(ins_src2 as i64, 0)
+                    if s2_typ == 4 or s2_typ == 5 do
+                        shr_m = native_read_i64(ins_src2 as i64, 32)
+                    end
+                end
+                if shr_m < 0 and rs2 >= 0 and rs2 < 32 do
+                    shr_m = vec_get_rt(reg_const_val, rs2)
+                end
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_lsr_rrr(cb, rd as int, a as int, breg as int)
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                    if a >= 0 and shr_m > 0 and shr_m < 32 do
+                        vec_set_rt(reg_shr_src, rd, a)
+                        vec_set_rt(reg_shr_amt, rd, shr_m)
+                    else
+                        vec_set_rt(reg_shr_src, rd, 0 - 1)
+                    end
+                    vec_set_rt(reg_shl_src, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Not do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                if rd >= 0 and a >= 0 do
+                    cb = arm64_mvn_rr(cb, rd as int, a as int)
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Pow do
+                cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_POW, rd)
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.MatMul do
+                cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_MATMUL, rd)
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Fma do
+                cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_FMA, rd)
+                last_cmp_pred = 0 - 1
+            # TCO: self-recursive tail-call — emit B <func_entry> instead of BL+RET.
+            # Arguments must already be in X0..X7 via preceding SetArg instructions.
+            # We restore the frame before branching so the callee sees a clean state.
+            eif op == LirOp.TailCall do
+                # Restore stack pointer to pre-prologue state
+                if stack_size > 0 and stack_size <= 4095 do
+                    cb = arm64_add_imm(cb, 31, 31, stack_size as int)
+                end
+                cb = emit_callee_restore(cb, max_phys)
+                # Restore FP/LR that were saved in prologue
+                cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+                # Re-enter the function at its first instruction (after prologue saves).
+                # This is a guaranteed backward branch so offset is negative.
+                at_tco = codebuf_offset(cb) as i64
+                cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+                cb = arm64_mov_from_sp(cb, 29)
+                cb = emit_callee_save(cb, max_phys)
+                if stack_size > 0 and stack_size <= 4095 do
+                    cb = arm64_sub_imm(cb, 31, 31, stack_size as int)
+                end
+                # Branch back to body start (first block after prologue), using a fixup.
+                at_jmp = codebuf_offset(cb) as i64
+                cb = arm64_b_imm26(cb, 0)
+                fixups = vec_push_rt(fixups, lir_fixup_new(at_jmp, 0, 0))
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Cmp do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                is_imm_cmp = 0
+                imm_v = 0 - 1
+                if (ins_src2 as i64) != 0 do
+                    s2_typ = native_read_i64(ins_src2 as i64, 0)
+                    if s2_typ == 4 or s2_typ == 5 do
+                        imm_v = native_read_i64(ins_src2 as i64, 32)
+                    end
+                end
+                if imm_v < 0 and rs2 >= 0 and rs2 < 32 do
+                    imm_v = vec_get_rt(reg_const_val, rs2)
+                end
+                if imm_v >= 0 and imm_v <= 4095 and a >= 0 do
+                    cb = arm64_cmp_imm(cb, a as int, imm_v as int)
+                    is_imm_cmp = 1
+                end
+                if is_imm_cmp == 0 do
+                    b_val = resolve_or_imm_reg(cb, ins_src2, assigned_phys, 10)
+                    if a >= 0 and b_val >= 0 do
+                        cb = arm64_cmp_rr(cb, a as int, b_val as int)
+                    end
+                end
+                is_fused = 0
+                if (ii + 1) < n_instrs do
+                    next_ins = vec_get_rt(instrs, ii + 1)
+                    if native_read_i64(next_ins as i64, 0) == (LirOp.JmpCond as i64) do
+                        next_src1 = native_read_i64(next_ins as i64, 24)
+                        if lir_opnd_matches(ins_dst, next_src1) == 1 do
+                            is_fused = 1
+                            last_cmp_pred = ins_aux
+                            last_cmp_dst = ins_dst
+                        end
+                    end
+                end
+                if is_fused == 0 do
+                    last_cmp_pred = 0 - 1
+                    if rd >= 0 do
+                        if ins_aux == LIR_CMP_EQ do
+                            cb = arm64_cset_eq(cb, rd as int)
+                        eif ins_aux == LIR_CMP_NE do
+                            cb = arm64_cset_ne(cb, rd as int)
+                        eif ins_aux == LIR_CMP_GT do
+                            cb = arm64_cset_gt(cb, rd as int)
+                        eif ins_aux == LIR_CMP_LT do
+                            cb = arm64_cset_lt(cb, rd as int)
+                        eif ins_aux == LIR_CMP_GE do
+                            cb = arm64_cset_ge(cb, rd as int)
+                        eif ins_aux == LIR_CMP_LE do
+                            cb = arm64_cset_le(cb, rd as int)
+                        end
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+            eif op == LirOp.Load do
+                if rd >= 0 and rs1 >= 0 do
+                    cb = codebuf_emit_u32(cb, 0xF9400000 bit_or ((rs1 as int bit_and 0x1F) shl 5) bit_or (rd as int bit_and 0x1F))
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Store do
+                if rs1 >= 0 and rs2 >= 0 do
+                    cb = codebuf_emit_u32(cb, 0xF9000000 bit_or ((rs2 as int bit_and 0x1F) shl 5) bit_or (rs1 as int bit_and 0x1F))
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Push do
+                rval = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                if rval >= 0 do
+                    cb = arm64_str_pre(cb, rval as int, 31, 0 - 16)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.SetArg do
+                ai = native_read_i64(ins as i64, 40)
+                s1_arg = native_read_i64(ins as i64, 24)
+                if (s1_arg as i64) != 0 do
+                    if native_read_i64(s1_arg as i64, 0) == 4 do
+                        ai = native_read_i64(s1_arg as i64, 32)
+                    end
+                end
+                s2_arg = native_read_i64(ins as i64, 32)
+                if ai >= 0 and ai < 4 do
+                    vec_set_rt(recent_setargs, ai, s2_arg)
+                end
+                if is_inlined_builtin_arg(instrs, ii, n_instrs) == 0 do
+                    pending_stk = emit_lir_setarg(cb, ins, assigned_phys, pending_stk)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Pop do
+                if rd >= 0 do
+                    cb = arm64_ldr_post(cb, rd as int, 31, 16)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Call do
+                pending_stk = emit_lir_call(cb, ins, rd, func_obj, lir_funcs, call_fixups, pending_stk)
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Intrinsic do
+                cb = emit_lir_intrinsic(cb, ins, rd, rs1, assigned_phys, call_fixups, func_obj, str_fixups, recent_setargs)
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Jmp do
+                tgt = 0 - 1
+                if (ins_src1 as i64) != 0 do
+                    src1_typ = native_read_i64(ins_src1 as i64, 0)
+                    if src1_typ == 5 do
+                        tgt = native_read_i64(ins_src1 as i64, 40)
+                    eif src1_typ == 4 do
+                        tgt = native_read_i64(ins_src1 as i64, 32)
+                    end
+                end
+                if tgt >= 0 do
+                    next_bid = 0 - 1
+                    if bi + 1 < n_blocks do
+                        next_b = vec_get_rt(f_blocks, bi + 1)
+                        next_bid = native_read_i64(next_b as i64, 0)
+                    end
+                    if tgt != next_bid do
+                        at = codebuf_offset(cb) as i64
+                        cb = arm64_b_imm26(cb, 0)
+                        fixups = vec_push_rt(fixups, lir_fixup_new(at, tgt, 0))
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.JmpCond do
+                tgt = 0 - 1
+                if (ins_src2 as i64) != 0 do
+                    src2_typ = native_read_i64(ins_src2 as i64, 0)
+                    if src2_typ == 5 do
+                        tgt = native_read_i64(ins_src2 as i64, 40)
+                    eif src2_typ == 4 do
+                        tgt = native_read_i64(ins_src2 as i64, 32)
+                    end
+                end
+                if last_cmp_pred >= 0 and lir_opnd_matches(last_cmp_dst, ins_src1) == 1 do
+                    # Fused Cmp + JmpCond: flags already in NZCV, branch directly to condition!
+                    if tgt >= 0 do
+                        at = codebuf_offset(cb) as i64
+                        is_ifnot = 0
+                        if ins_aux == LIR_JMP_IFNOT do
+                            is_ifnot = 1
+                        end
+                        cond = arm64_cond_code(last_cmp_pred, is_ifnot)
+                        cb = codebuf_emit_u32(cb, 0x54000000)
+                        fixups = vec_push_rt(fixups, lir_fixup_new(at, tgt, 10 + cond))
+                    end
+                    last_cmp_pred = 0 - 1
+                else
+                    a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                    if a >= 0 do
+                        cb = codebuf_emit_u32(cb, 0xF100001F bit_or ((a as int bit_and 0x1F) shl 5))
+                    end
+                    if tgt >= 0 do
+                        at = codebuf_offset(cb) as i64
+                        kind = 2
+                        if ins_aux == LIR_JMP_IFNOT do
+                            kind = 1
+                        end
+                        if kind == 1 do
+                            cb = arm64_beq_imm19(cb, 0)
+                        else
+                            cb = arm64_bne_imm19(cb, 0)
+                        end
+                        fixups = vec_push_rt(fixups, lir_fixup_new(at, tgt, kind))
+                    end
+                    last_cmp_pred = 0 - 1
+                end
+            eif op == LirOp.Ret do
+                if (ins_src1 as i64) != 0 do
+                    src1_typ = native_read_i64(ins_src1 as i64, 0)
+                    if src1_typ == 4 do
+                        imm_val = native_read_i64(ins_src1 as i64, 32)
+                        cb = arm64_movz_imm64(cb, 0, imm_val as int)
+                    eif rs1 >= 0 and rs1 != 0 do
+                        cb = arm64_mov_rr(cb, 0, rs1 as int)
+                    end
+                eif rs1 >= 0 and rs1 != 0 do
+                    cb = arm64_mov_rr(cb, 0, rs1 as int)
+                end
+                if stack_size > 0 and stack_size <= 4095 do
+                    cb = arm64_add_imm(cb, 31, 31, stack_size as int)
+                end
+                cb = emit_callee_restore(cb, max_phys)
+                cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+                cb = arm64_ret(cb)
+                last_cmp_pred = 0 - 1
+            end
+            if rd_spill < 0 do
+                cb = emit_spill_store(cb, ins_dst, SCRD)
+            end
+            ii = ii + 1
+        end
+        bi = bi + 1
+    end
+
+    # Fall-through epilogue (when function has no explicit Ret)
+    cb = arm64_mov_imm16(cb, 0, 0)
+    if stack_size > 0 and stack_size <= 4095 do
+        cb = arm64_add_imm(cb, 31, 31, stack_size as int)
+    end
+    cb = emit_callee_restore(cb, max_phys)
+    cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+    cb = arm64_ret(cb)
+
+    nf = vec_len_rt(fixups)
+    var fxi = 0
+    when fxi < nf loop
+        fx = vec_get_rt(fixups, fxi)
+        f_tgt = lir_fixup_target_block(fx)
+        f_kind = lir_fixup_kind(fx)
+        f_at = lir_fixup_at_off(fx)
+        if f_tgt >= 0 and f_tgt < max_bid do
+            dest = vec_get_rt(block_off, f_tgt)
+            if dest >= 0 do
+                rel = (dest - f_at) as int
+                if f_kind == 0 do
+                    imm26 = (rel shr 2) bit_and 0x03FFFFFF
+                    word = 0x14000000 bit_or imm26
+                    cb = codebuf_patch_u32(cb, f_at as int, word)
+                eif f_kind == 1 do
+                    imm19 = (rel shr 2) bit_and 0x7FFFF
+                    word = 0x54000000 bit_or (imm19 shl 5)
+                    cb = codebuf_patch_u32(cb, f_at as int, word)
+                eif f_kind == 2 do
+                    imm19 = (rel shr 2) bit_and 0x7FFFF
+                    word = 0x54000001 bit_or (imm19 shl 5)
+                    cb = codebuf_patch_u32(cb, f_at as int, word)
+                eif f_kind >= 10 do
+                    cond = (f_kind - 10) bit_and 0xF
+                    imm19 = (rel shr 2) bit_and 0x7FFFF
+                    word = 0x54000000 bit_or (imm19 shl 5) bit_or cond
+                    cb = codebuf_patch_u32(cb, f_at as int, word)
+                end
+            end
+        end
+        fxi = fxi + 1
+    end
+
+    out cb
+end.
+
+func emit_lir_module_arm64(lir_funcs: i64, is_linux: i64):
+    cb = codebuf_new(TargetArch.ARM64)
+    n_funcs = vec_len_rt(lir_funcs)
+    func_offs = vec_new_cap_rt(1024)
+    call_fixups = vec_new_cap_rt(1024)
+    str_fixups = vec_new_cap_rt(1024)
+
+    var fi = 0
+    when fi < n_funcs loop
+        func_offs = vec_push_rt(func_offs, codebuf_offset(cb) as i64)
+        lf = vec_get_rt(lir_funcs, fi)
+        cb = emit_lir_arm64_into(cb, lf, 0 - 1, lir_funcs, call_fixups, str_fixups)
+        fi = fi + 1
+    end
+
+    rt_offs = vec_new_cap_rt(1024)
+    cb = emit_lir_rt_stubs(cb, rt_offs, is_linux)
+
+    nf = vec_len_rt(call_fixups)
+    var ci = 0
+    when ci < nf loop
+        fx = vec_get_rt(call_fixups, ci)
+        f_tkind = native_read_i64(fx as i64, 8)
+        f_tid = native_read_i64(fx as i64, 16)
+        f_at = native_read_i64(fx as i64, 0)
+        dest = 0 - 1
+        if f_tkind == 0 do
+            if f_tid >= 0 and f_tid < n_funcs do
+                dest = vec_get_rt(func_offs, f_tid)
+            end
+        else
+            if f_tid >= 0 and f_tid < LIR_RT_STUB_COUNT do
+                dest = vec_get_rt(rt_offs, f_tid)
+            end
+        end
+        if dest < 0 do
+            dest = vec_get_rt(rt_offs, LIR_RT_UNRESOLVED)
+        end
+        cb = patch_bl_site(cb, f_at, dest)
+        ci = ci + 1
+    end
+
+    cb.start_offset = codebuf_offset(cb)
+    if is_linux == 1 do
+        # ── Linux ARM64 ELF Entry: [SP] = argc, SP + 8 = argv ──
+        cb = arm64_ldr_uoff(cb, 19, 31, 0)   # X19 = argc
+        cb = arm64_add_imm(cb, 20, 31, 8)    # X20 = argv
+        cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+        cb = arm64_mov_from_sp(cb, 29)
+
+        # ── Initialize 256MB Global Arena Heap via Linux mmap ──
+        cb = arm64_mov_imm16(cb, 0, 0)
+        cb = arm64_mov_imm16(cb, 1, 0)
+        cb = codebuf_emit_u32(cb, 0xF2A20001) # MOVK X1, #0x1000, LSL #16 (256MB)
+        cb = arm64_mov_imm16(cb, 2, 3)         # PROT_READ | PROT_WRITE
+        cb = arm64_mov_imm16(cb, 3, 34)        # MAP_PRIVATE | MAP_ANONYMOUS (0x22)
+        cb = codebuf_emit_u32(cb, 0x92800004) # MOVN X4, #0 (-1 fd)
+        cb = arm64_mov_imm16(cb, 5, 0)
+        cb = arm64_mov_imm16(cb, 8, 222)       # X8 = 222 (SYS_mmap)
+        cb = arm64_svc(cb, 0)                  # SVC #0
+    else
+        # ── macOS Mach-O Entry: dyld passes X0 = argc, X1 = argv ──
+        cb = arm64_mov_rr(cb, 19, 0)     # X19 = argc
+        cb = arm64_mov_rr(cb, 20, 1)     # X20 = argv
+
+        cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+        cb = arm64_mov_from_sp(cb, 29)
+
+        # ── Initialize 256MB Global Arena Heap via macOS mmap ──
+        cb = arm64_mov_imm16(cb, 0, 0)
+        cb = arm64_mov_imm16(cb, 1, 0)
+        cb = codebuf_emit_u32(cb, 0xF2A20001) # MOVK X1, #0x1000, LSL #16 (256MB)
+        cb = arm64_mov_imm16(cb, 2, 3)         # PROT_READ | PROT_WRITE
+        cb = arm64_mov_imm16(cb, 3, 4098)      # MAP_ANON | MAP_PRIVATE (0x1002)
+        cb = codebuf_emit_u32(cb, 0x92800004) # MOVN X4, #0 (-1 fd)
+        cb = arm64_mov_imm16(cb, 5, 0)
+        cb = arm64_mov_imm16(cb, 16, 197)     # SYS_mmap
+        cb = codebuf_emit_u32(cb, 0xF2A04010) # MOVK X16, #0x200, LSL #16
+        cb = arm64_svc(cb, 0x80)
+    end
+
+    # X28 = heap base returned in X0
+    cb = arm64_mov_rr(cb, 28, 0)
+    # Initialize bump pointer: *(X28) = X28 + 32
+    cb = arm64_add_imm(cb, 1, 28, 32)
+    cb = arm64_str_uoff(cb, 1, 28, 0)
+    # Save argc and argv in heap header:
+    cb = arm64_str_uoff(cb, 19, 28, 8)     # *(X28 + 8) = argc
+    cb = arm64_str_uoff(cb, 20, 28, 16)    # *(X28 + 16) = argv
+    if n_funcs > 0 do
+        main_idx = lir_find_func_index(lir_funcs, fat_str_new("main"))
+        if main_idx < 0 do
+            main_idx = 0
+        end
+        at = codebuf_offset(cb) as i64
+        cb = arm64_bl_imm26(cb, 0)
+        main_off = vec_get_rt(func_offs, main_idx)
+        cb = patch_bl_site(cb, at, main_off)
+    end
+    cb = arm64_mov_imm16(cb, 0, 0)
+    if is_linux == 1 do
+        cb = arm64_mov_imm16(cb, 8, 93)        # X8 = 93 (SYS_exit on Linux)
+        cb = arm64_svc(cb, 0)
+    else
+        cb = arm64_mov_imm16(cb, 16, 1)        # SYS_exit on macOS
+        cb = codebuf_emit_u32(cb, 0xF2A04010)
+        cb = arm64_svc(cb, 0x80)
+    end
+    cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+    cb = arm64_ret(cb)
+
+    # ── String Literal Pool & Patch ADR Sites ──
+    n_sfx = vec_len_rt(str_fixups)
+    if n_sfx > 0 do
+        pool_offsets = vec_new_cap_rt(n_sfx)
+        var sfi = 0
+        when sfi < n_sfx loop
+            sfx = vec_get_rt(str_fixups, sfi)
+            s_val = native_read_i64(sfx as i64, 8) as string
+            s_data = native_read_i64(s_val as i64, 0)
+            s_len = native_read_i64(s_val as i64, 8)
+            found_off = 0 - 1
+            var pfi = 0
+            when pfi < sfi loop
+                prev_sfx = vec_get_rt(str_fixups, pfi)
+                prev_s_val = native_read_i64(prev_sfx as i64, 8) as string
+                if fat_str_eq(prev_s_val, s_val) == 1 do
+                    found_off = vec_get_rt(pool_offsets, pfi)
+                    pfi = sfi
+                end
+                pfi = pfi + 1
+            end
+            if found_off < 0 do
+                found_off = codebuf_offset(cb) as i64
+                var bi = 0
+                when bi < s_len loop
+                    b_ch = native_read_u8(s_data, bi)
+                    cb = codebuf_emit_byte(cb, b_ch)
+                    bi = bi + 1
+                end
+                cb = codebuf_emit_byte(cb, 0)
+            end
+            pool_offsets = vec_push_rt(pool_offsets, found_off)
+            sfi = sfi + 1
+        end
+
+        pad = (4 - (codebuf_offset(cb) mod 4)) mod 4
+        var pi = 0
+        when pi < pad loop
+            cb = codebuf_emit_byte(cb, 0)
+            pi = pi + 1
+        end
+
+        sfi = 0
+        when sfi < n_sfx loop
+            sfx = vec_get_rt(str_fixups, sfi)
+            s_at = native_read_i64(sfx as i64, 0)
+            s_rd = native_read_i64(sfx as i64, 16)
+            s_target = vec_get_rt(pool_offsets, sfi)
+            delta = (s_target - s_at) as int
+            immlo = delta bit_and 3
+            immhi = (delta shr 2) bit_and 0x7FFFF
+            word = 0x10000000 bit_or (immlo shl 29) bit_or (immhi shl 5) bit_or (s_rd as int bit_and 0x1F)
+            cb = codebuf_patch_u32(cb, s_at as int, word)
+            sfi = sfi + 1
+        end
+    end
+
+    out cb
+end.
+
+# Single-func helper → module path.
+func emit_lir_arm64(func_obj: LirFunc, assigned_phys: i64, assigned_stack: i64):
+    funcs = vec_new_rt()
+    funcs = vec_push_rt(funcs, func_obj)
+    out emit_lir_module_arm64(funcs)
+end.
+
+export emit_lir_arm64, emit_lir_module_arm64, emit_lir_arm64_into
+export emit_lir_intrinsic, emit_lir_setarg, emit_lir_rt_stubs
+export lir_intr_is_marker, lir_intr_is_identity, lir_intr_is_payload
+export lir_fixup_new, lir_fixup_at_off, lir_fixup_target_block, lir_fixup_kind
+export lir_call_fixup_new, lir_stub_for_builtin_id
+export patch_bl_site, lir_find_func_index

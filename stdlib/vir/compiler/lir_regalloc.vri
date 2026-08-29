@@ -1,0 +1,180 @@
+##
+ * vir/compiler/lir_regalloc.vri — Register Allocation
+ * ==============================================================
+ * Maps Virtual Registers to Physical Registers using the
+ * Linear Scan Algorithm (Poletto & Sarkar). Handles Spilling to Stack.
+ *
+ * Soft LIR long-term policy: clean LIR → (this or Chaitin–Briggs) →
+ * George–Appel coalescing for remaining copies —
+ * MUST_READ_CONTEXT/REGISTER_ALLOCATION_ARCHITECTURE.md
+ ##
+
+include types;
+include vec_rt;
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt;
+include lir;
+import LirPhysReg, LirFunc from lir;
+include lir_liveness;
+import LiveInterval from lir_liveness;
+
+# Simple insertion sort for LiveIntervals by start_pos
+func sort_intervals_by_start(arr: i64)
+    n = vec_len_rt(arr);
+    i = 1;
+    when i < n loop
+        key = vec_get_rt(arr, i);
+        j = i - 1;
+        
+        # while j >= 0 and arr[j].start_pos > key.start_pos
+        should_loop = true;
+        when j >= 0 and should_loop loop
+            elem_j = vec_get_rt(arr, j);
+            if elem_j.start_pos > key.start_pos do
+                vec_set_rt(arr, j + 1, elem_j);
+                j = j - 1
+            else
+                should_loop = false
+            end
+        end
+        vec_set_rt(arr, j + 1, key);
+        i = i + 1
+    end
+    out arr
+end.
+# Simple insertion sort for active intervals by end_pos
+func sort_active_by_end(arr: i64)
+    n = vec_len_rt(arr);
+    i = 1;
+    when i < n loop
+        key = vec_get_rt(arr, i);
+        j = i - 1;
+        
+        should_loop = true;
+        when j >= 0 and should_loop loop
+            elem_j = vec_get_rt(arr, j);
+            if elem_j.end_pos > key.end_pos do
+                vec_set_rt(arr, j + 1, elem_j);
+                j = j - 1
+            else
+                should_loop = false
+            end
+        end
+        vec_set_rt(arr, j + 1, key);
+        i = i + 1
+    end
+    out arr
+end.
+func lir_allocate_registers(func_obj: LirFunc, intervals: i64)
+    n_intervals = vec_len_rt(intervals);
+    if n_intervals == 0 do
+        out intervals
+    end
+    # Filter live intervals and assign struct fields
+    # We will expand LiveInterval with phys_reg and stack_offset manually or parallel arrays
+    # Since we can't easily extend entity dynamically, we will use parallel arrays
+    # assigned_phys = vec of int (-1 if stack)
+    # assigned_stack = vec of int (0 if phys)
+    
+    assigned_phys = vec_new_rt();
+    assigned_stack = vec_new_rt();
+    i = 0;
+    when i < n_intervals loop
+        assigned_phys = vec_push_rt(assigned_phys, -1);
+        assigned_stack = vec_push_rt(assigned_stack, 0);
+        i = i + 1
+    end
+    live_only = vec_new_rt();
+    i = 0;
+    when i < n_intervals loop
+        iv = vec_get_rt(intervals, i);
+        if iv.start_pos != -1 do
+            live_only = vec_push_rt(live_only, iv)
+        end
+        i = i + 1
+    end
+    live_only = sort_intervals_by_start(live_only);
+    
+    # Allocatable registers: R0 to R7 (0 to 7)
+    # R8, R9 are scratch. SP, FP are reserved.
+    free_regs = vec_new_rt();
+    i = 0;
+    when i <= 7 loop
+        free_regs = vec_push_rt(free_regs, 1); # 1 = free, 0 = used
+        i = i + 1
+    end
+    active = vec_new_rt();
+    stack_size = func_obj.stack_size;
+    
+    n_live = vec_len_rt(live_only);
+    i = 0;
+    when i < n_live loop
+        iv = vec_get_rt(live_only, i);
+        
+        # Expire old intervals
+        active = sort_active_by_end(active);
+        
+        j = 0;
+        new_active = vec_new_rt();
+        n_active = vec_len_rt(active);
+        when j < n_active loop
+            act_iv = vec_get_rt(active, j);
+            if act_iv.end_pos >= iv.start_pos do
+                new_active = vec_push_rt(new_active, act_iv)
+            else
+                # Free register
+                reg = vec_get_rt(assigned_phys, act_iv.vreg);
+                if reg >= 0 do
+                    vec_set_rt(free_regs, reg, 1)
+                end
+            end
+            j = j + 1
+        end
+        active = new_active;
+        
+        # Allocate register
+        reg = -1;
+        r = 0;
+        when r <= 7 loop
+            if vec_get_rt(free_regs, r) == 1 do
+                reg = r;
+                r = 8 # break
+            end
+            r = r + 1
+        end
+        if reg == -1 do
+            # Spill at interval
+            spill_cand = vec_get_rt(active, vec_len_rt(active) - 1);
+            if spill_cand.end_pos > iv.end_pos do
+                # Evict candidate
+                reg = vec_get_rt(assigned_phys, spill_cand.vreg);
+                vec_set_rt(assigned_phys, iv.vreg, reg);
+                vec_set_rt(free_regs, reg, 0);
+                
+                vec_set_rt(assigned_phys, spill_cand.vreg, -1);
+                stack_size = stack_size + 8;
+                vec_set_rt(assigned_stack, spill_cand.vreg, 0 - stack_size);
+                
+                # Replace in active
+                vec_set_rt(active, vec_len_rt(active) - 1, iv);
+                active = sort_active_by_end(active)
+            else
+                # Spill current
+                vec_set_rt(assigned_phys, iv.vreg, -1);
+                stack_size = stack_size + 8;
+                vec_set_rt(assigned_stack, iv.vreg, 0 - stack_size)
+            end
+        else
+            vec_set_rt(assigned_phys, iv.vreg, reg);
+            vec_set_rt(free_regs, reg, 0);
+            
+            active = vec_push_rt(active, iv);
+            active = sort_active_by_end(active)
+        end
+        i = i + 1
+    end
+    func_obj.stack_size = stack_size;
+    
+    # We will return the assignments (assigned_phys, assigned_stack)
+    out (func_obj, assigned_phys, assigned_stack)
+end.
+export lir_allocate_registers;

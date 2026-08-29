@@ -1,0 +1,543 @@
+##
+ * vir/rt/macho.vri — Mach-O Executable Emitter (Pure Vir)
+ * =========================================================
+ * Emits a complete Mach-O 64-bit executable for macOS ARM64
+ * and x86-64. No external assembler (as) or linker (ld) needed.
+ *
+ * Produces a standalone binary that the kernel can exec directly
+ *   Mach-O Header → Load Commands → __TEXT → __DATA → LC_MAIN
+ *
+ * The binary uses direct BSD syscalls — no dyld, no libSystem
+ * unless linking is explicitly requested.
+ ##
+
+
+include vir.core.types;
+include vir.rt.vec_rt;
+import bvec_new, bvec_push, bvec_push_u32_le, bvec_push_u64_le,
+    bvec_len, bvec_get, bvec_set, bvec_patch_u32_le, bvec_data_ptr, bvec_free from vir.rt.vec_rt;
+include vir.rt.io;
+import write_file_bytes from vir.rt.io;
+include vir.rt.string_rt;
+import rt_strlen from vir.rt.string_rt;
+
+extern func native_sha256(data: i64, len: i64, out_addr: i64);
+
+# ═══════════════════════════════════════════════════════
+# Mach-O Constants
+# ═══════════════════════════════════════════════════════
+
+# Magic numbers
+const MH_MAGIC_64:      0xFEEDFACF;
+
+# CPU types
+const CPU_TYPE_X86_64:  0x01000007;
+const CPU_TYPE_ARM64:   0x0100000C;
+const CPU_SUB_ALL:      0x00000000;
+const CPU_SUB_ARM64_ALL: 0x00000000;
+
+# File types
+const MH_EXECUTE:       2;
+
+# Flags
+const MH_NOUNDEFS:      0x00000001;
+const MH_DYLDLINK:      0x00000004;
+const MH_TWOLEVEL:      0x00000080;
+const MH_PIE:           0x00200000;
+
+# Load command types
+const LC_SEGMENT_64:    0x19;
+const LC_MAIN:          0x80000028;
+const LC_SYMTAB:        0x02;
+const LC_DYSYMTAB:      0x0B;
+const LC_UUID:          0x1B;
+const LC_BUILD_VERSION: 0x32;
+const LC_SOURCE_VERSION: 0x2A;
+const LC_LOAD_DYLIB:    0x0C;
+const LC_LOAD_DYLINKER: 0x0E;
+const LC_DYLD_INFO_ONLY: 0x80000022;
+const LC_DYLD_CHAINED_FIXUPS: 0x80000034;
+const LC_CODE_SIGNATURE: 0x1D;
+
+# Code signing constants (big-endian blobs inside __LINKEDIT)
+const CSMAGIC_EMBEDDED_SIGNATURE: 0xFADE0CC0;
+const CSMAGIC_CODEDIRECTORY:      0xFADE0C02;
+const CS_SUPPORTSEXECSEG:         0x20100;
+const CS_ADHOC:                   0x2;
+const CS_HASHTYPE_SHA256:         0x2;
+const CS_SHA256_SIZE:             32;
+const CS_CODEDIRECTORY_HEADER:    48;
+
+# Segment/section constants
+const VM_PROT_READ:     1;
+const VM_PROT_WRITE:    2;
+const VM_PROT_EXECUTE:  4;
+
+const S_ATTR_PURE_INSTRUCTIONS: 0x80000000;
+const S_ATTR_SOME_INSTRUCTIONS: 0x00000400;
+const S_REGULAR:        0x00000000;
+const S_ZEROFILL:       0x00000001;
+
+# Page sizes
+const PAGE_SIZE_ARM64:  0x4000;     # 16KB
+const PAGE_SIZE_X86:    0x1000;     # 4KB
+const TEXT_BASE:        0x100000000;
+
+# ═══════════════════════════════════════════════════════
+# Mach-O Builder
+# ═══════════════════════════════════════════════════════
+
+entity MachOBuilder:
+    buf: i64;        # bvec byte buffer
+    macho_arch: i64;        # 0=ARM64, 1=x86_64
+    page_size: i64,
+        text_code: i64;        # bvec with machine code
+    data_bytes: i64;        # bvec with data section
+    entry_offset: i64        # offset of _start in __text
+end.
+func macho_new(arch: i64)
+    let page = PAGE_SIZE_ARM64;
+    if arch == 1 do
+        page = PAGE_SIZE_X86
+    end
+    out MachOBuilder(buf: bvec_new(),
+        macho_arch: arch,
+        page_size: page,
+        text_code: bvec_new(),
+        data_bytes: bvec_new(),
+        entry_offset: 0)
+end.
+# ═══════════════════════════════════════════════════════
+# Write Header
+# ═══════════════════════════════════════════════════════
+
+func macho_write_header(b: MachOBuilder, ncmds: i64, sizeofcmds: i64)
+    let buf = b.buf;
+
+    # MH_MAGIC_64
+    buf = bvec_push_u32_le(buf, MH_MAGIC_64);
+
+    # CPU type
+    if b.macho_arch == 0 do
+        buf = bvec_push_u32_le(buf, CPU_TYPE_ARM64);
+        buf = bvec_push_u32_le(buf, CPU_SUB_ARM64_ALL)
+    else
+        buf = bvec_push_u32_le(buf, CPU_TYPE_X86_64);
+        buf = bvec_push_u32_le(buf, CPU_SUB_ALL)
+    end
+    # File type
+    buf = bvec_push_u32_le(buf, MH_EXECUTE);
+
+    # Number of load commands
+    buf = bvec_push_u32_le(buf, ncmds);
+
+    # Size of load commands
+    buf = bvec_push_u32_le(buf, sizeofcmds);
+
+    # Flags: PIE + NOUNDEFS + DYLDLINK + TWOLEVEL (required for dynamic linking)
+    buf = bvec_push_u32_le(buf, MH_PIE | MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL);
+
+    # Reserved (64-bit header)
+    buf = bvec_push_u32_le(buf, 0);
+
+    b.buf = buf;
+    out b
+end.
+# ═══════════════════════════════════════════════════════
+# Write LC_SEGMENT_64
+# ═══════════════════════════════════════════════════════
+
+func macho_write_segment(b: MachOBuilder, name: i64, vmaddr: i64, vmsize: i64,
+       fileoff: i64, filesize: i64, maxprot: i64, initprot: i64,
+       nsects: i64)
+    let buf = b.buf;
+
+    # cmd
+    buf = bvec_push_u32_le(buf, LC_SEGMENT_64);
+
+    # cmdsize (72 + 80 * nsects)
+    let cmdsize = 72 + 80 * nsects;
+    buf = bvec_push_u32_le(buf, cmdsize);
+
+    # segname (16 bytes, padded)
+    let name_len = rt_strlen(name);
+    let i = 0;
+    extern func native_read_u8(addr: i64, offset: i64) -> i64;
+    when i < 16 loop
+        if i < name_len do
+            buf = bvec_push(buf, native_read_u8(name, i))
+        else
+            buf = bvec_push(buf, 0)
+        end
+        i = i + 1
+    end
+    # vmaddr, vmsize
+    buf = bvec_push_u64_le(buf, vmaddr);
+    buf = bvec_push_u64_le(buf, vmsize);
+
+    # fileoff, filesize
+    buf = bvec_push_u64_le(buf, fileoff);
+    buf = bvec_push_u64_le(buf, filesize);
+
+    # maxprot, initprot
+    buf = bvec_push_u32_le(buf, maxprot);
+    buf = bvec_push_u32_le(buf, initprot);
+
+    # nsects, flags
+    buf = bvec_push_u32_le(buf, nsects);
+    buf = bvec_push_u32_le(buf, 0);
+
+    b.buf = buf;
+    out b
+end.
+# ═══════════════════════════════════════════════════════
+# Write Section Header (within a segment)
+# ═══════════════════════════════════════════════════════
+
+func macho_write_section(b: MachOBuilder, sectname: i64, segname: i64,
+       addr: i64, size: i64, offset: i64, align: i64,
+       flags: i64)
+    let buf = b.buf;
+
+    extern func native_read_u8(addr: i64, offset: i64) -> i64;
+
+    # sectname (16 bytes)
+    let sn_len = rt_strlen(sectname);
+    let i = 0;
+    when i < 16 loop
+        if i < sn_len do
+            buf = bvec_push(buf, native_read_u8(sectname, i))
+        else
+            buf = bvec_push(buf, 0)
+        end
+        i = i + 1
+    end
+    # segname (16 bytes)
+    let sg_len = rt_strlen(segname);
+    i = 0;
+    when i < 16 loop
+        if i < sg_len do
+            buf = bvec_push(buf, native_read_u8(segname, i))
+        else
+            buf = bvec_push(buf, 0)
+        end
+        i = i + 1
+    end
+    # addr, size
+    buf = bvec_push_u64_le(buf, addr);
+    buf = bvec_push_u64_le(buf, size);
+
+    # offset, align
+    buf = bvec_push_u32_le(buf, offset);
+    buf = bvec_push_u32_le(buf, align);
+
+    # reloff, nreloc
+    buf = bvec_push_u32_le(buf, 0);
+    buf = bvec_push_u32_le(buf, 0);
+
+    # flags, reserved1, reserved2
+    buf = bvec_push_u32_le(buf, flags);
+    buf = bvec_push_u32_le(buf, 0);
+    buf = bvec_push_u32_le(buf, 0);
+    buf = bvec_push_u32_le(buf, 0);
+
+    b.buf = buf;
+    out b
+end.
+# ═══════════════════════════════════════════════════════
+# Write LC_MAIN
+# ═══════════════════════════════════════════════════════
+
+func macho_write_lc_main(b: MachOBuilder, entryoff: i64)
+    let buf = b.buf;
+
+    buf = bvec_push_u32_le(buf, LC_MAIN);
+    buf = bvec_push_u32_le(buf, 24);           # cmdsize
+    buf = bvec_push_u64_le(buf, entryoff);      # entryoff (file offset of entry)
+    buf = bvec_push_u64_le(buf, 0);             # stacksize (0 = default)
+
+    b.buf = buf;
+    out b
+end.
+func bvec_push_u32_be(v: i64, val: i64)
+    v = bvec_push(v, (val shr 24) & 0xFF);
+    v = bvec_push(v, (val shr 16) & 0xFF);
+    v = bvec_push(v, (val shr 8) & 0xFF);
+    v = bvec_push(v, val & 0xFF);
+    out v
+end.
+func macho_write_ad_hoc_signature(b: MachOBuilder, code_limit: i64, code_slots: i64,
+       cd_size: i64, cd_hash_offset: i64, cd_ident_offset: i64,
+       ident: i64, ident_len: i64, superblob_size: i64)
+    extern func native_read_u8(addr: i64, offset: i64) -> i64;
+
+    let cd_offset = 20;   # SuperBlob header (12) + one index entry (8)
+    let page_log = 14;
+    if b.page_size == PAGE_SIZE_X86 do
+        page_log = 12
+    end
+    # SuperBlob, count=1, slot 0 = CodeDirectory.
+    b.buf = bvec_push_u32_be(b.buf, CSMAGIC_EMBEDDED_SIGNATURE);
+    b.buf = bvec_push_u32_be(b.buf, superblob_size);
+    b.buf = bvec_push_u32_be(b.buf, 1);
+    b.buf = bvec_push_u32_be(b.buf, 0);
+    b.buf = bvec_push_u32_be(b.buf, cd_offset);
+
+    # CodeDirectory v=0x20100, ad-hoc SHA-256, no special slots.
+    b.buf = bvec_push_u32_be(b.buf, CSMAGIC_CODEDIRECTORY);
+    b.buf = bvec_push_u32_be(b.buf, cd_size);
+    b.buf = bvec_push_u32_be(b.buf, CS_SUPPORTSEXECSEG);
+    b.buf = bvec_push_u32_be(b.buf, CS_ADHOC);
+    b.buf = bvec_push_u32_be(b.buf, cd_hash_offset);
+    b.buf = bvec_push_u32_be(b.buf, cd_ident_offset);
+    b.buf = bvec_push_u32_be(b.buf, 0);              # nSpecialSlots
+    b.buf = bvec_push_u32_be(b.buf, code_slots);
+    b.buf = bvec_push_u32_be(b.buf, code_limit);
+    b.buf = bvec_push(b.buf, CS_SHA256_SIZE);        # hashSize
+    b.buf = bvec_push(b.buf, CS_HASHTYPE_SHA256);    # hashType
+    b.buf = bvec_push(b.buf, 0);                     # platform
+    b.buf = bvec_push(b.buf, page_log);              # pageSize = log2(page)
+    b.buf = bvec_push_u32_be(b.buf, 0);              # spare2
+    b.buf = bvec_push_u32_be(b.buf, 0);              # scatterOffset
+
+    let ii = 0;
+    when ii < ident_len loop
+        if ii < ident_len - 1 do
+            b.buf = bvec_push(b.buf, native_read_u8(ident, ii))
+        else
+            b.buf = bvec_push(b.buf, 0)
+        end
+        ii = ii + 1
+    end
+    let hash_buf = bvec_new()
+    let slot = 0;
+    when slot < code_slots loop
+        let page_start = slot * b.page_size;
+        let page_len = b.page_size;
+        if page_start + page_len > code_limit do
+            page_len = code_limit - page_start
+        end
+        let file_ptr = bvec_data_ptr(b.buf);
+        native_sha256(file_ptr + page_start, page_len, hash_buf);
+
+        let hi = 0;
+        when hi < CS_SHA256_SIZE loop
+            b.buf = bvec_push(b.buf, bvec_get(hash_buf, hi));
+            hi = hi + 1
+        end
+        slot = slot + 1
+    end
+    out b
+end.
+# ═══════════════════════════════════════════════════════
+# Emit Complete Mach-O Executable
+# ═══════════════════════════════════════════════════════
+
+func macho_emit(b: MachOBuilder, entry_off_param: i64)
+    let page = b.page_size;
+    let code_size = bvec_len(b.text_code);
+
+    # ── Layout: code INLINE on page 0+, LINKEDIT on next page ──
+    # 11 load commands
+    #   __PAGEZERO(72) + __TEXT+__text(152) + __LINKEDIT(72)
+    #   + CHAINED_FIXUPS(16) + SYMTAB(24) + DYSYMTAB(80)
+    #   + LOAD_DYLINKER(32) + UUID(24) + MAIN(24) + LOAD_DYLIB(56)
+    #   + CODE_SIGNATURE(16)
+    let ncmds = 11;
+    let sizeofcmds = 568;
+    let header_end = 32 + sizeofcmds;
+
+    # Keep __text at the historical 616-byte offset: 16 bytes padding after LCs.
+    let code_offset = header_end + 16;
+
+    # Entry point = file offset of _start within the code
+    let entry_file_offset = code_offset + entry_off_param;
+
+    # Calculate __TEXT segment size: must contain header + LCs + pad + code
+    # Calculate __TEXT segment size: must contain header + LCs + pad + code
+    # Round up to page boundary
+    let text_raw_size = code_offset + code_size;
+    let text_segment_size = ((text_raw_size + page - 1) / page) * page;
+
+    # LINKEDIT: chained fixups + string table + padding + embedded ad-hoc signature.
+    let chained_fixups_size = 48;
+    let string_table_size = 4;
+    let linkedit_fileoff = text_segment_size;
+    let linkedit_vmaddr = TEXT_BASE + text_segment_size;
+    let strtab_off = linkedit_fileoff + chained_fixups_size;
+    let code_sig_dataoff = ((linkedit_fileoff + chained_fixups_size + string_table_size + 15) / 16) * 16;
+    let code_limit = code_sig_dataoff;
+    let code_slots = (code_limit + page - 1) / page;
+    let code_sig_ident = "a-555549440102030405060708090a0b0c0d0e0f10";
+    let code_sig_ident_len = rt_strlen(code_sig_ident) + 1;
+    let cd_ident_offset = CS_CODEDIRECTORY_HEADER;
+    let cd_hash_offset = cd_ident_offset + code_sig_ident_len;
+    let cd_size = cd_hash_offset + code_slots * CS_SHA256_SIZE;
+    let code_sig_size = 12 + 8 + cd_size;
+    let linkedit_data_size = (code_sig_dataoff + code_sig_size) - linkedit_fileoff;
+    let linkedit_vmsize = ((linkedit_data_size + page - 1) / page) * page;
+
+    # ── Write Mach-O header ──
+    b = macho_write_header(b, ncmds, sizeofcmds);
+
+    # ── 1. __PAGEZERO ──
+    b = macho_write_segment(b, "__PAGEZERO", 0, TEXT_BASE, 0, 0, 0, 0, 0);
+
+    # ── 2. __TEXT (header + LCs + code, page-aligned) ──
+    b = macho_write_segment(b, "__TEXT",
+                            TEXT_BASE, text_segment_size,
+                            0, text_segment_size,
+                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE,
+                            1);
+    b = macho_write_section(b, "__text", "__TEXT",
+                            TEXT_BASE + code_offset, code_size, code_offset,
+                            2,
+                            S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS);
+
+    # ── 3. __LINKEDIT ──
+    b = macho_write_segment(b, "__LINKEDIT",
+                            linkedit_vmaddr, linkedit_vmsize,
+                            linkedit_fileoff, linkedit_data_size,
+                            VM_PROT_READ,
+                            VM_PROT_READ,
+                            0);
+
+    # ── 4. LC_DYLD_CHAINED_FIXUPS ──
+    b.buf = bvec_push_u32_le(b.buf, LC_DYLD_CHAINED_FIXUPS);
+    b.buf = bvec_push_u32_le(b.buf, 16);
+    b.buf = bvec_push_u32_le(b.buf, linkedit_fileoff);
+    b.buf = bvec_push_u32_le(b.buf, chained_fixups_size);
+
+    # ── 5. LC_SYMTAB ──
+    b.buf = bvec_push_u32_le(b.buf, LC_SYMTAB);
+    b.buf = bvec_push_u32_le(b.buf, 24);
+    b.buf = bvec_push_u32_le(b.buf, strtab_off);
+    b.buf = bvec_push_u32_le(b.buf, 0);
+    b.buf = bvec_push_u32_le(b.buf, strtab_off);
+    b.buf = bvec_push_u32_le(b.buf, string_table_size);
+
+    # ── 6. LC_DYSYMTAB (80 bytes, all zeros after cmd/cmdsize) ──
+    b.buf = bvec_push_u32_le(b.buf, LC_DYSYMTAB);
+    b.buf = bvec_push_u32_le(b.buf, 80);
+    let dsi = 0;
+    when dsi < 18 loop
+        b.buf = bvec_push_u32_le(b.buf, 0);
+        dsi = dsi + 1
+    end
+    # ── 7. LC_LOAD_DYLINKER ──
+    b.buf = bvec_push_u32_le(b.buf, LC_LOAD_DYLINKER);
+    b.buf = bvec_push_u32_le(b.buf, 32);
+    b.buf = bvec_push_u32_le(b.buf, 12);
+    extern func native_read_u8(addr: i64, offset: i64) -> i64;
+    let dyld_path = "/usr/lib/dyld";
+    let dyld_len = 13;
+    let di = 0;
+    when di < 20 loop
+        if di < dyld_len do
+            b.buf = bvec_push(b.buf, native_read_u8(dyld_path, di))
+        else
+            b.buf = bvec_push(b.buf, 0)
+        end
+        di = di + 1
+    end
+    # ── 8. LC_UUID (24 bytes) ──
+    b.buf = bvec_push_u32_le(b.buf, LC_UUID);
+    b.buf = bvec_push_u32_le(b.buf, 24);
+    let ui = 1;
+    when ui <= 16 loop
+        b.buf = bvec_push(b.buf, ui);
+        ui = ui + 1
+    end
+    # ── 9. LC_MAIN ──
+    b = macho_write_lc_main(b, entry_file_offset);
+
+    # ── 10. LC_LOAD_DYLIB ──
+    b.buf = bvec_push_u32_le(b.buf, LC_LOAD_DYLIB);
+    b.buf = bvec_push_u32_le(b.buf, 56);
+    b.buf = bvec_push_u32_le(b.buf, 24);
+    b.buf = bvec_push_u32_le(b.buf, 0);
+    b.buf = bvec_push_u32_le(b.buf, 0x00010000);
+    b.buf = bvec_push_u32_le(b.buf, 0x00010000);
+    let dylib_path = "/usr/lib/libSystem.B.dylib";
+    let dylib_len = 26;
+    let dli = 0;
+    when dli < 32 loop
+        if dli < dylib_len do
+            b.buf = bvec_push(b.buf, native_read_u8(dylib_path, dli))
+        else
+            b.buf = bvec_push(b.buf, 0)
+        end
+        dli = dli + 1
+    end
+    # ── 11. LC_CODE_SIGNATURE ──
+    b.buf = bvec_push_u32_le(b.buf, LC_CODE_SIGNATURE);
+    b.buf = bvec_push_u32_le(b.buf, 16);
+    b.buf = bvec_push_u32_le(b.buf, code_sig_dataoff);
+    b.buf = bvec_push_u32_le(b.buf, code_sig_size);
+
+    # ── Pad to code_offset ──
+    let current = bvec_len(b.buf);
+    when current < code_offset loop
+        b.buf = bvec_push(b.buf, 0);
+        current = current + 1
+    end
+    # ── Write machine code (inline on page 0) ──
+    let i = 0;
+    when i < code_size loop
+        b.buf = bvec_push(b.buf, bvec_get(b.text_code, i));
+        i = i + 1
+    end
+    # ── Pad to __TEXT segment boundary ──
+    current = bvec_len(b.buf);
+    when current < text_segment_size loop
+        b.buf = bvec_push(b.buf, 0);
+        current = current + 1
+    end
+    # ── Write LINKEDIT data ──
+    # Chained fixups header (28 bytes)
+    b.buf = bvec_push_u32_le(b.buf, 0);     # fixups_version
+    b.buf = bvec_push_u32_le(b.buf, 28);    # starts_offset
+    b.buf = bvec_push_u32_le(b.buf, 44);    # imports_offset
+    b.buf = bvec_push_u32_le(b.buf, 44);    # symbols_offset
+    b.buf = bvec_push_u32_le(b.buf, 0);     # imports_count
+    b.buf = bvec_push_u32_le(b.buf, 1);     # imports_format (DYLD_CHAINED_IMPORT)
+    b.buf = bvec_push_u32_le(b.buf, 0);     # symbols_format
+
+    # dyld_chained_starts_in_image (16 bytes)
+    b.buf = bvec_push_u32_le(b.buf, 3);     # seg_count = 3
+    b.buf = bvec_push_u32_le(b.buf, 0);     # seg_info_offset[0] (PAGEZERO)
+    b.buf = bvec_push_u32_le(b.buf, 0);     # seg_info_offset[1] (TEXT)
+    b.buf = bvec_push_u32_le(b.buf, 0);     # seg_info_offset[2] (LINKEDIT)
+
+    # Padding to 48 bytes (44 actual + 4 pad)
+    b.buf = bvec_push_u32_le(b.buf, 0);
+
+    # String table (4 NUL bytes for LC_SYMTAB)
+    b.buf = bvec_push_u32_le(b.buf, 0);
+
+    # Align embedded signature data to 16 bytes.
+    current = bvec_len(b.buf);
+    when current < code_sig_dataoff loop
+        b.buf = bvec_push(b.buf, 0);
+        current = current + 1
+    end
+    b = macho_write_ad_hoc_signature(b, code_limit, code_slots,
+                                     cd_size, cd_hash_offset, cd_ident_offset,
+                                     code_sig_ident, code_sig_ident_len,
+                                     code_sig_size);
+
+    out b
+end.
+# ═══════════════════════════════════════════════════════
+# Write to disk
+# ═══════════════════════════════════════════════════════
+
+func macho_write_to_file(b: MachOBuilder, path: i64)
+    let eo = b.entry_offset;
+    b = macho_emit(b, eo);
+    let data = bvec_data_ptr(b.buf);
+    let size = bvec_len(b.buf);
+    write_file_bytes(path, data, size, 493);
+    out true
+end.

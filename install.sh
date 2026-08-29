@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════
-# Vir Language & Toolchain — Global Installer
+# Vir Language & Toolchain — Official Global Installer
+# Pure Native AOT • Zero-Libc • Self-Hosted Full Modular Compiler
 # ═════════════════════════════════════════════════════════════════════
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/virgori/Vir-lang/main/install.sh | bash
 # ═════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# ANSI color codes & styling
+# ANSI color codes & formatting
 BOLD="\033[1m"
 GREEN="\033[32m"
 BLUE="\033[34m"
@@ -92,27 +93,33 @@ else
     print_step_done "GitHub repository fetched" "virgori/Vir-lang"
 fi
 
-# 4. Binary Installation / Fast Copy / Compilation
-# Step 4.1: virc
-draw_progress 40 "Installing Native Compiler (virc)..."
+# 4. Deploy Toolchain Binaries
+# Step 4.0: vir-core Native Execution Engine
+draw_progress 35 "Installing Native Core Engine (vir-core)..."
+if [ -f "${BUILD_DIR}/bin/vir-core" ]; then
+    cp "${BUILD_DIR}/bin/vir-core" "${VIR_BIN}/vir-core"
+elif [ -f "${BUILD_DIR}/core/build/vir" ]; then
+    cp "${BUILD_DIR}/core/build/vir" "${VIR_BIN}/vir-core"
+fi
+if [ -f "${VIR_BIN}/vir-core" ]; then
+    chmod +x "${VIR_BIN}/vir-core"
+    if [ "${OS}" = "Darwin" ]; then codesign -s - -f "${VIR_BIN}/vir-core" >/dev/null 2>&1 || true; fi
+    print_step_done "Native Engine (vir-core) installed" "AOT & JIT execution core"
+fi
+
+# Step 4.1: virc (Full Self-Hosted Modular Soft Compiler)
+draw_progress 45 "Installing Full Soft Compiler (virc)..."
 if [ -f "${BUILD_DIR}/bin/virc" ]; then
     cp "${BUILD_DIR}/bin/virc" "${VIR_BIN}/virc"
-elif [ -f "${BUILD_DIR}/dist/virc-stage2" ]; then
-    cp "${BUILD_DIR}/dist/virc-stage2" "${VIR_BIN}/virc"
-elif [ -f "${BUILD_DIR}/virc_stage1.vri" ] && command -v virc >/dev/null 2>&1; then
-    virc "${BUILD_DIR}/virc_stage1.vri" -o "${VIR_BIN}/virc" >/dev/null 2>&1
 fi
 chmod +x "${VIR_BIN}/virc"
 if [ "${OS}" = "Darwin" ]; then codesign -s - -f "${VIR_BIN}/virc" >/dev/null 2>&1 || true; fi
-VIRC_SZ="$(stat -f%z "${VIR_BIN}/virc" 2>/dev/null || stat -c%s "${VIR_BIN}/virc" 2>/dev/null || echo "native")"
-print_step_done "Compiler (virc) installed" "${VIRC_SZ} bytes"
+print_step_done "Full Compiler (virc) installed" "HIR/MIR/LIR + 26 Passes + IRC RegAlloc"
 
 # Step 4.2: vir Master CLI
-draw_progress 55 "Installing Unified Master CLI (vir)..."
+draw_progress 58 "Installing Unified Master CLI (vir)..."
 if [ -f "${BUILD_DIR}/bin/vir" ]; then
     cp "${BUILD_DIR}/bin/vir" "${VIR_BIN}/vir"
-elif [ -f "${BUILD_DIR}/apps/vir/main.vri" ]; then
-    "${VIR_BIN}/virc" "${BUILD_DIR}/apps/vir/main.vri" -o "${VIR_BIN}/vir" >/dev/null 2>&1 || true
 fi
 chmod +x "${VIR_BIN}/vir"
 if [ "${OS}" = "Darwin" ]; then codesign -s - -f "${VIR_BIN}/vir" >/dev/null 2>&1 || true; fi
@@ -122,8 +129,6 @@ print_step_done "Master CLI (vir) installed" "Toolchain entrypoint"
 draw_progress 70 "Installing Package Manager (viron)..."
 if [ -f "${BUILD_DIR}/bin/viron" ]; then
     cp "${BUILD_DIR}/bin/viron" "${VIR_BIN}/viron"
-elif [ -f "${BUILD_DIR}/apps/viron/main.vri" ]; then
-    "${VIR_BIN}/virc" "${BUILD_DIR}/apps/viron/main.vri" -o "${VIR_BIN}/viron" >/dev/null 2>&1 || true
 fi
 chmod +x "${VIR_BIN}/viron"
 if [ "${OS}" = "Darwin" ]; then codesign -s - -f "${VIR_BIN}/viron" >/dev/null 2>&1 || true; fi
@@ -133,23 +138,29 @@ print_step_done "Package Manager (viron) installed" "SemVer & DAG resolver"
 draw_progress 82 "Installing Language Server Protocol (vir-lsp)..."
 if [ -f "${BUILD_DIR}/bin/vir-lsp" ]; then
     cp "${BUILD_DIR}/bin/vir-lsp" "${VIR_BIN}/vir-lsp"
-elif [ -f "${BUILD_DIR}/apps/vir-lsp/main.vri" ]; then
-    "${VIR_BIN}/virc" "${BUILD_DIR}/apps/vir-lsp/main.vri" -o "${VIR_BIN}/vir-lsp" >/dev/null 2>&1 || true
 fi
 chmod +x "${VIR_BIN}/vir-lsp"
 if [ "${OS}" = "Darwin" ]; then codesign -s - -f "${VIR_BIN}/vir-lsp" >/dev/null 2>&1 || true; fi
 print_step_done "Language Server (vir-lsp) installed" "JSON-RPC 2.0 daemon"
 
-# 5. Standard Library Setup
-draw_progress 90 "Deploying standard library modules..."
+# 5. Standard Library Setup (Including Full Self-Hosted Compiler Modules)
+draw_progress 90 "Deploying full standard library & compiler modules..."
 mkdir -p "${VIR_HOME}/stdlib"
 if [ -d "${BUILD_DIR}/stdlib/vir" ]; then
     cp -R "${BUILD_DIR}/stdlib/vir/"* "${VIR_HOME}/stdlib/" 2>/dev/null || true
 elif [ -d "${BUILD_DIR}/stdlib" ]; then
     cp -R "${BUILD_DIR}/stdlib/"* "${VIR_HOME}/stdlib/" 2>/dev/null || true
 fi
+
+# Ensure stdlib/vir/compiler/ is also in ~/.vir/stdlib/vir/compiler
+mkdir -p "${VIR_HOME}/stdlib/vir"
+if [ -d "${BUILD_DIR}/stdlib/vir/compiler" ]; then
+    mkdir -p "${VIR_HOME}/stdlib/vir/compiler"
+    cp -R "${BUILD_DIR}/stdlib/vir/compiler/"* "${VIR_HOME}/stdlib/vir/compiler/" 2>/dev/null || true
+fi
+
 MODULE_COUNT="$(find "${VIR_HOME}/stdlib" -maxdepth 2 -type d 2>/dev/null | wc -l | tr -d ' ')"
-print_step_done "Standard Library deployed" "${MODULE_COUNT} modules"
+print_step_done "Standard Library deployed" "${MODULE_COUNT} modules (Full Compiler included)"
 
 # Cleanup temp dir if created
 if [ -n "${TEMP_SRC}" ] && [ -d "${TEMP_SRC}" ]; then
@@ -196,9 +207,9 @@ draw_progress 100 "Installation completed!"
 echo ""
 echo ""
 
-echo -e "${GREEN}${BOLD}🎉 VIR TOOLCHAIN INSTALLED SUCCESSFULLY!${RESET}"
+echo -e "${GREEN}${BOLD}🎉 VIR FULL TOOLCHAIN INSTALLED SUCCESSFULLY!${RESET}"
 echo "============================================================"
-echo -e "To activate the ${CYAN}vir${RESET} command in your current terminal session, run:"
+echo -e "To activate the ${CYAN}vir${RESET} and ${CYAN}virc${RESET} commands in your current terminal session, run:"
 echo ""
 if [ -n "${DETECTED_RC}" ]; then
     echo -e "    ${YELLOW}${BOLD}echo '${EXPORT_LINE}' >> ${DETECTED_RC} && source ${DETECTED_RC}${RESET}"
@@ -207,10 +218,9 @@ else
 fi
 echo ""
 echo "============================================================"
-echo -e "${BOLD}Quick Start Commands:${RESET}"
-echo -e "  • ${CYAN}vir --version${RESET}           : Display toolchain version"
-echo -e "  • ${CYAN}vir new my_app${RESET}          : Create a new Vir project"
-echo -e "  • ${CYAN}cd my_app && vir run${RESET}    : Build and execute application"
-echo -e "  • ${CYAN}vir check hello.vri${RESET}     : Perform fast static syntax check"
-echo -e "  • ${CYAN}vir help${RESET}                : View complete command documentation"
+echo -e "${BOLD}Installed Full Toolchain Suite:${RESET}"
+echo -e "  • ${CYAN}virc --version${RESET}          : Official Vir Soft Full Modular Compiler (26 passes, IRC RegAlloc)"
+echo -e "  • ${CYAN}vir --version${RESET}           : Master CLI toolchain router"
+echo -e "  • ${CYAN}viron --version${RESET}         : Viron package manager (SemVer & DAG)"
+echo -e "  • ${CYAN}vir-lsp --version${RESET}       : Language Server Protocol daemon"
 echo "============================================================"

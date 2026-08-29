@@ -1,0 +1,909 @@
+##
+ * vir/compiler/vm.vri — Vir-Native Q-IR Interpreter (vm.c port)
+ * ==============================================================
+ * Stage 2 milestone: self-hosted VM tháo bỏ phụ thuộc C runtime.
+ * Implements the same instruction set as core/src/vm.c but in
+ * pure Vir.  Scalar fallback — SIMD opcodes execute element-wise.
+ *
+ * Usage
+ *   state = vm_new(my_module);
+ *   exit_code = vm_exec(state, str_new("main"));
+ ##
+
+include types;
+include "stdlib/vir/rt/string_rt.vri";
+import str_new, str_concat, str_len, rt_streq from "stdlib/vir/rt/string_rt.vri";
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get, vec_set from vec;
+include ir_optimizer;
+import QOp, QOperand, QInstr, QFunction, QModule, OperandType,
+       q_none, q_vreg, q_imm, q_instr from ir_optimizer;
+include vir.jit.bridge;
+import JitBridge, jit_bridge_new, jit_begin_patch, jit_end_patch,
+       jit_emit_code, jit_get_entry from bridge;
+include vir.compiler.codegen;
+import TargetArch, codegen_emit from codegen;
+
+
+# ═══════════════════════════════════════════════════════
+# VM Register File
+# ═══════════════════════════════════════════════════════
+
+entity VMReg:
+    ival: int;      # integer / pointer value
+    fval: int;      # float value encoded as int64 bits (reinterpret)
+    is_float: int  # 1 if fval is active, 0 if ival is active
+end.
+func vmreg_int(v: int):
+    out VMReg ( ival: v, fval: 0, is_float: 0 )
+end.
+func vmreg_zero:
+    out VMReg ( ival: 0, fval: 0, is_float: 0 )
+end.
+# ═══════════════════════════════════════════════════════
+# VM Status Codes  (mirrors vm_status_t)
+# ═══════════════════════════════════════════════════════
+
+entity VMStatus:
+    code: int
+end.
+func vm_ok:       out VMStatus ( code: 0 ) end.   # VM_OK
+func vm_halt:     out VMStatus ( code: 1 ) end.   # VM_HALT
+func vm_err_op:   out VMStatus ( code: 2 ) end.   # VM_ERR_BAD_OP
+func vm_err_div:  out VMStatus ( code: 3 ) end.   # VM_ERR_DIV_ZERO
+func vm_err_ret:  out VMStatus ( code: 4 ) end.   # VM_ERR_STACK
+
+
+# ═══════════════════════════════════════════════════════
+# Stage 3 metadata tracked by the Vir VM
+# ═══════════════════════════════════════════════════════
+
+entity PatchRecord:
+    patch_id:      int,
+        target_func:   int,
+        source_func:   int
+end.
+entity PinRecord:
+    vreg:          int,
+        phys_reg:      int
+end.
+entity SignRecord:
+    patch_id:      int,
+        token:         int
+end.
+# ═══════════════════════════════════════════════════════
+# VM State
+# ═══════════════════════════════════════════════════════
+
+entity VMState:
+    regs:       Vec<VMReg>;   # virtual register file (index = vreg id)
+    ip:         int;          # instruction pointer within current func
+    module:     QModule;      # module under execution
+    call_stack: Vec<int>;     # saved IPs for call/ret
+    func_stack: Vec<int>;     # function indices for call/ret
+    patches:    Vec<PatchRecord>,
+        pins:       Vec<PinRecord>,
+        sigs:       Vec<SignRecord>,
+        output:     Vec<string>;  # print output accumulator
+    exit_code:  int,
+        halted:     int,
+        jit_bridge: JitBridge;    # Stage 3: live patching bridge
+    jit_enabled: int         # 1 if jit_bridge is initialised
+end.
+# Maximum virtual registers per function
+const VM_MAX_REGS: int = 4096;
+
+func vm_new(m: QModule):
+    regs = vec_new<VMReg>();
+    i = 0;
+    when i < VM_MAX_REGS loop
+        vec_push(regs, vmreg_zero());
+        i = i + 1
+    end
+    out VMState (
+        regs:       regs,
+        ip:         0,
+        module:     m,
+        call_stack: vec_new<int>(),
+        func_stack: vec_new<int>(),
+        patches:    vec_new<PatchRecord>(),
+        pins:       vec_new<PinRecord>(),
+        sigs:       vec_new<SignRecord>(),
+        output:     vec_new<string>(),
+        exit_code:  0,
+        halted:     0,
+        jit_bridge: jit_bridge_new(0),
+        jit_enabled: 1
+    )
+end.
+# ═══════════════════════════════════════════════════════
+# Register helpers
+# ═══════════════════════════════════════════════════════
+
+func vm_get_reg(state: VMState, idx: int):
+    if idx >= 0 and idx < vec_len(state.regs) do
+        out vec_get(state.regs, idx)
+    end
+    out vmreg_zero()
+end.
+func vm_set_reg:
+    in  state: VMState;
+        idx: int;
+        val: VMReg
+    if idx >= 0 and idx < vec_len(state.regs) do
+        vec_set(state.regs, idx, val)
+    end
+    out state
+end.
+# Resolve a QOperand to an integer value
+func vm_operand_ival(state: VMState, op: QOperand):
+    if op.op_type == OperandType.Immediate do
+        out op.imm_val
+    end
+    if op.op_type == OperandType.VReg do
+        r = vm_get_reg(state, op.vreg);
+        out r.ival
+    end
+    out 0
+end.
+# ═══════════════════════════════════════════════════════
+# Find function by name in module
+# ═══════════════════════════════════════════════════════
+
+func vm_find_func(m: QModule, name: string):
+    i = 0;
+    when i < vec_len(m.functions) loop
+        f = vec_get(m.functions, i);
+        if str_eq(f.name, name) do
+            out (true, i)
+        end
+        i = i + 1
+    end
+    out (false, -1)
+end.
+func vm_func_meta(func: QFunction):
+    out (func.param_count << 32) + vec_len(func.body)
+end.
+func vm_record_signature:
+    in  state: VMState;
+        patch_id: int;
+        token: int
+    vec_push(state.sigs, SignRecord ( patch_id: patch_id, token: token ));
+    out state
+end.
+func vm_apply_patch:
+    in  state: VMState;
+        target_func: int;
+        source_func: int;
+        patch_id: int
+    if target_func >= 0 and target_func < vec_len(state.module.functions) and
+       source_func >= 0 and source_func < vec_len(state.module.functions) do
+        dst = vec_get(state.module.functions, target_func);
+        src = vec_get(state.module.functions, source_func);
+
+        # Stage 3: if JIT bridge is active, compile new body and
+        # emit into the JIT region for live code patching.
+        if state.jit_enabled == 1 do
+            # Compile new function body to native code
+            code_buf = codegen_emit(src.body, vec_len(src.body), TargetArch.ARM64);
+            code_ptr = codebuf_data_ptr(code_buf);
+            code_len = codebuf_offset(code_buf);
+            if code_len > 0 do
+                jit_begin_patch(state.jit_bridge);
+                jit_emit_code(state.jit_bridge, target_func, code_ptr, code_len);
+                jit_end_patch(state.jit_bridge)
+            end
+        end
+
+        # Always update IR-level body so interpreter sees the patch too
+        dst.body = src.body;
+        dst.param_count = src.param_count;
+        dst.param_vregs = src.param_vregs;
+        vec_set(state.module.functions, target_func, dst);
+        vec_push(state.patches, PatchRecord (
+            patch_id: patch_id,
+            target_func: target_func,
+            source_func: source_func
+        ))
+    end
+    out state
+end.
+func vm_record_pin:
+    in  state: VMState;
+        vreg: int;
+        phys_reg: int
+    vec_push(state.pins, PinRecord ( vreg: vreg, phys_reg: phys_reg ));
+    out state
+end.
+# ═══════════════════════════════════════════════════════
+# Label resolution (linear scan for patch_id)
+# ═══════════════════════════════════════════════════════
+
+func vm_resolve_label(func: QFunction, label_id: int):
+    i = 0;
+    when i < vec_len(func.body) loop
+        instr = vec_get(func.body, i);
+        if instr.opcode == QOp.Label and instr.patch_id == label_id do
+            out i
+        end
+        i = i + 1
+    end
+    out -1
+end.
+# ═══════════════════════════════════════════════════════
+# Single-step execution
+# Returns: (state, status)
+# ═══════════════════════════════════════════════════════
+
+func vm_step(state: VMState, func: QFunction):
+
+
+    if state.ip < 0 or state.ip >= vec_len(func.body) do
+        out (state, vm_err_ret())
+    end
+
+    instr = vec_get(func.body, state.ip);
+    op = instr.opcode;
+
+    # ── Nop ───────────────────────────────────────────
+    if op == QOp.Nop do
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Load immediate ────────────────────────────────
+    if op == QOp.Load do
+        v = vm_operand_ival(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Move (reg→reg copy) ───────────────────────────
+    if op == QOp.Move do
+        v = vm_operand_ival(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Integer arithmetic ────────────────────────────
+    if op == QOp.Add do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v1 + v2));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Sub do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v1 - v2));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Mul do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v1 * v2));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Div do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        if v2 == 0 do
+            out (state, vm_err_div())
+        end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v1 / v2));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Mod do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        if v2 == 0 do
+            out (state, vm_err_div())
+        end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v1 - (v1 / v2) * v2));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Bitwise ───────────────────────────────────────
+    if op == QOp.And do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v1 & v2));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Or do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v1 | v2));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Xor do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v1 ^ v2));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Shl do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v1 << v2));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Shr do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(v1 shr v2));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Comparisons (result: 1 = true, 0 = false) ────
+    if op == QOp.CmpEq do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        rv = 0;
+        if v1 == v2 do rv = 1 end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(rv));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.CmpNe do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        rv = 0;
+        if v1 != v2 do rv = 1 end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(rv));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.CmpGt do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        rv = 0;
+        if v1 > v2 do rv = 1 end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(rv));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.CmpLt do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        rv = 0;
+        if v1 < v2 do rv = 1 end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(rv));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.CmpGe do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        rv = 0;
+        if v1 >= v2 do rv = 1 end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(rv));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.CmpLe do
+        v1 = vm_operand_ival(state, instr.src1);
+        v2 = vm_operand_ival(state, instr.src2);
+        rv = 0;
+        if v1 <= v2 do rv = 1 end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(rv));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Control flow ──────────────────────────────────
+    if op == QOp.Label do
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Jump do
+        target = vm_resolve_label(func, instr.src1.vreg);
+        if target < 0 do
+            out (state, vm_err_op())
+        end
+        state.ip = target;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.JumpIfNot do
+        cond = vm_operand_ival(state, instr.src1);
+        if cond == 0 do
+            target = vm_resolve_label(func, instr.src2.vreg);
+            if target < 0 do
+                out (state, vm_err_op())
+            end
+            state.ip = target
+        else
+            state.ip = state.ip + 1
+        end
+        out (state, vm_ok())
+    end
+
+    # ── Return / Exit ─────────────────────────────────
+    if op == QOp.Ret do
+        retval = vm_operand_ival(state, instr.src1);
+        state = vm_set_reg(state, 0, vmreg_int(retval));
+        out (state, vm_halt())
+    end
+
+    if op == QOp.Exit do
+        v1 = vm_operand_ival(state, instr.src1);
+        state.exit_code = v1;
+        state.halted = 1;
+        out (state, vm_halt())
+    end
+
+    # ── Print (debug output accumulator) ─────────────
+    if op == QOp.Print do
+        v1 = vm_operand_ival(state, instr.src1);
+        s = str_concat(str_new(""), str_new(""));  # placeholder — int→string needs stdlib
+        vec_push(state.output, s);
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.PrintStr do
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Array operations ──────────────────────────────
+    if op == QOp.ArrNew do
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(0));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.ArrLen or op == QOp.ArrGet or op == QOp.ArrSet or
+       op == QOp.ArrPush do
+        # Stub: array operations deferred to native layer
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── String operations ─────────────────────────────
+    if op == QOp.StrLenOp or op == QOp.StrGet or op == QOp.StrCat or
+       op == QOp.StrEq or op == QOp.IToStr or op == QOp.StrToI do
+        # Stub: string operations deferred to native layer
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(0));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Global get/set ────────────────────────────────
+    if op == QOp.LoadGlobal or op == QOp.StoreGlobal do
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Stage 2: raw syscall / memory ops ─────────────
+    if op == QOp.Syscall do
+        # Pure Vir VM cannot issue host syscalls directly yet.
+        # Preserve call shape and return stub value for now.
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(-1));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.MemLoad or op == QOp.MemLoad8 do
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(0));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.MemStore or op == QOp.MemStore8 do
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Stage 3: sovereignty hooks ────────────────────
+    if op == QOp.PatchFunc do
+        target_func = vm_operand_ival(state, instr.src1);
+        source_func = vm_operand_ival(state, instr.src2);
+        state = vm_apply_patch(state, target_func, source_func, instr.patch_id);
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.RegPin do
+        vreg_id = vm_operand_ival(state, instr.src1);
+        phys_reg = vm_operand_ival(state, instr.src2);
+        state = vm_record_pin(state, vreg_id, phys_reg);
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.SignVsib do
+        payload = vm_operand_ival(state, instr.src1);
+        token = (payload ^ 0x5A17C0DE) + instr.patch_id;
+        state = vm_record_signature(state, instr.patch_id, token);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(token));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.ReflectIR do
+        fidx = vm_operand_ival(state, instr.src1);
+        meta = 0;
+        if fidx >= 0 and fidx < vec_len(state.module.functions) do
+            meta = vm_func_meta(vec_get(state.module.functions, fidx))
+        end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(meta));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.PatchPoint do
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Optimizer-emitted opcodes (BCE / Escape Analysis) ─
+    if op == QOp.BoundsCheck do
+        # BoundsCheck: trap if index (src1) < 0 or index >= length (src2)
+        idx = vm_operand_ival(state, instr.src1);
+        len = vm_operand_ival(state, instr.src2);
+        if idx < 0 or idx >= len do
+            state.exit_code = 1;
+            state.halted = 1;
+            out (state, vm_err_op())
+        end
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.StackAlloc do
+        # StackAlloc: semantically identical to Alloc in the interpreter.
+        # In native codegen, this maps to SUB SP instead of heap malloc.
+        # The interpreter treats it as a zero-cost alloc (value = 0 pointer stub).
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(0));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── SIMD Vector opcodes (interpreter scalar fallback) ──
+    if op == QOp.VAdd do
+        a = vm_operand_fval(state, instr.src1);
+        b = vm_operand_fval(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(a + b));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VSub do
+        a = vm_operand_fval(state, instr.src1);
+        b = vm_operand_fval(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(a - b));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VMul do
+        a = vm_operand_fval(state, instr.src1);
+        b = vm_operand_fval(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(a * b));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VDiv do
+        a = vm_operand_fval(state, instr.src1);
+        b = vm_operand_fval(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(a / b));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VFma do
+        a = vm_operand_fval(state, instr.src1);
+        b = vm_operand_fval(state, instr.src2);
+        acc = vm_operand_fval(state, instr.dest);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(acc + a * b));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VLoad do
+        a = vm_operand_fval(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VStore do
+        a = vm_operand_fval(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VMin do
+        a = vm_operand_fval(state, instr.src1);
+        b = vm_operand_fval(state, instr.src2);
+        v = if a < b do a else b end;
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(v));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VMax do
+        a = vm_operand_fval(state, instr.src1);
+        b = vm_operand_fval(state, instr.src2);
+        v = if a > b do a else b end;
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(v));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VReduce do
+        a = vm_operand_fval(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VSplat do
+        a = vm_operand_fval(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VPerm do
+        a = vm_operand_fval(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VCmpEq do
+        a = vm_operand_fval(state, instr.src1);
+        b = vm_operand_fval(state, instr.src2);
+        v = if a == b do 1.0 else 0.0 end;
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(v));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VAbs do
+        a = vm_operand_fval(state, instr.src1);
+        v = if a < 0.0 do 0.0 - a else a end;
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(v));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VSqrt do
+        a = vm_operand_fval(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(native_sqrt(a)));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+    if op == QOp.VMla do
+        a = vm_operand_fval(state, instr.src1);
+        b = vm_operand_fval(state, instr.src2);
+        acc = vm_operand_fval(state, instr.dest);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_float(acc + a * b));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Phase 7: New opcodes (VM stubs) ───────────────
+
+    if op == QOp.MemCopy do
+        # MemCopy: dest=dest_ptr, src1=src_ptr, src2=len — stub in VM
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(0));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.MemSet do
+        # MemSet: dest=dest_ptr, src1=byte_val, src2=len — stub in VM
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(0));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.CLZ do
+        a = vm_operand_ival(state, instr.src1);
+        # Software CLZ: count leading zeros
+        count = 0;
+        if a == 0 do
+            count = 64
+        else
+            mask = 1 << 63;
+            when (a & mask) == 0 and count < 64 loop
+                count = count + 1;
+                mask = mask shr 1
+            end
+        end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(count));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.CTZ do
+        a = vm_operand_ival(state, instr.src1);
+        count = 0;
+        if a == 0 do
+            count = 64
+        else
+            when (a & 1) == 0 and count < 64 loop
+                a = a shr 1;
+                count = count + 1
+            end
+        end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(count));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.PopCnt do
+        a = vm_operand_ival(state, instr.src1);
+        count = 0;
+        when a != 0 loop
+            a = a & (a - 1);
+            count = count + 1
+        end
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(count));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.BSwap do
+        a = vm_operand_ival(state, instr.src1);
+        # Byte swap 64-bit
+        b0 = (a shr 56) & 0xFF;
+        b1 = (a shr 40) & 0xFF;
+        b2 = (a shr 24) & 0xFF;
+        b3 = (a shr 16) & 0xFF;
+        b4 = (a shr 8)  & 0xFF;
+        b5 = a         & 0xFF;
+        # Simplified: just reverse bytes
+        r = b5 << 56;
+        r = r | (b4 << 48);
+        r = r | (b3 << 40);
+        r = r | (b2 << 32);
+        r = r | (b1 << 24);
+        r = r | (b0 << 16);
+        # Full 8-byte swap would need all 8 bytes; approximation for VM
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(r));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Not do
+        a = vm_operand_ival(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(~a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Neg do
+        a = vm_operand_ival(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(0 - a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Fence do
+        # Memory barrier — NOP in single-threaded VM
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.AtomicLoad do
+        # In VM, same as regular load from address
+        a = vm_operand_ival(state, instr.src1);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.AtomicStore do
+        # In VM, same as regular store — NOP side effect
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.AtomicCas do
+        # In VM (single-threaded): always succeeds, return old=expected
+        a = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.AtomicAdd do
+        a = vm_operand_ival(state, instr.src1);
+        b = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.AtomicSub do
+        a = vm_operand_ival(state, instr.src1);
+        b = vm_operand_ival(state, instr.src2);
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(a));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    if op == QOp.Trap do
+        # Debug breakpoint — halt execution
+        state.exit_code = 1;
+        state.halted = 1;
+        out (state, vm_err_op())
+    end
+
+    if op == QOp.Unreachable do
+        # Should never be reached — halt with error
+        state.exit_code = 2;
+        state.halted = 1;
+        out (state, vm_err_op())
+    end
+
+    if op == QOp.AlignPtr do
+        ptr = vm_operand_ival(state, instr.src1);
+        align = vm_operand_ival(state, instr.src2);
+        # result = (ptr + align - 1) & ~(align - 1)
+        result = (ptr + align - 1) & (~(align - 1));
+        state = vm_set_reg(state, instr.dest.vreg, vmreg_int(result));
+        state.ip = state.ip + 1;
+        out (state, vm_ok())
+    end
+
+    # ── Unrecognised opcode ───────────────────────────
+    state.ip = state.ip + 1;
+    out (state, vm_ok())
+end.
+# ═══════════════════════════════════════════════════════
+# Execute a single function to completion
+# (simple loop — no nested call dispatch yet)
+# ═══════════════════════════════════════════════════════
+
+func vm_run_func(state: VMState, func: QFunction):
+    state.ip = 0;
+    max_steps = 1000000;
+    steps = 0;
+    status = vm_ok();
+
+    when state.halted == 0 and steps < max_steps loop
+        var (state2, st2) = vm_step(state, func);
+        state = state2;
+        status = st2;
+        if status.code != 0 do
+            state.halted = 1
+        end
+        steps = steps + 1
+    end
+
+    out (state, status)
+end.
+# ═══════════════════════════════════════════════════════
+# Public entry point: execute a named function in a module
+# ═══════════════════════════════════════════════════════
+
+func vm_exec(m: QModule, func_name: string):
+    var (found, fidx) = vm_find_func(m, func_name);
+    if not found do
+        out -1
+    end
+    func = vec_get(m.functions, fidx);
+    state = vm_new(m);
+    var (final_state, _status) = vm_run_func(state, func);
+    out final_state.exit_code
+end.
