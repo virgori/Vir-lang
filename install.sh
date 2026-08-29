@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ═════════════════════════════════════════════════════════════════════
-# Vir Language & Toolchain — Fast Global Installer with Progress
+# Vir Language & Toolchain — Global Installer
 # ═════════════════════════════════════════════════════════════════════
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/virgori/Vir-lang/main/install.sh | bash
 # ═════════════════════════════════════════════════════════════════════
 set -euo pipefail
 
-# ANSI color codes & formatting
+# ANSI color codes & styling
 BOLD="\033[1m"
 GREEN="\033[32m"
 BLUE="\033[34m"
@@ -59,10 +59,10 @@ echo -e "${RESET}"
 draw_progress 10 "Detecting system platform and architecture..."
 OS="$(uname -s)"
 ARCH="$(uname -m)"
-sleep 0.1
+sleep 0.05
 
 if [ "${OS}" != "Darwin" ] && [ "${OS}" != "Linux" ]; then
-    echo -e "\n${RED}Error: Unsupported operating system: ${OS}.${RESET}"
+    echo -e "\n${RED}Error: Unsupported operating system: ${OS}. Vir supports macOS and Linux.${RESET}"
     exit 1
 fi
 print_step_done "Platform detected" "${OS} ${ARCH}"
@@ -70,15 +70,15 @@ print_step_done "Platform detected" "${OS} ${ARCH}"
 # 2. Target Directory Setup
 draw_progress 20 "Configuring installation workspace..."
 mkdir -p "${VIR_HOME}" "${VIR_BIN}"
-sleep 0.1
-print_step_done "Workspace ready" "${VIR_HOME}"
+sleep 0.05
+print_step_done "Workspace configured" "${VIR_HOME}"
 
 # 3. Obtain Source / Binaries
 TEMP_SRC=""
 if [ -f "stdlib/vir/prelude.vri" ] || [ -f "stdlib/prelude.vri" ]; then
     BUILD_DIR="$(pwd)"
     draw_progress 30 "Using local repository files..."
-    sleep 0.1
+    sleep 0.05
     print_step_done "Source located" "local workspace"
 else
     draw_progress 25 "Fetching latest Vir release from GitHub..."
@@ -94,7 +94,7 @@ fi
 
 # 4. Binary Installation / Fast Copy / Compilation
 # Step 4.1: virc
-draw_progress 40 "Installing compiler binary (virc)..."
+draw_progress 40 "Installing Native Compiler (virc)..."
 if [ -f "${BUILD_DIR}/bin/virc" ]; then
     cp "${BUILD_DIR}/bin/virc" "${VIR_BIN}/virc"
 elif [ -f "${BUILD_DIR}/dist/virc-stage2" ]; then
@@ -127,7 +127,7 @@ elif [ -f "${BUILD_DIR}/apps/viron/main.vri" ]; then
 fi
 chmod +x "${VIR_BIN}/viron"
 if [ "${OS}" = "Darwin" ]; then codesign -s - -f "${VIR_BIN}/viron" >/dev/null 2>&1 || true; fi
-print_step_done "Package Manager (viron) installed" "SemVer & DAG solver"
+print_step_done "Package Manager (viron) installed" "SemVer & DAG resolver"
 
 # Step 4.4: vir-lsp Language Server
 draw_progress 82 "Installing Language Server Protocol (vir-lsp)..."
@@ -196,9 +196,9 @@ draw_progress 100 "Installation completed!"
 echo ""
 echo ""
 
-echo -e "${GREEN}${BOLD}🎉 CÀI ĐẶT VIR TOOLCHAIN HOÀN TẤT THÀNH CÔNG!${RESET}"
+echo -e "${GREEN}${BOLD}🎉 VIR TOOLCHAIN INSTALLED SUCCESSFULLY!${RESET}"
 echo "============================================================"
-echo -e "Để kích hoạt lệnh ${CYAN}vir${RESET} ngay trong terminal hiện tại, hãy chạy:"
+echo -e "To activate the ${CYAN}vir${RESET} command in your current terminal session, run:"
 echo ""
 if [ -n "${DETECTED_RC}" ]; then
     echo -e "    ${YELLOW}${BOLD}echo '${EXPORT_LINE}' >> ${DETECTED_RC} && source ${DETECTED_RC}${RESET}"
@@ -207,9 +207,10 @@ else
 fi
 echo ""
 echo "============================================================"
-echo -e "${BOLD}Lệnh bắt đầu nhanh:${RESET}"
-echo -e "  • ${CYAN}vir --version${RESET}           : Kiểm tra phiên bản hệ thống"
-echo -e "  • ${CYAN}vir new my_app${RESET}          : Tạo dự án Vir mới"
-echo -e "  • ${CYAN}cd my_app && vir run${RESET}    : Biên dịch và chạy ứng dụng"
-echo -e "  • ${CYAN}vir help${RESET}                : Xem tài liệu các lệnh đầy đủ"
+echo -e "${BOLD}Quick Start Commands:${RESET}"
+echo -e "  • ${CYAN}vir --version${RESET}           : Display toolchain version"
+echo -e "  • ${CYAN}vir new my_app${RESET}          : Create a new Vir project"
+echo -e "  • ${CYAN}cd my_app && vir run${RESET}    : Build and execute application"
+echo -e "  • ${CYAN}vir check hello.vri${RESET}     : Perform fast static syntax check"
+echo -e "  • ${CYAN}vir help${RESET}                : View complete command documentation"
 echo "============================================================"
