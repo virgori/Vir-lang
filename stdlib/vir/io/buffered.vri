@@ -1,0 +1,264 @@
+##
+ * vir/io/buffered.vri — Buffered I/O Wrappers
+ * ===============================================
+ * Inspired by Python: io.BufferedReader, io.BufferedWriter
+ * Inspired by C23: stdio.h (setvbuf, fread/fwrite buffering)
+ *
+ * Giảm syscall overhead == cách đệm đọc/ghi in userspace.
+ ##
+
+include types;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include alloc;
+import alloc, free from alloc;
+include copy;
+import mem_copy from copy;
+include string;
+import String, str_new, str_from_bytes from string;
+
+const BUFFER_SIZE: 8192   # 8 KB default;
+
+# ═══════════════════════════════════════════════════════
+# BufferedReader
+# ═══════════════════════════════════════════════════════
+
+entity BufferedReader:
+    fd:      int        # file descriptor,
+        buf:     ptr        # internal buffer,
+        buf_len: int      # số byte in buf,
+        buf_pos: int      # vị trí đọc hiện tại in buf,
+        buf_cap: int      # size buffer,
+        eof:     bool       # đã end dữ liệu;
+end.
+func buffered_reader_new(fd: int):
+    out BufferedReader (;
+        fd = fd,
+        buf = alloc(BUFFER_SIZE),
+        buf_len = 0,
+        buf_pos = 0,
+        buf_cap = BUFFER_SIZE,
+        eof = false
+    );
+end.
+func buffered_reader_with_cap(fd: int, cap: int):
+    real_cap = cap;
+    if real_cap < 512 do real_cap = 512 end
+    out BufferedReader (;
+        fd = fd,
+        buf = alloc(real_cap),
+        buf_len = 0,
+        buf_pos = 0,
+        buf_cap = real_cap,
+        eof = false
+    );
+end.
+func _br_fill(r: BufferedReader):
+    # Đọc thêm dữ liệu từ fd vào buffer.
+    if r.eof do out Ok(0) end
+    
+    # Di chuyển dữ liệu chưa đọc về đầu buffer
+    remaining = r.buf_len - r.buf_pos;
+    if remaining > 0 and r.buf_pos > 0 do
+        mem_copy(r.buf, r.buf + r.buf_pos, remaining);
+    end
+    r.buf_pos = 0;
+    r.buf_len = remaining;
+    
+    # Đọc thêm
+    space = r.buf_cap - r.buf_len;
+    n = native_read(r.fd, r.buf + r.buf_len, space);
+    if n < 0 do out Err(str_new("read error")) end
+    if n == 0 r. do eof = true end
+    r.buf_len = r.buf_len + n;
+    out Ok(n);
+end.
+func br_read:
+    in  r: BufferedReader;
+        dst: ptr;
+        count: int
+    # Đọc tối đa count bytes vào dst.
+    total = 0;
+    
+    when total < count loop
+        avail = r.buf_len - r.buf_pos;
+        if avail == 0 do
+            fill_result = _br_fill(r);
+            if is_err(fill_result) do out fill_result end
+            avail = r.buf_len - r.buf_pos;
+            if avail == 0 do break end # EOF
+        end
+        
+        to_copy = count - total;
+        if to_copy > avail do to_copy = avail end
+        
+        mem_copy(dst + total, r.buf + r.buf_pos, to_copy);
+        r.buf_pos = r.buf_pos + to_copy;
+        total = total + to_copy;
+    end
+    
+    out Ok(total);
+end.
+func br_read_byte(r: BufferedReader):
+    # Đọc 1 byte.
+    if r.buf_pos >= r.buf_len do
+        result = _br_fill(r);
+        if r.buf_pos >= r.buf_len do out None end
+    end
+    b = native_load_u8(r.buf, r.buf_pos);
+    r.buf_pos = r.buf_pos + 1;
+    out Some(b);
+end.
+func br_read_line(r: BufferedReader):
+    # Đọc đến '\n' or EOF. Bao gồm '\n' if có.
+    line_buf = alloc(256);
+    line_len = 0;
+    line_cap = 256;
+    
+    loop
+        byte_opt = br_read_byte(r);
+        case byte_opt;
+        None:
+                if line_len == 0 do
+                    free(line_buf);
+                    out None;
+                end
+                break;
+        Some(b):
+                # Mở rộng if cần
+                if line_len >= line_cap do
+                    line_cap = line_cap * 2;
+                    new_buf = alloc(line_cap);
+                    mem_copy(new_buf, line_buf, line_len);
+                    free(line_buf);
+                    line_buf = new_buf;
+                end
+                native_store_u8(line_buf, line_len, b);
+                line_len = line_len + 1;
+                if b == 0x0A do break end # '\n'
+        end
+    end
+    
+    result = str_from_bytes(line_buf, line_len);
+    free(line_buf);
+    out Some(result);
+end.
+func br_is_eof(r: BufferedReader):
+    out r.eof and r.buf_pos >= r.buf_len;
+end.
+func br_close(r: BufferedReader):
+    if r.buf != null do free(r.buf) end
+    r.buf = null;
+    native_close(r.fd);
+end.
+# ═══════════════════════════════════════════════════════
+# BufferedWriter
+# ═══════════════════════════════════════════════════════
+
+entity BufferedWriter:
+    fd:      int,
+        buf:     ptr,
+        buf_len: int,
+        buf_cap: int;
+end.
+func buffered_writer_new(fd: int):
+    out BufferedWriter (;
+        fd = fd,
+        buf = alloc(BUFFER_SIZE),
+        buf_len = 0,
+        buf_cap = BUFFER_SIZE
+    );
+end.
+func bw_write:
+    in  w: BufferedWriter;
+        src: ptr;
+        count: int
+    # Ghi vào buffer, flush khi full.
+    total = 0;
+    
+    when total < count loop
+        space = w.buf_cap - w.buf_len;
+        if space == 0 do
+            flush_result = bw_flush(w);
+            if is_err(flush_result) do out flush_result end
+            space = w.buf_cap;
+        end
+        
+        to_copy = count - total;
+        if to_copy > space do to_copy = space end
+        
+        mem_copy(w.buf + w.buf_len, src + total, to_copy);
+        w.buf_len = w.buf_len + to_copy;
+        total = total + to_copy;
+    end
+    
+    out Ok(total);
+end.
+func bw_write_byte(w: BufferedWriter, b: int):
+    if w.buf_len >= w.buf_cap do
+        result = bw_flush(w);
+        if is_err(result) do out result end
+    end
+    native_store_u8(w.buf, w.buf_len, b);
+    w.buf_len = w.buf_len + 1;
+    out Ok(1);
+end.
+func bw_write_str(w: BufferedWriter, s: string):
+    out bw_write(w, s.data, s.byte_len);
+end.
+func bw_flush(w: BufferedWriter):
+    if w.buf_len == 0 do out Ok(0) end
+    
+    written = 0;
+    when written < w.buf_len loop
+        n = native_write(w.fd, w.buf + written, w.buf_len - written);
+        if n < 0 do out Err(str_new("write error")) end
+        if n == 0 do out Err(str_new("write returned 0")) end
+        written = written + n;
+    end
+    
+    total = w.buf_len;
+    w.buf_len = 0;
+    out Ok(total);
+end.
+func bw_close(w: BufferedWriter):
+    bw_flush(w);
+    if w.buf != null do free(w.buf) end
+    w.buf = null;
+    native_close(w.fd);
+end.
+# ═══════════════════════════════════════════════════════
+# Line-buffered Writer (auto-flush on '\n')
+# ═══════════════════════════════════════════════════════
+
+entity LineWriter:
+    inner: BufferedWriter;
+end.
+func line_writer_new(fd: int):
+    out LineWriter ( inner = buffered_writer_new(fd) );
+end.
+func lw_write:
+    in  w: LineWriter;
+        src: ptr;
+        count: int
+    result = bw_write(&w.inner, src, count);
+    
+    # Kiểm tra có '\n' in dữ liệu vừa ghi
+    i = 0;
+    has_newline = false;
+    when i < count loop
+        if native_load_u8(src, i) == 0x0A do
+            has_newline = true;
+            break;
+        end
+        i = i + 1;
+    end
+    
+    if has_newline do bw_flush(&w.inner) end
+    out result;
+end.
+func lw_close(w: LineWriter):
+    bw_close(&w.inner);
+end.

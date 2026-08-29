@@ -1,0 +1,246 @@
+##
+ * vir/auth/oauth2.vri — OAuth 2.0 Client
+ * =========================================
+ * Inspired by Python: requests-oauthlib, authlib
+ * Inspired by Rust: oauth2 crate
+ * Inspired by RFC 6749, RFC 7636 (PKCE)
+ *
+ * OAuth 2.0 flows: Authorization Code (with PKCE),
+ * Client Credentials, Resource Owner Password, Refresh Token.
+ ##
+
+include types;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include string;
+import String, str_new, str_byte_len, str_ptr, str_concat from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include json;
+import json_parse, json_get, json_as_string, json_as_number from json;
+include http;
+import http_post, http_get, HttpResponse from http;
+include encode;
+import base64_url_encode from encode;
+include crypto;
+import crypto_random_bytes, sha256_hash, sha256_hex from crypto;
+
+# ═══════════════════════════════════════════════════════
+# OAuth2 Flow Types
+# ═══════════════════════════════════════════════════════
+
+enum OAuth2GrantType:
+    AuthorizationCode   = 0;
+    ClientCredentials   = 1;
+    ResourceOwnerPassword = 2;
+    RefreshToken        = 3;
+end.
+
+# ═══════════════════════════════════════════════════════
+# Entities
+# ═══════════════════════════════════════════════════════
+
+entity OAuth2Config:
+    client_id:       string,
+        client_secret:   Option<string>,
+        auth_url:        string,
+        token_url:       string,
+        redirect_uri:    Option<string>,
+        scopes:          Vec<string>;
+end.
+entity OAuth2Token:
+    access_token:  string,
+        token_type:    string,
+        expires_in:    int;            # seconds
+    refresh_token: Option<string>,
+        scope:         Option<string>;
+end.
+entity PkceChallenge:
+    verifier:  string;    # random 43-128 char string
+    challenge: string;    # S256 hash of verifier
+    method:    string;    # "S256"
+end.
+
+# ═══════════════════════════════════════════════════════
+# Config Builder
+# ═══════════════════════════════════════════════════════
+
+func oauth2_config:
+    in  client_id: string;
+        auth_url: string;
+        token_url: string
+    out OAuth2Config (
+        client_id = client_id,
+        client_secret = None,
+        auth_url = auth_url,
+        token_url = token_url,
+        redirect_uri = None,
+        scopes = vec_new<string>()
+    );
+end.
+func oauth2_set_secret(cfg: OAuth2Config, secret: string):
+    cfg.client_secret = Some(secret);
+end.
+func oauth2_set_redirect(cfg: OAuth2Config, uri: string):
+    cfg.redirect_uri = Some(uri);
+end.
+func oauth2_add_scope(cfg: OAuth2Config, scope: string):
+    vec_push<string>(&cfg.scopes, scope);
+end.
+# ═══════════════════════════════════════════════════════
+# PKCE (RFC 7636) — Proof Key for Code Exchange
+# ═══════════════════════════════════════════════════════
+
+func oauth2_pkce_generate:
+    # Generate a random 32-byte verifier (43 chars base64url)
+    var random_bytes: [int; 32];
+    crypto_random_bytes(&random_bytes, 32);
+    verifier = base64_url_encode(&random_bytes, 32);
+
+    # S256: challenge = BASE64URL(SHA256(verifier))
+    hash = sha256_hash(str_ptr(verifier), str_byte_len(verifier));
+    challenge = base64_url_encode(&hash, 32);
+
+    out PkceChallenge (
+        verifier = verifier,
+        challenge = challenge,
+        method = str_new("S256")
+    );
+end.
+# ═══════════════════════════════════════════════════════
+# Authorization URL (step 1 of auth code flow)
+# ═══════════════════════════════════════════════════════
+
+## Build the authorization URL for the user to visit.
+func oauth2_auth_url:
+    in  cfg: OAuth2Config;
+        state: string;
+        pkce: Option<PkceChallenge>
+    url = str_concat(cfg.auth_url, str_new("?response_type=code"));
+    url = str_concat(url, str_concat(str_new("&client_id="), cfg.client_id));
+
+    if is_some(cfg.redirect_uri) do
+        url = str_concat(url, str_concat(str_new("&redirect_uri="), unwrap(cfg.redirect_uri)));
+    end
+
+    # Scopes
+    if vec_len<string>(cfg.scopes) > 0 do
+        scope_str = str_new("");
+        i = 0;
+        when i < vec_len<string>(cfg.scopes) loop
+            if i > 0 do scope_str = str_concat(scope_str, str_new(" ")) end
+            scope_str = str_concat(scope_str, vec_get<string>(cfg.scopes, i));
+            i = i + 1;
+        end
+        url = str_concat(url, str_concat(str_new("&scope="), scope_str));
+    end
+
+    url = str_concat(url, str_concat(str_new("&state="), state));
+
+    # PKCE
+    if is_some(pkce) do
+        p = unwrap(pkce);
+        url = str_concat(url, str_concat(str_new("&code_challenge="), p.challenge));
+        url = str_concat(url, str_concat(str_new("&code_challenge_method="), p.method));
+    end
+
+    out url;
+end.
+# ═══════════════════════════════════════════════════════
+# Token Exchange
+# ═══════════════════════════════════════════════════════
+
+## Exchange authorization code for tokens (step 2).
+func oauth2_exchange_code:
+    in  cfg: OAuth2Config;
+        code: string;
+        pkce_verifier: Option<string>
+    body = str_concat(str_new("grant_type=authorization_code&code="), code);
+    body = str_concat(body, str_concat(str_new("&client_id="), cfg.client_id));
+
+    if is_some(cfg.client_secret) do
+        body = str_concat(body, str_concat(str_new("&client_secret="), unwrap(cfg.client_secret)));
+    end
+    if is_some(cfg.redirect_uri) do
+        body = str_concat(body, str_concat(str_new("&redirect_uri="), unwrap(cfg.redirect_uri)));
+    end
+    if is_some(pkce_verifier) do
+        body = str_concat(body, str_concat(str_new("&code_verifier="), unwrap(pkce_verifier)));
+    end
+
+    out _oauth2_token_request(cfg.token_url, body);
+end.
+## Client Credentials flow (machine-to-machine).
+func oauth2_client_credentials(cfg: OAuth2Config):
+    if is_none(cfg.client_secret) do
+        out Err(str_new("OAuth2: client_secret required for client_credentials"));
+    end
+    body = str_concat(str_new("grant_type=client_credentials&client_id="), cfg.client_id);
+    body = str_concat(body, str_concat(str_new("&client_secret="), unwrap(cfg.client_secret)));
+
+    if vec_len<string>(cfg.scopes) > 0 do
+        scope_str = str_new("");
+        i = 0;
+        when i < vec_len<string>(cfg.scopes) loop
+            if i > 0 do scope_str = str_concat(scope_str, str_new(" ")) end
+            scope_str = str_concat(scope_str, vec_get<string>(cfg.scopes, i));
+            i = i + 1;
+        end
+        body = str_concat(body, str_concat(str_new("&scope="), scope_str));
+    end
+
+    out _oauth2_token_request(cfg.token_url, body);
+end.
+## Refresh token flow.
+func oauth2_refresh(cfg: OAuth2Config, refresh_token: string):
+    body = str_concat(str_new("grant_type=refresh_token&refresh_token="), refresh_token);
+    body = str_concat(body, str_concat(str_new("&client_id="), cfg.client_id));
+    if is_some(cfg.client_secret) do
+        body = str_concat(body, str_concat(str_new("&client_secret="), unwrap(cfg.client_secret)));
+    end
+    out _oauth2_token_request(cfg.token_url, body);
+end.
+# ═══════════════════════════════════════════════════════
+# Internal token request
+# ═══════════════════════════════════════════════════════
+
+func _oauth2_token_request(token_url: string, body: string):
+    resp = http_post(token_url, body,
+        str_new("application/x-www-form-urlencoded"));
+    if resp.status != 200 do
+        out Err(str_new("OAuth2: token request failed"));
+    end
+
+    json_r = json_parse(resp.body);
+    if is_err(json_r) do
+        out Err(str_new("OAuth2: invalid JSON response"));
+    end
+    doc = unwrap_ok(json_r);
+
+    access = json_as_string(json_get(doc, str_new("access_token")));
+    ttype = json_as_string(json_get(doc, str_new("token_type")));
+    expires = json_as_number(json_get(doc, str_new("expires_in")));
+
+    refresh = None;
+    refresh_node = json_get(doc, str_new("refresh_token"));
+    if is_some(refresh_node) do
+        refresh = Some(json_as_string(unwrap(refresh_node)));
+    end
+
+    out Ok(OAuth2Token (
+        access_token = access,
+        token_type = ttype,
+        expires_in = float_to_int(expires),
+        refresh_token = refresh,
+        scope = None
+    ));
+end.
+# ═══════════════════════════════════════════════════════
+# Helper: Add Bearer token to request
+# ═══════════════════════════════════════════════════════
+
+func oauth2_bearer_header(token: OAuth2Token):
+    out str_concat(str_new("Bearer "), token.access_token);
+end.

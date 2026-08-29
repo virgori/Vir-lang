@@ -1,0 +1,486 @@
+##
+ * vir/math/attention.vri — Flash Attention & Fused Kernels
+ * ==========================================================
+ * Tiled IO-aware attention that keeps data in registers / L1 cache.
+ * Replaces torch.nn.functional.scaled_dot_product_attention.
+ *
+ * ═══════════════════════════════════════════════════════════
+ * FLASH ATTENTION — VirFlash Algorithm
+ * ═══════════════════════════════════════════════════════════
+ *
+ * Standard attention: 3 materialized matrices (QK^T, softmax, AV)
+ *   Memory: O(N²) — dominated by the N×N attention score matrix
+ *   Passes: Q@K^T → softmax → @V = 3 full-matrix passes
+ *
+ * VirFlash: Tiled online softmax with O(N) memory
+ *   - Tile Q into blocks of TILE_Q rows
+ *   - Tile K,V into blocks of TILE_KV rows
+ *   - For each Q-tile
+ *       Accumulate softmax(Q_tile @ K_tile^T) @ V_tile
+ *       using online log-sum-exp correction (no N×N matrix ever exists)
+ *   - Final rescale for exact softmax
+ *
+ * [CUSTOM ALGORITHM — "VirFlash: Register-Resident Tiled Attention"]
+ *
+ * Key advantage over standard implementation
+ *   - Memory: O(TILE_Q × TILE_KV) instead of O(N²)
+ *   - The score tile fits in L1 cache (or registers on NEON/AVX)
+ *   - No global max/sum needed — online correction handles it
+ *   - Compatible with Q-IR auto-vectorizer (inner loops are FMA-dense)
+ *
+ * Performance characteristics
+ *   - For N=2048, d=64: standard needs 32MB for scores, VirFlash needs ~32KB
+ *   - Inner kernel is pure FMA: a*b + c patterns for Q-IR → FMLA vectorization
+ *   - Tile sizes chosen for arm64 NEON: 32×32 keeps tile in 8KB (fits L1)
+ *
+ * ═══════════════════════════════════════════════════════════
+ * FUSED ELEMENTWISE KERNEL INFRASTRUCTURE
+ * ═══════════════════════════════════════════════════════════
+ *
+ * The fused_* functions demonstrate the pattern that Q-IR kernel fusion
+ * targets: multi-operation kernels that read input once and write output
+ * once, with all intermediate values in registers.
+ *
+ * When Q-IR detects chains like: LOAD → MUL → ADD → RELU → STORE
+ * it fuses them into a single kernel equivalent to fused_bias_relu().
+ * Data stays in NEON f64×2 registers throughout the chain.
+ *
+ * [CUSTOM ALGORITHM — "Register-Only Elementwise Fusion"]
+ ##
+
+include types;
+include alloc;
+import alloc, alloc_zeroed, free from alloc;
+include basic;
+import sqrt, exp, log, abs_f, max_f from basic;
+
+# ═══════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════
+
+const TILE_Q: 32     # Q-block rows (fits 32×64×8 = 16KB in L1);
+const TILE_KV: 32     # KV-block rows;
+
+# ═══════════════════════════════════════════════════════
+# Flash Attention — Core Implementation
+# ═══════════════════════════════════════════════════════
+
+func flash_attention(
+    Q: ptr, K: ptr, V: ptr, Out: ptr,
+    N: int, d: int, scale: float;
+);
+    ##
+     * Q, K, V: [N, d] row-major f64 arrays
+     * Out:     [N, d] output, pre-allocated
+     * N:       sequence length
+     * d:       head dimension
+     * scale:   1/sqrt(d) scaling factor
+     *
+     * Algorithm: tiled online softmax attention in O(N) extra memory.
+     ##
+
+    # Per-row running statistics for online softmax correction
+    row_max = alloc(N * size_of<float>())       # running max per query row;
+    row_sum = alloc(N * size_of<float>())       # running exp sum per query row;
+
+    # Initialize: max = -inf, sum = 0, out = 0
+    i = 0;
+    when i < N loop
+        native_store<float>(row_max, i, -1.0e30);
+        native_store<float>(row_sum, i, 0.0);
+        i = i + 1;
+    end
+    i = 0;
+    when i < N * d loop
+        native_store<float>(Out, i, 0.0);
+        i = i + 1;
+    end
+
+    # Tile workspace: score[TILE_Q × TILE_KV] — this is the ONLY temp matrix
+    score_buf = alloc(TILE_Q * TILE_KV * size_of<float>());
+
+    # ─── Outer loop: tile over K/V blocks ─────────────
+    kv_start = 0;
+    when kv_start < N loop
+        kv_end = kv_start + TILE_KV;
+        if kv_end > N do kv_end = N end
+        kv_len = kv_end - kv_start;
+
+        # ─── Inner loop: tile over Q blocks ───────────
+        q_start = 0;
+        when q_start < N loop
+            q_end = q_start + TILE_Q;
+            if q_end > N do q_end = N end
+            q_len = q_end - q_start;
+
+            # Step 1: Compute score tile = Q_tile @ K_tile^T * scale
+            _compute_score_tile(Q, K, score_buf,
+                                q_start, q_len, kv_start, kv_len, d, scale);
+
+            # Step 2: Online softmax update + accumulate V
+            _online_softmax_update(score_buf, V, Out,
+                                   row_max, row_sum,
+                                   q_start, q_len, kv_start, kv_len, d);
+
+            q_start = q_end;
+        end
+
+        kv_start = kv_end;
+    end
+
+    # Step 3: Final rescale — divide each output row by its sum
+    _rescale_output(Out, row_sum, N, d);
+
+    free(score_buf);
+    free(row_max);
+    free(row_sum);
+end.
+# ─── Score Tile Computation ───────────────────────────
+
+func _compute_score_tile(
+    Q: ptr, K: ptr, score: ptr,
+    q_start: int, q_len: int,
+    kv_start: int, kv_len: int,
+    d: int, scale: float;
+);
+    # score[qi, ki] = sum_over_d(Q[q_start+qi, :] * K[kv_start+ki, :]) * scale
+    # This is a tiny GEMM: [q_len, d] × [kv_len, d]^T → [q_len, kv_len]
+    # Fits entirely in L1 cache.
+
+    qi = 0;
+    when qi < q_len loop
+        q_row = (q_start + qi) * d;
+        ki = 0;
+        when ki < kv_len loop
+            k_row = (kv_start + ki) * d;
+            acc = 0.0;
+            j = 0;
+            # Inner dot product — pure FMA pattern for Q-IR vectorization
+            when j < d loop
+                acc = acc + native_load<float>(Q, q_row + j) *;
+                            native_load<float>(K, k_row + j);
+                j = j + 1;
+            end
+            native_store<float>(score, qi * kv_len + ki, acc * scale);
+            ki = ki + 1;
+        end
+        qi = qi + 1;
+    end
+end.
+# ─── Online Softmax Update ───────────────────────────
+
+func _online_softmax_update(
+    score: ptr, V: ptr, Out: ptr,
+    row_max: ptr, row_sum: ptr,
+    q_start: int, q_len: int,
+    kv_start: int, kv_len: int,
+    d: int;
+);
+    ##
+     * For each query row qi
+     *   1. Find max of score[qi, :] → new_max
+     *   2. Correction factor: alpha = exp(old_max - new_max)
+     *   3. Update: row_sum *= alpha, Out[row] *= alpha
+     *   4. Accumulate: for each ki, p = exp(score - new_max)
+     *      row_sum += p, Out[row] += p * V[kv_start+ki, :]
+     ##
+
+    qi = 0;
+    when qi < q_len loop
+        global_row = q_start + qi;
+
+        # Find max of this score row
+        local_max = -1.0e30;
+        ki = 0;
+        when ki < kv_len loop
+            s = native_load<float>(score, qi * kv_len + ki);
+            if s > local_max do local_max = s end
+            ki = ki + 1;
+        end
+
+        # Compute correction factor
+        old_max = native_load<float>(row_max, global_row);
+        new_max = local_max;
+        if old_max > new_max do new_max = old_max end
+
+        alpha = exp(old_max - new_max);
+        old_sum = native_load<float>(row_sum, global_row) * alpha;
+
+        # Rescale existing output accumulator
+        j = 0;
+        when j < d loop
+            idx = global_row * d + j;
+            native_store<float>(Out, idx, native_load<float>(Out, idx) * alpha);
+            j = j + 1;
+        end
+
+        # Accumulate softmax(score) @ V for this tile
+        tile_sum = 0.0;
+        ki = 0;
+        when ki < kv_len loop
+            s = native_load<float>(score, qi * kv_len + ki);
+            p = exp(s - new_max);
+            tile_sum = tile_sum + p;
+
+            # Out[global_row, :] += p * V[kv_start+ki, :]
+            v_row = (kv_start + ki) * d;
+            j = 0;
+            when j < d loop
+                idx = global_row * d + j;
+                old = native_load<float>(Out, idx);
+                # FMA pattern: old + p * V[v_row+j]
+                native_store<float>(Out, idx, old + p * native_load<float>(V, v_row + j));
+                j = j + 1;
+            end
+
+            ki = ki + 1;
+        end
+
+        native_store<float>(row_max, global_row, new_max);
+        native_store<float>(row_sum, global_row, old_sum + tile_sum);
+
+        qi = qi + 1;
+    end
+end.
+# ─── Final Rescale ────────────────────────────────────
+
+func _rescale_output:
+    in  Out: ptr;
+        row_sum: ptr;
+        N: int;
+        d: int
+    i = 0;
+    when i < N loop
+        s = native_load<float>(row_sum, i);
+        if s < 1.0e-30 do s = 1.0e-30 end
+        inv = 1.0 / s;
+        j = 0;
+        when j < d loop
+            idx = i * d + j;
+            native_store<float>(Out, idx, native_load<float>(Out, idx) * inv);
+            j = j + 1;
+        end
+        i = i + 1;
+    end
+end.
+# ═══════════════════════════════════════════════════════
+# Causal (Masked) Flash Attention
+# ═══════════════════════════════════════════════════════
+
+func flash_attention_causal(
+    Q: ptr, K: ptr, V: ptr, Out: ptr,
+    N: int, d: int, scale: float;
+);
+    ##
+     * Same as flash_attention but with causal mask
+     * score[i, j] = -inf when j > i  (future tokens masked)
+     * This is the standard for autoregressive (GPT-style) models.
+     ##
+
+    row_max = alloc(N * size_of<float>());
+    row_sum = alloc(N * size_of<float>());
+    score_buf = alloc(TILE_Q * TILE_KV * size_of<float>());
+
+    i = 0;
+    when i < N loop
+        native_store<float>(row_max, i, -1.0e30);
+        native_store<float>(row_sum, i, 0.0);
+        i = i + 1;
+    end
+    i = 0;
+    when i < N * d loop
+        native_store<float>(Out, i, 0.0);
+        i = i + 1;
+    end
+
+    kv_start = 0;
+    when kv_start < N loop
+        kv_end = kv_start + TILE_KV;
+        if kv_end > N do kv_end = N end
+        kv_len = kv_end - kv_start;
+
+        q_start = 0;
+        when q_start < N loop
+            q_end = q_start + TILE_Q;
+            if q_end > N do q_end = N end
+            q_len = q_end - q_start;
+
+            # Compute score with causal mask applied
+            _compute_score_tile(Q, K, score_buf,
+                                q_start, q_len, kv_start, kv_len, d, scale);
+
+            # Apply causal mask: set score[qi, ki] = -1e30 if kv_start+ki > q_start+qi
+            qi = 0;
+            when qi < q_len loop
+                ki = 0;
+                when ki < kv_len loop
+                    if (kv_start + ki) > (q_start + qi) do
+                        native_store<float>(score_buf, qi * kv_len + ki, -1.0e30);
+                    end
+                    ki = ki + 1;
+                end
+                qi = qi + 1;
+            end
+
+            _online_softmax_update(score_buf, V, Out,
+                                   row_max, row_sum,
+                                   q_start, q_len, kv_start, kv_len, d);
+
+            q_start = q_end;
+        end
+
+        kv_start = kv_end;
+    end
+
+    _rescale_output(Out, row_sum, N, d);
+    free(score_buf);
+    free(row_max);
+    free(row_sum);
+end.
+# ═══════════════════════════════════════════════════════
+# Multi-Head Attention Wrapper
+# ═══════════════════════════════════════════════════════
+
+func multi_head_attention(
+    Q: ptr, K: ptr, V: ptr, Out: ptr,
+    batch: int, n_heads: int, seq_len: int, head_dim: int,
+    causal: bool;
+);
+    ##
+     * Q, K, V: [batch * n_heads, seq_len, head_dim]
+     * Runs flash attention per head independently.
+     ##
+    scale = 1.0 / sqrt(to_f64(head_dim));
+    head_size = seq_len * head_dim;
+    total_heads = batch * n_heads;
+    h = 0;
+    when h < total_heads loop
+        offset = h * head_size;
+        if causal do
+            flash_attention_causal(;
+                Q + offset * size_of<float>(),
+                K + offset * size_of<float>(),
+                V + offset * size_of<float>(),
+                Out + offset * size_of<float>(),
+                seq_len, head_dim, scale);
+        else
+            flash_attention(;
+                Q + offset * size_of<float>(),
+                K + offset * size_of<float>(),
+                V + offset * size_of<float>(),
+                Out + offset * size_of<float>(),
+                seq_len, head_dim, scale);
+        end
+        h = h + 1;
+    end
+end.
+# ═══════════════════════════════════════════════════════
+# Fused Elementwise Kernels
+# ═══════════════════════════════════════════════════════
+# These demonstrate the pattern that Q-IR fusion targets
+# All intermediates stay in registers, zero extra memory traffic.
+
+func fused_bias_relu:
+    in  x: ptr;
+        bias: ptr;
+        out: ptr;
+        batch: int;
+        dim: int
+    # Fused: out = max(0, x + bias)
+    # Q-IR fusion: LOAD x → LOAD bias → ADD → RELU → STORE
+    # All in NEON registers: 1 read x, 1 read bias, 1 write out
+    b = 0;
+    when b < batch loop
+        off = b * dim;
+        j = 0;
+        when j < dim loop
+            v = native_load<float>(x, off + j) + native_load<float>(bias, j);
+            if v < 0.0 do v = 0.0 end
+            native_store<float>(out, off + j, v);
+            j = j + 1;
+        end
+        b = b + 1;
+    end
+end.
+func fused_bias_gelu:
+    in  x: ptr;
+        bias: ptr;
+        out: ptr;
+        batch: int;
+        dim: int
+    # Fused: out = gelu(x + bias)
+    b = 0;
+    when b < batch loop
+        off = b * dim;
+        j = 0;
+        when j < dim loop
+            v = native_load<float>(x, off + j) + native_load<float>(bias, j);
+            # Inline GELU approximation
+            if v > 8.0 do
+                native_store<float>(out, off + j, v);
+            eif v < -8.0 do
+                native_store<float>(out, off + j, 0.0);
+            else
+                sig = 1.0 / (1.0 + exp(-1.702 * v));
+                native_store<float>(out, off + j, v * sig);
+            end
+            j = j + 1;
+        end
+        b = b + 1;
+    end
+end.
+func fused_residual_layernorm(
+    x: ptr, residual: ptr, gamma: ptr, beta: ptr,
+    out: ptr, batch: int, dim: int, eps: float;
+);
+    # Fused: out = layernorm(x + residual, gamma, beta)
+    # Standard: 3 passes (add, compute stats, normalize)
+    # Fused: 2 passes (add+stats in pass 1, normalize in pass 2)
+    b = 0;
+    when b < batch loop
+        off = b * dim;
+        # Pass 1: residual add + Welford mean/variance
+        mean = 0.0;
+        m2 = 0.0;
+        j = 0;
+        when j < dim loop
+            v = native_load<float>(x, off + j) + native_load<float>(residual, off + j);
+            native_store<float>(out, off + j, v)   # store sum for pass 2;
+            delta = v - mean;
+            mean = mean + delta / to_f64(j + 1);
+            delta2 = v - mean;
+            m2 = m2 + delta * delta2;
+            j = j + 1;
+        end
+        inv_std = 1.0 / sqrt(m2 / to_f64(dim) + eps);
+        # Pass 2: normalize + affine
+        j = 0;
+        when j < dim loop
+            v = native_load<float>(out, off + j);
+            native_store<float>(out, off + j,
+                (v - mean) * inv_std * native_load<float>(gamma, j) + native_load<float>(beta, j));
+            j = j + 1;
+        end
+        b = b + 1;
+    end
+end.
+func fused_scale_add_relu:
+    in  a: ptr;
+        b: ptr;
+        out: ptr;
+        n: int;
+        scale_a: float;
+        scale_b: float
+    # Fused: out = max(0, scale_a * a + scale_b * b)
+    # 1 read a, 1 read b, 1 write out — all intermediates in registers
+    i = 0;
+    when i < n loop
+        v = scale_a * native_load<float>(a, i) + scale_b * native_load<float>(b, i);
+        if v < 0.0 do v = 0.0 end
+        native_store<float>(out, i, v);
+        i = i + 1;
+    end
+end.
+export flash_attention, flash_attention_causal, multi_head_attention;
+export fused_bias_relu, fused_bias_gelu;
+export fused_residual_layernorm, fused_scale_add_relu;

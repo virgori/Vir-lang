@@ -1,0 +1,316 @@
+##
+ * vir/test/bench_e2e_vtest.vri — Benchmark & End-to-End Compilation Tests
+ * =========================================================================
+ * 1) Benchmark suite: measure optimizer pass effectiveness (instruction count
+ *    reduction) and QIR pipeline throughput.
+ * 2) E2E suite: full source → lex → parse → QIR → optimize → verify tests.
+ ##
+
+include types;
+include string;
+import String, str_new, str_eq from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include test;
+import TestSuite, TestResult from test;
+include vtest;
+import VTestRegistry,
+       vtest_suite_new, vtest_add,
+       vtest_registry_new, vtest_registry_add_suite, vtest_registry_run,
+       vtest_print_summary, vtest_exit_code,
+       vtest_pass, vtest_fail,
+       vtest_expect_true, vtest_expect_false,
+       vtest_expect_eq_i64, vtest_expect_ne_i64 from vtest;
+include compiler/ir_optimizer;
+import QOp, QOperand, QInstr, QFunction, QModule, OperandType,
+       OptStats, opt_stats_total_changes,
+       q_none, q_vreg, q_imm, q_instr,
+       qir_pipeline_h, qir_pipeline_m, qir_pipeline_m_stats, qir_pipeline_l,
+       lower_ctx_new, lower_program from ir_optimizer;
+include compiler/lexer;
+import Lexer, Token, TokType, lexer_new, tokenize from compiler/lexer;
+include compiler/parser;
+import Parser, AstNode, AstType, parser_new, parse_program from compiler/parser;
+include compiler/codegen;
+import TargetArch, CodeBuf, codebuf_new, codebuf_offset from compiler/codegen;
+include time;
+import Instant, instant_now, instant_elapsed_ns from time;
+
+
+# ═══════════════════════════════════════════════════════
+# Helper: build a simple QIR module for benchmarking
+# ═══════════════════════════════════════════════════════
+
+func _make_bench_module(instr_count: int):
+    let instrs = vec_new<QInstr>();
+    # Generate: v0 = 0; loop { v0 = v0 + 1; } (repeated)
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Load, q_vreg(0), q_imm(0), q_none()));
+    let i = 0;
+    when i < instr_count loop
+        instrs = vec_push<QInstr>(instrs, q_instr(QOp::Add, q_vreg(0), q_vreg(0), q_imm(1)));
+        i = i + 1;
+    end
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Ret, q_none(), q_vreg(0), q_none()));
+    let func = QFunction (
+        name: str_new("bench_main"),
+        param_count: 0,
+        param_vregs: vec_new<int>(),
+        body: instrs,
+        label_count: 0
+    );
+    let mod = QModule (
+        name: str_new("bench_mod"),
+        functions: vec_new<QFunction>(),
+        strings: vec_new<string>()
+    );
+    mod.functions = vec_push<QFunction>(mod.functions, func);
+    out mod;
+end.
+# ═══════════════════════════════════════════════════════
+# Benchmark Tests
+# ═══════════════════════════════════════════════════════
+
+## Const fold should reduce "v0 + 0" instructions
+func _test_bench_const_fold_effect:
+    let instrs = vec_new<QInstr>();
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Load, q_vreg(0), q_imm(42), q_none()));
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Add, q_vreg(1), q_vreg(0), q_imm(0)));
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Add, q_vreg(2), q_vreg(1), q_imm(10)));
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Ret, q_none(), q_vreg(2), q_none()));
+    let func = QFunction (
+        name: str_new("fold_test"),
+        param_count: 0,
+        param_vregs: vec_new<int>(),
+        body: instrs,
+        label_count: 0
+    );
+    let mod = QModule (
+        name: str_new("fold_mod"),
+        functions: vec_new<QFunction>(),
+        strings: vec_new<string>()
+    );
+    mod.functions = vec_push<QFunction>(mod.functions, func);
+    var (opt_mod, stats) = qir_pipeline_m_stats(mod);
+    let total = opt_stats_total_changes(stats);
+    if total >= 1 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("const fold should optimize at least 1 instruction"));
+end.
+## DCE should eliminate dead stores
+func _test_bench_dce_dead_store:
+    let instrs = vec_new<QInstr>();
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Load, q_vreg(0), q_imm(1), q_none()));
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Load, q_vreg(1), q_imm(999), q_none()));  # dead
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Ret, q_none(), q_vreg(0), q_none()));
+    let func = QFunction (
+        name: str_new("dce_test"),
+        param_count: 0,
+        param_vregs: vec_new<int>(),
+        body: instrs,
+        label_count: 0
+    );
+    let mod = QModule (
+        name: str_new("dce_mod"),
+        functions: vec_new<QFunction>(),
+        strings: vec_new<string>()
+    );
+    mod.functions = vec_push<QFunction>(mod.functions, func);
+    var (opt_mod, stats) = qir_pipeline_m_stats(mod);
+    if stats.dce >= 1 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("DCE should eliminate dead instruction"));
+end.
+## Strength reduction: x * 2 → x << 1
+func _test_bench_strength_reduction:
+    let instrs = vec_new<QInstr>();
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Load, q_vreg(0), q_imm(7), q_none()));
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Mul, q_vreg(1), q_vreg(0), q_imm(2)));
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Ret, q_none(), q_vreg(1), q_none()));
+    let func = QFunction (
+        name: str_new("sr_test"),
+        param_count: 0,
+        param_vregs: vec_new<int>(),
+        body: instrs,
+        label_count: 0
+    );
+    let mod = QModule (
+        name: str_new("sr_mod"),
+        functions: vec_new<QFunction>(),
+        strings: vec_new<string>()
+    );
+    mod.functions = vec_push<QFunction>(mod.functions, func);
+    var (opt_mod, stats) = qir_pipeline_m_stats(mod);
+    if stats.strength_red >= 1 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("strength reduction should transform x*2 → x<<1"));
+end.
+## Pipeline on a non-trivial module shouldn't crash and should produce output
+func _test_bench_pipeline_100_instrs:
+    let mod = _make_bench_module(100);
+    var (opt_mod, stats) = qir_pipeline_m_stats(mod);
+    let total = opt_stats_total_changes(stats);
+    # After optimization, the module should still have at least 1 function
+    if vec_len<QFunction>(opt_mod.functions) >= 1 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("pipeline destroyed all functions"));
+end.
+## Copy propagation
+func _test_bench_copy_prop:
+    let instrs = vec_new<QInstr>();
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Load, q_vreg(0), q_imm(42), q_none()));
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Move, q_vreg(1), q_vreg(0), q_none()));
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Add, q_vreg(2), q_vreg(1), q_imm(1)));
+    instrs = vec_push<QInstr>(instrs, q_instr(QOp::Ret, q_none(), q_vreg(2), q_none()));
+    let func = QFunction (
+        name: str_new("cp_test"),
+        param_count: 0,
+        param_vregs: vec_new<int>(),
+        body: instrs,
+        label_count: 0
+    );
+    let mod = QModule (
+        name: str_new("cp_mod"),
+        functions: vec_new<QFunction>(),
+        strings: vec_new<string>()
+    );
+    mod.functions = vec_push<QFunction>(mod.functions, func);
+    var (opt_mod, stats) = qir_pipeline_m_stats(mod);
+    if stats.copy_prop >= 1 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("copy propagation should eliminate MOVE copies"));
+end.
+# ═══════════════════════════════════════════════════════
+# End-to-End Compilation Tests
+# ═══════════════════════════════════════════════════════
+
+## Lex a simple expression
+func _test_e2e_lex_simple:
+    let src = "let x = 42;";
+    let lex = lexer_new(src);
+    lex = tokenize(lex);
+    if lex.error_count == 0 and lex.token_count >= 3 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("lex failed on simple expression"));
+end.
+## Lex keywords
+func _test_e2e_lex_keywords:
+    let src = "func main: end";
+    let lex = lexer_new(src);
+    lex = tokenize(lex);
+    if lex.error_count == 0 and lex.token_count >= 2 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("lex failed on keywords"));
+end.
+## Lex + Parse a function
+func _test_e2e_parse_func:
+    let src = "func add: in(a:int; b:int) out a + b; end";
+    let lex = lexer_new(src);
+    lex = tokenize(lex);
+    if lex.error_count > 0 do
+        out vtest_fail(str_new("lex error"));
+    end
+    let parser = parser_new(lex.tokens);
+    let ast = parse_program(parser);
+    if ast.error_count == 0 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("parse failed on function definition"));
+end.
+## Full pipeline: source → lex → parse → QIR → optimize
+func _test_e2e_full_pipeline:
+    let src = "func main: let x = 10; let y = x + 5; out y; end";
+    let lex = lexer_new(src);
+    lex = tokenize(lex);
+    if lex.error_count > 0 do
+        out vtest_fail(str_new("lex error in full pipeline"));
+    end
+    let parser = parser_new(lex.tokens);
+    let ast = parse_program(parser);
+    if ast.error_count > 0 do
+        out vtest_fail(str_new("parse error in full pipeline"));
+    end
+    let ctx = lower_ctx_new(str_new("e2e_test"));
+    ctx = qir_pipeline_h(ctx, ast);
+    if ctx.error_count > 0 do
+        out vtest_fail(str_new("QIR lowering error in full pipeline"));
+    end
+    var (opt_mod, stats) = qir_pipeline_m_stats(ctx.module);
+    if vec_len<QFunction>(opt_mod.functions) >= 1 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("full pipeline produced no functions"));
+end.
+## Pipeline does not crash on empty module
+func _test_e2e_empty_module:
+    let mod = QModule (
+        name: str_new("empty"),
+        functions: vec_new<QFunction>(),
+        strings: vec_new<string>()
+    );
+    var (opt_mod, stats) = qir_pipeline_m_stats(mod);
+    if vec_len<QFunction>(opt_mod.functions) == 0 and opt_stats_total_changes(stats) == 0 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("empty module optimisation should be no-op"));
+end.
+## QIR-L register allocation doesn't crash
+func _test_e2e_regalloc_pipeline:
+    let mod = _make_bench_module(10);
+    var (opt_mod, _) = qir_pipeline_m_stats(mod);
+    let final_mod = qir_pipeline_l(opt_mod, 14);
+    if vec_len<QFunction>(final_mod.functions) >= 1 do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("QIR-L regalloc crashed"));
+end.
+## Verify instruction count decreases after optimisation
+func _test_e2e_instr_count_reduction:
+    let mod = _make_bench_module(50);
+    let before = vec_len<QInstr>(vec_get<QFunction>(mod.functions, 0).body);
+    var (opt_mod, _) = qir_pipeline_m_stats(mod);
+    let after = vec_len<QInstr>(vec_get<QFunction>(opt_mod.functions, 0).body);
+    # After optimisation, instruction count should be <= original
+    if after <= before do
+        out vtest_pass();
+    end
+    out vtest_fail(str_new("optimisation increased instruction count"));
+end.
+# ═══════════════════════════════════════════════════════
+# Suite Registration & Entry
+# ═══════════════════════════════════════════════════════
+
+func bench_e2e_vtest_main:
+    let reg = vtest_registry_new();
+
+    # Benchmark / optimizer effectiveness tests
+    let ts_bench = vtest_suite_new(str_new("benchmark"));
+    vtest_add(ts_bench, str_new("const_fold_effect"),      _test_bench_const_fold_effect);
+    vtest_add(ts_bench, str_new("dce_dead_store"),         _test_bench_dce_dead_store);
+    vtest_add(ts_bench, str_new("strength_reduction"),     _test_bench_strength_reduction);
+    vtest_add(ts_bench, str_new("pipeline_100"),           _test_bench_pipeline_100_instrs);
+    vtest_add(ts_bench, str_new("copy_prop"),              _test_bench_copy_prop);
+    vtest_registry_add_suite(reg, ts_bench);
+
+    # End-to-end compilation tests
+    let ts_e2e = vtest_suite_new(str_new("e2e"));
+    vtest_add(ts_e2e, str_new("lex_simple"),               _test_e2e_lex_simple);
+    vtest_add(ts_e2e, str_new("lex_keywords"),             _test_e2e_lex_keywords);
+    vtest_add(ts_e2e, str_new("parse_func"),               _test_e2e_parse_func);
+    vtest_add(ts_e2e, str_new("full_pipeline"),            _test_e2e_full_pipeline);
+    vtest_add(ts_e2e, str_new("empty_module"),             _test_e2e_empty_module);
+    vtest_add(ts_e2e, str_new("regalloc_pipeline"),        _test_e2e_regalloc_pipeline);
+    vtest_add(ts_e2e, str_new("instr_count_reduction"),    _test_e2e_instr_count_reduction);
+    vtest_registry_add_suite(reg, ts_e2e);
+
+    vtest_registry_run(reg);
+    vtest_print_summary(reg);
+    out vtest_exit_code(reg);
+end.
+export bench_e2e_vtest_main;

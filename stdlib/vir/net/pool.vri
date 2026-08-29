@@ -1,0 +1,220 @@
+##
+ * vir/net/pool.vri — Connection Pool
+ * ====================================
+ * Inspired by Rust: r2d2, deadpool crates
+ * Inspired by Java: HikariCP, Apache DBCP
+ *
+ * Phase C — thread-safe connection pool with idle timeout.
+ * Uses Mutex + CondVar from the thread module.
+ ##
+
+include types;
+include option;
+import Option, Some, None from option;
+include vec;
+import Vec, vec_new, vec_push, vec_pop, vec_get, vec_len, vec_remove from vec;
+include thread;
+import Mutex, CondVar, mutex_new, mutex_lock, mutex_unlock,
+       condvar_new, condvar_wait, condvar_signal from thread;
+include time;
+import Instant, Duration, now, elapsed, sleep from time;
+
+# ═══════════════════════════════════════════════════════
+# Connection wrapper
+# ═══════════════════════════════════════════════════════
+
+entity PooledConn:
+    conn_id:     int;        # unique connection identifier
+    created_at:  Instant,
+        last_used:   Instant,
+        is_alive:    bool;
+end.
+
+# ═══════════════════════════════════════════════════════
+# Pool Configuration
+# ═══════════════════════════════════════════════════════
+
+entity PoolConfig:
+    min_idle:       int,
+        max_size:       int,
+        idle_timeout:   Duration;    # max idle before eviction
+    max_lifetime:   Duration;    # max total lifetime
+end.
+func pool_config_default():
+    out PoolConfig (
+        min_idle: 2,
+        max_size: 10,
+        idle_timeout: Duration ( secs: 300 ),
+        max_lifetime: Duration ( secs: 3600 )
+    );
+end.
+# ═══════════════════════════════════════════════════════
+# Connection Pool
+# ═══════════════════════════════════════════════════════
+
+entity ConnPool:
+    idle:           Vec;         # Vec of PooledConn
+    active_count:   int,
+        total_created:  int,
+        config:         PoolConfig,
+        mtx:            Mutex,
+        cv:             CondVar,
+        closed:         bool;
+end.
+func pool_new(cfg: PoolConfig):
+    p = ConnPool (
+        idle: vec_new(),
+        active_count: 0,
+        total_created: 0,
+        config: cfg,
+        mtx: mutex_new(),
+        cv: condvar_new(),
+        closed: false
+    );
+
+    # Pre-populate min_idle connections
+    i = 0;
+    when i < cfg.min_idle loop
+        conn = _pool_create_conn(p);
+        vec_push(p.idle, conn);
+        i = i + 1;
+    end
+
+    out p;
+end.
+func _pool_create_conn(p: ConnPool):
+    p.total_created = p.total_created + 1;
+    t = now();
+    out PooledConn (
+        conn_id: p.total_created,
+        created_at: t,
+        last_used: t,
+        is_alive: true
+    );
+end.
+# ─── Acquire — get a connection from pool ────────────
+
+func pool_acquire(p: ConnPool):
+    mutex_lock(p.mtx);
+
+    # Try to find a valid idle connection
+    found = false;
+    result_conn = PooledConn ( conn_id: 0, created_at: now(), last_used: now(), is_alive: false );
+
+    when not found loop
+        if p.closed do
+            mutex_unlock(p.mtx);
+            out None;
+        end
+
+        if vec_len(p.idle) > 0 do
+            conn = vec_pop(p.idle);
+            age = elapsed(conn.created_at);
+
+            if age.secs >= p.config.max_lifetime.secs do
+                # Connection too old, discard and try next
+                conn.is_alive = false;
+            eif not conn.is_alive do
+                # Dead connection, skip
+                conn.is_alive = false;
+            else
+                conn.last_used = now();
+                p.active_count = p.active_count + 1;
+                result_conn = conn;
+                found = true;
+            end
+        else
+            total = p.active_count + vec_len(p.idle);
+            if total < p.config.max_size do
+                # Create new connection
+                conn = _pool_create_conn(p);
+                p.active_count = p.active_count + 1;
+                result_conn = conn;
+                found = true;
+            else
+                # Wait for a connection to become available
+                condvar_wait(p.cv, p.mtx);
+            end
+        end
+    end
+
+    mutex_unlock(p.mtx);
+    out Some(result_conn);
+end.
+# ─── Release — return connection to pool ─────────────
+
+func pool_release(p: ConnPool, conn: PooledConn):
+    mutex_lock(p.mtx);
+    p.active_count = p.active_count - 1;
+
+    if p.closed do
+        conn.is_alive = false;
+        mutex_unlock(p.mtx);
+        condvar_signal(p.cv);
+        out;
+    end
+
+    conn.last_used = now();
+    vec_push(p.idle, conn);
+    mutex_unlock(p.mtx);
+    condvar_signal(p.cv);
+end.
+# ─── Evict idle connections past timeout ─────────────
+
+func pool_evict_idle(p: ConnPool):
+    mutex_lock(p.mtx);
+
+    i = vec_len(p.idle) - 1;
+    when i >= 0 loop
+        conn = vec_get(p.idle, i);
+        idle_time = elapsed(conn.last_used);
+        if idle_time.secs >= p.config.idle_timeout.secs do
+            if vec_len(p.idle) > p.config.min_idle do
+                vec_remove(p.idle, i);
+            end
+        end
+        i = i - 1;
+    end
+
+    mutex_unlock(p.mtx);
+end.
+# ─── Stats ───────────────────────────────────────────
+
+entity PoolStats:
+    idle_count:    int,
+        active_count:  int,
+        total_created: int;
+end.
+func pool_stats(p: ConnPool):
+    mutex_lock(p.mtx);
+    s = PoolStats (
+        idle_count: vec_len(p.idle),
+        active_count: p.active_count,
+        total_created: p.total_created
+    );
+    mutex_unlock(p.mtx);
+    out s;
+end.
+# ─── Close pool ──────────────────────────────────────
+
+func pool_close(p: ConnPool):
+    mutex_lock(p.mtx);
+    p.closed = true;
+
+    # Mark all idle connections dead
+    i = 0;
+    when i < vec_len(p.idle) loop
+        conn = vec_get(p.idle, i);
+        conn.is_alive = false;
+        i = i + 1;
+    end
+
+    mutex_unlock(p.mtx);
+    condvar_signal(p.cv);
+end.
+func pool_is_closed(p: ConnPool):
+    out p.closed;
+end.
+func pool_size(p: ConnPool):
+    out p.active_count + vec_len(p.idle);
+end.

@@ -1,0 +1,360 @@
+##
+ * vir/math/stats.vri — Statistical Functions
+ * =============================================
+ * Numerically stable statistics for the Vir AI stack.
+ * Replaces numpy.stats / scipy.stats / torch.var/std.
+ *
+ * Novel algorithms
+ *
+ *   1. WELFORD ONLINE VARIANCE with Kahan compensation
+ *      Standard Welford: E[(x - μ)²] accumulated online.
+ *      Our variant layers Kahan summation on the M2 accumulator
+ *      to prevent catastrophic cancellation in long sequences.
+ *      [CUSTOM ALGORITHM — "Kahan-Welford" (KW)]
+ *
+ *   2. PARALLEL MERGE for distributed statistics
+ *      Two partial Welford states (n, mean, M2) can be merged in O(1).
+ *      Enables map-reduce style computation across tensor chunks.
+ *      [ALGORITHM: Chan et al. parallel Welford merge]
+ *
+ *   3. ONLINE COVARIANCE Matrix via West's algorithm
+ *      Extends Welford to multivariate. No full-data materialization.
+ *      [ALGORITHM: West 1979 updating formulas]
+ *
+ * All functions operate on flat f64 arrays for SIMD compatibility.
+ ##
+
+include types;
+include alloc;
+import alloc, alloc_zeroed, free from alloc;
+include basic;
+import sqrt, abs_f, exp, log from basic;
+
+# ═══════════════════════════════════════════════════════
+# Basic Statistics
+# ═══════════════════════════════════════════════════════
+
+func stat_mean(x: ptr, n: int):
+    # Kahan-compensated mean
+    sum = 0.0;
+    comp = 0.0;
+    i = 0;
+    when i < n loop
+        y = native_load<float>(x, i) - comp;
+        s = sum + y;
+        comp = (s - sum) - y;
+        sum = s;
+        i = i + 1;
+    end
+    out sum / to_f64(n);
+end.
+func stat_variance(x: ptr, n: int):
+    # Kahan-Welford online variance (CUSTOM: KW algorithm)
+    out _welford(x, n).variance;
+end.
+func stat_stddev(x: ptr, n: int):
+    out sqrt(stat_variance(x, n));
+end.
+func stat_variance_mean:
+    in  x: ptr;
+        n: int;
+        out_mean: float;
+        out_var: float
+    # Returns both mean and variance in a single pass.
+    w = _welford(x, n);
+    *out_mean = w.mean;
+    *out_var = w.variance;
+end.
+# ═══════════════════════════════════════════════════════
+# Welford State Entity
+# ═══════════════════════════════════════════════════════
+
+entity WelfordState:
+    n:        int,
+        mean:     float,
+        m2:       float       # sum of squared deviations,
+        variance: float       # m2 / n (population variance);
+end.
+func _welford(x: ptr, n: int):
+    mean = 0.0;
+    m2 = 0.0;
+    m2_comp = 0.0     # Kahan compensator for M2;
+    i = 0;
+    when i < n loop
+        v = native_load<float>(x, i);
+        delta = v - mean;
+        mean = mean + delta / to_f64(i + 1);
+        delta2 = v - mean;
+        # Kahan-compensated M2 accumulation
+        term = delta * delta2;
+        y = term - m2_comp;
+        s = m2 + y;
+        m2_comp = (s - m2) - y;
+        m2 = s;
+        i = i + 1;
+    end
+    variance = 0.0;
+    if n > 0 do variance = m2 / to_f64(n) end
+    out WelfordState { n: n, mean: mean, m2: m2, variance: variance };
+end.
+# ─── Parallel Welford Merge ──────────────────────────
+
+func welford_merge(a: WelfordState, b: WelfordState):
+    # Chan et al. parallel combine of two partial Welford states.
+    if a.n == 0 do out b end
+    if b.n == 0 do out a end
+    n = a.n + b.n;
+    delta = b.mean - a.mean;
+    mean = a.mean + delta * to_f64(b.n) / to_f64(n);
+    m2 = a.m2 + b.m2 + delta * delta * to_f64(a.n) * to_f64(b.n) / to_f64(n);
+    out WelfordState { n: n, mean: mean, m2: m2, variance: m2 / to_f64(n) };
+end.
+# ═══════════════════════════════════════════════════════
+# Percentile / Median (selection-based, no full sort)
+# ═══════════════════════════════════════════════════════
+
+func stat_median(x: ptr, n: int):
+    # QuickSelect-based median: expected O(n), no sort needed.
+    # We work on a copy to preserve original data.
+    buf = alloc(n * size_of<float>());
+    i = 0;
+    when i < n loop
+        native_store<float>(buf, i, native_load<float>(x, i));
+        i = i + 1;
+    end
+    med = 0.0;
+    if (n % 2) == 1 do
+        med = _quickselect(buf, 0, n - 1, n / 2);
+    else
+        lo = _quickselect(buf, 0, n - 1, n / 2 - 1);
+        hi = _quickselect(buf, 0, n - 1, n / 2);
+        med = (lo + hi) * 0.5;
+    end
+    free(buf);
+    out med;
+end.
+func _quickselect:
+    in  arr: ptr;
+        lo: int;
+        hi: int;
+        k: int
+    if lo == hi do out native_load<f64>(arr, lo) end
+    pivot_idx = lo + (hi - lo) / 2;
+    pivot_idx = _partition(arr, lo, hi, pivot_idx);
+    if k == pivot_idx do
+        out native_load<float>(arr, k);
+    eif k < pivot_idx do
+        out _quickselect(arr, lo, pivot_idx - 1, k);
+    else
+        out _quickselect(arr, pivot_idx + 1, hi, k);
+    end
+end.
+func _partition:
+    in  arr: ptr;
+        lo: int;
+        hi: int;
+        pivot_idx: int
+    pivot = native_load<float>(arr, pivot_idx);
+    # Move pivot to end
+    _swap_f64(arr, pivot_idx, hi);
+    store = lo;
+    i = lo;
+    when i < hi loop
+        if native_load<f64>(arr, i) < pivot do
+            _swap_f64(arr, i, store);
+            store = store + 1;
+        end
+        i = i + 1;
+    end
+    _swap_f64(arr, store, hi);
+    out store;
+end.
+func _swap_f64:
+    in  arr: ptr;
+        a: int;
+        b: int
+    tmp = native_load<float>(arr, a);
+    native_store<float>(arr, a, native_load<float>(arr, b));
+    native_store<float>(arr, b, tmp);
+end.
+# ═══════════════════════════════════════════════════════
+# Covariance & Correlation
+# ═══════════════════════════════════════════════════════
+
+func stat_covariance:
+    in  x: ptr;
+        y: ptr;
+        n: int
+    # Online covariance (West's algorithm): single pass
+    mean_x = 0.0;
+    mean_y = 0.0;
+    c12 = 0.0;
+    i = 0;
+    when i < n loop
+        vx = native_load<float>(x, i);
+        vy = native_load<float>(y, i);
+        dx = vx - mean_x;
+        mean_x = mean_x + dx / to_f64(i + 1);
+        dy = vy - mean_y;
+        mean_y = mean_y + dy / to_f64(i + 1);
+        # Update cross-moment with corrected means
+        dy2 = vy - mean_y;
+        c12 = c12 + dx * dy2;
+        i = i + 1;
+    end
+    if n < 2 do out 0.0 end
+    out c12 / to_f64(n - 1)    # sample covariance;
+end.
+func stat_correlation:
+    in  x: ptr;
+        y: ptr;
+        n: int
+    # Pearson correlation: cov(x,y) / (std(x) * std(y))
+    mean_x = 0.0;
+    mean_y = 0.0;
+    m2x = 0.0;
+    m2y = 0.0;
+    c12 = 0.0;
+    i = 0;
+    when i < n loop
+        vx = native_load<float>(x, i);
+        vy = native_load<float>(y, i);
+        dx = vx - mean_x;
+        mean_x = mean_x + dx / to_f64(i + 1);
+        dx2 = vx - mean_x;
+        m2x = m2x + dx * dx2;
+        dy = vy - mean_y;
+        mean_y = mean_y + dy / to_f64(i + 1);
+        dy2 = vy - mean_y;
+        m2y = m2y + dy * dy2;
+        c12 = c12 + dx * dy2;
+        i = i + 1;
+    end
+    denom = sqrt(m2x * m2y);
+    if denom < 1.0e-30 do out 0.0 end
+    out c12 / denom;
+end.
+func stat_covariance_matrix:
+    in  data: ptr;
+        n: int;
+        dim: int;
+        out: ptr
+    # data: f64[n * dim] row-major (n observations, dim variables)
+    # out: f64[dim * dim] symmetric covariance matrix
+    # Online West algorithm extended to matrices.
+    means = alloc_zeroed(dim * size_of<float>());
+    c = alloc_zeroed(dim * dim * size_of<float>())   # cross-moment matrix;
+    i = 0;
+    when i < n loop
+        row_off = i * dim;
+        # Update means and cross-moments
+        j = 0;
+        when j < dim loop
+            vj = native_load<float>(data, row_off + j);
+            dj = vj - native_load<float>(means, j);
+            native_store<float>(means, j, native_load<float>(means, j) + dj / to_f64(i + 1));
+            k = 0;
+            when k <= j loop
+                vk = native_load<float>(data, row_off + k);
+                dk_new = vk - native_load<float>(means, k);
+                old_c = native_load<float>(c, j * dim + k);
+                native_store<float>(c, j * dim + k, old_c + dj * dk_new);
+                k = k + 1;
+            end
+            j = j + 1;
+        end
+        i = i + 1;
+    end
+    # Finalize: divide by (n-1) and copy symmetric
+    j = 0;
+    when j < dim loop
+        k = 0;
+        when k <= j loop
+            val = native_load<float>(c, j * dim + k) / to_f64(n - 1);
+            native_store<float>(out, j * dim + k, val);
+            native_store<float>(out, k * dim + j, val);
+            k = k + 1;
+        end
+        j = j + 1;
+    end
+    free(means);
+    free(c);
+end.
+# ═══════════════════════════════════════════════════════
+# Histogram / Bin Counts
+# ═══════════════════════════════════════════════════════
+
+func stat_histogram:
+    in  x: ptr;
+        n: int;
+        bins: int;
+        min_val: float;
+        max_val: float;
+        counts: ptr
+    # counts: usize[bins], caller must allocate and zero.
+    range = max_val - min_val;
+    if range <= 0.0 do out end
+    i = 0;
+    when i < n loop
+        v = native_load<float>(x, i);
+        if v >= min_val and v <= max_val do
+            idx = to_usize((v - min_val) / range * to_f64(bins));
+            if idx >= bins do idx = bins - 1 end
+            prev = native_load<int>(counts, idx);
+            native_store<int>(counts, idx, prev + 1);
+        end
+        i = i + 1;
+    end
+end.
+# ═══════════════════════════════════════════════════════
+# Normalization helpers
+# ═══════════════════════════════════════════════════════
+
+func stat_zscore:
+    in  x: ptr;
+        out: ptr;
+        n: int
+    # Standardize: z = (x - μ) / σ
+    mean = 0.0;
+    var_val = 0.0;
+    stat_variance_mean(x, n, &mean, &var_val);
+    std = sqrt(var_val);
+    if std < 1.0e-30 do std = 1.0e-30 end
+    inv_std = 1.0 / std;
+    i = 0;
+    when i < n loop
+        native_store<float>(out, i, (native_load<float>(x, i) - mean) * inv_std);
+        i = i + 1;
+    end
+end.
+func stat_minmax_scale:
+    in  x: ptr;
+        out: ptr;
+        n: int
+    # Scale to [0, 1]: (x - min) / (max - min)
+    if n == 0 do out end
+    mn = native_load<float>(x, 0);
+    mx = mn;
+    i = 1;
+    when i < n loop
+        v = native_load<float>(x, i);
+        if v < mn do mn = v end
+        if v > mx do mx = v end
+        i = i + 1;
+    end
+    range = mx - mn;
+    if range < 1.0e-30 do range = 1.0e-30 end
+    inv_range = 1.0 / range;
+    i = 0;
+    when i < n loop
+        native_store<float>(out, i, (native_load<float>(x, i) - mn) * inv_range);
+        i = i + 1;
+    end
+end.
+export WelfordState;
+export stat_mean, stat_variance, stat_stddev, stat_variance_mean;
+export welford_merge;
+export stat_median;
+export stat_covariance, stat_correlation, stat_covariance_matrix;
+export stat_histogram;
+export stat_zscore, stat_minmax_scale;

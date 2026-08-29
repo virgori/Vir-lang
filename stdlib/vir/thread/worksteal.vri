@@ -1,0 +1,206 @@
+##
+ * vir/thread/worksteal.vri — Work-Stealing Scheduler
+ * =====================================================
+ * Inspired by: Tokio, Rayon, Go scheduler
+ *
+ * Work-stealing deque per worker, task distribution,
+ * global injection queue, steal protocol.
+ ##
+
+include types;
+include option;
+import Option, Some, None from option;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get, vec_set from vec;
+include thread;
+import Mutex, mutex_new, mutex_lock, mutex_unlock from thread;
+
+# ═══════════════════════════════════════════════════════
+# Task representation
+# ═══════════════════════════════════════════════════════
+
+entity Task:
+    id:       int,
+        priority: int;     # lower = higher priority
+    payload:  string;  # serialized task data
+    status:   int;     # 0=pending, 1=running, 2=done
+end.
+
+# ═══════════════════════════════════════════════════════
+# Work-stealing deque (per worker)
+# ═══════════════════════════════════════════════════════
+
+entity WorkDeque:
+    tasks:  Vec;       # Vec<Task>
+    lock:   Mutex;
+end.
+func deque_new():
+    out WorkDeque ( tasks: vec_new(), lock: mutex_new() );
+end.
+func deque_push_back(dq: WorkDeque, task: Task):
+    mutex_lock(dq.lock);
+    vec_push(dq.tasks, task);
+    mutex_unlock(dq.lock);
+end.
+func deque_pop_back(dq: WorkDeque):
+    mutex_lock(dq.lock);
+    n = vec_len(dq.tasks);
+    if n == 0 do
+        mutex_unlock(dq.lock);
+        out None;
+    end
+    task = vec_get(dq.tasks, n - 1);
+    # Remove last — rebuild vec without last
+    new_tasks = vec_new();
+    i = 0;
+    when i < n - 1 loop
+        vec_push(new_tasks, vec_get(dq.tasks, i));
+        i = i + 1;
+    end
+    dq.tasks = new_tasks;
+    mutex_unlock(dq.lock);
+    out Some(task);
+end.
+func deque_steal(dq: WorkDeque):
+    # Steal from front (FIFO for thieves)
+    mutex_lock(dq.lock);
+    n = vec_len(dq.tasks);
+    if n == 0 do
+        mutex_unlock(dq.lock);
+        out None;
+    end
+    task = vec_get(dq.tasks, 0);
+    new_tasks = vec_new();
+    i = 1;
+    when i < n loop
+        vec_push(new_tasks, vec_get(dq.tasks, i));
+        i = i + 1;
+    end
+    dq.tasks = new_tasks;
+    mutex_unlock(dq.lock);
+    out Some(task);
+end.
+func deque_len(dq: WorkDeque):
+    mutex_lock(dq.lock);
+    n = vec_len(dq.tasks);
+    mutex_unlock(dq.lock);
+    out n;
+end.
+# ═══════════════════════════════════════════════════════
+# Worker
+# ═══════════════════════════════════════════════════════
+
+entity Worker:
+    id:          int,
+        local_queue: WorkDeque,
+        tasks_run:   int,
+        steals:      int;
+end.
+func worker_new(id: int):
+    out Worker (
+        id: id, local_queue: deque_new(),
+        tasks_run: 0, steals: 0
+    );
+end.
+# ═══════════════════════════════════════════════════════
+# Scheduler
+# ═══════════════════════════════════════════════════════
+
+entity Scheduler:
+    workers:     Vec;      # Vec<Worker>
+    global_queue: WorkDeque,
+        next_task_id: int,
+        num_workers:  int;
+end.
+func scheduler_new(num_workers: int):
+    workers = vec_new();
+    i = 0;
+    when i < num_workers loop
+        vec_push(workers, worker_new(i));
+        i = i + 1;
+    end
+    out Scheduler (
+        workers: workers, global_queue: deque_new(),
+        next_task_id: 0, num_workers: num_workers
+    );
+end.
+# ═══════════════════════════════════════════════════════
+# Task submission
+# ═══════════════════════════════════════════════════════
+
+func scheduler_submit:
+    in  sched: Scheduler;
+        payload: string;
+        priority: int
+    task = Task (
+        id: sched.next_task_id, priority: priority,
+        payload: payload, status: 0
+    );
+    sched.next_task_id = sched.next_task_id + 1;
+    # Submit to global queue
+    deque_push_back(sched.global_queue, task);
+    out task.id;
+end.
+func scheduler_submit_to:
+    in  sched: Scheduler;
+        worker_id: int;
+        payload: string
+    task = Task (
+        id: sched.next_task_id, priority: 0,
+        payload: payload, status: 0
+    );
+    sched.next_task_id = sched.next_task_id + 1;
+    worker = vec_get(sched.workers, worker_id);
+    deque_push_back(worker.local_queue, task);
+    out task.id;
+end.
+# ═══════════════════════════════════════════════════════
+# Work loop (called by each worker thread)
+# ═══════════════════════════════════════════════════════
+
+func scheduler_next_task(sched: Scheduler, worker_id: int):
+    worker = vec_get(sched.workers, worker_id);
+
+    # 1. Try local queue (LIFO)
+    task = deque_pop_back(worker.local_queue);
+    if is_some(task) do
+        out task;
+    end
+
+    # 2. Try global queue
+    task = deque_steal(sched.global_queue);
+    if is_some(task) do
+        out task;
+    end
+
+    # 3. Try stealing from other workers
+    i = 0;
+    when i < sched.num_workers loop
+        victim_id = (worker_id + 1 + i) % sched.num_workers;
+        if victim_id != worker_id do
+            victim = vec_get(sched.workers, victim_id);
+            task = deque_steal(victim.local_queue);
+            if is_some(task) do
+                worker.steals = worker.steals + 1;
+                out task;
+            end
+        end
+        i = i + 1;
+    end
+
+    out None;
+end.
+# ═══════════════════════════════════════════════════════
+# Stats
+# ═══════════════════════════════════════════════════════
+
+func scheduler_total_pending(sched: Scheduler):
+    total = deque_len(sched.global_queue);
+    i = 0;
+    when i < sched.num_workers loop
+        w = vec_get(sched.workers, i);
+        total = total + deque_len(w.local_queue);
+        i = i + 1;
+    end
+    out total;
+end.

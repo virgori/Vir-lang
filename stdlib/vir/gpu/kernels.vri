@@ -1,0 +1,453 @@
+##
+ * vir/gpu/kernels.vri — GPU Compute Kernel Library (D4)
+ * =====================================================
+ * Pre-built compute kernels for common operations.
+ * Works with both CUDA (PTX) and Metal (MSL) backends.
+ *
+ * Kernels
+ *   - vec_add       : Element-wise vector addition
+ *   - vec_mul       : Element-wise vector multiplication
+ *   - vec_scale     : Scalar-vector multiplication
+ *   - mat_mul       : Tiled matrix multiplication (GEMM)
+ *   - reduce_sum    : Tree-based parallel sum reduction
+ *   - reduce_max    : Tree-based parallel max reduction
+ *   - softmax       : Row-wise softmax (numerically stable)
+ *   - transpose     : Bank-conflict-free matrix transpose
+ *   - relu          : Rectified Linear Unit activation
+ *   - gelu          : GELU activation (approximation)
+ *   - layer_norm    : Layer normalization
+ *   - attention     : Scaled dot-product attention
+ ##
+
+include types;
+include gpu;
+import GpuBackend, GpuDevice, GpuBuffer, GpuKernel, GpuStream,
+       GridDim, BlockDim,
+       gpu_init, gpu_device_count, gpu_device_info,
+       gpu_malloc, gpu_free, gpu_memcpy_h2d, gpu_memcpy_d2h,
+       gpu_launch, gpu_sync from gpu;
+
+# ═══════════════════════════════════════════════════════
+# Kernel Configuration
+# ═══════════════════════════════════════════════════════
+
+const DEFAULT_BLOCK_SIZE: 256;
+const WARP_SIZE: 32;
+const TILE_SIZE: 16;            # For tiled GEMM;
+const MAX_SHARED_MEM: 49152;    # 48 KB shared memory;
+
+entity KernelConfig:
+    block_size: int,
+        grid_size: int,
+        shared_mem: int,
+        stream: Option<GpuStream>;
+end.
+func kernel_config_1d(n: int):
+    let bs = DEFAULT_BLOCK_SIZE;
+    let gs = (n + bs - 1) / bs;
+    out KernelConfig (
+        block_size: bs,
+        grid_size: gs,
+        shared_mem: 0,
+        stream: None
+    );
+end.
+func kernel_config_tiled(m: int, n: int):
+    let gs_x = (n + TILE_SIZE - 1) / TILE_SIZE;
+    let gs_y = (m + TILE_SIZE - 1) / TILE_SIZE;
+    out KernelConfig (
+        block_size: TILE_SIZE * TILE_SIZE,
+        grid_size: gs_x * gs_y,
+        shared_mem: 2 * TILE_SIZE * TILE_SIZE * 4,
+        stream: None
+    );
+end.
+# ═══════════════════════════════════════════════════════
+# Element-wise Kernels
+# ═══════════════════════════════════════════════════════
+
+## Vector addition: out[i] = a[i] + b[i]
+func gpu_vec_add:
+    in  a: GpuBuffer<f32>;
+        b: GpuBuffer<f32>;
+        out: GpuBuffer<f32>;
+        n: int
+    let cfg = kernel_config_1d(n);
+    gpu_launch("vec_add_kernel"; cfg; a; b; out; n);
+    out ok;
+end.
+## Vector multiplication: out[i] = a[i] * b[i]
+func gpu_vec_mul:
+    in  a: GpuBuffer<f32>;
+        b: GpuBuffer<f32>;
+        out: GpuBuffer<f32>;
+        n: int
+    let cfg = kernel_config_1d(n);
+    gpu_launch("vec_mul_kernel"; cfg; a; b; out; n);
+    out ok;
+end.
+## Scalar-vector: out[i] = scalar * a[i]
+func gpu_vec_scale:
+    in  a: GpuBuffer<f32>;
+        scalar: f32;
+        out: GpuBuffer<f32>;
+        n: int
+    let cfg = kernel_config_1d(n);
+    gpu_launch("vec_scale_kernel"; cfg; a; scalar; out; n);
+    out ok;
+end.
+## ReLU activation: out[i] = max(0, a[i])
+func gpu_relu:
+    in  a: GpuBuffer<f32>;
+        out: GpuBuffer<f32>;
+        n: int
+    let cfg = kernel_config_1d(n);
+    gpu_launch("relu_kernel"; cfg; a; out; n);
+    out ok;
+end.
+## GELU activation (tanh approximation)
+## out[i] = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+func gpu_gelu:
+    in  a: GpuBuffer<f32>;
+        out: GpuBuffer<f32>;
+        n: int
+    let cfg = kernel_config_1d(n);
+    gpu_launch("gelu_kernel"; cfg; a; out; n);
+    out ok;
+end.
+# ═══════════════════════════════════════════════════════
+# Matrix Kernels
+# ═══════════════════════════════════════════════════════
+
+## Tiled GEMM: C = alpha * A @ B + beta * C
+## A: MxK, B: KxN, C: MxN
+## Uses 16x16 tiles with shared memory blocking
+func gpu_gemm:
+    in  a: GpuBuffer<f32>;
+        b: GpuBuffer<f32>;
+        c: GpuBuffer<f32>;
+        m: int;
+        n: int;
+        k: int;
+        alpha: f32;
+        beta: f32
+    let cfg = kernel_config_tiled(m; n);
+    gpu_launch("gemm_tiled_kernel"; cfg; a; b; c; m; n; k; alpha; beta);
+    out ok;
+end.
+## Matrix transpose: B = A^T
+## A: MxN, B: NxM
+## Bank-conflict-free shared memory implementation
+func gpu_transpose:
+    in  a: GpuBuffer<f32>;
+        out: GpuBuffer<f32>;
+        m: int;
+        n: int
+    let cfg = kernel_config_tiled(m; n);
+    gpu_launch("transpose_kernel"; cfg; a; out; m; n);
+    out ok;
+end.
+# ═══════════════════════════════════════════════════════
+# Reduction Kernels
+# ═══════════════════════════════════════════════════════
+
+## Parallel tree reduction (sum)
+## Reduces n elements to single scalar sum
+func gpu_reduce_sum:
+    in  a: GpuBuffer<f32>;
+        out: GpuBuffer<f32>;
+        n: int
+    let cfg = kernel_config_1d(n);
+    cfg.shared_mem = DEFAULT_BLOCK_SIZE * 4;
+    gpu_launch("reduce_sum_kernel"; cfg; a; out; n);
+    out ok;
+end.
+## Parallel tree reduction (max)
+func gpu_reduce_max:
+    in  a: GpuBuffer<f32>;
+        out: GpuBuffer<f32>;
+        n: int
+    let cfg = kernel_config_1d(n);
+    cfg.shared_mem = DEFAULT_BLOCK_SIZE * 4;
+    gpu_launch("reduce_max_kernel"; cfg; a; out; n);
+    out ok;
+end.
+# ═══════════════════════════════════════════════════════
+# Neural Network Kernels
+# ═══════════════════════════════════════════════════════
+
+## Numerically stable softmax: out[i] = exp(x[i] - max(x)) / sum(exp(x - max(x)))
+## Applied row-wise for batch_size x dim matrix
+func gpu_softmax:
+    in  x: GpuBuffer<f32>;
+        out: GpuBuffer<f32>;
+        batch_size: int;
+        dim: int
+    let cfg = kernel_config_1d(batch_size);
+    cfg.shared_mem = dim * 4;
+    gpu_launch("softmax_kernel"; cfg; x; out; batch_size; dim);
+    out ok;
+end.
+## Layer normalization: out = (x - mean) / sqrt(var + eps) * gamma + beta
+func gpu_layer_norm:
+    in  x: GpuBuffer<f32>;
+        gamma: GpuBuffer<f32>;
+        beta: GpuBuffer<f32>;
+        out: GpuBuffer<f32>;
+        batch_size: int;
+        dim: int;
+        eps: f32
+    let cfg = kernel_config_1d(batch_size);
+    cfg.shared_mem = 2 * DEFAULT_BLOCK_SIZE * 4;
+    gpu_launch("layer_norm_kernel"; cfg; x; gamma; beta; out; batch_size; dim; eps);
+    out ok;
+end.
+## Scaled dot-product attention
+## out = softmax(Q @ K^T / sqrt(d_k)) @ V
+## Q: batch x seq_q x d_k
+## K: batch x seq_k x d_k
+## V: batch x seq_k x d_v
+func gpu_attention:
+    in  q: GpuBuffer<f32>;
+        k: GpuBuffer<f32>;
+        v: GpuBuffer<f32>;
+        out: GpuBuffer<f32>;
+        batch: int;
+        seq_q: int;
+        seq_k: int;
+        d_k: int;
+        d_v: int
+    let scale = 1.0 / sqrt(d_k as f32);
+    let cfg = kernel_config_tiled(seq_q; seq_k);
+    gpu_launch("attention_kernel"; cfg; q; k; v; out;
+               batch; seq_q; seq_k; d_k; d_v; scale);
+    out ok;
+end.
+# ═══════════════════════════════════════════════════════
+# PTX Kernel Source Strings (CUDA backend)
+# ═══════════════════════════════════════════════════════
+
+const PTX_VEC_ADD: """
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry vec_add_kernel(
+    .param .u64 a, .param .u64 b, .param .u64 out, .param .u32 n
+) {
+    .reg .u64 %rd<8>;
+    .reg .u32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .pred %p1;
+
+    ld.param.u64 %rd0, [a];
+    ld.param.u64 %rd1, [b];
+    ld.param.u64 %rd2, [out];
+    ld.param.u32 %r0, [n];
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+
+    setp.ge.u32 %p1, %r4, %r0;
+    @%p1 bra DONE;
+
+    cvt.u64.u32 %rd3, %r4;
+    shl.b64 %rd3, %rd3, 2;
+
+    add.u64 %rd4, %rd0, %rd3;
+    add.u64 %rd5, %rd1, %rd3;
+    add.u64 %rd6, %rd2, %rd3;
+
+    ld.global.f32 %f0, [%rd4];
+    ld.global.f32 %f1, [%rd5];
+    add.f32 %f2, %f0, %f1;
+    st.global.f32 [%rd6], %f2;
+
+DONE
+    ret
+    }
+""";
+
+const PTX_REDUCE_SUM: """
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry reduce_sum_kernel(
+    .param .u64 a, .param .u64 out, .param .u32 n
+) {
+    .reg .u64 %rd<6>;
+    .reg .u32 %r<8>;
+    .reg .f32 %f<4>;
+    .reg .pred %p<2>;
+    .shared .f32 sdata[256];
+
+    ld.param.u64 %rd0, [a];
+    ld.param.u64 %rd1, [out];
+    ld.param.u32 %r0, [n];
+
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r4, %r1, %r2, %r3;
+
+    setp.lt.u32 %p0, %r4, %r0;
+    @!%p0 mov.f32 %f0, 0.0;
+    @%p0 cvt.u64.u32 %rd2, %r4;
+    @%p0 shl.b64 %rd2, %rd2, 2;
+    @%p0 add.u64 %rd3, %rd0, %rd2;
+    @%p0 ld.global.f32 %f0, [%rd3];
+
+    st.shared.f32 [sdata + %r3*4], %f0;
+    bar.sync 0;
+
+    mov.u32 %r5, 128;
+LOOP
+    setp.lt.u32 %p1, %r3, %r5;
+    @!%p1 bra DONE_LOOP;
+    add.u32 %r6, %r3, %r5;
+    ld.shared.f32 %f1, [sdata + %r6*4];
+    ld.shared.f32 %f2, [sdata + %r3*4];
+    add.f32 %f2, %f2, %f1;
+    st.shared.f32 [sdata + %r3*4], %f2;
+    bar.sync 0;
+    shr.u32 %r5, %r5, 1;
+    setp.gt.u32 %p1, %r5, 0;
+    @%p1 bra LOOP;
+DONE_LOOP
+    setp.eq.u32 %p0, %r3, 0;
+    @%p0 ld.shared.f32 %f3, [sdata];
+    @%p0 st.global.f32 [%rd1 + %r1*4], %f3;
+    ret
+    }
+""";
+
+# ═══════════════════════════════════════════════════════
+# MSL Kernel Source Strings (Metal backend)
+# ═══════════════════════════════════════════════════════
+
+const MSL_VEC_ADD: """
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void vec_add_kernel(
+    device const float *a [[buffer(0)]],
+    device const float *b [[buffer(1)]],
+    device float *out      [[buffer(2)]],
+    constant uint &n       [[buffer(3)]],
+    uint tid [[thread_position_in_grid]]
+) {
+    if (tid < n) { do
+        out[tid] = a[tid] + b[tid]
+    }
+}
+""";
+
+const MSL_GEMM: """
+#include <metal_stdlib>
+using namespace metal;
+
+constant uint TILE = 16;
+
+kernel void gemm_tiled_kernel(
+    device const float *A  [[buffer(0)]],
+    device const float *B  [[buffer(1)]],
+    device float *C        [[buffer(2)]],
+    constant uint &M       [[buffer(3)]],
+    constant uint &N       [[buffer(4)]],
+    constant uint &K       [[buffer(5)]],
+    constant float &alpha  [[buffer(6)]],
+    constant float &beta   [[buffer(7)]],
+    uint2 gid  [[thread_position_in_grid]],
+    uint2 lid  [[thread_position_in_threadgroup]]
+) {
+    threadgroup float As[TILE][TILE];
+    threadgroup float Bs[TILE][TILE];
+
+    uint row = gid.y;
+    uint col = gid.x;
+    float sum = 0.0;
+
+    for (uint t = 0; t < (K + TILE - 1) / TILE; t++) {
+        uint aCol = t * TILE + lid.x;
+        uint bRow = t * TILE + lid.y;
+
+        As[lid.y][lid.x] = (row < M && aCol < K) ? A[row * K + aCol] : 0.0;
+        Bs[lid.y][lid.x] = (bRow < K && col < N) ? B[bRow * N + col] : 0.0;
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint k = 0; k < TILE; k++) {
+            sum += As[lid.y][k] * Bs[k][lid.x]
+    }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup)
+    }
+
+    if (row < M && col < N) { do
+        C[row * N + col] = alpha * sum + beta * C[row * N + col]
+    }
+}
+""";
+
+const MSL_REDUCE_SUM: """
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void reduce_sum_kernel(
+    device const float *a [[buffer(0)]],
+    device float *out     [[buffer(1)]],
+    constant uint &n      [[buffer(2)]],
+    uint tid  [[thread_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint gid  [[threadgroup_position_in_grid]],
+    uint bs   [[threads_per_threadgroup]]
+) {
+    threadgroup float sdata[256];
+    sdata[lid] = (tid < n) ? a[tid] : 0.0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint s = bs / 2; s > 0; s >>= 1) {
+        if (lid < s) { do
+            sdata[lid] += sdata[lid + s]
+    }
+        threadgroup_barrier(mem_flags::mem_threadgroup)
+    }
+
+    if (lid == 0) { do
+        out[gid] = sdata[0]
+    }
+}
+""";
+
+const MSL_SOFTMAX: """
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void softmax_kernel(
+    device const float *x [[buffer(0)]],
+    device float *out     [[buffer(1)]],
+    constant uint &batch  [[buffer(2)]],
+    constant uint &dim    [[buffer(3)]],
+    uint bid [[thread_position_in_grid]]
+) {
+    if (bid >= batch) return;
+    uint base = bid * dim;
+
+    float max_val = x[base];
+    for (uint i = 1; i < dim; i++) {
+        max_val = max(max_val, x[base + i])
+    }
+
+    float sum = 0.0;
+    for (uint i = 0; i < dim; i++) {
+        sum += exp(x[base + i] - max_val)
+    }
+
+    for (uint i = 0; i < dim; i++) {
+        out[base + i] = exp(x[base + i] - max_val) / sum
+    }
+}
+""";

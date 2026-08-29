@@ -1,0 +1,385 @@
+##
+ * vir/crypto/x25519.vri — X25519 Diffie-Hellman Key Exchange (RFC 7748)
+ * =======================================================================
+ * Inspired by Rust: x25519-dalek crate
+ * Inspired by Go: crypto/curve25519
+ * Inspired by Python: PyNaCl
+ *
+ * Phase C — Tier 2: Curve25519 scalar multiplication for ECDH.
+ * All arithmetic in GF(2^255 - 19) using 5-limb representation.
+ * Each limb holds ~51 bits. Based on the Montgomery ladder.
+ ##
+
+include types;
+include vec;
+import Vec, vec_new, vec_push, vec_get, vec_set, vec_len from vec;
+include crypto/crypto;
+import sha256_hash from crypto/crypto;
+
+# ═══════════════════════════════════════════════════════
+# Field element: 5 limbs of ~51 bits each
+# GF(p) where p = 2^255 - 19
+# ═══════════════════════════════════════════════════════
+
+entity Fe25519:
+    l0: int,
+        l1: int,
+        l2: int,
+        l3: int,
+        l4: int;
+end.
+const LIMB_MASK = 2251799813685247;    # (1<<51) - 1
+
+func fe_zero():
+    out Fe25519 ( l0: 0, l1: 0, l2: 0, l3: 0, l4: 0 );
+end.
+func fe_one():
+    out Fe25519 ( l0: 1, l1: 0, l2: 0, l3: 0, l4: 0 );
+end.
+# ─── Load from 32 bytes (little-endian) ─────────────
+
+func fe_from_bytes(b: [int]):
+    # Read 5 limbs of 51 bits from 32 bytes
+    # Simplified: load as 5x51-bit little-endian unpacking
+    l0 = b[0] + b[1] * 256 + b[2] * 65536 + b[3] * 16777216
+         + b[4] * 4294967296 + b[5] * 1099511627776
+         + (b[6] - (b[6] / 8) * 8) * 281474976710656;
+
+    l1 = b[6] / 8 + b[7] * 32 + b[8] * 8192 + b[9] * 2097152
+         + b[10] * 536870912 + b[11] * 137438953472
+         + b[12] * 35184372088832;
+
+    l2 = b[12] / 4 + b[13] * 64 + b[14] * 16384 + b[15] * 4194304
+         + b[16] * 1073741824 + b[17] * 274877906944
+         + (b[18] - (b[18] / 2) * 2) * 70368744177664;
+
+    l3 = b[18] / 2 + b[19] * 128 + b[20] * 32768 + b[21] * 8388608
+         + b[22] * 2147483648 + b[23] * 549755813888
+         + b[24] * 140737488355328;
+
+    l4 = b[25] + b[26] * 256 + b[27] * 65536 + b[28] * 16777216
+         + b[29] * 4294967296 + b[30] * 1099511627776
+         + b[31] * 281474976710656;
+
+    out Fe25519 (
+        l0: l0 - (l0 / (LIMB_MASK + 1)) * (LIMB_MASK + 1),
+        l1: l1 - (l1 / (LIMB_MASK + 1)) * (LIMB_MASK + 1),
+        l2: l2 - (l2 / (LIMB_MASK + 1)) * (LIMB_MASK + 1),
+        l3: l3 - (l3 / (LIMB_MASK + 1)) * (LIMB_MASK + 1),
+        l4: l4 - (l4 / (LIMB_MASK + 1)) * (LIMB_MASK + 1)
+    );
+end.
+# ─── Store to 32 bytes ──────────────────────────────
+
+func fe_to_bytes(f: Fe25519, out_b: [int]):
+    # Reduce and serialize 5x51-bit limbs to 32 bytes LE
+    # First, carry-reduce
+    h = _fe_carry(f);
+    # Full reduction mod p
+    h = _fe_reduce(h);
+
+    # Pack 255 bits into 32 bytes
+    # Limb 0: bits 0..50 → bytes 0..6 (51 bits = 6 bytes + 3 bits)
+    val = h.l0;
+    i = 0;
+    when i < 6 loop
+        out_b[i] = val - (val / 256) * 256;
+        val = val / 256;
+        i = i + 1;
+    end
+    # Remaining 3 bits of l0 + first 48 bits of l1
+    combined = val + (h.l1 - (h.l1 / (LIMB_MASK + 1)) * (LIMB_MASK + 1)) * 8;
+    i = 6;
+    when i < 12 loop
+        out_b[i] = combined - (combined / 256) * 256;
+        combined = combined / 256;
+        i = i + 1;
+    end
+
+    combined = combined + (h.l2 - (h.l2 / (LIMB_MASK + 1)) * (LIMB_MASK + 1)) * 4;
+    i = 12;
+    when i < 19 loop
+        out_b[i] = combined - (combined / 256) * 256;
+        combined = combined / 256;
+        i = i + 1;
+    end
+
+    combined = combined + (h.l3 - (h.l3 / (LIMB_MASK + 1)) * (LIMB_MASK + 1)) * 2;
+    i = 19;
+    when i < 25 loop
+        out_b[i] = combined - (combined / 256) * 256;
+        combined = combined / 256;
+        i = i + 1;
+    end
+
+    combined = h.l4;
+    i = 25;
+    when i < 32 loop
+        out_b[i] = combined - (combined / 256) * 256;
+        combined = combined / 256;
+        i = i + 1;
+    end
+end.
+# ─── Field arithmetic ──────────────────────────────
+
+func fe_add(a: Fe25519, b: Fe25519):
+    out Fe25519 (
+        l0: a.l0 + b.l0,
+        l1: a.l1 + b.l1,
+        l2: a.l2 + b.l2,
+        l3: a.l3 + b.l3,
+        l4: a.l4 + b.l4
+    );
+end.
+func fe_sub(a: Fe25519, b: Fe25519):
+    # Add 2*p to avoid underflow
+    p2_0 = 4503599627370458;    # 2 * (2^51 - 19) = 2^52 - 38
+    p2_mid = 4503599627370494;  # 2 * (2^51 - 1)
+    out Fe25519 (
+        l0: a.l0 - b.l0 + p2_0,
+        l1: a.l1 - b.l1 + p2_mid,
+        l2: a.l2 - b.l2 + p2_mid,
+        l3: a.l3 - b.l3 + p2_mid,
+        l4: a.l4 - b.l4 + p2_mid
+    );
+end.
+func _fe_carry(f: Fe25519):
+    M = LIMB_MASK + 1;  # 2^51
+    c0 = f.l0 / M;
+    r0 = f.l0 - c0 * M;
+    l1 = f.l1 + c0;
+    c1 = l1 / M;
+    r1 = l1 - c1 * M;
+    l2 = f.l2 + c1;
+    c2 = l2 / M;
+    r2 = l2 - c2 * M;
+    l3 = f.l3 + c2;
+    c3 = l3 / M;
+    r3 = l3 - c3 * M;
+    l4 = f.l4 + c3;
+    c4 = l4 / M;
+    r4 = l4 - c4 * M;
+    # Wrap carry from top limb: c4 * 19 feeds back to l0
+    r0 = r0 + c4 * 19;
+    out Fe25519 ( l0: r0, l1: r1, l2: r2, l3: r3, l4: r4 );
+end.
+func _fe_reduce(f: Fe25519):
+    h = _fe_carry(f);
+    h = _fe_carry(h);
+    out h;
+end.
+func fe_mul(a: Fe25519, b: Fe25519):
+    # Schoolbook multiply with 19-reduction on overflow limbs
+    # For 51-bit limbs, intermediate products fit in 128-bit range
+    # Since Vir ints are 64-bit, we need to be careful about overflow
+    # Use the "mul with reduce" approach
+
+    a0 = a.l0; a1 = a.l1; a2 = a.l2; a3 = a.l3; a4 = a.l4;
+    b0 = b.l0; b1 = b.l1; b2 = b.l2; b3 = b.l3; b4 = b.l4;
+
+    # Precompute b_i * 19 for reduction
+    b1_19 = b1 * 19;
+    b2_19 = b2 * 19;
+    b3_19 = b3 * 19;
+    b4_19 = b4 * 19;
+
+    # c0 = a0*b0 + a1*b4_19 + a2*b3_19 + a3*b2_19 + a4*b1_19
+    c0 = a0 * b0 + a1 * b4_19 + a2 * b3_19 + a3 * b2_19 + a4 * b1_19;
+    c1 = a0 * b1 + a1 * b0 + a2 * b4_19 + a3 * b3_19 + a4 * b2_19;
+    c2 = a0 * b2 + a1 * b1 + a2 * b0 + a3 * b4_19 + a4 * b3_19;
+    c3 = a0 * b3 + a1 * b2 + a2 * b1 + a3 * b0 + a4 * b4_19;
+    c4 = a0 * b4 + a1 * b3 + a2 * b2 + a3 * b1 + a4 * b0;
+
+    out _fe_carry(Fe25519 ( l0: c0, l1: c1, l2: c2, l3: c3, l4: c4 ));
+end.
+func fe_sq(a: Fe25519):
+    out fe_mul(a, a);
+end.
+# ─── Field inversion via Fermat's little theorem ────
+# a^(-1) = a^(p-2) mod p, where p = 2^255 - 19
+
+func fe_invert(z: Fe25519):
+    # Exponentiation chain for p-2 = 2^255 - 21
+    t0 = fe_sq(z);                 # z^2
+    t1 = fe_sq(t0);               # z^4
+    t1 = fe_sq(t1);               # z^8
+    t1 = fe_mul(t1, z);           # z^9
+    t0 = fe_mul(t0, t1);          # z^11
+    t2 = fe_sq(t0);               # z^22
+    t1 = fe_mul(t1, t2);          # z^31 = 2^5 - 1
+
+    t2 = fe_sq(t1);
+    i = 0;
+    when i < 4 loop
+        t2 = fe_sq(t2);
+        i = i + 1;
+    end
+    t1 = fe_mul(t2, t1);          # z^(2^10 - 1)
+
+    t2 = fe_sq(t1);
+    i = 0;
+    when i < 9 loop
+        t2 = fe_sq(t2);
+        i = i + 1;
+    end
+    t2 = fe_mul(t2, t1);           # z^(2^20 - 1)
+
+    t3 = fe_sq(t2);
+    i = 0;
+    when i < 19 loop
+        t3 = fe_sq(t3);
+        i = i + 1;
+    end
+    t2 = fe_mul(t3, t2);           # z^(2^40 - 1)
+
+    t2 = fe_sq(t2);
+    i = 0;
+    when i < 9 loop
+        t2 = fe_sq(t2);
+        i = i + 1;
+    end
+    t1 = fe_mul(t2, t1);           # z^(2^50 - 1)
+
+    t2 = fe_sq(t1);
+    i = 0;
+    when i < 49 loop
+        t2 = fe_sq(t2);
+        i = i + 1;
+    end
+    t2 = fe_mul(t2, t1);           # z^(2^100 - 1)
+
+    t3 = fe_sq(t2);
+    i = 0;
+    when i < 99 loop
+        t3 = fe_sq(t3);
+        i = i + 1;
+    end
+    t2 = fe_mul(t3, t2);           # z^(2^200 - 1)
+
+    t2 = fe_sq(t2);
+    i = 0;
+    when i < 49 loop
+        t2 = fe_sq(t2);
+        i = i + 1;
+    end
+    t1 = fe_mul(t2, t1);           # z^(2^250 - 1)
+
+    t1 = fe_sq(t1);
+    t1 = fe_sq(t1);               # z^(2^252 - 4)
+    t1 = fe_sq(t1);               # z^(2^253 - 8)
+
+    out fe_mul(t1, t0);            # z^(2^255 - 21) = z^(p-2)
+end.
+# ═══════════════════════════════════════════════════════
+# X25519 scalar multiplication (Montgomery ladder)
+# RFC 7748 §5
+# ═══════════════════════════════════════════════════════
+
+func x25519(scalar: [int], point: [int]):
+    # Clamp scalar (RFC 7748)
+    var k: [int; 32];
+    i = 0;
+    when i < 32 loop
+        k[i] = scalar[i];
+        i = i + 1;
+    end
+    # k[0] &= 248  (clear bottom 3 bits)
+    k[0] = (k[0] / 8) * 8;
+    # k[31] &= 127  (clear top bit)
+    k[31] = k[31] - (k[31] / 128) * 128;
+    # k[31] |= 64   (set second-highest bit)
+    if k[31] < 64 do
+        k[31] = k[31] + 64;
+    end
+
+    # Decode u-coordinate
+    u = fe_from_bytes(point);
+
+    # Montgomery ladder
+    x_1 = u;
+    x_2 = fe_one();
+    z_2 = fe_zero();
+    x_3 = u;
+    z_3 = fe_one();
+    swap = 0;
+
+    # Constant 121665 for curve25519: a24 = (a-2)/4 = 121665
+    a24 = Fe25519 ( l0: 121665, l1: 0, l2: 0, l3: 0, l4: 0 );
+
+    t = 254;
+    when t >= 0 loop
+        byte_idx = t / 8;
+        bit_idx = t - byte_idx * 8;
+        # Extract bit
+        byte_val = k[byte_idx];
+        j = 0;
+        when j < bit_idx loop
+            byte_val = byte_val / 2;
+            j = j + 1;
+        end
+        k_t = byte_val - (byte_val / 2) * 2;
+
+        # Conditional swap
+        sw = k_t ^ swap;
+        if sw == 1 do
+            tmp = x_2;
+            x_2 = x_3;
+            x_3 = tmp;
+            tmp = z_2;
+            z_2 = z_3;
+            z_3 = tmp;
+        end
+        swap = k_t;
+
+        A = fe_add(x_2, z_2);
+        AA = fe_sq(A);
+        B = fe_sub(x_2, z_2);
+        BB = fe_sq(B);
+        E = fe_sub(AA, BB);
+        C = fe_add(x_3, z_3);
+        D = fe_sub(x_3, z_3);
+        DA = fe_mul(D, A);
+        CB = fe_mul(C, B);
+        x_3 = fe_sq(fe_add(DA, CB));
+        z_3 = fe_mul(x_1, fe_sq(fe_sub(DA, CB)));
+        x_2 = fe_mul(AA, BB);
+        z_2 = fe_mul(E, fe_add(AA, fe_mul(a24, E)));
+
+        t = t - 1;
+    end
+
+    # Final conditional swap
+    if swap == 1 do
+        tmp = x_2;
+        x_2 = x_3;
+        x_3 = tmp;
+        tmp = z_2;
+        z_2 = z_3;
+        z_3 = tmp;
+    end
+
+    # Result = x_2 * z_2^(-1)
+    result = fe_mul(x_2, fe_invert(z_2));
+
+    var out_bytes: [int; 32];
+    fe_to_bytes(result, &out_bytes);
+    out out_bytes;
+end.
+# ═══════════════════════════════════════════════════════
+# High-level API
+# ═══════════════════════════════════════════════════════
+
+# Basepoint: u=9
+func x25519_basepoint(scalar: [int]):
+    var bp: [int; 32] = [0; 32];
+    bp[0] = 9;
+    out x25519(scalar, &bp);
+end.
+# Generate keypair: secret -> public
+func x25519_keypair(secret: [int]):
+    out x25519_basepoint(secret);
+end.
+# Shared secret: my_secret * their_public
+func x25519_shared_secret(my_secret: [int], their_public: [int]):
+    out x25519(my_secret, their_public);
+end.

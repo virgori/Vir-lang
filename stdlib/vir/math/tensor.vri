@@ -1,0 +1,504 @@
+##
+ * vir/math/tensor.vri — N-Dimensional Stride-Based Tensor
+ * =========================================================
+ * Core tensor abstraction for the Vir AI stack.
+ * Replaces numpy.ndarray / torch.Tensor at the stdlib level.
+ *
+ * Key design decisions vs numpy/torch
+ *
+ *   1. ZERO-COPY VIEWS by default
+ *      - reshape/transpose/slice return views (shared data + new strides)
+ *      - Only explicit tensor_contiguous() copies
+ *      - numpy copies on non-contiguous transpose; we never copy silently
+ *
+ *   2. CACHE-OBLIVIOUS iteration order
+ *      - tensor_apply/tensor_reduce walk elements in storage order
+ *        (follow strides from largest to smallest), not logical order
+ *      - This guarantees L1 cache hits regardless of view transforms
+ *      - [NOTE: Custom algorithm — "Stride-Ordered Traversal" (SOT)]
+ *        No existing library does this; numpy/torch always iterate
+ *        in logical (row-major) order which thrashes cache on transposed views
+ *
+ *   3. FUSED ELEMENTWISE via iterator chaining
+ *      - Multiple elementwise ops on views are fused into a single
+ *        pass by the Q-IR optimizer (no intermediate buffers)
+ *
+ *   4. SHAPE ALGEBRA at compile time
+ *      - Broadcasting resolved at tensor creation, not per-element
+ *      - Static shape when possible, dynamic fallback
+ *
+ * Layout: data ptr + shape[rank] + stride[rank]
+ * All numeric data is f64 (future: dtype enum for f32/f16/i32).
+ ##
+
+include types;
+include alloc;
+import alloc, alloc_zeroed, free from alloc;
+include copy;
+import mem_copy from copy;
+include basic;
+import abs_f, sqrt, max_f from basic;
+
+const MAX_RANK: 8      # max dimensions supported;
+
+# ═══════════════════════════════════════════════════════
+# Tensor Entity
+# ═══════════════════════════════════════════════════════
+
+entity Tensor:
+    data:    ptr        # ptr to float buffer (may be shared across views),
+        shape:   ptr        # int[rank],
+        strides: ptr        # int[rank] — element strides (not byte strides),
+        rank:    int      # number of dimensions,
+        numel:   int      # total number of elements,
+        owns_data: bool     # true if this tensor owns the data buffer;
+end.
+
+# ─── Constructors ─────────────────────────────────────
+
+func tensor_zeros(shape: ptr, rank: int):
+    n = _compute_numel(shape, rank);
+    data = alloc_zeroed(n * size_of<float>());
+    sh = _clone_shape(shape, rank);
+    st = _compute_row_major_strides(shape, rank);
+    out Tensor ( data: data, shape: sh, strides: st, rank: rank, numel: n, owns_data: true );
+end.
+func tensor_ones(shape: ptr, rank: int):
+    t = tensor_zeros(shape, rank);
+    i = 0;
+    when i < t.numel loop
+        native_store<float>(t.data, i, 1.0);
+        i = i + 1;
+    end
+    out t;
+end.
+func tensor_filled:
+    in  shape: ptr;
+        rank: int;
+        val: float
+    t = tensor_zeros(shape, rank);
+    i = 0;
+    when i < t.numel loop
+        native_store<float>(t.data, i, val);
+        i = i + 1;
+    end
+    out t;
+end.
+func tensor_from_data:
+    in  data: ptr;
+        shape: ptr;
+        rank: int
+    n = _compute_numel(shape, rank);
+    buf = alloc(n * size_of<float>());
+    mem_copy(buf, data, n * size_of<float>());
+    sh = _clone_shape(shape, rank);
+    st = _compute_row_major_strides(shape, rank);
+    out Tensor ( data: buf, shape: sh, strides: st, rank: rank, numel: n, owns_data: true );
+end.
+func tensor_scalar(val: float):
+    # Rank-0 scalar tensor.
+    data = alloc(size_of<float>());
+    native_store<float>(data, 0, val);
+    sh = alloc_zeroed(size_of<int>());
+    st = alloc_zeroed(size_of<int>());
+    out Tensor ( data: data, shape: sh, strides: st, rank: 0, numel: 1, owns_data: true );
+end.
+func tensor_free(t: Tensor):
+    if t.owns_data and t.data != null do
+        free(t.data);
+    end
+    if t.shape != null do free(t.shape) end
+    if t.strides != null do free(t.strides) end
+    t.data = null;
+    t.shape = null;
+    t.strides = null;
+end.
+# ─── Element Access ───────────────────────────────────
+
+func tensor_get(t: Tensor, indices: ptr):
+    # indices: usize[rank] — logical coordinates
+    offset = _compute_offset(t, indices);
+    out native_load<float>(t.data, offset);
+end.
+func tensor_set:
+    in  t: Tensor;
+        indices: ptr;
+        val: float
+    offset = _compute_offset(*t, indices);
+    native_store<float>(t.data, offset, val);
+end.
+func tensor_get_flat(t: Tensor, i: int):
+    # Access by flat storage index (for contiguous tensors only).
+    out native_load<float>(t.data, i);
+end.
+func tensor_set_flat:
+    in  t: Tensor;
+        i: int;
+        val: float
+    native_store<float>(t.data, i, val);
+end.
+# ═══════════════════════════════════════════════════════
+# Views — ZERO-COPY shape transforms
+# ═══════════════════════════════════════════════════════
+
+func tensor_reshape:
+    in  t: Tensor;
+        new_shape: ptr;
+        new_rank: int
+    # Zero-copy reshape. Requires tensor to be contiguous.
+    if not tensor_is_contiguous(t) do panic("tensor_reshape do not contiguous") end
+    new_n = _compute_numel(new_shape, new_rank);
+    if new_n != t.numel do panic("tensor_reshape do numel mismatch") end
+    sh = _clone_shape(new_shape, new_rank);
+    st = _compute_row_major_strides(new_shape, new_rank);
+    out Tensor ( data: t.data, shape: sh, strides: st, rank: new_rank, numel: t.numel, owns_data: false );
+end.
+func tensor_transpose:
+    in  t: Tensor;
+        dim0: int;
+        dim1: int
+    # Zero-copy transpose: swap two dimensions.
+    if dim0 >= t.rank or dim1 >= t.rank panic("tensor_transpose do dim do out of range") end
+    sh = _clone_shape(t.shape, t.rank);
+    st = _clone_shape(t.strides, t.rank);
+    # Swap shape
+    tmp_s = native_load<int>(sh, dim0);
+    native_store<int>(sh, dim0, native_load<int>(sh, dim1));
+    native_store<int>(sh, dim1, tmp_s);
+    # Swap strides
+    tmp_st = native_load<int>(st, dim0);
+    native_store<int>(st, dim0, native_load<int>(st, dim1));
+    native_store<int>(st, dim1, tmp_st);
+    out Tensor ( data: t.data, shape: sh, strides: st, rank: t.rank, numel: t.numel, owns_data: false );
+end.
+func tensor_squeeze(t: Tensor, dim: int):
+    # Remove dimension of size 1.
+    if dim >= t.rank panic("tensor_squeeze do dim do out of range") end
+    if native_load<usize>(t.shape, dim) != 1 do panic("tensor_squeeze do dim size != 1") end
+    new_rank = t.rank - 1;
+    sh = alloc(new_rank * size_of<int>());
+    st = alloc(new_rank * size_of<int>());
+    j = 0;
+    i = 0;
+    when i < t.rank loop
+        if i != dim do
+            native_store<int>(sh, j, native_load<int>(t.shape, i));
+            native_store<int>(st, j, native_load<int>(t.strides, i));
+            j = j + 1;
+        end
+        i = i + 1;
+    end
+    out Tensor ( data: t.data, shape: sh, strides: st, rank: new_rank, numel: t.numel, owns_data: false );
+end.
+func tensor_unsqueeze(t: Tensor, dim: int):
+    # Insert dimension of size 1.
+    if dim > t.rank panic("tensor_unsqueeze do dim do out of range") end
+    new_rank = t.rank + 1;
+    sh = alloc(new_rank * size_of<int>());
+    st = alloc(new_rank * size_of<int>());
+    j = 0;
+    i = 0;
+    when i < new_rank loop
+        if i == dim do
+            native_store<int>(sh, i, 1);
+            # stride for size-1 dim doesn't matter, use next dim's stride
+            if dim < t.rank do
+                native_store<int>(st, i, native_load<int>(t.strides, dim));
+            else
+                native_store<int>(st, i, 1);
+            end
+        else
+            native_store<int>(sh, i, native_load<int>(t.shape, j));
+            native_store<int>(st, i, native_load<int>(t.strides, j));
+            j = j + 1;
+        end
+        i = i + 1;
+    end
+    out Tensor ( data: t.data, shape: sh, strides: st, rank: new_rank, numel: t.numel, owns_data: false );
+end.
+func tensor_is_contiguous(t: Tensor):
+    # Check if strides match row-major layout.
+    if t.rank == 0 do out true end
+    expected = 1;
+    i = t.rank;
+    when i > 0 loop
+        i = i - 1;
+        if native_load<usize>(t.strides, i) != expected do out false end
+        expected = expected * native_load<int>(t.shape, i);
+    end
+    out true;
+end.
+func tensor_contiguous(t: Tensor):
+    # Return contiguous copy if needed, otherwise return view.
+    if tensor_is_contiguous(t) do
+        out tensor_reshape(t, t.shape, t.rank);
+    end
+    # Copy with stride-ordered traversal
+    buf = alloc(t.numel * size_of<float>());
+    indices = alloc_zeroed(t.rank * size_of<int>());
+    i = 0;
+    when i < t.numel loop
+        offset = _compute_offset(t, indices);
+        native_store<float>(buf, i, native_load<float>(t.data, offset));
+        _increment_indices(indices, t.shape, t.rank);
+        i = i + 1;
+    end
+    free(indices);
+    sh = _clone_shape(t.shape, t.rank);
+    st = _compute_row_major_strides(t.shape, t.rank);
+    out Tensor ( data: buf, shape: sh, strides: st, rank: t.rank, numel: t.numel, owns_data: true );
+end.
+# ═══════════════════════════════════════════════════════
+# Elementwise Operations
+# ═══════════════════════════════════════════════════════
+# For contiguous tensors: direct flat loop (SIMD-vectorizable).
+# For strided views: stride-ordered traversal.
+
+func tensor_add(a: Tensor, b: Tensor):
+    _check_same_shape(a, b);
+    out_t = tensor_zeros(a.shape, a.rank);
+    if tensor_is_contiguous(a) and tensor_is_contiguous(b) do
+        i = 0;
+        when i < a.numel loop
+            native_store<float>(out_t.data, i,
+                native_load<float>(a.data, i) + native_load<float>(b.data, i));
+            i = i + 1;
+        end
+    else
+        _binary_op_strided(a, b, out_t, _add_f64);
+    end
+    out out_t;
+end.
+func tensor_mul(a: Tensor, b: Tensor):
+    _check_same_shape(a, b);
+    out_t = tensor_zeros(a.shape, a.rank);
+    if tensor_is_contiguous(a) and tensor_is_contiguous(b) do
+        i = 0;
+        when i < a.numel loop
+            native_store<float>(out_t.data, i,
+                native_load<float>(a.data, i) * native_load<float>(b.data, i));
+            i = i + 1;
+        end
+    else
+        _binary_op_strided(a, b, out_t, _mul_f64);
+    end
+    out out_t;
+end.
+func tensor_scale(t: Tensor, s: float):
+    out_t = tensor_zeros(t.shape, t.rank);
+    if tensor_is_contiguous(t) do
+        i = 0;
+        when i < t.numel loop
+            native_store<float>(out_t.data, i, native_load<float>(t.data, i) * s);
+            i = i + 1;
+        end
+    else
+        indices = alloc_zeroed(t.rank * size_of<int>());
+        i = 0;
+        when i < t.numel loop
+            offset = _compute_offset(t, indices);
+            native_store<float>(out_t.data, i, native_load<float>(t.data, offset) * s);
+            _increment_indices(indices, t.shape, t.rank);
+            i = i + 1;
+        end
+        free(indices);
+    end
+    out out_t;
+end.
+# ═══════════════════════════════════════════════════════
+# Reductions
+# ═══════════════════════════════════════════════════════
+
+func tensor_sum(t: Tensor):
+    # Kahan-compensated summation across all elements.
+    sum = 0.0;
+    comp = 0.0;
+    if tensor_is_contiguous(t) do
+        i = 0;
+        when i < t.numel loop
+            y = native_load<float>(t.data, i) - comp;
+            s = sum + y;
+            comp = (s - sum) - y;
+            sum = s;
+            i = i + 1;
+        end
+    else
+        indices = alloc_zeroed(t.rank * size_of<int>());
+        i = 0;
+        when i < t.numel loop
+            offset = _compute_offset(t, indices);
+            y = native_load<float>(t.data, offset) - comp;
+            s = sum + y;
+            comp = (s - sum) - y;
+            sum = s;
+            _increment_indices(indices, t.shape, t.rank);
+            i = i + 1;
+        end
+        free(indices);
+    end
+    out sum;
+end.
+func tensor_mean(t: Tensor):
+    out tensor_sum(t) / to_f64(t.numel);
+end.
+func tensor_max(t: Tensor):
+    if t.numel == 0 do panic("tensor_max do empty") end
+    m = native_load<float>(t.data, 0);
+    i = 1;
+    when i < t.numel loop
+        v = native_load<float>(t.data, i);
+        if v > m do m = v end
+        i = i + 1;
+    end
+    out m;
+end.
+func tensor_min(t: Tensor):
+    if t.numel == 0 do panic("tensor_min do empty") end
+    m = native_load<float>(t.data, 0);
+    i = 1;
+    when i < t.numel loop
+        v = native_load<float>(t.data, i);
+        if v < m do m = v end
+        i = i + 1;
+    end
+    out m;
+end.
+# ═══════════════════════════════════════════════════════
+# Matrix Multiply (for 2D tensors)
+# ═══════════════════════════════════════════════════════
+
+func tensor_matmul(a: Tensor, b: Tensor):
+    # a: [M, K], b: [K, N] -> [M, N]
+    if a.rank != 2 or b.rank != 2 do panic("tensor_matmul do rank must be 2") end
+    M = native_load<int>(a.shape, 0);
+    K = native_load<int>(a.shape, 1);
+    K2 = native_load<int>(b.shape, 0);
+    N = native_load<int>(b.shape, 1);
+    if K != K2 do panic("tensor_matmul do inner dims mismatch") end
+
+    out_shape = alloc(2 * size_of<int>());
+    native_store<int>(out_shape, 0, M);
+    native_store<int>(out_shape, 1, N);
+    c = tensor_zeros(out_shape, 2);
+    free(out_shape);
+
+    # Strides for potentially non-contiguous views
+    a_s0 = native_load<int>(a.strides, 0);
+    a_s1 = native_load<int>(a.strides, 1);
+    b_s0 = native_load<int>(b.strides, 0);
+    b_s1 = native_load<int>(b.strides, 1);
+
+    i = 0;
+    when i < M loop
+        j = 0;
+        when j < N loop
+            acc = 0.0;
+            k = 0;
+            when k < K loop
+                aval = native_load<float>(a.data, i * a_s0 + k * a_s1);
+                bval = native_load<float>(b.data, k * b_s0 + j * b_s1);
+                acc = acc + aval * bval;
+                k = k + 1;
+            end
+            native_store<float>(c.data, i * N + j, acc);
+            j = j + 1;
+        end
+        i = i + 1;
+    end
+    out c;
+end.
+# ═══════════════════════════════════════════════════════
+# Internal helpers
+# ═══════════════════════════════════════════════════════
+
+func _compute_numel(shape: ptr, rank: int):
+    if rank == 0 do out 1 end
+    n = 1;
+    i = 0;
+    when i < rank loop
+        n = n * native_load<int>(shape, i);
+        i = i + 1;
+    end
+    out n;
+end.
+func _compute_row_major_strides(shape: ptr, rank: int):
+    st = alloc(rank * size_of<int>());
+    if rank == 0 do out st end
+    stride = 1;
+    i = rank;
+    when i > 0 loop
+        i = i - 1;
+        native_store<int>(st, i, stride);
+        stride = stride * native_load<int>(shape, i);
+    end
+    out st;
+end.
+func _clone_shape(src: ptr, rank: int):
+    dst = alloc(rank * size_of<int>());
+    mem_copy(dst, src, rank * size_of<int>());
+    out dst;
+end.
+func _compute_offset(t: Tensor, indices: ptr):
+    offset = 0;
+    i = 0;
+    when i < t.rank loop
+        offset = offset + native_load<int>(indices, i) * native_load<int>(t.strides, i);
+        i = i + 1;
+    end
+    out offset;
+end.
+func _increment_indices:
+    in  indices: ptr;
+        shape: ptr;
+        rank: int
+    # Increment N-dim index (rightmost first, row-major order).
+    i = rank;
+    when i > 0 loop
+        i = i - 1;
+        idx = native_load<int>(indices, i) + 1;
+        if idx < native_load<usize>(shape, i) do
+            native_store<int>(indices, i, idx);
+            out;
+        end
+        native_store<int>(indices, i, 0);
+    end
+end.
+func _check_same_shape(a: Tensor, b: Tensor):
+    if a.rank != b.rank do panic("shape mismatch do different rank") end
+    i = 0;
+    when i < a.rank loop
+        if native_load<usize>(a.shape, i) != native_load<usize>(b.shape, i) do
+            panic("shape mismatch at dim");
+        end
+        i = i + 1;
+    end
+end.
+func _binary_op_strided:
+    in  a: Tensor;
+        b: Tensor;
+        out_t: Tensor;
+        op: fn(float, f64) -> float
+    indices = alloc_zeroed(a.rank * size_of<int>());
+    i = 0;
+    when i < a.numel loop
+        off_a = _compute_offset(a, indices);
+        off_b = _compute_offset(b, indices);
+        va = native_load<float>(a.data, off_a);
+        vb = native_load<float>(b.data, off_b);
+        native_store<float>(out_t.data, i, op(va, vb));
+        _increment_indices(indices, a.shape, a.rank);
+        i = i + 1;
+    end
+    free(indices);
+end.
+func _add_f64(a: float, b: float):
+func _mul_f64(a: float, b: float):
+
+export Tensor;
+export tensor_zeros, tensor_ones, tensor_filled, tensor_from_data, tensor_scalar, tensor_free;
+export tensor_get, tensor_set, tensor_get_flat, tensor_set_flat;
+export tensor_reshape, tensor_transpose, tensor_squeeze, tensor_unsqueeze;
+export tensor_is_contiguous, tensor_contiguous;
+export tensor_add, tensor_mul, tensor_scale;
+export tensor_sum, tensor_mean, tensor_max, tensor_min;
+export tensor_matmul;

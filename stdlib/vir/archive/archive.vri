@@ -1,0 +1,331 @@
+##
+ * vir/archive/archive.vri — Archive (tar) + Compression (zlib/gzip)
+ * ===================================================================
+ * Inspired by Python: tarfile, zipfile, gzip, zlib
+ *
+ * Phase C — tar read/write + deflate/inflate
+ ##
+
+include types;
+include option;
+import Option, Some, None from option;
+include result;
+import Result, Ok, Err from result;
+include string;
+import String, str_new from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len from vec;
+include file;
+import File, file_open, file_read_all, file_write_all, file_close from file;
+
+# ═══════════════════════════════════════════════════════
+# Compression: Deflate / Inflate (zlib wrapper)
+# ═══════════════════════════════════════════════════════
+
+enum CompressLevel:
+    None    = 0;
+    Fast    = 1;
+    Default = 6;
+    Best    = 9;
+end.
+
+extern func native_deflate(src: ptr, src_len: int, dst: ptr, dst_cap: int, level: int) -> int
+extern func native_inflate(src: ptr, src_len: int, dst: ptr, dst_cap: int) -> int
+
+func compress:
+    in  data: [int];
+        len: int;
+        level: CompressLevel
+    # Allocate worst-case output (input + 12 + input/1000)
+    cap = len + 64 + len / 100;
+    out = vec_with_capacity<int>(cap);
+    n = native_deflate(data, len, vec_ptr<int>(&out), cap, level);
+    if n < 0 do out Err(str_new("compression failed")) end
+    vec_set_len<int>(&out, n);
+    out Ok(out);
+end.
+func decompress:
+    in  data: [int];
+        len: int;
+        max_output: int
+    out = vec_with_capacity<int>(max_output);
+    n = native_inflate(data, len, vec_ptr<int>(&out), max_output);
+    if n < 0 do out Err(str_new("decompression failed")) end
+    vec_set_len<int>(&out, n);
+    out Ok(out);
+end.
+# ═══════════════════════════════════════════════════════
+# Gzip: compress/decompress files (RFC 1952)
+# ═══════════════════════════════════════════════════════
+
+extern func native_gzip_compress(src: ptr, src_len: int, dst: ptr, dst_cap: int) -> int
+extern func native_gzip_decompress(src: ptr, src_len: int, dst: ptr, dst_cap: int) -> int
+
+func gzip_compress(data: [int], len: int):
+    cap = len + 64 + len / 100;
+    out = vec_with_capacity<int>(cap);
+    n = native_gzip_compress(data, len, vec_ptr<int>(&out), cap);
+    if n < 0 do out Err(str_new("gzip compress failed")) end
+    vec_set_len<int>(&out, n);
+    out Ok(out);
+end.
+func gzip_decompress:
+    in  data: [int];
+        len: int;
+        max_output: int
+    out = vec_with_capacity<int>(max_output);
+    n = native_gzip_decompress(data, len, vec_ptr<int>(&out), max_output);
+    if n < 0 do out Err(str_new("gzip decompress failed")) end
+    vec_set_len<int>(&out, n);
+    out Ok(out);
+end.
+func gzip_compress_file(src_path: string, dst_path: string):
+    data_result = file_read_all(src_path);
+    var data:Vec<int>;
+    case data_result;
+        Err(e): out Err(e);
+        case Ok(d) data = d
+    end
+    compressed = gzip_compress(vec_ptr<int>(&data), vec_len<int>(data));
+    case compressed;
+        Err(e): out Err(e);
+        Ok(out): out file_write_all(dst_path, vec_ptr<int>(&out), vec_len<int>(out));;
+    end
+end.
+# ═══════════════════════════════════════════════════════
+# Tar Archive (POSIX ustar format)
+# ═══════════════════════════════════════════════════════
+
+enum TarEntryType:
+    RegFile   = 0x30   # '0';
+    Directory = 0x35   # '5';
+    Symlink   = 0x32   # '2';
+end.
+entity TarEntry:
+    name:     string,
+        size:     int,
+        mode:     int,
+        mtime:    int,
+        kind:     TarEntryType,
+        linkname: string,
+        data:     Vec<int>;
+end.
+entity TarArchive:
+    entries: Vec<TarEntry>;
+end.
+func tar_new:
+    out TarArchive ( entries = vec_new<TarEntry>() );
+end.
+func tar_add_file:
+    in  ar: TarArchive;
+        name: string;
+        data: Vec<int>;
+        mode: int
+    vec_push<TarEntry>(&ar.entries, TarEntry (;
+        name = name,
+        size = vec_len<int>(data),
+        mode = mode,
+        mtime = 0,
+        kind = TarEntryType.RegFile,
+        linkname = str_new(""),
+        data = data
+    ));
+end.
+func tar_add_dir:
+    in  ar: TarArchive;
+        name: string;
+        mode: int
+    vec_push<TarEntry>(&ar.entries, TarEntry (;
+        name = name,
+        size = 0,
+        mode = mode,
+        mtime = 0,
+        kind = TarEntryType.Directory,
+        linkname = str_new(""),
+        data = vec_new<int>()
+    ));
+end.
+func tar_write(ar: TarArchive, path: string):
+    buf = vec_new<int>();
+    i = 0;
+    when i < vec_len<TarEntry>(ar.entries) loop
+        entry = vec_get<TarEntry>(ar.entries, i);
+        _tar_write_header(&buf, entry);
+        # Write data (padded to 512-byte blocks)
+        j = 0;
+        when j < entry.size loop
+            vec_push<int>(&buf, vec_get<int>(entry.data, j));
+            j = j + 1;
+        end
+        # Pad to 512
+        pad = (512 - (entry.size % 512)) % 512;
+        j = 0;
+        when j < pad vec_push<u8>(&buf, 0); j = j + 1 end loop
+        i = i + 1;
+    end
+    # Two zero blocks = end of archive
+    k = 0;
+    when k < 1024 vec_push<u8>(&buf, 0); k = k + 1 end loop
+    
+    out file_write_all(path, vec_ptr<int>(&buf), vec_len<int>(buf));
+end.
+func _tar_write_header(buf: Vec<int>, entry: TarEntry):
+    # 512-byte header: name(100) + mode(8) + uid(8) + gid(8) + size(12) + mtime(12)
+    #   + checksum(8) + typeflag(1) + linkname(100) + magic(6) + version(2) + ...
+    var hdr: [int; 512] = [0; 512];
+    
+    # Name (bytes 0-99)
+    _write_str(&hdr, 0, entry.name, 100);
+    # Mode (bytes 100-107) — octal
+    _write_octal(&hdr, 100, entry.mode, 8);
+    # UID (108-115)
+    _write_octal(&hdr, 108, 0, 8);
+    # GID (116-123)
+    _write_octal(&hdr, 116, 0, 8);
+    # Size (124-135) — octal
+    _write_octal(&hdr, 124, entry.size, 12);
+    # Mtime (136-147)
+    _write_octal(&hdr, 136, entry.mtime, 12);
+    # Checksum placeholder (148-155) — spaces
+    c = 148;
+    when c < 156 hdr[c] = 0x20; c = c + 1 end loop
+    # Typeflag (156)
+    hdr[156] = entry.kind;
+    # Linkname (157-256)
+    _write_str(&hdr, 157, entry.linkname, 100);
+    # Magic (257-262)
+    hdr[257] = 0x75; hdr[258] = 0x73; hdr[259] = 0x74;
+    hdr[260] = 0x61; hdr[261] = 0x72; hdr[262] = 0x00  # "ustar\0";
+    # Version (263-264)
+    hdr[263] = 0x30; hdr[264] = 0x30   # "00";
+    
+    # Compute checksum
+    sum = 0;
+    i = 0;
+    when i < 512 sum = sum + hdr[i]; i = i + 1 end loop
+    _write_octal(&hdr, 148, sum, 7);
+    hdr[155] = 0x00;
+    
+    # Append to buffer
+    i = 0;
+    when i < 512 vec_push<u8>(buf, hdr[i]); i = i + 1 end loop
+end.
+func _write_str:
+    in  hdr: [int];
+        off: int;
+        s: string;
+        max: int
+    len = str_byte_len(s);
+    if len > max do len = max end
+    i = 0;
+    when i < len hdr[off + i] = str_byte_at(s, i); i = i + 1 end loop
+end.
+func _write_octal:
+    in  hdr: [int];
+        off: int;
+        val: int;
+        width: int
+    # Write octal string right-justified, null-terminated
+    var buf: [int; 16];
+    v = val;
+    i = width - 2;
+    when i >= 0 loop
+        buf[i] = 0x30 + (v % 8);
+        v = v / 8;
+        i = i - 1;
+    end
+    j = 0;
+    when j < width - 1 hdr[off + j] = buf[j]; j = j + 1 end loop
+    hdr[off + width - 1] = 0x00;
+end.
+# ═══════════════════════════════════════════════════════
+# Tar Reader
+# ═══════════════════════════════════════════════════════
+
+func tar_read(path: string):
+    data_result = file_read_all(path);
+    var data:Vec<int>;
+    case data_result;
+        Err(e): out Err(e);
+        case Ok(d) data = d
+    end
+    
+    entries = vec_new<TarEntry>();
+    pos = 0;
+    total = vec_len<int>(data);
+    
+    when pos + 512 <= total loop
+        # Kiểm tra zero block (end of archive)
+        all_zero = true;
+        c = 0;
+        when c < 512 loop
+            if vec_get<u8>(data, pos + c) != 0 do all_zero = false; break end
+            c = c + 1;
+        end
+        if all_zero do break end
+        
+        # Parse header
+        name = _read_tar_str(data, pos, 100);
+        size = _read_tar_octal(data, pos + 124, 12);
+        typeflag = vec_get<int>(data, pos + 156);
+        linkname = _read_tar_str(data, pos + 157, 100);
+        
+        kind = case typeflag;
+            case 0x35 TarEntryType.Directory
+            case 0x32 TarEntryType.Symlink
+            default TarEntryType.RegFile;
+        end
+        
+        pos = pos + 512  # past header;
+        
+        # Read data
+        entry_data = vec_new<int>();
+        d = 0;
+        when d < size loop
+            vec_push<int>(&entry_data, vec_get<int>(data, pos + d));
+            d = d + 1;
+        end
+        
+        vec_push<TarEntry>(&entries, TarEntry (;
+            name = name, size = size, mode = 0o644,
+            mtime = 0, kind = kind, linkname = linkname,
+            data = entry_data
+    ));
+        
+        # Skip data + padding
+        blocks = (size + 511) / 512;
+        pos = pos + blocks * 512;
+    end
+    
+    out Ok(TarArchive ( entries = entries ));
+end.
+func _read_tar_str:
+    in  data: Vec<int>;
+        off: int;
+        maxlen: int
+    sb = sb_new();
+    i = 0;
+    when i < maxlen loop
+        b = vec_get<int>(data, off + i);
+        if b == 0 do break end
+        sb_push_byte(&sb, b);
+        i = i + 1;
+    end
+    out sb_build(sb);
+end.
+func _read_tar_octal:
+    in  data: Vec<int>;
+        off: int;
+        width: int
+    val = 0;
+    i = 0;
+    when i < width loop
+        b = vec_get<int>(data, off + i);
+        if b == 0 or b == 0x20 do break end
+        if b >= 0x30 and b <= 0x37 do
+            val = val * 8 + (b - 0x30);
+        end
+        i = i + 1;
+    end
+    out val;
+end.

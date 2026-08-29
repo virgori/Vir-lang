@@ -1,0 +1,342 @@
+##
+ * vir/wir/lower_m_l.vri — WIR-M → WIR-L Lowering Pass
+ * ======================================================
+ * Each WIR-M node maps to one or more WIR-L nodes modeling
+ * concrete JS import calls, CSS emission, or linear-memory ops.
+ * WIR-L nodes become input to the final WASM code-gen stage.
+ *
+ * Lowering rules
+ *   CREATE_ELEMENT   → JS_CREATE_ELEMENT
+ *   CREATE_TEXT      → JS_CREATE_TEXT
+ *   SET_ATTR         → JS_SET_ATTRIBUTE
+ *   REMOVE_ATTR      → JS_REMOVE_ATTRIBUTE
+ *   SET_PROP         → JS_SET_PROPERTY
+ *   APPEND_CHILD     → JS_APPEND_CHILD
+ *   INSERT_BEFORE    → JS_INSERT_BEFORE
+ *   REMOVE_CHILD     → JS_REMOVE_CHILD
+ *   REPLACE_CHILD    → JS_REPLACE_CHILD
+ *   SET_TEXT          → JS_SET_TEXT
+ *   ADD_LISTENER     → JS_ADD_EVENT
+ *   REMOVE_LISTENER  → JS_REMOVE_EVENT
+ *   RESOLVE_CLASS    → EMIT_CSS_RULE
+ *   APPLY_STYLE      → JS_SET_STYLE / JS_SET_ATTRIBUTE
+ *   ALLOC_STATE      → STRING_ALLOC / DATA_ALLOC
+ *   LOAD/STORE_STATE → CALL_JS
+ *   SUBSCRIBE        → CALL_JS
+ *   DIFF_START/COMMIT→ REQUEST_FRAME
+ *   DISPATCH_EVENT   → CALL_JS
+ *   BATCH_SET_ATTRS  → JS_SET_ATTRIBUTE per attr
+ ##
+
+include types;
+include string;
+import String, str_new, str_eq, str_concat from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include map;
+import Map, map_get, map_set, map_has from map;
+include wir/opcodes;
+import WIRMOp, WIRLOp from wir/opcodes;
+include wir/schema;
+import WIRMNode, WIRLNode, wir_l_node_new, KVPair from wir/schema;
+include wir/module;
+import WIRGraph from wir/module;
+
+
+# ═══════════════════════════════════════════════════════
+# JS module name constants
+# ═══════════════════════════════════════════════════════
+
+const DOM_MODULE: "dom";
+const STATE_MODULE: "state";
+const EVENT_MODULE: "event";
+
+
+# ═══════════════════════════════════════════════════════
+# L-node emitter with auto-incrementing IDs
+# ═══════════════════════════════════════════════════════
+
+var _next_l_id: int = 0;
+
+func _alloc_l:
+    lid = _next_l_id;
+    _next_l_id = _next_l_id + 1;
+    out lid;
+end.
+func _add_l:
+    in  g: WIRGraph;
+        op: WIRLOp;
+        src_m: int
+    lid = _alloc_l();
+    node = wir_l_node_new(lid, op, src_m);
+    map_set(g.l_nodes, lid, node);
+    out (g, lid >> int);
+end.
+func _add_l_js:
+    in  g: WIRGraph;
+        op: WIRLOp;
+        src_m: int;
+        mod: string;
+        fn_name: string
+    (g, lid) = _add_l(g, op, src_m);
+    node = map_get(g.l_nodes, lid);
+    node.js_module = mod;
+    node.js_func = fn_name;
+    map_set(g.l_nodes, lid, node);
+    out (g, lid >> int);
+end.
+func _add_l_js_str:
+    in  g: WIRGraph;
+        op: WIRLOp;
+        src_m: int;
+        mod: string;
+        fn_name: string;
+        sdata: string
+    (g, lid) = _add_l_js(g, op, src_m, mod, fn_name);
+    node = map_get(g.l_nodes, lid);
+    node.string_data = sdata;
+    map_set(g.l_nodes, lid, node);
+    out (g, lid >> int);
+end.
+func _add_l_css:
+    in  g: WIRGraph;
+        op: WIRLOp;
+        src_m: int;
+        selector: string
+    (g, lid) = _add_l(g, op, src_m);
+    node = map_get(g.l_nodes, lid);
+    node.css_selector = selector;
+    map_set(g.l_nodes, lid, node);
+    out (g, lid >> int);
+end.
+func _add_l_alloc:
+    in  g: WIRGraph;
+        op: WIRLOp;
+        src_m: int;
+        size: int
+    (g, lid) = _add_l(g, op, src_m);
+    node = map_get(g.l_nodes, lid);
+    node.alloc_size = size;
+    map_set(g.l_nodes, lid, node);
+    out (g, lid >> int);
+end.
+# ═══════════════════════════════════════════════════════
+# Main lowering pass
+# ═══════════════════════════════════════════════════════
+
+func lower_m_to_l(g: WIRGraph):
+    # Initialize L-ID counter past all existing IDs
+    _next_l_id = g.next_id + 2000;
+
+    # Iterate M-nodes in sorted order
+    mid = 0;
+    max_mid = g.next_id + 1500;
+    when mid < max_mid loop
+        if map_has(g.m_nodes, mid) do
+            m = map_get(g.m_nodes, mid);
+            g = _lower_m_node(g, m);
+        end
+        mid = mid + 1;
+    end
+    out g;
+end.
+# ═══════════════════════════════════════════════════════
+# Single M-node dispatch
+# ═══════════════════════════════════════════════════════
+
+func _lower_m_node(g: WIRGraph, m: WIRMNode):
+    op = m.op;
+
+    # ── DOM mutation ─────────────────────────────────────
+
+    if op == WIRMOp::CreateElement do
+        (g, _) = _add_l_js(g, WIRLOp::JSCreateElement, m.node_id,
+                            DOM_MODULE, "createElement");
+        out g;
+    end
+
+    if op == WIRMOp::CreateText do
+        (g, _) = _add_l_js_str(g, WIRLOp::JSCreateText, m.node_id,
+                                DOM_MODULE, "createTextNode", m.text_content);
+        out g;
+    end
+
+    if op == WIRMOp::SetAttr do
+        (g, _) = _add_l_js(g, WIRLOp::JSSetAttribute, m.node_id,
+                            DOM_MODULE, "setAttribute");
+        out g;
+    end
+
+    if op == WIRMOp::RemoveAttr do
+        (g, _) = _add_l_js(g, WIRLOp::JSRemoveAttribute, m.node_id,
+                            DOM_MODULE, "removeAttribute");
+        out g;
+    end
+
+    if op == WIRMOp::SetProp do
+        (g, _) = _add_l_js(g, WIRLOp::JSSetProperty, m.node_id,
+                            DOM_MODULE, "setProperty");
+        out g;
+    end
+
+    if op == WIRMOp::AppendChild do
+        (g, _) = _add_l_js(g, WIRLOp::JSAppendChild, m.node_id,
+                            DOM_MODULE, "appendChild");
+        out g;
+    end
+
+    if op == WIRMOp::InsertBefore do
+        (g, _) = _add_l_js(g, WIRLOp::JSInsertBefore, m.node_id,
+                            DOM_MODULE, "insertBefore");
+        out g;
+    end
+
+    if op == WIRMOp::RemoveChild do
+        (g, _) = _add_l_js(g, WIRLOp::JSRemoveChild, m.node_id,
+                            DOM_MODULE, "removeChild");
+        out g;
+    end
+
+    if op == WIRMOp::ReplaceChild do
+        (g, _) = _add_l_js(g, WIRLOp::JSReplaceChild, m.node_id,
+                            DOM_MODULE, "replaceChild");
+        out g;
+    end
+
+    if op == WIRMOp::SetText do
+        (g, _) = _add_l_js(g, WIRLOp::JSSetText, m.node_id,
+                            DOM_MODULE, "setTextContent");
+        out g;
+    end
+
+    if op == WIRMOp::SetInnerHTML do
+        (g, _) = _add_l_js(g, WIRLOp::JSSetText, m.node_id,
+                            DOM_MODULE, "setInnerHTML");
+        out g;
+    end
+
+    # ── Style resolution ─────────────────────────────────
+
+    if op == WIRMOp::ResolveClass do
+        if str_eq(m.css_class, "") == 0 do
+            sel = str_concat(".", m.css_class);
+            (g, _) = _add_l_css(g, WIRLOp::EmitCSSRule, m.node_id, sel);
+        end
+        out g;
+    end
+
+    if op == WIRMOp::ResolveDynamic do
+        (g, lid) = _add_l(g, WIRLOp::EmitCSSVar, m.node_id);
+        node = map_get(g.l_nodes, lid);
+        node.css_var_name = m.attr_name;
+        node.css_var_value = m.attr_value;
+        map_set(g.l_nodes, lid, node);
+        out g;
+    end
+
+    if op == WIRMOp::ApplyStyle do
+        if vec_len(m.css_properties) > 0 do
+            # Inline style per declaration
+            j = 0;
+            when j < vec_len(m.css_properties) loop
+                kv = vec_get(m.css_properties, j);
+                sdata = str_concat(kv.key, str_concat(":", kv.val));
+                (g, _) = _add_l_js_str(g, WIRLOp::JSSetStyle, m.node_id,
+                                        DOM_MODULE, "setStyle", sdata);
+                j = j + 1;
+            end
+        eif str_eq(m.css_class, "") == 0 do
+            # Class-based: set className attribute
+            sdata = str_concat("class=", m.css_class);
+            (g, _) = _add_l_js_str(g, WIRLOp::JSSetAttribute, m.node_id,
+                                    DOM_MODULE, "setAttribute", sdata);
+        end
+        out g;
+    end
+
+    # ── Events ───────────────────────────────────────────
+
+    if op == WIRMOp::AddListener do
+        (g, _) = _add_l_js_str(g, WIRLOp::JSAddEvent, m.node_id,
+                                EVENT_MODULE, "addEventListener", m.event_type);
+        out g;
+    end
+
+    if op == WIRMOp::RemoveListener do
+        (g, _) = _add_l_js_str(g, WIRLOp::JSRemoveEvent, m.node_id,
+                                EVENT_MODULE, "removeEventListener", m.event_type);
+        out g;
+    end
+
+    if op == WIRMOp::DispatchEvent do
+        (g, _) = _add_l_js_str(g, WIRLOp::CallJS, m.node_id,
+                                EVENT_MODULE, "dispatchEvent", m.event_type);
+        out g;
+    end
+
+    # ── State management ─────────────────────────────────
+
+    if op == WIRMOp::AllocState do
+        if str_eq(m.state_type, "str") do
+            (g, _) = _add_l_alloc(g, WIRLOp::StringAlloc, m.node_id, 256);
+        eif m.state_size > 0 do
+            (g, _) = _add_l_alloc(g, WIRLOp::DataAlloc, m.node_id, m.state_size);
+        else
+            (g, _) = _add_l_alloc(g, WIRLOp::DataAlloc, m.node_id, 4);
+        end
+        out g;
+    end
+
+    if op == WIRMOp::LoadState do
+        (g, _) = _add_l_js(g, WIRLOp::CallJS, m.node_id,
+                            STATE_MODULE, "load");
+        out g;
+    end
+
+    if op == WIRMOp::StoreState do
+        (g, _) = _add_l_js(g, WIRLOp::CallJS, m.node_id,
+                            STATE_MODULE, "store");
+        out g;
+    end
+
+    if op == WIRMOp::Subscribe do
+        (g, _) = _add_l_js(g, WIRLOp::CallJS, m.node_id,
+                            STATE_MODULE, "subscribe");
+        out g;
+    end
+
+    # ── VDOM diff ────────────────────────────────────────
+
+    if op == WIRMOp::DiffStart do
+        (g, _) = _add_l(g, WIRLOp::RequestFrame, m.node_id);
+        out g;
+    end
+
+    if op == WIRMOp::DiffPatch do
+        (g, _) = _add_l_js(g, WIRLOp::CallJS, m.node_id,
+                            DOM_MODULE, "patch");
+        out g;
+    end
+
+    if op == WIRMOp::DiffCommit do
+        (g, _) = _add_l(g, WIRLOp::RequestFrame, m.node_id);
+        out g;
+    end
+
+    # ── Attribute batching ───────────────────────────────
+
+    if op == WIRMOp::BatchSetAttrs do
+        j = 0;
+        when j < vec_len(m.batch_attrs) loop
+            kv = vec_get(m.batch_attrs, j);
+            (g, _) = _add_l_js(g, WIRLOp::JSSetAttribute, m.node_id,
+                                DOM_MODULE, "setAttribute");
+            j = j + 1;
+        end
+        out g;
+    end
+
+    # Fallback
+    out g;
+end.
+export lower_m_to_l

@@ -1,0 +1,329 @@
+##
+ * vir/net/dns.vri — DNS Client (Full Resolver)
+ * ===============================================
+ * Inspired by C: res_query, getaddrinfo
+ * Inspired by Python: dnspython
+ * Inspired by Rust: trust-dns
+ *
+ * Full DNS resolver: A, AAAA, CNAME, MX, TXT, SRV, NS, PTR records.
+ * Supports recursive resolution, caching, and custom nameservers.
+ ##
+
+include types;
+include result;
+import Result, Ok, Err from result;
+include option;
+import Option, Some, None from option;
+include string;
+import String, str_new, str_byte_len, str_ptr, str_concat from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include net;
+import UdpSocket, udp_bind, udp_send_to, udp_recv_from,
+       SocketAddr, socket_addr, ipv4 from net;
+
+# ═══════════════════════════════════════════════════════
+# DNS Record Types
+# ═══════════════════════════════════════════════════════
+
+const DNS_TYPE_A:     1;
+const DNS_TYPE_NS:    2;
+const DNS_TYPE_CNAME: 5;
+const DNS_TYPE_SOA:   6;
+const DNS_TYPE_PTR:  12;
+const DNS_TYPE_MX:   15;
+const DNS_TYPE_TXT:  16;
+const DNS_TYPE_AAAA: 28;
+const DNS_TYPE_SRV:  33;
+
+const DNS_CLASS_IN:   1;
+
+# ═══════════════════════════════════════════════════════
+# DNS Records
+# ═══════════════════════════════════════════════════════
+
+entity DnsRecordA:
+    name: string,
+        ttl:  int,
+        ip:   string;    # "1.2.3.4"
+end.
+entity DnsRecordAAAA:
+    name: string,
+        ttl:  int,
+        ip:   string;    # "::1"
+end.
+entity DnsRecordMX:
+    name:       string,
+        ttl:        int,
+        priority:   int,
+        exchange:   string;
+end.
+entity DnsRecordTXT:
+    name:  string,
+        ttl:   int,
+        texts: Vec<string>;
+end.
+entity DnsRecordSRV:
+    name:     string,
+        ttl:      int,
+        priority: int,
+        weight:   int,
+        port:     int,
+        target:   string;
+end.
+entity DnsRecordCNAME:
+    name:   string,
+        ttl:    int,
+        target: string;
+end.
+entity DnsRecordNS:
+    name:       string,
+        ttl:        int,
+        nameserver: string;
+end.
+
+# ═══════════════════════════════════════════════════════
+# DNS Response
+# ═══════════════════════════════════════════════════════
+
+entity DnsResponse:
+    id:          int,
+        authoritative: bool,
+        rcode:       int;      # 0=NOERROR, 3=NXDOMAIN
+    answers:     Vec<DnsRecordA>,
+        aaaa:        Vec<DnsRecordAAAA>,
+        mx:          Vec<DnsRecordMX>,
+        txt:         Vec<DnsRecordTXT>,
+        srv:         Vec<DnsRecordSRV>,
+        cname:       Vec<DnsRecordCNAME>,
+        ns:          Vec<DnsRecordNS>;
+end.
+
+# ═══════════════════════════════════════════════════════
+# DNS Resolver
+# ═══════════════════════════════════════════════════════
+
+entity DnsResolver:
+    nameservers: Vec<SocketAddr>,
+        timeout_ms:  int,
+        _next_id:    int;
+end.
+
+## Create a resolver using system DNS (8.8.8.8 fallback).
+func dns_resolver_new:
+    servers = vec_new<SocketAddr>();
+    vec_push<SocketAddr>(&servers, socket_addr(ipv4(8, 8, 8, 8), 53));
+    vec_push<SocketAddr>(&servers, socket_addr(ipv4(8, 8, 4, 4), 53));
+    out DnsResolver (
+        nameservers = servers,
+        timeout_ms = 5000,
+        _next_id = 1
+    );
+end.
+## Create a resolver with custom nameservers.
+func dns_resolver_custom(servers: Vec<SocketAddr>):
+    out DnsResolver (
+        nameservers = servers,
+        timeout_ms = 5000,
+        _next_id = 1
+    );
+end.
+# ═══════════════════════════════════════════════════════
+# Query Encoding
+# ═══════════════════════════════════════════════════════
+
+func _dns_encode_name(buf: ptr, name: string):
+    pos = 0;
+    start = 0;
+    slen = str_byte_len(name);
+    i = 0;
+    when i <= slen loop
+        if i == slen | native_load_u8(ptr_add(str_ptr(name), i)) == 0x2E do
+            label_len = i - start;
+            native_store_u8(ptr_add(buf, pos), label_len);
+            pos = pos + 1;
+            j = start;
+            when j < i loop
+                native_store_u8(ptr_add(buf, pos), native_load_u8(ptr_add(str_ptr(name), j)));
+                pos = pos + 1;
+                j = j + 1;
+            end
+            start = i + 1;
+        end
+        i = i + 1;
+    end
+    native_store_u8(ptr_add(buf, pos), 0);  # null terminator
+    out pos + 1;
+end.
+func _dns_build_query:
+    in  id: int;
+        name: string;
+        qtype: int
+    var pkt: [int; 512];
+    # Header
+    pkt[0] = (id >> 8) & 0xFF;
+    pkt[1] = id & 0xFF;
+    pkt[2] = 0x01;  # RD=1 (recursion desired)
+    pkt[3] = 0x00;
+    pkt[4] = 0; pkt[5] = 1;   # QDCOUNT = 1
+    pkt[6] = 0; pkt[7] = 0;   # ANCOUNT = 0
+    pkt[8] = 0; pkt[9] = 0;   # NSCOUNT = 0
+    pkt[10] = 0; pkt[11] = 0; # ARCOUNT = 0
+
+    # Question
+    pos = 12;
+    name_len = _dns_encode_name(ptr_add(&pkt, pos), name);
+    pos = pos + name_len;
+    # QTYPE
+    pkt[pos] = (qtype >> 8) & 0xFF; pos = pos + 1;
+    pkt[pos] = qtype & 0xFF;        pos = pos + 1;
+    # QCLASS = IN
+    pkt[pos] = 0; pos = pos + 1;
+    pkt[pos] = 1; pos = pos + 1;
+
+    out _dns_buf_copy(&pkt, pos);
+end.
+# ═══════════════════════════════════════════════════════
+# High-level API
+# ═══════════════════════════════════════════════════════
+
+## Resolve A records for a hostname. Returns list of IPv4 addresses.
+func dns_lookup(resolver: DnsResolver, name: string):
+    out dns_query(resolver, name, DNS_TYPE_A);
+end.
+## Resolve AAAA records for a hostname.
+func dns_lookup_ipv6(resolver: DnsResolver, name: string):
+    out dns_query(resolver, name, DNS_TYPE_AAAA);
+end.
+## Lookup MX records for a domain.
+func dns_lookup_mx(resolver: DnsResolver, domain: string):
+    out dns_query(resolver, domain, DNS_TYPE_MX);
+end.
+## Lookup TXT records.
+func dns_lookup_txt(resolver: DnsResolver, domain: string):
+    out dns_query(resolver, domain, DNS_TYPE_TXT);
+end.
+## Lookup SRV records (e.g. _http._tcp.example.com).
+func dns_lookup_srv(resolver: DnsResolver, name: string):
+    out dns_query(resolver, name, DNS_TYPE_SRV);
+end.
+## Lookup NS records.
+func dns_lookup_ns(resolver: DnsResolver, domain: string):
+    out dns_query(resolver, domain, DNS_TYPE_NS);
+end.
+## Generic DNS query.
+func dns_query:
+    in  resolver: DnsResolver;
+        name: string;
+        qtype: int
+    id = resolver._next_id;
+    resolver._next_id = resolver._next_id + 1;
+
+    pkt = _dns_build_query(id, name, qtype);
+    sock_r = udp_bind(str_new("0.0.0.0"), 0);
+    if is_err(sock_r) do
+        out Err(str_new("DNS: failed to bind UDP socket"));
+    end
+    sock = unwrap_ok(sock_r);
+
+    # Send to first nameserver
+    server = vec_get<SocketAddr>(resolver.nameservers, 0);
+    udp_send_to(sock, server, pkt);
+
+    # Receive response
+    var resp: [int; 512];
+    n = udp_recv_from(sock, &resp, 512);
+    if n < 12 do
+        out Err(str_new("DNS: invalid response"));
+    end
+
+    # Parse header
+    resp_id = (resp[0] << 8) | resp[1];
+    rcode = resp[3] & 0x0F;
+    ancount = (resp[6] << 8) | resp[7];
+
+    if rcode == 3 do
+        out Err(str_new("DNS: NXDOMAIN"));
+    end
+    if rcode != 0 do
+        out Err(str_new("DNS: query failed"));
+    end
+
+    response = DnsResponse (
+        id = resp_id, authoritative = (resp[2] & 0x04) != 0,
+        rcode = rcode,
+        answers = vec_new<DnsRecordA>(),
+        aaaa = vec_new<DnsRecordAAAA>(),
+        mx = vec_new<DnsRecordMX>(),
+        txt = vec_new<DnsRecordTXT>(),
+        srv = vec_new<DnsRecordSRV>(),
+        cname = vec_new<DnsRecordCNAME>(),
+        ns = vec_new<DnsRecordNS>()
+    );
+
+    # Skip question section
+    pos = 12;
+    pos = _dns_skip_name(&resp, pos);
+    pos = pos + 4;  # QTYPE + QCLASS
+
+    # Parse answer records
+    i = 0;
+    when i < ancount loop
+        pos = _dns_parse_record(&resp, pos, n, response);
+        i = i + 1;
+    end
+
+    out Ok(response);
+end.
+func _dns_skip_name(buf: ptr, pos: int):
+    p = pos;
+    loop
+        b = native_load_u8(ptr_add(buf, p));
+        if b == 0 do
+            out p + 1;
+        end
+        if (b & 0xC0) == 0xC0 do
+            out p + 2;   # compression pointer
+        end
+        p = p + 1 + b;
+    end
+end.
+func _dns_parse_record:
+    in  buf: ptr;
+        pos: int;
+        buf_len: int;
+        resp: DnsResponse
+    # Name
+    p = _dns_skip_name(buf, pos);
+    # Type, Class, TTL, RDLENGTH
+    rtype = (native_load_u8(ptr_add(buf, p)) << 8) | native_load_u8(ptr_add(buf, p + 1));
+    p = p + 2;
+    p = p + 2;  # class
+    ttl = (native_load_u8(ptr_add(buf, p)) << 24) | (native_load_u8(ptr_add(buf, p+1)) << 16)
+        | (native_load_u8(ptr_add(buf, p+2)) << 8) | native_load_u8(ptr_add(buf, p+3));
+    p = p + 4;
+    rdlen = (native_load_u8(ptr_add(buf, p)) << 8) | native_load_u8(ptr_add(buf, p + 1));
+    p = p + 2;
+
+    if rtype == DNS_TYPE_A & rdlen == 4 do
+        a = native_load_u8(ptr_add(buf, p));
+        b = native_load_u8(ptr_add(buf, p+1));
+        c = native_load_u8(ptr_add(buf, p+2));
+        d = native_load_u8(ptr_add(buf, p+3));
+        ip_str = _format_ipv4(a, b, c, d);
+        vec_push<DnsRecordA>(&resp.answers,
+            DnsRecordA ( name = str_new(""), ttl = ttl, ip = ip_str ));
+    end
+
+    out p + rdlen;
+end.
+func _format_ipv4:
+    in  a: int;
+        b: int;
+        c: int;
+        d: int
+    out str_concat(i64_to_str(a), str_concat(str_new("."),
+        str_concat(i64_to_str(b), str_concat(str_new("."),
+        str_concat(i64_to_str(c), str_concat(str_new("."),
+        i64_to_str(d)))))));
+end.

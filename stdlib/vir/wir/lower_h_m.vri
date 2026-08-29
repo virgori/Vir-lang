@@ -1,0 +1,449 @@
+##
+ * vir/wir/lower_h_m.vri — WIR-H → WIR-M Lowering Pass
+ * ======================================================
+ * Converts high-level component/element/event/style abstractions
+ * into concrete DOM mutations, event listener setup, and state ops.
+ *
+ * Lowering rules
+ *   ELEMENT        → CREATE_ELEMENT + SET_ATTR* + APPEND_CHILD*
+ *   TEXT           → CREATE_TEXT
+ *   FRAGMENT       → children emitted inline
+ *   EVENT_BIND     → ADD_LISTENER
+ *   STATE_DEF      → ALLOC_STATE
+ *   STATE_GET      → LOAD_STATE
+ *   STATE_SET      → STORE_STATE
+ *   COMPUTED       → LOAD_STATE + SUBSCRIBE per dep
+ *   EFFECT         → SUBSCRIBE per dep
+ *   STYLE_BIND     → RESOLVE_CLASS + APPLY_STYLE
+ *   CONDITIONAL    → DIFF markers
+ *   LIST           → DIFF markers
+ *   FORM_BIND      → SET_PROP + ADD_LISTENER
+ *   EVENT_EMIT     → DISPATCH_EVENT
+ ##
+
+include types;
+include string;
+import String, str_eq from string;
+include vec;
+import Vec, vec_new, vec_push, vec_len, vec_get from vec;
+include map;
+import Map, map_get, map_set, map_has from map;
+include wir/opcodes;
+import WIRHOp, WIRMOp, DOMAttrType from wir/opcodes;
+include wir/schema;
+import WIRHNode, WIRMNode, wir_m_node_new, KVPair from wir/schema;
+include wir/module;
+import WIRGraph, wir_topo_order_h from wir/module;
+
+
+# ═══════════════════════════════════════════════════════
+# Type sizes for state allocation
+# ═══════════════════════════════════════════════════════
+
+func type_size(stype: string):
+    if str_eq(stype, "int") do
+        out 4;
+    end
+    if str_eq(stype, "i32") do
+        out 4;
+    end
+    if str_eq(stype, "i64") do
+        out 8;
+    end
+    if str_eq(stype, "f32") do
+        out 4;
+    end
+    if str_eq(stype, "f64") do
+        out 8;
+    end
+    if str_eq(stype, "bool") do
+        out 1;
+    end
+    if str_eq(stype, "str") do
+        out 4;
+    end
+    out 4;
+end.
+# ═══════════════════════════════════════════════════════
+# M-node emitter with auto-incrementing IDs
+# ═══════════════════════════════════════════════════════
+
+var _next_m_id: int = 0;
+
+func _alloc_m:
+    mid = _next_m_id;
+    _next_m_id = _next_m_id + 1;
+    out mid;
+end.
+func _add_m:
+    in  g: WIRGraph;
+        op: WIRMOp;
+        src_h: int
+    mid = _alloc_m();
+    node = wir_m_node_new(mid, op, src_h);
+    map_set(g.m_nodes, mid, node);
+    out (g, mid >> int);
+end.
+func _add_m_tag:
+    in  g: WIRGraph;
+        op: WIRMOp;
+        src_h: int;
+        tag: string
+    (g, mid) = _add_m(g, op, src_h);
+    node = map_get(g.m_nodes, mid);
+    node.tag = tag;
+    map_set(g.m_nodes, mid, node);
+    out (g, mid >> int);
+end.
+func _add_m_text:
+    in  g: WIRGraph;
+        op: WIRMOp;
+        src_h: int;
+        text: string
+    (g, mid) = _add_m(g, op, src_h);
+    node = map_get(g.m_nodes, mid);
+    node.text_content = text;
+    map_set(g.m_nodes, mid, node);
+    out (g, mid >> int);
+end.
+func _add_m_parent_attr:
+    in  g: WIRGraph;
+        op: WIRMOp;
+        src_h: int;
+        pid: int;
+        aname: string;
+        aval: string
+    (g, mid) = _add_m(g, op, src_h);
+    node = map_get(g.m_nodes, mid);
+    node.parent_id = pid;
+    node.attr_name = aname;
+    node.attr_value = aval;
+    map_set(g.m_nodes, mid, node);
+    out (g, mid >> int);
+end.
+func _add_m_parent_child:
+    in  g: WIRGraph;
+        op: WIRMOp;
+        src_h: int;
+        pid: int;
+        cid: int
+    (g, mid) = _add_m(g, op, src_h);
+    node = map_get(g.m_nodes, mid);
+    node.parent_id = pid;
+    node.child_id = cid;
+    map_set(g.m_nodes, mid, node);
+    out (g, mid >> int);
+end.
+func _add_m_event:
+    in  g: WIRGraph;
+        op: WIRMOp;
+        src_h: int;
+        pid: int;
+        etype: string;
+        hid: int
+    (g, mid) = _add_m(g, op, src_h);
+    node = map_get(g.m_nodes, mid);
+    node.parent_id = pid;
+    node.event_type = etype;
+    node.handler_id = hid;
+    map_set(g.m_nodes, mid, node);
+    out (g, mid >> int);
+end.
+func _add_m_class:
+    in  g: WIRGraph;
+        op: WIRMOp;
+        src_h: int;
+        pid: int;
+        cls: string
+    (g, mid) = _add_m(g, op, src_h);
+    node = map_get(g.m_nodes, mid);
+    node.parent_id = pid;
+    node.css_class = cls;
+    map_set(g.m_nodes, mid, node);
+    out (g, mid >> int);
+end.
+func _add_m_state:
+    in  g: WIRGraph;
+        op: WIRMOp;
+        src_h: int;
+        stype: string;
+        ssize: int
+    (g, mid) = _add_m(g, op, src_h);
+    node = map_get(g.m_nodes, mid);
+    node.state_type = stype;
+    node.state_size = ssize;
+    map_set(g.m_nodes, mid, node);
+    out (g, mid >> int);
+end.
+func _add_m_callback:
+    in  g: WIRGraph;
+        op: WIRMOp;
+        src_h: int;
+        cb_id: int
+    (g, mid) = _add_m(g, op, src_h);
+    node = map_get(g.m_nodes, mid);
+    node.callback_id = cb_id;
+    map_set(g.m_nodes, mid, node);
+    out (g, mid >> int);
+end.
+# ═══════════════════════════════════════════════════════
+# Main lowering pass
+# ═══════════════════════════════════════════════════════
+
+func lower_h_to_m(g: WIRGraph):
+    # Initialize M-ID counter past all H-node IDs
+    _next_m_id = g.next_id + 1000;
+
+    # Process H-nodes in topological order
+    ids = wir_topo_order_h(g);
+    i = 0;
+    when i < vec_len(ids) loop
+        hid = vec_get(ids, i);
+        h = map_get(g.h_nodes, hid);
+        g = _lower_h_node(g, h);
+        i = i + 1;
+    end
+    out g;
+end.
+# ═══════════════════════════════════════════════════════
+# Single H-node dispatch
+# ═══════════════════════════════════════════════════════
+
+func _lower_h_node(g: WIRGraph, h: WIRHNode):
+    op = h.op;
+
+    # ── ELEMENT → CREATE_ELEMENT + SET_ATTR* + APPEND_CHILD*
+    if op == WIRHOp::Element do
+        (g, elem_id) = _add_m_tag(g, WIRMOp::CreateElement, h.node_id, h.tag);
+        # Set attributes
+        j = 0;
+        when j < vec_len(h.attrs) loop
+            attr = vec_get(h.attrs, j);
+            (g, _) = _add_m_parent_attr(g, WIRMOp::SetAttr, h.node_id,
+                                         elem_id, attr.key, attr.val);
+            j = j + 1;
+        end
+        # Append children
+        j = 0;
+        when j < vec_len(h.children_ids) loop
+            cid = vec_get(h.children_ids, j);
+            (g, _) = _add_m_parent_child(g, WIRMOp::AppendChild, h.node_id,
+                                          elem_id, cid);
+            j = j + 1;
+        end
+        # Style binding
+        if str_eq(h.vss_class, "") == 0 do
+            (g, _) = _add_m_class(g, WIRMOp::ResolveClass, h.node_id,
+                                   elem_id, h.vss_class);
+            (g, _) = _add_m_class(g, WIRMOp::ApplyStyle, h.node_id,
+                                   elem_id, h.vss_class);
+        end
+        out g;
+    end
+
+    # ── TEXT → CREATE_TEXT
+    if op == WIRHOp::Text do
+        (g, _) = _add_m_text(g, WIRMOp::CreateText, h.node_id, h.text_content);
+        out g;
+    end
+
+    # ── FRAGMENT → children processed individually
+    if op == WIRHOp::Fragment do
+        out g;
+    end
+
+    # ── EVENT_BIND → ADD_LISTENER
+    if op == WIRHOp::EventBind do
+        target = 0;
+        if vec_len(h.input_ids) > 0 do
+            target = vec_get(h.input_ids, 0);
+        end
+        (g, _) = _add_m_event(g, WIRMOp::AddListener, h.node_id,
+                               target, h.event_type, h.node_id);
+        out g;
+    end
+
+    # ── EVENT_UNBIND → REMOVE_LISTENER
+    if op == WIRHOp::EventUnbind do
+        target = 0;
+        if vec_len(h.input_ids) > 0 do
+            target = vec_get(h.input_ids, 0);
+        end
+        (g, _) = _add_m_event(g, WIRMOp::RemoveListener, h.node_id,
+                               target, h.event_type, h.node_id);
+        out g;
+    end
+
+    # ── STATE_DEF → ALLOC_STATE
+    if op == WIRHOp::StateDef do
+        stype = "int";
+        if vec_len(h.state_fields) > 0 do
+            sf = vec_get(h.state_fields, 0);
+            stype = sf.stype;
+        end
+        (g, _) = _add_m_state(g, WIRMOp::AllocState, h.node_id,
+                               stype, type_size(stype));
+        out g;
+    end
+
+    # ── STATE_GET → LOAD_STATE
+    if op == WIRHOp::StateGet do
+        (g, _) = _add_m(g, WIRMOp::LoadState, h.node_id);
+        out g;
+    end
+
+    # ── STATE_SET → STORE_STATE
+    if op == WIRHOp::StateSet do
+        (g, _) = _add_m(g, WIRMOp::StoreState, h.node_id);
+        out g;
+    end
+
+    # ── COMPUTED → SUBSCRIBE per dep + LOAD_STATE
+    if op == WIRHOp::Computed do
+        j = 0;
+        when j < vec_len(h.deps) loop
+            dep_id = vec_get(h.deps, j);
+            (g, _) = _add_m_callback(g, WIRMOp::Subscribe, h.node_id, dep_id);
+            j = j + 1;
+        end
+        (g, _) = _add_m(g, WIRMOp::LoadState, h.node_id);
+        out g;
+    end
+
+    # ── EFFECT → SUBSCRIBE per dep
+    if op == WIRHOp::Effect do
+        j = 0;
+        when j < vec_len(h.deps) loop
+            dep_id = vec_get(h.deps, j);
+            (g, _) = _add_m_callback(g, WIRMOp::Subscribe, h.node_id, dep_id);
+            j = j + 1;
+        end
+        out g;
+    end
+
+    # ── STYLE_BIND / STYLE_DYNAMIC / STYLE_SCOPED
+    if op == WIRHOp::StyleBind do
+        target = 0;
+        if vec_len(h.input_ids) > 0 do
+            target = vec_get(h.input_ids, 0);
+        end
+        (g, _) = _add_m_class(g, WIRMOp::ResolveClass, h.node_id,
+                               target, h.vss_class);
+        (g, _) = _add_m_class(g, WIRMOp::ApplyStyle, h.node_id,
+                               target, h.vss_class);
+        out g;
+    end
+    if op == WIRHOp::StyleDynamic do
+        target = 0;
+        if vec_len(h.input_ids) > 0 do
+            target = vec_get(h.input_ids, 0);
+        end
+        (g, _) = _add_m_class(g, WIRMOp::ResolveClass, h.node_id,
+                               target, h.vss_class);
+        (g, _) = _add_m_class(g, WIRMOp::ApplyStyle, h.node_id,
+                               target, h.vss_class);
+        out g;
+    end
+    if op == WIRHOp::StyleScoped do
+        target = 0;
+        if vec_len(h.input_ids) > 0 do
+            target = vec_get(h.input_ids, 0);
+        end
+        (g, _) = _add_m_class(g, WIRMOp::ResolveClass, h.node_id,
+                               target, h.vss_class);
+        (g, _) = _add_m_class(g, WIRMOp::ApplyStyle, h.node_id,
+                               target, h.vss_class);
+        out g;
+    end
+
+    # ── CONDITIONAL → DIFF markers
+    if op == WIRHOp::Conditional do
+        (g, _) = _add_m(g, WIRMOp::DiffStart, h.node_id);
+        (g, _) = _add_m(g, WIRMOp::DiffCommit, h.node_id);
+        out g;
+    end
+
+    # ── LIST → DIFF markers
+    if op == WIRHOp::List do
+        (g, _) = _add_m(g, WIRMOp::DiffStart, h.node_id);
+        (g, _) = _add_m(g, WIRMOp::DiffCommit, h.node_id);
+        out g;
+    end
+
+    # ── COMPONENT_DEF → no M-op (metadata node)
+    if op == WIRHOp::ComponentDef do
+        out g;
+    end
+
+    # ── ROUTE_DEF → state-based navigation
+    if op == WIRHOp::RouteDef do
+        (g, _) = _add_m_state(g, WIRMOp::AllocState, h.node_id, "str", 4);
+        out g;
+    end
+
+    # ── Lifecycle hooks → noop at M-level
+    if op == WIRHOp::OnMount do
+        out g;
+    end
+    if op == WIRHOp::OnUnmount do
+        out g;
+    end
+    if op == WIRHOp::OnUpdate do
+        out g;
+    end
+    if op == WIRHOp::ComponentMount do
+        out g;
+    end
+    if op == WIRHOp::ComponentUpdate do
+        out g;
+    end
+    if op == WIRHOp::ComponentUnmount do
+        out g;
+    end
+
+    # ── FORM_BIND → SET_PROP + ADD_LISTENER
+    if op == WIRHOp::FormBind do
+        target = 0;
+        if vec_len(h.input_ids) > 0 do
+            target = vec_get(h.input_ids, 0);
+        end
+        (g, mid) = _add_m(g, WIRMOp::SetProp, h.node_id);
+        node = map_get(g.m_nodes, mid);
+        node.parent_id = target;
+        node.attr_name = "value";
+        node.attr_type = DOMAttrType::Property;
+        map_set(g.m_nodes, mid, node);
+        (g, _) = _add_m_event(g, WIRMOp::AddListener, h.node_id,
+                               target, "input", 0);
+        out g;
+    end
+
+    # ── FORM_VALIDATE → noop
+    if op == WIRHOp::FormValidate do
+        out g;
+    end
+
+    # ── SLOT → noop
+    if op == WIRHOp::Slot do
+        out g;
+    end
+
+    # ── ROUTE_NAVIGATE → STORE_STATE
+    if op == WIRHOp::RouteNavigate do
+        (g, _) = _add_m(g, WIRMOp::StoreState, h.node_id);
+        out g;
+    end
+
+    # ── EVENT_EMIT → DISPATCH_EVENT
+    if op == WIRHOp::EventEmit do
+        (g, mid) = _add_m(g, WIRMOp::DispatchEvent, h.node_id);
+        node = map_get(g.m_nodes, mid);
+        node.event_type = h.event_type;
+        map_set(g.m_nodes, mid, node);
+        out g;
+    end
+
+    # Fallback: unhandled op
+    out g;
+end.
+export lower_h_to_m;

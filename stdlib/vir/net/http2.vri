@@ -1,0 +1,264 @@
+##
+ * vir/net/http2.vri — HTTP/2 Frame Protocol (RFC 7540)
+ * ====================================================
+ * Inspired by Rust: h2 crate
+ * Inspired by Go: net/http (HTTP/2 built-in)
+ *
+ * Phase D — HTTP/2 frame types, HPACK header compression,
+ * stream management, flow control.
+ ##
+
+include types;
+include option;
+import Option, Some, None, is_some, is_none, unwrap from option;
+include vec;
+import Vec, vec_new, vec_push, vec_get, vec_set, vec_len from vec;
+include builder;
+import StringBuilder, sb_new, sb_append, sb_append_byte, sb_append_i64,
+       sb_build, sb_free from builder;
+include collections/map;
+import Map, map_new, map_insert, map_get, native_hash_str from collections/map;
+
+# ═══════════════════════════════════════════════════════
+# HTTP/2 Frame types (RFC 7540 §6)
+# ═══════════════════════════════════════════════════════
+
+const H2_DATA          = 0;
+const H2_HEADERS       = 1;
+const H2_PRIORITY      = 2;
+const H2_RST_STREAM    = 3;
+const H2_SETTINGS      = 4;
+const H2_PUSH_PROMISE  = 5;
+const H2_PING          = 6;
+const H2_GOAWAY        = 7;
+const H2_WINDOW_UPDATE = 8;
+const H2_CONTINUATION  = 9;
+
+# Flags
+const H2_FLAG_END_STREAM  = 1;
+const H2_FLAG_END_HEADERS = 4;
+const H2_FLAG_PADDED      = 8;
+const H2_FLAG_PRIORITY    = 32;
+
+# Settings
+const H2_SETTINGS_HEADER_TABLE_SIZE      = 1;
+const H2_SETTINGS_ENABLE_PUSH            = 2;
+const H2_SETTINGS_MAX_CONCURRENT_STREAMS = 3;
+const H2_SETTINGS_INITIAL_WINDOW_SIZE    = 4;
+const H2_SETTINGS_MAX_FRAME_SIZE         = 5;
+const H2_SETTINGS_MAX_HEADER_LIST_SIZE   = 6;
+
+# ═══════════════════════════════════════════════════════
+# Frame entity
+# ═══════════════════════════════════════════════════════
+
+entity H2Frame:
+    length:    int;      # 24-bit payload length
+    frame_type: int;     # 8-bit type
+    flags:     int;      # 8-bit flags
+    stream_id: int;      # 31-bit stream identifier
+    payload:   string;   # raw payload bytes
+end.
+
+# Connection preface: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+const H2_PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+# ═══════════════════════════════════════════════════════
+# Frame encode/decode
+# ═══════════════════════════════════════════════════════
+
+func h2_encode_frame(frame: H2Frame):
+    sb = sb_new();
+    # Length: 3 bytes big-endian
+    sb_append_byte(sb, (frame.length / 65536) & 255);
+    sb_append_byte(sb, (frame.length / 256) & 255);
+    sb_append_byte(sb, frame.length & 255);
+    # Type: 1 byte
+    sb_append_byte(sb, frame.frame_type & 255);
+    # Flags: 1 byte
+    sb_append_byte(sb, frame.flags & 255);
+    # Stream ID: 4 bytes big-endian (R bit = 0)
+    sb_append_byte(sb, (frame.stream_id / 16777216) & 127);
+    sb_append_byte(sb, (frame.stream_id / 65536) & 255);
+    sb_append_byte(sb, (frame.stream_id / 256) & 255);
+    sb_append_byte(sb, frame.stream_id & 255);
+    # Payload
+    i = 0;
+    when i < frame.length loop
+        sb_append_byte(sb, str_byte_at(frame.payload, i));
+        i = i + 1;
+    end
+    result = sb_build(sb);
+    sb_free(sb);
+    out result;
+end.
+func h2_decode_frame(data: string, pos: int):
+    length = str_byte_at(data, pos) * 65536
+           + str_byte_at(data, pos + 1) * 256
+           + str_byte_at(data, pos + 2);
+    frame_type = str_byte_at(data, pos + 3);
+    flags = str_byte_at(data, pos + 4);
+    stream_id = (str_byte_at(data, pos + 5) & 127) * 16777216
+              + str_byte_at(data, pos + 6) * 65536
+              + str_byte_at(data, pos + 7) * 256
+              + str_byte_at(data, pos + 8);
+    payload = str_slice(data, pos + 9, pos + 9 + length);
+    out H2Frame (
+        length: length, frame_type: frame_type,
+        flags: flags, stream_id: stream_id, payload: payload
+    );
+end.
+# ═══════════════════════════════════════════════════════
+# HPACK — Header Compression (RFC 7541)
+# ═══════════════════════════════════════════════════════
+
+entity HpackEntry:
+    name:  string,
+        value: string;
+end.
+entity HpackTable:
+    entries:  Vec;       # Vec<HpackEntry> — dynamic table
+    max_size: int,
+        cur_size: int;
+end.
+func hpack_new(max_size: int):
+    out HpackTable (
+        entries: vec_new(),
+        max_size: max_size,
+        cur_size: 0
+    );
+end.
+# Static table (RFC 7541 Appendix A) — first 15 entries
+func _hpack_static_entry(index: int):
+    if index == 1 do out HpackEntry ( name: ":authority", value: "" ); end
+    if index == 2 do out HpackEntry ( name: ":method", value: "GET" ); end
+    if index == 3 do out HpackEntry ( name: ":method", value: "POST" ); end
+    if index == 4 do out HpackEntry ( name: ":path", value: "/" ); end
+    if index == 5 do out HpackEntry ( name: ":path", value: "/index.html" ); end
+    if index == 6 do out HpackEntry ( name: ":scheme", value: "http" ); end
+    if index == 7 do out HpackEntry ( name: ":scheme", value: "https" ); end
+    if index == 8 do out HpackEntry ( name: ":status", value: "200" ); end
+    if index == 9 do out HpackEntry ( name: ":status", value: "204" ); end
+    if index == 10 do out HpackEntry ( name: ":status", value: "206" ); end
+    if index == 11 do out HpackEntry ( name: ":status", value: "304" ); end
+    if index == 12 do out HpackEntry ( name: ":status", value: "400" ); end
+    if index == 13 do out HpackEntry ( name: ":status", value: "404" ); end
+    if index == 14 do out HpackEntry ( name: ":status", value: "500" ); end
+    if index == 15 do out HpackEntry ( name: "accept-charset", value: "" ); end
+    out HpackEntry ( name: "", value: "" );
+end.
+func hpack_add:
+    in  table: HpackTable;
+        name: string;
+        value: string
+    entry_size = str_len(name) + str_len(value) + 32;
+    # Evict entries to fit
+    when table.cur_size + entry_size > table.max_size loop
+        if vec_len(table.entries) == 0 do
+            out;
+        end
+        last = vec_get(table.entries, vec_len(table.entries) - 1);
+        table.cur_size = table.cur_size - (str_len(last.name) + str_len(last.value) + 32);
+        vec_remove(table.entries, vec_len(table.entries) - 1);
+    end
+    entry = HpackEntry ( name: name, value: value );
+    # Insert at front (index 0)
+    new_entries = vec_new();
+    vec_push(new_entries, entry);
+    i = 0;
+    when i < vec_len(table.entries) loop
+        vec_push(new_entries, vec_get(table.entries, i));
+        i = i + 1;
+    end
+    table.entries = new_entries;
+    table.cur_size = table.cur_size + entry_size;
+end.
+# ═══════════════════════════════════════════════════════
+# Stream management
+# ═══════════════════════════════════════════════════════
+
+const H2_STREAM_IDLE        = 0;
+const H2_STREAM_OPEN        = 1;
+const H2_STREAM_HALF_CLOSED = 2;
+const H2_STREAM_CLOSED      = 3;
+
+entity H2Stream:
+    id:              int,
+        state:           int,
+        send_window:     int,
+        recv_window:     int,
+        request_headers: Vec;     # Vec<HpackEntry>
+    response_headers: Vec,
+        data_buf:        string;
+end.
+func h2_stream_new(id: int, initial_window: int):
+    out H2Stream (
+        id: id, state: H2_STREAM_IDLE,
+        send_window: initial_window, recv_window: initial_window,
+        request_headers: vec_new(), response_headers: vec_new(),
+        data_buf: ""
+    );
+end.
+# ═══════════════════════════════════════════════════════
+# Settings frame builder
+# ═══════════════════════════════════════════════════════
+
+func h2_settings_frame:
+    in  max_concurrent: int;
+        initial_window: int;
+        max_frame_size: int
+    sb = sb_new();
+    # Each setting: 2-byte ID + 4-byte value
+    # MAX_CONCURRENT_STREAMS
+    sb_append_byte(sb, 0); sb_append_byte(sb, H2_SETTINGS_MAX_CONCURRENT_STREAMS);
+    sb_append_byte(sb, (max_concurrent / 16777216) & 255);
+    sb_append_byte(sb, (max_concurrent / 65536) & 255);
+    sb_append_byte(sb, (max_concurrent / 256) & 255);
+    sb_append_byte(sb, max_concurrent & 255);
+    # INITIAL_WINDOW_SIZE
+    sb_append_byte(sb, 0); sb_append_byte(sb, H2_SETTINGS_INITIAL_WINDOW_SIZE);
+    sb_append_byte(sb, (initial_window / 16777216) & 255);
+    sb_append_byte(sb, (initial_window / 65536) & 255);
+    sb_append_byte(sb, (initial_window / 256) & 255);
+    sb_append_byte(sb, initial_window & 255);
+    payload = sb_build(sb);
+    sb_free(sb);
+
+    out H2Frame (
+        length: 12, frame_type: H2_SETTINGS, flags: 0,
+        stream_id: 0, payload: payload
+    );
+end.
+func h2_settings_ack():
+    out H2Frame (
+        length: 0, frame_type: H2_SETTINGS, flags: 1,
+        stream_id: 0, payload: ""
+    );
+end.
+func h2_ping_frame(data: string, is_ack: bool):
+    flags = 0;
+    if is_ack do
+        flags = 1;
+    end
+    out H2Frame (
+        length: 8, frame_type: H2_PING, flags: flags,
+        stream_id: 0, payload: data
+    );
+end.
+func h2_goaway_frame(last_stream_id: int, error_code: int):
+    sb = sb_new();
+    sb_append_byte(sb, (last_stream_id / 16777216) & 127);
+    sb_append_byte(sb, (last_stream_id / 65536) & 255);
+    sb_append_byte(sb, (last_stream_id / 256) & 255);
+    sb_append_byte(sb, last_stream_id & 255);
+    sb_append_byte(sb, (error_code / 16777216) & 255);
+    sb_append_byte(sb, (error_code / 65536) & 255);
+    sb_append_byte(sb, (error_code / 256) & 255);
+    sb_append_byte(sb, error_code & 255);
+    payload = sb_build(sb);
+    sb_free(sb);
+    out H2Frame (
+        length: 8, frame_type: H2_GOAWAY, flags: 0,
+        stream_id: 0, payload: payload
+    );
+end.
