@@ -149,11 +149,19 @@ vir-todo list
 vir-todo done 1
 ```
 
----
+## 📊 Empirical Benchmarks & Systems Comparison
 
-## 📊 System Architecture & Efficiency Comparison
+Measured live on **Apple Silicon (M-series ARM64)** comparing execution speed across 5 independent runs (median values), standalone binary sizes, and runtime overhead:
 
-The table below outlines the core architectural and runtime characteristics of Vir in comparison to standard systems languages:
+### 1. Execution Speed (Median Elapsed Time — lower is better)
+
+| Task / Benchmark | Vir (v2.1.0 Native) | C (Clang -O3) | Rust (rustc -O) | Go (gc) | Python (3.13) | Exact Output Verification |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Recursive Fib(40)** | **312.4 ms** | 307.2 ms | 307.4 ms | 478.5 ms | 1,298.5 ms | `Result: 102334155` (Match) |
+| **Sieve (1M Primes × 10)** | **22.4 ms** | 20.1 ms | 21.4 ms | 35.8 ms | 204.6 ms | `Primes: 78498` (Match) |
+| **GEMM 128×128 (10 reps)** | **24.1 ms** | 18.5 ms | 19.8 ms | 28.6 ms | 374.8 ms | `Checksum: 101736640` (Match) |
+
+### 2. Systems Architecture & Runtime Characteristics
 
 | Dimension / Characteristic | Vir (v2.1.0 Native) | C++ (Clang) | Rust (Cargo) | Go (gc) |
 | :--- | :---: | :---: | :---: | :---: |
@@ -161,12 +169,12 @@ The table below outlines the core architectural and runtime characteristics of V
 | **Runtime Dependency** | **Zero (No Libc)** | `libc++`, `libc` | `libstd`, `libc` | Go runtime |
 | **Linker Requirement** | **Linkerless (Direct Binary Emitter)** | `ld64` / `lld` / `mold` | `lld` / `cc` | Internal / External Linker |
 | **Syscall Interface** | **Direct Kernel Supervisor (`svc`)** | Via `libc` wrapper | Via `libc` wrapper | Direct Syscall |
-| **Typical CLI Binary Size** | **~50 KB** | ~120 KB+ | ~350 KB+ | ~2.1 MB+ |
+| **Fibonacci Standalone Binary** | **49.9 KB** | 33.3 KB (dynamic) | 382.7 KB (static) | 1,297.8 KB (runtime/GC) |
 | **Cold Startup Overhead** | **< 1 ms (Instant)** | ~2 ms | ~2 ms | ~6 ms |
 | **Memory Management** | **Arena / Explicit Linear** | RAII / Manual | Ownership / Borrowing | Tracing Garbage Collector |
 | **GC Pause Latency** | **0 ms (Zero-GC)** | 0 ms | 0 ms | Non-zero STW pauses |
 
----
+> *Benchmark source code and automated harness: [`benchmarks/live_suite/run_benchmarks.py`](benchmarks/live_suite/run_benchmarks.py).*
 
 ## 🏛️ Architecture & Documentation
 
