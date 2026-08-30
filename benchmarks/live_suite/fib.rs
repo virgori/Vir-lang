@@ -7,6 +7,6 @@ fn fib(n: u64) -> u64 {
 }
 
 fn main() {
-    let res = fib(40);
+    let res = fib(35);
     println!("Result: {}", res);
 }

@@ -18,6 +18,6 @@ def run_matmul(n):
 
 if __name__ == "__main__":
     checksum = 0
-    for _ in range(2): # 2 reps for Python
+    for _ in range(10):
         checksum = run_matmul(128)
     print(f"Matmul Checksum: {checksum}")

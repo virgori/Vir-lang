@@ -91,7 +91,9 @@ def run_benchmark_dir(bench_dir, stage1_bin, soft_script):
         return None
         
     # Benchmark Stage-1
-    stats_s1, chk_s1, err_s1 = benchmark_executable(s1_bin)
+    stats_s1, chk_s1, err_s1 = None, None, None
+    if os.path.exists(s1_bin):
+        stats_s1, chk_s1, err_s1 = benchmark_executable(s1_bin)
     
     # Benchmark Soft Pipeline
     stats_soft, chk_soft, err_soft = None, None, None
@@ -147,7 +149,7 @@ def main():
     print("=" * 75)
 
     bench_dirs = []
-    for pattern in ["micro/*", "algorithms/*", "allocator/*", "systems/*", "realworld/*"]:
+    for pattern in ["micro/*", "algorithms/*", "allocator/*", "vector/*", "systems/*", "realworld/*"]:
         bench_dirs.extend(sorted(glob.glob(os.path.join(root_dir, pattern))))
 
     results = []

@@ -9,4 +9,8 @@ if [ "$(uname -s)" = "Linux" ]; then
         EXTRA_ARGS+=(--format elf)
     fi
 fi
+if [ -f "./bin/virc" ]; then
+    exec ./bin/virc "$@"
+fi
+
 exec ./core/build/vir run stdlib/vir/compiler/virc.vri -- "$@" "${EXTRA_ARGS[@]}"

@@ -16,7 +16,7 @@ def qsort_custom(arr, low, high):
         qsort_custom(arr, pi + 1, high)
 
 if __name__ == "__main__":
-    n = 20000 # 20k for python to avoid excessive run times
+    n = 100000
     arr = [((i * 1664525 + 1013904223) % 1000000) for i in range(n)]
     qsort_custom(arr, 0, n - 1)
     print(f"Qsort Checksum: {arr[n // 2]}")

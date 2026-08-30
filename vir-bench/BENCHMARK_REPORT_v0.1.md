@@ -11,10 +11,14 @@
 
 | Benchmark Suite | Vir Soft (Chaitin-Briggs) | Vir Stage-1 (Bootstrap) | Clang -O2 | Clang -O0 | Tỉ Lệ Soft / Clang -O2 |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **`fnv1a_hash`** | **88.44 ms** | 225.00 ms | 17.09 ms | 91.63 ms | **5.17x** |
-| **`quicksort`** | **6.29 ms** | 11.67 ms | 4.61 ms | 6.57 ms | **1.36x** |
-| **`sieve_eratosthenes`** | **141.82 ms** | 168.54 ms | 17.73 ms | 131.44 ms | **8.00x** |
-| **`arena_linear`** | **N/A** | 59.05 ms | 2.88 ms | 23.73 ms | **20.54x (S1)** |
+| **`bit_ops`** | **N/A** | 430.77 ms | 33.02 ms | 174.14 ms | **13.05x (S1)** |
+| **`int_arith`** | **N/A** | 355.94 ms | 139.29 ms | 191.08 ms | **2.56x (S1)** |
+| **`loop_sum`** | **N/A** | 80.70 ms | 8.69 ms | 48.38 ms | **9.28x (S1)** |
+| **`fnv1a_hash`** | **84.77 ms** | 218.67 ms | 16.22 ms | 88.88 ms | **5.22x** |
+| **`quicksort`** | **6.11 ms** | 11.10 ms | 4.40 ms | 6.19 ms | **1.39x** |
+| **`sieve_eratosthenes`** | **136.76 ms** | 174.49 ms | 18.12 ms | 133.30 ms | **7.55x** |
+| **`arena_linear`** | **16.24 ms** | 75.79 ms | 3.07 ms | 28.62 ms | **5.28x** |
+| **`matmul_simd`** | **8.09 ms** | N/A | 2.41 ms | 8.25 ms | **3.36x** |
 
 ---
 *Báo cáo được khởi tạo tự động bởi bộ công cụ `vir-bench`.*

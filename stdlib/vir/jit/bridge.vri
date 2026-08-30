@@ -33,6 +33,8 @@ import Mmap, mmap_anonymous, mmap_protect, mmap_close,
        PROT_READ, PROT_WRITE, PROT_EXEC from os/mmap;
 include hw/cpu;
 import cpu_arch, ARCH_X86_64, ARCH_AARCH64 from hw/cpu;
+include vir.rt.string_rt;
+import native_read_i64, native_write_i64, native_read_u8, native_write_u8 from vir.rt.string_rt;
 
 
 # ═══════════════════════════════════════════════════════
@@ -61,8 +63,9 @@ end.
 
 entity JitBlock:
     id:              int,
-        offset:          int;        # byte offset inside region
+        offset:          int;        # byte offset inside region (trampoline entry)
     size:            int,
+        jmp_offset:      int,        # byte offset of jump trampoline
         safe_offset:     int,
         safe_size:       int,
         fast_offset:     int,
@@ -179,6 +182,7 @@ func jit_emit_code:
         id:             block_id,
         offset:         jb.region_used,
         size:           code_len,
+        jmp_offset:     jb.region_used,
         safe_offset:    jb.region_used,
         safe_size:      code_len,
         fast_offset:    0,
@@ -190,6 +194,74 @@ func jit_emit_code:
     );
     vec_push(jb.blocks, blk);
     jb.region_used = jb.region_used + ((code_len + 7) & ~7);   # align 8
+    out Ok(vec_len(jb.blocks) - 1);
+end.
+
+## Emit both Safe (Bản A) and Fast (Bản B) variants with a stable Jump Trampoline.
+func jit_emit_dual:
+    in  jb: JitBridge;
+        block_id: int;
+        safe_code: ptr;
+        safe_len: int;
+        fast_code: ptr;
+        fast_len: int
+    if jb.is_executable do
+        out Err(str_new("region is RX — call jit_begin_patch first"));
+    end
+
+    # 1. Align & Reserve Trampoline (16 bytes)
+    jmp_off = (jb.region_used + 15) & ~15;
+    safe_off = (jmp_off + 16 + 15) & ~15;
+    fast_off = (safe_off + safe_len + 15) & ~15;
+    total_needed = fast_off + fast_len;
+
+    if total_needed > jb.region.length do
+        out Err(str_new("region exhausted for dual variants"));
+    end
+
+    # 2. Write JMP trampoline pointing to safe_code initially
+    jmp_dst_addr = ptr_to_int(ptr_add(jb.region.addr, jmp_off));
+    if jb.arch == ARCH_AARCH64 do
+        disp = safe_off - jmp_off;
+        imm26 = ((disp >> 2) & 0x03FFFFFF);
+        ins = 0x14000000 | imm26;
+        native_write_u8(jmp_dst_addr, 0, ins & 0xFF);
+        native_write_u8(jmp_dst_addr, 1, (ins >> 8) & 0xFF);
+        native_write_u8(jmp_dst_addr, 2, (ins >> 16) & 0xFF);
+        native_write_u8(jmp_dst_addr, 3, (ins >> 24) & 0xFF);
+    eif jb.arch == ARCH_X86_64 do
+        rel = safe_off - (jmp_off + 5);
+        native_write_u8(jmp_dst_addr, 0, 0xE9);
+        native_write_u8(jmp_dst_addr, 1, rel & 0xFF);
+        native_write_u8(jmp_dst_addr, 2, (rel >> 8) & 0xFF);
+        native_write_u8(jmp_dst_addr, 3, (rel >> 16) & 0xFF);
+        native_write_u8(jmp_dst_addr, 4, (rel >> 24) & 0xFF);
+    end
+
+    # 3. Write Safe Code
+    safe_dst = ptr_add(jb.region.addr, safe_off);
+    mem_copy(safe_dst, safe_code, safe_len);
+
+    # 4. Write Fast Code
+    fast_dst = ptr_add(jb.region.addr, fast_off);
+    mem_copy(fast_dst, fast_code, fast_len);
+
+    blk = JitBlock (
+        id:             block_id,
+        offset:         jmp_off,     # Stable entry point = Trampoline
+        size:           safe_len,
+        jmp_offset:     jmp_off,
+        safe_offset:    safe_off,
+        safe_size:      safe_len,
+        fast_offset:    fast_off,
+        fast_size:      fast_len,
+        is_fast:        false,
+        exec_count:     0,
+        rollback_count: 0,
+        permanent_safe: false
+    );
+    vec_push(jb.blocks, blk);
+    jb.region_used = (total_needed + 7) & ~7;
     out Ok(vec_len(jb.blocks) - 1);
 end.
 # ═══════════════════════════════════════════════════════
@@ -248,22 +320,92 @@ func jit_emit_fast_variant:
     out Ok(());
 end.
 func jit_patch_to_fast(jb: JitBridge, block_idx: int):
+    if block_idx >= vec_len(jb.blocks) do
+        out Err(str_new("invalid block index"));
+    end
     blk = vec_get(jb.blocks, block_idx);
     if blk.permanent_safe or blk.fast_size == 0 do
         out Err(str_new("cannot patch to fast"));
     end
+    if blk.is_fast do
+        out Ok(());
+    end
+
+    was_exec = jb.is_executable;
+    if was_exec do
+        jit_begin_patch(jb);
+    end
+
+    # In-place patch branch instruction at jmp_offset -> fast_offset
+    jmp_dst_addr = ptr_to_int(ptr_add(jb.region.addr, blk.jmp_offset));
+    if jb.arch == ARCH_AARCH64 do
+        disp = blk.fast_offset - blk.jmp_offset;
+        imm26 = ((disp >> 2) & 0x03FFFFFF);
+        ins = 0x14000000 | imm26;
+        native_write_u8(jmp_dst_addr, 0, ins & 0xFF);
+        native_write_u8(jmp_dst_addr, 1, (ins >> 8) & 0xFF);
+        native_write_u8(jmp_dst_addr, 2, (ins >> 16) & 0xFF);
+        native_write_u8(jmp_dst_addr, 3, (ins >> 24) & 0xFF);
+    eif jb.arch == ARCH_X86_64 do
+        rel = blk.fast_offset - (blk.jmp_offset + 5);
+        native_write_u8(jmp_dst_addr, 0, 0xE9);
+        native_write_u8(jmp_dst_addr, 1, rel & 0xFF);
+        native_write_u8(jmp_dst_addr, 2, (rel >> 8) & 0xFF);
+        native_write_u8(jmp_dst_addr, 3, (rel >> 16) & 0xFF);
+        native_write_u8(jmp_dst_addr, 4, (rel >> 24) & 0xFF);
+    end
+
     blk.is_fast = true;
     vec_set(jb.blocks, block_idx, blk);
+
+    if was_exec do
+        jit_end_patch(jb);
+    end
     out Ok(());
 end.
 func jit_patch_to_safe(jb: JitBridge, block_idx: int):
+    if block_idx >= vec_len(jb.blocks) do
+        out Err(str_new("invalid block index"));
+    end
     blk = vec_get(jb.blocks, block_idx);
+    if not blk.is_fast do
+        out Ok(());
+    end
+
+    was_exec = jb.is_executable;
+    if was_exec do
+        jit_begin_patch(jb);
+    end
+
+    # In-place patch branch instruction at jmp_offset -> safe_offset
+    jmp_dst_addr = ptr_to_int(ptr_add(jb.region.addr, blk.jmp_offset));
+    if jb.arch == ARCH_AARCH64 do
+        disp = blk.safe_offset - blk.jmp_offset;
+        imm26 = ((disp >> 2) & 0x03FFFFFF);
+        ins = 0x14000000 | imm26;
+        native_write_u8(jmp_dst_addr, 0, ins & 0xFF);
+        native_write_u8(jmp_dst_addr, 1, (ins >> 8) & 0xFF);
+        native_write_u8(jmp_dst_addr, 2, (ins >> 16) & 0xFF);
+        native_write_u8(jmp_dst_addr, 3, (ins >> 24) & 0xFF);
+    eif jb.arch == ARCH_X86_64 do
+        rel = blk.safe_offset - (blk.jmp_offset + 5);
+        native_write_u8(jmp_dst_addr, 0, 0xE9);
+        native_write_u8(jmp_dst_addr, 1, rel & 0xFF);
+        native_write_u8(jmp_dst_addr, 2, (rel >> 8) & 0xFF);
+        native_write_u8(jmp_dst_addr, 3, (rel >> 16) & 0xFF);
+        native_write_u8(jmp_dst_addr, 4, (rel >> 24) & 0xFF);
+    end
+
     blk.is_fast = false;
     blk.rollback_count = blk.rollback_count + 1;
     if jb.blacklist_threshold > 0 and blk.rollback_count >= jb.blacklist_threshold do
         blk.permanent_safe = true;
     end
     vec_set(jb.blocks, block_idx, blk);
+
+    if was_exec do
+        jit_end_patch(jb);
+    end
     out Ok(());
 end.
 # ═══════════════════════════════════════════════════════
@@ -331,8 +473,7 @@ func jit_get_entry(jb: JitBridge, block_idx: int):
         out Err(str_new("invalid block index"));
     end
     blk = vec_get(jb.blocks, block_idx);
-    off = if blk.is_fast do blk.fast_offset; else blk.offset; end;
-    out Ok(ptr_add(jb.region.addr, off));
+    out Ok(ptr_add(jb.region.addr, blk.offset));
 end.
 # ═══════════════════════════════════════════════════════
 # Exports
@@ -341,7 +482,7 @@ end.
 export JitBridge, JitCallback, JitBlock;
 export jit_bridge_new, jit_bridge_free;
 export jit_register_callback, jit_lookup_callback;
-export jit_emit_code, jit_emit_fast_variant;
+export jit_emit_code, jit_emit_dual, jit_emit_fast_variant;
 export jit_finalise, jit_begin_patch, jit_end_patch;
 export jit_patch_to_fast, jit_patch_to_safe;
 export jit_emit_call_thunk;
