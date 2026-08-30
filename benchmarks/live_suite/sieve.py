@@ -14,6 +14,6 @@ def run_sieve(limit):
 
 if __name__ == "__main__":
     total_primes = 0
-    for _ in range(2): # Python runs 2 reps to avoid taking too long
+    for _ in range(10):
         total_primes = run_sieve(1000000)
     print(f"Primes count: {total_primes}")

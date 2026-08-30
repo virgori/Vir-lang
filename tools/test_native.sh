@@ -9,7 +9,7 @@ if [ ! -f "$VIRC" ]; then
     exit 1
 fi
 
-TMP_BIN="/tmp/vir_test_out"
+mkdir -p dist/test_artifacts
 PASS=0
 FAIL=0
 
@@ -20,7 +20,7 @@ echo ""
 # Run all bootstrap tests
 for t in tests/bootstrap_codegen/cg_*.vri; do
     name=$(basename "$t" .vri)
-    test_bin="/tmp/vtest_${name}"
+    test_bin="dist/test_artifacts/vtest_${name}"
     if ! "$VIRC" "$t" -o "$test_bin" >/dev/null 2>&1; then
         echo "FAIL (compile): ${name}.vri"
         FAIL=$((FAIL+1))

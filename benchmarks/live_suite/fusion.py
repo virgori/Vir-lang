@@ -12,6 +12,6 @@ def run_fusion(n):
 
 if __name__ == "__main__":
     res = 0
-    for _ in range(2):
-        res = run_fusion(500000)
+    for _ in range(10):
+        res = run_fusion(1000000)
     print(f"Fusion Checksum: {res}")

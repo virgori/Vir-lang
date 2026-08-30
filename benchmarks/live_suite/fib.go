@@ -10,6 +10,6 @@ func fib(n uint64) uint64 {
 }
 
 func main() {
-	res := fib(40)
+	res := fib(35)
 	fmt.Printf("Result: %d\n", res)
 }

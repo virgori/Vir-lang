@@ -15,6 +15,6 @@ def run_kahan_dot(n):
 
 if __name__ == "__main__":
     res = 0
-    for _ in range(2):
-        res = run_kahan_dot(500000)
+    for _ in range(5):
+        res = run_kahan_dot(1000000)
     print(f"Kahan Dot Sum: {res}")

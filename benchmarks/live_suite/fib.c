@@ -7,7 +7,7 @@ uint64_t fib(uint64_t n) {
 }
 
 int main(void) {
-    uint64_t res = fib(40);
+    uint64_t res = fib(35);
     printf("Result: %llu\n", (unsigned long long)res);
     return 0;
 }
