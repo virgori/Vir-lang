@@ -1,9 +1,17 @@
 ##
  * vir/compiler/sem_pass8_borrow.vri
  * ==============================================================
- * Pass 8: Borrow / Ref Analysis (soft-path AST).
- * Tracks Move-type ownership, active borrows, and arena escape.
- * Mirrors C-core §4.8 borrow rules at semantic analysis time.
+ * Pass 8: Borrow / Ownership / Lifetime Analysis (Pure Vir AST).
+ * Implements rigorous CS affine ownership rules & borrow checking:
+ *   - Move semantics for non-copy types (Array, String, Entity, Dict, etc.)
+ *   - Use-after-move / Double move detection (E5001)
+ *   - Re-assignment / Re-initialization reviving moved variables
+ *   - Ownership transfer on by-value function call arguments
+ *   - Aliasing XOR Mutability exclusivity (& vs &mut) (E5002, E5003, E5006)
+ *   - Moving values while borrowed prevention (E5008)
+ *   - Borrow of moved value prevention (E5004)
+ *   - Function-local reference escape detection (E5007)
+ *   - Region / Arena-allocated lifetime escape detection (E5005)
  ##
 
 include vec_rt;
@@ -25,7 +33,7 @@ include context;
 import DiagnosticEngine, report_error, report_warning from context;
 
 include type_table;
-import TypeKind, type_is_move from type_table;
+import TypeKind, type_is_move, type_is_copy from type_table;
 
 include alloc;
 import vir_alloc, vir_free from alloc;
@@ -176,11 +184,15 @@ func pass8_analyze_borrow(symbols: SymbolTable, scopes: ScopeTree, diag: Diagnos
     let arena_locals = pass8_box_new();
     let pre_arena_names = pass8_box_new();
     let var_types = pass8_box_new();
+    let func_locals = pass8_box_new();
     pass8_walk(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
-               bound_borrows, arena_locals, pre_arena_names, 0, var_types)
+               bound_borrows, arena_locals, pre_arena_names, 0, var_types, func_locals)
 end.
 
 func pass8_is_moved(moved_vars: int, name: string):
+    if pass8_strlen(name) == 0 do
+        out 0
+    end
     let count = pass8_box_len(moved_vars);
     var i = 0;
     when i < count loop
@@ -193,12 +205,39 @@ func pass8_is_moved(moved_vars: int, name: string):
 end.
 
 func pass8_mark_moved(moved_vars: int, name: string):
+    if pass8_strlen(name) == 0 do
+        out 0
+    end
     if pass8_is_moved(moved_vars, name) == 0 do
         pass8_box_push(moved_vars, var_item_new(name, 0) as i64)
     end
+    out 0
+end.
+
+func pass8_unmark_moved(moved_vars: int, name: string):
+    if pass8_strlen(name) == 0 do
+        out 0
+    end
+    let count = pass8_box_len(moved_vars);
+    var i = 0;
+    when i < count loop
+        let item = pass8_box_get(moved_vars, i);
+        if pass8_streq(var_item_name(item), name) == 1 do
+            if i < count - 1 do
+                pass8_box_set(moved_vars, i, pass8_box_get(moved_vars, count - 1));
+            end
+            pass8_box_truncate_to(moved_vars, count - 1);
+            out 0
+        end
+        i = i + 1
+    end
+    out 0
 end.
 
 func pass8_vec_contains(names: int, name: string):
+    if pass8_strlen(name) == 0 do
+        out 0
+    end
     let count = pass8_box_len(names);
     var i = 0;
     when i < count loop
@@ -211,6 +250,9 @@ func pass8_vec_contains(names: int, name: string):
 end.
 
 func pass8_borrow_count(borrows: int, name: string):
+    if pass8_strlen(name) == 0 do
+        out 0
+    end
     let count = pass8_box_len(borrows);
     var total = 0;
     var i = 0;
@@ -228,6 +270,9 @@ func pass8_truncate_to(lst: int, watermark: int):
 end.
 
 func pass8_remove_one_borrow(borrows: int, name: string):
+    if pass8_strlen(name) == 0 do
+        out 0
+    end
     let len = pass8_box_len(borrows);
     var i = len - 1;
     when i >= 0 loop
@@ -244,6 +289,9 @@ func pass8_remove_one_borrow(borrows: int, name: string):
 end.
 
 func pass8_release_borrower(bound_borrows: int, shared_borrows: int, mut_borrows: int, borrower: string):
+    if pass8_strlen(borrower) == 0 do
+        out 0
+    end
     let len = pass8_box_len(bound_borrows);
     var i = 0;
     when i < len loop
@@ -329,31 +377,13 @@ func pass8_infer_expr_type(var_types: int, expr: AstNode):
         out pass8_get_var_type(var_types, expr.name)
     end
     if t == AstType.AddrOf do
-        out TypeKind.Int
+        if pass8_streq(expr.name, "mut") == 1 do
+            out TypeKind.MutRef
+        else
+            out TypeKind.Ref
+        end
     end
     out TypeKind.Void
-end.
-
-func pass8_name_in_scope(symbols: SymbolTable, scopes: ScopeTree, name: string):
-    if pass8_strlen(name) == 0 do
-        out 0
-    end
-    let curr = scopes.current_id;
-    let s_count = vec_len_rt(symbols.symbols);
-    var i = 0;
-    when i < s_count loop
-        let sym = vec_get_rt(symbols.symbols, i);
-        if sym.scope_id == curr do
-            # SymbolNode.name_id currently stores the persistent fat-string
-            # pointer, not an Interner ID. There is no g_interner in this pass.
-            let sym_name = native_read_i64(sym as i64, 8) as string;
-            if pass8_streq(sym_name, name) == 1 do
-                out 1
-            end
-        end
-        i = i + 1
-    end
-    out 0
 end.
 
 func pass8_expr_has_arena_local(expr: AstNode, arena_locals: int, in_arena: int):
@@ -441,10 +471,28 @@ func pass8_end_stmt(shared_borrows: int, mut_borrows: int, shared_wm: int, mut_w
     out 0
 end.
 
+func pass8_get_addr_target(node: AstNode):
+    if (node as i64) == 0 do
+        out ""
+    end
+    if node.node_type != AstType.AddrOf do
+        out ""
+    end
+    let child_count = vec_len_rt(node.children);
+    if child_count < 1 do
+        out ""
+    end
+    let child = vec_get_rt(node.children, 0);
+    if child.node_type == AstType.Identifier do
+        out child.name
+    end
+    out ""
+end.
+
 func pass8_handle_addr_of(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                           node: AstNode, moved_vars: int, shared_borrows: int, mut_borrows: int,
                           bound_borrows: int, arena_locals: int, pre_arena_names: int, in_arena: int,
-                          var_types: int):
+                          var_types: int, func_locals: int):
     let child_count = vec_len_rt(node.children);
     if child_count < 1 do
         out ""
@@ -452,7 +500,7 @@ func pass8_handle_addr_of(symbols: SymbolTable, scopes: ScopeTree, diag: Diagnos
     let child = vec_get_rt(node.children, 0);
     if child.node_type != AstType.Identifier do
         pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
-                   bound_borrows, arena_locals, pre_arena_names, in_arena, var_types);
+                   bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
         out ""
     end
     let tgt = child.name;
@@ -487,7 +535,7 @@ end.
 func pass8_process_binding_rhs(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                                rhs: AstNode, moved_vars: int, shared_borrows: int, mut_borrows: int,
                                bound_borrows: int, lhs: string, arena_locals: int, pre_arena_names: int, in_arena: int,
-                               var_types: int):
+                               var_types: int, func_locals: int):
     var claimed = 0;
     var borrow_tgt = "";
     var borrow_kind = 0;
@@ -495,7 +543,7 @@ func pass8_process_binding_rhs(symbols: SymbolTable, scopes: ScopeTree, diag: Di
     if rhs.node_type == AstType.AddrOf do
         borrow_tgt = pass8_handle_addr_of(symbols, scopes, diag, rhs, moved_vars,
                                           shared_borrows, mut_borrows, bound_borrows,
-                                          arena_locals, pre_arena_names, in_arena, var_types);
+                                          arena_locals, pre_arena_names, in_arena, var_types, func_locals);
         if pass8_strlen(borrow_tgt) > 0 do
             if pass8_streq(rhs.name, "mut") == 1 do
                 borrow_kind = 2
@@ -507,11 +555,19 @@ func pass8_process_binding_rhs(symbols: SymbolTable, scopes: ScopeTree, diag: Di
         end
     else
         pass8_walk(symbols, scopes, diag, rhs, moved_vars, shared_borrows, mut_borrows,
-                   bound_borrows, arena_locals, pre_arena_names, in_arena, var_types);
+                   bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
         if rhs.node_type == AstType.Identifier do
-            let rhs_type = pass8_get_var_type(var_types, rhs.name);
-            if type_is_move(rhs_type) do
-                pass8_mark_moved(moved_vars, rhs.name)
+            let rhs_name = rhs.name;
+            if pass8_is_moved(moved_vars, rhs_name) == 1 do
+                report_error(diag, 5001, rhs.line, 0);
+            else
+                if pass8_borrow_count(shared_borrows, rhs_name) > 0 or pass8_borrow_count(mut_borrows, rhs_name) > 0 do
+                    report_error(diag, 5008, rhs.line, 0);
+                end
+                let rhs_type = pass8_get_var_type(var_types, rhs_name);
+                if type_is_move(rhs_type) do
+                    pass8_mark_moved(moved_vars, rhs_name)
+                end
             end
         end
     end
@@ -521,7 +577,7 @@ end.
 func pass8_walk_children_stmts(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                                node: AstNode, moved_vars: int, shared_borrows: int, mut_borrows: int,
                                bound_borrows: int, arena_locals: int, pre_arena_names: int, in_arena: int,
-                               var_types: int):
+                               var_types: int, func_locals: int):
     let child_count = vec_len_rt(node.children);
     var i = 0;
     var claimed_any = 0;
@@ -530,7 +586,7 @@ func pass8_walk_children_stmts(symbols: SymbolTable, scopes: ScopeTree, diag: Di
         let mut_wm = pass8_box_len(mut_borrows);
         let child = vec_get_rt(node.children, i);
         let claimed = pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
-                                 bound_borrows, arena_locals, pre_arena_names, in_arena, var_types);
+                                 bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
         if claimed == 1 do
             claimed_any = 1
         end
@@ -543,11 +599,12 @@ end.
 func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode,
                 moved_vars: int, shared_borrows: int, mut_borrows: int,
                 bound_borrows: int, arena_locals: int, pre_arena_names: int, in_arena: int,
-                var_types: int):
+                var_types: int, func_locals: int):
     if (node as i64) == 0 do
         out 0
     end
 
+    # 1. Identifier / Index / Field Access — check use of moved value
     if node.node_type == AstType.Identifier or node.node_type == AstType.IndexAccess or node.node_type == AstType.FieldAccess do
         if pass8_strlen(node.name) > 0 do
             if pass8_is_moved(moved_vars, node.name) == 1 do
@@ -559,29 +616,49 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         end
     end
 
+    # 2. AddrOf
     if node.node_type == AstType.AddrOf do
         pass8_handle_addr_of(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
-                             bound_borrows, arena_locals, pre_arena_names, in_arena, var_types);
+                             bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
         out 0
     end
 
+    # 3. Variable Assignment (x = rhs)
     if node.node_type == AstType.Assign do
-        pass8_release_borrower(bound_borrows, shared_borrows, mut_borrows, node.name);
+        let assign_name = node.name;
+        if pass8_strlen(assign_name) > 0 do
+            # Cannot mutate variable while shared borrow is active
+            if pass8_borrow_count(shared_borrows, assign_name) > 0 do
+                report_error(diag, 5002, node.line, 0);
+            end
+            # Cannot mutate variable while mutable borrow is held by another reference
+            if pass8_borrow_count(mut_borrows, assign_name) > 0 do
+                report_error(diag, 5003, node.line, 0);
+            end
+            # Release previous borrows held by this variable
+            pass8_release_borrower(bound_borrows, shared_borrows, mut_borrows, assign_name);
+            # Re-assignment revives moved variable (clears moved state)
+            pass8_unmark_moved(moved_vars, assign_name);
+        end
+
         var claimed = 0;
         let child_count = vec_len_rt(node.children);
         if child_count > 0 do
             let rhs = vec_get_rt(node.children, 0);
             let rhs_type = pass8_infer_expr_type(var_types, rhs);
-            pass8_register_var_type(var_types, node.name, rhs_type);
-            pass8_register_arena_local(arena_locals, pre_arena_names, node.name, in_arena);
-            pass8_check_arena_escape_assign(diag, node.name, rhs, arena_locals, pre_arena_names, in_arena, node.line);
+            if pass8_strlen(assign_name) > 0 do
+                pass8_register_var_type(var_types, assign_name, rhs_type);
+                pass8_register_arena_local(arena_locals, pre_arena_names, assign_name, in_arena);
+                pass8_check_arena_escape_assign(diag, assign_name, rhs, arena_locals, pre_arena_names, in_arena, node.line);
+            end
             claimed = pass8_process_binding_rhs(symbols, scopes, diag, rhs, moved_vars,
                                                   shared_borrows, mut_borrows, bound_borrows,
-                                                  node.name, arena_locals, pre_arena_names, in_arena, var_types)
+                                                  assign_name, arena_locals, pre_arena_names, in_arena, var_types, func_locals)
         end
         out claimed
     end
 
+    # 4. Variable / Constant Declaration (let x = init / var x = init)
     if node.node_type == AstType.VarDecl or node.node_type == AstType.ConstDecl do
         var claimed = 0;
         let child_count = vec_len_rt(node.children);
@@ -590,12 +667,18 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
             when ti < child_count loop
                 let tuple_child = vec_get_rt(node.children, ti);
                 if tuple_child.node_type == AstType.Identifier do
-                    pass8_register_arena_local(arena_locals, pre_arena_names, tuple_child.name, in_arena)
+                    pass8_register_arena_local(arena_locals, pre_arena_names, tuple_child.name, in_arena);
+                    if pass8_vec_contains(func_locals, tuple_child.name) == 0 do
+                        pass8_box_push(func_locals, var_item_new(tuple_child.name, 0) as i64);
+                    end
                 end
                 ti = ti + 1
             end
         else
-            pass8_register_arena_local(arena_locals, pre_arena_names, node.name, in_arena)
+            pass8_register_arena_local(arena_locals, pre_arena_names, node.name, in_arena);
+            if pass8_strlen(node.name) > 0 and pass8_vec_contains(func_locals, node.name) == 0 do
+                pass8_box_push(func_locals, var_item_new(node.name, 0) as i64);
+            end
         end
         if child_count > 0 do
             let init = vec_get_rt(node.children, child_count - 1);
@@ -609,50 +692,94 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                 pass8_check_arena_escape_assign(diag, bind_name, init, arena_locals, pre_arena_names, in_arena, node.line);
                 claimed = pass8_process_binding_rhs(symbols, scopes, diag, init, moved_vars,
                                                       shared_borrows, mut_borrows, bound_borrows,
-                                                      bind_name, arena_locals, pre_arena_names, in_arena, var_types)
+                                                      bind_name, arena_locals, pre_arena_names, in_arena, var_types, func_locals)
             else
                 pass8_walk(symbols, scopes, diag, init, moved_vars, shared_borrows, mut_borrows,
-                           bound_borrows, arena_locals, pre_arena_names, in_arena, var_types)
+                           bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals)
             end
         end
         out claimed
     end
 
-    if node.node_type == AstType.ReturnStmt do
+    # 5. Function & Method Calls — by-value arguments of Move-types transfer ownership
+    if node.node_type == AstType.Call or node.node_type == AstType.MethodCall do
         let child_count = vec_len_rt(node.children);
-        if child_count > 0 do
-            let val = vec_get_rt(node.children, 0);
-            if in_arena == 1 and pass8_expr_has_arena_local(val, arena_locals, in_arena) == 1 do
-                report_error(diag, 5005, node.line, 0)
+        var i = 0;
+        when i < child_count loop
+            let arg = vec_get_rt(node.children, i);
+            if arg.node_type == AstType.Identifier do
+                let arg_name = arg.name;
+                if pass8_strlen(arg_name) > 0 do
+                    if pass8_is_moved(moved_vars, arg_name) == 1 do
+                        report_error(diag, 5001, arg.line, 0);
+                    else
+                        if pass8_borrow_count(shared_borrows, arg_name) > 0 or pass8_borrow_count(mut_borrows, arg_name) > 0 do
+                            report_error(diag, 5008, arg.line, 0);
+                        end
+                        let arg_type = pass8_get_var_type(var_types, arg_name);
+                        if type_is_move(arg_type) do
+                            pass8_mark_moved(moved_vars, arg_name);
+                        end
+                    end
+                end
+            eif arg.node_type == AstType.AddrOf do
+                pass8_handle_addr_of(symbols, scopes, diag, arg, moved_vars, shared_borrows, mut_borrows,
+                                     bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
+            else
+                pass8_walk(symbols, scopes, diag, arg, moved_vars, shared_borrows, mut_borrows,
+                           bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
             end
-            pass8_walk(symbols, scopes, diag, val, moved_vars, shared_borrows, mut_borrows,
-                       bound_borrows, arena_locals, pre_arena_names, in_arena, var_types)
+            i = i + 1
         end
         out 0
     end
 
+    # 6. Return Statement — verify no local reference / arena reference escape
+    if node.node_type == AstType.ReturnStmt do
+        let child_count = vec_len_rt(node.children);
+        if child_count > 0 do
+            let val = vec_get_rt(node.children, 0);
+            # Check local reference escape
+            if val.node_type == AstType.AddrOf do
+                let tgt = pass8_get_addr_target(val);
+                if pass8_strlen(tgt) > 0 and pass8_vec_contains(func_locals, tgt) == 1 do
+                    report_error(diag, 5007, node.line, 0);
+                end
+            end
+            if in_arena == 1 and pass8_expr_has_arena_local(val, arena_locals, in_arena) == 1 do
+                report_error(diag, 5005, node.line, 0);
+            end
+            pass8_walk(symbols, scopes, diag, val, moved_vars, shared_borrows, mut_borrows,
+                       bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
+        end
+        out 0
+    end
+
+    # 7. Print / Throw Statements
     if node.node_type == AstType.PrintStmt or node.node_type == AstType.ThrowStmt do
         let child_count = vec_len_rt(node.children);
         var i = 0;
         when i < child_count loop
             let child = vec_get_rt(node.children, i);
             pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
-                       bound_borrows, arena_locals, pre_arena_names, in_arena, var_types);
+                       bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
             i = i + 1
         end
         out 0
     end
 
+    # 8. Attribute bindings
     if node.node_type == AstType.BindAttr do
         let child_count = vec_len_rt(node.children);
         if child_count > 0 do
             let child = vec_get_rt(node.children, 0);
             out pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
-                           bound_borrows, arena_locals, pre_arena_names, in_arena, var_types)
+                           bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals)
         end
         out 0
     end
 
+    # 9. Function Definition — fresh function-level ownership tracking context
     if node.node_type == AstType.FuncDef do
         scope_push(scopes, ScopeKind.Func);
         let func_moved = pass8_box_new();
@@ -662,29 +789,47 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         let func_arena_locals = pass8_box_new();
         let func_pre_arena = pass8_box_new();
         let func_var_types = pass8_box_new();
+        let fn_locals = pass8_box_new();
+
         let child_count = vec_len_rt(node.children);
         var i = 0;
         when i < child_count loop
             let child = vec_get_rt(node.children, i);
-            if child.node_type == AstType.Identifier or child.node_type == AstType.ParamDef do
-                pass8_register_var_type(func_var_types, child.name, TypeKind.Int);
+            if child.node_type == AstType.Identifier or child.node_type == AstType.ParamDef or child.node_type == AstType.RefParam do
+                if pass8_strlen(child.name) > 0 do
+                    pass8_box_push(fn_locals, var_item_new(child.name, 0) as i64);
+                    if child.node_type == AstType.RefParam do
+                        pass8_register_var_type(func_var_types, child.name, TypeKind.Ref);
+                    else
+                        pass8_register_var_type(func_var_types, child.name, TypeKind.Int);
+                    end
+                end
             end
             pass8_walk(symbols, scopes, diag, child, func_moved, func_shared, func_mut,
-                       func_bound_borrows, func_arena_locals, func_pre_arena, 0, func_var_types);
+                       func_bound_borrows, func_arena_locals, func_pre_arena, 0, func_var_types, fn_locals);
             i = i + 1
         end
         scope_pop(scopes);
         out 0
     end
 
+    # 10. Generic Block — lexical borrow lifetime scope
     if node.node_type == AstType.Block do
         scope_push(scopes, ScopeKind.Block);
+        let bound_wm = pass8_box_len(bound_borrows);
+        let shared_wm = pass8_box_len(shared_borrows);
+        let mut_wm = pass8_box_len(mut_borrows);
         let claimed = pass8_walk_children_stmts(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
-                                                bound_borrows, arena_locals, pre_arena_names, in_arena, var_types);
+                                                bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
+        # Release block-scoped borrows
+        pass8_truncate_to(bound_borrows, bound_wm);
+        pass8_truncate_to(shared_borrows, shared_wm);
+        pass8_truncate_to(mut_borrows, mut_wm);
         scope_pop(scopes);
         out claimed
     end
 
+    # 11. Arena Block — region lifetime validation
     if node.node_type == AstType.ArenaBlock do
         scope_push(scopes, ScopeKind.Block);
         let moved_wm = pass8_box_len(moved_vars);
@@ -693,7 +838,7 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         let bound_wm = pass8_box_len(bound_borrows);
         let arena_wm = pass8_box_len(arena_locals);
         pass8_walk_children_stmts(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
-                                  bound_borrows, arena_locals, pre_arena_names, 1, var_types);
+                                  bound_borrows, arena_locals, pre_arena_names, 1, var_types, func_locals);
         pass8_check_arena_borrow_escape(diag, arena_locals, pre_arena_names, bound_borrows, node.line);
         pass8_truncate_to(moved_vars, moved_wm);
         pass8_truncate_to(shared_borrows, shared_wm);
@@ -704,6 +849,7 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         out 0
     end
 
+    # 12. Control Flow: IfStmt, LoopStmt, WhileStmt, ForRange
     if node.node_type == AstType.IfStmt or node.node_type == AstType.LoopStmt or node.node_type == AstType.WhileStmt or node.node_type == AstType.ForRange do
         scope_push(scopes, ScopeKind.Block);
         let moved_wm = pass8_box_len(moved_vars);
@@ -714,7 +860,7 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         if child_count > 0 do
             let cond = vec_get_rt(node.children, 0);
             pass8_walk(symbols, scopes, diag, cond, moved_vars, shared_borrows, mut_borrows,
-                       bound_borrows, arena_locals, pre_arena_names, in_arena, var_types)
+                       bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals)
         end
         var i = 1;
         when i < child_count loop
@@ -722,11 +868,10 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
             let mut_stmt_wm = pass8_box_len(mut_borrows);
             let child = vec_get_rt(node.children, i);
             let claimed = pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
-                                     bound_borrows, arena_locals, pre_arena_names, in_arena, var_types);
+                                     bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
             pass8_end_stmt(shared_borrows, mut_borrows, shared_stmt_wm, mut_stmt_wm, claimed);
             i = i + 1
         end
-        pass8_truncate_to(moved_vars, moved_wm);
         pass8_truncate_to(shared_borrows, shared_wm);
         pass8_truncate_to(mut_borrows, mut_wm);
         pass8_truncate_to(bound_borrows, bound_wm);
@@ -734,12 +879,13 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         out 0
     end
 
+    # 13. Default: walk all child AST nodes
     let child_count = vec_len_rt(node.children);
     var i = 0;
     when i < child_count loop
         let child = vec_get_rt(node.children, i);
         pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
-                   bound_borrows, arena_locals, pre_arena_names, in_arena, var_types);
+                   bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals);
         i = i + 1
     end
     out 0
