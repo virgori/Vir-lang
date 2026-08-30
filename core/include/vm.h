@@ -11,6 +11,7 @@
 #define VIR_VM_H
 
 #include "q_ir.h"
+#include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -298,6 +299,10 @@ typedef struct vm_state {
 
     /* §16.5 Simulated MMIO region for volatile_read / volatile_write */
     int64_t mmio_region[VM_MMIO_SIZE / sizeof(int64_t)];
+
+    /* Valid open FILE handles created via Q_FILE_OPEN */
+    FILE *open_files[64];
+    uint32_t open_file_count;
 } vm_state_t;
 
 /* ═══════════════════════════════════════════════════════

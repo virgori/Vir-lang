@@ -47,7 +47,9 @@ void hir_free_node(hir_node_t* node) {
         case HIR_BLOCK:
             if (node->as.block.body) {
                 for (uint32_t i = 0; i < node->as.block.count; i++) {
-                    hir_free_node(node->as.block.body[i]);
+                    if (node->as.block.body[i]) {
+                        hir_free_node(node->as.block.body[i]);
+                    }
                 }
                 free(node->as.block.body);
             }

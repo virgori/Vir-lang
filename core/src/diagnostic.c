@@ -419,7 +419,7 @@ static void render_terminal(diag_context_t *ctx, const diag_entry_t *e) {
     if (color) sink_print(s, "Code      : [%s%s%04u%s]\n", ANSI_BOLD, prefix, e->code, ANSI_RESET);
     else sink_print(s, "Code      : [%s%04u]\n", prefix, e->code);
     sink_print(s, "Subsystem : Compiler (%s)\n", phase_label[e->phase]);
-    sink_print(s, "Version   : Vir 2.0.0-dev\n");
+    sink_print(s, "Version   : Vir 2.2.0\n");
     sink_print(s, "Stage     : %s\n", stage_label[e->stage]);
     
     sink_print(s, "\nDetails\n");

@@ -715,24 +715,45 @@ static FILE *vm_dbg_file(void) {
 }
 
 static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
-    int64_t s = ctx->args[0];
-#ifdef VIR_PLATFORM_MACOS
-    s &= 0xFFFFFF;
-#endif
+    int64_t s = ctx->args[0] & 0xFFFFFF;
     int64_t r1 = ctx->args[1], r2 = ctx->args[2], r3 = ctx->args[3];
     int64_t r4 = ctx->args[4], r5 = ctx->args[5];
     int64_t result = -1;
+    if (getenv("VIR_DEBUG_SYSCALL")) {
+        fprintf(stderr, "[SYSCALL] num=%lld r1=%lld (%s) r2=%lld r3=%lld\n",
+                (long long)s, (long long)r1, (s == 5 && r1 != 0) ? (const char *)(uintptr_t)r1 : "", (long long)r2, (long long)r3);
+    }
     switch (s) {
     case 1:   exit((int)r1);                                                    break;
     case 3:   result = read((int)r1, (void *)(uintptr_t)r2, (size_t)r3);      break;
     case 4:   result = write((int)r1, (const void *)(uintptr_t)r2, (size_t)r3); break;
-    case 5:   result = open((const char *)(uintptr_t)r1, (int)r2, (mode_t)r3); break;
+    case 5: {
+        int flags = (int)r2;
+#ifndef VIR_PLATFORM_MACOS
+        int lflags = 0;
+        if (flags & 0x0001) lflags |= O_WRONLY;
+        if (flags & 0x0002) lflags |= O_RDWR;
+        if (flags & 0x0008) lflags |= O_APPEND;
+        if (flags & 0x0200) lflags |= O_CREAT;
+        if (flags & 0x0400) lflags |= O_TRUNC;
+        if (flags & 0x0800) lflags |= O_EXCL;
+        flags = lflags;
+#endif
+        result = open((const char *)(uintptr_t)r1, flags, (mode_t)r3);
+        break;
+    }
     case 6:   result = close((int)r1);                                          break;
     case 73:  result = munmap((void *)(uintptr_t)r1, (size_t)r2);             break;
     case 197: {
+        int flags = (int)r4;
+#ifndef VIR_PLATFORM_MACOS
+        if (flags & 0x1000) {
+            flags = (flags & ~0x1000) | MAP_ANONYMOUS;
+        }
+#endif
         void *p = mmap((void *)(uintptr_t)r1, (size_t)r2,
-                       (int)r3, (int)r4, (int)r5, 0);
-        result = (int64_t)(intptr_t)p;
+                       (int)r3, flags, (int)r5, 0);
+        result = (p == MAP_FAILED) ? -1 : (int64_t)(intptr_t)p;
         break;
     }
     case 199: result = lseek((int)r1, (off_t)r2, (int)r3);                    break;
@@ -855,7 +876,7 @@ static void intr_native_read_i64(vir_intrinsic_ctx_t *ctx)
     int64_t base = ctx->args[0];
     int64_t off = ctx->args[1];
     if (base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE) {
-        size_t slot = (size_t)((base - VM_MMIO_BASE) / (int64_t)sizeof(int64_t) + off);
+        size_t slot = (size_t)((base - VM_MMIO_BASE) + off) / sizeof(int64_t);
         size_t slots = VM_MMIO_SIZE / sizeof(int64_t);
         *ctx->ret = slot < slots ? ctx->vm->mmio_region[slot] : 0;
         return;
@@ -864,8 +885,7 @@ static void intr_native_read_i64(vir_intrinsic_ctx_t *ctx)
         *ctx->ret = 0;
         return;
     }
-    const int64_t *ptr = (const int64_t *)((const char *)(intptr_t)base +
-                                           off * (int64_t)sizeof(int64_t));
+    const int64_t *ptr = (const int64_t *)((const char *)(intptr_t)base + off);
     *ctx->ret = *ptr;
 }
 
@@ -875,7 +895,7 @@ static void intr_native_write_i64(vir_intrinsic_ctx_t *ctx)
     int64_t off = ctx->args[1];
     int64_t val = ctx->args[2];
     if (base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE) {
-        size_t slot = (size_t)((base - VM_MMIO_BASE) / (int64_t)sizeof(int64_t) + off);
+        size_t slot = (size_t)((base - VM_MMIO_BASE) + off) / sizeof(int64_t);
         size_t slots = VM_MMIO_SIZE / sizeof(int64_t);
         if (slot < slots)
             ctx->vm->mmio_region[slot] = val;
@@ -886,8 +906,7 @@ static void intr_native_write_i64(vir_intrinsic_ctx_t *ctx)
         *ctx->ret = 0;
         return;
     }
-    int64_t *ptr = (int64_t *)((char *)(intptr_t)base +
-                               off * (int64_t)sizeof(int64_t));
+    int64_t *ptr = (int64_t *)((char *)(intptr_t)base + off);
     *ptr = val;
     *ctx->ret = 0;
 }
@@ -1690,7 +1709,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
                 break;
             }
             uintptr_t target_addr = (uintptr_t)((char *)(intptr_t)base + idx);
-            if (target_addr < 4096 || target_addr > 0x7fffffffffffULL) {
+            if (target_addr < 4096 || target_addr >= (uintptr_t)-4096) {
                 set_dest(vm, &instr->dest, 0);
                 break;
             }
@@ -1715,7 +1734,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
                 break;  /* silently ignore write to null/invalid ptr */
             }
             uintptr_t target_addr = (uintptr_t)((char *)(intptr_t)base + idx);
-            if (target_addr < 4096 || target_addr > 0x7fffffffffffULL) {
+            if (target_addr < 4096 || target_addr >= (uintptr_t)-4096) {
                 break;
             }
             memcpy((void *)target_addr, &val, sizeof(val));
@@ -1778,12 +1797,19 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         FILE *f = (path && mode && (uintptr_t)path >= 0x1000u)
                       ? fopen(path, mode)
                       : NULL;
+        if (f && vm->open_file_count < 64) {
+            vm->open_files[vm->open_file_count++] = f;
+        }
         set_dest(vm, &instr->dest, (int64_t)(intptr_t)f);
         break;
     }
     case Q_FILE_READ: {
         FILE *f = (FILE *)(intptr_t)operand_value(vm, &instr->src1);
-        if (!f) { set_dest(vm, &instr->dest, 0); break; }
+        int valid = 0;
+        for (uint32_t i = 0; i < vm->open_file_count; i++) {
+            if (vm->open_files[i] == f && f != NULL) { valid = 1; break; }
+        }
+        if (!valid) { set_dest(vm, &instr->dest, 0); break; }
         fseek(f, 0, SEEK_END);
         long sz = ftell(f);
         fseek(f, 0, SEEK_SET);
@@ -1796,18 +1822,32 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_FILE_WRITE: {
         FILE *f = (FILE *)(intptr_t)operand_value(vm, &instr->src1);
         const char *data = (const char *)(intptr_t)operand_value(vm, &instr->src2);
-        if (f && data) fputs(data, f);
+        int valid = 0;
+        for (uint32_t i = 0; i < vm->open_file_count; i++) {
+            if (vm->open_files[i] == f && f != NULL) { valid = 1; break; }
+        }
+        if (valid && data) fputs(data, f);
         break;
     }
     case Q_FILE_CLOSE: {
         FILE *f = (FILE *)(intptr_t)operand_value(vm, &instr->src1);
-        if (f) fclose(f);
+        for (uint32_t i = 0; i < vm->open_file_count; i++) {
+            if (vm->open_files[i] == f && f != NULL) {
+                fclose(f);
+                vm->open_files[i] = NULL;
+                break;
+            }
+        }
         break;
     }
     case Q_FILE_WRITE_BYTE: {
         FILE *f = (FILE *)(intptr_t)operand_value(vm, &instr->src1);
         int64_t byte = operand_value(vm, &instr->src2);
-        if (f) fputc((int)byte, f);
+        int valid = 0;
+        for (uint32_t i = 0; i < vm->open_file_count; i++) {
+            if (vm->open_files[i] == f && f != NULL) { valid = 1; break; }
+        }
+        if (valid) fputc((int)byte, f);
         break;
     }
 
@@ -2032,7 +2072,6 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     }
     case Q_PRINT_STR: {
         const char *s = (const char *)(intptr_t)operand_value(vm, &instr->src1);
-        fprintf(stderr, "[Q_PRINT_STR] s=%p hex=%02x%02x%02x%02x\n", s, s?s[0]&0xff:0, s?s[1]&0xff:0, s?s[2]&0xff:0, s?s[3]&0xff:0);
         if (s) { fputs(s, stdout); fflush(stdout); }
         break;
     }

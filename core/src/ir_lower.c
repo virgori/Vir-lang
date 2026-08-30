@@ -761,6 +761,31 @@ static void register_func_return_type(lower_ctx_t *ctx, const char *name,
   ctx->func_return_types[idx].type_name[AST_NAME_LEN - 1] = '\0';
 }
 
+static record_type_t *record_type_for_symbol(lower_ctx_t *ctx,
+                                             const char *name,
+                                             const char **out_type_name);
+
+static int copy_symbol_type_name(lower_ctx_t *ctx, const char *name, char *out,
+                                 size_t out_sz) {
+  if (!ctx || !name || !name[0] || !out || out_sz == 0)
+    return 0;
+  out[0] = '\0';
+  symbol_entry_t *ent = NULL;
+  if (sym_lookup_entry_both(ctx, name, &ent, NULL) >= 0 && ent &&
+      ent->type_name[0]) {
+    strncpy(out, ent->type_name, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    return 1;
+  }
+  const char *inferred = NULL;
+  if (record_type_for_symbol(ctx, name, &inferred) && inferred && inferred[0]) {
+    strncpy(out, inferred, out_sz - 1);
+    out[out_sz - 1] = '\0';
+    return 1;
+  }
+  return 0;
+}
+
 static const record_field_t *record_field_info(const record_type_t *rt,
                                                const char *field) {
   if (!rt || !field)
@@ -790,19 +815,7 @@ static int copy_array_element_type_name(const char *type_name, char *out,
   return out[0] != '\0';
 }
 
-static int copy_symbol_type_name(lower_ctx_t *ctx, const char *name, char *out,
-                                 size_t out_sz) {
-  if (!ctx || !name || !name[0] || !out || out_sz == 0)
-    return 0;
-  out[0] = '\0';
-  symbol_entry_t *ent = NULL;
-  if (sym_lookup_entry_both(ctx, name, &ent, NULL) < 0 || !ent ||
-      !ent->type_name[0])
-    return 0;
-  strncpy(out, ent->type_name, out_sz - 1);
-  out[out_sz - 1] = '\0';
-  return 1;
-}
+
 
 static int copy_expr_type_name(lower_ctx_t *ctx, const ast_node_t *expr,
                                char *out, size_t out_sz) {
@@ -2987,7 +3000,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
      * Each field is stored as an int64_t word.
      * name = record type name, children = field values
      * children[i]->name2 = field name */
-    record_type_t *rt = find_record_type(ctx, expr->name); if (strcmp(expr->name, "VirFile") == 0) { printf("AST_RECORD_LITERAL VirFile: child_count=%d, rt->field_count=%d\n", expr->child_count, rt ? rt->field_count : -1); }
+    record_type_t *rt = find_record_type(ctx, expr->name);
     if (!rt) {
       if (expr->name[0] == '\0') {
         uint32_t sz_r = fresh_vreg(ctx);
