@@ -30,11 +30,14 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
                 break;
             }
             hir_node_t **body =
-                (hir_node_t **)malloc(ast->child_count * sizeof(hir_node_t *));
+                (hir_node_t **)calloc(ast->child_count, sizeof(hir_node_t *));
             uint32_t count = 0;
             for (uint32_t i = 0; i < ast->child_count; i++) {
                 hir_node_t *child = lower_node(ctx, ast->children[i]);
                 if (!child) {
+                    for (uint32_t j = 0; j < count; j++) {
+                        if (body[j]) hir_free_node(body[j]);
+                    }
                     free(body);
                     return NULL;
                 }
@@ -107,7 +110,7 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
                 const ast_node_t *b = ast->children[body_idx];
                 body = hir_create_node(HIR_BLOCK, 0);
                 body->as.block.body =
-                    (hir_node_t **)malloc(b->child_count * sizeof(hir_node_t *));
+                    (hir_node_t **)calloc(b->child_count, sizeof(hir_node_t *));
                 body->as.block.count = b->child_count;
                 for (uint32_t i = 0; i < b->child_count; i++) {
                     body->as.block.body[i] = lower_node(ctx, b->children[i]);
@@ -131,11 +134,11 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
                 if_stmt->as.if_stmt.then_block = body;
                 if_stmt->as.if_stmt.else_block = hir_create_node(HIR_BREAK, 0);
 
-                hir->as.block.body = (hir_node_t **)malloc(sizeof(hir_node_t *));
+                hir->as.block.body = (hir_node_t **)calloc(1, sizeof(hir_node_t *));
                 hir->as.block.count = 1;
                 hir->as.block.body[0] = if_stmt;
             } else {
-                hir->as.block.body = (hir_node_t **)malloc(sizeof(hir_node_t *));
+                hir->as.block.body = (hir_node_t **)calloc(1, sizeof(hir_node_t *));
                 hir->as.block.count = 1;
                 hir->as.block.body[0] = body;
             }
@@ -144,7 +147,7 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
         case AST_FOR_RANGE: {
             hir = hir_create_node(HIR_BLOCK, 0);
             hir->as.block.count = 1;
-            hir->as.block.body = (hir_node_t **)malloc(sizeof(hir_node_t *));
+            hir->as.block.body = (hir_node_t **)calloc(1, sizeof(hir_node_t *));
 
             hir_node_t *loop = hir_create_node(HIR_LOOP, 0);
 
@@ -155,7 +158,7 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
                 ast->children[body_idx]->type == AST_BLOCK) {
                 const ast_node_t *b = ast->children[body_idx];
                 body->as.block.body =
-                    (hir_node_t **)malloc(b->child_count * sizeof(hir_node_t *));
+                    (hir_node_t **)calloc(b->child_count, sizeof(hir_node_t *));
                 body->as.block.count = b->child_count;
                 for (uint32_t i = 0; i < b->child_count; i++) {
                     body->as.block.body[i] = lower_node(ctx, b->children[i]);
@@ -167,7 +170,7 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
                     }
                 }
             }
-            loop->as.block.body = (hir_node_t **)malloc(sizeof(hir_node_t *));
+            loop->as.block.body = (hir_node_t **)calloc(1, sizeof(hir_node_t *));
             loop->as.block.count = 1;
             loop->as.block.body[0] = body;
 

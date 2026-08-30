@@ -1,18 +1,20 @@
-# BÁO CÁO BENCHMARK CHUYÊN NGHIỆP: VIR V2.0 vs C (CLANG)
+# BÁO CÁO BENCHMARK: VIR SOFT PIPELINE & STAGE-1 vs C (CLANG)
 
 **Ngày đo lường:** 28 Tháng 08 Năm 2026  
 **Hệ thống:** Apple M2 • Darwin 25.5.0 (arm64) • 8 Cores  
 **C Compiler:** Apple clang version 21.0.0 (clang-2100.1.1.101)  
-**Vir Engine:** Vir V2.0 (Self-Hosted Native Compiler)  
-**Quy chuẩn đo lường:** Warmup=5 vòng, Đo lường=20 vòng, Kiểm tra Checksum khớp 100% giữa Vir và C.  
+**Vir Soft Pipeline:** Chaitin-Briggs Graph Coloring RegAlloc (K=8, X19..X26) + 10 Semantic Passes  
+**Vir Stage-1:** Self-Hosted Bootstrap Native Binary  
+**Quy chuẩn:** Warmup=5 vòng, Đo lường=20 vòng, Checksum khớp 100%.  
 
 ## BẢNG TỔNG HỢP KẾT QUẢ ĐO LƯỜNG HIỆU NĂNG
 
-| Tầng Kiểm Thử / Benchmark | Vir Native (Median) | Clang -O2 (Median) | Clang -O0 (Median) | Tỉ Lệ Vir / Clang -O2 | Đánh Giá |
-| :--- | ---: | ---: | ---: | ---: | :---: |
-| **`loop_sum`** | 108.35 ms | 8.75 ms | 52.16 ms | **12.38x** | ⚙️ Ổn định |
-| **`sieve_eratosthenes`** | 194.34 ms | 20.35 ms | 134.82 ms | **9.55x** | ⚙️ Ổn định |
-| **`arena_linear`** | 66.72 ms | 4.93 ms | 50.33 ms | **13.53x** | ⚙️ Ổn định |
+| Benchmark Suite | Vir Soft (Chaitin-Briggs) | Vir Stage-1 (Bootstrap) | Clang -O2 | Clang -O0 | Tỉ Lệ Soft / Clang -O2 |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **`fnv1a_hash`** | **88.44 ms** | 225.00 ms | 17.09 ms | 91.63 ms | **5.17x** |
+| **`quicksort`** | **6.29 ms** | 11.67 ms | 4.61 ms | 6.57 ms | **1.36x** |
+| **`sieve_eratosthenes`** | **141.82 ms** | 168.54 ms | 17.73 ms | 131.44 ms | **8.00x** |
+| **`arena_linear`** | **N/A** | 59.05 ms | 2.88 ms | 23.73 ms | **20.54x (S1)** |
 
 ---
 *Báo cáo được khởi tạo tự động bởi bộ công cụ `vir-bench`.*

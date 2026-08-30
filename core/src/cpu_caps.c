@@ -21,6 +21,8 @@
 
 #ifdef __linux__
 #include <unistd.h>
+#include <sys/auxv.h>
+#include <sys/prctl.h>
 #endif
 
 /* ═══════════════════════════════════════════════════════
@@ -123,11 +125,13 @@ static void detect_arm64_simd(cpu_caps_t *caps) {
     s->neon_i8mm = (hwcap2 & (1UL << 13)) != 0;
     s->bf16 = (hwcap2 & (1UL << 14)) != 0;
     if (s->sve) {
-        /* Read SVE width */
-        uint64_t vl;
-        __asm__ volatile("rdvl %0, #1" : "=r"(vl));
-        s->sve_width = (uint32_t)(vl * 8);
-        s->max_simd_width = (uint32_t)vl;
+#ifdef PR_SVE_GET_VL
+        int vl = prctl(PR_SVE_GET_VL);
+        if (vl > 0) {
+            s->sve_width = (uint32_t)((vl & 0xffff) * 8);
+            s->max_simd_width = (uint32_t)(vl & 0xffff);
+        }
+#endif
     }
 #endif
 }

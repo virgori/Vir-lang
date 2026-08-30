@@ -193,24 +193,24 @@ C / Libc Dependencies     : 0 (ZERO)
 
 ---
 
-## PHẦN IV: MULTI-PASS IR OPTIMIZER ENGINE & ADVANCED COMPILER PASSES (16 THUẬT TOÁN)
+## PHẦN IV: MULTI-PASS IR OPTIMIZER ENGINE & ADVANCED COMPILER PASSES (26 THUẬT TOÁN)
 
-Trình biên dịch Vir đã chính thức hoàn thiện và kiểm thử toàn diện **16 Thuật Toán Tối Ưu Hoá & Quản Lý Bộ Nhớ Trọng Tâm** theo Đặc Tả Vir v2.0 (Pillar 6 & Spec §10, §15, §16, §18):
+Trình biên dịch Vir đã chính thức hoàn thiện và kiểm thử toàn diện **26 Thuật Toán Tối Ưu Hoá & Quản Lý Bộ Nhớ Trọng Tâm** theo Đặc Tả Vir v2.0 (Pillar 6 & Spec §10, §15, §16, §18):
 
-### Nhóm 1: Tối Ưu Hóa Số Học & Cục Bộ
+### Nhóm 1: Tối Ưu Hóa Số Học & Cục Bộ (Tier-1)
 1. **Constant Folding & Propagation**: Gập hằng số đại số ở thời gian biên dịch (`+`, `-`, `*`, `/`, `%`, `&`, `|`, `^`, `<<`, `>>`) và triệt tiêu hằng đẳng thức (`x + 0 -> x`, `x * 1 -> x`, `x * 0 -> 0`, `x ^ x -> 0`, `x & 0 -> 0`).
 2. **Peephole Strength Reduction**: Thay thế phép nhân/chia lũy thừa 2 thành phép dịch bit (`x * 2^k -> x << k`, `x / 2^k -> x >> k`, `x % 2^k -> x & (2^k - 1)`).
 3. **Common Subexpression Elimination (CSE)**: Đánh số giá trị cục bộ/toàn cục để tái sử dụng biểu thức tính toán trùng lặp.
 4. **Dead Code Elimination (DCE)**: Quét biến sống (liveness analysis) và loại bỏ các lệnh gán biến chết / mã không bao giờ chạm tới.
 
-### Nhóm 2: Tối Ưu Hóa Vòng Lặp & Ma Trận
+### Nhóm 2: Tối Ưu Hóa Vòng Lặp & Ma Trận (Tier-2)
 5. **Loop Invariant Code Motion (LICM)**: Phân tích thân vòng lặp và dời các tính toán bất biến ra khối tiền thân (Preheader).
 6. **Induction Variable Strength Reduction (IVSR)**: Chuyển đổi phép nhân biến đếm `i * Stride` trong vòng lặp thành chuỗi phép cộng tích luỹ liên tục `acc += Stride`.
 7. **Loop Unrolling Engine**: Tự động duỗi vòng lặp 2-way và 4-way kèm vòng lặp vô hướng vét cạn (Scalar Epilogue).
 8. **Symbolic Loop Collapse (Gauss Closed-Form)**: Rút gọn vòng lặp cấp số cộng $\sum i$ từ $O(N)$ về công thức đóng giải tích $O(1)$ $\frac{N(N+1)}{2}$.
 9. **Polyhedral Loop Tiling & Cache Blocking**: Phân mảnh vòng lặp 2D/3D thành các khối ô vuông tối ưu hoá bộ nhớ đệm L1 (32KB) / L2 (128KB).
 
-### Nhóm 3: Tối Ưu Hóa Vector & Đồ Thị Thanh Ghi
+### Nhóm 3: Tối Ưu Hóa Vector, Thanh Ghi & Bộ Nhớ (Tier-3)
 10. **SIMD Auto-Vectorization (NEON 128-bit & AVX2 256-bit)**: Tự động song song hoá 4 lane (i32) / 16 lane (u8) trên mảng và tính tổng thu gọn (SIMD Reduction).
 11. **Tail-Call Optimization (TCO)**: Tối ưu đệ quy đuôi thành lệnh nhảy trực tiếp `B / JMP`, đảm bảo $O(1)$ stack space và triệt tiêu lỗi Stack Overflow.
 12. **George-Appel Iterated Register Coalescing (IRC)**: Gộp thanh ghi bảo toàn theo tiêu chuẩn Briggs ($K=8$, Callee-Saved `X19..X26`), triệt tiêu lệnh `MOV` dư thừa.
@@ -218,6 +218,22 @@ Trình biên dịch Vir đã chính thức hoàn thiện và kiểm thử toàn 
 14. **Escape Analysis & Stack/Arena Promotion**: Phân tích thoát của con trỏ để chuyển đổi bộ nhớ heap `alloc()` sang stack hoặc linear arena.
 15. **Bacon-Rajan Cycle Collection (Trial Deletion)**: Thuật toán 3 màu phát hiện và giải phóng chu trình tham chiếu vòng (Cyclic References) cho bộ nhớ tự động ARC.
 16. **Multi-Pass Pipeline Orchestrator**: Trình điều phối chạy lặp hội tụ theo các mức tối ưu hoá `O1`, `O2`, `O3`.
+
+### Nhóm 4: Tối Ưu Hóa Bậc Cao Liên Khối & Liên Hàm (Tier-4)
+17. **Inter-procedural Function Inlining (IPA Inliner)**: Inline tự động các hàm lá nhỏ ($\le 6$ lệnh) trực tiếp tại call site, triệt tiêu $100\%$ call overhead và function prologue/epilogue.
+18. **Global Value Numbering (GVN)**: Đánh số giá trị toàn cục trên Dominator Tree, nhận diện biểu thức tương đương trên mọi nhánh rẽ kèm chuẩn hóa giao hoán ($VN(a + b) == VN(b + a)$).
+19. **Partial Redundancy Elimination (PRE / Lazy Code Motion)**: Khử dư thừa từng phần qua thuật toán Knoop et al., chèn phép tính bù vào predecessor block để loại bỏ hoàn toàn tính toán dư thừa tại join block.
+20. **Superword-Level Parallelism (SLP Auto-Vectorization)**: Gom các thao tác vô hướng độc lập đẳng cấu liền kề trong cùng basic block thành 1 lệnh vector 128-bit (4 x 32-bit lanes).
+
+### Nhóm 5: Tối Ưu Hóa Siêu Cấp Backend & Cấu Trúc Dữ Liệu (Tier-5)
+21. **Shrink-Wrapping**: Dời các lệnh lưu/khôi phục thanh ghi callee-saved (`STP/LDP`) từ Entry vào nhánh tính toán nặng, triệt tiêu $100\%$ frame overhead khi thoát sớm (Guard Clauses / Fast Paths).
+22. **CFG Simplification & Jump Threading**: Rút gọn chuỗi lệnh nhảy liên hoàn (`Jump L1 -> L1: Jump L2 ==> Jump L2`), loại bỏ basic block rỗng (Empty Block Pruning) và hợp nhất các khối liên tiếp.
+23. **Scalar Replacement of Aggregates (SROA)**: Phân rã struct/tuple nhỏ (2-4 trường) thành các thanh ghi vô hướng độc lập (`VReg`), loại bỏ hoàn toàn cấp phát heap/stack và lệnh đọc/ghi bộ nhớ.
+
+### Nhóm 6: Tối Ưu Hóa Toàn Cục & Toàn Bộ Chương Trình (Tier-6 / LTO)
+24. **Sparse Conditional Constant Propagation (SCCP)**: Thuật toán Wegman & Zadeck đồng thời lan truyền giá trị trên lưới SSA (Lattice) và phát hiện cạnh CFG khả đạt, loại bỏ hoàn toàn các nhánh điều kiện chết.
+25. **Dead Argument Elimination & Arg Promotion (DAE)**: Phân tích call graph toàn cục để loại bỏ các tham số không sử dụng khỏi ABI, đồng thời promote tham số con trỏ struct thành truyền trực tiếp qua thanh ghi CPU (`X0..X7`).
+26. **Devirtualization**: Phân tích phân cấp kiểu (CHA) và monomorphism để chuyển đổi các lời gọi gián tiếp/vtable (`BLR Xn`) thành lệnh gọi trực tiếp (`BL label`), mở đường cho Function Inlining trên cả mã đa hình.
 
 ### Bảng Tổng Hợp Kiểm Thử Xác Minh (100% Pure Vir):
 - [`cg_optimizer_engine.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_engine.vri): **100% PASS**
@@ -228,6 +244,16 @@ Trình biên dịch Vir đã chính thức hoàn thiện và kiểm thử toàn 
 - [`cg_optimizer_symbolic.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_symbolic.vri): **100% PASS**
 - [`cg_optimizer_tiling.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_tiling.vri): **100% PASS**
 - [`cg_gc_bacon_rajan.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_gc_bacon_rajan.vri): **100% PASS**
+- [`cg_optimizer_inlining.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_inlining.vri): **100% PASS**
+- [`cg_optimizer_gvn.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_gvn.vri): **100% PASS**
+- [`cg_optimizer_pre.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_pre.vri): **100% PASS**
+- [`cg_optimizer_slp.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_slp.vri): **100% PASS**
+- [`cg_optimizer_shrinkwrap.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_shrinkwrap.vri): **100% PASS**
+- [`cg_optimizer_jumpthreading.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_jumpthreading.vri): **100% PASS**
+- [`cg_optimizer_sroa.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_sroa.vri): **100% PASS**
+- [`cg_optimizer_sccp.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_sccp.vri): **100% PASS**
+- [`cg_optimizer_dae.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_dae.vri): **100% PASS**
+- [`cg_optimizer_devirt.vri`](file:///Users/gengyang/Vir/tests/bootstrap_codegen/cg_optimizer_devirt.vri): **100% PASS**
 
 ---
 

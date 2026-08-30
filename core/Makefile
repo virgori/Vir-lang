@@ -58,7 +58,7 @@ endif
 
 # ── Compiler settings ────────────────────────────────────
 CC      := cc
-CFLAGS  := -g -Wall -Wextra -Wpedantic -std=c11 -fPIC
+CFLAGS  := -g -Wall -Wextra -Wpedantic -std=c11 -fPIC -D_GNU_SOURCE
 CFLAGS  += -Iinclude
 CFLAGS  += -DVIR_ARCH_$(shell echo $(ARCH) | tr a-z A-Z)
 CFLAGS  += -DVIR_PLATFORM_$(shell echo $(PLATFORM) | tr a-z A-Z)
