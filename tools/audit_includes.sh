@@ -34,6 +34,8 @@ resolve_include() {
         stdlib/vir/mem \
         stdlib/vir/str \
         stdlib/vir/io \
+        stdlib/vir/error \
+        stdlib/vir/core \
         stdlib/vir; do
         if [ -f "$ROOT/$prefix/$rel" ]; then
             echo "$ROOT/$prefix/$rel"

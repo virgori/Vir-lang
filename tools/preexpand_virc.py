@@ -78,8 +78,9 @@ def expand_file(path: Path, seen_names: set[str], seen_paths: set[Path]) -> str:
         return ""
     seen_paths.add(path)
 
-    out: list[str] = []
-    for line in path.read_text().splitlines():
+    display_path = path.relative_to(ROOT).as_posix()
+    out: list[str] = [f"# @vir_source {display_path} 1"]
+    for line_no, line in enumerate(path.read_text().splitlines(), start=1):
         m = re.match(r"^include\s+(\S+)", line)
         if m:
             iname = normalize_include(m.group(1))
@@ -91,6 +92,8 @@ def expand_file(path: Path, seen_names: set[str], seen_paths: set[Path]) -> str:
             else:
                 seen_names.add(iname)
                 out.append(expand_file(inc, seen_names, seen_paths))
+                # Restore the parent mapping after returning from an include.
+                out.append(f"# @vir_source {display_path} {line_no + 1}")
         else:
             out.append(line)
     return "\n".join(out) + "\n"

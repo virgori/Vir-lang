@@ -5860,13 +5860,9 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
 
   for (uint32_t i = 0; i < program->child_count; i++) {
     ast_node_t *child = program->children[i];
-    if (!child || (child->type != AST_INCLUDE && child->type != AST_IMPORT))
+    if (!child || child->type != AST_INCLUDE)
       continue;
 
-    /* Imports are source dependencies too.  Keep the AST_IMPORT node so
-     * lower_process_imports can retain aliases and imported-symbol metadata,
-     * but splice its module immediately before it. */
-    int is_import = child->type == AST_IMPORT;
     const char *filename = child->name;
 
     /* Guard against double-include */
@@ -5878,14 +5874,12 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
       }
     }
     if (already) {
-      if (!is_import) {
-        /* Remove duplicate include nodes.  Imports stay as metadata. */
-        ast_free(child);
-        for (uint32_t j = i; j + 1 < program->child_count; j++)
-          program->children[j] = program->children[j + 1];
-        program->child_count--;
-        i--; /* Re-check this index */
-      }
+      /* Remove duplicate include nodes. */
+      ast_free(child);
+      for (uint32_t j = i; j + 1 < program->child_count; j++)
+        program->children[j] = program->children[j + 1];
+      program->child_count--;
+      i--; /* Re-check this index */
       continue;
     }
 
@@ -5900,10 +5894,6 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
     size_t src_len = 0;
     char *src = ctx->include_reader(filename, &src_len, ctx->include_user_data);
     if (!src) {
-      /* An import may be metadata-only (the linker/package resolver supplies
-       * it later). Includes remain eager and must name a readable source. */
-      if (is_import)
-        continue;
       char buf[320];
       snprintf(buf, sizeof(buf), "include: cannot read '%s'", filename);
       lower_error(ctx, NULL, buf);
@@ -5968,20 +5958,18 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
       }
     }
 
-    /* ── O(n) splice using memmove (one shift per dependency) ── */
+    /* ── O(n) splice using memmove (one shift per include) ── */
     uint32_t n_new = sub->child_count;
     if (n_new == 0) {
-      if (!is_import) {
-        /* Empty include — remove its directive. */
-        ast_free(child);
-        if (i + 1 < program->child_count)
-          memmove(&program->children[i], &program->children[i + 1],
-                  (program->child_count - i - 1) * sizeof(ast_node_t *));
-        program->child_count--;
-        i--;
-      }
+      /* Empty include — remove its directive. */
+      ast_free(child);
+      if (i + 1 < program->child_count)
+        memmove(&program->children[i], &program->children[i + 1],
+                (program->child_count - i - 1) * sizeof(ast_node_t *));
+      program->child_count--;
+      i--;
     } else {
-      uint32_t needed = program->child_count + n_new - (is_import ? 0 : 1);
+      uint32_t needed = program->child_count + n_new - 1;
       if (needed > AST_MAX_CHILDREN) {
         lower_error(ctx, NULL, "module resolution: too many top-level nodes");
         ast_free(sub);
@@ -5999,11 +5987,7 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
         return -1;
       }
 
-      /* An import stays after its resolved module; an include is replaced. */
-      if (is_import) {
-        memmove(&program->children[i + n_new], &program->children[i],
-                (program->child_count - i) * sizeof(ast_node_t *));
-      } else if (n_new > 1 && i + 1 < program->child_count) {
+      if (n_new > 1 && i + 1 < program->child_count) {
         memmove(&program->children[i + n_new], &program->children[i + 1],
                 (program->child_count - i - 1) * sizeof(ast_node_t *));
       }
@@ -6015,8 +5999,7 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
       }
       program->child_count = needed;
 
-      if (!is_import)
-        ast_free(child);
+      ast_free(child);
 
       /* Re-process position i (first spliced child may itself be an include) */
       i--;

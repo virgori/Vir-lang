@@ -9,10 +9,34 @@ include vec_rt
 import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt
 
 include mir
-import MirOp, MirOperandType, MirOperand, MirInstr, MirBlock, MirFunc, mir_opnd_imm, mir_opnd_vreg, mir_opnd_none, mir_instr_new, mir_block_new, mir_instr_op, mir_instr_dst, mir_instr_src1, mir_instr_src2, mir_block_id, mir_block_head, mir_block_tail, mir_block_successors, mir_block_preds, mir_block_idom, mir_block_dom_children, mir_block_df, mir_block_next_block, mir_block_phis, mir_phi_new, mir_phi_dst, mir_phi_orig_vreg, mir_phi_incoming_values, mir_phi_incoming_blocks, mir_opnd_type, mir_opnd_vreg_id, mir_opnd_imm_val, mir_opnd_block_id, MIR_INTR_BUILTIN from mir
+import MirOp, MirOperandType, MirOperand, MirInstr, MirBlock, MirFunc, mir_opnd_imm, mir_opnd_vreg, mir_opnd_none, mir_instr_new, mir_block_new, mir_instr_op, mir_instr_dst, mir_instr_src1, mir_instr_src2, mir_block_id, mir_block_head, mir_block_replace_head, mir_block_tail, mir_block_successors, mir_block_preds, mir_block_idom, mir_block_dom_children, mir_block_df, mir_block_next_block, mir_block_phis, mir_phi_new, mir_phi_dst, mir_phi_orig_vreg, mir_phi_incoming_values, mir_phi_incoming_blocks, mir_opnd_type, mir_opnd_vreg_id, mir_opnd_imm_val, mir_opnd_block_id, mir_func_name, mir_func_blocks, mir_func_strings, mir_func_next_vreg, MIR_INTR_BUILTIN, MIR_INTR_PARAM, MIR_INTR_SAFE_ACCESS, MIR_INTR_INDEX, MIR_INTR_FIELD, MIR_INTR_ENTITY, MIR_INTR_TUPLE, MIR_INTR_ADDR_OF, MIR_INTR_ARENA, MIR_INTR_PATCH_POINT, MIR_INTR_NOP_MARKER, MIR_INTR_SWIZZLE from mir
+
+include string_rt
+import rt_streq, fat_str_eq from string_rt
 
 var g_mir_opt_last_changes: i64 = 0
 var g_mir_opt_total_changes: i64 = 0
+var g_mir_opt_program: i64 = -1
+var g_mir_opt_current_func: i64 = 0
+
+const MIR_INLINE_MAX_INSTRS: i64 = 40
+const MIR_SROA_MAX_FIELDS: i64 = 4
+const MIR_UNROLL_MAX: i64 = 4
+const MIR_BCE_MARKER: i64 = 77
+const MIR_SHRINK_WRAP_MARKER: i64 = 88
+const MIR_HOT_BLOCK_MARKER: i64 = 99
+const MIR_COLD_BLOCK_MARKER: i64 = 100
+const MIR_ARC_RETAIN: i64 = 201
+const MIR_ARC_RELEASE: i64 = 202
+const MIR_ARC_TRIAL: i64 = 203
+
+func mir_opt_set_program(program: i64):
+    g_mir_opt_program = program
+end.
+
+func mir_opt_set_current_func(func_obj: i64):
+    g_mir_opt_current_func = func_obj
+end.
 
 func mir_opt_reset_counters():
     g_mir_opt_last_changes = 0
@@ -476,16 +500,188 @@ func mir_opt_strength_reduction(blocks: i64):
     out blocks
 end.
 
+func mir_is_control_terminator(op: i64):
+    out op == MirOp.Jump or op == MirOp.JumpIf or op == MirOp.JumpIfNot or op == MirOp.Return
+end.
+
+func mir_block_insert_before_terminator(instrs: i64, ins: MirInstr):
+    n = vec_len_rt(instrs)
+    insert_at = n
+    var scan = n - 1
+    when scan >= 0 loop
+        op = mir_instr_op(vec_get_rt(instrs, scan))
+        if mir_is_control_terminator(op) do
+            insert_at = scan
+        end
+        scan = scan - 1
+    end
+    new_instrs = vec_new_rt()
+    var j = 0
+    when j < n loop
+        if j == insert_at do
+            new_instrs = vec_push_rt(new_instrs, ins)
+        end
+        new_instrs = vec_push_rt(new_instrs, vec_get_rt(instrs, j))
+        j = j + 1
+    end
+    if insert_at == n do
+        new_instrs = vec_push_rt(new_instrs, ins)
+    end
+    out new_instrs
+end.
+
+func mir_find_block_index(blocks: i64, block_id: i64):
+    n_blocks = vec_len_rt(blocks)
+    var i = 0
+    when i < n_blocks loop
+        if mir_block_id(vec_get_rt(blocks, i)) == block_id do out i end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func mir_find_loop_preheader(blocks: i64, hdr_idx: i64, back_edge_body_id: i64):
+    hdr = vec_get_rt(blocks, hdr_idx)
+    preds = mir_block_preds(hdr)
+    if preds < 0 do out 0 - 1 end
+    var pi = 0
+    when pi < vec_len_rt(preds) loop
+        pred_id = vec_get_rt(preds, pi)
+        if pred_id != back_edge_body_id do
+            out mir_find_block_index(blocks, pred_id)
+        end
+        pi = pi + 1
+    end
+    out 0 - 1
+end.
+
+func mir_vreg_defined_in_body(blocks: i64, body_idx: i64, v: i64, except_idx: i64):
+    instrs = mir_block_head(vec_get_rt(blocks, body_idx))
+    if instrs < 0 do out false end
+    var ji = 0
+    when ji < vec_len_rt(instrs) loop
+        if ji != except_idx do
+            ins = vec_get_rt(instrs, ji)
+            if mir_instr_defines_vreg(ins, v) do out true end
+        end
+        ji = ji + 1
+    end
+    out false
+end.
+
+func mir_opt_licm_hoistable(op: i64):
+    if is_pure_mir_op(op) do out true end
+    if op == MirOp.Load do out true end
+    out false
+end.
+
+func mir_opt_licm_operands_invariant(blocks: i64, body_idx: i64, op: i64, ins: MirInstr):
+    s1 = mir_instr_src1(ins)
+    if op == MirOp.Not do
+        out mir_opt_operand_loop_invariant(blocks, body_idx, s1)
+    end
+    if op == MirOp.Load do
+        s2 = mir_instr_src2(ins)
+        out mir_opt_operand_loop_invariant(blocks, body_idx, s1) and mir_opt_operand_loop_invariant(blocks, body_idx, s2)
+    end
+    s2 = mir_instr_src2(ins)
+    out mir_opt_operand_loop_invariant(blocks, body_idx, s1) and mir_opt_operand_loop_invariant(blocks, body_idx, s2)
+end.
+
 ##
  * mir_opt_licm — Loop-Invariant Code Motion.
- * Safe conservative LICM: only operates on pure SSA values that are truly loop-invariant.
+ * Hoists pure invariant ops to the loop preheader (or header before terminator).
  ## 
 func mir_opt_licm(blocks: i64):
+    n_blocks = vec_len_rt(blocks)
+    var hdr_idx = 0
+    when hdr_idx < n_blocks loop
+        hdr = vec_get_rt(blocks, hdr_idx)
+        hdr_id = mir_block_id(hdr)
+        succs = mir_block_successors(hdr)
+        if succs >= 0 do
+            ns = vec_len_rt(succs)
+            var si = 0
+            when si < ns loop
+                body_id = vec_get_rt(succs, si)
+                body_idx = mir_find_block_index(blocks, body_id)
+                if body_idx >= 0 do
+                    preds = mir_block_preds(vec_get_rt(blocks, body_idx))
+                    var is_back_edge = 0
+                    if preds >= 0 do
+                        var pi = 0
+                        when pi < vec_len_rt(preds) loop
+                            if vec_get_rt(preds, pi) == hdr_id do is_back_edge = 1 end
+                            pi = pi + 1
+                        end
+                    end
+                    if is_back_edge == 1 do
+                        pre_idx = mir_find_loop_preheader(blocks, hdr_idx, body_id)
+                        hoist_idx = pre_idx
+                        if hoist_idx < 0 do hoist_idx = hdr_idx end
+                        body = vec_get_rt(blocks, body_idx)
+                        instrs = mir_block_head(body)
+                        hoist_b = vec_get_rt(blocks, hoist_idx)
+                        hoist_instrs = mir_block_head(hoist_b)
+                        if instrs >= 0 and hoist_instrs >= 0 do
+                            n_ins = vec_len_rt(instrs)
+                            var ii = 0
+                            when ii < n_ins loop
+                                ins = vec_get_rt(instrs, ii)
+                                op = mir_instr_op(ins)
+                                if mir_opt_licm_hoistable(op) do
+                                    dst = mir_instr_dst(ins)
+                                    can_hoist = mir_opt_licm_operands_invariant(blocks, body_idx, op, ins)
+                                    if can_hoist and mir_opnd_type(dst) == MirOperandType.VReg do
+                                        dv = mir_opnd_vreg_id(dst)
+                                        if not mir_vreg_defined_in_body(blocks, body_idx, dv, ii) do
+                                            hoisted = mir_instr_new(op, dst, mir_instr_src1(ins), mir_instr_src2(ins))
+                                            hoist_instrs = mir_block_insert_before_terminator(hoist_instrs, hoisted)
+                                            vec_set_rt(instrs, ii, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                            mir_opt_note_change()
+                                        end
+                                    end
+                                end
+                                ii = ii + 1
+                            end
+                            body = mir_block_replace_head(body, instrs)
+                            hoist_b = mir_block_replace_head(hoist_b, hoist_instrs)
+                            vec_set_rt(blocks, body_idx, body)
+                            vec_set_rt(blocks, hoist_idx, hoist_b)
+                        end
+                    end
+                end
+                si = si + 1
+            end
+        end
+        hdr_idx = hdr_idx + 1
+    end
     out blocks
 end.
 
-func mir_opt_bce(blocks: i64):
-    out blocks
+func mir_opt_operand_loop_invariant(blocks: i64, loop_body_idx: i64, opnd: MirOperand):
+    if mir_opnd_type(opnd) == MirOperandType.Imm do out true end
+    if mir_opnd_type(opnd) != MirOperandType.VReg do out false end
+    v = mir_opnd_vreg_id(opnd)
+    if count_vreg_defs_mir(blocks, v) != 1 do out false end
+    n_blocks = vec_len_rt(blocks)
+    var bi = 0
+    when bi < n_blocks loop
+        instrs = mir_block_head(vec_get_rt(blocks, bi))
+        if instrs >= 0 do
+            var ji = 0
+            when ji < vec_len_rt(instrs) loop
+                ins = vec_get_rt(instrs, ji)
+                if mir_instr_defines_vreg(ins, v) do
+                    if bi == loop_body_idx do out false end
+                    out true
+                end
+                ji = ji + 1
+            end
+        end
+        bi = bi + 1
+    end
+    out true
 end.
 
 ##
@@ -507,6 +703,7 @@ func mir_opt_gvn(blocks: i64):
                 if mir_gvn_candidate(op) and mir_opnd_type(dst) == MirOperandType.VReg do
                     s1 = mir_instr_src1(ins)
                     s2 = mir_instr_src2(ins)
+                    var (cs1, cs2) = mir_gvn_canonicalize_pair(op, s1, s2)
                     replacement = mir_opnd_none()
                     found = false
                     var d_idx = 0
@@ -520,7 +717,7 @@ func mir_opt_gvn(blocks: i64):
                                 var j = 0
                                 when j < limit and not found loop
                                     prev = vec_get_rt(d_instrs, j)
-                                    if mir_gvn_expr_same(prev, op, s1, s2) do
+                                    if mir_gvn_expr_same(prev, op, cs1, cs2) do
                                         prev_dst = mir_instr_dst(prev)
                                         if mir_opnd_type(prev_dst) == MirOperandType.VReg do
                                             replacement = prev_dst
@@ -547,7 +744,22 @@ func mir_opt_gvn(blocks: i64):
 end.
 
 func mir_gvn_candidate(op: i64):
+    if op == MirOp.Load or op == MirOp.Not do out true end
     out op == MirOp.Add or op == MirOp.Sub or op == MirOp.Mul or op == MirOp.Div or op == MirOp.Mod or op == MirOp.And or op == MirOp.Or or op == MirOp.Xor or op == MirOp.Shl or op == MirOp.Shr or op == MirOp.CmpEq or op == MirOp.CmpNe or op == MirOp.CmpGt or op == MirOp.CmpLt or op == MirOp.CmpGe or op == MirOp.CmpLe
+end.
+
+func mir_gvn_canonicalize_pair(op: i64, s1: MirOperand, s2: MirOperand):
+    if mir_gvn_commutative(op) do
+        if mir_opnd_type(s1) == MirOperandType.Imm and mir_opnd_type(s2) != MirOperandType.Imm do
+            out (s2, s1)
+        end
+        if mir_opnd_type(s1) == MirOperandType.VReg and mir_opnd_type(s2) == MirOperandType.VReg do
+            if mir_opnd_vreg_id(s1) > mir_opnd_vreg_id(s2) do
+                out (s2, s1)
+            end
+        end
+    end
+    out (s1, s2)
 end.
 
 func mir_gvn_commutative(op: i64):
@@ -558,8 +770,9 @@ func mir_gvn_expr_same(ins: MirInstr, op: i64, s1: MirOperand, s2: MirOperand):
     if mir_instr_op(ins) != op do out false end
     p1 = mir_instr_src1(ins)
     p2 = mir_instr_src2(ins)
-    if mir_opnd_is_same(p1, s1) and mir_opnd_is_same(p2, s2) do out true end
-    if mir_gvn_commutative(op) and mir_opnd_is_same(p1, s2) and mir_opnd_is_same(p2, s1) do out true end
+    var (cs1, cs2) = mir_gvn_canonicalize_pair(op, s1, s2)
+    var (cp1, cp2) = mir_gvn_canonicalize_pair(op, p1, p2)
+    if mir_opnd_is_same(cp1, cs1) and mir_opnd_is_same(cp2, cs2) do out true end
     out false
 end.
 
@@ -574,35 +787,6 @@ func mir_block_index_dominates(blocks: i64, dom_idx: i64, block_idx: i64):
         steps = steps + 1
     end
     out false
-end.
-
-##
- * mir_opt_pre — Partial Redundancy Elimination (Lazy Code Motion).
- ##
-func mir_opt_pre(blocks: i64):
-    out blocks
-end.
-
-##
- * mir_opt_slp — Superword-Level Parallelism (Larsen & Amarasinghe Isomorphic Vector Packing).
- * Identifies contiguous isomorphic load/store chains and pairs them for 128-bit SIMD execution.
- ##
-func mir_opt_slp(blocks: i64):
-    out blocks
-end.
-
-##
- * mir_opt_inlining — Inter-procedural Leaf Function Inlining.
- ##
-func mir_opt_inlining(blocks: i64):
-    out blocks
-end.
-
-##
- * mir_opt_shrink_wrapping — Sinks callee-saved saves/restores into heavy blocks.
- ##
-func mir_opt_shrink_wrapping(blocks: i64):
-    out blocks
 end.
 
 ##
@@ -647,16 +831,6 @@ func mir_opt_jump_threading(blocks: i64):
     out blocks
 end.
 
-func mir_find_block_index(blocks: i64, block_id: i64):
-    n_blocks = vec_len_rt(blocks)
-    var i = 0
-    when i < n_blocks loop
-        if mir_block_id(vec_get_rt(blocks, i)) == block_id do out i end
-        i = i + 1
-    end
-    out 0 - 1
-end.
-
 func mir_trampoline_target(blocks: i64, block_id: i64):
     idx = mir_find_block_index(blocks, block_id)
     if idx < 0 do out 0 - 1 end
@@ -699,52 +873,120 @@ func mir_resolve_trampoline(blocks: i64, target_id: i64):
     out target_id
 end.
 
-##
- * mir_opt_sroa — Scalar Replacement of Aggregates (Promotes small structs to VRegs).
- ##
-func mir_opt_sroa(blocks: i64):
-    out blocks
+const MIR_SCCP_TOP: i64 = 0
+const MIR_SCCP_CONST: i64 = 1
+const MIR_SCCP_OVER: i64 = 2
+
+func mir_sccp_lattice_meet(a_state: i64, a_val: i64, b_state: i64, b_val: i64):
+    if a_state == MIR_SCCP_OVER or b_state == MIR_SCCP_OVER do out (MIR_SCCP_OVER, 0) end
+    if a_state == MIR_SCCP_TOP do out (b_state, b_val) end
+    if b_state == MIR_SCCP_TOP do out (a_state, a_val) end
+    if a_state == MIR_SCCP_CONST and b_state == MIR_SCCP_CONST do
+        if a_val == b_val do out (MIR_SCCP_CONST, a_val) end
+        out (MIR_SCCP_OVER, 0)
+    end
+    out (MIR_SCCP_OVER, 0)
+end.
+
+func mir_sccp_operand_state(opnd: MirOperand, states: i64, values: i64):
+    if mir_opnd_type(opnd) == MirOperandType.Imm do
+        out (MIR_SCCP_CONST, mir_opnd_imm_val(opnd))
+    end
+    if mir_opnd_type(opnd) == MirOperandType.VReg do
+        id = mir_opnd_vreg_id(opnd)
+        if id >= 0 and id < vec_len_rt(states) do
+            st = vec_get_rt(states, id)
+            if st == MIR_SCCP_CONST do out (MIR_SCCP_CONST, vec_get_rt(values, id)) end
+            out (st, 0)
+        end
+    end
+    out (MIR_SCCP_OVER, 0)
+end.
+
+func mir_sccp_try_set(states: i64, values: i64, v: i64, new_state: i64, new_val: i64):
+    if v < 0 or v >= vec_len_rt(states) do out false end
+    old_state = vec_get_rt(states, v)
+    old_val = vec_get_rt(values, v)
+    if old_state == new_state and (new_state != MIR_SCCP_CONST or old_val == new_val) do out false end
+    vec_set_rt(states, v, new_state)
+    if new_state == MIR_SCCP_CONST do vec_set_rt(values, v, new_val) end
+    out true
 end.
 
 ##
- * mir_opt_sccp — Sparse Conditional Constant Propagation (Wegman & Zadeck lattice).
+ * mir_opt_sccp — Sparse Conditional Constant Propagation (lattice + phi meet).
  ##
 func mir_opt_sccp(blocks: i64):
     n_vregs = max_vreg_mir(blocks)
-    known = vec_new_rt()
+    states = vec_new_rt()
     values = vec_new_rt()
     var v = 0
     when v < n_vregs loop
-        known = vec_push_rt(known, 0)
+        states = vec_push_rt(states, MIR_SCCP_TOP)
         values = vec_push_rt(values, 0)
         v = v + 1
     end
 
     changed = true
     var iter = 0
-    when changed and iter < n_vregs loop
+    max_iter = (n_vregs + 1) * (vec_len_rt(blocks) + 1)
+    when changed and iter < max_iter loop
         changed = false
         n_blocks = vec_len_rt(blocks)
         var b_idx = 0
         when b_idx < n_blocks loop
-            instrs = mir_block_head(vec_get_rt(blocks, b_idx))
+            b = vec_get_rt(blocks, b_idx)
+            phis = mir_block_phis(b)
+            if phis >= 0 do
+                var p = 0
+                when p < vec_len_rt(phis) loop
+                    phi = vec_get_rt(phis, p)
+                    dst_v = mir_phi_dst(phi)
+                    inc_vals = mir_phi_incoming_values(phi)
+                    meet_state = MIR_SCCP_TOP
+                    meet_val = 0
+                    var k = 0
+                    when k < vec_len_rt(inc_vals) loop
+                        inc = vec_get_rt(inc_vals, k)
+                        var (ist, ival) = mir_sccp_operand_state(inc, states, values)
+                        var (mst, mval) = mir_sccp_lattice_meet(meet_state, meet_val, ist, ival)
+                        meet_state = mst
+                        meet_val = mval
+                        k = k + 1
+                    end
+                    if mir_sccp_try_set(states, values, dst_v, meet_state, meet_val) do
+                        changed = true
+                    end
+                    p = p + 1
+                end
+            end
+            instrs = mir_block_head(b)
             if instrs >= 0 do
-                n_instrs = vec_len_rt(instrs)
                 var i = 0
-                when i < n_instrs loop
+                when i < vec_len_rt(instrs) loop
                     ins = vec_get_rt(instrs, i)
                     op = mir_instr_op(ins)
                     dst = mir_instr_dst(ins)
                     if mir_op_defines_value(op) and mir_opnd_type(dst) == MirOperandType.VReg do
                         dst_v = mir_opnd_vreg_id(dst)
-                        if dst_v >= 0 and dst_v < n_vregs and count_vreg_value_defs_mir(blocks, dst_v) == 1 do
-                            s1 = mir_sccp_resolve_operand(mir_instr_src1(ins), known, values)
-                            s2 = mir_sccp_resolve_operand(mir_instr_src2(ins), known, values)
-                            var (is_const, const_val) = mir_sccp_eval(op, s1, s2)
-                            if is_const and vec_get_rt(known, dst_v) == 0 do
-                                vec_set_rt(known, dst_v, 1)
-                                vec_set_rt(values, dst_v, const_val)
-                                changed = true
+                        s1 = mir_instr_src1(ins)
+                        s2 = mir_instr_src2(ins)
+                        var (s1_st, s1_val) = mir_sccp_operand_state(s1, states, values)
+                        var (s2_st, s2_val) = mir_sccp_operand_state(s2, states, values)
+                        if s1_st == MIR_SCCP_OVER or s2_st == MIR_SCCP_OVER do
+                            if mir_sccp_try_set(states, values, dst_v, MIR_SCCP_OVER, 0) do changed = true end
+                        eif s1_st == MIR_SCCP_TOP or s2_st == MIR_SCCP_TOP do
+                            # wait for operands
+                        else
+                            rs1_eval = s1
+                            rs2_eval = s2
+                            if s1_st == MIR_SCCP_CONST do rs1_eval = mir_opnd_imm(s1_val) end
+                            if s2_st == MIR_SCCP_CONST do rs2_eval = mir_opnd_imm(s2_val) end
+                            var (is_const, const_val) = mir_sccp_eval(op, rs1_eval, rs2_eval)
+                            if is_const do
+                                if mir_sccp_try_set(states, values, dst_v, MIR_SCCP_CONST, const_val) do changed = true end
+                            else
+                                if mir_sccp_try_set(states, values, dst_v, MIR_SCCP_OVER, 0) do changed = true end
                             end
                         end
                     end
@@ -761,19 +1003,19 @@ func mir_opt_sccp(blocks: i64):
     when bi < n_blocks2 loop
         instrs2 = mir_block_head(vec_get_rt(blocks, bi))
         if instrs2 >= 0 do
-            n_instrs2 = vec_len_rt(instrs2)
             var ii = 0
-            when ii < n_instrs2 loop
+            when ii < vec_len_rt(instrs2) loop
                 ins2 = vec_get_rt(instrs2, ii)
                 op2 = mir_instr_op(ins2)
                 dst2 = mir_instr_dst(ins2)
-                rs1 = mir_sccp_resolve_operand(mir_instr_src1(ins2), known, values)
-                rs2 = mir_sccp_resolve_operand(mir_instr_src2(ins2), known, values)
+                rs1 = mir_sccp_resolve_operand(mir_instr_src1(ins2), states, values)
+                rs2 = mir_sccp_resolve_operand(mir_instr_src2(ins2), states, values)
                 if mir_op_defines_value(op2) and mir_opnd_type(dst2) == MirOperandType.VReg do
                     dv = mir_opnd_vreg_id(dst2)
-                    if dv >= 0 and dv < n_vregs and vec_get_rt(known, dv) == 1 do
-                        if op2 != MirOp.Move or mir_opnd_type(mir_instr_src1(ins2)) != MirOperandType.Imm or mir_opnd_imm_val(mir_instr_src1(ins2)) != vec_get_rt(values, dv) do
-                            vec_set_rt(instrs2, ii, mir_instr_new(MirOp.Move, dst2, mir_opnd_imm(vec_get_rt(values, dv)), mir_opnd_none()))
+                    if dv >= 0 and dv < n_vregs and vec_get_rt(states, dv) == MIR_SCCP_CONST do
+                        cval = vec_get_rt(values, dv)
+                        if op2 != MirOp.Move or mir_opnd_type(mir_instr_src1(ins2)) != MirOperandType.Imm or mir_opnd_imm_val(mir_instr_src1(ins2)) != cval do
+                            vec_set_rt(instrs2, ii, mir_instr_new(MirOp.Move, dst2, mir_opnd_imm(cval), mir_opnd_none()))
                             mir_opt_note_change()
                         end
                     else
@@ -821,10 +1063,10 @@ func count_vreg_value_defs_mir(blocks: i64, target_vreg: i64):
     out defs
 end.
 
-func mir_sccp_resolve_operand(opnd: MirOperand, known: i64, values: i64):
+func mir_sccp_resolve_operand(opnd: MirOperand, states: i64, values: i64):
     if mir_opnd_type(opnd) == MirOperandType.VReg do
         id = mir_opnd_vreg_id(opnd)
-        if id >= 0 and id < vec_len_rt(known) and vec_get_rt(known, id) == 1 do
+        if id >= 0 and id < vec_len_rt(states) and vec_get_rt(states, id) == MIR_SCCP_CONST do
             out mir_opnd_imm(vec_get_rt(values, id))
         end
     end
@@ -842,48 +1084,6 @@ func mir_sccp_eval(op: i64, s1: MirOperand, s2: MirOperand):
         out (false, 0)
     end
     out mir_eval_const_binary(op, mir_opnd_imm_val(s1), mir_opnd_imm_val(s2))
-end.
-
-##
- * mir_opt_dae — Dead Argument Elimination & Arg Promotion across call graph.
- ##
-func mir_opt_dae(blocks: i64):
-    out blocks
-end.
-
-##
- * mir_opt_devirtualization — Devirtualization of monomorphic indirect calls.
- ##
-func mir_opt_devirtualization(blocks: i64):
-    out blocks
-end.
-
-##
- * mir_opt_escape_analysis_and_arena_promotion — 3-Tier automatic stack/arena promotion.
- ##
-func mir_opt_escape_analysis_and_arena_promotion(blocks: i64):
-    out blocks
-end.
-
-##
- * mir_opt_ipo_inline_cascade — Interprocedural Optimization & inlining cascade.
- ##
-func mir_opt_ipo_inline_cascade(blocks: i64):
-    out blocks
-end.
-
-##
- * mir_opt_loop_tiling_fusion_interchange — Polyhedral loop tiling, fusion, and interchange.
- ##
-func mir_opt_loop_tiling_fusion_interchange(blocks: i64):
-    out blocks
-end.
-
-##
- * mir_opt_hot_cold_layout_partitioning — Hot/Cold field splitting & spatial co-location.
- ##
-func mir_opt_hot_cold_layout_partitioning(blocks: i64):
-    out blocks
 end.
 
 func mir_opnd_is_same(o1: MirOperand, o2: MirOperand):
@@ -1173,7 +1373,7 @@ func mir_opt_phi_simplification(blocks: i64):
 end.
 
 func mir_terminates_control(op: i64):
-    out op == MirOp.Jump or op == MirOp.Return
+    out mir_is_control_terminator(op)
 end.
 
 func mir_opt_cfg_simplification(blocks: i64):
@@ -1292,6 +1492,18 @@ end.
 ##
  * mir_opt_arm64_instruction_selection_and_scheduling — Immediate folding & MADD/MSUB fusion.
  ##
+func mir_arm64_trace_vreg_def(instrs: i64, before_idx: i64, vreg: i64):
+  var k = before_idx - 1
+  when k >= 0 loop
+    ins = vec_get_rt(instrs, k)
+    if mir_instr_defines_vreg(ins, vreg) do
+      out ins
+    end
+    k = k - 1
+  end
+  out mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none())
+end.
+
 func mir_opt_arm64_instruction_selection_and_scheduling(blocks: i64):
     n_blocks = vec_len_rt(blocks)
     var b_idx = 0
@@ -1304,40 +1516,54 @@ func mir_opt_arm64_instruction_selection_and_scheduling(blocks: i64):
             when i < n_ins loop
                 ins = vec_get_rt(instrs, i)
                 op = mir_instr_op(ins)
-                
-                # Immediate arithmetic strength reduction
+                dst = mir_instr_dst(ins)
+                s1 = mir_instr_src1(ins)
+                s2 = mir_instr_src2(ins)
+
                 if op == MirOp.Mul do
-                    dst = mir_instr_dst(ins)
-                    s1 = mir_instr_src1(ins)
-                    s2 = mir_instr_src2(ins)
                     if mir_opnd_type(s2) == MirOperandType.Imm do
                         v = mir_opnd_imm_val(s2)
-                        if v == 2 do
-                            vec_set_rt(instrs, i, mir_instr_new(MirOp.Shl, dst, s1, mir_opnd_imm(1)))
-                        eif v == 4 do
-                            vec_set_rt(instrs, i, mir_instr_new(MirOp.Shl, dst, s1, mir_opnd_imm(2)))
-                        eif v == 8 do
-                            vec_set_rt(instrs, i, mir_instr_new(MirOp.Shl, dst, s1, mir_opnd_imm(3)))
-                        eif v == 16 do
-                            vec_set_rt(instrs, i, mir_instr_new(MirOp.Shl, dst, s1, mir_opnd_imm(4)))
+                        if mir_is_pow2(v) do
+                            vec_set_rt(instrs, i, mir_instr_new(MirOp.Shl, dst, s1, mir_opnd_imm(mir_log2(v))))
+                            mir_opt_note_change()
+                        end
+                    eif mir_opnd_type(s1) == MirOperandType.Imm do
+                        v = mir_opnd_imm_val(s1)
+                        if mir_is_pow2(v) do
+                            vec_set_rt(instrs, i, mir_instr_new(MirOp.Shl, dst, s2, mir_opnd_imm(mir_log2(v))))
+                            mir_opt_note_change()
                         end
                     end
                 end
-                
+
+                if op == MirOp.Add do
+                    fused = false
+                    if mir_opnd_type(s1) == MirOperandType.VReg do
+                        mul_ins = mir_arm64_trace_vreg_def(instrs, i, mir_opnd_vreg_id(s1))
+                        if mir_instr_op(mul_ins) == MirOp.Mul do
+                            ma = mir_instr_src1(mul_ins)
+                            mb = mir_instr_src2(mul_ins)
+                            vec_set_rt(instrs, i, mir_instr_new(MirOp.Fma, dst, ma, mb, s2))
+                            mir_opt_note_change()
+                            fused = true
+                        end
+                    end
+                    if not fused and mir_opnd_type(s2) == MirOperandType.VReg do
+                        mul_ins2 = mir_arm64_trace_vreg_def(instrs, i, mir_opnd_vreg_id(s2))
+                        if mir_instr_op(mul_ins2) == MirOp.Mul do
+                            ma2 = mir_instr_src1(mul_ins2)
+                            mb2 = mir_instr_src2(mul_ins2)
+                            vec_set_rt(instrs, i, mir_instr_new(MirOp.Fma, dst, ma2, mb2, s1))
+                            mir_opt_note_change()
+                        end
+                    end
+                end
+
                 i = i + 1
             end
         end
         b_idx = b_idx + 1
     end
-    out blocks
-end.
-
-##
- * mir_opt_neon_simd_vector_lowering — Vectorizes contiguous load/store pairs to SIMD blocks.
- * Automatically identifies candidate scalar loops and vectorizes loop iterations
- * into dual-lane 128-bit SIMD execution blocks.
- ##
-func mir_opt_neon_simd_vector_lowering(blocks: i64):
     out blocks
 end.
 
@@ -1356,24 +1582,53 @@ func mir_opt_zero_cost_abi_and_semantics_tuning(blocks: i64):
             when i < n_ins loop
                 ins = vec_get_rt(instrs, i)
                 op = mir_instr_op(ins)
-                
+                dst = mir_instr_dst(ins)
+                s1 = mir_instr_src1(ins)
+                s2 = mir_instr_src2(ins)
+                s1_t = mir_opnd_type(s1)
+                s2_t = mir_opnd_type(s2)
+
                 if op == MirOp.Move do
-                    dst = mir_instr_dst(ins)
-                    src = mir_instr_src1(ins)
-                    if mir_opnd_is_same(dst, src) do
+                    if mir_opnd_is_same(dst, s1) do
                         vec_set_rt(instrs, i, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                        mir_opt_note_change()
                     end
                 end
-                
+
                 if op == MirOp.Add or op == MirOp.Sub do
-                    dst = mir_instr_dst(ins)
-                    s1 = mir_instr_src1(ins)
-                    s2 = mir_instr_src2(ins)
-                    if mir_opnd_type(s2) == MirOperandType.Imm and mir_opnd_imm_val(s2) == 0 do
+                    if s2_t == MirOperandType.Imm and mir_opnd_imm_val(s2) == 0 do
                         vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, dst, s1, mir_opnd_none()))
+                        mir_opt_note_change()
+                    eif s1_t == MirOperandType.Imm and mir_opnd_imm_val(s1) == 0 and op == MirOp.Add do
+                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, dst, s2, mir_opnd_none()))
+                        mir_opt_note_change()
                     end
                 end
-                
+
+                if op == MirOp.Mul do
+                    if (s2_t == MirOperandType.Imm and mir_opnd_imm_val(s2) == 1) or (s1_t == MirOperandType.Imm and mir_opnd_imm_val(s1) == 1) do
+                        mv_src = s1
+                        if s2_t == MirOperandType.Imm and mir_opnd_imm_val(s2) == 1 do mv_src = s1 end
+                        if s1_t == MirOperandType.Imm and mir_opnd_imm_val(s1) == 1 do mv_src = s2 end
+                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, dst, mv_src, mir_opnd_none()))
+                        mir_opt_note_change()
+                    end
+                end
+
+                if op == MirOp.Div or op == MirOp.Mod do
+                    if s2_t == MirOperandType.Imm and mir_opnd_imm_val(s2) == 1 do
+                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, dst, s1, mir_opnd_none()))
+                        mir_opt_note_change()
+                    end
+                end
+
+                if op == MirOp.Shl or op == MirOp.Shr do
+                    if s2_t == MirOperandType.Imm and mir_opnd_imm_val(s2) == 0 do
+                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, dst, s1, mir_opnd_none()))
+                        mir_opt_note_change()
+                    end
+                end
+
                 i = i + 1
             end
         end
@@ -1446,9 +1701,24 @@ func mir_opt_arm64_addressing_modes_and_register_induction(blocks: i64):
                     dst = mir_instr_dst(ins)
                     ptr = mir_instr_src1(ins)
                     off = mir_instr_src2(ins)
-                    if mir_opnd_type(off) == MirOperandType.Imm and mir_opnd_imm_val(off) == 0 do
-                        if op == MirOp.Load do
-                            vec_set_rt(instrs, i, mir_instr_new(MirOp.Load, dst, ptr, mir_opnd_imm(0)))
+                    if mir_opnd_type(off) == MirOperandType.Imm and mir_opnd_imm_val(off) == 0 and i > 0 do
+                        prev = vec_get_rt(instrs, i - 1)
+                        if mir_instr_op(prev) == MirOp.Add do
+                            add_dst = mir_instr_dst(prev)
+                            if mir_opnd_is_same(add_dst, ptr) do
+                                base = mir_instr_src1(prev)
+                                imm = mir_instr_src2(prev)
+                                if mir_opnd_type(imm) == MirOperandType.Imm do
+                                    if op == MirOp.Load do
+                                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Load, dst, base, imm))
+                                    else
+                                        st_val = mir_instr_src2(ins)
+                                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Store, base, imm, st_val))
+                                    end
+                                    vec_set_rt(instrs, i - 1, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                    mir_opt_note_change()
+                                end
+                            end
                         end
                     end
                 end
@@ -1639,48 +1909,6 @@ func mir_opt_loop_idiom_recognizer(blocks: i64):
     out blocks
 end.
 
-func mir_opt_loop_unroll(blocks: i64):
-    out blocks
-end.
+include mir_opt_advanced
 
-func mir_optimize_all(blocks: i64):
-    mir_opt_reset_counters()
-    blocks = mir_opt_constant_folding(blocks)
-    blocks = mir_opt_algebraic_simplification(blocks)
-    blocks = mir_opt_strength_reduction(blocks)
-    blocks = mir_opt_constant_propagation(blocks)
-    blocks = mir_opt_loop_idiom_recognizer(blocks)
-    blocks = mir_opt_loop_unroll(blocks)
-    blocks = mir_opt_copy_propagation(blocks)
-    blocks = mir_opt_cse(blocks)
-    blocks = mir_opt_ipo_inline_cascade(blocks)
-    blocks = mir_opt_sccp(blocks)
-    blocks = mir_opt_constant_propagation(blocks)
-    blocks = mir_opt_algebraic_simplification(blocks)
-    blocks = mir_opt_branch_folding(blocks)
-    blocks = mir_opt_cfg_simplification(blocks)
-    blocks = mir_opt_phi_simplification(blocks)
-    blocks = mir_opt_gvn(blocks)
-    blocks = mir_opt_devirtualization(blocks)
-    blocks = mir_opt_dae(blocks)
-    blocks = mir_opt_escape_analysis_and_arena_promotion(blocks)
-    blocks = mir_opt_inline_bump_arena_fastpath(blocks)
-    blocks = mir_opt_hot_cold_layout_partitioning(blocks)
-    blocks = mir_opt_loop_tiling_fusion_interchange(blocks)
-    blocks = mir_opt_slp(blocks)
-    blocks = mir_opt_neon_simd_vector_lowering(blocks)
-    blocks = mir_opt_redundant_load_store_elimination(blocks)
-    blocks = mir_opt_arm64_addressing_modes_and_register_induction(blocks)
-    blocks = mir_opt_arm64_instruction_selection_and_scheduling(blocks)
-    blocks = mir_opt_zero_cost_abi_and_semantics_tuning(blocks)
-    blocks = mir_opt_jump_threading(blocks)
-    blocks = mir_opt_sroa(blocks)
-    blocks = mir_opt_copy_propagation(blocks)
-    blocks = mir_opt_branch_folding(blocks)
-    blocks = mir_opt_cfg_simplification(blocks)
-    blocks = mir_opt_shrink_wrapping(blocks)
-    blocks = mir_opt_dce(blocks)
-    out blocks
-end.
-
-export mir_opt_constant_folding, mir_opt_constant_propagation, mir_opt_copy_propagation, mir_opt_cse, mir_opt_dce, mir_opt_bce, mir_opt_strength_reduction, mir_opt_loop_unroll, mir_opt_licm, mir_opt_gvn, mir_opt_pre, mir_opt_slp, mir_opt_inlining, mir_opt_shrink_wrapping, mir_opt_jump_threading, mir_opt_sroa, mir_opt_sccp, mir_opt_dae, mir_opt_devirtualization, mir_opt_escape_analysis_and_arena_promotion, mir_opt_ipo_inline_cascade, mir_opt_loop_tiling_fusion_interchange, mir_opt_loop_idiom_recognizer, mir_opt_hot_cold_layout_partitioning, mir_opt_redundant_load_store_elimination, mir_opt_arm64_instruction_selection_and_scheduling, mir_opt_neon_simd_vector_lowering, mir_opt_zero_cost_abi_and_semantics_tuning, mir_opt_inline_bump_arena_fastpath, mir_opt_arm64_addressing_modes_and_register_induction, mir_opt_algebraic_simplification, mir_opt_branch_folding, mir_opt_phi_simplification, mir_opt_cfg_simplification, mir_opt_reset_counters, mir_opt_get_last_changes, mir_opt_get_total_changes, mir_optimize_all
+export mir_opt_set_program, mir_opt_set_current_func, mir_opt_constant_folding, mir_opt_constant_propagation, mir_opt_copy_propagation, mir_opt_cse, mir_opt_dce, mir_opt_bce, mir_opt_strength_reduction, mir_opt_loop_unroll, mir_opt_licm, mir_opt_ivsr, mir_opt_symbolic_loop_collapse, mir_opt_gvn, mir_opt_pre, mir_opt_slp, mir_opt_inlining, mir_opt_shrink_wrapping, mir_opt_jump_threading, mir_opt_sroa, mir_opt_sccp, mir_opt_dae, mir_opt_devirtualization, mir_opt_escape_analysis_and_arena_promotion, mir_opt_ipo_inline_cascade, mir_opt_loop_tiling_fusion_interchange, mir_opt_loop_idiom_recognizer, mir_opt_hot_cold_layout_partitioning, mir_opt_redundant_load_store_elimination, mir_opt_arm64_instruction_selection_and_scheduling, mir_opt_neon_simd_vector_lowering, mir_opt_zero_cost_abi_and_semantics_tuning, mir_opt_inline_bump_arena_fastpath, mir_opt_arm64_addressing_modes_and_register_induction, mir_opt_algebraic_simplification, mir_opt_branch_folding, mir_opt_phi_simplification, mir_opt_cfg_simplification, mir_opt_arc_trial_deletion, mir_opt_reset_counters, mir_opt_get_last_changes, mir_opt_get_total_changes
