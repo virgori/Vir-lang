@@ -861,7 +861,7 @@ int lexer_tokenize(vir_lexer_t *lex) {
     case '/':
       single_sym = TOK_SLASH;
       break;
-    case '%': single_sym = TOK_PERCENT; printf("LEXER: tokenized %% as TOK_PERCENT\n"); break;
+    case '%':
       single_sym = TOK_PERCENT;
       break;
     case '^':
