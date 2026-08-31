@@ -1,35 +1,37 @@
 #!/bin/bash
-# Self-Hosting Lifecycle: Compile Vir using Vir native compiler
+# Self-host cycle: stable bin/virc → compile virc.vri full → dist/virc-next.
+# Backs up bin/virc before any install. NO C-VM. NO virc_stage1.vri.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=tools/virc_bin.sh
+source tools/virc_bin.sh
 
-echo "=== Vir Self-Hosting Cycle ==="
+echo "=== Vir Full Compiler Self-Host Cycle ==="
 
-CURRENT_COMPILER="./bin/virc"
-if [ ! -f "$CURRENT_COMPILER" ]; then
-    echo "Current compiler $CURRENT_COMPILER not found. Using dist/virc-stage2..."
-    cp dist/virc-stage2 bin/virc
+STABLE="$(virc_resolve)"
+if [ ! -x "$STABLE" ]; then
+    echo "ERROR: no stable compiler. Restore bin/virc or run install.sh"
+    exit 1
 fi
 
-echo "Step 1: Compiling new virc from virc_stage1.vri using current $CURRENT_COMPILER..."
-"$CURRENT_COMPILER" virc_stage1.vri -o dist/virc-next
+echo "Step 1: Backup stable bin/virc..."
+virc_backup_stable
 
-echo "Step 2: Signing newly compiled binary..."
-codesign -s - -f dist/virc-next >/dev/null 2>&1 || true
-chmod +x dist/virc-next
+echo "Step 2: Compile virc.vri full → dist/virc-next (using $STABLE)..."
+bash tools/promote_virc.sh
 
-echo "Step 3: Smoke testing dist/virc-next..."
-dist/virc-next tests/bootstrap_codegen/cg_arith.vri -o /tmp/smoke_test
-codesign -s - -f /tmp/smoke_test >/dev/null 2>&1 || true
-/tmp/smoke_test >/dev/null 2>&1
+echo "Step 3: Verify bootstrap suite with experimental compiler..."
+bash tools/test_native.sh dist/virc-next
 
-echo "Step 4: Installing new binary to bin/virc..."
+echo "Step 4: Install experimental → bin/virc (backed up above)..."
 cp dist/virc-next bin/virc
-codesign -s - -f bin/virc >/dev/null 2>&1 || true
-chmod +x bin/virc
+virc_sign bin/virc
 
-echo "Step 5: Verifying full test suite with new bin/virc..."
-bash tools/test_native.sh
+echo "Step 5: Fixed-point check (re-compile with new bin)..."
+bash tools/promote_virc.sh
+NEW_SIZE=$(stat -f%z dist/virc-next 2>/dev/null || stat -c%s dist/virc-next)
+OLD_SIZE=$(stat -f%z bin/virc 2>/dev/null || stat -c%s bin/virc)
+echo "bin/virc=$OLD_SIZE bytes, dist/virc-next=$NEW_SIZE bytes"
 
 echo ""
-echo ">>> SELF-HOSTING CYCLE COMPLETE: 100% Native Vir Success! <<<"
+echo ">>> SELF-HOST CYCLE COMPLETE <<<"

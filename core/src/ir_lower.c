@@ -933,7 +933,8 @@ static record_type_t *record_type_for_symbol(lower_ctx_t *ctx,
       return rt;
     }
   }
-  if (strncmp(name, "lex", 3) == 0) {
+  if (strncmp(name, "lex", 3) == 0 || strcmp(name, "lexer") == 0 ||
+      strcmp(name, "held_source") == 0 || strcmp(name, "held_src") == 0) {
     record_type_t *rt = find_record_type(ctx, "Lexer");
     if (rt) {
       if (out_type_name) *out_type_name = "Lexer";
@@ -1048,6 +1049,14 @@ static void infer_func_return_type(lower_ctx_t *ctx,
   }
 }
 
+static const char *expr_identifier_name(const ast_node_t *expr) {
+  if (!expr)
+    return NULL;
+  if (expr->type == AST_IDENTIFIER && expr->name[0])
+    return expr->name;
+  return NULL;
+}
+
 static int record_field_offset_for_expr(lower_ctx_t *ctx,
                                         const ast_node_t *base_expr,
                                         const char *field,
@@ -1066,6 +1075,21 @@ static int record_field_offset_for_expr(lower_ctx_t *ctx,
       if (out_rt)
         *out_rt = typed_rt;
       return off;
+    }
+  }
+
+  {
+    const char *sym = expr_identifier_name(base_expr);
+    if (sym) {
+      record_type_t *sym_rt = record_type_for_symbol(ctx, sym, NULL);
+      if (sym_rt) {
+        int off = record_field_offset(sym_rt, field);
+        if (off >= 0) {
+          if (out_rt)
+            *out_rt = sym_rt;
+          return off;
+        }
+      }
     }
   }
 

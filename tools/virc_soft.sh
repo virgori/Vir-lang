@@ -1,16 +1,16 @@
 #!/bin/bash
-# Wrapper: run the soft self-hosted compiler (stdlib/vir/compiler/virc.vri)
-# under the C-core VM, so it can be passed to test_native.sh as $VIRC.
-# Usage: tools/virc_soft.sh <input.vri> -o <output> [--target ...] [--format ...]
+# Wrapper: run native Vir compiler (stable bin/virc or dist/virc-next). NO C-VM.
+set -euo pipefail
 cd "$(dirname "$0")/.."
+# shellcheck source=tools/virc_bin.sh
+source tools/virc_bin.sh
+
 EXTRA_ARGS=()
 if [ "$(uname -s)" = "Linux" ]; then
     if [[ ! "$*" =~ "--format" ]]; then
         EXTRA_ARGS+=(--format elf)
     fi
 fi
-if [ -f "./bin/virc" ]; then
-    exec ./bin/virc "$@"
-fi
 
-exec ./core/build/vir run stdlib/vir/compiler/virc.vri -- "$@" "${EXTRA_ARGS[@]}"
+VIRC_BIN="$(virc_resolve)"
+exec "$VIRC_BIN" "$@" "${EXTRA_ARGS[@]}"
