@@ -259,8 +259,8 @@ int vir_register_multi_keyword(const char *w1, const char *w2, const char *w3,
                                vir_tok_t type);
 int vir_register_stop_word(const char *word);
 
-/* §28 SubLib Adapter — call once at startup to register all CJK and
- * Vietnamese keyword aliases. Defined in sublib_adapter.c. */
+/* §28 SubLib Adapter — optional C hook (no-op by default).
+ * Language aliases: import stdlib/vir/lang/lang_*.vri in Vir source. */
 void vir_sublib_adapter_init(void);
 
 #ifdef __cplusplus

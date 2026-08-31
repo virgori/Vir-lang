@@ -468,7 +468,7 @@ consume_suffix:
  * String Lexing
  * ═══════════════════════════════════════════════════════ */
 
-static int lex_string(vir_lexer_t *lex, vir_token_t *tok) {
+static int lex_string_interp(vir_lexer_t *lex, vir_token_t *tok, int is_interp) {
   tok->type = TOK_STRING;
   tok->line = lex->line;
   tok->col = lex->col;
@@ -509,24 +509,67 @@ static int lex_string(vir_lexer_t *lex, vir_token_t *tok) {
         break;
       }
     } else if (lex_peek(lex) == '$') {
-      /* String interpolation: $identifier */
-      /* Mark the position where interpolation starts */
-      if (n < TOK_STR_MAX - 1)
-        tok->str.buf[n++] = '\x01'; /* Use \x01 as interpolation marker */
-      lex_advance(lex);             /* consume $ */
-
-      /* Read the identifier name */
-      while (!lex_eof(lex) &&
-             (isalnum(lex_peek(lex)) || lex_peek(lex) == '_')) {
-        if (n < TOK_STR_MAX - 1)
-          tok->str.buf[n++] = (char)lex_advance(lex);
-        else
-          lex_advance(lex); /* overflow: skip */
+      /* $ident or ${ident} inside string */
+      lex_advance(lex); /* consume $ */
+      int has_brace = 0;
+      if (lex_peek(lex) == '{') {
+        has_brace = 1;
+        lex_advance(lex); /* consume { */
       }
 
-      /* Mark the end of interpolation */
-      if (n < TOK_STR_MAX - 1)
-        tok->str.buf[n++] = '\x02'; /* Use \x02 as end marker */
+      /* Check if next character is a valid identifier start */
+      if (!lex_eof(lex) && (isalpha(lex_peek(lex)) || lex_peek(lex) == '_')) {
+        if (n < TOK_STR_MAX - 1)
+          tok->str.buf[n++] = '\x01'; /* marker start */
+
+        while (!lex_eof(lex) &&
+               (isalnum(lex_peek(lex)) || lex_peek(lex) == '_')) {
+          if (n < TOK_STR_MAX - 1)
+            tok->str.buf[n++] = (char)lex_advance(lex);
+          else
+            lex_advance(lex);
+        }
+
+        if (has_brace && lex_peek(lex) == '}') {
+          lex_advance(lex); /* consume } */
+        }
+
+        if (n < TOK_STR_MAX - 1)
+          tok->str.buf[n++] = '\x02'; /* marker end */
+      } else {
+        /* Not an identifier: keep $ (and { if consumed) literally */
+        if (n < TOK_STR_MAX - 1)
+          tok->str.buf[n++] = '$';
+        if (has_brace && n < TOK_STR_MAX - 1)
+          tok->str.buf[n++] = '{';
+      }
+    } else if (is_interp && lex_peek(lex) == '{') {
+      /* {ident} inside $"..." prefix strings */
+      unsigned char next_c = lex_peek_at(lex, 1);
+      if (isalpha(next_c) || next_c == '_') {
+        lex_advance(lex); /* consume { */
+        if (n < TOK_STR_MAX - 1)
+          tok->str.buf[n++] = '\x01';
+
+        while (!lex_eof(lex) &&
+               (isalnum(lex_peek(lex)) || lex_peek(lex) == '_')) {
+          if (n < TOK_STR_MAX - 1)
+            tok->str.buf[n++] = (char)lex_advance(lex);
+          else
+            lex_advance(lex);
+        }
+
+        if (lex_peek(lex) == '}') {
+          lex_advance(lex); /* consume } */
+        }
+
+        if (n < TOK_STR_MAX - 1)
+          tok->str.buf[n++] = '\x02';
+      } else {
+        /* Not a valid identifier, keep '{' as literal */
+        if (n < TOK_STR_MAX - 1)
+          tok->str.buf[n++] = (char)lex_advance(lex);
+      }
     } else {
       if (n < TOK_STR_MAX - 1)
         tok->str.buf[n++] = (char)lex_advance(lex);
@@ -546,6 +589,10 @@ static int lex_string(vir_lexer_t *lex, vir_token_t *tok) {
   tok->str.buf[n] = '\0';
   tok->str.len = (uint32_t)n;
   return 0;
+}
+
+static int lex_string(vir_lexer_t *lex, vir_token_t *tok) {
+  return lex_string_interp(lex, tok, 0);
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -666,9 +713,18 @@ int lexer_tokenize(vir_lexer_t *lex) {
     }
 
     /* ── String literal ─────────────────────────────── */
+    int is_interp_prefix = 0;
+    if (c == '$' && (lex_peek_at(lex, 1) == '"' || lex_peek_at(lex, 1) == '\'')) {
+      is_interp_prefix = 1;
+      lex_advance(lex); /* consume $ */
+      c = lex_peek(lex);
+    }
     if (c == '"' || c == '\'') {
       vir_token_t tok = {0};
-      lex_string(lex, &tok);
+      if (is_interp_prefix)
+        lex_string_interp(lex, &tok, 1);
+      else
+        lex_string(lex, &tok);
       lex_push_token(lex, tok); 
       continue;
     }

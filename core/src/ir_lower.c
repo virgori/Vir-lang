@@ -30,6 +30,27 @@ ast_node_t *ast_new(ast_type_t type) {
   return n;
 }
 
+static int ast_reserve_children(ast_node_t *node, uint32_t needed) {
+  if (!node || needed > AST_MAX_CHILDREN)
+    return -1;
+  if (needed <= node->child_capacity)
+    return 0;
+
+  uint32_t cap = node->child_capacity ? node->child_capacity : 4u;
+  while (cap < needed && cap < AST_MAX_CHILDREN / 2u)
+    cap *= 2u;
+  if (cap < needed)
+    cap = AST_MAX_CHILDREN;
+
+  ast_node_t **children = (ast_node_t **)realloc(
+      node->children, (size_t)cap * sizeof(*children));
+  if (!children)
+    return -1;
+  node->children = children;
+  node->child_capacity = cap;
+  return 0;
+}
+
 int ast_add_child(ast_node_t *parent, ast_node_t *child) {
   if (!parent || !child)
     return -1;
@@ -38,6 +59,8 @@ int ast_add_child(ast_node_t *parent, ast_node_t *child) {
             AST_MAX_CHILDREN, parent->type, child->type, child->name ? child->name : "");
     return -1;
   }
+  if (ast_reserve_children(parent, parent->child_count + 1u) != 0)
+    return -1;
   parent->children[parent->child_count++] = child;
   return 0;
 }
@@ -47,6 +70,7 @@ void ast_free(ast_node_t *node) {
     return;
   for (uint32_t i = 0; i < node->child_count; i++)
     ast_free(node->children[i]);
+  free(node->children);
   free(node);
 }
 
@@ -93,11 +117,38 @@ int sym_lookup(const symbol_table_t *st, const char *name, uint32_t *vreg) {
  * ═══════════════════════════════════════════════════════ */
 
 void lower_init(lower_ctx_t *ctx, const char *module_name) {
-  memset(ctx, 0, sizeof(*ctx));
+  /* lower_ctx_t contains deliberately generous fixed-capacity enum and
+   * record metadata tables.  Clearing the entire context touches hundreds of
+   * megabytes of otherwise-unused virtual memory on every compiler startup.
+   * Only counters make those tables live, so initialize the active state and
+   * leave unused entries untouched until they are populated. */
   q_module_init(&ctx->module, module_name);
   q_vreg_alloc_init(&ctx->vreg_alloc);
   sym_init(&ctx->symbols);
   sym_init(&ctx->global_symbols);
+  ctx->global_index_counter = 0;
+  ctx->label_counter = 0;
+  ctx->patch_counter = 0;
+  ctx->pipeline_label_base = 0;
+  ctx->enum_type_count = 0;
+  ctx->record_type_count = 0;
+  ctx->func_return_type_count = 0;
+  ctx->bit_type_count = 0;
+  ctx->loop_depth = 0;
+  ctx->module_alias_count = 0;
+  ctx->imported_sym_count = 0;
+  ctx->include_reader = NULL;
+  ctx->include_user_data = NULL;
+  ctx->include_search_path_count = 0;
+  ctx->included_file_count = 0;
+  ctx->current_func = NULL;
+  ctx->interval_count = 0;
+  ctx->error_count = 0;
+  ctx->last_error[0] = '\0';
+  ctx->stmt_borrow_count = 0;
+  ctx->map_arr_vreg = 0;
+  ctx->in_map_expr = 0;
+  ctx->arena_depth = 0;
 }
 
 #include "diagnostic.h"
@@ -676,6 +727,38 @@ static void emit(lower_ctx_t *ctx, q_instruction_t instr) {
 }
 
 /* ═══════════════════════════════════════════════════════
+ * String Identification Helpers
+ * ═══════════════════════════════════════════════════════ */
+
+static int symbol_is_string_value(const symbol_entry_t *ent) {
+  if (!ent) return 0;
+  if (ent->type_name[0] &&
+      (strcmp(ent->type_name, "string") == 0 ||
+       strcmp(ent->type_name, "str") == 0 ||
+       strcmp(ent->type_name, "chuỗi") == 0)) {
+    return 1;
+  }
+  return 0;
+}
+
+static int expr_is_string_value(lower_ctx_t *ctx, const ast_node_t *expr) {
+  if (!expr) return 0;
+  if (expr->type == AST_LITERAL_STR) return 1;
+  if (expr->type == AST_BUILTIN_CALL &&
+      (expr->builtin_id == BUILTIN_STR_CAT ||
+       expr->builtin_id == BUILTIN_I_TO_STR)) {
+    return 1;
+  }
+  if (expr->type == AST_IDENTIFIER) {
+    symbol_entry_t *ent = NULL;
+    if (sym_lookup_entry_both(ctx, expr->name, &ent, NULL) >= 0 && ent) {
+      return symbol_is_string_value(ent);
+    }
+  }
+  return 0;
+}
+
+/* ═══════════════════════════════════════════════════════
  * Enum / Record Type Lookup Helpers
  * ═══════════════════════════════════════════════════════ */
 
@@ -717,6 +800,76 @@ static record_type_t *find_record_type(lower_ctx_t *ctx, const char *name) {
     }
   }
   return NULL;
+}
+
+/* §4.8.5 GlobalEscape: copy arena-backed return value into FFI heap. */
+static int lower_promote_return(lower_ctx_t *ctx, const ast_node_t *expr,
+                                int val) {
+  if (val < 0 || !expr || !ast_produces_move_type(expr))
+    return val;
+
+  const ast_node_t *u = ast_unwrap_borrow(expr);
+  if (u && u->type == AST_IDENTIFIER) {
+    symbol_entry_t *ent = NULL;
+    if (sym_lookup_entry_both(ctx, u->name, &ent, NULL) == 0 && ent) {
+      if (ent->is_dict)
+        return val;
+    }
+  }
+
+  record_type_t *rt = NULL;
+  if (u && u->type == AST_IDENTIFIER) {
+    rt = find_record_type(ctx, u->name);
+    if (!rt) {
+      symbol_entry_t *ent = NULL;
+      if (sym_lookup_entry_both(ctx, u->name, &ent, NULL) == 0 && ent &&
+          ent->type_name[0])
+        rt = find_record_type(ctx, ent->type_name);
+    }
+  }
+  if (expr->type == AST_RECORD_LITERAL && expr->name[0])
+    rt = find_record_type(ctx, expr->name);
+
+  if (rt && rt->field_count > 0) {
+    uint32_t sz_r = fresh_vreg(ctx);
+    uint32_t heap_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_LOAD, q_vreg(sz_r),
+                      q_imm((int64_t)rt->field_count * 8), q_none()));
+    emit(ctx, q_instr(Q_HEAP_ALLOC, q_vreg(heap_r), q_vreg(sz_r), q_none()));
+    emit(ctx, q_instr(Q_MEM_COPY, q_vreg(heap_r), q_vreg((uint32_t)val),
+                      q_vreg(sz_r)));
+    return (int)heap_r;
+  }
+
+  int is_string = 0;
+  if (expr->type == AST_LITERAL_STR)
+    is_string = 1;
+  if (expr->type == AST_BUILTIN_CALL &&
+      (expr->builtin_id == BUILTIN_STR_CAT ||
+       expr->builtin_id == BUILTIN_I_TO_STR))
+    is_string = 1;
+  if (u && u->type == AST_IDENTIFIER) {
+    symbol_entry_t *ent = NULL;
+    if (sym_lookup_entry_both(ctx, u->name, &ent, NULL) == 0 && ent) {
+      if (symbol_is_string_value(ent))
+        is_string = 1;
+    }
+  }
+  if (is_string) {
+    uint32_t len_r = fresh_vreg(ctx);
+    uint32_t one_r = fresh_vreg(ctx);
+    uint32_t sz_r = fresh_vreg(ctx);
+    uint32_t heap_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_STR_LEN, q_vreg(len_r), q_vreg((uint32_t)val), q_none()));
+    emit(ctx, q_instr(Q_LOAD, q_vreg(one_r), q_imm(1), q_none()));
+    emit(ctx, q_instr(Q_ADD, q_vreg(sz_r), q_vreg(len_r), q_vreg(one_r)));
+    emit(ctx, q_instr(Q_HEAP_ALLOC, q_vreg(heap_r), q_vreg(sz_r), q_none()));
+    emit(ctx, q_instr(Q_MEM_COPY, q_vreg(heap_r), q_vreg((uint32_t)val),
+                      q_vreg(sz_r)));
+    return (int)heap_r;
+  }
+
+  return val;
 }
 
 static int record_field_offset(const record_type_t *rt, const char *field) {
@@ -1562,30 +1715,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     if (expr->op == OP_ADD && expr->child_count >= 2) {
       const ast_node_t *left = expr->children[0];
       const ast_node_t *right = expr->children[1];
-      int is_string_concat = 0;
-
-      /* Check if either operand is a string */
-      if (left->type == AST_LITERAL_STR || right->type == AST_LITERAL_STR) {
-        is_string_concat = 1;
-      } else {
-        /* Check if variables are strings */
-        if (left->type == AST_IDENTIFIER) {
-          symbol_entry_t *ent = NULL;
-          if (sym_lookup_entry_both(ctx, left->name, &ent, NULL) >= 0 && ent) {
-            if (ent->type == VIR_TYPE_PTR) {
-              is_string_concat = 1;
-            }
-          }
-        }
-        if (!is_string_concat && right->type == AST_IDENTIFIER) {
-          symbol_entry_t *ent = NULL;
-          if (sym_lookup_entry_both(ctx, right->name, &ent, NULL) >= 0 && ent) {
-            if (ent->type == VIR_TYPE_PTR) {
-              is_string_concat = 1;
-            }
-          }
-        }
-      }
+      int is_string_concat = expr_is_string_value(ctx, left) || expr_is_string_value(ctx, right);
 
       if (is_string_concat) {
         /* Emit Q_STR_CAT for string concatenation */
@@ -1740,6 +1870,43 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
   }
 
   case AST_CALL: {
+    /* FFI heap API — not arena bump (§4.5 / MEMORY_MANAGEMENT.md). */
+    if (expr->name) {
+      if ((strcmp(expr->name, "vir_alloc") == 0 ||
+           strcmp(expr->name, "heap_alloc") == 0) &&
+          expr->child_count >= 1) {
+        int size = lower_expr(ctx, expr->children[0]);
+        if (size < 0)
+          return -1;
+        uint32_t rd = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_HEAP_ALLOC, q_vreg(rd), q_vreg((uint32_t)size),
+                          q_none()));
+        return (int)rd;
+      }
+      if ((strcmp(expr->name, "vir_free") == 0 ||
+           strcmp(expr->name, "heap_free") == 0) &&
+          expr->child_count >= 1) {
+        int ptr = lower_expr(ctx, expr->children[0]);
+        if (ptr < 0)
+          return -1;
+        emit(ctx, q_instr(Q_FREE, q_none(), q_vreg((uint32_t)ptr), q_none()));
+        return emit_soft_zero(ctx);
+      }
+      if ((strcmp(expr->name, "vir_realloc") == 0 ||
+           strcmp(expr->name, "heap_realloc") == 0) &&
+          expr->child_count >= 2) {
+        int ptr = lower_expr(ctx, expr->children[0]);
+        int size = lower_expr(ctx, expr->children[1]);
+        if (ptr < 0 || size < 0)
+          return -1;
+        uint32_t rd = fresh_vreg(ctx);
+        emit(ctx, q_instr(Q_REALLOC, q_vreg(rd), q_vreg((uint32_t)ptr),
+                          q_vreg((uint32_t)size)));
+        return (int)rd;
+      }
+      if (strcmp(expr->name, "heap_init") == 0)
+        return emit_soft_zero(ctx);
+    }
     /* Function call: evaluate args, put in R0..Rn, call, result in R0 */
     int fidx = find_func_index(ctx, expr->name);
     /* Empty extern stubs (body_count==0) for soft/native_* names must not
@@ -1810,7 +1977,8 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
             uint32_t sz_r = fresh_vreg(ctx);
             uint32_t ptr_r = fresh_vreg(ctx);
             emit(ctx, q_instr(Q_LOAD, q_vreg(sz_r), q_imm(16), q_none()));
-            emit(ctx, q_instr(Q_ALLOC, q_vreg(ptr_r), q_vreg(sz_r), q_none()));
+            emit(ctx, q_instr(Q_HEAP_ALLOC, q_vreg(ptr_r), q_vreg(sz_r),
+                              q_none()));
             uint32_t tag_r = fresh_vreg(ctx);
             uint32_t off0 = fresh_vreg(ctx);
             emit(ctx, q_instr(Q_LOAD, q_vreg(tag_r), q_imm(variant_tag),
@@ -1840,7 +2008,8 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
           uint32_t ptr_r = fresh_vreg(ctx);
           emit(ctx, q_instr(Q_LOAD, q_vreg(sz_r),
                             q_imm((int64_t)rt->field_count * 8), q_none()));
-          emit(ctx, q_instr(Q_ALLOC, q_vreg(ptr_r), q_vreg(sz_r), q_none()));
+          emit(ctx, q_instr(Q_HEAP_ALLOC, q_vreg(ptr_r), q_vreg(sz_r),
+                            q_none()));
           /* Store each child:
            *   AST_NAMED_ARG → use name → field offset
            *   positional    → use index as field index */
@@ -1918,7 +2087,8 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
           int size = lower_expr(ctx, expr->children[0]);
           if (size < 0) return -1;
           uint32_t rd = fresh_vreg(ctx);
-          emit(ctx, q_instr(Q_ALLOC, q_vreg(rd), q_vreg((uint32_t)size), q_none()));
+          emit(ctx, q_instr(Q_HEAP_ALLOC, q_vreg(rd), q_vreg((uint32_t)size),
+                            q_none()));
           return (int)rd;
         }
         if (strcmp(expr->name, "native_calloc") == 0 && expr->child_count >= 2) {
@@ -1929,7 +2099,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
           uint32_t rd = fresh_vreg(ctx);
           emit(ctx, q_instr(Q_MUL, q_vreg(bytes), q_vreg((uint32_t)count),
                             q_vreg((uint32_t)size)));
-          emit(ctx, q_instr(Q_ALLOC, q_vreg(rd), q_vreg(bytes), q_none()));
+          emit(ctx, q_instr(Q_HEAP_ALLOC, q_vreg(rd), q_vreg(bytes), q_none()));
           return (int)rd;
         }
         if (strcmp(expr->name, "native_free") == 0 ||
@@ -2301,6 +2471,11 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
         }
 
         uint32_t var_r = ent->vreg;
+        if (!symbol_is_string_value(ent)) {
+          uint32_t str_r = fresh_vreg(ctx);
+          emit(ctx, q_instr(Q_I_TO_STR, q_vreg(str_r), q_vreg(var_r), q_none()));
+          var_r = str_r;
+        }
 
         /* Concatenate with result */
         if (first_part) {
@@ -2623,7 +2798,8 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
       break;
     case BUILTIN_ALLOC:
       if (a0 >= 0)
-        emit(ctx, q_instr(Q_ALLOC, q_vreg(rd), q_vreg((uint32_t)a0), q_none()));
+        emit(ctx, q_instr(Q_HEAP_ALLOC, q_vreg(rd), q_vreg((uint32_t)a0),
+                          q_none()));
       break;
     case BUILTIN_FREE_MEM:
       if (a0 >= 0)
@@ -3031,7 +3207,8 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
         uint32_t ptr_r = fresh_vreg(ctx);
         emit(ctx, q_instr(Q_LOAD, q_vreg(sz_r),
                           q_imm((int64_t)expr->child_count * 8), q_none()));
-        emit(ctx, q_instr(Q_ALLOC, q_vreg(ptr_r), q_vreg(sz_r), q_none()));
+        emit(ctx, q_instr(Q_HEAP_ALLOC, q_vreg(ptr_r), q_vreg(sz_r),
+                          q_none()));
         for (uint32_t i = 0; i < expr->child_count; i++) {
           const ast_node_t *child = expr->children[i];
           if (!child)
@@ -3064,7 +3241,7 @@ int lower_expr(lower_ctx_t *ctx, const ast_node_t *expr) {
     uint32_t ptr_r = fresh_vreg(ctx);
     emit(ctx, q_instr(Q_LOAD, q_vreg(sz_r), q_imm((int64_t)rt->field_count * 8),
                       q_none()));
-    emit(ctx, q_instr(Q_ALLOC, q_vreg(ptr_r), q_vreg(sz_r), q_none()));
+    emit(ctx, q_instr(Q_HEAP_ALLOC, q_vreg(ptr_r), q_vreg(sz_r), q_none()));
     /* Store each field value at its offset */
     for (uint32_t i = 0; i < expr->child_count; i++) {
       const ast_node_t *child = expr->children[i];
@@ -3910,9 +4087,14 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     /* §4.8: locate the just-defined entry and classify its type. */
     symbol_entry_t *new_ent = NULL;
     sym_lookup_entry_both(ctx, stmt->name, &new_ent, NULL);
-    if (new_ent && stmt->name2[0]) {
-      strncpy(new_ent->type_name, stmt->name2, AST_NAME_LEN - 1);
-      new_ent->type_name[AST_NAME_LEN - 1] = '\0';
+    if (new_ent) {
+      if (stmt->name2[0]) {
+        strncpy(new_ent->type_name, stmt->name2, AST_NAME_LEN - 1);
+        new_ent->type_name[AST_NAME_LEN - 1] = '\0';
+      } else if (stmt->child_count > 0 && expr_is_string_value(ctx, stmt->children[0])) {
+        strncpy(new_ent->type_name, "string", AST_NAME_LEN - 1);
+        new_ent->type_name[AST_NAME_LEN - 1] = '\0';
+      }
     }
     /* §13.7 atomic-var marker: parser sets bit 12 (0x1000) in int_val
      * for `atomic var ...`. Record on the symbol so try(isolate:) can
@@ -4286,65 +4468,18 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     const char *type_str = "int"; /* default */
     const ast_node_t *expr = stmt->children[0];
 
-    /* Helper function to infer type recursively */
-    vir_type_t inferred_type = VIR_TYPE_I64;
-
-    if (expr->type == AST_LITERAL_STR) {
-      inferred_type = VIR_TYPE_PTR;
+    if (expr_is_string_value(ctx, expr)) {
+      type_str = "string";
     } else if (expr->type == AST_LITERAL_FLOAT) {
-      inferred_type = VIR_TYPE_F64;
+      type_str = "float";
     } else if (expr->type == AST_IDENTIFIER) {
       symbol_entry_t *ent = NULL;
       if (sym_lookup_entry_both(ctx, expr->name, &ent, NULL) >= 0 && ent) {
-        inferred_type = ent->type;
+        if (ent->type == VIR_TYPE_F32 || ent->type == VIR_TYPE_F64)
+          type_str = "float";
+        else if (ent->type == VIR_TYPE_I8)
+          type_str = "bool";
       }
-    } else if (expr->type == AST_BUILTIN_CALL) {
-      if (expr->builtin_id == BUILTIN_STR_CAT ||
-          expr->builtin_id == BUILTIN_I_TO_STR) {
-        inferred_type = VIR_TYPE_PTR;
-      }
-    } else if (expr->type == AST_BINOP && expr->op == OP_ADD) {
-      /* Check if either operand is a string - string concatenation */
-      if (expr->child_count >= 2) {
-        const ast_node_t *left = expr->children[0];
-        const ast_node_t *right = expr->children[1];
-
-        /* Check left operand */
-        if (left->type == AST_LITERAL_STR) {
-          inferred_type = VIR_TYPE_PTR;
-        } else if (left->type == AST_IDENTIFIER) {
-          symbol_entry_t *ent = NULL;
-          if (sym_lookup_entry_both(ctx, left->name, &ent, NULL) >= 0 && ent) {
-            if (ent->type == VIR_TYPE_PTR) {
-              inferred_type = VIR_TYPE_PTR;
-            }
-          }
-        }
-
-        /* Check right operand if left wasn't a string */
-        if (inferred_type != VIR_TYPE_PTR) {
-          if (right->type == AST_LITERAL_STR) {
-            inferred_type = VIR_TYPE_PTR;
-          } else if (right->type == AST_IDENTIFIER) {
-            symbol_entry_t *ent = NULL;
-            if (sym_lookup_entry_both(ctx, right->name, &ent, NULL) >= 0 &&
-                ent) {
-              if (ent->type == VIR_TYPE_PTR) {
-                inferred_type = VIR_TYPE_PTR;
-              }
-            }
-          }
-        }
-      }
-    }
-
-    /* Convert vir_type_t to string */
-    if (inferred_type == VIR_TYPE_PTR) {
-      type_str = "string";
-    } else if (inferred_type == VIR_TYPE_F32 || inferred_type == VIR_TYPE_F64) {
-      type_str = "float";
-    } else if (inferred_type == VIR_TYPE_I8) {
-      type_str = "bool";
     }
 
     q_instruction_t instr =
@@ -4358,13 +4493,11 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
   case AST_RETURN: {
     if (stmt->child_count > 0) {
       const ast_node_t *ret_e = stmt->children[0];
-      /* Returning from a function always escapes any arena block. */
-      if (check_arena_escape(ctx, stmt, ret_e, 0) != 0)
-        return -1;
       int val = lower_expr(ctx, ret_e);
       if (val < 0)
         return -1;
-      /* §20.2: inside `map ... end`, `out expr` appends to array. */
+      /* Promote arena-backed move values before callee arena watermark restore. */
+      val = lower_promote_return(ctx, ret_e, val);
       if (ctx->in_map_expr) {
         emit(ctx, q_instr(Q_ARR_PUSH, q_none(), q_vreg(ctx->map_arr_vreg),
                           q_vreg((uint32_t)val)));
@@ -4431,6 +4564,7 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
 
     uint32_t loop_label = fresh_label(ctx);
     uint32_t cont_label = fresh_label(ctx);
+    uint32_t break_cleanup_label = fresh_label(ctx);
     uint32_t end_label = fresh_label(ctx);
 
     /* Loop header */
@@ -4445,25 +4579,38 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     emit(ctx,
          q_instr(Q_JUMP_IF_NOT, q_none(), q_vreg(cmp_r), q_label(end_label)));
 
-    /* Push loop labels: continue → increment, break → end */
+    /* Both non-local exits must pass the per-iteration arena cleanup. */
     ctx->loop_start_labels[ctx->loop_depth] = cont_label;
-    ctx->loop_end_labels[ctx->loop_depth] = end_label;
+    ctx->loop_end_labels[ctx->loop_depth] = break_cleanup_label;
     ctx->loop_depth++;
 
-    /* Body */
+    uint32_t mark_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_SAVE, q_vreg(mark_r), q_none(), q_none()));
     lower_stmt(ctx, stmt->children[1]);
 
     ctx->loop_depth--;
 
-    /* Continue target: increment counter */
+    /* Continue target: restore the escape-aware iteration checkpoint before
+     * incrementing the counter. */
     lbl.patch_id = cont_label;
     emit(ctx, lbl);
+    uint32_t cleanup_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_RESTORE, q_vreg(cleanup_r), q_none(),
+                      q_vreg(mark_r)));
     uint32_t one = fresh_vreg(ctx);
     emit(ctx, q_instr(Q_LOAD, q_vreg(one), q_imm(1), q_none()));
     emit(ctx, q_instr(Q_ADD, q_vreg(counter), q_vreg(counter), q_vreg(one)));
 
     /* Loop back */
     emit(ctx, q_instr(Q_JUMP, q_none(), q_label(loop_label), q_none()));
+
+    /* `break` bypasses the increment. */
+    lbl.patch_id = break_cleanup_label;
+    emit(ctx, lbl);
+    cleanup_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_RESTORE, q_vreg(cleanup_r), q_none(),
+                      q_vreg(mark_r)));
+    emit(ctx, q_instr(Q_JUMP, q_none(), q_label(end_label), q_none()));
 
     /* End label */
     lbl.patch_id = end_label;
@@ -4480,6 +4627,8 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
       return -1;
 
     uint32_t loop_label = fresh_label(ctx);
+    uint32_t continue_cleanup_label = fresh_label(ctx);
+    uint32_t break_cleanup_label = fresh_label(ctx);
     uint32_t end_label = fresh_label(ctx);
 
     q_instruction_t lbl = q_instr(Q_LABEL, q_none(), q_none(), q_none());
@@ -4494,24 +4643,29 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
                       q_label(end_label)));
 
     /* Push loop labels for break/continue */
-    ctx->loop_start_labels[ctx->loop_depth] = loop_label;
-    ctx->loop_end_labels[ctx->loop_depth] = end_label;
+    ctx->loop_start_labels[ctx->loop_depth] = continue_cleanup_label;
+    ctx->loop_end_labels[ctx->loop_depth] = break_cleanup_label;
     ctx->loop_depth++;
 
-    /* Watermark only — do not bump arena_depth (escape diag stays for
-     * explicit `arena:`). Loop-carried assigns to outer locals are normal. */
     uint32_t mark_r = fresh_vreg(ctx);
     emit(ctx, q_instr(Q_ARENA_SAVE, q_vreg(mark_r), q_none(), q_none()));
     lower_stmt(ctx, stmt->children[1]);
-    {
-      uint32_t dummy = fresh_vreg(ctx);
-      emit(ctx, q_instr(Q_ARENA_RESTORE, q_vreg(dummy), q_none(),
-                        q_vreg(mark_r)));
-    }
+    lbl.patch_id = continue_cleanup_label;
+    emit(ctx, lbl);
+    uint32_t cleanup_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_RESTORE, q_vreg(cleanup_r), q_none(),
+                      q_vreg(mark_r)));
 
     ctx->loop_depth--;
 
     emit(ctx, q_instr(Q_JUMP, q_none(), q_label(loop_label), q_none()));
+
+    lbl.patch_id = break_cleanup_label;
+    emit(ctx, lbl);
+    cleanup_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_RESTORE, q_vreg(cleanup_r), q_none(),
+                      q_vreg(mark_r)));
+    emit(ctx, q_instr(Q_JUMP, q_none(), q_label(end_label), q_none()));
 
     lbl.patch_id = end_label;
     emit(ctx, lbl);
@@ -4776,33 +4930,38 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
          q_instr(Q_JUMP_IF_NOT, q_none(), q_vreg(cmp_r), q_label(end_label)));
 
     uint32_t cont_label = fresh_label(ctx);
+    uint32_t break_cleanup_label = fresh_label(ctx);
 
     /* Push loop labels: continue → increment, break → end */
     ctx->loop_start_labels[ctx->loop_depth] = cont_label;
-    ctx->loop_end_labels[ctx->loop_depth] = end_label;
+    ctx->loop_end_labels[ctx->loop_depth] = break_cleanup_label;
     ctx->loop_depth++;
 
-    /* §4.6 auto watermark per iteration (no arena_depth / escape). */
-    {
-      uint32_t mark_r = fresh_vreg(ctx);
-      emit(ctx, q_instr(Q_ARENA_SAVE, q_vreg(mark_r), q_none(), q_none()));
-      lower_stmt(ctx, stmt->children[2]);
-      uint32_t dummy = fresh_vreg(ctx);
-      emit(ctx, q_instr(Q_ARENA_RESTORE, q_vreg(dummy), q_none(),
-                        q_vreg(mark_r)));
-    }
+    uint32_t mark_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_SAVE, q_vreg(mark_r), q_none(), q_none()));
+    lower_stmt(ctx, stmt->children[2]);
+    lbl.patch_id = cont_label;
+    emit(ctx, lbl);
+    uint32_t cleanup_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_RESTORE, q_vreg(cleanup_r), q_none(),
+                      q_vreg(mark_r)));
 
     ctx->loop_depth--;
 
-    /* Continue target: increment loop variable */
-    lbl.patch_id = cont_label;
-    emit(ctx, lbl);
+    /* Continue target increments the index. */
     uint32_t one = fresh_vreg(ctx);
     emit(ctx, q_instr(Q_LOAD, q_vreg(one), q_imm(1), q_none()));
     emit(ctx, q_instr(Q_ADD, q_vreg(loop_var), q_vreg(loop_var), q_vreg(one)));
 
     /* Loop back */
     emit(ctx, q_instr(Q_JUMP, q_none(), q_label(loop_label), q_none()));
+
+    lbl.patch_id = break_cleanup_label;
+    emit(ctx, lbl);
+    cleanup_r = fresh_vreg(ctx);
+    emit(ctx, q_instr(Q_ARENA_RESTORE, q_vreg(cleanup_r), q_none(),
+                      q_vreg(mark_r)));
+    emit(ctx, q_instr(Q_JUMP, q_none(), q_label(end_label), q_none()));
 
     /* End label */
     lbl.patch_id = end_label;
@@ -5549,11 +5708,8 @@ int lower_func_def(lower_ctx_t *ctx, const ast_node_t *func_def) {
   ownership_release_unclaimed_stmt_borrows(ctx);
   ownership_release_all_borrows(ctx);
 
-  /* §4.8 (2.11): auto-drop — emit Q_FREE for every local that owns a
-   * move-type value and has NOT been moved out (consumed by assignment
-   * to another owner). Parameters and non-move-type locals are skipped.
-   * Q_FREE is a no-op on non-heap addresses, so this is safe even for
-   * values the allocator did not hand out via Q_ALLOC. */
+  /* §4.8 (2.11): symbolic auto-drop — Q_FREE is a no-op on arena pointers;
+   * still emitted so borrow-check drop sites stay aligned with the spec. */
   for (uint32_t i = 0; i < ctx->symbols.count; i++) {
     const symbol_entry_t *e = &ctx->symbols.entries[i];
     if (e->is_move_type && !e->is_moved) {
@@ -5678,20 +5834,25 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
         i--;
         continue;
       }
+      if (n_b > 1) {
+        uint32_t needed = program->child_count + n_b - 1u;
+        if (needed > AST_MAX_CHILDREN ||
+            ast_reserve_children(program, needed) != 0) {
+          lower_error(ctx, child, "module resolution: too many top-level nodes");
+          return -1;
+        }
+      }
       program->children[i] = child->children[0];
       if (n_b > 1) {
         for (int32_t j = (int32_t)program->child_count - 1; j > (int32_t)i; j--) {
-          if (j + n_b - 1 < AST_MAX_CHILDREN) {
-            program->children[j + n_b - 1] = program->children[j];
-          }
+          program->children[j + n_b - 1] = program->children[j];
         }
         for (uint32_t k = 1; k < n_b; k++) {
-          if (i + k < AST_MAX_CHILDREN) {
-            program->children[i + k] = child->children[k];
-          }
+          program->children[i + k] = child->children[k];
         }
         program->child_count += (n_b - 1);
       }
+      free(child->children);
       free(child);
       i--;
     }
@@ -5699,9 +5860,13 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
 
   for (uint32_t i = 0; i < program->child_count; i++) {
     ast_node_t *child = program->children[i];
-    if (!child || child->type != AST_INCLUDE)
+    if (!child || (child->type != AST_INCLUDE && child->type != AST_IMPORT))
       continue;
 
+    /* Imports are source dependencies too.  Keep the AST_IMPORT node so
+     * lower_process_imports can retain aliases and imported-symbol metadata,
+     * but splice its module immediately before it. */
+    int is_import = child->type == AST_IMPORT;
     const char *filename = child->name;
 
     /* Guard against double-include */
@@ -5713,12 +5878,14 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
       }
     }
     if (already) {
-      /* Remove the include node, shift remaining children */
-      ast_free(child);
-      for (uint32_t j = i; j + 1 < program->child_count; j++)
-        program->children[j] = program->children[j + 1];
-      program->child_count--;
-      i--; /* Re-check this index */
+      if (!is_import) {
+        /* Remove duplicate include nodes.  Imports stay as metadata. */
+        ast_free(child);
+        for (uint32_t j = i; j + 1 < program->child_count; j++)
+          program->children[j] = program->children[j + 1];
+        program->child_count--;
+        i--; /* Re-check this index */
+      }
       continue;
     }
 
@@ -5733,6 +5900,10 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
     size_t src_len = 0;
     char *src = ctx->include_reader(filename, &src_len, ctx->include_user_data);
     if (!src) {
+      /* An import may be metadata-only (the linker/package resolver supplies
+       * it later). Includes remain eager and must name a readable source. */
+      if (is_import)
+        continue;
       char buf[320];
       snprintf(buf, sizeof(buf), "include: cannot read '%s'", filename);
       lower_error(ctx, NULL, buf);
@@ -5797,20 +5968,30 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
       }
     }
 
-    /* ── O(n) splice using memmove (one shift per include) ── */
+    /* ── O(n) splice using memmove (one shift per dependency) ── */
     uint32_t n_new = sub->child_count;
     if (n_new == 0) {
-      /* Empty file — just remove the include node */
-      ast_free(child);
-      if (i + 1 < program->child_count)
-        memmove(&program->children[i], &program->children[i + 1],
-                (program->child_count - i - 1) * sizeof(ast_node_t *));
-      program->child_count--;
-      i--;
+      if (!is_import) {
+        /* Empty include — remove its directive. */
+        ast_free(child);
+        if (i + 1 < program->child_count)
+          memmove(&program->children[i], &program->children[i + 1],
+                  (program->child_count - i - 1) * sizeof(ast_node_t *));
+        program->child_count--;
+        i--;
+      }
     } else {
-      uint32_t needed = program->child_count + n_new - 1;
+      uint32_t needed = program->child_count + n_new - (is_import ? 0 : 1);
       if (needed > AST_MAX_CHILDREN) {
-        lower_error(ctx, NULL, "include: too many top-level nodes");
+        lower_error(ctx, NULL, "module resolution: too many top-level nodes");
+        ast_free(sub);
+        lexer_free(lex);
+        free(lex);
+        free(src);
+        return -1;
+      }
+      if (ast_reserve_children(program, needed) != 0) {
+        lower_error(ctx, NULL, "module resolution: out of memory");
         ast_free(sub);
         lexer_free(lex);
         free(lex);
@@ -5818,10 +5999,12 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
         return -1;
       }
 
-      /* Single memmove to open space for n_new children at position i */
-      if (n_new > 1 && i + 1 < program->child_count) {
-        memmove(&program->children[i + n_new],
-                &program->children[i + 1],
+      /* An import stays after its resolved module; an include is replaced. */
+      if (is_import) {
+        memmove(&program->children[i + n_new], &program->children[i],
+                (program->child_count - i) * sizeof(ast_node_t *));
+      } else if (n_new > 1 && i + 1 < program->child_count) {
+        memmove(&program->children[i + n_new], &program->children[i + 1],
                 (program->child_count - i - 1) * sizeof(ast_node_t *));
       }
 
@@ -5832,8 +6015,8 @@ int lower_resolve_includes(lower_ctx_t *ctx, ast_node_t *program) {
       }
       program->child_count = needed;
 
-      /* Free original include node */
-      ast_free(child);
+      if (!is_import)
+        ast_free(child);
 
       /* Re-process position i (first spliced child may itself be an include) */
       i--;
@@ -5899,17 +6082,6 @@ int lower_process_imports(lower_ctx_t *ctx, const ast_node_t *program) {
       strncpy(ctx->module.name, child->name, sizeof(ctx->module.name) - 1);
     } else if (child->type == AST_IMPORT && child->child_count == 0) {
       /* `import X` or `import X as Y` */
-      if (!is_module_known(program, child->name)) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "module not found: '%s'", child->name);
-        diag_entry_t *e = lower_error(ctx, child, buf);
-        if (e) {
-          diag_add_cause(&g_parser_diag, e, "Module file is missing or not included");
-          diag_add_action(&g_parser_diag, e, "Ensure the module is in VIR_STDLIB or the correct path");
-          diag_add_action(&g_parser_diag, e, "Check for typos in the module name");
-        }
-        return -1;
-      }
       if (ctx->module_alias_count < MODULE_ALIAS_MAX) {
         uint32_t idx = ctx->module_alias_count++;
         strncpy(ctx->module_aliases[idx].original, child->name,
@@ -5924,17 +6096,6 @@ int lower_process_imports(lower_ctx_t *ctx, const ast_node_t *program) {
       }
     } else if (child->type == AST_IMPORT && child->child_count > 0) {
       /* `from X import sym1, sym2, ...` */
-      if (!is_module_known(program, child->name)) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "module not found: '%s'", child->name);
-        diag_entry_t *e = lower_error(ctx, child, buf);
-        if (e) {
-          diag_add_cause(&g_parser_diag, e, "Module file is missing or not included");
-          diag_add_action(&g_parser_diag, e, "Ensure the module is in VIR_STDLIB or the correct path");
-          diag_add_action(&g_parser_diag, e, "Check for typos in the module name");
-        }
-        return -1;
-      }
       for (uint32_t j = 0; j < child->child_count; j++) {
         const ast_node_t *sym = child->children[j];
         if (!sym || sym->type != AST_IDENTIFIER)
@@ -6529,5 +6690,14 @@ int lower_insert_spill_code(lower_ctx_t *ctx, q_function_t *func,
 
 void lower_destroy(lower_ctx_t *ctx) {
   q_module_free(&ctx->module);
-  memset(ctx, 0, sizeof(*ctx));
+  /* Do not fault every unused metadata-table page merely to clear an object
+   * that is about to be released.  Reset externally observable live state;
+   * lower_init() fully initializes the context before reuse. */
+  ctx->current_func = NULL;
+  ctx->enum_type_count = 0;
+  ctx->record_type_count = 0;
+  ctx->func_return_type_count = 0;
+  ctx->bit_type_count = 0;
+  ctx->interval_count = 0;
+  ctx->error_count = 0;
 }

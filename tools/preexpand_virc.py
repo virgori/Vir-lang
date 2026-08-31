@@ -106,7 +106,8 @@ def main() -> int:
     out.write_text(text)
     funcs = len(re.findall(r"^func ", text, re.M))
     missing = text.count("MISSING INCLUDE")
-    print(f"Wrote {out} ({len(text)} bytes, {funcs} funcs, {missing} missing)")
+    byte_len = len(text.encode())
+    print(f"Wrote {out} ({byte_len} bytes, {funcs} funcs, {missing} missing)")
     return 0 if missing == 0 else 1
 
 

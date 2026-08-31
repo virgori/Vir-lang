@@ -61,15 +61,20 @@ typedef enum {
     Q_PRINT         = 0x50,
     Q_INPUT         = 0x51,
 
-    /* Memory management */
-    Q_ALLOC         = 0x60,   /* dest = alloc(src1 bytes)      */
-    Q_FREE          = 0x61,   /* free(src1)                    */
+    /* Memory management (§4.5–4.7)
+     * Q_ALLOC       — bump from current TL arena (language objects)
+     * Q_HEAP_ALLOC  — FFI / escape-promoted heap (malloc registry)
+     * Q_FREE        — drop handle or heap_free; no-op on arena ptrs */
+    Q_ALLOC         = 0x60,   /* dest = arena_alloc(src1 bytes) */
+    Q_FREE          = 0x61,   /* drop(src1): heap or array handle */
     Q_LOAD_BYTE     = 0x62,   /* dest = *(u8*)(src1 + src2)    */
     Q_STORE_BYTE    = 0x63,   /* *(u8*)(src1+src2) = dest      */
     Q_LOAD_WORD     = 0x64,   /* dest = *(i64*)(src1+src2*8)   */
     Q_STORE_WORD    = 0x65,   /* *(i64*)(src1+src2*8) = dest   */
     Q_MEM_COPY      = 0x66,   /* memcpy(dest, src1, src2)      */
     Q_MEM_SET       = 0x67,   /* memset(dest, src1, src2)      */
+    Q_REALLOC       = 0x68,   /* dest = heap_realloc(src1,src2) */
+    Q_HEAP_ALLOC    = 0x69,   /* dest = heap_alloc(src1 bytes)  */
 
     /* String operations */
     Q_STR_LEN       = 0x70,   /* dest = strlen(src1)           */

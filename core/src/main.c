@@ -777,7 +777,7 @@ static int cmd_jit(const char *source, size_t len, int verbose,
 static void usage(const char *prog)
 {
     fprintf(stderr,
-        "Vir – Ngôn ngữ lập trình Việt Nam\n"
+        "Vir Programming Language \n"
         "Usage: %s <command> [options] <file.vri>\n\n"
         "Commands:\n"
         "  run    <file>   Interpret via Q-IR VM\n"

@@ -302,8 +302,12 @@ struct ast_node {
   int builtin_id;           /* For BUILTIN_CALL             */
   int is_async;             /* For AST_FUNC_DEF - marks async functions (§22) */
   uint32_t flags;           /* Node-specific flags          */
-  ast_node_t *children[AST_MAX_CHILDREN];
+  /* Most AST nodes have only a handful of children.  Keeping the historical
+   * 16K pointer capacity inline made every node about 128 KiB and pushed the
+   * self-host compiler into multi-gigabyte RSS. */
+  ast_node_t **children;
   uint32_t child_count;
+  uint32_t child_capacity;
   uint32_t line; /* Source line number            */
 };
 

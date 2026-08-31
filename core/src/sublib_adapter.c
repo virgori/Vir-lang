@@ -1,10 +1,9 @@
 #include "lexer.h"
-#include "lang.h"
 
+/*
+ * Optional SubLib hook for C lexer keyword aliases.
+ * Natural-language aliases live in stdlib/vir/lang/*.vri and are loaded via
+ * `import` in user/compiler code — not wired into core or the compiler by default.
+ */
 void vir_sublib_adapter_init(void) {
-    /* Automatically load all supported languages to preserve backward compatibility */
-    vir_lang_load(VIR_LANG_VI);
-    vir_lang_load(VIR_LANG_ZH);
-    vir_lang_load(VIR_LANG_JA);
-    vir_lang_load(VIR_LANG_KO);
 }

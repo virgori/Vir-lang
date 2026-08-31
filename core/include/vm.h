@@ -11,6 +11,8 @@
 #define VIR_VM_H
 
 #include "q_ir.h"
+#include "vm_heap.h"
+#include "vm_arena.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stddef.h>
@@ -183,11 +185,12 @@ typedef struct {
     uint8_t   closed;
 } vm_port_t;
 
-/* ═══════════════════════════════════════════════════════
- * VM Heap Tracking
- * ═══════════════════════════════════════════════════════ */
+typedef struct {
+    void   *ptr;
+    size_t  size;
+    uint8_t live;
+} vm_mapping_t;
 
-#define VM_MAX_HEAP_BLOCKS 16384
 #define VM_MAX_STRINGS_RT  16384
 
 typedef struct vm_state {
@@ -217,6 +220,10 @@ typedef struct vm_state {
         uint32_t caller_reg_count;
         int64_t *caller_regs;
         int64_t ref_bindings[Q_MAX_PARAMS];
+        int     arena_id;           /* arena active when function entered */
+        size_t  arena_wm;           /* function-scope region checkpoint */
+        uint8_t arena_escaped;      /* new pointer stored into older owner */
+        uint8_t arena_mark_sp;      /* iteration marks active on entry */
     } func_stack[VM_MAX_CALL_DEPTH];
     uint32_t        func_depth;
     const q_function_t *current_func;  /* currently executing function */
@@ -259,14 +266,17 @@ typedef struct vm_state {
     uint64_t        instr_executed;
     uint64_t        patches_triggered;
 
-    /* Arrays managed by VM */
-    vm_array_t      arrays[VM_MAX_ARRAYS];
+    /* Arrays managed by VM. Handles are sparse but the table is growable:
+     * embedding VM_MAX_ARRAYS entries in every vm_state exhausted the stack. */
+    vm_array_t     *arrays;
     uint32_t        array_count;
+    uint32_t        array_cap;
     /* Handles reclaimed by Q_FREE.  Tuple destructuring creates short-lived
      * Q_ARR_NEW values in hot lexer paths, so monotonically allocating handle
      * IDs exhausts VM_MAX_ARRAYS even when their backing storage is freed. */
-    uint32_t        array_free[VM_MAX_ARRAYS];
+    uint32_t       *array_free;
     uint32_t        array_free_count;
+    uint32_t        array_free_cap;
 
     /* §20 Dicts managed by VM */
     vm_dict_t       dicts[VM_MAX_DICTS];
@@ -276,9 +286,27 @@ typedef struct vm_state {
     vm_port_t       ports[VM_MAX_PORTS];
     uint32_t        port_count;
 
-    /* Heap allocated blocks (for Q_ALLOC/Q_FREE) */
-    void           *heap_blocks[VM_MAX_HEAP_BLOCKS];
-    uint32_t        heap_count;
+    /* FFI / escape-promoted heap (Q_HEAP_ALLOC). Language objects use arena. */
+    vm_heap_t       heap;
+
+    /* Per-VM arena table (root arena id=0, Q_ARENA_*). */
+    vm_arena_ctx_t  arena_ctx;
+
+    /* Q_ARENA_SAVE/Q_ARENA_RESTORE iteration checkpoints.  These are
+     * distinct from function watermarks: an escaping iteration retains only
+     * that iteration, while the next iteration starts a fresh checkpoint. */
+    struct {
+        int     arena_id;
+        size_t  watermark;
+        uint8_t escaped;
+        uint32_t func_depth;
+    } arena_marks[VM_ARENA_MAX_TL_DEPTH];
+    uint8_t arena_mark_sp;
+
+    /* Direct sys_mmap regions owned by Vir runtime code. */
+    vm_mapping_t    *mappings;
+    uint32_t         mapping_count;
+    uint32_t         mapping_cap;
 
     /* Runtime string table (for Q_STR_CAT, Q_I_TO_STR, etc.) */
     char           *rt_strings[VM_MAX_STRINGS_RT];
@@ -297,6 +325,10 @@ typedef struct vm_state {
 
     /* Module reference (for string table) */
     const q_module_t *module;
+
+    /* Cached intrinsic ID for each function in module */
+    int16_t        *func_intrinsic_cache;
+    uint32_t        func_intrinsic_cache_count;
 
     /* Program arguments */
     const char **args;

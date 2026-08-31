@@ -8,7 +8,6 @@
 #include "vm.h"
 #include "task.h"
 #include "atomic.h"
-#include "mem_manager.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -19,6 +18,9 @@
 #include <sys/mman.h>
 #include <sys/types.h>
 #include <stdint.h>
+
+static void vm_track_pointer_store(vm_state_t *vm, int64_t base,
+                                   int64_t value);
 
 /* Preserve enough caller vregs across Call. Nested returns can shrink
  * reg_count while outer locals remain live — always keep SAVE_MIN. */
@@ -203,6 +205,44 @@ static inline void set_dest(vm_state_t *vm, const q_operand_t *dest, int64_t val
  * VM Array Helpers
  * ═══════════════════════════════════════════════════════ */
 
+#define VM_ARRAY_TABLE_INIT_CAP 64u
+
+static int vm_array_table_reserve(vm_state_t *vm, uint32_t need)
+{
+    if (need <= vm->array_cap)
+        return 0;
+    uint32_t cap = vm->array_cap ? vm->array_cap : VM_ARRAY_TABLE_INIT_CAP;
+    while (cap < need && cap < VM_MAX_ARRAYS / 2u)
+        cap *= 2u;
+    if (cap < need || cap > VM_MAX_ARRAYS)
+        return -1;
+    vm_array_t *p = (vm_array_t *)realloc(vm->arrays, (size_t)cap * sizeof(*p));
+    if (!p)
+        return -1;
+    memset(p + vm->array_cap, 0,
+           (size_t)(cap - vm->array_cap) * sizeof(*p));
+    vm->arrays = p;
+    vm->array_cap = cap;
+    return 0;
+}
+
+static int vm_array_free_reserve(vm_state_t *vm, uint32_t need)
+{
+    if (need <= vm->array_free_cap)
+        return 0;
+    uint32_t cap = vm->array_free_cap ? vm->array_free_cap : VM_ARRAY_TABLE_INIT_CAP;
+    while (cap < need && cap < VM_MAX_ARRAYS / 2u)
+        cap *= 2u;
+    if (cap < need || cap > VM_MAX_ARRAYS)
+        return -1;
+    uint32_t *p = (uint32_t *)realloc(vm->array_free, (size_t)cap * sizeof(*p));
+    if (!p)
+        return -1;
+    vm->array_free = p;
+    vm->array_free_cap = cap;
+    return 0;
+}
+
 static int64_t vm_array_new(vm_state_t *vm, int64_t cap)
 {
     uint32_t idx;
@@ -210,19 +250,24 @@ static int64_t vm_array_new(vm_state_t *vm, int64_t cap)
         idx = vm->array_free[--vm->array_free_count];
     } else {
         if (vm->array_count >= VM_MAX_ARRAYS) return -1;
+        if (vm_array_table_reserve(vm, vm->array_count + 1u) != 0)
+            return -1;
         idx = vm->array_count++;
     }
     vm->arrays[idx].cap = (uint32_t)(cap > 0 ? cap : 16);
     vm->arrays[idx].len = 0;
-    vm->arrays[idx].data = (int64_t *)calloc(vm->arrays[idx].cap, sizeof(int64_t));
+    vm->arrays[idx].data = (int64_t *)vm_heap_alloc(
+        &vm->heap, (size_t)vm->arrays[idx].cap * sizeof(int64_t));
     if (!vm->arrays[idx].data) {
         vm->arrays[idx].cap = 0;
         /* Handle 0 is also the null sentinel for Q_FREE, so keep it out of
          * the reusable pool. */
-        if (idx != 0 && vm->array_free_count < VM_MAX_ARRAYS)
+        if (idx != 0 && vm_array_free_reserve(vm, vm->array_free_count + 1u) == 0)
             vm->array_free[vm->array_free_count++] = idx;
         return -1;
     }
+    memset(vm->arrays[idx].data, 0,
+           (size_t)vm->arrays[idx].cap * sizeof(int64_t));
     return (int64_t)idx;
 }
 
@@ -231,8 +276,18 @@ static void vm_array_push(vm_state_t *vm, int64_t arr_handle, int64_t val)
     if (arr_handle < 0 || (uint32_t)arr_handle >= vm->array_count) return;
     vm_array_t *arr = &vm->arrays[(uint32_t)arr_handle];
     if (arr->len >= arr->cap) {
+        uint32_t old_cap = arr->cap;
+        int64_t *old = arr->data;
         arr->cap *= 2;
-        arr->data = (int64_t *)realloc(arr->data, arr->cap * sizeof(int64_t));
+        arr->data = (int64_t *)vm_heap_realloc(
+            &vm->heap, old, (size_t)arr->cap * sizeof(int64_t));
+        if (!arr->data) {
+            arr->data = old;
+            arr->cap = old_cap;
+            return;
+        }
+        memset(arr->data + old_cap, 0,
+               (size_t)(arr->cap - old_cap) * sizeof(int64_t));
     }
     arr->data[arr->len++] = val;
 }
@@ -495,9 +550,64 @@ static void vm_clear_func_frames(vm_state_t *vm)
         vm->func_stack[i].caller_regs = NULL;
         vm->func_stack[i].func = NULL;
         vm->func_stack[i].ip = 0;
+        vm->func_stack[i].arena_id = -1;
+        vm->func_stack[i].arena_wm = 0;
+        vm->func_stack[i].arena_escaped = 0;
+        vm->func_stack[i].arena_mark_sp = 0;
     }
     vm->func_depth = 0;
     vm->reg_save_top = 0;
+}
+
+static int vm_mapping_register(vm_state_t *vm, void *ptr, size_t size)
+{
+    if (!vm || !ptr || ptr == MAP_FAILED || size == 0)
+        return -1;
+    if (vm->mapping_count >= vm->mapping_cap) {
+        uint32_t cap = vm->mapping_cap ? vm->mapping_cap * 2u : 64u;
+        vm_mapping_t *p = (vm_mapping_t *)realloc(
+            vm->mappings, (size_t)cap * sizeof(*p));
+        if (!p)
+            return -1;
+        vm->mappings = p;
+        vm->mapping_cap = cap;
+    }
+    vm_mapping_t *m = &vm->mappings[vm->mapping_count++];
+    m->ptr = ptr;
+    m->size = size;
+    m->live = 1;
+    return 0;
+}
+
+static int vm_mapping_contains(const vm_state_t *vm, const void *ptr,
+                               size_t size)
+{
+    if (!vm || !ptr)
+        return 0;
+    uintptr_t p = (uintptr_t)ptr;
+    if (size > SIZE_MAX - p)
+        return 0;
+    uintptr_t end = p + size;
+    for (int32_t i = (int32_t)vm->mapping_count - 1; i >= 0; i--) {
+        const vm_mapping_t *m = &vm->mappings[i];
+        uintptr_t begin = (uintptr_t)m->ptr;
+        if (m->live && m->size <= SIZE_MAX - begin && p >= begin &&
+            end <= begin + m->size)
+            return 1;
+    }
+    return 0;
+}
+
+static void vm_mapping_remove(vm_state_t *vm, void *ptr)
+{
+    if (!vm || !ptr)
+        return;
+    for (uint32_t i = 0; i < vm->mapping_count; i++) {
+        if (vm->mappings[i].live && vm->mappings[i].ptr == ptr) {
+            vm->mappings[i].live = 0;
+            return;
+        }
+    }
 }
 
 /* ═══════════════════════════════════════════════════════
@@ -507,6 +617,8 @@ static void vm_clear_func_frames(vm_state_t *vm)
 void vm_init(vm_state_t *vm)
 {
     memset(vm, 0, sizeof(*vm));
+    vm_heap_init(&vm->heap);
+    vm_arena_ctx_init(&vm->arena_ctx);
     vm->regs = vm->root_regs;
     vm->status = VM_OK;
     vm->active_label_map = vm->label_map;
@@ -536,23 +648,33 @@ void vm_reset(vm_state_t *vm)
 void vm_destroy(vm_state_t *vm)
 {
     vm_clear_func_frames(vm);
-    /* Free arrays */
+    vm_arena_ctx_destroy(&vm->arena_ctx);
+    vm_heap_destroy(&vm->heap);
+    for (uint32_t i = 0; i < vm->mapping_count; i++) {
+        if (vm->mappings[i].live && vm->mappings[i].ptr)
+            munmap(vm->mappings[i].ptr, vm->mappings[i].size);
+    }
+    free(vm->mappings);
+    vm->mappings = NULL;
+    vm->mapping_count = 0;
+    vm->mapping_cap = 0;
+    /* Array backing belongs to arenas; the VM owns only this metadata. */
     for (uint32_t i = 0; i < vm->array_count; i++) {
-        free(vm->arrays[i].data);
         vm->arrays[i].data = NULL;
+        vm->arrays[i].len = 0;
+        vm->arrays[i].cap = 0;
     }
+    free(vm->arrays);
+    free(vm->array_free);
+    vm->arrays = NULL;
+    vm->array_free = NULL;
     vm->array_count = 0;
-    /* Free heap blocks */
-    for (uint32_t i = 0; i < vm->heap_count; i++) {
-        free(vm->heap_blocks[i]);
-        vm->heap_blocks[i] = NULL;
-    }
-    vm->heap_count = 0;
-    /* Free runtime strings */
-    for (uint32_t i = 0; i < vm->rt_string_count; i++) {
-        free(vm->rt_strings[i]);
+    vm->array_cap = 0;
+    vm->array_free_count = 0;
+    vm->array_free_cap = 0;
+    /* Runtime string table slots (payload freed via heap registry). */
+    for (uint32_t i = 0; i < vm->rt_string_count; i++)
         vm->rt_strings[i] = NULL;
-    }
     vm->rt_string_count = 0;
     /* Free ports */
     for (uint32_t i = 0; i < vm->port_count; i++) {
@@ -572,6 +694,10 @@ void vm_destroy(vm_state_t *vm)
         vm->reg_need_by_fidx = NULL;
         vm->label_by_fidx_n = 0;
     }
+    /* Free intrinsic cache */
+    free(vm->func_intrinsic_cache);
+    vm->func_intrinsic_cache = NULL;
+    vm->func_intrinsic_cache_count = 0;
     /* Free shared register save-stack */
     free(vm->reg_save_stack);
     vm->reg_save_stack = NULL;
@@ -598,6 +724,9 @@ void vm_set_module(vm_state_t *vm, const q_module_t *mod)
         vm->reg_need_by_fidx = NULL;
         vm->label_by_fidx_n = 0;
     }
+    free(vm->func_intrinsic_cache);
+    vm->func_intrinsic_cache = NULL;
+    vm->func_intrinsic_cache_count = 0;
     for (uint32_t i = 0; i < VM_MAX_CALL_DEPTH; i++) {
         free(vm->reg_windows[i]);
         vm->reg_windows[i] = NULL;
@@ -618,6 +747,29 @@ void vm_set_module(vm_state_t *vm, const q_module_t *mod)
                     max_need = vm->reg_need_by_fidx[i];
             }
             vm->reg_window_size = max_need;
+        }
+        vm->func_intrinsic_cache = (int16_t *)malloc(mod->func_count * sizeof(int16_t));
+        vm->func_intrinsic_cache_count = mod->func_count;
+        if (vm->func_intrinsic_cache) {
+            for (uint32_t i = 0; i < mod->func_count; i++) {
+                if (mod->functions[i].body_count == 0) {
+                    const char *fname = mod->functions[i].name;
+                    if (strncmp(fname, "syscall", 7) == 0) {
+                        vm->func_intrinsic_cache[i] = -2;
+                    } else {
+                        int16_t found = -3;
+                        for (int k = 0; k < VIR_MAX_INTRINSICS; k++) {
+                            if (vir_intr_table[k].fn && strcmp(vir_intr_table[k].name, fname) == 0) {
+                                found = (int16_t)k;
+                                break;
+                            }
+                        }
+                        vm->func_intrinsic_cache[i] = found;
+                    }
+                } else {
+                    vm->func_intrinsic_cache[i] = -1;
+                }
+            }
         }
     }
 }
@@ -640,8 +792,8 @@ void vm_set_patch_handler(vm_state_t *vm, vm_patch_handler_t handler, void *ud)
 
 int vm_resolve_labels(vm_state_t *vm, const q_function_t *func)
 {
-    /* O(1) cache by function index. Each entry is a full VM_MAX_LABELS map
-     * so Jump(lid < VM_MAX_LABELS) cannot SIGBUS. Short maps were unsafe. */
+    /* O(1) cache by function index, sized to that function's highest label.
+     * The dispatch sites guard with label_count before indexing. */
     uint32_t fidx = UINT32_MAX;
     if (vm->module && func >= vm->module->functions &&
         func < vm->module->functions + vm->module->func_count) {
@@ -686,9 +838,11 @@ int vm_resolve_labels(vm_state_t *vm, const q_function_t *func)
 
     if (vm->label_count > 0 && fidx != UINT32_MAX && fidx < vm->label_by_fidx_n &&
         vm->label_by_fidx) {
-        uint32_t *cache = (uint32_t *)calloc(VM_MAX_LABELS, sizeof(uint32_t));
+        uint32_t *cache =
+            (uint32_t *)calloc(vm->label_count, sizeof(uint32_t));
         if (cache) {
-            memcpy(cache, vm->label_map, sizeof(vm->label_map));
+            memcpy(cache, vm->label_map,
+                   (size_t)vm->label_count * sizeof(uint32_t));
             free(vm->label_by_fidx[fidx]);
             vm->label_by_fidx[fidx] = cache;
             vm->label_len_by_fidx[fidx] = vm->label_count;
@@ -716,17 +870,6 @@ int vm_resolve_labels(vm_state_t *vm, const q_function_t *func)
 
 /* VIR_INTR_SYSCALL: R0=syscall_num, R1..R6=args
  * Translates macOS BSD layer numbers (| 0x2000000). */
-static FILE *vm_dbg_file(void) {
-    static FILE *f = NULL;
-    static int tried = 0;
-    if (!tried) {
-        tried = 1;
-        if (getenv("VIR_VM_DEBUG"))
-            f = fopen("/tmp/vm_dbg.log", "w");
-    }
-    return f;
-}
-
 static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
     int64_t s = ctx->args[0] & 0xFFFFFF;
     int64_t r1 = ctx->args[1], r2 = ctx->args[2], r3 = ctx->args[3];
@@ -756,7 +899,13 @@ static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
         break;
     }
     case 6:   result = close((int)r1);                                          break;
-    case 73:  result = munmap((void *)(uintptr_t)r1, (size_t)r2);             break;
+    case 73: {
+        void *p = (void *)(uintptr_t)r1;
+        result = munmap(p, (size_t)r2);
+        if (result == 0)
+            vm_mapping_remove(ctx->vm, p);
+        break;
+    }
     case 197: {
         int flags = (int)r4;
 #ifndef VIR_PLATFORM_MACOS
@@ -767,10 +916,16 @@ static void intr_syscall(vir_intrinsic_ctx_t *ctx) {
         void *p = mmap((void *)(uintptr_t)r1, (size_t)r2,
                        (int)r3, flags, (int)r5, 0);
         result = (p == MAP_FAILED) ? -1 : (int64_t)(intptr_t)p;
+        if (p != MAP_FAILED)
+            vm_mapping_register(ctx->vm, p, (size_t)r2);
         break;
     }
     case 199: result = lseek((int)r1, (off_t)r2, (int)r3);                    break;
     default:  result = -1;                                                      break;
+    }
+    if (getenv("VIR_DEBUG_SYSCALL")) {
+        fprintf(stderr, "[SYSCALL RESULT] num=%lld result=%lld errno=%d\n",
+                (long long)s, (long long)result, errno);
     }
     *ctx->ret = result;
 }
@@ -782,10 +937,6 @@ static void intr_sys_read(vir_intrinsic_ctx_t *ctx) {
 }
 
 static void intr_sys_write(vir_intrinsic_ctx_t *ctx) {
-    int fd = (int)ctx->args[0];
-    char *buf = (char *)(uintptr_t)ctx->args[1];
-    int len = (int)ctx->args[2];
-
     *ctx->ret = (int64_t)write((int)ctx->args[0],
                                (const void *)(uintptr_t)ctx->args[1],
                                (size_t)ctx->args[2]);
@@ -812,18 +963,22 @@ static void intr_sys_lseek(vir_intrinsic_ctx_t *ctx) {
 }
 
 static void intr_sys_mmap(vir_intrinsic_ctx_t *ctx) {
-    int saved_errno; void *p = mmap((void *)(uintptr_t)ctx->args[0],
+    void *p = mmap((void *)(uintptr_t)ctx->args[0],
                    (size_t)ctx->args[1],
                    (int)ctx->args[2],
                    (int)ctx->args[3],
                    (int)ctx->args[4],
                    (off_t)ctx->args[5]);
+    if (p != MAP_FAILED)
+        vm_mapping_register(ctx->vm, p, (size_t)ctx->args[1]);
     *ctx->ret = (int64_t)(intptr_t)p;
 }
 
 static void intr_sys_munmap(vir_intrinsic_ctx_t *ctx) {
-    *ctx->ret = (int64_t)munmap((void *)(uintptr_t)ctx->args[0],
-                                (size_t)ctx->args[1]);
+    void *p = (void *)(uintptr_t)ctx->args[0];
+    *ctx->ret = (int64_t)munmap(p, (size_t)ctx->args[1]);
+    if (*ctx->ret == 0)
+        vm_mapping_remove(ctx->vm, p);
 }
 
 static void intr_sys_exit(vir_intrinsic_ctx_t *ctx) {
@@ -847,22 +1002,53 @@ static void intr_memset(vir_intrinsic_ctx_t *ctx) {
 }
 
 /* Raw memory access for virc_boot `extern func native_*` shims (Stage-0 VM). */
-static int vm_host_ptr_ok(int64_t base)
+static int vm_host_ptr_ok(const vm_state_t *vm, int64_t base, size_t size)
 {
-    if (base <= 0)
+    if (!vm || base <= 0)
         return 0;
     if (base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE)
         return 1;
-    if (base > 0 && base < 4096)
+    const void *p = (const void *)(intptr_t)base;
+    if (vm_arena_contains_in(&vm->arena_ctx, p, size) ||
+        vm_mapping_contains(vm, p, size) ||
+        vm_heap_contains(&vm->heap, p, size))
+        return 1;
+    /* String literals belong to module static storage. */
+    if (vm->module) {
+        for (uint32_t i = 0; i < vm->module->string_count; i++) {
+            const char *s = vm->module->strings[i];
+            if (s == (const char *)p)
+                return size <= strlen(s) + 1u;
+        }
+    }
+    return 0;
+}
+
+static int vm_host_read_ptr_ok(const vm_state_t *vm, int64_t base, size_t size)
+{
+    if (vm_host_ptr_ok(vm, base, size))
+        return 1;
+    if (!vm || base <= 0)
         return 0;
-    return 1;
+
+    /* Q_GET_ARG returns host-owned C strings.  They are intentionally not
+     * copied into the VM heap, so native reads (used by rt_strlen/strcmp)
+     * must recognize the exact argv base pointer.  Keep argv read-only. */
+    const char *p = (const char *)(intptr_t)base;
+    for (int i = 0; i < vm->arg_count; i++) {
+        const char *arg = vm->args ? vm->args[i] : NULL;
+        if (arg == p)
+            return size <= strlen(arg) + 1u;
+    }
+    return 0;
 }
 
 static void intr_native_read_u8(vir_intrinsic_ctx_t *ctx)
 {
     int64_t base = ctx->args[0];
     int64_t off = ctx->args[1];
-    if (!vm_host_ptr_ok(base)) {
+    if (off < 0 || (uint64_t)off > SIZE_MAX - 1u ||
+        !vm_host_read_ptr_ok(ctx->vm, base, (size_t)off + 1u)) {
         *ctx->ret = 0;
         return;
     }
@@ -875,7 +1061,8 @@ static void intr_native_write_u8(vir_intrinsic_ctx_t *ctx)
     int64_t base = ctx->args[0];
     int64_t off = ctx->args[1];
     int64_t val = ctx->args[2];
-    if (!vm_host_ptr_ok(base)) {
+    if (off < 0 || (uint64_t)off > SIZE_MAX - 1u ||
+        !vm_host_ptr_ok(ctx->vm, base, (size_t)off + 1u)) {
         *ctx->ret = 0;
         return;
     }
@@ -888,13 +1075,19 @@ static void intr_native_read_i64(vir_intrinsic_ctx_t *ctx)
 {
     int64_t base = ctx->args[0];
     int64_t off = ctx->args[1];
+    if (off < 0) {
+        *ctx->ret = 0;
+        return;
+    }
     if (base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE) {
         size_t slot = (size_t)((base - VM_MMIO_BASE) + off) / sizeof(int64_t);
         size_t slots = VM_MMIO_SIZE / sizeof(int64_t);
         *ctx->ret = slot < slots ? ctx->vm->mmio_region[slot] : 0;
         return;
     }
-    if (!vm_host_ptr_ok(base)) {
+    if ((uint64_t)off > SIZE_MAX - sizeof(int64_t) ||
+        !vm_host_read_ptr_ok(ctx->vm, base,
+                             (size_t)off + sizeof(int64_t))) {
         *ctx->ret = 0;
         return;
     }
@@ -907,6 +1100,10 @@ static void intr_native_write_i64(vir_intrinsic_ctx_t *ctx)
     int64_t base = ctx->args[0];
     int64_t off = ctx->args[1];
     int64_t val = ctx->args[2];
+    if (off < 0) {
+        *ctx->ret = 0;
+        return;
+    }
     if (base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE) {
         size_t slot = (size_t)((base - VM_MMIO_BASE) + off) / sizeof(int64_t);
         size_t slots = VM_MMIO_SIZE / sizeof(int64_t);
@@ -915,11 +1112,16 @@ static void intr_native_write_i64(vir_intrinsic_ctx_t *ctx)
         *ctx->ret = 0;
         return;
     }
-    if (!vm_host_ptr_ok(base)) {
+    if ((uint64_t)off > SIZE_MAX - sizeof(int64_t) ||
+        !vm_host_ptr_ok(ctx->vm, base, (size_t)off + sizeof(int64_t))) {
         *ctx->ret = 0;
         return;
     }
     int64_t *ptr = (int64_t *)((char *)(intptr_t)base + off);
+    /* Collections such as Vec<T> write their elements through this
+     * intrinsic.  An iteration-local entity stored in a pre-existing Vec
+     * outlives the loop checkpoint just like Q_STORE_WORD does. */
+    vm_track_pointer_store(ctx->vm, base, val);
     *ptr = val;
     *ctx->ret = 0;
 }
@@ -1152,14 +1354,175 @@ static void vm_restore_caller_window(vm_state_t *vm, uint32_t frame_index)
     vm->func_stack[frame_index].caller_regs = NULL;
 }
 
+static int vm_enter_call_arena(vm_state_t *vm, uint32_t frame)
+{
+    int arena_id = vm_arena_tl_get_in(&vm->arena_ctx);
+    if (arena_id < 0)
+        return -1;
+    /* A function is a logical region in the current arena.  Giving every
+     * tiny lexer helper its own mmap page made per-character calls retain a
+     * minimum 64 KiB mapping.  A watermark provides the specified O(1)
+     * function-scope lifetime while keeping allocations densely packed. */
+    vm->func_stack[frame].arena_id = arena_id;
+    vm->func_stack[frame].arena_wm =
+        vm_arena_save_in(&vm->arena_ctx, arena_id);
+    vm->func_stack[frame].arena_escaped = 0;
+    vm->func_stack[frame].arena_mark_sp = vm->arena_mark_sp;
+    return 0;
+}
+
+static void vm_track_pointer_store(vm_state_t *vm, int64_t base, int64_t value)
+{
+    if (!vm || value == 0)
+        return;
+    const void *src = (const void *)(intptr_t)value;
+    const void *dst = (const void *)(intptr_t)base;
+    /* The self-host compiler performs pointer-store tracking for every Vec
+     * element and record field, but nearly all of those values are scalars or
+     * heap objects.  Reject non-arena values once instead of walking every
+     * active loop/function watermark for them. */
+    if (vm_arena_owner_in(&vm->arena_ctx, src, 1) < 0)
+        return;
+    /* An enclosing loop checkpoint remains a lifetime boundary while calls
+     * made by its body are running.  For example vec_reserve() can allocate
+     * a new backing store two frames below tokenize() and install it in a
+     * Vec that predates the tokenize iteration.  Walk every active mark,
+     * rather than requiring the store to happen at the mark's func_depth. */
+    for (uint8_t mi = 0; mi < vm->arena_mark_sp; mi++) {
+        int mark_arena = vm->arena_marks[mi].arena_id;
+        size_t mark_wm = vm->arena_marks[mi].watermark;
+        int src_new = vm_arena_contains_after_in(&vm->arena_ctx, mark_arena,
+                                                 src, 1, mark_wm);
+        int dst_new = vm_arena_contains_after_in(&vm->arena_ctx, mark_arena,
+                                                 dst, 1, mark_wm);
+        if (src_new &&
+            (base == 0 ||
+             !dst_new))
+            vm->arena_marks[mi].escaped = 1;
+    }
+
+    /* Function watermarks share the same physical arena.  If a nested call
+     * installs one of its allocations in storage that predates an enclosing
+     * caller, every enclosing watermark crossed by that store must retain
+     * the region.  Marking only the immediate callee lets the next caller
+     * (vec_push around vec_reserve, for example) free the live allocation. */
+    for (uint32_t frame = 0; frame < vm->func_depth; frame++) {
+        int arena_id = vm->func_stack[frame].arena_id;
+        size_t watermark = vm->func_stack[frame].arena_wm;
+        if (vm_arena_contains_after_in(&vm->arena_ctx, arena_id, src, 1,
+                                       watermark) &&
+            (base == 0 ||
+             !vm_arena_contains_after_in(&vm->arena_ctx, arena_id, dst, 1,
+                                         watermark)))
+            vm->func_stack[frame].arena_escaped = 1;
+    }
+}
+
+static void vm_track_iteration_value(vm_state_t *vm, int64_t value)
+{
+    if (!vm || value == 0 || vm->arena_mark_sp == 0)
+        return;
+    uint8_t mi = vm->arena_mark_sp - 1u;
+    if (vm->arena_marks[mi].func_depth != vm->func_depth)
+        return;
+    if (vm_arena_contains_after_in(&vm->arena_ctx,
+                                   vm->arena_marks[mi].arena_id,
+                                   (const void *)(intptr_t)value, 1,
+                                   vm->arena_marks[mi].watermark))
+        vm->arena_marks[mi].escaped = 1;
+}
+
+static int vm_value_escapes_call(vm_state_t *vm, int64_t value,
+                                 int arena_id, size_t watermark)
+{
+    if (value == 0)
+        return 0;
+
+    /* Raw entity/string pointer returned or written through a ref. */
+    const void *p = (const void *)(intptr_t)value;
+    if (vm_arena_contains_after_in(&vm->arena_ctx, arena_id, p, 1,
+                                   watermark))
+        return 1;
+
+    /* A promoted record is a shallow POD copy.  Its fields may still point
+     * at nested records/strings in the function region, so retain that
+     * region when a heap return contains an arena pointer. */
+    size_t heap_size = vm_heap_size_of(&vm->heap, p);
+    if (heap_size >= sizeof(int64_t)) {
+        const int64_t *words = (const int64_t *)p;
+        size_t count = heap_size / sizeof(*words);
+        for (size_t i = 0; i < count; i++) {
+            const void *nested = (const void *)(intptr_t)words[i];
+            if (vm_arena_contains_after_in(&vm->arena_ctx, arena_id,
+                                           nested, 1, watermark))
+                return 1;
+        }
+    }
+
+    /* Array/dict handles are untagged small integers and overlap ordinary
+     * scalar return values.  Scanning a large token Vec whenever a helper
+     * returns 0, 1, ... creates catastrophic O(n^2) behaviour.  All stores
+     * into arrays, dicts, globals and native records pass through
+     * vm_track_pointer_store(), which marks the crossed region at write time;
+     * therefore handle contents do not need to be rescanned on return. */
+    return 0;
+}
+
+static void vm_leave_call_arena(vm_state_t *vm, uint32_t frame,
+                                int64_t ret_val,
+                                const int64_t *ref_values,
+                                uint32_t ref_count)
+{
+    int arena_id = vm->func_stack[frame].arena_id;
+    size_t watermark = vm->func_stack[frame].arena_wm;
+
+    /* A well-formed function leaves explicit nested `arena:` blocks before
+     * returning. Restore the caller as the active allocation region first. */
+    while (vm_arena_tl_get_in(&vm->arena_ctx) != arena_id &&
+           vm->arena_ctx.tl_sp > 0)
+        vm_arena_tl_pop_in(&vm->arena_ctx);
+
+    int escapes = vm->func_stack[frame].arena_escaped ||
+                  vm_value_escapes_call(vm, ret_val, arena_id, watermark);
+    for (uint32_t i = 0; !escapes && i < ref_count; i++) {
+        if (vm_value_escapes_call(vm, ref_values[i], arena_id, watermark))
+            escapes = 1;
+    }
+    if (!escapes && arena_id >= 0)
+        vm_arena_restore_in(&vm->arena_ctx, arena_id, watermark);
+
+    /* A return/break out of a loop can bypass its Q_ARENA_RESTORE.  Do not
+     * let that stale mark classify stores performed later by the caller. */
+    vm->arena_mark_sp = vm->func_stack[frame].arena_mark_sp;
+
+    vm->func_stack[frame].arena_id = -1;
+    vm->func_stack[frame].arena_wm = 0;
+    vm->func_stack[frame].arena_escaped = 0;
+}
+
 static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
 {
     if (fidx >= vm->module->func_count) return VM_ERR_BAD_JUMP;
     const q_function_t *callee = &vm->module->functions[fidx];
 
     if (callee->body_count == 0) {
-        /* Intrinsic / Extern intercept */
-        if (strncmp(callee->name, "syscall", 7) == 0) {
+        int intr_id = -3;
+        if (vm->func_intrinsic_cache && fidx < vm->func_intrinsic_cache_count) {
+            intr_id = vm->func_intrinsic_cache[fidx];
+        } else {
+            if (strncmp(callee->name, "syscall", 7) == 0) {
+                intr_id = -2;
+            } else {
+                for (int i = 0; i < VIR_MAX_INTRINSICS; i++) {
+                    if (vir_intr_table[i].fn && strcmp(vir_intr_table[i].name, callee->name) == 0) {
+                        intr_id = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (intr_id == -2) {
             int64_t ret_val = 0;
             vir_intrinsic_ctx_t ctx = {
                 .args = &vm->regs[0],
@@ -1171,22 +1534,18 @@ static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
             vm->regs[0] = ret_val;
             vm->ip++;
             return VM_OK;
-        }
-
-        for (int i = 0; i < VIR_MAX_INTRINSICS; i++) {
-            if (vir_intr_table[i].fn && strcmp(vir_intr_table[i].name, callee->name) == 0) {
-                int64_t ret_val = 0;
-                vir_intrinsic_ctx_t ctx = {
-                    .args = &vm->regs[0],
-                    .argc = callee->param_count,
-                    .ret  = &ret_val,
-                    .vm   = vm,
-                };
-                vir_intr_table[i].fn(&ctx);
-                vm->regs[0] = ret_val;
-                vm->ip++;
-                return VM_OK;
-            }
+        } else if (intr_id >= 0) {
+            int64_t ret_val = 0;
+            vir_intrinsic_ctx_t ctx = {
+                .args = &vm->regs[0],
+                .argc = callee->param_count,
+                .ret  = &ret_val,
+                .vm   = vm,
+            };
+            vir_intr_table[intr_id].fn(&ctx);
+            vm->regs[0] = ret_val;
+            vm->ip++;
+            return VM_OK;
         }
         vm->ip++;
         return VM_OK; /* No-op for unhandled extern */
@@ -1206,6 +1565,8 @@ static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
     uint32_t save_base = vm->reg_save_top;
     vm->func_stack[vm->func_depth].saved_base = save_base;
     vm->func_stack[vm->func_depth].saved_reg_count = nregs;
+    if (vm_enter_call_arena(vm, vm->func_depth) != 0)
+        return VM_ERR_STACK_OF;
     memcpy(&vm->reg_save_stack[save_base], vm->regs,
            (size_t)nregs * sizeof(int64_t));
     vm->reg_save_top = save_base + nregs;
@@ -1233,13 +1594,80 @@ static vm_status_t vm_dispatch_call(vm_state_t *vm, uint32_t fidx)
 }
 
 
+static void vm_apply_ref_writeback(vm_state_t *vm,
+                                   const int64_t *bindings,
+                                   const int64_t *values,
+                                   uint32_t count)
+{
+    for (uint32_t pi = 0; pi < count && pi < Q_MAX_PARAMS; pi++) {
+        int64_t binding = bindings[pi];
+        if (binding == 0) continue;
+        int64_t val = values[pi];
+        if (binding > 0) {
+            uint32_t vreg = (uint32_t)(binding - 1);
+            if (vreg < VREG_MAX) vm->regs[vreg] = val;
+        } else {
+            uint32_t gidx = (uint32_t)((-binding) - 1);
+            if (gidx < VM_MAX_GLOBALS) vm->globals[gidx] = val;
+        }
+    }
+}
+
+static vm_status_t vm_finish_tailcall_return(vm_state_t *vm, int64_t ret_val)
+{
+    if (vm->func_depth == 0) {
+        vm->regs[0] = ret_val;
+        return VM_OK;
+        return VM_HALT;
+    }
+    uint32_t frame = vm->func_depth - 1;
+    int64_t ref_bindings[Q_MAX_PARAMS] = {0};
+    int64_t ref_values[Q_MAX_PARAMS] = {0};
+    uint32_t ref_count = 0;
+    if (vm->current_func) {
+        ref_count = vm->current_func->param_count;
+        for (uint32_t pi = 0; pi < ref_count && pi < Q_MAX_PARAMS; pi++) {
+            if (!vm->current_func->param_is_ref[pi]) continue;
+            ref_bindings[pi] = vm->func_stack[vm->func_depth].ref_bindings[pi];
+            ref_bindings[pi] = vm->func_stack[frame].ref_bindings[pi];
+            ref_values[pi] = vm->regs[vm->current_func->param_vregs[pi]];
+        }
+    }
+    vm_leave_call_arena(vm, frame, ret_val, ref_values, ref_count);
+    vm->func_depth--;
+    vm_restore_caller_window(vm, vm->func_depth);
+    vm_apply_ref_writeback(vm, ref_bindings, ref_values, ref_count);
+    /* Put return value in R0 */
+    vm->regs[0] = ret_val;
+    vm->current_func = vm->func_stack[vm->func_depth].func;
+    vm->ip = vm->func_stack[vm->func_depth].ip;
+    vm_resolve_labels(vm, vm->current_func);
+    return VM_OK;
+}
+
 static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
 {
     if (fidx >= vm->module->func_count) return VM_ERR_BAD_JUMP;
     const q_function_t *callee = &vm->module->functions[fidx];
 
     if (callee->body_count == 0) {
-        if (strncmp(callee->name, "syscall", 7) == 0) {
+        int intr_id = -3;
+        if (vm->func_intrinsic_cache && fidx < vm->func_intrinsic_cache_count) {
+            intr_id = vm->func_intrinsic_cache[fidx];
+        } else {
+            if (strncmp(callee->name, "syscall", 7) == 0) {
+                intr_id = -2;
+            } else {
+                for (int i = 0; i < VIR_MAX_INTRINSICS; i++) {
+                    if (vir_intr_table[i].fn && strcmp(vir_intr_table[i].name, callee->name) == 0) {
+                        intr_id = i;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (intr_id == -2) {
             int64_t ret_val = 0;
             vir_intrinsic_ctx_t ctx = {
                 .args = &vm->regs[0],
@@ -1248,51 +1676,21 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
                 .vm   = vm,
             };
             intr_syscall(&ctx);
-            
-            if (vm->func_depth == 0) {
-                vm->regs[0] = ret_val;
-                return VM_OK;
-            }
-            vm->func_depth--;
-            vm->current_func = vm->func_stack[vm->func_depth].func;
-            vm->ip           = vm->func_stack[vm->func_depth].ip;
-            vm_restore_caller_window(vm, vm->func_depth);
-            vm->regs[0] = ret_val;
-            return VM_OK;
+            return vm_finish_tailcall_return(vm, ret_val);
+        } else if (intr_id >= 0) {
+            int64_t ret_val = 0;
+            vir_intrinsic_ctx_t ctx = {
+                .args = &vm->regs[0],
+                .argc = callee->param_count,
+                .ret  = &ret_val,
+                .vm   = vm,
+            };
+            vir_intr_table[intr_id].fn(&ctx);
+            return vm_finish_tailcall_return(vm, ret_val);
         }
 
-        for (int i = 0; i < VIR_MAX_INTRINSICS; i++) {
-            if (vir_intr_table[i].fn && strcmp(vir_intr_table[i].name, callee->name) == 0) {
-                int64_t ret_val = 0;
-                vir_intrinsic_ctx_t ctx = {
-                    .args = &vm->regs[0],
-                    .argc = callee->param_count,
-                    .ret  = &ret_val,
-                    .vm   = vm,
-                };
-                vir_intr_table[i].fn(&ctx);
-                
-                if (vm->func_depth == 0) {
-                    vm->regs[0] = ret_val;
-                    return VM_OK;
-                }
-                vm->func_depth--;
-                vm->current_func = vm->func_stack[vm->func_depth].func;
-                vm->ip           = vm->func_stack[vm->func_depth].ip;
-                vm_restore_caller_window(vm, vm->func_depth);
-                vm->regs[0] = ret_val;
-                return VM_OK;
-            }
-        }
-
-        if (vm->func_depth == 0) return VM_OK;
-        vm->func_depth--;
-        vm->current_func = vm->func_stack[vm->func_depth].func;
-        vm->ip           = vm->func_stack[vm->func_depth].ip;
-        vm_restore_caller_window(vm, vm->func_depth);
-        return VM_OK;
+        return vm_finish_tailcall_return(vm, 0);
     }
-
 
     /* Tailcall: reuse frame; stage args first so param_vreg writes cannot
      * clobber later ABI argument slots. */
@@ -1320,25 +1718,6 @@ static vm_status_t vm_dispatch_tailcall(vm_state_t *vm, uint32_t fidx)
     return VM_OK;
 }
 
-static void vm_apply_ref_writeback(vm_state_t *vm,
-                                   const int64_t *bindings,
-                                   const int64_t *values,
-                                   uint32_t count)
-{
-    for (uint32_t pi = 0; pi < count && pi < Q_MAX_PARAMS; pi++) {
-        int64_t binding = bindings[pi];
-        if (binding == 0) continue;
-        int64_t val = values[pi];
-        if (binding > 0) {
-            uint32_t vreg = (uint32_t)(binding - 1);
-            if (vreg < VREG_MAX) vm->regs[vreg] = val;
-        } else {
-            uint32_t gidx = (uint32_t)((-binding) - 1);
-            if (gidx < VM_MAX_GLOBALS) vm->globals[gidx] = val;
-        }
-    }
-}
-
 vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
 {
     int64_t a, b, result;
@@ -1361,7 +1740,13 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         break;
 
     case Q_MOVE:
-        set_dest(vm, &instr->dest, operand_value(vm, &instr->src1));
+        a = operand_value(vm, &instr->src1);
+        /* A call result is commonly materialised with Q_MOVE.  If it was
+         * allocated during the current `when` iteration, conservatively
+         * retain that iteration.  Q_MOVE is register-local, so it must not
+         * mark the surrounding function frame as a global escape. */
+        vm_track_iteration_value(vm, a);
+        set_dest(vm, &instr->dest, a);
         break;
 
     /* ── Arithmetic ────────────────────────────────────── */
@@ -1460,7 +1845,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_JUMP:
         if (instr->src1.type == OPERAND_LABEL) {
             uint32_t lid = instr->src1.label;
-            if (lid < VM_MAX_LABELS && vm->active_label_map) {
+            if (lid < vm->label_count && vm->active_label_map) {
                 vm->ip = vm->active_label_map[lid];
                 return VM_OK;
             }
@@ -1470,7 +1855,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_JUMP_IF:
         a = operand_value(vm, &instr->src1);
         if (a != 0 && instr->src2.type == OPERAND_LABEL) {
-            if (instr->src2.label >= VM_MAX_LABELS || !vm->active_label_map)
+            if (instr->src2.label >= vm->label_count || !vm->active_label_map)
                 return VM_ERR_BAD_JUMP;
             vm->ip = vm->active_label_map[instr->src2.label];
             return VM_OK;
@@ -1480,7 +1865,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_JUMP_IF_NOT:
         a = operand_value(vm, &instr->src1);
         if (a == 0 && instr->src2.type == OPERAND_LABEL) {
-            if (instr->src2.label >= VM_MAX_LABELS || !vm->active_label_map)
+            if (instr->src2.label >= vm->label_count || !vm->active_label_map)
                 return VM_ERR_BAD_JUMP;
             vm->ip = vm->active_label_map[instr->src2.label];
             return VM_OK;
@@ -1492,7 +1877,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
             return VM_ERR_STACK_OF;
         vm->call_stack[vm->call_depth++] = vm->ip + 1;
         if (instr->src1.type == OPERAND_LABEL) {
-            if (instr->src1.label >= VM_MAX_LABELS || !vm->active_label_map)
+            if (instr->src1.label >= vm->label_count || !vm->active_label_map)
                 return VM_ERR_BAD_JUMP;
             vm->ip = vm->active_label_map[instr->src1.label];
             return VM_OK;
@@ -1514,7 +1899,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         }
         /* Cross-function return? */
         if (vm->func_depth > 0) {
-            vm->func_depth--;
+            uint32_t frame = vm->func_depth - 1;
             int64_t ref_bindings[Q_MAX_PARAMS] = {0};
             int64_t ref_values[Q_MAX_PARAMS] = {0};
             uint32_t ref_count = 0;
@@ -1523,9 +1908,12 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
                 for (uint32_t pi = 0; pi < ref_count && pi < Q_MAX_PARAMS; pi++) {
                     if (!vm->current_func->param_is_ref[pi]) continue;
                     ref_bindings[pi] = vm->func_stack[vm->func_depth].ref_bindings[pi];
+                    ref_bindings[pi] = vm->func_stack[frame].ref_bindings[pi];
                     ref_values[pi] = vm->regs[vm->current_func->param_vregs[pi]];
                 }
             }
+            vm_leave_call_arena(vm, frame, ret_val, ref_values, ref_count);
+            vm->func_depth--;
             vm_restore_caller_window(vm, vm->func_depth);
             vm_apply_ref_writeback(vm, ref_bindings, ref_values, ref_count);
             /* Put return value in R0 */
@@ -1615,82 +2003,86 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
 
     /* ── Memory management ─────────────────────────────── */
     case Q_ALLOC: {
-        /* Heap blocks via calloc. Do NOT bump-allocate from the TL arena:
-         * auto `when`/`while` SAVE/RESTORE would reclaim loop-carried
-         * pointers (boot parser/AST). Explicit `arena:` uses Q_ARENA_*. */
+        /* Language objects: current TL arena bump (§4.5–4.7). */
         int64_t sz = operand_value(vm, &instr->src1);
-        void *p = calloc(1, (size_t)(sz > 0 ? sz : 1));
-        if (p && vm->heap_count < VM_MAX_HEAP_BLOCKS) {
-            vm->heap_blocks[vm->heap_count++] = p;
-        }
+        void *p = vm_arena_tl_alloc_in(&vm->arena_ctx,
+                                       (size_t)(sz > 0 ? sz : 1));
+        if (p)
+            memset(p, 0, (size_t)(sz > 0 ? sz : 1));
+        set_dest(vm, &instr->dest, (int64_t)(intptr_t)p);
+        break;
+    }
+    case Q_HEAP_ALLOC: {
+        int64_t sz = operand_value(vm, &instr->src1);
+        void *p = vm_heap_alloc(&vm->heap, (size_t)(sz > 0 ? sz : 1));
         set_dest(vm, &instr->dest, (int64_t)(intptr_t)p);
         break;
     }
     case Q_FREE: {
         int64_t addr = operand_value(vm, &instr->src1);
-        /* §4.8 Auto-drop: Q_FREE is polymorphic and safe.
-         *   (a) array handle in [0, array_count): free array data, zero the slot.
-         *   (b) pointer present in rt_strings[]: free string, null the slot.
-         *   (c) pointer present in heap_blocks[] (from Q_ALLOC): free block.
-         *   (d) anything else: no-op. */
-        if (addr == 0) break;
-        /* (a) array handle */
+        /* §4.8 symbolic drop — arena objects are NOT individually freed.
+         *   (a) array handle: reclaim handle id only.
+         *   (b) heap registry pointer: vm_heap_free.
+         *   (c) arena pointer or unknown: no-op. */
+        if (addr == 0)
+            break;
         if (addr >= 0 && (uint32_t)addr < vm->array_count) {
             vm_array_t *a = &vm->arrays[(uint32_t)addr];
-            if (a->data) {
-                free(a->data);
-                a->data = NULL;
-                if (addr != 0 && vm->array_free_count < VM_MAX_ARRAYS)
-                    vm->array_free[vm->array_free_count++] = (uint32_t)addr;
-            }
+            if (a->data && vm_heap_owns_live(&vm->heap, a->data))
+                vm_heap_free(&vm->heap, a->data);
+            a->data = NULL;
             a->len = 0;
             a->cap = 0;
+                if (addr != 0 &&
+                    vm_array_free_reserve(vm, vm->array_free_count + 1u) == 0)
+                    vm->array_free[vm->array_free_count++] = (uint32_t)addr;
             break;
         }
         void *p = (void *)(intptr_t)addr;
-        /* (b) runtime string */
-        for (uint32_t i = 0; i < vm->rt_string_count; i++) {
-            if (vm->rt_strings[i] == (char *)p) {
-                free(vm->rt_strings[i]);
-                vm->rt_strings[i] = NULL;
-                goto q_free_done;
+        if (vm_heap_owns_live(&vm->heap, p)) {
+            vm_heap_free(&vm->heap, p);
+            for (uint32_t i = 0; i < vm->rt_string_count; i++) {
+                if (vm->rt_strings[i] == (char *)p)
+                    vm->rt_strings[i] = NULL;
             }
         }
-        /* (c) heap_blocks from Q_ALLOC */
-        for (uint32_t i = 0; i < vm->heap_count; i++) {
-            if (vm->heap_blocks[i] == p) {
-                free(p);
-                vm->heap_blocks[i] = vm->heap_blocks[--vm->heap_count];
-                break;
-            }
-        }
-    q_free_done:
         break;
     }
     case Q_LOAD_BYTE: {
         int64_t base = operand_value(vm, &instr->src1);
         int64_t off  = operand_value(vm, &instr->src2);
-        /* Null/invalid pointer guard: address 0 or below page boundary */
-        if (base <= 0 || (base > 0 && base < 4096 &&
-            !(base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE))) {
+        if (base >= VM_MMIO_BASE &&
+            base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE) {
+            int64_t pos = base - VM_MMIO_BASE + off;
+            const uint8_t *bytes = (const uint8_t *)vm->mmio_region;
+            set_dest(vm, &instr->dest,
+                     pos >= 0 && pos < (int64_t)VM_MMIO_SIZE ? bytes[pos] : 0);
+            break;
+        }
+        if (off < 0 || !vm_host_read_ptr_ok(vm, base, (size_t)off + 1u)) {
             set_dest(vm, &instr->dest, 0);
             break;
         }
-        uint8_t *ptr = (uint8_t *)(intptr_t)base;
-        set_dest(vm, &instr->dest, ptr ? (int64_t)ptr[off] : 0);
+        const uint8_t *ptr = (const uint8_t *)(intptr_t)base;
+        set_dest(vm, &instr->dest, (int64_t)ptr[off]);
         break;
     }
     case Q_STORE_BYTE: {
         int64_t base = operand_value(vm, &instr->src1);
         int64_t off  = operand_value(vm, &instr->src2);
         int64_t val  = operand_value(vm, &instr->dest);
-        /* Null/invalid pointer guard */
-        if (base <= 0 || (base > 0 && base < 4096 &&
-            !(base >= VM_MMIO_BASE && base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE))) {
-            break;  /* silently ignore write to null/invalid ptr */
+        if (base >= VM_MMIO_BASE &&
+            base < VM_MMIO_BASE + (int64_t)VM_MMIO_SIZE) {
+            int64_t pos = base - VM_MMIO_BASE + off;
+            uint8_t *bytes = (uint8_t *)vm->mmio_region;
+            if (pos >= 0 && pos < (int64_t)VM_MMIO_SIZE)
+                bytes[pos] = (uint8_t)val;
+            break;
         }
+        if (off < 0 || !vm_host_ptr_ok(vm, base, (size_t)off + 1u))
+            break;
         uint8_t *ptr = (uint8_t *)(intptr_t)base;
-        if (ptr) ptr[off] = (uint8_t)val;
+        ptr[off] = (uint8_t)val;
         break;
     }
     case Q_MEM_COPY: {
@@ -1721,16 +2113,26 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
             set_dest(vm, &instr->dest,
                      total < slots ? vm->mmio_region[total] : 0);
         } else {
-            /* Null/invalid pointer guard */
-            if (base <= 0 || (base > 0 && base < 4096)) {
-                set_dest(vm, &instr->dest, 0);
-                break;
+            if (idx < 0 || (uint64_t)idx > SIZE_MAX - sizeof(int64_t) ||
+                !vm_host_read_ptr_ok(vm, base,
+                                     (size_t)idx + sizeof(int64_t))) {
+                fprintf(stderr,
+                        "VM invalid Q_LOAD_WORD: func=%s ip=%u base=%lld offset=%lld\n",
+                        vm->current_func ? vm->current_func->name : "<none>",
+                        vm->ip, (long long)base, (long long)idx);
+                uint32_t first = vm->func_depth > 8u
+                                   ? vm->func_depth - 8u : 0u;
+                for (uint32_t depth = vm->func_depth; depth > first; depth--) {
+                    uint32_t caller = depth - 1u;
+                    fprintf(stderr, "  caller[%u]=%s return_ip=%u\n",
+                            vm->func_depth - depth,
+                            vm->func_stack[caller].func
+                                ? vm->func_stack[caller].func->name : "<root>",
+                            vm->func_stack[caller].ip);
+                }
+                return VM_ERR_NULL_PTR;
             }
             uintptr_t target_addr = (uintptr_t)((char *)(intptr_t)base + idx);
-            if (target_addr < 4096 || target_addr >= (uintptr_t)-4096) {
-                set_dest(vm, &instr->dest, 0);
-                break;
-            }
             int64_t v = 0;
             memcpy(&v, (const void *)target_addr, sizeof(v));
             set_dest(vm, &instr->dest, v);
@@ -1747,14 +2149,17 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
             size_t slots  = VM_MMIO_SIZE / sizeof(int64_t);
             if (total < slots) vm->mmio_region[total] = val;
         } else {
-            /* Null/invalid pointer guard */
-            if (base <= 0 || (base > 0 && base < 4096)) {
-                break;  /* silently ignore write to null/invalid ptr */
+            if (idx < 0 || (uint64_t)idx > SIZE_MAX - sizeof(int64_t) ||
+                !vm_host_ptr_ok(vm, base,
+                                (size_t)idx + sizeof(int64_t))) {
+                fprintf(stderr,
+                        "VM invalid Q_STORE_WORD: func=%s ip=%u base=%lld offset=%lld\n",
+                        vm->current_func ? vm->current_func->name : "<none>",
+                        vm->ip, (long long)base, (long long)idx);
+                return VM_ERR_NULL_PTR;
             }
             uintptr_t target_addr = (uintptr_t)((char *)(intptr_t)base + idx);
-            if (target_addr < 4096 || target_addr >= (uintptr_t)-4096) {
-                break;
-            }
+            vm_track_pointer_store(vm, base, val);
             memcpy((void *)target_addr, &val, sizeof(val));
         }
         break;
@@ -1775,12 +2180,39 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         break;
     }
     case Q_STR_CAT: {
-        const char *sa = (const char *)(intptr_t)operand_value(vm, &instr->src1);
-        const char *sb = (const char *)(intptr_t)operand_value(vm, &instr->src2);
+        int64_t raw_a = operand_value(vm, &instr->src1);
+        int64_t raw_b = operand_value(vm, &instr->src2);
+        const char *sa = (const char *)(intptr_t)raw_a;
+        const char *sb = (const char *)(intptr_t)raw_b;
         if (!sa) sa = "";
         if (!sb) sb = "";
+        size_t ha = vm_heap_size_of(&vm->heap, sa);
+        size_t hb = vm_heap_size_of(&vm->heap, sb);
+        if ((raw_a && !vm_host_read_ptr_ok(vm, raw_a, 1)) ||
+            (raw_b && !vm_host_read_ptr_ok(vm, raw_b, 1)) ||
+            (ha && !memchr(sa, '\0', ha)) ||
+            (hb && !memchr(sb, '\0', hb))) {
+            size_t live_bytes = 0;
+            for (uint32_t i = 0; i < vm->heap.count; i++)
+                if (vm->heap.entries[i].live)
+                    live_bytes += vm->heap.entries[i].size;
+            fprintf(stderr,
+                    "VM invalid Q_STR_CAT operand: func=%s ip=%u "
+                    "a=%lld(heap=%zu) b=%lld(heap=%zu) "
+                    "live_heap=%u/%zu arena=%zu\n",
+                    vm->current_func ? vm->current_func->name : "<none>",
+                    vm->ip, (long long)(intptr_t)sa, ha,
+                    (long long)(intptr_t)sb, hb,
+                    vm_heap_live_count(&vm->heap), live_bytes,
+                    vm->arena_ctx.arenas[0].used);
+            return VM_ERR_NULL_PTR;
+        }
         size_t la = strlen(sa), lb = strlen(sb);
-        char *cat = (char *)malloc(la + lb + 1);
+        char *cat = (char *)vm_arena_tl_alloc_in(&vm->arena_ctx, la + lb + 1);
+        if (!cat) {
+            set_dest(vm, &instr->dest, 0);
+            break;
+        }
         memcpy(cat, sa, la);
         memcpy(cat + la, sb, lb);
         cat[la + lb] = '\0';
@@ -1831,7 +2263,8 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         fseek(f, 0, SEEK_END);
         long sz = ftell(f);
         fseek(f, 0, SEEK_SET);
-        char *buf = (char *)malloc((size_t)sz + 1);
+        char *buf = (char *)vm_arena_tl_alloc_in(&vm->arena_ctx, (size_t)sz + 1);
+        if (!buf) { set_dest(vm, &instr->dest, 0); break; }
         size_t rd = fread(buf, 1, (size_t)sz, f);
         buf[rd] = '\0';
         set_dest(vm, &instr->dest, vm_add_rt_string(vm, buf));
@@ -1880,7 +2313,8 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         /* Polymorphic: if valid array handle, return array len;
            otherwise treat as string pointer and return strlen */
         if (v >= 0 && (uint32_t)v < vm->array_count) {
-            set_dest(vm, &instr->dest, vm_array_len(vm, v));
+            int64_t al = vm_array_len(vm, v);
+            set_dest(vm, &instr->dest, al);
         } else {
             const char *s = (const char *)(intptr_t)v;
             set_dest(vm, &instr->dest, (s && v != 0) ? (int64_t)strlen(s) : 0);
@@ -1897,12 +2331,14 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         int64_t arr = operand_value(vm, &instr->src1);
         int64_t idx = operand_value(vm, &instr->src2);
         int64_t val = operand_value(vm, &instr->dest);
+        vm_track_pointer_store(vm, 0, val);
         vm_array_set(vm, arr, idx, val);
         break;
     }
     case Q_ARR_PUSH: {
         int64_t arr = operand_value(vm, &instr->src1);
         int64_t val = operand_value(vm, &instr->src2);
+        vm_track_pointer_store(vm, 0, val);
         vm_array_push(vm, arr, val);
         break;
     }
@@ -1928,23 +2364,35 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         set_dest(vm, &instr->dest, new_handle);
         break;
     }
+    case Q_REALLOC: {
+        /* Heap-only (FFI / vir_realloc). Arena pointers cannot realloc. */
+        int64_t old_ptr = operand_value(vm, &instr->src1);
+        int64_t new_sz  = operand_value(vm, &instr->src2);
+        void *old = (void *)(intptr_t)old_ptr;
+        void *np = NULL;
+        if (old_ptr == 0)
+            np = vm_heap_alloc(&vm->heap, (size_t)(new_sz > 0 ? new_sz : 0));
+        else if (vm_heap_owns_live(&vm->heap, old))
+            np = vm_heap_realloc(&vm->heap, old, (size_t)(new_sz > 0 ? new_sz : 0));
+        set_dest(vm, &instr->dest, (int64_t)(intptr_t)np);
+        break;
+    }
     case Q_ARENA_NEW: {
         int64_t sz = operand_value(vm, &instr->src1);
         if (sz <= 0) sz = 64 * 1024;
-        int aid = vir_arena_create((size_t)sz);
+        int aid = vm_arena_create_in(&vm->arena_ctx, (size_t)sz);
         set_dest(vm, &instr->dest, (int64_t)aid);
         break;
     }
     case Q_ARENA_ALLOC: {
-        /* Prefer explicit aid; src1 < 0 → current TL / default arena. */
         int64_t aid = operand_value(vm, &instr->src1);
         int64_t sz  = operand_value(vm, &instr->src2);
         void *p = NULL;
         if (sz > 0) {
             if (aid < 0) {
-                p = vir_tl_arena_alloc((size_t)sz);
+                p = vm_arena_tl_alloc_in(&vm->arena_ctx, (size_t)sz);
             } else {
-                p = vir_arena_alloc((int)aid, (size_t)sz);
+                p = vm_arena_alloc_in(&vm->arena_ctx, (int)aid, (size_t)sz);
             }
         }
         set_dest(vm, &instr->dest, (int64_t)(intptr_t)p);
@@ -1952,35 +2400,77 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     }
     case Q_ARENA_FREE: {
         int64_t aid = operand_value(vm, &instr->src1);
-        vir_arena_destroy((int)aid);
+        vm_arena_destroy_in(&vm->arena_ctx, (int)aid);
         set_dest(vm, &instr->dest, 0);
         break;
     }
     case Q_ARENA_ENTER: {
         int64_t aid = operand_value(vm, &instr->src1);
-        vir_tl_arena_push((int)aid);
+        vm_arena_tl_push_in(&vm->arena_ctx, (int)aid);
         set_dest(vm, &instr->dest, 0);
         break;
     }
     case Q_ARENA_LEAVE: {
-        vir_tl_arena_pop();
+        vm_arena_tl_pop_in(&vm->arena_ctx);
         set_dest(vm, &instr->dest, 0);
         break;
     }
     case Q_ARENA_SAVE: {
-        /* src1=NONE → thread-local current arena (auto when/loop watermark). */
         int aid = (instr->src1.type == OPERAND_NONE)
-                      ? vir_tl_arena_get()
+                      ? vm_arena_tl_get_in(&vm->arena_ctx)
                       : (int)operand_value(vm, &instr->src1);
-        set_dest(vm, &instr->dest, (int64_t)vir_arena_save(aid));
+        size_t wm = vm_arena_save_in(&vm->arena_ctx, aid);
+        if (vm->arena_mark_sp < VM_ARENA_MAX_TL_DEPTH) {
+            uint8_t mi = vm->arena_mark_sp++;
+            vm->arena_marks[mi].arena_id = aid;
+            vm->arena_marks[mi].watermark = wm;
+            vm->arena_marks[mi].escaped = 0;
+            vm->arena_marks[mi].func_depth = vm->func_depth;
+        }
+        set_dest(vm, &instr->dest, (int64_t)wm);
         break;
     }
     case Q_ARENA_RESTORE: {
+        static uint64_t restore_count = 0;
+        static int mem_stats_enabled = -1;
         int aid = (instr->src1.type == OPERAND_NONE)
-                      ? vir_tl_arena_get()
+                      ? vm_arena_tl_get_in(&vm->arena_ctx)
                       : (int)operand_value(vm, &instr->src1);
         int64_t wm = operand_value(vm, &instr->src2);
-        vir_arena_restore(aid, (size_t)wm);
+        int escaped = 0;
+        if (vm->arena_mark_sp > 0) {
+            uint8_t mi = vm->arena_mark_sp - 1u;
+            if (vm->arena_marks[mi].arena_id == aid &&
+                vm->arena_marks[mi].watermark == (size_t)wm) {
+                escaped = vm->arena_marks[mi].escaped;
+                vm->arena_mark_sp--;
+            }
+        }
+        if (!escaped)
+            vm_arena_restore_in(&vm->arena_ctx, aid, (size_t)wm);
+        restore_count++;
+        if (mem_stats_enabled < 0)
+            mem_stats_enabled = getenv("VIR_MEM_STATS") != NULL;
+        if (mem_stats_enabled && restore_count % 2000u == 0) {
+            size_t live_bytes = 0;
+            size_t label_bytes = 0;
+            for (uint32_t i = 0; i < vm->heap.count; i++)
+                if (vm->heap.entries[i].live)
+                    live_bytes += vm->heap.entries[i].size;
+            for (uint32_t i = 0; i < vm->label_by_fidx_n; i++)
+                if (vm->label_by_fidx && vm->label_by_fidx[i])
+                    label_bytes += (size_t)vm->label_len_by_fidx[i] *
+                                   sizeof(uint32_t);
+            fprintf(stderr,
+                    "[vm-mem] restores=%llu func=%s heap=%u/%u "
+                    "bytes=%zu arena=%zu labels=%zu regsave=%u arrays=%u\n",
+                    (unsigned long long)restore_count,
+                    vm->current_func ? vm->current_func->name : "<none>",
+                    vm->heap.live_count, vm->heap.count, live_bytes,
+                    aid >= 0 ? vm->arena_ctx.arenas[aid].used : 0,
+                    label_bytes, vm->reg_save_cap,
+                    vm->array_count);
+        }
         set_dest(vm, &instr->dest, 0);
         break;
     }
@@ -1994,6 +2484,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         int64_t d = operand_value(vm, &instr->src1);
         int64_t k = operand_value(vm, &instr->src2);
         int64_t v = operand_value(vm, &instr->dest);
+        vm_track_pointer_store(vm, 0, v);
         vm_dict_set(vm, d, instr->opcode == Q_DICT_SET_S, k, v);
         break;
     }
@@ -2052,7 +2543,8 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         break; /* unreachable */
     }
     case Q_I_TO_STR: {
-        char *buf = (char *)malloc(32);
+        char *buf = (char *)vm_arena_tl_alloc_in(&vm->arena_ctx, 32);
+        if (!buf) { set_dest(vm, &instr->dest, 0); break; }
         snprintf(buf, 32, "%lld", (long long)operand_value(vm, &instr->src1));
         set_dest(vm, &instr->dest, vm_add_rt_string(vm, buf));
         break;
@@ -2060,7 +2552,8 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_CHAR_TO_STR: {
         /* Convert an integer char code to a 1-character string */
         int64_t code = operand_value(vm, &instr->src1);
-        char *buf = (char *)malloc(5); /* up to 4 UTF-8 bytes + NUL */
+        char *buf = (char *)vm_arena_tl_alloc_in(&vm->arena_ctx, 5); /* up to 4 UTF-8 bytes + NUL */
+        if (!buf) { set_dest(vm, &instr->dest, 0); break; }
         if (code < 0x80) {
             buf[0] = (char)(code & 0x7F);
             buf[1] = '\0';
@@ -2115,38 +2608,16 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         } else {
             set_dest(vm, &instr->dest, 0);
         }
-        {
-            FILE *dbg = vm_dbg_file();
-            if (dbg && vm->current_func &&
-                (strcmp(vm->current_func->name, "vir_alloc") == 0 ||
-                 strcmp(vm->current_func->name, "heap_alloc") == 0 ||
-                 strcmp(vm->current_func->name, "heap_init") == 0)) {
-                fprintf(dbg, "LOADG %s idx=%lld -> %lld (ip=%u)\n",
-                        vm->current_func->name, (long long)idx,
-                        (long long)(idx >= 0 && idx < (int64_t)VM_MAX_GLOBALS ?
-                                    vm->globals[(uint32_t)idx] : 0), vm->ip);
-            }
-        }
         break;
     }
     case Q_STORE_GLOBAL: {
         int64_t idx = operand_value(vm, &instr->src1);
         int64_t val = operand_value(vm, &instr->src2);
+        vm_track_pointer_store(vm, 0, val);
         if (idx >= 0 && idx < (int64_t)VM_MAX_GLOBALS) {
             vm->globals[(uint32_t)idx] = val;
             if ((uint32_t)idx >= vm->global_count)
                 vm->global_count = (uint32_t)idx + 1;
-        }
-        {
-            FILE *dbg = vm_dbg_file();
-            if (dbg && vm->current_func &&
-                (strcmp(vm->current_func->name, "vir_alloc") == 0 ||
-                 strcmp(vm->current_func->name, "heap_alloc") == 0 ||
-                 strcmp(vm->current_func->name, "heap_init") == 0)) {
-                fprintf(dbg, "STOREG %s idx=%lld val=%lld (ip=%u)\n",
-                        vm->current_func->name, (long long)idx,
-                        (long long)val, vm->ip);
-            }
         }
         break;
     }
@@ -2625,7 +3096,7 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
             return VM_ERR_STACK_OF;
         uint32_t revert_pc = 0;
         if (instr->dest.type == OPERAND_LABEL &&
-            instr->dest.label < VM_MAX_LABELS && vm->active_label_map) {
+            instr->dest.label < vm->label_count && vm->active_label_map) {
             revert_pc = vm->active_label_map[instr->dest.label];
         }
         vm->try_stack[vm->try_sp].revert_pc = revert_pc;
@@ -2743,7 +3214,7 @@ vm_status_t vm_exec_function(vm_state_t *vm, const q_function_t *func)
             /* Fell off end of function - implicit return 0 */
             vm->regs[0] = 0;
             if (vm->func_depth > 0) {
-                vm->func_depth--;
+                uint32_t frame = vm->func_depth - 1;
                 int64_t ref_bindings[Q_MAX_PARAMS] = {0};
                 int64_t ref_values[Q_MAX_PARAMS] = {0};
                 uint32_t ref_count = 0;
@@ -2752,9 +3223,12 @@ vm_status_t vm_exec_function(vm_state_t *vm, const q_function_t *func)
                     for (uint32_t pi = 0; pi < ref_count && pi < Q_MAX_PARAMS; pi++) {
                         if (!vm->current_func->param_is_ref[pi]) continue;
                         ref_bindings[pi] = vm->func_stack[vm->func_depth].ref_bindings[pi];
+                        ref_bindings[pi] = vm->func_stack[frame].ref_bindings[pi];
                         ref_values[pi] = vm->regs[vm->current_func->param_vregs[pi]];
                     }
                 }
+                vm_leave_call_arena(vm, frame, 0, ref_values, ref_count);
+                vm->func_depth--;
                 vm_restore_caller_window(vm, vm->func_depth);
                 vm_apply_ref_writeback(vm, ref_bindings, ref_values, ref_count);
                 vm->regs[0] = 0; /* overwrite with return value */
@@ -2771,6 +3245,8 @@ vm_status_t vm_exec_function(vm_state_t *vm, const q_function_t *func)
             /* Check if we should pop the call stack */
             if (vm->func_depth > 0) {
                 int64_t ret_val = vm->regs[0];
+                uint32_t frame = vm->func_depth - 1;
+                vm_leave_call_arena(vm, frame, ret_val, NULL, 0);
                 vm->func_depth--;
                 vm_restore_caller_window(vm, vm->func_depth);
                 vm->regs[0] = ret_val;
@@ -2848,7 +3324,7 @@ vm_status_t vm_exec_module(vm_state_t *vm, const q_module_t *mod)
     }
     if (!entry) return VM_HALT;
 
-    fprintf(stderr, "EXECUTING: %s\n", entry->name); return vm_exec_function(vm, entry);
+    return vm_exec_function(vm, entry);
 }
 
 /* ═══════════════════════════════════════════════════════
