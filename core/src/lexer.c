@@ -1,8 +1,7 @@
 /*
  * lexer.c – Vir Source Lexer Implementation
  * ==========================================
- * UTF-8 tokenizer with Vietnamese + English keyword support.
- * Multi-word Vietnamese keywords handled via lookahead.
+ * UTF-8 tokenizer for the standard English keyword surface.
  */
 
 #include "lexer.h"
@@ -43,10 +42,8 @@ static const kw_single_t kw_singles[] = {
     {"const", TOK_CONST},
     {"if", TOK_IF},
     {"else", TOK_ELSE},
-    {"elif", TOK_ELIF},
     {"eif", TOK_EIF},
     {"loop", TOK_LOOP},
-    {"while", TOK_WHILE},
     {"when", TOK_WHEN},
     {"for", TOK_FOR},
     {"break", TOK_BREAK},
@@ -56,7 +53,6 @@ static const kw_single_t kw_singles[] = {
     {"out", TOK_OUT},
     {"case", TOK_CASE},
     {"del", TOK_DEL},
-    {"xóa", TOK_DEL},
     {"then", TOK_THEN},
     {"do", TOK_THEN},
     {"end", TOK_END},
@@ -102,9 +98,7 @@ static const kw_single_t kw_singles[] = {
     {"shr", TOK_BIT_SHR},
     {"bit_and", TOK_BIT_AND},
     {"bit_or", TOK_BIT_OR},
-    {"giao_diện", TOK_INTERFACE},
     {"interface", TOK_INTERFACE},
-    {"thực_hiện", TOK_IMPLEMENT},
     {"implement", TOK_IMPLEMENT},
     {"in", TOK_IN},
     {"import", TOK_IMPORT},
@@ -694,14 +688,27 @@ int lexer_tokenize(vir_lexer_t *lex) {
 
     /* ── Comment ────────────────────────────────────── */
     if (c == '#') {
-      /* ## block comment ## */
-      if (lex_peek_at(lex, 1) == '#') {
+      /* Preferred #*# block comment #*#, plus legacy ## block comment ##. */
+      int framed_block =
+          lex_peek_at(lex, 1) == '*' && lex_peek_at(lex, 2) == '#';
+      int legacy_block = lex_peek_at(lex, 1) == '#';
+      if (framed_block || legacy_block) {
         lex_advance(lex);
-        lex_advance(lex); /* consume ## */
+        lex_advance(lex);
+        if (framed_block)
+          lex_advance(lex); /* consume #*#; legacy consumed ## */
         while (!lex_eof(lex)) {
-          if (lex_peek(lex) == '#' && lex_peek_at(lex, 1) == '#') {
+          int at_framed_close =
+              framed_block && lex_peek(lex) == '#' &&
+              lex_peek_at(lex, 1) == '*' && lex_peek_at(lex, 2) == '#';
+          int at_legacy_close =
+              legacy_block && lex_peek(lex) == '#' &&
+              lex_peek_at(lex, 1) == '#';
+          if (at_framed_close || at_legacy_close) {
             lex_advance(lex);
             lex_advance(lex);
+            if (framed_block)
+              lex_advance(lex);
             break;
           }
           lex_advance(lex);

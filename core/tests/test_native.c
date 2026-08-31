@@ -868,6 +868,45 @@ static void test_lexer_strings_numbers(void)
     if (ok) PASS(); else FAIL("literal mismatch");
 }
 
+static void test_lexer_block_comments(void)
+{
+    TEST("lexer: new and legacy block comments");
+    const char *src =
+        "#*# preferred block\nwith ## inside #*#"
+        "func ## legacy block #*# inside ## main";
+    vir_lexer_t lex;
+    lexer_init(&lex, src, strlen(src));
+    int rc = lexer_tokenize(&lex);
+    if (rc != 0) { FAIL(lex.error); return; }
+
+    int ok = lex.token_count == 3;
+    ok = ok && lex.tokens[0].type == TOK_FUNC;
+    ok = ok && lex.tokens[1].type == TOK_IDENT;
+    ok = ok && strcmp(lex.tokens[1].str.buf, "main") == 0;
+    ok = ok && lex.tokens[2].type == TOK_EOF;
+    if (ok) PASS(); else FAIL("block comment delimiter mismatch");
+    lexer_free(&lex);
+}
+
+static void test_lexer_removed_legacy_aliases(void)
+{
+    TEST("lexer: elif/while aliases are identifiers");
+    const char *src = "elif while eif when";
+    vir_lexer_t lex;
+    lexer_init(&lex, src, strlen(src));
+    int rc = lexer_tokenize(&lex);
+    if (rc != 0) { FAIL(lex.error); return; }
+
+    int ok = lex.token_count == 5;
+    ok = ok && lex.tokens[0].type == TOK_IDENT;
+    ok = ok && lex.tokens[1].type == TOK_IDENT;
+    ok = ok && lex.tokens[2].type == TOK_EIF;
+    ok = ok && lex.tokens[3].type == TOK_WHEN;
+    ok = ok && lex.tokens[4].type == TOK_EOF;
+    if (ok) PASS(); else FAIL("legacy alias still recognized as keyword");
+    lexer_free(&lex);
+}
+
 /* ═══════════════════════════════════════════════════════
  * Parser Tests
  * ═══════════════════════════════════════════════════════ */
@@ -1053,7 +1092,7 @@ static void test_e2e_vm_loop(void)
 {
     TEST("e2e: loop via VM");
     const char *src = "func main() then\n  var sum = 0\n  var i = 0\n"
-                      "  while i < 5 then\n    sum = sum + i\n    i = i + 1\n  end\n"
+                      "  when i < 5 loop\n    sum = sum + i\n    i = i + 1\n  end\n"
                       "  return sum\nend\n";
 
     vir_lexer_t lex;
@@ -2271,7 +2310,7 @@ static void test_e2e_break(void)
         "func main() then\n"
         "  var s = 0\n"
         "  var i = 0\n"
-        "  while i < 10 then\n"
+        "  when i < 10 loop\n"
         "    if i == 5 then\n"
         "      break\n"
         "    end\n"
@@ -2667,7 +2706,7 @@ static void test_e2e_interpolation_int(void)
 {
     TEST("e2e: string interpolation integer");
     int ok;
-    int64_t r = run_vir("func main() then\n  var line = 42\n  var s = $\"line {line}\"\n  return dài_chuỗi(s)\nend\n", &ok);
+    int64_t r = run_vir("func main() then\n  var line = 42\n  var s = $\"line {line}\"\n  return str_len(s)\nend\n", &ok);
     ok = ok && (r == 7);
     if (ok) PASS();
     else {
@@ -2681,7 +2720,7 @@ static void test_e2e_interpolation_string(void)
 {
     TEST("e2e: string interpolation string var");
     int ok;
-    int64_t r = run_vir("func main() then\n  var name: string = \"world\"\n  var s = $\"hello {name}\"\n  return dài_chuỗi(s)\nend\n", &ok);
+    int64_t r = run_vir("func main() then\n  var name: string = \"world\"\n  var s = $\"hello {name}\"\n  return str_len(s)\nend\n", &ok);
     ok = ok && (r == 11);
     if (ok) PASS();
     else {
@@ -2695,7 +2734,7 @@ static void test_e2e_interpolation_raw_pointer(void)
 {
     TEST("e2e: string interpolation raw pointer");
     int ok;
-    int64_t r = run_vir("func main() then\n  var p = cấp(16)\n  var s = $\"ptr={p}\"\n  return dài_chuỗi(s) >= 5 ? 1 : 0\nend\n", &ok);
+    int64_t r = run_vir("func main() then\n  var p = alloc(16)\n  var s = $\"ptr={p}\"\n  return str_len(s) >= 5 ? 1 : 0\nend\n", &ok);
     ok = ok && (r == 1);
     if (ok) PASS();
     else {
@@ -2728,7 +2767,7 @@ static void test_ir_lower_interpolation_qir(void)
         return;
     }
 
-    const char *src = "func main() then\n  var line: i64 = 42\n  var name: string = \"foo\"\n  var p = cấp(16)\n  var s1 = $\"line {line}\"\n  var s2 = $\"name {name}\"\n  var s3 = $\"ptr {p}\"\n  var s4 = $\"doll $line\"\n  var s5 = $\"brace ${line}\"\n  var s6 = \"{literal}\"\n  return 0\nend\n";
+    const char *src = "func main() then\n  var line: i64 = 42\n  var name: string = \"foo\"\n  var p = alloc(16)\n  var s1 = $\"line {line}\"\n  var s2 = $\"name {name}\"\n  var s3 = $\"ptr {p}\"\n  var s4 = $\"doll $line\"\n  var s5 = $\"brace ${line}\"\n  var s6 = \"{literal}\"\n  return 0\nend\n";
     vir_lexer_t lex;
     lexer_init(&lex, src, strlen(src));
     lexer_tokenize(&lex);
@@ -2843,6 +2882,8 @@ int main(void)
     test_lexer_english_keywords();
     test_lexer_operators();
     test_lexer_strings_numbers();
+    test_lexer_block_comments();
+    test_lexer_removed_legacy_aliases();
 
     printf("\n── Parser ──────────────────────────────────\n");
     test_parser_simple_func();

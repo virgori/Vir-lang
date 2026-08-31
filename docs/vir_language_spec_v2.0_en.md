@@ -395,11 +395,13 @@ When a better scheduler appears (Rayon, Tokio, TBB, …), Vir only needs a new l
 ```vir
 # single-line comment
 
-##
+#*#
   block comment
   spanning multiple lines
-##
+#*#
 ```
+
+The legacy `## ... ##` delimiter remains accepted for backward compatibility.
 
 ---
 

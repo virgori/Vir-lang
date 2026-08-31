@@ -1617,7 +1617,6 @@ static vm_status_t vm_finish_tailcall_return(vm_state_t *vm, int64_t ret_val)
 {
     if (vm->func_depth == 0) {
         vm->regs[0] = ret_val;
-        return VM_OK;
         return VM_HALT;
     }
     uint32_t frame = vm->func_depth - 1;
@@ -1628,7 +1627,6 @@ static vm_status_t vm_finish_tailcall_return(vm_state_t *vm, int64_t ret_val)
         ref_count = vm->current_func->param_count;
         for (uint32_t pi = 0; pi < ref_count && pi < Q_MAX_PARAMS; pi++) {
             if (!vm->current_func->param_is_ref[pi]) continue;
-            ref_bindings[pi] = vm->func_stack[vm->func_depth].ref_bindings[pi];
             ref_bindings[pi] = vm->func_stack[frame].ref_bindings[pi];
             ref_values[pi] = vm->regs[vm->current_func->param_vregs[pi]];
         }
@@ -1907,7 +1905,6 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
                 ref_count = vm->current_func->param_count;
                 for (uint32_t pi = 0; pi < ref_count && pi < Q_MAX_PARAMS; pi++) {
                     if (!vm->current_func->param_is_ref[pi]) continue;
-                    ref_bindings[pi] = vm->func_stack[vm->func_depth].ref_bindings[pi];
                     ref_bindings[pi] = vm->func_stack[frame].ref_bindings[pi];
                     ref_values[pi] = vm->regs[vm->current_func->param_vregs[pi]];
                 }
@@ -3222,7 +3219,6 @@ vm_status_t vm_exec_function(vm_state_t *vm, const q_function_t *func)
                     ref_count = vm->current_func->param_count;
                     for (uint32_t pi = 0; pi < ref_count && pi < Q_MAX_PARAMS; pi++) {
                         if (!vm->current_func->param_is_ref[pi]) continue;
-                        ref_bindings[pi] = vm->func_stack[vm->func_depth].ref_bindings[pi];
                         ref_bindings[pi] = vm->func_stack[frame].ref_bindings[pi];
                         ref_values[pi] = vm->regs[vm->current_func->param_vregs[pi]];
                     }

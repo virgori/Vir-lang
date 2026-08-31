@@ -391,11 +391,13 @@ Khi xuất hiện scheduler tốt hơn (Rayon, Tokio, TBB, …), Vir chỉ cần
 ```vir
 # chú thích dòng đơn
 
-##
+#*#
   chú thích khối
   trải nhiều dòng
-##
+#*#
 ```
+
+Delimiter cũ `## ... ##` vẫn được chấp nhận để tương thích ngược.
 
 ---
 
