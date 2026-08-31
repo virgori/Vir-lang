@@ -264,6 +264,13 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
             }
             break;
         case AST_BUILTIN_CALL: {
+            /* The MIR path has no complete intrinsic opcode coverage yet.
+             * Returning a partial HIR node makes expression builtins (notably
+             * len(...)) silently lower as zero.  Fail this node deliberately
+             * so compiler_pipeline falls back to the classic Q-IR emitter,
+             * which implements the VM builtin semantics. */
+            return NULL;
+#if 0
             hir_node_t **args = NULL;
             if (ast->child_count > 0) {
                 args = (hir_node_t **)malloc(
@@ -285,6 +292,7 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
             hir->as.intrinsic_call.argc = ast->child_count;
             hir->as.intrinsic_call.args = args;
             break;
+#endif
         }
         case AST_PRINT:
             hir = hir_create_node(HIR_PRINT, 0);
@@ -298,7 +306,17 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
             hir = hir_create_node(HIR_CONST, 0);
             hir->as.constant.value = (int64_t)ast->float_val;
             break;
-        case AST_LITERAL_STR:
+        case AST_LITERAL_STR: {
+            const char *str = ast->name;
+            int has_interp = 0;
+            for (const char *p = str; *p; p++) {
+                if (*p == '\x01') {
+                    has_interp = 1;
+                    break;
+                }
+            }
+            if (has_interp)
+                return NULL;
             hir = hir_create_node(HIR_CONST, 0);
             hir->as.constant.is_string = 1;
             strncpy(hir->as.constant.str_value, ast->name,
@@ -306,6 +324,7 @@ static hir_node_t *lower_node(hir_lower_ctx_t *ctx, const ast_node_t *ast) {
             hir->as.constant.str_value[sizeof(hir->as.constant.str_value) - 1] =
                 '\0';
             break;
+        }
         case AST_FIELD_ACCESS:
         case AST_SAFE_ACCESS: {
             if (ast->child_count < 1)

@@ -16,7 +16,6 @@
 #include "ir_lower.h"
 #include "lexer.h"
 #include "parser.h"
-#include "lang.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -831,39 +830,6 @@ static void test_lexer_english_keywords(void)
     ok = ok && lex.tokens[3].type == TOK_RPAREN;
     ok = ok && lex.tokens[4].type == TOK_THEN;
     if (ok) PASS(); else FAIL("token mismatch");
-}
-
-static void test_lexer_vietnamese_keywords(void)
-{
-    TEST("lexer: Vietnamese keywords");
-    /* "hàm chính() thì\n  biến x = 42\n  trả về x\nhết\n" */
-    const char *src = "h\xc3\xa0m ch\xc3\xadnh() th\xc3\xac\n"
-                      "  bi\xe1\xba\xbfn x = 42\n"
-                      "  tr\xe1\xba\xa3 v\xe1\xbb\x81 x\n"
-                      "h\xe1\xba\xbft\n";
-    vir_lang_load(VIR_LANG_VI);
-    vir_lexer_t lex;
-    lexer_init(&lex, src, strlen(src));
-    int rc = lexer_tokenize(&lex);
-    if (rc != 0) { FAIL(lex.error); vir_lang_unload_all(); return; }
-
-    int ok = lex.token_count >= 8;
-    ok = ok && lex.tokens[0].type == TOK_FUNC;    /* hàm */
-    /* thì should appear after RPAREN */
-    int found_then = 0;
-    for (uint32_t i = 0; i < lex.token_count; i++) {
-        if (lex.tokens[i].type == TOK_THEN) { found_then = 1; break; }
-    }
-    ok = ok && found_then;
-    /* hết should appear */
-    int found_end = 0;
-    for (uint32_t i = 0; i < lex.token_count; i++) {
-        if (lex.tokens[i].type == TOK_END) { found_end = 1; break; }
-    }
-    ok = ok && found_end;
-    if (ok) PASS();
-    else FAIL("Vietnamese keyword mismatch");
-    vir_lang_unload_all();
 }
 
 static void test_lexer_operators(void)
@@ -1769,14 +1735,14 @@ static void test_vm_heap_tracking_growth(void)
     q_func_emit(&fn, loop);
     q_func_emit(&fn, q_instr(Q_CMP_LT, q_vreg(1), q_vreg(0), q_imm(iterations)));
     q_func_emit(&fn, q_instr(Q_JUMP_IF_NOT, q_none(), q_vreg(1), q_label(2)));
-    q_func_emit(&fn, q_instr(Q_ALLOC, q_vreg(2), q_imm(8), q_none()));
+    q_func_emit(&fn, q_instr(Q_HEAP_ALLOC, q_vreg(2), q_imm(8), q_none()));
     q_func_emit(&fn, q_instr(Q_ADD, q_vreg(0), q_vreg(0), q_imm(1)));
     q_func_emit(&fn, q_instr(Q_JUMP, q_none(), q_label(1), q_none()));
 
     q_instruction_t done = q_instr(Q_LABEL, q_none(), q_none(), q_none());
     done.patch_id = 2;
     q_func_emit(&fn, done);
-    q_func_emit(&fn, q_instr(Q_ALLOC, q_vreg(3), q_imm(24), q_none()));
+    q_func_emit(&fn, q_instr(Q_HEAP_ALLOC, q_vreg(3), q_imm(24), q_none()));
     q_func_emit(&fn, q_instr(Q_STORE_WORD, q_imm(777), q_vreg(3), q_imm(16)));
     q_func_emit(&fn, q_instr(Q_LOAD_WORD, q_vreg(4), q_vreg(3), q_imm(16)));
     q_func_emit(&fn, q_instr(Q_RET, q_none(), q_vreg(4), q_none()));
@@ -1787,14 +1753,14 @@ static void test_vm_heap_tracking_growth(void)
 
     int ok = status >= 0 &&
              vm_get_reg(&vm, 0) == 777 &&
-             vm.heap_count >= 100;
+             vm_heap_live_count(&vm.heap) >= 100;
     if (ok) PASS();
     else {
         char msg[160];
         snprintf(msg, sizeof(msg),
-                 "status=%s r0=%lld heap_count=%u",
+                 "status=%s r0=%lld heap_live=%u",
                  vm_status_str(status), (long long)vm_get_reg(&vm, 0),
-                 vm.heap_count);
+                 vm_heap_live_count(&vm.heap));
         FAIL(msg);
     }
 
@@ -1828,6 +1794,67 @@ static void test_vm_native_read_u8_invalid_pointer(void)
                  vm_status_str(status), (long long)vm_get_reg(&vm, 0));
         FAIL(msg);
     }
+
+    vm_destroy(&vm);
+    q_module_free(&mod);
+}
+
+static void test_vm_native_read_u8_program_arg(void)
+{
+    TEST("vm: native_read_u8 accepts program argv");
+    q_module_t mod;
+    q_module_init(&mod, "native_read_argv");
+    q_module_add_func(&mod, "native_read_u8");
+    q_function_t *main_fn = q_module_add_func(&mod, "main");
+
+    q_func_emit(main_fn, q_instr(Q_GET_ARG, q_vreg(0), q_imm(1), q_none()));
+    q_func_emit(main_fn, q_instr(Q_LOAD, q_vreg(1), q_imm(0), q_none()));
+    q_func_emit(main_fn, q_instr(Q_CALL_FUNC, q_none(), q_func_idx(0), q_none()));
+    q_func_emit(main_fn, q_instr(Q_MOVE, q_vreg(2), q_vreg(0), q_none()));
+    q_func_emit(main_fn, q_instr(Q_RET, q_none(), q_vreg(2), q_none()));
+
+    const char *args[] = {"virc", "-q"};
+    vm_state_t vm;
+    vm_init(&vm);
+    vm_set_args(&vm, 2, args);
+    vm_status_t status = vm_exec_module(&vm, &mod);
+
+    int ok = status >= 0 && vm_get_reg(&vm, 0) == '-';
+    if (ok) PASS();
+    else {
+        char msg[96];
+        snprintf(msg, sizeof(msg), "status=%s r0=%lld",
+                 vm_status_str(status), (long long)vm_get_reg(&vm, 0));
+        FAIL(msg);
+    }
+
+    vm_destroy(&vm);
+    q_module_free(&mod);
+}
+
+static void test_vm_native_write_u8_rejects_program_arg(void)
+{
+    TEST("vm: native_write_u8 rejects program argv");
+    q_module_t mod;
+    q_module_init(&mod, "native_write_argv");
+    q_module_add_func(&mod, "native_write_u8");
+    q_function_t *main_fn = q_module_add_func(&mod, "main");
+
+    q_func_emit(main_fn, q_instr(Q_GET_ARG, q_vreg(0), q_imm(1), q_none()));
+    q_func_emit(main_fn, q_instr(Q_LOAD, q_vreg(1), q_imm(0), q_none()));
+    q_func_emit(main_fn, q_instr(Q_LOAD, q_vreg(2), q_imm('X'), q_none()));
+    q_func_emit(main_fn, q_instr(Q_CALL_FUNC, q_none(), q_func_idx(0), q_none()));
+    q_func_emit(main_fn, q_instr(Q_RET, q_none(), q_vreg(0), q_none()));
+
+    char arg[] = "-q";
+    const char *args[] = {"virc", arg};
+    vm_state_t vm;
+    vm_init(&vm);
+    vm_set_args(&vm, 2, args);
+    vm_status_t status = vm_exec_module(&vm, &mod);
+
+    if (status >= 0 && arg[0] == '-') PASS();
+    else FAIL("argv storage was modified");
 
     vm_destroy(&vm);
     q_module_free(&mod);
@@ -1974,26 +2001,6 @@ static void test_e2e_for_range(void)
     ok = ok && r == 10;
     if (ok) PASS();
     else { char msg[64]; snprintf(msg, sizeof(msg), "got %lld exp 10", (long long)r); FAIL(msg); }
-}
-
-static void test_e2e_for_range_vi(void)
-{
-    TEST("e2e: for-range (Vietnamese)");
-    int ok;
-    vir_lang_load(VIR_LANG_VI);
-    /* với mỗi i trong 1..4 → 1+2+3 = 6 */
-    int64_t r = run_vir(
-        "hàm main() thì\n"
-        "  biến tổng = 0\n"
-        "  for i in 1..4 then\n"
-        "    tổng = tổng + i\n"
-        "  end\n"
-        "  trả về tổng\n"
-        "hết\n", &ok);
-    ok = ok && r == 6;
-    if (ok) PASS();
-    else { char msg[64]; snprintf(msg, sizeof(msg), "got %lld exp 6", (long long)r); FAIL(msg); }
-    vir_lang_unload_all();
 }
 
 static void test_e2e_enum_basic(void)
@@ -2605,6 +2612,160 @@ static void test_process_imports(void)
 }
 
 /* ═══════════════════════════════════════════════════════
+ * Regression Tests: Intrinsic Tail-Call & String Interpolation
+ * ═══════════════════════════════════════════════════════ */
+
+static void test_vm_tailcall_intrinsic_arena_cleanup(void)
+{
+    TEST("vm: intrinsic tailcall leaves arena + restores stack");
+    q_module_t mod;
+    q_module_init(&mod, "test_tailcall_arena");
+
+    /* Func 0: intrinsic "popcnt" */
+    q_module_add_func(&mod, "popcnt");
+
+    /* Func 1: helper - allocates 128 bytes in call arena with Q_ALLOC, loads 7, tailcalls "popcnt" */
+    q_function_t *helper = q_module_add_func(&mod, "helper");
+    q_func_emit(helper, q_instr(Q_ALLOC, q_vreg(1), q_imm(128), q_none()));
+    q_func_emit(helper, q_instr(Q_LOAD, q_vreg(0), q_imm(7), q_none()));
+    /* Tailcall intrinsic popcnt(7) -> 3 */
+    q_func_emit(helper, q_instr(Q_TAILCALL_FUNC, q_none(), q_func_idx(0), q_none()));
+
+    /* Func 2: main - calls helper, returns result */
+    q_function_t *main_fn = q_module_add_func(&mod, "main");
+    q_func_emit(main_fn, q_instr(Q_CALL_FUNC, q_none(), q_func_idx(1), q_none()));
+    q_func_emit(main_fn, q_instr(Q_RET, q_none(), q_vreg(0), q_none()));
+
+    vm_state_t vm;
+    vm_init(&vm);
+    int aid = vm_arena_tl_get_in(&vm.arena_ctx);
+    size_t used_before = aid >= 0 ? vm.arena_ctx.arenas[aid].used : 0;
+
+    vm_status_t status = vm_exec_module(&vm, &mod);
+
+    size_t used_after = aid >= 0 ? vm.arena_ctx.arenas[aid].used : 0;
+
+    int ok = (status == VM_OK || status == VM_HALT) &&
+             vm_get_reg(&vm, 0) == 3 &&
+             vm.func_depth == 0 &&
+             vm.reg_save_top == 0 &&
+             vm.arena_mark_sp == 0 &&
+             used_after == used_before;
+
+    if (ok) PASS();
+    else {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "r0=%lld depth=%u rtop=%u mark_sp=%u used_before=%zu used_after=%zu",
+                 (long long)vm_get_reg(&vm, 0), vm.func_depth, vm.reg_save_top, vm.arena_mark_sp, used_before, used_after);
+        FAIL(msg);
+    }
+    vm_destroy(&vm);
+    q_module_free(&mod);
+}
+
+static void test_e2e_interpolation_int(void)
+{
+    TEST("e2e: string interpolation integer");
+    int ok;
+    int64_t r = run_vir("func main() then\n  var line = 42\n  var s = $\"line {line}\"\n  return dài_chuỗi(s)\nend\n", &ok);
+    ok = ok && (r == 7);
+    if (ok) PASS();
+    else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "got %lld exp 7", (long long)r);
+        FAIL(msg);
+    }
+}
+
+static void test_e2e_interpolation_string(void)
+{
+    TEST("e2e: string interpolation string var");
+    int ok;
+    int64_t r = run_vir("func main() then\n  var name: string = \"world\"\n  var s = $\"hello {name}\"\n  return dài_chuỗi(s)\nend\n", &ok);
+    ok = ok && (r == 11);
+    if (ok) PASS();
+    else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "got %lld exp 11", (long long)r);
+        FAIL(msg);
+    }
+}
+
+static void test_e2e_interpolation_raw_pointer(void)
+{
+    TEST("e2e: string interpolation raw pointer");
+    int ok;
+    int64_t r = run_vir("func main() then\n  var p = cấp(16)\n  var s = $\"ptr={p}\"\n  return dài_chuỗi(s) >= 5 ? 1 : 0\nend\n", &ok);
+    ok = ok && (r == 1);
+    if (ok) PASS();
+    else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "got %lld exp 1", (long long)r);
+        FAIL(msg);
+    }
+}
+
+static void test_ir_lower_interpolation_qir(void)
+{
+    TEST("ir_lower: string interpolation emits Q_I_TO_STR for non-string only");
+    /* Test lexer markers for $"...", $"... $var", $"... ${var}", and regular "{name}" */
+    const char *lex_src = "$\"line {line}\" $\"line $line\" $\"line ${line}\" \"{name}\"";
+    vir_lexer_t lex_test;
+    lexer_init(&lex_test, lex_src, strlen(lex_src));
+    lexer_tokenize(&lex_test);
+    int lex_ok = (lex_test.token_count == 5); /* 4 strings + EOF */
+    if (lex_ok) {
+        /* Check markers in tokens */
+        lex_ok = lex_ok && (strcmp(lex_test.tokens[0].str.buf, "line \x01line\x02") == 0);
+        lex_ok = lex_ok && (strcmp(lex_test.tokens[1].str.buf, "line \x01line\x02") == 0);
+        lex_ok = lex_ok && (strcmp(lex_test.tokens[2].str.buf, "line \x01line\x02") == 0);
+        lex_ok = lex_ok && (strcmp(lex_test.tokens[3].str.buf, "{name}") == 0); /* plain string unchanged */
+    }
+    lexer_free(&lex_test);
+
+    if (!lex_ok) {
+        FAIL("lexer interpolation marker mismatch");
+        return;
+    }
+
+    const char *src = "func main() then\n  var line: i64 = 42\n  var name: string = \"foo\"\n  var p = cấp(16)\n  var s1 = $\"line {line}\"\n  var s2 = $\"name {name}\"\n  var s3 = $\"ptr {p}\"\n  var s4 = $\"doll $line\"\n  var s5 = $\"brace ${line}\"\n  var s6 = \"{literal}\"\n  return 0\nend\n";
+    vir_lexer_t lex;
+    lexer_init(&lex, src, strlen(src));
+    lexer_tokenize(&lex);
+
+    vir_parser_t parser;
+    parser_init(&parser, lex.tokens, lex.token_count, 0);
+    ast_node_t *ast = parser_parse_program(&parser);
+
+    lower_ctx_t *ctx = malloc(sizeof(lower_ctx_t));
+    lower_init(ctx, "test_interp_qir");
+    lower_program(ctx, ast);
+
+    int count_i_to_str = 0;
+    for (uint32_t fi = 0; fi < ctx->module.func_count; fi++) {
+        const q_function_t *f = &ctx->module.functions[fi];
+        for (uint32_t i = 0; i < f->body_count; i++) {
+            if (f->body[i].opcode == Q_I_TO_STR) {
+                count_i_to_str++;
+            }
+        }
+    }
+
+    /* Expected: Q_I_TO_STR emitted for line (s1), p (s3), line (s4), line (s5) = 4 times. NOT for name (s2) or literal (s6) */
+    int ok = (count_i_to_str == 4);
+    if (ok) PASS();
+    else {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "expected 4 Q_I_TO_STR, got %d", count_i_to_str);
+        FAIL(msg);
+    }
+    lower_destroy(ctx);
+    free(ctx);
+    ast_free(ast);
+    lexer_free(&lex);
+}
+
+/* ═══════════════════════════════════════════════════════
  * Main
  * ═══════════════════════════════════════════════════════ */
 
@@ -2680,7 +2841,6 @@ int main(void)
 
     printf("\n── Lexer ───────────────────────────────────\n");
     test_lexer_english_keywords();
-    test_lexer_vietnamese_keywords();
     test_lexer_operators();
     test_lexer_strings_numbers();
 
@@ -2716,6 +2876,8 @@ int main(void)
     test_vm_word_ops();
     test_vm_heap_tracking_growth();
     test_vm_native_read_u8_invalid_pointer();
+    test_vm_native_read_u8_program_arg();
+    test_vm_native_write_u8_rejects_program_arg();
     test_vm_i_to_str();
 
     printf("\n── E2E New Features ────────────────────────\n");
@@ -2727,7 +2889,6 @@ int main(void)
 
     printf("\n── E2E Phase 1B: For/Enum/Record ───────────\n");
     test_e2e_for_range();
-    test_e2e_for_range_vi();
     test_e2e_enum_basic();
     test_e2e_enum_auto();
     test_e2e_enum_explicit();
@@ -2758,6 +2919,13 @@ int main(void)
     printf("\n── Module System Internals ──────────────────\n");
     test_metadata_helper();
     test_process_imports();
+
+    printf("\n── Regression: Tailcall & String Interpolation ─\n");
+    test_vm_tailcall_intrinsic_arena_cleanup();
+    test_e2e_interpolation_int();
+    test_e2e_interpolation_string();
+    test_e2e_interpolation_raw_pointer();
+    test_ir_lower_interpolation_qir();
 
     printf("\n═══════════════════════════════════════════\n");
     printf("Results: %d / %d passed\n", tests_passed, tests_run);

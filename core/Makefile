@@ -78,6 +78,8 @@ endif
 # ── Source files ──────────────────────────────────────────
 C_SRCS := src/q_ir.c \
           src/vm.c \
+          src/vm_heap.c \
+          src/vm_arena.c \
           src/codegen.c \
           src/patcher.c \
           src/bridge.c \

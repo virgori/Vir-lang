@@ -318,6 +318,8 @@ const char* q_opcode_name(q_opcode_t op)
         case Q_STORE_WORD:   return "Q_STORE_WORD";
         case Q_MEM_COPY:     return "Q_MEM_COPY";
         case Q_MEM_SET:      return "Q_MEM_SET";
+        case Q_REALLOC:      return "Q_REALLOC";
+        case Q_HEAP_ALLOC:   return "Q_HEAP_ALLOC";
         case Q_STR_LEN:      return "Q_STR_LEN";
         case Q_STR_GET:      return "Q_STR_GET";
         case Q_STR_CAT:      return "Q_STR_CAT";

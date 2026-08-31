@@ -53,6 +53,8 @@ static var_info_t *bc_get_var(borrow_ctx_t *ctx, uint32_t vreg) {
 static bool is_alloc_opcode(q_opcode_t op) {
     switch (op) {
     case Q_ALLOC:
+    case Q_HEAP_ALLOC:
+    case Q_REALLOC:
     case Q_ARR_NEW:
     case Q_ARR_COMPACT:
     case Q_DICT_NEW:
@@ -314,6 +316,41 @@ static void compute_drops(borrow_ctx_t *ctx, const q_function_t *func) {
                     escaped[j] = true;
             }
         }
+        /* Q_ARR_SET: dest = value stored into array element */
+        if (instr->opcode == Q_ARR_SET && instr->dest.type == OPERAND_VREG) {
+            for (uint32_t j = 0; j < ctx->var_count; j++) {
+                if (ctx->vars[j].vreg == instr->dest.vreg && ctx->vars[j].is_alloc)
+                    escaped[j] = true;
+            }
+        }
+        /* Q_STORE_BYTE: dest = byte value written into buffer/memory */
+        if (instr->opcode == Q_STORE_BYTE && instr->dest.type == OPERAND_VREG) {
+            for (uint32_t j = 0; j < ctx->var_count; j++) {
+                if (ctx->vars[j].vreg == instr->dest.vreg && ctx->vars[j].is_alloc)
+                    escaped[j] = true;
+            }
+        }
+        /* Q_PORT_SEND: src1 = value sent to port channel */
+        if (instr->opcode == Q_PORT_SEND && instr->src1.type == OPERAND_VREG) {
+            for (uint32_t j = 0; j < ctx->var_count; j++) {
+                if (ctx->vars[j].vreg == instr->src1.vreg && ctx->vars[j].is_alloc)
+                    escaped[j] = true;
+            }
+        }
+        /* Q_SWIZZLE_STORE: src1 = rhs array stored */
+        if (instr->opcode == Q_SWIZZLE_STORE && instr->src1.type == OPERAND_VREG) {
+            for (uint32_t j = 0; j < ctx->var_count; j++) {
+                if (ctx->vars[j].vreg == instr->src1.vreg && ctx->vars[j].is_alloc)
+                    escaped[j] = true;
+            }
+        }
+        /* Q_FLUX_STORE: src2 = stored array */
+        if (instr->opcode == Q_FLUX_STORE && instr->src2.type == OPERAND_VREG) {
+            for (uint32_t j = 0; j < ctx->var_count; j++) {
+                if (ctx->vars[j].vreg == instr->src2.vreg && ctx->vars[j].is_alloc)
+                    escaped[j] = true;
+            }
+        }
         /* Q_MOVE: if source is an alloc, the pointer is aliased → mark escaped.
          * This covers function argument passing (MOVE to R0..Rn) and other
          * aliasing that could lead to indirect escapes via callee stores. */
@@ -321,6 +358,22 @@ static void compute_drops(borrow_ctx_t *ctx, const q_function_t *func) {
             for (uint32_t j = 0; j < ctx->var_count; j++) {
                 if (ctx->vars[j].vreg == instr->src1.vreg && ctx->vars[j].is_alloc)
                     escaped[j] = true;
+            }
+        }
+        /* Interior/derived pointer: `alloc(n) + header` and `p - header`
+         * retain the allocation's ownership.  Dropping the allocation after
+         * its last direct use leaves the derived pointer dangling (Vec's
+         * data pointer is the canonical case). */
+        if (instr->opcode == Q_ADD || instr->opcode == Q_SUB) {
+            const q_operand_t *sources[2] = {&instr->src1, &instr->src2};
+            for (uint32_t s = 0; s < 2; s++) {
+                if (sources[s]->type != OPERAND_VREG)
+                    continue;
+                for (uint32_t j = 0; j < ctx->var_count; j++) {
+                    if (ctx->vars[j].vreg == sources[s]->vreg &&
+                        ctx->vars[j].is_alloc)
+                        escaped[j] = true;
+                }
             }
         }
     }
