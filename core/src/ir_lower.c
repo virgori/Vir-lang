@@ -3820,8 +3820,14 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
     if (stmt->int_val & 0x4000) {
       /* Tuple destructuring: var (a, b) = expr */
       int expr_vreg = -1;
+      int release_tuple = 0;
       if (stmt->child_count > 0) {
         ast_node_t *init = stmt->children[stmt->child_count - 1];
+        /* Calls and tuple literals produce an ephemeral Q_ARR_NEW used only
+         * for this destructuring operation.  Reclaim it after ARR_GETs so a
+         * hot multi-return path cannot exhaust the VM handle table.  Do not
+         * free an identifier: it may be a caller-owned persistent array. */
+        release_tuple = init->type == AST_CALL || init->type == AST_TUPLE_LITERAL;
         if (init->type != AST_IDENTIFIER) { /* ensure it's the RHS */
             expr_vreg = lower_expr(ctx, init);
         } else {
@@ -3853,6 +3859,9 @@ int lower_stmt(lower_ctx_t *ctx, const ast_node_t *stmt) {
           emit(ctx, q_instr(Q_LOAD, q_vreg(idx_r), q_imm(i), q_none()));
           emit(ctx, q_instr(Q_ARR_GET, q_vreg(r), q_vreg((uint32_t)expr_vreg), q_vreg(idx_r)));
         }
+      }
+      if (release_tuple && expr_vreg >= 0) {
+        emit(ctx, q_instr(Q_FREE, q_none(), q_vreg((uint32_t)expr_vreg), q_none()));
       }
       return 0;
     }
