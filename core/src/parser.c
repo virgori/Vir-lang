@@ -3892,6 +3892,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
   }
   case TOK_EXPORT: {
     advance(p);
+    skip_newlines(p);
     ast_node_t *block = ast_new(AST_BLOCK);
     while (1) {
       const vir_token_t *fn = expect_name(p, "expected function name after export");
@@ -3901,6 +3902,7 @@ static ast_node_t *parse_statement(vir_parser_t *p) {
       n->line = t->line;
       ast_add_child(block, n);
       if (!match(p, TOK_COMMA)) break;
+      skip_newlines(p);
     }
     match(p, TOK_SEMICOLON);
     return block;

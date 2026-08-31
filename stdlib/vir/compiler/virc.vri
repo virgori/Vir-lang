@@ -47,7 +47,8 @@ import ElfBuilder, elf_new, elf_write_to_file from vir.rt.elf
 
 # ── Compiler modules (self-hosting, pure Vir) ──
 include vir.compiler.lexer
-import Lexer, TokType, Token, lexer_new, tokenize, lexer_lex from vir.compiler.lexer
+import Lexer, TokType, Token, lexer_new, tokenize,
+       lexer_token_count, lexer_token_get, lexer_error_message from vir.compiler.lexer
 include vir.compiler.parser
 import Parser, AstNode, AstType, parser_new, parse_program from vir.compiler.parser
 include vir.compiler.semantic
@@ -71,7 +72,7 @@ include vir.compiler.codegen
 import TargetArch, CodeBuf, codebuf_new, codebuf_offset,
        codebuf_emit_u32, codebuf_patch_u32, codebuf_get_data, lir_emit_module from vir.compiler.codegen
 include vir.compiler.lir_codegen
-import emit_lir_module_arm64 from vir.compiler.lir_codegen
+import emit_lir_module_arm64, lir_find_func_index from vir.compiler.lir_codegen
 include vir.compiler.codegen_x86
 include vir.compiler.lir_codegen_x86
 import emit_lir_module_x86_64 from vir.compiler.lir_codegen_x86
@@ -96,6 +97,11 @@ entity CompilerConfig:
     out_fmt:        int;    # 0=Mach-O, 1=ELF
     verbose:        int    # 0=quiet, 1=verbose
 end.
+
+# C-VM bootstrap CALLs may clobber locals that hold aggregate values.  Keep
+# the parser hand-off pointer global so it is reloaded for every use.
+var g_virc_parser_tokens: i64 = 0
+
 func default_config:
     out CompilerConfig (
         input_path:  0,
@@ -125,7 +131,7 @@ func parse_args:
     let cfg = default_config()
 
     var base_idx = 0
-    if argc > 1 and cstr_ends_with_vri(get_arg(0)) == 0 do
+    if argc > 0 and cstr_ends_with_vri(get_arg(0)) == 0 do
         base_idx = 1
     end
 
@@ -305,23 +311,24 @@ func virc_compile(cfg: CompilerConfig):
     let lex = lexer_new(held_src)
     lex = tokenize(lex)
 
-    if fat_str_len(lex.error_msg) > 0 do
+    # Read lexer state through its internal globals.  Do not access fields on
+    # the returned Lexer aggregate after another CALL in the bootstrap C-VM.
+    if fat_str_len(lexer_error_message()) > 0 do
         let sb = sb_new()
         sb = sb_append(sb, "virc: lex error_msg: ")
-        sb = sb_append(sb, lex.error_msg)
+        sb = sb_append(sb, lexer_error_message())
         print_ln(sb_to_string(sb))
         sb_free(sb)
         exit_prog(1)
     end
 
-    # Parser expects rt-vec of token pointers; lexer uses collections Vec.
-    let tok_count = vec_len(lex.tokens)
-    let tok_rt = vec_new_rt()
-    let ti = 0
-    when ti < tok_count loop
-        let tok = vec_get(lex.tokens, ti)
-        tok_rt = vec_push_rt(tok_rt, tok)
-        ti = ti + 1
+    # Read and validate the count immediately.  Do not test this local after
+    # the token-copy loop: that loop performs hundreds of thousands of CALLs
+    # in a full self-host and exposed stale/clobbered caller state as a false 0.
+    let tok_count = lexer_token_count()
+    if tok_count <= 0 do
+        print_ln("virc: error: lexer produced no tokens")
+        exit_prog(1)
     end
 
     if verbose == 1 do
@@ -333,12 +340,22 @@ func virc_compile(cfg: CompilerConfig):
         sb_free(sb)
     end
 
+    # Parser expects rt-vec of token pointers; lexer uses collections Vec.
+    let tok_rt = vec_new_rt()
+    g_virc_parser_tokens = tok_rt
+    let ti = 0
+    when ti < tok_count loop
+        let tok = lexer_token_get(ti)
+        g_virc_parser_tokens = vec_push_rt(g_virc_parser_tokens, tok)
+        ti = ti + 1
+    end
+
     # ── Step 2: Parse ──
     if verbose == 1 do
         print_ln("virc: parsing...")
     end
 
-    let parser = parser_new(tok_rt)
+    let parser = parser_new(g_virc_parser_tokens)
     var (parser2, ast) = parse_program(parser)
 
     if verbose == 1 do
@@ -350,15 +367,17 @@ func virc_compile(cfg: CompilerConfig):
         sb_free(sb_ast)
     end
 
-    # Report parse errors
-    if rt_strlen(parser2.error_msg) > 0 do
+    # parse_program prints and recovers from individual errors, clearing
+    # error_msg so it can report more than one.  error_line remains non-zero
+    # after any error and must prevent semantic analysis of a partial AST.
+    if parser2.error_line > 0 do
         let sb_pe = sb_new()
-        sb_pe = sb_append(sb_pe, "virc: parse error (line ")
+        sb_pe = sb_append(sb_pe, "virc: parse warning (line ")
         sb_pe = sb_append_int(sb_pe, parser2.error_line)
-        sb_pe = sb_append(sb_pe, "): ")
-        sb_pe = sb_append(sb_pe, parser2.error_msg)
+        sb_pe = sb_append(sb_pe, "): skipping semantic analysis for partial AST")
         print_ln(sb_to_string(sb_pe))
         sb_free(sb_pe)
+        exit_prog(1)
     end
 
     # ── Step 2.5: Semantic Analysis ──
@@ -396,6 +415,22 @@ func virc_compile(cfg: CompilerConfig):
     let lir_funcs = compile_pipeline(cfg.input_path, ast, verbose)
 
     let func_count = vec_len_rt(lir_funcs)
+
+    # Executable compilation must never silently accept an empty pipeline.
+    # Without this guard the runtime-only ARM64 stubs form a valid Mach-O that
+    # exits 0 immediately, which looks like a successful compiler promotion.
+    if func_count <= 0 do
+        print_ln("virc: error: pipeline produced no LIR functions")
+        exit_prog(1)
+        out 1
+    end
+
+    let main_idx = lir_find_func_index(lir_funcs, fat_str_new("main"))
+    if main_idx < 0 do
+        print_ln("virc: error: executable has no main function in LIR")
+        exit_prog(1)
+        out 1
+    end
 
     if verbose == 1 do
         let sb = sb_new()

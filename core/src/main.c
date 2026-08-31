@@ -330,7 +330,7 @@ static ast_node_t *frontend(const char *filepath, const char *source, size_t len
         trace_stage1_event("parser_error", "elapsed_phase_ms=%llu pos=%u error=%s",
                            (unsigned long long)(trace_now_ms() - phase_start),
                            parser.pos, parser.error);
-        if (0) {
+        if (g_diag_initialized && g_parser_diag.count > 0) {
             diag_render_all(&g_parser_diag);
         } else {
             fprintf(stderr, "parse error in %s (line %u): %s\n", filepath, 

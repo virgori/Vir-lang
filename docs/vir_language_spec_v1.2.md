@@ -12,11 +12,13 @@ All blocks close with `end`. The colon `:` opens a block. Statements terminate w
 ```vir
 # single-line comment
 
-##
+#*#
   block comment
   spanning multiple lines
-##
+#*#
 ```
+
+The legacy `## ... ##` delimiter remains accepted for backward compatibility.
 
 ---
 
@@ -351,7 +353,7 @@ none            # null
 | —                | `map`         | Map literal               |
 | —                | `try`/`error` | Error handling            |
 | —                | `include`     | Module include            |
-| —                | `## ... ##`   | Block comments            |
+| —                | `#*# ... #*#` | Block comments (`## ... ##` legacy) |
 
 ---
 
