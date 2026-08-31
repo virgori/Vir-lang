@@ -262,6 +262,11 @@ typedef struct vm_state {
     /* Arrays managed by VM */
     vm_array_t      arrays[VM_MAX_ARRAYS];
     uint32_t        array_count;
+    /* Handles reclaimed by Q_FREE.  Tuple destructuring creates short-lived
+     * Q_ARR_NEW values in hot lexer paths, so monotonically allocating handle
+     * IDs exhausts VM_MAX_ARRAYS even when their backing storage is freed. */
+    uint32_t        array_free[VM_MAX_ARRAYS];
+    uint32_t        array_free_count;
 
     /* §20 Dicts managed by VM */
     vm_dict_t       dicts[VM_MAX_DICTS];

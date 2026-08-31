@@ -70,6 +70,11 @@ ifneq (,$(filter 1 true yes,$(DEBUG)))
   LDFLAGS += -fsanitize=address
 endif
 
+# Release build (bootstrap Stage-0, large C-VM compiles)
+ifneq (,$(filter 1 true yes,$(RELEASE)))
+  CFLAGS += -O3 -DNDEBUG
+endif
+
 # ── Source files ──────────────────────────────────────────
 C_SRCS := src/q_ir.c \
           src/vm.c \
@@ -157,9 +162,13 @@ CLI_BIN  := $(BUILD_DIR)/vir
 # Targets
 # ══════════════════════════════════════════════════════════
 
-.PHONY: all shared static test clean install info
+.PHONY: all shared static test clean install info release
 
 all: shared static cli
+
+release:
+	$(MAKE) clean RELEASE=1 cli
+	@echo "✓ Release build complete [$(PLATFORM)/$(ARCH), -O3]"
 
 shared: $(LIB_PATH)
 	@echo "✓ Built $(LIB_PATH) [$(PLATFORM)/$(ARCH)]"

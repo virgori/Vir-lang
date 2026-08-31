@@ -205,11 +205,24 @@ static inline void set_dest(vm_state_t *vm, const q_operand_t *dest, int64_t val
 
 static int64_t vm_array_new(vm_state_t *vm, int64_t cap)
 {
-    if (vm->array_count >= VM_MAX_ARRAYS) return -1;
-    uint32_t idx = vm->array_count++;
+    uint32_t idx;
+    if (vm->array_free_count > 0) {
+        idx = vm->array_free[--vm->array_free_count];
+    } else {
+        if (vm->array_count >= VM_MAX_ARRAYS) return -1;
+        idx = vm->array_count++;
+    }
     vm->arrays[idx].cap = (uint32_t)(cap > 0 ? cap : 16);
     vm->arrays[idx].len = 0;
     vm->arrays[idx].data = (int64_t *)calloc(vm->arrays[idx].cap, sizeof(int64_t));
+    if (!vm->arrays[idx].data) {
+        vm->arrays[idx].cap = 0;
+        /* Handle 0 is also the null sentinel for Q_FREE, so keep it out of
+         * the reusable pool. */
+        if (idx != 0 && vm->array_free_count < VM_MAX_ARRAYS)
+            vm->array_free[vm->array_free_count++] = idx;
+        return -1;
+    }
     return (int64_t)idx;
 }
 
@@ -1624,7 +1637,12 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
         /* (a) array handle */
         if (addr >= 0 && (uint32_t)addr < vm->array_count) {
             vm_array_t *a = &vm->arrays[(uint32_t)addr];
-            if (a->data) { free(a->data); a->data = NULL; }
+            if (a->data) {
+                free(a->data);
+                a->data = NULL;
+                if (addr != 0 && vm->array_free_count < VM_MAX_ARRAYS)
+                    vm->array_free[vm->array_free_count++] = (uint32_t)addr;
+            }
             a->len = 0;
             a->cap = 0;
             break;
