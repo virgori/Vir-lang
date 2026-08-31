@@ -24,9 +24,9 @@ SKIP_ROOTS = {
 
 # << not part of <<< ; >> not part of >>> and not >>= 
 SHL_RE = re.compile(r"(?<!<)<<(?!>)")
-# Shift-right: `x >> n` where rhs looks numeric/paren — not `Type>>` generic close.
+# Shift-right: `x >> n` only — never generic closer `Type>>` / `B>>`.
 SHR_RE = re.compile(
-    r">>(?=\s*[\d(])"
+    r"(?<![A-Za-z0-9_>])>>(?=\s*[\d(])"
 )
 
 

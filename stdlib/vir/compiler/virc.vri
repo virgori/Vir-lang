@@ -64,7 +64,7 @@ include vir.compiler.lir_interference
 include vir.compiler.lir_regalloc_color
 include vir.compiler.lir_lower
 include vir.compiler.pipeline
-import compile_pipeline, set_pipeline_hir_mode, set_pipeline_mir_full from vir.compiler.pipeline
+import compile_pipeline, set_pipeline_hir_mode, set_pipeline_mir_full, set_pipeline_opt_level from vir.compiler.pipeline
 import set_codegen_target from vir.compiler.target
 include vir.compiler.ir_optimizer
 import LowerCtx, QModule, QOp, lower_ctx_new, lower_program, optimize_module from vir.compiler.ir_optimizer
@@ -101,6 +101,8 @@ end.
 # C-VM bootstrap CALLs may clobber locals that hold aggregate values.  Keep
 # the parser hand-off pointer global so it is reloaded for every use.
 var g_virc_parser_tokens: i64 = 0
+var g_virc_diag_file: i64 = 0
+var g_virc_diag_line: i64 = 0
 
 func default_config:
     out CompilerConfig (
@@ -120,6 +122,74 @@ func cstr_ends_with_vri(s: int):
     if native_read_u8(s, l - 2) != 114 do out 0 end
     if native_read_u8(s, l - 1) != 105 do out 0 end
     out 1
+end.
+
+# Resolve an expanded-bundle line through markers emitted by
+# tools/preexpand_virc.py:
+#     # @vir_source path/to/module.vri ORIGINAL_LINE
+func virc_locate_source(source: string, target_line: int):
+    data = native_read_i64(source as i64, 0)
+    n = native_read_i64(source as i64, 8)
+    pos = 0
+    expanded_line = 1
+    original_line = 1
+    g_virc_diag_file = "<expanded>" as i64
+
+    when pos < n loop
+        line_start = pos
+        when pos < n and native_read_u8(data, pos) != 10 loop
+            pos = pos + 1
+        end
+        line_end = pos
+
+        is_marker = line_end - line_start >= 15
+        if is_marker do
+            # "# @vir_source "
+            is_marker = native_read_u8(data, line_start) == 35 and native_read_u8(data, line_start + 1) == 32 and native_read_u8(data, line_start + 2) == 64 and native_read_u8(data, line_start + 3) == 118 and native_read_u8(data, line_start + 4) == 105 and native_read_u8(data, line_start + 5) == 114 and native_read_u8(data, line_start + 6) == 95 and native_read_u8(data, line_start + 7) == 115 and native_read_u8(data, line_start + 8) == 111 and native_read_u8(data, line_start + 9) == 117 and native_read_u8(data, line_start + 10) == 114 and native_read_u8(data, line_start + 11) == 99 and native_read_u8(data, line_start + 12) == 101 and native_read_u8(data, line_start + 13) == 32
+        end
+
+        if is_marker do
+            path_start = line_start + 14
+            sep = path_start
+            when sep < line_end and native_read_u8(data, sep) != 32 loop
+                sep = sep + 1
+            end
+            path_len = sep - path_start
+            path_buf = vir_alloc(path_len + 1)
+            j = 0
+            when j < path_len loop
+                native_write_u8(path_buf, j, native_read_u8(data, path_start + j))
+                j = j + 1
+            end
+            native_write_u8(path_buf, path_len, 0)
+            # Store a raw C-string pointer.  Keeping a fat-string aggregate in
+            # a global is not stable across the many scanner CALLs in C-VM.
+            g_virc_diag_file = path_buf
+            original_line = 0
+            k = sep + 1
+            when k < line_end loop
+                c = native_read_u8(data, k)
+                if c >= 48 and c <= 57 do
+                    original_line = original_line * 10 + c - 48
+                end
+                k = k + 1
+            end
+        else
+            if expanded_line == target_line do
+                g_virc_diag_line = original_line
+                out 0
+            end
+            original_line = original_line + 1
+        end
+
+        if pos < n do
+            pos = pos + 1
+        end
+        expanded_line = expanded_line + 1
+    end
+
+    g_virc_diag_line = original_line
+    out 0
 end.
 
 # ═══════════════════════════════════════════════════════
@@ -198,6 +268,15 @@ func parse_args:
         eif rt_streq(arg, "--mir-full") do
             set_pipeline_mir_full(1)
 
+        eif rt_streq(arg, "-O0") do
+            set_pipeline_opt_level(0)
+        eif rt_streq(arg, "-O1") do
+            set_pipeline_opt_level(1)
+        eif rt_streq(arg, "-O2") do
+            set_pipeline_opt_level(2)
+        eif rt_streq(arg, "-O3") do
+            set_pipeline_opt_level(3)
+
         eif rt_streq(arg, "-q") or rt_streq(arg, "--quiet") do
             cfg.verbose = 0
 
@@ -214,7 +293,8 @@ func parse_args:
             print_ln("  -o <file>           Output file (default: a.out)")
             print_ln("  --target <arch>     arm64, x86_64 or wasm32 (default: arm64)")
             print_ln("  --format <fmt>      macho, elf or wasm (default: macho)")
-            print_ln("  --mir-full          Enable full MIR optimization pipeline")
+            print_ln("  --mir-full          Enable full MIR optimization pipeline (alias -O3)")
+            print_ln("  -O0 .. -O3          Optimization tier (spec §1.2.1, 26 MIR passes)")
             print_ln("  -q, --quiet         Suppress progress messages")
             print_ln("  -v, --version       Print version")
             print_ln("  -h, --help          Print this help")
@@ -371,8 +451,13 @@ func virc_compile(cfg: CompilerConfig):
     # error_msg so it can report more than one.  error_line remains non-zero
     # after any error and must prevent semantic analysis of a partial AST.
     if parser2.error_line > 0 do
+        virc_locate_source(source_fat, parser2.error_line)
         let sb_pe = sb_new()
-        sb_pe = sb_append(sb_pe, "virc: parse warning (line ")
+        sb_pe = sb_append(sb_pe, "virc: parse warning at ")
+        sb_pe = sb_append(sb_pe, str_from_cstr(g_virc_diag_file))
+        sb_pe = sb_append(sb_pe, ":")
+        sb_pe = sb_append_int(sb_pe, g_virc_diag_line)
+        sb_pe = sb_append(sb_pe, " (expanded line ")
         sb_pe = sb_append_int(sb_pe, parser2.error_line)
         sb_pe = sb_append(sb_pe, "): skipping semantic analysis for partial AST")
         print_ln(sb_to_string(sb_pe))

@@ -512,7 +512,24 @@ func parse_error(p: Parser, msg: string):
                 rt_strcat(" [tok=", rt_strcat(rt_itoa(t.tok_type as int), "]"))
             )
         end
-        p.error_line = t.line
+        # Keep the first failing line across parse-program recovery.  Later
+        # errors are still printed, but the driver source-map summary should
+        # identify the root error rather than a cascading EOF diagnostic.
+        if p.error_line == 0 do
+            p.error_line = t.line
+        end
+    end
+    out p
+end.
+func parse_error_at(p: Parser, msg: string, line: int):
+
+    first_error = p.error_line == 0
+    p = parse_error(p, msg)
+    # An expression parser can consume through EOF while diagnosing a missing
+    # delimiter.  Keep the line where the construct began so source-map
+    # diagnostics point at the offending statement, not the end of a bundle.
+    if first_error and line > 0 do
+        p.error_line = line
     end
     out p
 end.
@@ -522,7 +539,12 @@ func peek(p: Parser):
         out Token (
             tok_type: TokType.Eof,
             line: 0,
-            col: 0
+            col: 0,
+            start: 0,
+            len: 0,
+            str_val: "",
+            int_val: 0,
+            float_val: 0.0
         )
     end
     out vec_get_rt(p.tokens, p.pos)
@@ -542,7 +564,12 @@ func peek_n(p: Parser, offset: int):
         out Token (
             tok_type: TokType.Eof,
             line: 0,
-            col: 0
+            col: 0,
+            start: 0,
+            len: 0,
+            str_val: "",
+            int_val: 0,
+            float_val: 0.0
         )
     end
     out vec_get_rt(p.tokens, idx)
@@ -1212,7 +1239,12 @@ func check_entity_literal(p: Parser):
 end.
 func try_skip_generic_call_args(p: Parser):
 
-    # If at '<' and span is type-args then '(', move p.pos to that '('; else unchanged.
+    # If at '<' and span is type-args then '(', move p.pos to that '('; else
+    # leave it unchanged.  This must be index-only lookahead: Parser aggregates
+    # alias in the bootstrap VM, so speculative advance(p) calls mutate the
+    # caller even when this function returns the original value.  A comparison
+    # such as `total < end_pos loop` was therefore scanned all the way to EOF
+    # while looking for a generic-closing `>`.
     if not check(p, TokType.Lt) do
         out (p, false)
     end
@@ -1222,26 +1254,28 @@ func try_skip_generic_call_args(p: Parser):
     if not is_name_token(vec_get_rt(p.tokens, p.pos + 1).tok_type) do
         out (p, false)
     end
-    var (p2, _) = advance(p)
+    idx = p.pos
     depth = 1
-    when depth > 0 and not check(p2, TokType.Eof) loop
-        if check(p2, TokType.Lt) do
+    idx = idx + 1
+    when depth > 0 and idx < p.token_count loop
+        tt = vec_get_rt(p.tokens, idx).tok_type
+        if tt == TokType.Lt do
             depth = depth + 1
-        eif check(p2, TokType.Gt) do
+        eif tt == TokType.Gt do
             depth = depth - 1
-        eif check(p2, TokType.Cast) do
+        eif tt == TokType.Cast do
             depth = depth - 2
         end
-        var (p3, _) = advance(p2)
-        p2 = p3
+        idx = idx + 1
     end
     if depth != 0 do
         out (p, false)
     end
-    if not check(p2, TokType.LParen) do
+    if idx >= p.token_count or vec_get_rt(p.tokens, idx).tok_type != TokType.LParen do
         out (p, false)
     end
-    out (p2, true)
+    p.pos = idx
+    out (p, true)
 end.
 # Spec §30 precedence (tight → loose):
 #   postfix . ?. ~mask !! ? | unary ! - ~ & &mut | ^ (right) | ** >< |
@@ -2180,9 +2214,9 @@ func parse_when_loop_stmt(p: Parser, is_when_kw: int):
     var (p2, cond) = parse_expr(p)
     if not check(p2, TokType.Loop) do
         if is_when_kw == 1 do
-            p2 = parse_error(p2, "expected `loop` after when condition")
+            p2 = parse_error_at(p2, "expected `loop` after when condition", line)
         else
-            p2 = parse_error(p2, "expected `loop` after while condition")
+            p2 = parse_error_at(p2, "expected `loop` after while condition", line)
         end
         out (p2, ast_new(AstType.WhileStmt))
     end
@@ -2299,6 +2333,38 @@ func skip_type_expr(p: Parser):
         end
     end
     out p
+end.
+
+# Skip optional `out(TYPE)` / `out TYPE` return annotation (§6).
+# Without this, `out(Vec):` is parsed as a body return statement.
+func skip_out_return_type(p: Parser):
+    if not check(p, TokType.Out) do
+        out p
+    end
+    var (p2, _) = advance(p)
+    if check(p2, TokType.LParen) do
+        depth = 1
+        var (p3, _) = advance(p2)
+        p2 = p3
+        when depth > 0 and not check(p2, TokType.Eof) loop
+            if check(p2, TokType.LParen) do
+                depth = depth + 1
+            eif check(p2, TokType.RParen) do
+                depth = depth - 1
+            end
+            var (p4, _) = advance(p2)
+            p2 = p4
+        end
+        out p2
+    end
+    if is_name_token(peek(p2).tok_type) do
+        var (p3, _) = advance(p2)
+        p2 = p3
+        if check(p2, TokType.Lt) do
+            p2 = skip_generic_list(p2)
+        end
+    end
+    out p2
 end.
 
 func parse_func_def(p: Parser):
@@ -2432,11 +2498,12 @@ func parse_func_def(p: Parser):
         p2 = p4
     end
 
-    # Skip optional return type `-> type`
+    # Skip optional return type `-> type` or `out(TYPE)` / `out TYPE`
     if check(p2, TokType.Arrow) do
         var (p_arr, _) = advance(p2)
         p2 = skip_type_expr(p_arr)
     end
+    p2 = skip_out_return_type(p2)
 
     # Skip optional trailing colon `:`
     var (p_colon, _) = match_tok(p2, TokType.Colon)
@@ -2588,6 +2655,9 @@ func parse_func_def(p: Parser):
         end
     end
 
+    if not check(p5, TokType.End) do
+        p5 = parse_error_at(p5, "expected 'end' to close function", fn_node.line)
+    end
     var (p6, _, _) = expect_tok(p5, TokType.End, "expected 'end' to close function")
     # `end` and `end.` are both accepted by the C parser/spec-compatible
     # frontend.  Keep the dot optional on the soft self-host path as well.
