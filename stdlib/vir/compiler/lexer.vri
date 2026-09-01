@@ -16,8 +16,8 @@ include result
 import Result, Ok, Err from result
 include vir.rt.string_rt
 import fat_str_new, fat_str_concat, fat_str_len, fat_str_byte_at, fat_str_eq, fat_str_eq_span, fat_str_slice,
-    fat_char_to_str, rt_streq, str_from_cstr, sb_new, sb_append_char, sb_to_string, sb_len, StringBuilder,
-    native_read_u8, native_write_u8 from vir.rt.string_rt
+    fat_str_sentinel_pad, fat_char_to_str, rt_streq, str_from_cstr, sb_new, sb_append_char, sb_to_string, sb_len,
+    StringBuilder, native_read_u8, native_write_u8, native_read_i64, native_write_i64, rt_memcpy from vir.rt.string_rt
 include alloc
 import alloc, vir_alloc from alloc
 include vec
@@ -227,7 +227,8 @@ enum TokType:
     PtrKw         = 227;  # ptr type keyword (§29 FFI)
     MutKw         = 228;  # mut (after & or standalone binder)
     Then          = 229;  # then — block opener (alias of Do)
-    EmbedKw       = 230   # embed (bundle asset macro §25.3)
+    EmbedKw       = 230;  # embed (bundle asset macro §25.3)
+    InterfaceKw   = 231   # interface declaration (signature-only methods)
 end.
 # ═══════════════════════════════════════════════════════
 # Token
@@ -363,7 +364,7 @@ func kw_table_part2:
     table = vec_push(table, KeywordEntry ( word: fat_str_new("map"), tok: TokType.MapKw ))
     table = vec_push(table, KeywordEntry ( word: fat_str_new("struct"), tok: TokType.Entity ))
     table = vec_push(table, KeywordEntry ( word: fat_str_new("record"), tok: TokType.Entity ))
-    table = vec_push(table, KeywordEntry ( word: fat_str_new("interface"), tok: TokType.Entity ))
+    table = vec_push(table, KeywordEntry ( word: fat_str_new("interface"), tok: TokType.InterfaceKw ))
     table = vec_push(table, KeywordEntry ( word: fat_str_new("atomic"), tok: TokType.AtomicKw ))
     table = vec_push(table, KeywordEntry ( word: fat_str_new("isolate"), tok: TokType.IsolateKw ))
     table = vec_push(table, KeywordEntry ( word: fat_str_new("resume"), tok: TokType.ResumeKw ))
@@ -393,44 +394,83 @@ func kw_table_part2:
     out table
 end.
 
+# Keyword lookup index.  The old path scanned all ~100 keywords for every
+# source word.  Bucket by first byte + length so a lookup normally compares
+# only one or two candidates while keeping the table as the source of truth.
+const KW_LEN_SLOTS: int = 32
+const KW_BUCKET_COUNT: int = 8192
+const KW_MAX_ENTRIES: int = 256
+var g_kw_bucket_head: i64 = 0
+var g_kw_bucket_next: i64 = 0
+
+func keyword_bucket_build(table: Vec<KeywordEntry>):
+    if g_kw_bucket_head == 0 do
+        g_kw_bucket_head = vir_alloc(KW_BUCKET_COUNT * 8)
+    end
+    if g_kw_bucket_next == 0 do
+        g_kw_bucket_next = vir_alloc(KW_MAX_ENTRIES * 8)
+    end
+
+    var i = 0
+    when i < KW_BUCKET_COUNT loop
+        native_write_i64(g_kw_bucket_head, i * 8, 0)
+        i = i + 1
+    end
+
+    count = vec_len(table)
+    i = 0
+    when i < count and i < KW_MAX_ENTRIES loop
+        entry = vec_get(table, i)
+        word_len = fat_str_len(entry.word)
+        if word_len > 0 and word_len < KW_LEN_SLOTS do
+            first = fat_str_byte_at(entry.word, 0)
+            key = first * KW_LEN_SLOTS + word_len
+            head = native_read_i64(g_kw_bucket_head, key * 8)
+            native_write_i64(g_kw_bucket_next, i * 8, head)
+            native_write_i64(g_kw_bucket_head, key * 8, i + 1)
+        end
+        i = i + 1
+    end
+end.
+
 func build_keyword_table:
     table = vec_new<KeywordEntry>()
     table = kw_table_part1(table)
     table = kw_table_part2(table)
+    keyword_bucket_build(table)
     out table
 end.
-func lookup_keyword(table: Vec<KeywordEntry>, word: string):
-
-    # P1: length pre-filter then strcmp (avoids full strcmp on mismatches).
-    wlen = fat_str_len(word)
-    i = 0
-    when i < vec_len(table) loop
-        entry = vec_get(table, i)
-        if fat_str_len(entry.word) == wlen do
-            if fat_str_eq(entry.word, word) do
-                out entry.tok
-            end
-        end
-        i = i + 1
-    end
-    out TokType.Error  # sentinel: not found (instead of Eof)
-end.
-
 # Zero-copy keyword match: compare lexeme span in source buffer (no substring alloc).
 func lookup_keyword_span(table: Vec<KeywordEntry>, source: string, start: int, span_len: int):
     if span_len <= 0 do out TokType.Error end
+    if span_len >= KW_LEN_SLOTS or g_kw_bucket_head == 0 or g_kw_bucket_next == 0 do
+        i = 0
+        when i < vec_len(table) loop
+            entry = vec_get(table, i)
+            if fat_str_len(entry.word) == span_len do
+                if fat_str_eq_span(source, start, span_len, entry.word) do out entry.tok end
+            end
+            i = i + 1
+        end
+        out TokType.Error
+    end
     first = fat_str_byte_at(source, start)
-    i = 0
+    key = first * KW_LEN_SLOTS + span_len
+    link = native_read_i64(g_kw_bucket_head, key * 8)
+    when link > 0 loop
+        i = link - 1
+        entry = vec_get(table, i)
+        if fat_str_eq_span(source, start, span_len, entry.word) do
+            out entry.tok
+        end
+        link = native_read_i64(g_kw_bucket_next, i * 8)
+    end
+    # Runtime keyword registration may grow beyond the fixed fast index.
+    i = KW_MAX_ENTRIES
     when i < vec_len(table) loop
         entry = vec_get(table, i)
-        ew = entry.word
-        elen = fat_str_len(ew)
-        if elen == span_len do
-            if fat_str_byte_at(ew, 0) == first do
-                if fat_str_eq_span(source, start, span_len, ew) do
-                    out entry.tok
-                end
-            end
+        if fat_str_len(entry.word) == span_len do
+            if fat_str_eq_span(source, start, span_len, entry.word) do out entry.tok end
         end
         i = i + 1
     end
@@ -458,6 +498,19 @@ end.
 var g_lexer_tokens: i64 = 0
 var g_lexer_error: i64 = 0
 var g_lexer_source: i64 = 0
+var g_lexer_source_data: i64 = 0
+var g_ident_intern: i64 = 0
+
+func ident_intern_reset():
+    g_ident_intern = 0
+end.
+
+# Materialize identifier from source span.  Do NOT linear-scan a growing
+# intern table here: on large inputs (parser.vri ~50k tokens) that is O(n²)
+# string compares and looks like a silent hang in C-VM.
+func ident_intern_span(source: int, start: int, span_len: int):
+    out fat_str_slice(source, start, span_len)
+end.
 
 # ASCII class flags for single-pass lexer hot path (256-byte lookup).
 const LEX_C_SPACE: int = 1
@@ -466,6 +519,57 @@ const LEX_C_ID_START: int = 4
 const LEX_C_ID_CONT: int = 8
 
 var g_lex_ascii: i64 = 0
+var g_lex_single: i64 = 0
+
+func lex_single_store(c: int, tok: TokType):
+    native_write_i64(g_lex_single, c * 8, tok as int)
+end.
+
+func lex_single_init():
+    if g_lex_single != 0 do out end
+    if g_lex_ascii == 0 do lex_ascii_init() end
+    g_lex_single = vir_alloc(256 * 8)
+    var c = 0
+    when c < 256 loop
+        native_write_i64(g_lex_single, c * 8, 0)
+        c = c + 1
+    end
+    lex_single_store(43, TokType.Plus)
+    lex_single_store(45, TokType.Minus)
+    lex_single_store(42, TokType.Star)
+    lex_single_store(47, TokType.Slash)
+    lex_single_store(37, TokType.Percent)
+    lex_single_store(94, TokType.Power)
+    lex_single_store(61, TokType.Assign)
+    lex_single_store(62, TokType.Gt)
+    lex_single_store(60, TokType.Lt)
+    lex_single_store(33, TokType.Not)
+    lex_single_store(63, TokType.Exist)
+    lex_single_store(38, TokType.BitAnd)
+    lex_single_store(124, TokType.BitOr)
+    lex_single_store(126, TokType.BitNot)
+    lex_single_store(40, TokType.LParen)
+    lex_single_store(41, TokType.RParen)
+    lex_single_store(91, TokType.LBracket)
+    lex_single_store(93, TokType.RBracket)
+    lex_single_store(123, TokType.LBrace)
+    lex_single_store(125, TokType.RBrace)
+    lex_single_store(58, TokType.Colon)
+    lex_single_store(44, TokType.Comma)
+    lex_single_store(59, TokType.Semicolon)
+    lex_single_store(64, TokType.AtSign)
+    lex_single_store(46, TokType.Dot)
+end.
+
+# Materialize token text: zero-copy span for keywords, intern pool for idents.
+func token_lexeme(tok: Token):
+    if tok.len <= 0 do out tok.str_val end
+    if fat_str_len(tok.str_val) == tok.len and fat_str_len(tok.str_val) > 0 do
+        out tok.str_val
+    end
+    if g_lexer_source == 0 do out tok.str_val end
+    out ident_intern_span(g_lexer_source, tok.start, tok.len)
+end.
 
 func lex_char_flags(c: int):
     flags = 0
@@ -494,8 +598,20 @@ func lex_flags(c: int):
     out native_read_u8(g_lex_ascii, c)
 end.
 
-func lex_is_space_fast(c: int):
-    out (lex_flags(c) & LEX_C_SPACE) != 0
+func lex_skip_whitespace(lex: Lexer):
+    # This runs inside the C-VM, where constructing and inspecting a fake
+    # 64-bit SIMD word costs more than a direct byte loop. Newlines are not
+    # whitespace here because the parser needs them as separator tokens.
+    source_data = g_lexer_source_data
+    if source_data == 0 do
+        source_data = native_read_i64(lex.source as i64, 0)
+    end
+    when lex.pos < lex.source_len loop
+        c = native_read_u8(source_data, lex.pos)
+        if c != 32 and c != 9 and c != 13 do out lex end
+        lex.pos = lex.pos + 1
+    end
+    out lex
 end.
 
 func lex_is_digit_fast(c: int):
@@ -536,6 +652,7 @@ func register_keyword:
         tok: TokType
 
     lex.keywords = vec_push(lex.keywords, KeywordEntry ( word: word, tok: tok ))
+    keyword_bucket_build(lex.keywords)
     out lex
 end.
 func lexer_new(source: string):
@@ -546,10 +663,15 @@ func lexer_new(source: string):
     # result of a later call and the lexer observes an empty/corrupt input.
     # See the matching safeguard in parser_new.
     lex_ascii_init()
-    held_source = source
+    lex_single_init()
+    held_source = fat_str_sentinel_pad(source)
     slen = fat_str_len(held_source)
+    g_lexer_source_data = native_read_i64(held_source as i64, 0)
     toks = vec_new()
-    est_toks = slen / 4
+    est_toks = 64
+    if slen >= 4 do
+        est_toks = slen / 4
+    end
     if est_toks < 64 do est_toks = 64 end
     vec_reserve(toks, est_toks)
     kws = build_keyword_table()
@@ -577,7 +699,7 @@ end.
 func lex_peek(lex: Lexer):
 
     if lex.pos < lex.source_len do
-        out fat_str_byte_at(lex.source, lex.pos)
+        out native_read_u8(g_lexer_source_data, lex.pos)
     end
     out 0
 end.
@@ -585,7 +707,7 @@ func lex_peek_at(lex: Lexer, offset: int):
 
     p = lex.pos + offset
     if p < lex.source_len do
-        out fat_str_byte_at(lex.source, p)
+        out native_read_u8(g_lexer_source_data, p)
     end
     out 0
 end.
@@ -623,24 +745,15 @@ end.
 # ═══════════════════════════════════════════════════════
 
 func skip_whitespace(lex: Lexer):
-
-    when not is_eof(lex) loop
-        c = lex_peek(lex)
-        if lex_is_space_fast(c) do
-            lex.pos = lex.pos + 1
-        else
-            out lex
-        end
-    end
-    out lex
+    out lex_skip_whitespace(lex)
 end.
 
 # Bulk skip: whitespace + line/block comments in one tight loop (no per-byte dispatcher).
 func skip_trivia(lex: Lexer):
     when not is_eof(lex) loop
         c = lex_peek(lex)
-        if lex_is_space_fast(c) do
-            lex.pos = lex.pos + 1
+        if c == 32 or c == 9 or c == 13 do
+            lex = lex_skip_whitespace(lex)
         eif c == 35 do
             if lex_peek_at(lex, 1) == 35 or (lex_peek_at(lex, 1) == 42 and lex_peek_at(lex, 2) == 35) do
                 lex = skip_block_comment(lex)
@@ -942,8 +1055,15 @@ func lex_word(lex: Lexer):
     start_col = lex.col
     start_pos = lex.pos
 
-    when not is_eof(lex) and lex_is_ident_continue_fast(lex_peek(lex)) loop
-        lex.pos = lex.pos + 1
+    scanning = true
+    when scanning and lex.pos < lex.source_len loop
+        c = native_read_u8(g_lexer_source_data, lex.pos)
+        flags = native_read_u8(g_lex_ascii, c)
+        if c >= 128 or (flags & LEX_C_ID_CONT) != 0 do
+            lex.pos = lex.pos + 1
+        else
+            scanning = false
+        end
     end
 
     span_len = lex.pos - start_pos
@@ -958,7 +1078,6 @@ func lex_word(lex: Lexer):
     tok = token_new(TokType.Ident, start_line, start_col)
     tok.start = start_pos
     tok.len = span_len
-    tok.str_val = fat_str_slice(lex.source, start_pos, span_len)
     out (lex, tok)
 end.
 # ═══════════════════════════════════════════════════════
@@ -967,7 +1086,9 @@ end.
 
 func tokenize(lex: Lexer):
 
+    ident_intern_reset()
     g_lexer_source = lex.source as i64
+    g_lexer_source_data = native_read_i64(lex.source as i64, 0)
     prev_was_newline = true
 
     when not is_eof(lex) loop
@@ -982,6 +1103,7 @@ func tokenize(lex: Lexer):
         end
 
         c = lex_peek(lex)
+        c_flags = native_read_u8(g_lex_ascii, c)
 
         # Newline (statement / list separator, §1.0) — emit inside parens too
         if c == 10 do
@@ -1005,8 +1127,17 @@ func tokenize(lex: Lexer):
         end
 
         # Number literal
-        if lex_is_digit_fast(c) do
+        if (c_flags & LEX_C_DIGIT) != 0 do
             var (lex2, tok) = lex_number(lex)
+            lex = lex2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # Words dominate compiler source. Recognize them before walking the
+        # long multi-character operator cascade below.
+        if (c_flags & LEX_C_ID_START) != 0 or c >= 128 do
+            var (lex2, tok) = lex_word(lex)
             lex = lex2
             lex.tokens = vec_push(lex.tokens, tok)
             skip
@@ -1298,110 +1429,22 @@ func tokenize(lex: Lexer):
         end
 
 
-        # Single-char operators
+        # Single-char operators / delimiters (256-byte table; multi-char rules above win).
+        single_val = native_read_i64(g_lex_single, c * 8)
         single_tok = TokType.Eof
-        if c == 43 do
-            single_tok = TokType.Plus
-        end
-        if c == 45 and single_tok == TokType.Eof do
-            single_tok = TokType.Minus
-        end
-        if c == 42 do
-            single_tok = TokType.Star
-        end
-        if c == 47 do
-            single_tok = TokType.Slash
-        end
-        if c == 37 do
-            single_tok = TokType.Percent
-        end
-        if c == 94 do
-            single_tok = TokType.Power
-        end
-        if c == 61 and single_tok == TokType.Eof do
-            single_tok = TokType.Assign
-        end
-        if c == 62 and single_tok == TokType.Eof do
-            single_tok = TokType.Gt
-        end
-        if c == 60 and single_tok == TokType.Eof do
-            single_tok = TokType.Lt
-        end
-        if c == 33 and single_tok == TokType.Eof do
-            single_tok = TokType.Not
-        end
-        if c == 63 and single_tok == TokType.Eof do
-            single_tok = TokType.Exist
-        end
-        if c == 38 do
-            single_tok = TokType.BitAnd
-        end
-        if c == 124 and single_tok == TokType.Eof do
-            single_tok = TokType.BitOr
-        end
-        if c == 126 do
-            single_tok = TokType.BitNot
-        end
-
-        # Delimiters
-        if c == 40 do
-            single_tok = TokType.LParen
+        if single_val != 0 do single_tok = single_val as TokType end
+        if single_tok == TokType.LParen or single_tok == TokType.LBracket or single_tok == TokType.LBrace do
             lex.paren_depth = lex.paren_depth + 1
         end
-        if c == 41 do
-            single_tok = TokType.RParen
+        if single_tok == TokType.RParen or single_tok == TokType.RBracket or single_tok == TokType.RBrace do
             if lex.paren_depth > 0 do
                 lex.paren_depth = lex.paren_depth - 1
             end
-        end
-        if c == 91 do
-            single_tok = TokType.LBracket
-            lex.paren_depth = lex.paren_depth + 1
-        end
-        if c == 93 do
-            single_tok = TokType.RBracket
-            if lex.paren_depth > 0 do
-                lex.paren_depth = lex.paren_depth - 1
-            end
-        end
-        if c == 123 do
-            single_tok = TokType.LBrace
-            lex.paren_depth = lex.paren_depth + 1
-        end
-        if c == 125 do
-            single_tok = TokType.RBrace
-            if lex.paren_depth > 0 do
-                lex.paren_depth = lex.paren_depth - 1
-            end
-        end
-        if c == 44 do
-            single_tok = TokType.Comma
-        end
-        if c == 46 and single_tok == TokType.Eof do
-            single_tok = TokType.Dot
-        end
-        if c == 58 and single_tok == TokType.Eof do
-            single_tok = TokType.Colon
-        end
-        if c == 59 do
-            single_tok = TokType.Semicolon
-        end
-        if c == 64 do
-            single_tok = TokType.AtSign
         end
 
         if single_tok != TokType.Eof do
             tok = token_new(single_tok, lex.line, lex.col)
-            var (lex2, _) = lex_advance(lex)
-            lex = lex2
-            lex.tokens = vec_push(lex.tokens, tok)
-            skip
-        end
-
-        # Word (keyword / identifier)
-        if lex_is_ident_start_fast(c) or c >= 128 do
-            var (lex2, tok) = lex_word(lex)
-            lex = lex2
+            lex.pos = lex.pos + 1
             lex.tokens = vec_push(lex.tokens, tok)
             skip
         end
@@ -1465,6 +1508,9 @@ func token_name(t: TokType):
     end
     if t == TokType.Entity do
         out fat_str_new("ENTITY")
+    end
+    if t == TokType.InterfaceKw do
+        out fat_str_new("INTERFACE")
     end
     if t == TokType.Enum do
         out fat_str_new("ENUM")
@@ -1617,4 +1663,4 @@ func token_name(t: TokType):
 end.
 export TokType, Token, KeywordEntry, Lexer, lexer_new, tokenize, lexer_lex,
        lexer_token_count, lexer_token_get, lexer_error_message, token_name,
-       g_lexer_source, lookup_keyword_span
+       token_lexeme, g_lexer_source, lookup_keyword_span
