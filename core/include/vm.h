@@ -134,7 +134,13 @@ extern vir_intr_desc_t vir_intr_table[VIR_MAX_INTRINSICS];
  * ═══════════════════════════════════════════════════════ */
 
 #define VM_MAX_ARRAYS   1048576
-#define VM_MAX_GLOBALS  1024
+/* Large self-hosted compiler bundles routinely exceed 1K module globals.
+ * The VM previously ignored stores beyond this bound and returned zero on
+ * loads, turning a capacity error into unrelated runtime failures (for
+ * example PAGE_SIZE becoming zero inside page_alloc).  vm_state_t is already
+ * heap-allocated by the CLI, so reserving 8K slots is inexpensive and leaves
+ * headroom for expanded frontend/optimizer modules. */
+#define VM_MAX_GLOBALS  8192
 
 typedef struct {
     int64_t  *data;

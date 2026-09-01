@@ -2,6 +2,70 @@
 
 All notable changes to the Vir Language Support extension will be documented in this file.
 
+## [4.5.6] - 2026-09-01
+
+### Fixed
+
+- File icon theme maps **only** `.vri` / `.sri` / `.sci` / `.svi` / `.vsib` (no longer overrides every file).
+- Enable: Command Palette → `Preferences: File Icon Theme` → **Vir-lang File Icons**.
+
+## [4.5.5] - 2026-09-01
+
+### Fixed
+
+- Extension / file logo: remove white corner background (RGBA transparent outside rounded square).
+
+## [4.5.4] - 2026-09-01
+
+### Fixed
+
+- File explorer icons for `.vri` / `.sri` / `.sci` / `.svi` / `.vsib`:
+  - language icons resized to 32×32 (large PNGs showed blank in sidebar)
+  - added **Vir-lang File Icons** theme (`contributes.iconThemes`)
+- After install: Command Palette → `Preferences: File Icon Theme` → **Vir-lang File Icons**
+
+## [4.5.3] - 2026-09-01
+
+### Changed
+
+- Extension Marketplace id `name` → `vir-lang` (displayName **Vir-lang**) under publisher `VirgoriLabs`.
+- Avoids conflict with existing Marketplace extension `virgori-core`.
+
+## [4.5.2] - 2026-09-01
+
+### Fixed
+
+- Removed broken imports of missing modules (`smartBar`, `blockDiagnostics`, `blockCommentValidation`) that prevented extension activation.
+- Slimmed VSIX assets to logo + file icon only.
+- Publisher remains `VirgoriLabs`.
+
+## [4.5.1] - 2026-09-01
+
+### Changed
+
+- Extension marketplace icon → Virgori compass logo (`assets/virgori-logo-128.png`).
+- File icons for `.vri` / `.sri` / `.sci` / `.svi` / `.vsib` → same logo (`assets/virgori-file-icon.png`).
+
+## [4.5.0] - 2026-09-01
+
+### Changed
+
+- Bumped extension version to `4.5.0`.
+- Palette refresh from 3.1.4 (import/include/declaration/AI/async/operator/comment scopes).
+
+## [3.1.4] - 2026-09-01
+
+### Changed
+
+- `import` / `export` / `get` / `from` → cam đậm (`#EA580C`).
+- `include` → đỏ đậm (`#B91C1C`), scope riêng `keyword.control.include.vri`.
+- Keyword khai báo (`func`/`entity`/`enum`/`var`/…) → xanh dương (`#3B82F6`).
+- Toán tử AI (`matmul`/`grad`/`embed`/`train`) → đỏ cam (`#F97316`).
+- Comment → xanh lá (`#22C55E`); nhận diện block `#*# … #*#` và `## … ##`.
+- Keyword bất đồng bộ (`async`/`await`/`send`/`recv`/…) → tím (`#A855F7`).
+- Keyword toán tử (`and`/`or`/`xor`/`shl`/`bit_*`/…) cùng màu toán tử ký hiệu.
+- Bumped extension version to `3.1.4`.
+
 ## [3.1.2] - 2026-03-10
 
 ### Changed

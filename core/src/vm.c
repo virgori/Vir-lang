@@ -45,6 +45,26 @@ static inline uint32_t vm_call_save_count(const vm_state_t *vm)
     return nregs;
 }
 
+static void vm_report_arithmetic_fault(const vm_state_t *vm,
+                                       const char *opcode,
+                                       int64_t lhs, int64_t rhs)
+{
+    fprintf(stderr,
+            "VM invalid %s: func=%s ip=%u lhs=%lld rhs=%lld\n",
+            opcode,
+            vm->current_func ? vm->current_func->name : "<none>",
+            vm->ip, (long long)lhs, (long long)rhs);
+    uint32_t first = vm->func_depth > 8u ? vm->func_depth - 8u : 0u;
+    for (uint32_t depth = vm->func_depth; depth > first; depth--) {
+        uint32_t caller = depth - 1u;
+        fprintf(stderr, "  caller[%u]=%s return_ip=%u\n",
+                vm->func_depth - depth,
+                vm->func_stack[caller].func
+                    ? vm->func_stack[caller].func->name : "<root>",
+                vm->func_stack[caller].ip);
+    }
+}
+
 static uint32_t vm_function_reg_need(const q_function_t *func)
 {
     uint32_t max_vreg = 0;
@@ -1769,14 +1789,20 @@ vm_status_t vm_step(vm_state_t *vm, const q_instruction_t *instr)
     case Q_DIV:
         a = operand_value(vm, &instr->src1);
         b = operand_value(vm, &instr->src2);
-        if (b == 0) return VM_ERR_DIV_ZERO;
+        if (b == 0) {
+            vm_report_arithmetic_fault(vm, "Q_DIV", a, b);
+            return VM_ERR_DIV_ZERO;
+        }
         set_dest(vm, &instr->dest, a / b);
         break;
 
     case Q_MOD:
         a = operand_value(vm, &instr->src1);
         b = operand_value(vm, &instr->src2);
-        if (b == 0) return VM_ERR_DIV_ZERO;
+        if (b == 0) {
+            vm_report_arithmetic_fault(vm, "Q_MOD", a, b);
+            return VM_ERR_DIV_ZERO;
+        }
         set_dest(vm, &instr->dest, a % b);
         break;
 
