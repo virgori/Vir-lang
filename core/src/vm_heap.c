@@ -158,6 +158,28 @@ static int vm_heap_rehash(vm_heap_t *heap, uint32_t new_cap)
     return 0;
 }
 
+/* Realloc/rebind changes at most one pointer. Rebuilding every hash bucket is
+ * O(number of live allocations) per vector growth and dominates large VM
+ * workloads. Move only the affected entry between bucket chains instead. */
+static void vm_heap_rebucket_entry(vm_heap_t *heap, uint32_t index,
+                                   uint32_t old_bucket)
+{
+    if (!heap || index >= heap->count || !heap->bucket_cap)
+        return;
+
+    uint32_t entry_ref = index + 1u;
+    uint32_t *link = &heap->buckets[old_bucket];
+    while (*link && *link != entry_ref)
+        link = &heap->entries[*link - 1u].next;
+    if (*link == entry_ref)
+        *link = heap->entries[index].next;
+
+    uint32_t new_bucket = vm_heap_hash_ptr(heap->entries[index].ptr) &
+                          (heap->bucket_cap - 1u);
+    heap->entries[index].next = heap->buckets[new_bucket];
+    heap->buckets[new_bucket] = entry_ref;
+}
+
 static int vm_heap_grow(vm_heap_t *heap)
 {
     uint32_t new_cap = heap->cap ? heap->cap * 2u : VM_HEAP_INIT_CAP;
@@ -270,10 +292,12 @@ int vm_heap_rebind(vm_heap_t *heap, void *old_ptr, void *new_ptr, size_t new_siz
     if (!e)
         return vm_heap_register(heap, new_ptr, new_size, VM_HEAP_KIND_GENERIC);
     uint32_t index = (uint32_t)(e - heap->entries);
+    uint32_t old_bucket = vm_heap_hash_ptr(old_ptr) & (heap->bucket_cap - 1u);
     vm_heap_range_remove_entry(heap, index);
     e->ptr = new_ptr;
     e->size = new_size;
-    (void)vm_heap_rehash(heap, heap->bucket_cap);
+    if (new_ptr != old_ptr)
+        vm_heap_rebucket_entry(heap, index, old_bucket);
     if (vm_heap_range_add_entry(heap, index) != 0)
         heap->range_degraded = 1;
     return 0;
@@ -324,6 +348,8 @@ void *vm_heap_realloc(vm_heap_t *heap, void *ptr, size_t new_size)
         return NULL;
     size_t old_size = e->size;
     uint32_t index = (uint32_t)(e - heap->entries);
+    uintptr_t old_addr = (uintptr_t)ptr;
+    uint32_t old_bucket = vm_heap_hash_ptr(ptr) & (heap->bucket_cap - 1u);
     vm_heap_range_remove_entry(heap, index);
     void *np = realloc(ptr, new_size);
     if (!np) {
@@ -333,7 +359,8 @@ void *vm_heap_realloc(vm_heap_t *heap, void *ptr, size_t new_size)
     }
     e->ptr = np;
     e->size = new_size;
-    (void)vm_heap_rehash(heap, heap->bucket_cap);
+    if ((uintptr_t)np != old_addr)
+        vm_heap_rebucket_entry(heap, index, old_bucket);
     if (vm_heap_range_add_entry(heap, index) != 0)
         heap->range_degraded = 1;
     if (new_size > old_size)

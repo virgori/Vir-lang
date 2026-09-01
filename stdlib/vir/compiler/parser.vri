@@ -201,7 +201,9 @@ end.
 
 # Bump-pointer AST arena: one slab for child vecs + node handle log (reset per parse).
 const AST_BUMP_BYTES: int = 8388608
-const AST_BUMP_ENABLED: int = 0
+# Runtime feature toggle: keeping this mutable avoids dead-branch diagnostics
+# while the bump allocator remains available for benchmarking/rollout.
+var AST_BUMP_ENABLED: int = 0
 const VEC_RT_HEADER: int = 16
 const VEC_RT_INIT_CAP: int = 16
 const VEC_RT_ELEM: int = 8
@@ -313,17 +315,18 @@ func ast_new(typ: AstType):
 end.
 func ast_add_child(parent: AstNode, child: AstNode):
     # Soft ABI: nested CALL (vec_new_rt / vec_push_rt) can clobber entity
-    # fields on the parent handle.  Save/restore name/line/type so Call /
-    # VarDecl / FuncDef names are not wiped → mass E2001 undefined.
-    let save_name = parent.name
-    let save_name2 = parent.name2
-    let save_type = parent.node_type
-    let save_op = parent.op
-    let save_line = parent.line
-    let save_int = parent.int_val
-    let save_float = parent.float_val
-    let save_bid = parent.builtin_id
-    var kids = parent.children
+    # fields on the parent handle. Save/restore raw 64-bit words directly
+    # without allocating temporary heap string headers.
+    let p_ptr = parent as i64
+    let s_name = native_read_i64(p_ptr, 0)
+    let s_name2 = native_read_i64(p_ptr, 8)
+    let s_type = native_read_i64(p_ptr, 16)
+    let s_op = native_read_i64(p_ptr, 24)
+    let s_line = native_read_i64(p_ptr, 32)
+    let s_int = native_read_i64(p_ptr, 40)
+    let s_float = native_read_i64(p_ptr, 48)
+    let s_bid = native_read_i64(p_ptr, 56)
+    var kids = native_read_i64(p_ptr, 64)
     if kids == 0 do
         if AST_BUMP_ENABLED == 0 do
             kids = vec_new_rt()
@@ -336,15 +339,15 @@ func ast_add_child(parent: AstNode, child: AstNode):
     else
         kids = ast_vec_push(kids, child)
     end
-    parent.children = kids
-    parent.name = save_name
-    parent.name2 = save_name2
-    parent.node_type = save_type
-    parent.op = save_op
-    parent.line = save_line
-    parent.int_val = save_int
-    parent.float_val = save_float
-    parent.builtin_id = save_bid
+    native_write_i64(p_ptr, 0, s_name)
+    native_write_i64(p_ptr, 8, s_name2)
+    native_write_i64(p_ptr, 16, s_type)
+    native_write_i64(p_ptr, 24, s_op)
+    native_write_i64(p_ptr, 32, s_line)
+    native_write_i64(p_ptr, 40, s_int)
+    native_write_i64(p_ptr, 48, s_float)
+    native_write_i64(p_ptr, 56, s_bid)
+    native_write_i64(p_ptr, 64, kids)
     out parent
 end.
 # ═══════════════════════════════════════════════════════
@@ -1208,9 +1211,10 @@ func parse_primary(p: Parser):
             if bid != BuiltinId.None do
                 # Builtin call
                 call = ast_new(AstType.BuiltinCall)
-                call.builtin_id = bid as i64
-                builtin_name = id_name
-                call.name = builtin_name
+                let this_bid = bid as i64
+                let this_builtin_name = id_name
+                call.builtin_id = this_bid
+                call.name = this_builtin_name
                 call.line = id_tok.line
                 var (p_lp, _) = advance(p)  # consume '('
                 p = skip_newlines(p_lp)
@@ -1234,15 +1238,15 @@ func parse_primary(p: Parser):
                 var (p7, _, _) = expect_tok(p, TokType.RParen, "expected ')' after builtin args")
                 # ast_add_child corrupts soft .name / .builtin_id — restore after children.
                 # Write builtin_id last so it survives if only the final field store sticks.
-                call.name = builtin_name
-                call.builtin_id = bid as i64
+                call.name = this_builtin_name
+                call.builtin_id = this_bid
                 out (p7, call)
             end
 
             # Regular function call
             call = ast_new(AstType.Call)
-            call_name = id_name
-            call.name = call_name
+            let this_call_name = id_name
+            call.name = this_call_name
             call.line = id_tok.line
             var (p_lp, _) = advance(p)  # consume '('
             p = skip_newlines(p_lp)
@@ -1294,7 +1298,7 @@ func parse_primary(p: Parser):
             end
             var (p7, _, _) = expect_tok(p, TokType.RParen, "expected ')' after arguments")
             # ast_add_child corrupts soft .name — restore after children.
-            call.name = call_name
+            call.name = this_call_name
             out (p7, call)
         end
 
@@ -1599,7 +1603,7 @@ func parse_infix_make(left: AstNode, op_tok: Token, right: AstNode):
     if tt == TokType.Power do bin.op = OpType.PowOp end
     if tt == TokType.MatMul do bin.op = OpType.MatMulOp end
     if tt == TokType.Fma do bin.op = OpType.FmaOp end
-    # `&` / `and` / `bit_and` → bitwise AndOp (Bool×Bool also allowed in pass 6).
+    # `&` / `and` / `and` → bitwise AndOp (Bool×Bool also allowed in pass 6).
     if tt == TokType.BitAnd do bin.op = OpType.AndOp end
     if tt == TokType.And do bin.op = OpType.AndOp end
     if tt == TokType.BitOr do bin.op = OpType.OrOp end
@@ -1625,8 +1629,8 @@ func parse_expr_bp(p: Parser, min_bp: int):
             pratt_more = false
         eif tt == TokType.As or tt == TokType.Cast do
             # Cast binds tighter than the following lower-precedence operator.
-            # Keep the Pratt loop running so `(x as int bit_and mask)` consumes
-            # `bit_and mask` instead of returning with `bit_and` before `)`.
+            # Keep the Pratt loop running so `(x as int and mask)` consumes
+            # `and mask` instead of returning with `and` before `)`.
             var (p3, _) = advance(p2)
             if check(p3, TokType.Ident) or check(p3, TokType.PtrKw) do
                 var (p4, _) = advance(p3)
