@@ -27,6 +27,113 @@ import DiagnosticEngine, report_error from context
 include io
 import print_str, print_int, print_newline from io
 
+include alloc
+import vir_alloc from alloc
+
+# Name resolution used to scan every symbol in the global scope for every
+# identifier.  A self-host build has thousands of globals and tens of
+# thousands of references, making pass 3 effectively O(refs * globals).
+# Keep scope-local lookup linear (local scopes are small), but index the
+# global scope once before walking the AST.
+const PASS3_GLOBAL_BUCKETS: int = 4096
+const PASS3_GLOBAL_BUCKET_MASK: int = 4095
+var g_pass3_global_heads: i64 = 0
+var g_pass3_global_next: i64 = 0
+var g_pass3_global_indexed_count: i64 = 0
+
+func pass3_name_bucket(name: string):
+    n = fat_str_len(name)
+    if n <= 0 do
+        out 0
+    end
+    data = native_read_i64(name as i64, 0)
+    h = n bit_and PASS3_GLOBAL_BUCKET_MASK
+    var i = 0
+    when i < n loop
+        h = (h * 131 + native_read_u8(data, i)) bit_and PASS3_GLOBAL_BUCKET_MASK
+        i = i + 1
+    end
+    out h
+end.
+
+func pass3_build_global_index(symbols: SymbolTable, scopes: ScopeTree):
+    if g_pass3_global_heads == 0 do
+        g_pass3_global_heads = vir_alloc(PASS3_GLOBAL_BUCKETS * 8)
+    end
+
+    var i = 0
+    when i < PASS3_GLOBAL_BUCKETS loop
+        native_write_i64(g_pass3_global_heads, i * 8, 0)
+        i = i + 1
+    end
+
+    scopes_vec = native_read_i64(scopes as i64, 0)
+    global_scope = vec_get_rt(scopes_vec, 0)
+    global_syms = native_read_i64(global_scope as i64, 16)
+    count = vec_len_rt(global_syms)
+    # semantic_run invokes pass 3 once.  Allocate the exact chain array for
+    # that snapshot; symbols added later use the small linear tail fallback.
+    if count > 0 do
+        g_pass3_global_next = vir_alloc(count * 8)
+    else
+        g_pass3_global_next = 0
+    end
+    g_pass3_global_indexed_count = count
+
+    syms_vec = native_read_i64(symbols as i64, 0)
+    i = 0
+    when i < count loop
+        sym_id = vec_get_rt(global_syms, i)
+        sym = vec_get_rt(syms_vec, sym_id)
+        sym_name = native_read_i64(sym as i64, 8) as string
+        bucket = pass3_name_bucket(sym_name)
+        head = native_read_i64(g_pass3_global_heads, bucket * 8)
+        native_write_i64(g_pass3_global_next, i * 8, head)
+        native_write_i64(g_pass3_global_heads, bucket * 8, i + 1)
+        i = i + 1
+    end
+end.
+
+func pass3_lookup_global(symbols: SymbolTable, scopes: ScopeTree, name: string):
+    if fat_str_len(name) == 0 do
+        out -1
+    end
+    scopes_vec = native_read_i64(scopes as i64, 0)
+    global_scope = vec_get_rt(scopes_vec, 0)
+    global_syms = native_read_i64(global_scope as i64, 16)
+    syms_vec = native_read_i64(symbols as i64, 0)
+
+    if g_pass3_global_heads != 0 and g_pass3_global_next != 0 do
+        bucket = pass3_name_bucket(name)
+        link = native_read_i64(g_pass3_global_heads, bucket * 8)
+        when link > 0 loop
+            pos = link - 1
+            sym_id = vec_get_rt(global_syms, pos)
+            sym = vec_get_rt(syms_vec, sym_id)
+            sym_name = native_read_i64(sym as i64, 8) as string
+            if fat_str_eq(sym_name, name) == 1 do
+                out sym_id
+            end
+            link = native_read_i64(g_pass3_global_next, pos * 8)
+        end
+    end
+
+    # Normally empty: declarations handled by pass 2 are already indexed.
+    # Preserve correctness for a declaration kind added by pass 3 itself.
+    count = vec_len_rt(global_syms)
+    var i = g_pass3_global_indexed_count
+    when i < count loop
+        sym_id = vec_get_rt(global_syms, i)
+        sym = vec_get_rt(syms_vec, sym_id)
+        sym_name = native_read_i64(sym as i64, 8) as string
+        if fat_str_eq(sym_name, name) == 1 do
+            out sym_id
+        end
+        i = i + 1
+    end
+    out -1
+end.
+
 func is_builtin_method_name(name: i64):
     if name == 0 do out 0 end
     if fat_cstr_eq(name, "send") or fat_cstr_eq(name, "recv") or fat_cstr_eq(name, "push") or fat_cstr_eq(name, "pop") or fat_cstr_eq(name, "len") do out 1 end
@@ -35,6 +142,7 @@ func is_builtin_method_name(name: i64):
 end.
 
 func pass3_resolve_names(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode):
+    pass3_build_global_index(symbols, scopes)
     pass3_walk(symbols, scopes, diag, node)
 end.
 func pass3_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode):
@@ -169,7 +277,7 @@ func pass3_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                 scope_id = scope_push(scopes, ScopeKind.Block)
 
                 if pat.node_type == AstType.Identifier do
-                    if not fat_str_eq(pat.name, "_") and not fat_str_eq(pat.name, "true") and not fat_str_eq(pat.name, "false") and not fat_str_eq(pat.name, "None") do
+                    if not fat_str_eq(pat.name, fat_str_new("_")) and not fat_str_eq(pat.name, fat_str_new("true")) and not fat_str_eq(pat.name, fat_str_new("false")) and not fat_str_eq(pat.name, fat_str_new("None")) do
                         found = pass3_lookup_chain(symbols, scopes, 0, pat.name)
                         if found == -1 do
                             pass3_register_local(symbols, scopes, pat.name, SymbolKind.Variable, pat.line)
@@ -341,6 +449,9 @@ func pass3_lookup_chain(symbols: SymbolTable, scopes: ScopeTree, start_scope: in
     scopes_vec = native_read_i64(scopes as i64, 0)
     syms_vec = native_read_i64(symbols as i64, 0)
     when curr >= 0 loop
+        if curr == 0 do
+            out pass3_lookup_global(symbols, scopes, name)
+        end
         scope_node = vec_get_rt(scopes_vec, curr)
         sym_list = native_read_i64(scope_node as i64, 16)
         count = vec_len_rt(sym_list)
@@ -362,11 +473,21 @@ func pass3_register_local(symbols: SymbolTable, scopes: ScopeTree, name: string,
     if fat_str_len(name) == 0 do
         out 0
     end
+    curr_scope = scope_current_id(scopes)
+    # Pass 2 already registered top-level declarations.  Registering them a
+    # second time here both changed shadowing behaviour and enlarged the hot
+    # global lookup set while pass 3 was running.
+    if curr_scope == 0 do
+        found = pass3_lookup_global(symbols, scopes, name)
+        if found != -1 do
+            out found
+        end
+    end
     sym = SymbolNode (
         kind: kind,
         name_id: name as i64,
         type_id: 0,
-        scope_id: scope_current_id(scopes),
+        scope_id: curr_scope,
         ast_id: 0,
         is_mutable: kind == SymbolKind.Variable or kind == SymbolKind.Param,
         offset: 0,
@@ -375,7 +496,7 @@ func pass3_register_local(symbols: SymbolTable, scopes: ScopeTree, name: string,
         parent_id: -1
     )
     sym_id = symbol_alloc(symbols, sym)
-    scope_add_symbol(scopes, scope_current_id(scopes), sym_id)
+    scope_add_symbol(scopes, curr_scope, sym_id)
     out sym_id
 end.
 

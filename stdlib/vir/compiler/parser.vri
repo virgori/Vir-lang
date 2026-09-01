@@ -35,8 +35,13 @@ import rt_strlen, fat_str_len, fat_str_eq, fat_cstr_eq, fat_str_new, fat_str_con
 
 include vec_rt
 import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt
+include vir.rt.alloc
+import vir_alloc from vir.rt.alloc
 include compiler.lexer
-import Token, TokType, token_name from compiler.lexer
+import Token, TokType, token_name, token_lexeme from compiler.lexer
+
+extern func native_read_i64(addr: int, offset: int) -> int
+extern func native_write_i64(addr: int, offset: int, val: int) -> int
 
 
 # ═══════════════════════════════════════════════════════
@@ -193,25 +198,132 @@ entity AstNode:
         builtin_id:     int,
         children:       int
 end.
-func ast_new(typ: AstType):
 
-    # C-core: temps before entity literal (nested calls clobber R0).
-    kids = vec_new_rt()
+# Bump-pointer AST arena: one slab for child vecs + node handle log (reset per parse).
+const AST_BUMP_BYTES: int = 8388608
+const AST_BUMP_ENABLED: int = 0
+const VEC_RT_HEADER: int = 16
+const VEC_RT_INIT_CAP: int = 16
+const VEC_RT_ELEM: int = 8
+
+var g_ast_bump_mem: i64 = 0
+var g_ast_bump_pos: int = 0
+var g_ast_empty_name: i64 = 0
+
+func ast_bump_align(pos: int):
+    rem = pos % 8
+    if rem != 0 do out pos + (8 - rem) end
+    out pos
+end.
+
+func ast_vec_bump_alloc(cap: int):
+    if g_ast_bump_mem == 0 do out 0 end
+    need = VEC_RT_HEADER + cap * VEC_RT_ELEM
+    g_ast_bump_pos = ast_bump_align(g_ast_bump_pos)
+    if g_ast_bump_pos + need > AST_BUMP_BYTES do out 0 end
+    base = g_ast_bump_mem + g_ast_bump_pos
+    g_ast_bump_pos = g_ast_bump_pos + need
+    data = base + VEC_RT_HEADER
+    native_write_i64(base, 0, cap)
+    native_write_i64(base, 8, 0)
+    out data
+end.
+
+func ast_vec_bump_new():
+    data = ast_vec_bump_alloc(VEC_RT_INIT_CAP)
+    if data == 0 do out vec_new_rt() end
+    out data
+end.
+
+func ast_vec_is_bump(v: int):
+    if v == 0 or g_ast_bump_mem == 0 do out false end
+    out v >= g_ast_bump_mem + VEC_RT_HEADER and v < g_ast_bump_mem + AST_BUMP_BYTES
+end.
+
+# vec_push_rt cannot grow an interior slab pointer with vir_realloc.  Grow
+# bump-backed child vectors into a fresh slab slice; if the slab is full,
+# copy into a normal heap vector and let vec_rt own future growth.
+func ast_vec_push(v: int, val: int):
+    if not ast_vec_is_bump(v) do out vec_push_rt(v, val) end
+    len = native_read_i64(v - 8, 0)
+    cap = native_read_i64(v - VEC_RT_HEADER, 0)
+    if len < cap do
+        native_write_i64(v, len * VEC_RT_ELEM, val)
+        native_write_i64(v - 8, 0, len + 1)
+        out v
+    end
+
+    new_cap = cap * 2
+    if new_cap < VEC_RT_INIT_CAP do new_cap = VEC_RT_INIT_CAP end
+    new_v = ast_vec_bump_alloc(new_cap)
+    if new_v == 0 do
+        new_v = vec_new_rt()
+        i = 0
+        when i < len loop
+            new_v = vec_push_rt(new_v, native_read_i64(v, i * VEC_RT_ELEM))
+            i = i + 1
+        end
+        out vec_push_rt(new_v, val)
+    end
+
+    i = 0
+    when i < len loop
+        native_write_i64(new_v, i * VEC_RT_ELEM, native_read_i64(v, i * VEC_RT_ELEM))
+        i = i + 1
+    end
+    native_write_i64(new_v - 8, 0, len)
+    native_write_i64(new_v, len * VEC_RT_ELEM, val)
+    native_write_i64(new_v - 8, 0, len + 1)
+    out new_v
+end.
+
+func ast_arena_begin():
+    if g_ast_empty_name == 0 do
+        g_ast_empty_name = fat_str_new("")
+    end
+    if AST_BUMP_ENABLED == 1 and g_ast_bump_mem == 0 do
+        g_ast_bump_mem = vir_alloc(AST_BUMP_BYTES)
+    end
+    if AST_BUMP_ENABLED == 0 do g_ast_bump_mem = 0 end
+    g_ast_bump_pos = 0
+end.
+
+func ast_arena_end():
+    g_ast_bump_pos = 0
+end.
+
+func ast_new(typ: AstType):
+    # Most AST nodes are leaves.  Allocate their child vector lazily in
+    # ast_add_child instead of reserving 16 slots for every literal/name.
+    # Empty node names are immutable, so all nodes can share one fat header.
+    if g_ast_empty_name == 0 do
+        g_ast_empty_name = fat_str_new("")
+    end
     out AstNode (
-        name:       fat_str_new(""),
-        name2:      fat_str_new(""),
+        name:       g_ast_empty_name as string,
+        name2:      g_ast_empty_name as string,
         node_type:  typ,
         op:         OpType.Add,
         line:       0,
         int_val:    0,
         float_val:  0.0,
         builtin_id: 0,
-        children:   kids
+        children:   0
     )
 end.
 func ast_add_child(parent: AstNode, child: AstNode):
-
-    parent.children = vec_push_rt(parent.children, child)
+    if parent.children == 0 do
+        if AST_BUMP_ENABLED == 0 do
+            parent.children = vec_new_rt()
+        else
+            parent.children = ast_vec_bump_new()
+        end
+    end
+    if AST_BUMP_ENABLED == 0 do
+        parent.children = vec_push_rt(parent.children, child)
+    else
+        parent.children = ast_vec_push(parent.children, child)
+    end
     out parent
 end.
 # ═══════════════════════════════════════════════════════
@@ -309,6 +421,43 @@ entity BuiltinEntry:
     name:   string,
         bid:    BuiltinId
 end.
+
+# Builtin calls are common in compiler sources.  Avoid scanning the complete
+# builtin table for every `name(...)`; bucket by first byte and name length.
+const BUILTIN_LEN_SLOTS: int = 32
+const BUILTIN_BUCKET_COUNT: int = 8192
+const BUILTIN_MAX_ENTRIES: int = 256
+var g_builtin_bucket_head: i64 = 0
+var g_builtin_bucket_next: i64 = 0
+
+func builtin_bucket_build(table: int):
+    if g_builtin_bucket_head == 0 do
+        g_builtin_bucket_head = vir_alloc(BUILTIN_BUCKET_COUNT * 8)
+    end
+    if g_builtin_bucket_next == 0 do
+        g_builtin_bucket_next = vir_alloc(BUILTIN_MAX_ENTRIES * 8)
+    end
+    var i = 0
+    when i < BUILTIN_BUCKET_COUNT loop
+        native_write_i64(g_builtin_bucket_head, i * 8, 0)
+        i = i + 1
+    end
+    count = vec_len_rt(table)
+    i = 0
+    when i < count and i < BUILTIN_MAX_ENTRIES loop
+        entry = vec_get_rt(table, i) as BuiltinEntry
+        n = rt_strlen(entry.name)
+        if n > 0 and n < BUILTIN_LEN_SLOTS do
+            first = native_read_u8(entry.name as i64, 0)
+            key = first * BUILTIN_LEN_SLOTS + n
+            head = native_read_i64(g_builtin_bucket_head, key * 8)
+            native_write_i64(g_builtin_bucket_next, i * 8, head)
+            native_write_i64(g_builtin_bucket_head, key * 8, i + 1)
+        end
+        i = i + 1
+    end
+end.
+
 func build_builtins:
     table = vec_new_rt()
     table = vec_push_rt(table, BuiltinEntry ( name: "len", bid: BuiltinId.Len ))
@@ -448,18 +597,32 @@ func build_builtins:
     table = vec_push_rt(table, BuiltinEntry ( name: "syscall4", bid: BuiltinId.Syscall ))
     table = vec_push_rt(table, BuiltinEntry ( name: "syscall5", bid: BuiltinId.Syscall ))
     table = vec_push_rt(table, BuiltinEntry ( name: "syscall6", bid: BuiltinId.Syscall ))
+    builtin_bucket_build(table)
     out table
 end.
 func lookup_builtin(table: int, name: string):
-
-    i = 0
+    n = fat_str_len(name)
+    if n > 0 and n < BUILTIN_LEN_SLOTS and g_builtin_bucket_head != 0 and g_builtin_bucket_next != 0 do
+        data = native_read_i64(name as i64, 0)
+        first = native_read_u8(data, 0)
+        key = first * BUILTIN_LEN_SLOTS + n
+        link = native_read_i64(g_builtin_bucket_head, key * 8)
+        when link > 0 loop
+            i = link - 1
+            entry = vec_get_rt(table, i) as BuiltinEntry
+            # Builtin table names are C-string literals; lexer names are fat.
+            if fat_cstr_eq(name, entry.name) == 1 do
+                out entry.bid
+            end
+            link = native_read_i64(g_builtin_bucket_next, i * 8)
+        end
+        out BuiltinId.None
+    end
+    # Preserve support for unusually long or runtime-extended builtin names.
+    var i = 0
     when i < vec_len_rt(table) loop
         entry = vec_get_rt(table, i) as BuiltinEntry
-        # Builtin table names are module C-string literals; lexer identifiers
-        # are fat strings.
-        if fat_cstr_eq(name, entry.name) == 1 do
-            out entry.bid
-        end
+        if fat_cstr_eq(name, entry.name) == 1 do out entry.bid end
         i = i + 1
     end
     out BuiltinId.None
@@ -547,14 +710,14 @@ func peek(p: Parser):
             float_val: 0.0
         )
     end
-    out vec_get_rt(p.tokens, p.pos)
+    out native_read_i64(p.tokens, p.pos * 8) as Token
 end.
 func advance(p: Parser):
-
-    t = peek(p)
-    if p.pos < p.token_count do
-        p.pos = p.pos + 1
+    if p.pos >= p.token_count do
+        out (p, peek(p))
     end
+    t = native_read_i64(p.tokens, p.pos * 8) as Token
+    p.pos = p.pos + 1
     out (p, t)
 end.
 func peek_n(p: Parser, offset: int):
@@ -572,7 +735,7 @@ func peek_n(p: Parser, offset: int):
             float_val: 0.0
         )
     end
-    out vec_get_rt(p.tokens, idx)
+    out native_read_i64(p.tokens, idx * 8) as Token
 end.
 func sync_statement(p: Parser):
 
@@ -585,8 +748,11 @@ func sync_statement(p: Parser):
     out p3
 end.
 func check(p: Parser, tok_type: TokType):
-
-    out peek(p).tok_type == tok_type
+    if p.pos >= p.token_count do
+        out tok_type == TokType.Eof
+    end
+    t = native_read_i64(p.tokens, p.pos * 8) as Token
+    out t.tok_type == tok_type
 end.
 func match_tok(p: Parser, tok_type: TokType):
 
@@ -621,6 +787,11 @@ func is_name_token(t: TokType):
     if v >= 191 and v <= 230 do out true end
     out false
 end.
+
+func tok_lex(tok: Token):
+    out token_lexeme(tok)
+end.
+
 func expect_name_tok:
     in  p: Parser
         msg: string
@@ -628,6 +799,7 @@ func expect_name_tok:
     t = peek(p)
     if is_name_token(t.tok_type) do
         var (p2, got) = advance(p)
+        got.str_val = tok_lex(got)
         out (p2, got, true)
     end
     p = parse_error(p, msg)
@@ -796,17 +968,17 @@ func parse_primary(p: Parser):
                     var (p4, _) = advance(p3)
                     var (p5, fld_t, _) = expect_name_tok(p4, "expected field after '.'")
                     fa = ast_new(AstType.FieldAccess)
-                    fa.name = fld_t.str_val
+                    fa.name = tok_lex(fld_t)
                     fa.line = fld_t.line
                     base = ast_new(AstType.Identifier)
-                    base.name = id_t.str_val
+                    base.name = tok_lex(id_t)
                     base.line = id_t.line
                     fa = ast_add_child(fa, base)
                     interp = ast_add_child(interp, fa)
                     p2 = p5
                 else
                     seg = ast_new(AstType.Identifier)
-                    seg.name = id_t.str_val
+                    seg.name = tok_lex(id_t)
                     seg.line = id_t.line
                     interp = ast_add_child(interp, seg)
                     p2 = p3
@@ -940,6 +1112,7 @@ func parse_primary(p: Parser):
     # Identifier (may be call, index, entity literal...)
     if is_name_token(t.tok_type) do
         var (p2, id_tok) = advance(p)
+        id_name = tok_lex(id_tok)
         p = p2
 
         # Enum access via '::' (rare). Dot form is FieldAccess; lower resolves Enum.Variant.
@@ -949,8 +1122,8 @@ func parse_primary(p: Parser):
             vt = peek(p3)
             var (p4, _) = advance(p3)
             ea = ast_new(AstType.EnumAccess)
-            ea.name = id_tok.str_val
-            ea.name2 = vt.str_val
+            ea.name = id_name
+            ea.name2 = tok_lex(vt)
             ea.line = id_tok.line
             out (p4, ea)
         end
@@ -961,7 +1134,7 @@ func parse_primary(p: Parser):
         if check(p, TokType.LParen) and check_entity_literal(p) do
             var (p3, _) = advance(p)  # consume '('
             el = ast_new(AstType.EntityLiteral)
-            el.name = id_tok.str_val
+            el.name = id_name
             el.line = id_tok.line
             p3 = skip_newlines(p3);    # skip optional newline/semicolon after '('
             var (p3, _) = match_tok(p3, TokType.Semicolon)
@@ -998,12 +1171,12 @@ func parse_primary(p: Parser):
 
         # Check for function call: IDENT '('
         if check(p, TokType.LParen) do
-            bid = lookup_builtin(p.builtins, id_tok.str_val)
+            bid = lookup_builtin(p.builtins, id_name)
             if bid != BuiltinId.None do
                 # Builtin call
                 call = ast_new(AstType.BuiltinCall)
                 call.builtin_id = bid as i64
-                builtin_name = id_tok.str_val
+                builtin_name = id_name
                 call.name = builtin_name
                 call.line = id_tok.line
                 var (p_lp, _) = advance(p)  # consume '('
@@ -1035,7 +1208,7 @@ func parse_primary(p: Parser):
 
             # Regular function call
             call = ast_new(AstType.Call)
-            call_name = id_tok.str_val
+            call_name = id_name
             call.name = call_name
             call.line = id_tok.line
             var (p_lp, _) = advance(p)  # consume '('
@@ -1058,7 +1231,7 @@ func parse_primary(p: Parser):
                         var (p_n2, _) = advance(p_n1)  # consume '='
                         var (p_na, val_expr) = parse_expr(p_n2)
                         p = p_na
-                        val_expr.name = name_ident_tok.str_val
+                        val_expr.name = tok_lex(name_ident_tok)
                         call = ast_add_child(call, val_expr)
                         # §1.0 / §6.4: named-arg sep is "," | ";" | NEWLINE
                         var (p_sc, sc_matched) = match_list_sep(p, true)
@@ -1098,7 +1271,7 @@ func parse_primary(p: Parser):
             var (p4, idx_expr) = parse_expr(p3)
             var (p5, _, _) = expect_tok(p4, TokType.RBracket, "expected ']' after index")
             access = ast_new(AstType.IndexAccess)
-            access.name = id_tok.str_val
+            access.name = id_name
             access.line = id_tok.line
             access = ast_add_child(access, idx_expr)
             out (p5, access)
@@ -1106,7 +1279,7 @@ func parse_primary(p: Parser):
 
         # Plain identifier
         n = ast_new(AstType.Identifier)
-        n.name = id_tok.str_val
+        n.name = id_name
         n.line = id_tok.line
         out (p, n)
     end
@@ -1256,8 +1429,12 @@ func try_skip_generic_call_args(p: Parser):
     end
     idx = p.pos
     depth = 1
+    paren_depth = 0
+    bracket_depth = 0
     idx = idx + 1
-    when depth > 0 and idx < p.token_count loop
+    steps = 0
+    valid = true
+    when depth > 0 and idx < p.token_count and valid loop
         tt = vec_get_rt(p.tokens, idx).tok_type
         if tt == TokType.Lt do
             depth = depth + 1
@@ -1265,10 +1442,45 @@ func try_skip_generic_call_args(p: Parser):
             depth = depth - 1
         eif tt == TokType.Cast do
             depth = depth - 2
+        eif tt == TokType.LParen do
+            paren_depth = paren_depth + 1
+        eif tt == TokType.RParen do
+            if paren_depth > 0 do
+                paren_depth = paren_depth - 1
+            else
+                valid = false
+            end
+        eif tt == TokType.LBracket do
+            bracket_depth = bracket_depth + 1
+        eif tt == TokType.RBracket do
+            if bracket_depth > 0 do
+                bracket_depth = bracket_depth - 1
+            else
+                valid = false
+            end
+        eif paren_depth == 0 and bracket_depth == 0 and
+             (tt == TokType.Newline or tt == TokType.Semicolon or
+              tt == TokType.Do or tt == TokType.Then or tt == TokType.Loop or
+              tt == TokType.Assign or tt == TokType.Colon or tt == TokType.RBrace or tt == TokType.Eof or
+              tt == TokType.Plus or tt == TokType.Minus or tt == TokType.Slash or
+              tt == TokType.Percent or tt == TokType.Mod or
+              tt == TokType.Eq or tt == TokType.Ne or tt == TokType.Ge or tt == TokType.Le or
+              tt == TokType.And or tt == TokType.Or or tt == TokType.LogicalOr or
+              tt == TokType.BitOr or tt == TokType.BitXor or
+              tt == TokType.BitShl or tt == TokType.BitShr or tt == TokType.Pattern) do
+            # This is an ordinary comparison/expression, not TypeArgs.
+            valid = false
         end
         idx = idx + 1
+        steps = steps + 1
+        # A malformed '<' must never scan an unbounded suffix for a later '>'.
+        # 128 tokens is far beyond normal type-argument lists while keeping
+        # lookahead O(1) with respect to the rest of the source file.
+        if steps > 128 do
+            valid = false
+        end
     end
-    if depth != 0 do
+    if not valid or depth != 0 do
         out (p, false)
     end
     if idx >= p.token_count or vec_get_rt(p.tokens, idx).tok_type != TokType.LParen do
@@ -1281,6 +1493,127 @@ end.
 #   postfix . ?. ~mask !! ? | unary ! - ~ & &mut | ^ (right) | ** >< |
 #   * / | % mod | shl shr as | + - | :~ | rel | eq | & and | || or xor
 # Parser must match Spec; do not "fix" Spec to match parser.
+#
+# Binding-power dispatch table (Pratt). parse_* layers below implement these levels.
+func infix_bp_left(t: TokType):
+    if t == TokType.LogicalOr or t == TokType.BitOr or t == TokType.Or or t == TokType.BitXor do out 1 end
+    if t == TokType.LogicalAnd or t == TokType.And do out 5 end
+    if t == TokType.BitAnd do out 5 end
+    if t == TokType.Eq or t == TokType.Ne or t == TokType.SafeEq or t == TokType.SafeNe do out 7 end
+    if t == TokType.Gt or t == TokType.Lt or t == TokType.Ge or t == TokType.Le do out 9 end
+    if t == TokType.Pattern do out 11 end
+    if t == TokType.Plus or t == TokType.Minus do out 13 end
+    if t == TokType.As or t == TokType.Cast or t == TokType.BitShl or t == TokType.BitShr do out 15 end
+    if t == TokType.Percent or t == TokType.Mod do out 17 end
+    if t == TokType.Star or t == TokType.Slash do out 19 end
+    if t == TokType.MatMul or t == TokType.Fma do out 21 end
+    if t == TokType.Power do out 23 end
+    out 0
+end.
+
+func infix_bp_right(t: TokType):
+    if t == TokType.Power do out 22 end
+    l = infix_bp_left(t)
+    if l > 0 do out l + 1 end
+    out 0
+end.
+
+func parse_infix_make(left: AstNode, op_tok: Token, right: AstNode):
+    tt = op_tok.tok_type
+    if tt == TokType.Eq or tt == TokType.Ne or tt == TokType.SafeEq or tt == TokType.SafeNe do
+        op = OpType.Eq
+        if tt == TokType.Ne do op = OpType.Ne end
+        if tt == TokType.SafeEq do op = OpType.SafeEq end
+        if tt == TokType.SafeNe do op = OpType.SafeNe end
+        cmp = ast_new(AstType.Compare)
+        cmp.op = op
+        cmp.line = op_tok.line
+        cmp = ast_add_child(cmp, left)
+        cmp = ast_add_child(cmp, right)
+        out cmp
+    end
+    if tt == TokType.Gt or tt == TokType.Lt or tt == TokType.Ge or tt == TokType.Le do
+        op = OpType.Gt
+        if tt == TokType.Lt do op = OpType.Lt end
+        if tt == TokType.Ge do op = OpType.Ge end
+        if tt == TokType.Le do op = OpType.Le end
+        cmp = ast_new(AstType.Compare)
+        cmp.op = op
+        cmp.line = op_tok.line
+        cmp = ast_add_child(cmp, left)
+        cmp = ast_add_child(cmp, right)
+        out cmp
+    end
+    if tt == TokType.Pattern do
+        n = ast_new(AstType.PatternExpr)
+        n.op = OpType.PatternOp
+        n.line = op_tok.line
+        n = ast_add_child(n, left)
+        n = ast_add_child(n, right)
+        out n
+    end
+    bin = ast_new(AstType.BinOp)
+    bin.op = OpType.Add
+    bin.line = op_tok.line
+    if tt == TokType.Plus do bin.op = OpType.Add end
+    if tt == TokType.Minus do bin.op = OpType.Sub end
+    if tt == TokType.Star do bin.op = OpType.Mul end
+    if tt == TokType.Slash do bin.op = OpType.Div end
+    if tt == TokType.Percent do bin.op = OpType.PercentOp end
+    if tt == TokType.Mod do bin.op = OpType.ModOp end
+    if tt == TokType.BitShl do bin.op = OpType.ShlOp end
+    if tt == TokType.BitShr do bin.op = OpType.ShrOp end
+    if tt == TokType.Power do bin.op = OpType.PowOp end
+    if tt == TokType.MatMul do bin.op = OpType.MatMulOp end
+    if tt == TokType.Fma do bin.op = OpType.FmaOp end
+    if tt == TokType.BitAnd do bin.op = OpType.Land end
+    if tt == TokType.And do bin.op = OpType.AndOp end
+    if tt == TokType.BitOr do bin.op = OpType.OrOp end
+    if tt == TokType.Or do bin.op = OpType.OrOp end
+    if tt == TokType.BitXor do bin.op = OpType.XorOp end
+    if tt == TokType.LogicalOr do bin.op = OpType.Lor end
+    bin = ast_add_child(bin, left)
+    bin = ast_add_child(bin, right)
+    out bin
+end.
+
+# Unified Pratt parser (replaces parse_power … parse_or_expr chain).
+func parse_expr_bp(p: Parser, min_bp: int):
+    var (p2, left) = parse_unary(p)
+    pratt_more = true
+    when pratt_more loop
+        p2 = skip_newlines(p2)
+        op_t = peek(p2)
+        tt = op_t.tok_type
+        lbp = infix_bp_left(tt)
+        if lbp < min_bp do
+            pratt_more = false
+        eif tt == TokType.As or tt == TokType.Cast do
+            # Cast binds tighter than the following lower-precedence operator.
+            # Keep the Pratt loop running so `(x as int bit_and mask)` consumes
+            # `bit_and mask` instead of returning with `bit_and` before `)`.
+            var (p3, _) = advance(p2)
+            if check(p3, TokType.Ident) or check(p3, TokType.PtrKw) do
+                var (p4, _) = advance(p3)
+                p3 = p4
+            end
+            cast_n = ast_new(AstType.CastExpr)
+            cast_n = ast_add_child(cast_n, left)
+            left = cast_n
+            p2 = p3
+        eif lbp > 0 do
+            var (p3, op_tok) = advance(p2)
+            rbp = infix_bp_right(op_tok.tok_type)
+            var (p4, right) = parse_expr_bp(p3, rbp)
+            left = parse_infix_make(left, op_tok, right)
+            p2 = p4
+        else
+            pratt_more = false
+        end
+    end
+    out (p2, left)
+end.
+
 func parse_unary(p: Parser):
 
     # Allow `a +\n b` / multiline args inside `()` once lexer emits NEWLINE (§1.0).
@@ -1407,7 +1740,7 @@ func parse_unary(p: Parser):
             end
             var (p4, field_tok) = advance(p3)
             sa = ast_new(AstType.SafeAccessExpr)
-            sa.name = field_tok.str_val
+            sa.name = tok_lex(field_tok)
             sa.line = field_tok.line
             sa = ast_add_child(sa, left)
             left = sa
@@ -1421,7 +1754,7 @@ func parse_unary(p: Parser):
             var (p4, field_tok) = advance(p3)
             if check(p4, TokType.LParen) do
                 mc = ast_new(AstType.MethodCall)
-                mc_name = field_tok.str_val
+                mc_name = tok_lex(field_tok)
                 mc.name = mc_name
                 mc.line = field_tok.line
                 mc = ast_add_child(mc, left)
@@ -1450,7 +1783,7 @@ func parse_unary(p: Parser):
                 p2 = p9
             else
                 fa = ast_new(AstType.FieldAccess)
-                fa_name = field_tok.str_val
+                fa_name = tok_lex(field_tok)
                 fa.name = fa_name
                 fa.line = field_tok.line
                 fa = ast_add_child(fa, left)
@@ -1463,7 +1796,7 @@ func parse_unary(p: Parser):
             var (p3, op_tok) = advance(p2)
             var (p4, mask_tok) = advance(p3)
             sw = ast_new(AstType.SwizzleExpr)
-            sw.name = mask_tok.str_val
+            sw.name = tok_lex(mask_tok)
             sw.line = op_tok.line
             sw = ast_add_child(sw, left)
             left = sw
@@ -1491,248 +1824,8 @@ func parse_unary(p: Parser):
     out (p2, left)
 end.
 
-# prec 30: ^ (right-assoc). prec 22: ** >< (left-assoc) — Spec §30
-func parse_power(p: Parser):
-    var (p2, left) = parse_unary(p)
-    # ^ right-associative: a^b^c = a^(b^c)
-    if check(p2, TokType.Power) do
-        var (p3, op_tok) = advance(p2)
-        var (p4, right) = parse_power(p3)
-        bin = ast_new(AstType.BinOp)
-        bin.op = OpType.PowOp
-        bin.line = op_tok.line
-        bin = ast_add_child(bin, left)
-        bin = ast_add_child(bin, right)
-        out (p4, bin)
-    end
-    when check(p2, TokType.MatMul) or check(p2, TokType.Fma) loop
-        var (p3, op_tok) = advance(p2)
-        var (p4, right) = parse_unary(p3)
-        bin = ast_new(AstType.BinOp)
-        bin.op = OpType.MatMulOp
-        if op_tok.tok_type == TokType.Fma do
-            bin.op = OpType.FmaOp
-        end
-        bin.line = op_tok.line
-        bin = ast_add_child(bin, left)
-        bin = ast_add_child(bin, right)
-        left = bin
-        p2 = p4
-    end
-    out (p2, left)
-end.
-
-# prec 20: * /
-func parse_mult(p: Parser):
-    var (p2, left) = parse_power(p)
-    when check(p2, TokType.Star) or check(p2, TokType.Slash) loop
-        var (p3, op_tok) = advance(p2)
-        op = OpType.Mul
-        if op_tok.tok_type == TokType.Slash do
-            op = OpType.Div
-        end
-        var (p4, right) = parse_power(p3)
-        bin = ast_new(AstType.BinOp)
-        bin.op = op
-        bin.line = op_tok.line
-        bin = ast_add_child(bin, left)
-        bin = ast_add_child(bin, right)
-        left = bin
-        p2 = p4
-    end
-    out (p2, left)
-end.
-
-# prec 18: mod = remainder; % = percent (Spec §10.1 — not the same op)
-func parse_mod(p: Parser):
-    var (p2, left) = parse_mult(p)
-    when check(p2, TokType.Percent) or check(p2, TokType.Mod) loop
-        var (p3, op_tok) = advance(p2)
-        var (p4, right) = parse_mult(p3)
-        bin = ast_new(AstType.BinOp)
-        bin.op = OpType.ModOp
-        if op_tok.tok_type == TokType.Percent do
-            bin.op = OpType.PercentOp
-        end
-        bin.line = op_tok.line
-        bin = ast_add_child(bin, left)
-        bin = ast_add_child(bin, right)
-        left = bin
-        p2 = p4
-    end
-    out (p2, left)
-end.
-
-# prec 12: shl shr | as / >> cast (Spec §30)
-func parse_shift(p: Parser):
-    var (p2, left) = parse_mod(p)
-    when check(p2, TokType.BitShl) or check(p2, TokType.BitShr) loop
-        var (p3, op_tok) = advance(p2)
-        op = OpType.ShlOp
-        if op_tok.tok_type == TokType.BitShr do
-            op = OpType.ShrOp
-        end
-        var (p4, right) = parse_mod(p3)
-        bin = ast_new(AstType.BinOp)
-        bin.op = op
-        bin.line = op_tok.line
-        bin = ast_add_child(bin, left)
-        bin = ast_add_child(bin, right)
-        left = bin
-        p2 = p4
-    end
-    # `as` / legacy Cast at same precedence as shift
-    if check(p2, TokType.As) or check(p2, TokType.Cast) do
-        var (p3, _) = advance(p2)
-        if check(p3, TokType.Ident) or check(p3, TokType.PtrKw) do
-            var (p4, _) = advance(p3)
-            p3 = p4
-        end
-        cast_n = ast_new(AstType.CastExpr)
-        cast_n = ast_add_child(cast_n, left)
-        out (p3, cast_n)
-    end
-    out (p2, left)
-end.
-
-# prec 10: + -
-func parse_addition(p: Parser):
-    var (p2, left) = parse_shift(p)
-    when check(p2, TokType.Plus) or check(p2, TokType.Minus) loop
-        var (p3, op_tok) = advance(p2)
-        op = OpType.Add
-        if op_tok.tok_type == TokType.Minus do
-            op = OpType.Sub
-        end
-        var (p4, right) = parse_shift(p3)
-        bin = ast_new(AstType.BinOp)
-        bin.op = op
-        bin.line = op_tok.line
-        bin = ast_add_child(bin, left)
-        bin = ast_add_child(bin, right)
-        left = bin
-        p2 = p4
-    end
-    out (p2, left)
-end.
-
-# prec 8: :~ pattern
-func parse_pattern_expr(p: Parser):
-    var (p2, left) = parse_addition(p)
-    when check(p2, TokType.Pattern) loop
-        var (p3, op_tok) = advance(p2)
-        var (p4, right) = parse_addition(p3)
-        n = ast_new(AstType.PatternExpr)
-        n.op = OpType.PatternOp
-        n.line = op_tok.line
-        n = ast_add_child(n, left)
-        n = ast_add_child(n, right)
-        left = n
-        p2 = p4
-    end
-    out (p2, left)
-end.
-
-# prec 6: > < >= <=
-func parse_rel(p: Parser):
-    var (p2, left) = parse_pattern_expr(p)
-    has_rel = check(p2, TokType.Gt) or check(p2, TokType.Lt) or check(p2, TokType.Ge) or check(p2, TokType.Le)
-    if has_rel do
-        var (p3, op_tok) = advance(p2)
-        op = OpType.Gt
-        if op_tok.tok_type == TokType.Lt do
-            op = OpType.Lt
-        end
-        if op_tok.tok_type == TokType.Ge do
-            op = OpType.Ge
-        end
-        if op_tok.tok_type == TokType.Le do
-            op = OpType.Le
-        end
-        var (p4, right) = parse_pattern_expr(p3)
-        cmp = ast_new(AstType.Compare)
-        cmp.op = op
-        cmp.line = op_tok.line
-        cmp = ast_add_child(cmp, left)
-        cmp = ast_add_child(cmp, right)
-        out (p4, cmp)
-    end
-    out (p2, left)
-end.
-
-# prec 5: == != ?= ?=/=
-func parse_eq(p: Parser):
-    var (p2, left) = parse_rel(p)
-    has_eq = check(p2, TokType.Eq) or check(p2, TokType.Ne) or check(p2, TokType.SafeEq) or check(p2, TokType.SafeNe)
-    if has_eq do
-        var (p3, op_tok) = advance(p2)
-        op = OpType.Eq
-        if op_tok.tok_type == TokType.Ne do
-            op = OpType.Ne
-        end
-        if op_tok.tok_type == TokType.SafeEq do
-            op = OpType.SafeEq
-        end
-        if op_tok.tok_type == TokType.SafeNe do
-            op = OpType.SafeNe
-        end
-        var (p4, right) = parse_rel(p3)
-        cmp = ast_new(AstType.Compare)
-        cmp.op = op
-        cmp.line = op_tok.line
-        cmp = ast_add_child(cmp, left)
-        cmp = ast_add_child(cmp, right)
-        out (p4, cmp)
-    end
-    out (p2, left)
-end.
-
-# prec 3: Spec §10.3 `&` = logical (Land); §10.4 `and` = bitwise (AndOp)
-func parse_and_expr(p: Parser):
-    var (p2, left) = parse_eq(p)
-    when check(p2, TokType.BitAnd) or check(p2, TokType.And) loop
-        var (p3, op_tok) = advance(p2)
-        var (p4, right) = parse_eq(p3)
-        bin = ast_new(AstType.BinOp)
-        bin.op = OpType.Land
-        if op_tok.tok_type == TokType.And do
-            bin.op = OpType.AndOp
-        end
-        bin.line = op_tok.line
-        bin = ast_add_child(bin, left)
-        bin = ast_add_child(bin, right)
-        left = bin
-        p2 = p4
-    end
-    out (p2, left)
-end.
-
-# prec 2: Spec §10.3 `||` = logical (Lor); §10.4 `or`/`xor` = bitwise; `|` alias bitwise
-func parse_or_expr(p: Parser):
-    var (p2, left) = parse_and_expr(p)
-    when check(p2, TokType.BitOr) or check(p2, TokType.LogicalOr) or check(p2, TokType.BitXor) or check(p2, TokType.Or) loop
-        var (p3, op_tok) = advance(p2)
-        var (p4, right) = parse_and_expr(p3)
-        bin = ast_new(AstType.BinOp)
-        bin.op = OpType.OrOp
-        if op_tok.tok_type == TokType.BitXor do
-            bin.op = OpType.XorOp
-        end
-        if op_tok.tok_type == TokType.LogicalOr do
-            bin.op = OpType.Lor
-        end
-        bin.line = op_tok.line
-        bin = ast_add_child(bin, left)
-        bin = ast_add_child(bin, right)
-        left = bin
-        p2 = p4
-    end
-    out (p2, left)
-end.
-
 func parse_expr(p: Parser):
-    # `as` handled in parse_shift (Spec §30 prec 12)
-    out parse_or_expr(p)
+    out parse_expr_bp(p, 0)
 end.
 # ═══════════════════════════════════════════════════════
 # Statement Parsing
@@ -2114,7 +2207,7 @@ func parse_case_stmt(p: Parser):
             eif idt.tok_type == TokType.False do
                 pat.name = fat_str_new("false")
             else
-                pat.name = idt.str_val
+                pat.name = tok_lex(idt)
             end
             pat.int_val = 0 - 3
             p2 = p3
@@ -2367,7 +2460,7 @@ func skip_out_return_type(p: Parser):
     out p2
 end.
 
-func parse_func_def(p: Parser):
+func parse_func_def_mode(p: Parser, signature_only: bool):
 
     var (p2, name_tok, ok) = expect_name_tok(p, "expected function name")
     if not ok do
@@ -2510,6 +2603,16 @@ func parse_func_def(p: Parser):
     p2 = p_colon
 
     p2 = skip_newlines(p2)
+
+    # Interface members are declarations, not nested function blocks. Their
+    # trailing `:` and newline finish the signature; the interface owns the
+    # only `end` token.
+    if signature_only do
+        empty_body = ast_new(AstType.Block)
+        fn_node = ast_add_child(fn_node, empty_body)
+        fn_node.name = fn_name
+        out (p2, fn_node)
+    end
 
     # v1.2 / Vir body params: `in(a:int; b:int)` or `in a:int; b:int`
     # Also accept repeated lines: `in a: int` / `in b: int`
@@ -2665,6 +2768,10 @@ func parse_func_def(p: Parser):
     # ast_add_child corrupts soft .name — restore for lowering / Call lookup.
     fn_node.name = fn_name
     out (p6b, fn_node)
+end.
+
+func parse_func_def(p: Parser):
+    out parse_func_def_mode(p, false)
 end.
 func parse_for_range_stmt(p: Parser):
 
@@ -2879,6 +2986,44 @@ func parse_entity_def(p: Parser):
     out (p2, ed)
 end.
 
+func parse_interface_def(p: Parser):
+    line = peek(p).line
+    var (p2, name_tok, ok) = expect_name_tok(p, "expected interface name")
+    if not ok do
+        out (p2, ast_new(AstType.EntityDef))
+    end
+
+    p2 = skip_generic_list(p2)
+    var (p_colon, _) = match_tok(p2, TokType.Colon)
+    p2 = skip_newlines(p_colon)
+
+    iface = ast_new(AstType.EntityDef)
+    iface.name = name_tok.str_val
+    iface.name2 = fat_str_new("interface")
+    iface.line = line
+
+    when not check(p2, TokType.End) and not check(p2, TokType.Eof) loop
+        if check(p2, TokType.Func) or check(p2, TokType.Method) do
+            var (p_func, _) = advance(p2)
+            var (p_after, method_node) = parse_func_def_mode(p_func, true)
+            iface = ast_add_child(iface, method_node)
+            p2 = skip_newlines(p_after)
+        else
+            # `implement Base` and future interface metadata are line-scoped.
+            # Preserve parser progress without treating them as method bodies.
+            when not check(p2, TokType.Newline) and not check(p2, TokType.End) and not check(p2, TokType.Eof) loop
+                var (p_next, _) = advance(p2)
+                p2 = p_next
+            end
+            p2 = skip_newlines(p2)
+        end
+    end
+
+    p2 = expect_block_end(p2, "expected 'end' after interface")
+    iface.name = name_tok.str_val
+    out (p2, iface)
+end.
+
 func parse_mold_def(p: Parser):
     line = peek(p).line
     var (p2, name_tok, ok) = expect_name_tok(p, "expected mold name")
@@ -2954,6 +3099,22 @@ func is_compound_assign(tok: Token):
         out true
     end
     out false
+end.
+
+func is_compound_assign_type(t: TokType):
+    if t == TokType.PlusAssign or t == TokType.MinusAssign or t == TokType.StarAssign or t == TokType.SlashAssign or t == TokType.ModAssign or t == TokType.BitAndAssign or t == TokType.BitOrAssign or t == TokType.BitXorAssign or t == TokType.BitShlAssign or t == TokType.BitShrAssign do
+        out true
+    end
+    out false
+end.
+
+func stmt_is_field_assign(p: Parser):
+    if peek_n(p, 1).tok_type != TokType.Dot do out false end
+    ft = peek_n(p, 2).tok_type
+    if not is_name_token(ft) do out false end
+    nxt = peek_n(p, 3).tok_type
+    if nxt == TokType.Assign do out true end
+    out is_compound_assign_type(nxt)
 end.
 
 func compound_assign_op(t: TokType):
@@ -3537,7 +3698,7 @@ func parse_statement(p: Parser):
             var (p_lp, _) = advance(p2)
             if check(p_lp, TokType.Ident) do
                 var (p_cap, cap_ident) = advance(p_lp)
-                if fat_str_eq(cap_ident.str_val, "capacity") do
+                if fat_str_eq(tok_lex(cap_ident), fat_str_new("capacity")) do
                     var (p_col, _) = match_tok(p_cap, TokType.Colon)
                     var (p_expr, cap_expr) = parse_expr(p_col)
                     n = ast_add_child(n, cap_expr)
@@ -3730,6 +3891,11 @@ func parse_statement(p: Parser):
     if t.tok_type == TokType.Entity do
         var (p2, _) = advance(p)
         out parse_entity_def(p2)
+    end
+
+    if t.tok_type == TokType.InterfaceKw do
+        var (p2, _) = advance(p)
+        out parse_interface_def(p2)
     end
 
     # packed entity Name: ... end
@@ -4116,128 +4282,70 @@ func parse_statement(p: Parser):
 
     # Identifier (may be assignment, field/index assign, or expression)
     if is_name_token(t.tok_type) do
-        name_start_pos = p.pos
-        # throw expr — detect by name checking
-        if rt_streq(t.str_val, "throw") do
-            var (p2, _) = advance(p)
-            var (p3, expr) = parse_expr(p2)
-            n = ast_new(AstType.ThrowStmt)
-            n.line = t.line
-            n = ast_add_child(n, expr)
-            out (p3, n)
-        end
+        ident_pos = p.pos
 
-        # §22 await — "await pass" (cooperative yield) | "await EXPR" (task join)
-        if rt_streq(t.str_val, "await") do
-            var (p2, _) = advance(p)
-            # `await pass` → yield builtin call
-            if check(p2, TokType.Ident) do
-                nx = peek(p2)
-                if rt_streq(nx.str_val, "pass") do
-                    var (p3, _) = advance(p2)
-                    call = ast_new(AstType.BuiltinCall)
-                    call.name = fat_str_new("yield")
-                    call.builtin_id = 48;   # BuiltinId.Yield
-                    call.line = t.line
-                    out (p3, call)
-                end
-            end
-            # generic `await EXPR` → AwaitExpr wrapping the result-bearing expr
-            var (p3, expr) = parse_expr(p2)
-            n = ast_new(AstType.AwaitExpr)
-            n.line = t.line
-            n = ast_add_child(n, expr)
-            out (p3, n)
-        end
-
-        # §22 cancel EXPR — mark task cancelled
-        if rt_streq(t.str_val, "cancel") do
-            var (p2, _) = advance(p)
-            var (p3, expr) = parse_expr(p2)
-            n = ast_new(AstType.CancelStmt)
-            n.line = t.line
-            n = ast_add_child(n, expr)
-            out (p3, n)
-        end
-
-        # §22 quiet EXPR — evaluate-and-discard
-        if rt_streq(t.str_val, "quiet") do
-            var (p2, _) = advance(p)
-            var (p3, expr) = parse_expr(p2)
-            n = ast_new(AstType.QuietStmt)
-            n.line = t.line
-            n = ast_add_child(n, expr)
-            out (p3, n)
-        end
-
-        # §4.6 sub-arena: arena: / arena(capacity: N): / arena NAME:
-        if rt_streq(t.str_val, "arena") do
-            if p.pos + 1 < p.token_count do
-                nx = vec_get_rt(p.tokens, p.pos + 1)
-                # arena: body end
-                if nx.tok_type == TokType.Colon do
-                    var (p2, _) = advance(p)
-                    var (p3, _) = advance(p2)
-                    p3 = skip_newlines(p3)
-                    var (p4, body) = parse_block(p3)
-                    var (p5, _, _) = expect_tok(p4, TokType.End, "expected 'end' after arena block")
-                    var (p5b, _) = match_tok(p5, TokType.Dot)
-                    n = ast_new(AstType.ArenaBlock)
-                    n.name = fat_str_new("")
-                    n.int_val = 65536
-                    n.line = t.line
-                    n = ast_add_child(n, body)
-                    out (p5b, n)
-                end
-                # arena NAME: body end
-                if nx.tok_type == TokType.Ident do
-                    if p.pos + 2 < p.token_count do
-                        nx2 = vec_get_rt(p.tokens, p.pos + 2)
-                        if nx2.tok_type == TokType.Colon do
-                            var (p2, _) = advance(p)
-                            var (p3, name_tok, _) = expect_name_tok(p2, "expected arena name")
-                            var (p4, _) = match_tok(p3, TokType.Colon)
-                            p4 = skip_newlines(p4)
-                            var (p5, body) = parse_block(p4)
-                            var (p6, _, _) = expect_tok(p5, TokType.End, "expected 'end' after arena block")
-                            var (p6b, _) = match_tok(p6, TokType.Dot)
-                            n = ast_new(AstType.ArenaBlock)
-                            n.name = name_tok.str_val
-                            n.int_val = 65536
-                            n.line = t.line
-                            n = ast_add_child(n, body)
-                            out (p6b, n)
-                        end
-                    end
-                end
-            end
-        end
-
-        # Peek ahead: if IDENT followed by '(' -> expression statement (function call)
+        # IDENT(...) — expression statement; no backtracking.
         if peek_n(p, 1).tok_type == TokType.LParen do
             out parse_expr(p)
         end
 
+        # IDENT.FIELD = expr — lookahead avoids rewinding into parse_expr.
+        if stmt_is_field_assign(p) do
+            var (p2, id_tok) = advance(p)
+            var (p3, _) = advance(p2)
+            var (p4, field_tok) = advance(p3)
+            id_name = tok_lex(id_tok)
+            field_name = tok_lex(field_tok)
+            if check(p4, TokType.Assign) do
+                var (p5, _) = advance(p4)
+                var (p6, val) = parse_expr(p5)
+                fa = ast_new(AstType.FieldAssign)
+                fa.line = id_tok.line
+                fa = ast_add_child(fa, val)
+                fa.name = id_name
+                fa.name2 = field_name
+                out (p6, fa)
+            end
+            var (p5, op_tok) = advance(p4)
+            var (p6, val) = parse_expr(p5)
+            lhs_obj = ast_new(AstType.Identifier)
+            lhs_obj.name = id_name
+            lhs_obj.line = id_tok.line
+            lhs_fa = ast_new(AstType.FieldAccess)
+            lhs_fa.line = field_tok.line
+            lhs_fa = ast_add_child(lhs_fa, lhs_obj)
+            lhs_fa.name = field_name
+            bin = ast_new(AstType.BinOp)
+            bin.op = compound_assign_op(op_tok.tok_type)
+            bin.line = op_tok.line
+            bin = ast_add_child(bin, lhs_fa)
+            bin = ast_add_child(bin, val)
+            fa = ast_new(AstType.FieldAssign)
+            fa.line = id_tok.line
+            fa = ast_add_child(fa, bin)
+            fa.name = id_name
+            fa.name2 = field_name
+            out (p6, fa)
+        end
+
         var (p2, id_tok) = advance(p)
+        id_name = tok_lex(id_tok)
 
         # Simple assignment: IDENT = expr or IDENT += expr
         if check(p2, TokType.Assign) do
-            # Advance in-place.  Parser is an entity reference under C-VM
-            # destructuring another Parser return here can alias the saved
-            # state and leave parse_expr positioned on '='.
             p2.pos = p2.pos + 1
             var (p4, val) = parse_expr(p2)
             assign = ast_new(AstType.Assign)
             assign.line = id_tok.line
             assign = ast_add_child(assign, val)
-            assign.name = id_tok.str_val
+            assign.name = id_name
             out (p4, assign)
         end
         if is_compound_assign(peek(p2)) do
             var (p3, op_tok) = advance(p2)
             var (p4, val) = parse_expr(p3)
             lhs_id = ast_new(AstType.Identifier)
-            lhs_id.name = id_tok.str_val
+            lhs_id.name = id_name
             lhs_id.line = id_tok.line
             bin = ast_new(AstType.BinOp)
             bin.op = compound_assign_op(op_tok.tok_type)
@@ -4247,54 +4355,8 @@ func parse_statement(p: Parser):
             assign = ast_new(AstType.Assign)
             assign.line = id_tok.line
             assign = ast_add_child(assign, bin)
-            assign.name = id_tok.str_val
+            assign.name = id_name
             out (p4, assign)
-        end
-
-        # Field assignment: IDENT.FIELD = expr or IDENT.FIELD += expr
-        if check(p2, TokType.Dot) do
-            var (p3, _) = advance(p2)
-            f_tok = peek(p3)
-            if f_tok.tok_type != TokType.Eof and f_tok.tok_type != TokType.Newline do
-                var (p4, field_tok) = advance(p3)
-                if check(p4, TokType.Assign) do
-                    var (p5, _) = advance(p4)
-                    var (p6, val) = parse_expr(p5)
-                    fa = ast_new(AstType.FieldAssign)
-                    fa.line = id_tok.line
-                    fa = ast_add_child(fa, val)
-                    # Set name and name2 AFTER ast_add_child since vec_push_rt corrupts them
-                    fa.name = id_tok.str_val
-                    fa.name2 = field_tok.str_val
-                    out (p6, fa)
-                end
-                if is_compound_assign(peek(p4)) do
-                    var (p5, op_tok) = advance(p4)
-                    var (p6, val) = parse_expr(p5)
-                    lhs_obj = ast_new(AstType.Identifier)
-                    lhs_obj.name = id_tok.str_val
-                    lhs_obj.line = id_tok.line
-                    lhs_fa = ast_new(AstType.FieldAccess)
-                    lhs_fa.line = field_tok.line
-                    lhs_fa = ast_add_child(lhs_fa, lhs_obj)
-                    lhs_fa.name = field_tok.str_val
-                    bin = ast_new(AstType.BinOp)
-                    bin.op = compound_assign_op(op_tok.tok_type)
-                    bin.line = op_tok.line
-                    bin = ast_add_child(bin, lhs_fa)
-                    bin = ast_add_child(bin, val)
-                    fa = ast_new(AstType.FieldAssign)
-                    fa.line = id_tok.line
-                    fa = ast_add_child(fa, bin)
-                    fa.name = id_tok.str_val
-                    fa.name2 = field_tok.str_val
-                    out (p6, fa)
-                end
-            end
-            # Not field assign — back up and parse as expression
-            p.pos = name_start_pos
-            var (p5, expr) = parse_expr(p)
-            out (p5, expr)
         end
 
         # Index assignment: IDENT[expr] = expr or IDENT[expr] += expr
@@ -4309,7 +4371,7 @@ func parse_statement(p: Parser):
                 ia.line = id_tok.line
                 ia = ast_add_child(ia, idx_expr)
                 ia = ast_add_child(ia, val)
-                ia.name = id_tok.str_val
+                ia.name = id_name
                 out (p7, ia)
             end
             if is_compound_assign(peek(p5)) do
@@ -4318,7 +4380,7 @@ func parse_statement(p: Parser):
                 lhs_ia = ast_new(AstType.IndexAccess)
                 lhs_ia.line = id_tok.line
                 lhs_ia = ast_add_child(lhs_ia, idx_expr)
-                lhs_ia.name = id_tok.str_val
+                lhs_ia.name = id_name
                 bin = ast_new(AstType.BinOp)
                 bin.op = compound_assign_op(op_tok.tok_type)
                 bin.line = op_tok.line
@@ -4328,21 +4390,14 @@ func parse_statement(p: Parser):
                 ia.line = id_tok.line
                 ia = ast_add_child(ia, idx_expr)
                 ia = ast_add_child(ia, bin)
-                ia.name = id_tok.str_val
+                ia.name = id_name
                 out (p7, ia)
             end
-            # Not assignment — it's an index access expression
-            acc = ast_new(AstType.IndexAccess)
-            acc.line = id_tok.line
-            acc = ast_add_child(acc, idx_expr)
-            acc.name = id_tok.str_val
-            out (p5, acc)
         end
 
-        # Back up and parse as expression
-        p.pos = name_start_pos
-        var (p3, expr) = parse_expr(p)
-        out (p3, expr)
+        # Expression statement (field access, index, calls, etc.)
+        p.pos = ident_pos
+        out parse_expr(p)
     end
 
     # EOF / END / ELSE / EIF — no statement
@@ -4360,6 +4415,7 @@ end.
 
 func parse_program(p: Parser):
 
+    ast_arena_begin()
     prog = ast_new(AstType.Program)
     p = skip_newlines(p)
 
@@ -4395,5 +4451,6 @@ func parse_program(p: Parser):
         p = skip_newlines(p)
     end
 
+    ast_arena_end()
     out (p, prog)
 end.
