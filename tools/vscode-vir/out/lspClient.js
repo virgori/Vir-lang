@@ -37,18 +37,36 @@ exports.startVirLanguageClient = startVirLanguageClient;
 exports.restartVirLanguageClient = restartVirLanguageClient;
 exports.stopVirLanguageClient = stopVirLanguageClient;
 const vscode = __importStar(require("vscode"));
+const fs = __importStar(require("fs"));
+const path = __importStar(require("path"));
 const node_1 = require("vscode-languageclient/node");
 let client;
+function resolveServerPath(configuredPath) {
+    if (configuredPath && configuredPath.trim().length > 0) {
+        return configuredPath.trim();
+    }
+    const workspaceFolders = vscode.workspace.workspaceFolders;
+    if (workspaceFolders) {
+        for (const folder of workspaceFolders) {
+            const candidate = path.join(folder.uri.fsPath, "bin", "vir-lsp");
+            if (fs.existsSync(candidate)) {
+                return candidate;
+            }
+        }
+    }
+    return undefined;
+}
 async function startVirLanguageClient(context) {
     const cfg = vscode.workspace.getConfiguration("vir");
-    const serverPath = cfg.get("lsp.serverPath", "").trim();
+    const rawPath = cfg.get("lsp.serverPath", "").trim();
+    const serverPath = resolveServerPath(rawPath);
     const serverArgs = cfg.get("lsp.serverArgs", []);
     if (!serverPath) {
         return undefined;
     }
     const serverOptions = {
         command: serverPath,
-        args: serverArgs,
+        args: serverArgs.length > 0 ? serverArgs : ["--stdio"],
         transport: node_1.TransportKind.stdio
     };
     const clientOptions = {

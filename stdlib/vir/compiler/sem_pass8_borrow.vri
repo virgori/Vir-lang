@@ -40,12 +40,143 @@ import vir_alloc, vir_free from alloc
 
 # ═══════════════════════════════════════════════════════
 # Boxed Vector Helpers (Pointer-safe across recursive walks)
+# Box layout: [0]=vec, [8]=lazy name→item hash (256 chain heads).
+# Avoids O(n²) linear scans on var_types / moved / locals / borrows.
 # ═══════════════════════════════════════════════════════
 
+const PASS8_BUCKETS: int = 256
+
+func pass8_hash_name(name: string):
+    let n = fat_str_len(name)
+    if n <= 0 do
+        out 0
+    end
+    # Mix pointer + length — avg O(1), no per-byte walk.
+    var h = (name as i64) * 131 + n * 17
+    if h < 0 do
+        h = 0 - h
+    end
+    out h mod PASS8_BUCKETS
+end.
+
+func pass8_map_new():
+    let heads = vir_alloc(PASS8_BUCKETS * 8)
+    var i = 0
+    when i < PASS8_BUCKETS loop
+        native_write_i64(heads, i * 8, 0)
+        i = i + 1
+    end
+    out heads
+end.
+
 func pass8_box_new():
-    let p = vir_alloc(8)
+    let p = vir_alloc(16)
     native_write_i64(p, 0, vec_new_rt())
+    native_write_i64(p, 8, 0)
     out p
+end.
+
+func pass8_box_map(b: int):
+    out native_read_i64(b, 8)
+end.
+
+func pass8_box_ensure_map(b: int):
+    var ht = native_read_i64(b, 8)
+    if ht == 0 do
+        ht = pass8_map_new()
+        native_write_i64(b, 8, ht)
+    end
+    out ht
+end.
+
+# Chain node: [0]=next, [8]=item ptr
+func pass8_map_index(ht: int, name: string, item: int):
+    if fat_str_len(name) == 0 do
+        out 0
+    end
+    if ht == 0 do
+        out 0
+    end
+    let bid = pass8_hash_name(name)
+    let node = vir_alloc(16)
+    native_write_i64(node, 0, native_read_i64(ht, bid * 8))
+    native_write_i64(node, 8, item as i64)
+    native_write_i64(ht, bid * 8, node)
+    out 0
+end.
+
+func pass8_map_unindex_one(ht: int, name: string, item: int):
+    if ht == 0 or fat_str_len(name) == 0 do
+        out 0
+    end
+    let bid = pass8_hash_name(name)
+    var prev = 0
+    var node = native_read_i64(ht, bid * 8)
+    var nxt = 0
+    var it = 0
+    when node != 0 loop
+        nxt = native_read_i64(node, 0)
+        it = native_read_i64(node, 8)
+        if it == item as i64 do
+            if prev == 0 do
+                native_write_i64(ht, bid * 8, nxt)
+            else
+                native_write_i64(prev, 0, nxt)
+            end
+            out 0
+        end
+        prev = node
+        node = nxt
+    end
+    out 0
+end.
+
+func pass8_map_find(ht: int, name: string):
+    if ht == 0 or fat_str_len(name) == 0 do
+        out 0
+    end
+    let bid = pass8_hash_name(name)
+    let name_ptr = name as i64
+    var node = native_read_i64(ht, bid * 8)
+    var it = 0
+    var nm_ptr = 0
+    when node != 0 loop
+        it = native_read_i64(node, 8)
+        if it >= 4096 do
+            nm_ptr = native_read_i64(it, 0)
+            if nm_ptr == name_ptr do
+                out it
+            end
+            if fat_str_eq(nm_ptr as string, name) == 1 do
+                out it
+            end
+        end
+        node = native_read_i64(node, 0)
+    end
+    out 0
+end.
+
+func pass8_map_count(ht: int, name: string):
+    if ht == 0 or fat_str_len(name) == 0 do
+        out 0
+    end
+    let bid = pass8_hash_name(name)
+    let name_ptr = name as i64
+    var total = 0
+    var node = native_read_i64(ht, bid * 8)
+    var it = 0
+    var nm_ptr = 0
+    when node != 0 loop
+        it = native_read_i64(node, 8)
+        if it >= 4096 do
+            nm_ptr = native_read_i64(it, 0)
+            if nm_ptr == name_ptr or fat_str_eq(nm_ptr as string, name) == 1 do
+                total = total + 1
+            end
+        end
+        node = native_read_i64(node, 0)
+    end
+    out total
 end.
 
 func pass8_box_len(b: int):
@@ -67,6 +198,13 @@ func pass8_box_push(b: int, val: int):
     var v = native_read_i64(b, 0)
     v = vec_push_rt(v, val)
     native_write_i64(b, 0, v)
+    # Index by name@0 (VarItem and BorrowBinding both store a string there).
+    if val >= 4096 do
+        let nm = native_read_i64(val, 0) as string
+        if fat_str_len(nm) > 0 do
+            pass8_map_index(pass8_box_ensure_map(b), nm, val)
+        end
+    end
 end.
 
 func pass8_box_pop(b: int):
@@ -76,8 +214,15 @@ end.
 
 func pass8_box_truncate_to(b: int, watermark: int):
     let v = native_read_i64(b, 0)
+    let ht = native_read_i64(b, 8)
+    var popped = 0
+    var nm = fat_str_new("")
     when vec_len_rt(v) > watermark loop
-        vec_pop_rt(v)
+        popped = vec_pop_rt(v)
+        if ht != 0 and popped >= 4096 do
+            nm = native_read_i64(popped, 0) as string
+            pass8_map_unindex_one(ht, nm, popped)
+        end
     end
 end.
 
@@ -166,13 +311,8 @@ func pass8_is_moved(moved_vars: int, name: string):
     if pass8_strlen(name) == 0 do
         out 0
     end
-    let count = pass8_box_len(moved_vars)
-    var i = 0
-    when i < count loop
-        if pass8_streq(var_item_name(pass8_box_get(moved_vars, i)), name) == 1 do
-            out 1
-        end
-        i = i + 1
+    if pass8_map_find(pass8_box_map(moved_vars), name) != 0 do
+        out 1
     end
     out 0
 end.
@@ -191,15 +331,22 @@ func pass8_unmark_moved(moved_vars: int, name: string):
     if pass8_strlen(name) == 0 do
         out 0
     end
+    let item = pass8_map_find(pass8_box_map(moved_vars), name)
+    if item == 0 do
+        out 0
+    end
     let count = pass8_box_len(moved_vars)
     var i = 0
+    var v = 0
     when i < count loop
-        let item = pass8_box_get(moved_vars, i)
-        if pass8_streq(var_item_name(item), name) == 1 do
+        if pass8_box_get(moved_vars, i) == item do
+            pass8_map_unindex_one(pass8_box_map(moved_vars), name, item)
             if i < count - 1 do
                 pass8_box_set(moved_vars, i, pass8_box_get(moved_vars, count - 1))
             end
-            pass8_box_truncate_to(moved_vars, count - 1)
+            # Truncate without re-unindexing the swapped tail: pop raw.
+            v = native_read_i64(moved_vars, 0)
+            vec_pop_rt(v)
             out 0
         end
         i = i + 1
@@ -211,13 +358,8 @@ func pass8_vec_contains(names: int, name: string):
     if pass8_strlen(name) == 0 do
         out 0
     end
-    let count = pass8_box_len(names)
-    var i = 0
-    when i < count loop
-        if pass8_streq(var_item_name(pass8_box_get(names, i)), name) == 1 do
-            out 1
-        end
-        i = i + 1
+    if pass8_map_find(pass8_box_map(names), name) != 0 do
+        out 1
     end
     out 0
 end.
@@ -226,16 +368,7 @@ func pass8_borrow_count(borrows: int, name: string):
     if pass8_strlen(name) == 0 do
         out 0
     end
-    let count = pass8_box_len(borrows)
-    var total = 0
-    var i = 0
-    when i < count loop
-        if pass8_streq(var_item_name(pass8_box_get(borrows, i)), name) == 1 do
-            total = total + 1
-        end
-        i = i + 1
-    end
-    out total
+    out pass8_map_count(pass8_box_map(borrows), name)
 end.
 
 func pass8_truncate_to(lst: int, watermark: int):
@@ -246,14 +379,21 @@ func pass8_remove_one_borrow(borrows: int, name: string):
     if pass8_strlen(name) == 0 do
         out 0
     end
+    let item = pass8_map_find(pass8_box_map(borrows), name)
+    if item == 0 do
+        out 0
+    end
     let len = pass8_box_len(borrows)
     var i = len - 1
+    var v = 0
     when i >= 0 loop
-        if pass8_streq(var_item_name(pass8_box_get(borrows, i)), name) == 1 do
+        if pass8_box_get(borrows, i) == item do
+            pass8_map_unindex_one(pass8_box_map(borrows), name, item)
             if i < len - 1 do
                 pass8_box_set(borrows, i, pass8_box_get(borrows, len - 1))
             end
-            pass8_box_truncate_to(borrows, len - 1)
+            v = native_read_i64(borrows, 0)
+            vec_pop_rt(v)
             out 0
         end
         i = i - 1
@@ -265,22 +405,26 @@ func pass8_release_borrower(bound_borrows: int, shared_borrows: int, mut_borrows
     if pass8_strlen(borrower) == 0 do
         out 0
     end
+    let b = pass8_map_find(pass8_box_map(bound_borrows), borrower)
+    if b == 0 do
+        out 0
+    end
+    if borrow_binding_kind(b) == 2 do
+        pass8_remove_one_borrow(mut_borrows, borrow_binding_target(b))
+    else
+        pass8_remove_one_borrow(shared_borrows, borrow_binding_target(b))
+    end
     let len = pass8_box_len(bound_borrows)
     var i = 0
+    var v = 0
     when i < len loop
-        let b = pass8_box_get(bound_borrows, i)
-        if pass8_streq(borrow_binding_lhs(b), borrower) == 1 do
-            if borrow_binding_kind(b) == 2 do
-                pass8_remove_one_borrow(mut_borrows, borrow_binding_target(b))
-            else
-                pass8_remove_one_borrow(shared_borrows, borrow_binding_target(b))
+        if pass8_box_get(bound_borrows, i) == b do
+            pass8_map_unindex_one(pass8_box_map(bound_borrows), borrower, b)
+            if i < len - 1 do
+                pass8_box_set(bound_borrows, i, pass8_box_get(bound_borrows, len - 1))
             end
-            var j = i
-            when j < len - 1 loop
-                pass8_box_set(bound_borrows, j, pass8_box_get(bound_borrows, j + 1))
-                j = j + 1
-            end
-            pass8_box_truncate_to(bound_borrows, len - 1)
+            v = native_read_i64(bound_borrows, 0)
+            vec_pop_rt(v)
             out 0
         end
         i = i + 1
@@ -296,15 +440,10 @@ func pass8_register_var_type(var_types: int, name: string, kind: TypeKind):
     if pass8_strlen(name) == 0 do
         out 0
     end
-    var i = 0
-    let count = pass8_box_len(var_types)
-    when i < count loop
-        let item = pass8_box_get(var_types, i)
-        if pass8_streq(var_item_name(item), name) == 1 do
-            var_item_set_val(item, kind as int)
-            out 0
-        end
-        i = i + 1
+    let item = pass8_map_find(pass8_box_map(var_types), name)
+    if item != 0 do
+        var_item_set_val(item, kind as int)
+        out 0
     end
     pass8_box_push(var_types, var_item_new(name, kind as int) as i64)
     out 0
@@ -314,14 +453,9 @@ func pass8_get_var_type(var_types: int, name: string):
     if pass8_strlen(name) == 0 do
         out TypeKind.Void
     end
-    var i = 0
-    let count = pass8_box_len(var_types)
-    when i < count loop
-        let item = pass8_box_get(var_types, i)
-        if pass8_streq(var_item_name(item), name) == 1 do
-            out var_item_val(item) as TypeKind
-        end
-        i = i + 1
+    let item = pass8_map_find(pass8_box_map(var_types), name)
+    if item != 0 do
+        out var_item_val(item) as TypeKind
     end
     out TypeKind.Void
 end.
