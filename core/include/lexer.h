@@ -224,7 +224,7 @@ typedef struct {
  * ═══════════════════════════════════════════════════════ */
 
 #define LEX_INIT_TOKENS 16384
-#define LEX_MAX_TOKENS 262144
+#define LEX_MAX_TOKENS 2097152
 
 typedef struct {
   const char *source;

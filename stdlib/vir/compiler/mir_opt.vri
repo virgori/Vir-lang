@@ -126,7 +126,45 @@ func count_vreg_defs_mir(blocks: i64, target_vreg: i64):
     out def_cnt
 end.
 
+# O(B*I) vreg def-count table; index = vreg id. Avoids repeated full-block scans.
+func mir_build_vreg_def_counts(blocks: i64):
+    counts = vec_new_rt()
+    n_blocks = vec_len_rt(blocks)
+    var i = 0
+    when i < n_blocks loop
+        instrs = mir_block_head(vec_get_rt(blocks, i))
+        if instrs >= 0 do
+            var j = 0
+            when j < vec_len_rt(instrs) loop
+                ins = vec_get_rt(instrs, j)
+                dst = mir_instr_dst(ins)
+                if mir_opnd_type(dst) == MirOperandType.VReg do
+                    vid = mir_opnd_vreg_id(dst)
+                    if vid >= 0 do
+                        cl = vec_len_rt(counts)
+                        when cl <= vid loop
+                            counts = vec_push_rt(counts, 0)
+                            cl = cl + 1
+                        end
+                        vec_set_rt(counts, vid, vec_get_rt(counts, vid) + 1)
+                    end
+                end
+                j = j + 1
+            end
+        end
+        i = i + 1
+    end
+    out counts
+end.
+
+func mir_vreg_def_count(def_counts: i64, vreg: i64):
+    if def_counts < 0 do out 0 end
+    if vreg < 0 or vreg >= vec_len_rt(def_counts) do out 0 end
+    out vec_get_rt(def_counts, vreg)
+end.
+
 func mir_opt_copy_propagation(blocks: i64):
+    def_counts = mir_build_vreg_def_counts(blocks)
     n_blocks = vec_len_rt(blocks)
     var i = 0
     when i < n_blocks loop
@@ -142,7 +180,7 @@ func mir_opt_copy_propagation(blocks: i64):
                 src1 = mir_instr_src1(ins)
                 if op == MirOp.Move and mir_opnd_type(dst) == MirOperandType.VReg do
                     dst_v = mir_opnd_vreg_id(dst)
-                    if count_vreg_defs_mir(blocks, dst_v) == 1 do
+                    if mir_vreg_def_count(def_counts, dst_v) == 1 do
                         is_prop_vreg = mir_opnd_type(src1) == MirOperandType.VReg
                         is_prop_imm = mir_opnd_type(src1) == MirOperandType.Imm
                         if is_prop_vreg or is_prop_imm do
@@ -191,6 +229,7 @@ func mir_opt_copy_propagation(blocks: i64):
 end.
 
 func mir_opt_constant_propagation(blocks: i64):
+    def_counts = mir_build_vreg_def_counts(blocks)
     n_blocks = vec_len_rt(blocks)
     var i = 0
     when i < n_blocks loop
@@ -202,7 +241,7 @@ func mir_opt_constant_propagation(blocks: i64):
                 ins = vec_get_rt(instrs, j)
                 if mir_instr_op(ins) == MirOp.Move and mir_opnd_type(mir_instr_dst(ins)) == MirOperandType.VReg and mir_opnd_type(mir_instr_src1(ins)) == MirOperandType.Imm do
                     dst_v = mir_opnd_vreg_id(mir_instr_dst(ins))
-                    if count_vreg_defs_mir(blocks, dst_v) == 1 do
+                    if mir_vreg_def_count(def_counts, dst_v) == 1 do
                         blocks = mir_rewrite_uses_from(blocks, dst_v, mir_instr_src1(ins))
                     end
                 end
@@ -361,13 +400,108 @@ func is_pure_mir_op(op: i64):
     out false
 end.
 
-func mir_opt_dce_once(blocks: i64):
+func mir_opt_dce(blocks: i64):
     n_vregs = max_vreg_mir(blocks)
+    if n_vregs <= 0 do out blocks end
     uses = count_vreg_uses_mir(blocks, n_vregs)
+
+    # Tables to track definition for each vreg
+    def_ins_tab = vec_new_rt()
+    var vi = 0
+    when vi < n_vregs loop
+        def_ins_tab = vec_push_rt(def_ins_tab, 0)
+        vi = vi + 1
+    end
+
+    worklist = vec_new_rt()
     n_blocks = vec_len_rt(blocks)
-    var i = 0
-    when i < n_blocks loop
-        b = vec_get_rt(blocks, i)
+    var bi = 0
+    when bi < n_blocks loop
+        b = vec_get_rt(blocks, bi)
+        instrs = mir_block_head(b)
+        if instrs >= 0 do
+            n_instrs = vec_len_rt(instrs)
+            var j = 0
+            when j < n_instrs loop
+                ins = vec_get_rt(instrs, j)
+                op = mir_instr_op(ins)
+                dst = mir_instr_dst(ins)
+                src1 = mir_instr_src1(ins)
+
+                if op == MirOp.Nop as i64 do
+                    # already dead
+                eif op == MirOp.Move as i64 & mir_opnd_type(dst) == MirOperandType.VReg & mir_opnd_type(src1) == MirOperandType.VReg & mir_opnd_vreg_id(dst) == mir_opnd_vreg_id(src1) do
+                    native_write_i64(ins as i64, 0, MirOp.Nop as i64)
+                    mir_opt_note_change()
+                eif mir_opnd_type(dst) == MirOperandType.VReg do
+                    dst_v = mir_opnd_vreg_id(dst)
+                    if dst_v >= 0 & dst_v < n_vregs do
+                        vec_set_rt(def_ins_tab, dst_v, ins)
+                        if is_pure_mir_op(op) & vec_get_rt(uses, dst_v) == 0 do
+                            worklist = vec_push_rt(worklist, dst_v)
+                        end
+                    end
+                end
+                j = j + 1
+            end
+        end
+        bi = bi + 1
+    end
+
+    # Process dead worklist recursively
+    var wl_head = 0
+    when wl_head < vec_len_rt(worklist) loop
+        dead_v = vec_get_rt(worklist, wl_head)
+        wl_head = wl_head + 1
+        d_ins = vec_get_rt(def_ins_tab, dead_v)
+        if d_ins != 0 do
+            d_op = mir_instr_op(d_ins)
+            if d_op != MirOp.Nop as i64 do
+                native_write_i64(d_ins as i64, 0, MirOp.Nop as i64)
+                mir_opt_note_change()
+
+                # Decrement uses of operands
+                s1 = mir_instr_src1(d_ins)
+                if mir_opnd_type(s1) == MirOperandType.VReg do
+                    s1_v = mir_opnd_vreg_id(s1)
+                    if s1_v >= 0 & s1_v < n_vregs do
+                        cnt = vec_get_rt(uses, s1_v) - 1
+                        vec_set_rt(uses, s1_v, cnt)
+                        if cnt == 0 do
+                            p_ins = vec_get_rt(def_ins_tab, s1_v)
+                            if p_ins != 0 do
+                                if is_pure_mir_op(mir_instr_op(p_ins)) do
+                                    worklist = vec_push_rt(worklist, s1_v)
+                                end
+                            end
+                        end
+                    end
+                end
+
+                s2 = mir_instr_src2(d_ins)
+                if mir_opnd_type(s2) == MirOperandType.VReg do
+                    s2_v = mir_opnd_vreg_id(s2)
+                    if s2_v >= 0 & s2_v < n_vregs do
+                        cnt2 = vec_get_rt(uses, s2_v) - 1
+                        vec_set_rt(uses, s2_v, cnt2)
+                        if cnt2 == 0 do
+                            p_ins2 = vec_get_rt(def_ins_tab, s2_v)
+                            if p_ins2 != 0 do
+                                if is_pure_mir_op(mir_instr_op(p_ins2)) do
+                                    worklist = vec_push_rt(worklist, s2_v)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    # Single sweep: rebuild blocks omitting Nop instructions
+    bi = 0
+    when bi < n_blocks loop
+        b = vec_get_rt(blocks, bi)
         instrs = mir_block_head(b)
         if instrs >= 0 do
             n_instrs = vec_len_rt(instrs)
@@ -375,30 +509,8 @@ func mir_opt_dce_once(blocks: i64):
             var j = 0
             when j < n_instrs loop
                 ins = vec_get_rt(instrs, j)
-                op = mir_instr_op(ins)
-                dst = mir_instr_dst(ins)
-                src1 = mir_instr_src1(ins)
-                is_dead = false
-                if op == MirOp.Nop as i64 do
-                    is_dead = true
-                end
-                if is_dead == false and op == MirOp.Move as i64 and mir_opnd_type(dst) == MirOperandType.VReg and mir_opnd_type(src1) == MirOperandType.VReg do
-                    if mir_opnd_vreg_id(dst) == mir_opnd_vreg_id(src1) do
-                        is_dead = true
-                    end
-                end
-                if is_dead == false and is_pure_mir_op(op) and mir_opnd_type(dst) == MirOperandType.VReg do
-                    dst_v = mir_opnd_vreg_id(dst)
-                    if dst_v >= 0 and dst_v < n_vregs do
-                        if vec_get_rt(uses, dst_v) == 0 do
-                            is_dead = true
-                        end
-                    end
-                end
-                if is_dead == false do
+                if mir_instr_op(ins) != MirOp.Nop as i64 do
                     new_instrs = vec_push_rt(new_instrs, ins)
-                else
-                    mir_opt_note_change()
                 end
                 j = j + 1
             end
@@ -414,23 +526,9 @@ func mir_opt_dce_once(blocks: i64):
                 mir_block_df(b),
                 mir_block_next_block(b)
             )
-            vec_set_rt(blocks, i, b_new)
+            vec_set_rt(blocks, bi, b_new)
         end
-        i = i + 1
-    end
-    out blocks
-end.
-
-func mir_opt_dce(blocks: i64):
-    var iter = 0
-    max_iter = max_vreg_mir(blocks) + 1
-    changed = true
-    when changed and iter < max_iter loop
-        before = mir_opt_get_total_changes()
-        blocks = mir_opt_dce_once(blocks)
-        after = mir_opt_get_total_changes()
-        changed = after != before
-        iter = iter + 1
+        bi = bi + 1
     end
     out blocks
 end.
@@ -575,17 +673,17 @@ func mir_opt_licm_hoistable(op: i64):
     out false
 end.
 
-func mir_opt_licm_operands_invariant(blocks: i64, body_idx: i64, op: i64, ins: MirInstr):
+func mir_opt_licm_operands_invariant(blocks: i64, body_idx: i64, op: i64, ins: MirInstr, def_counts: i64):
     s1 = mir_instr_src1(ins)
     if op == MirOp.Not do
-        out mir_opt_operand_loop_invariant(blocks, body_idx, s1)
+        out mir_opt_operand_loop_invariant(blocks, body_idx, s1, def_counts)
     end
     if op == MirOp.Load do
         s2 = mir_instr_src2(ins)
-        out mir_opt_operand_loop_invariant(blocks, body_idx, s1) and mir_opt_operand_loop_invariant(blocks, body_idx, s2)
+        out mir_opt_operand_loop_invariant(blocks, body_idx, s1, def_counts) and mir_opt_operand_loop_invariant(blocks, body_idx, s2, def_counts)
     end
     s2 = mir_instr_src2(ins)
-    out mir_opt_operand_loop_invariant(blocks, body_idx, s1) and mir_opt_operand_loop_invariant(blocks, body_idx, s2)
+    out mir_opt_operand_loop_invariant(blocks, body_idx, s1, def_counts) and mir_opt_operand_loop_invariant(blocks, body_idx, s2, def_counts)
 end.
 
 ##
@@ -593,6 +691,7 @@ end.
  * Hoists pure invariant ops to the loop preheader (or header before terminator).
  ## 
 func mir_opt_licm(blocks: i64):
+    def_counts = mir_build_vreg_def_counts(blocks)
     n_blocks = vec_len_rt(blocks)
     var hdr_idx = 0
     when hdr_idx < n_blocks loop
@@ -631,7 +730,7 @@ func mir_opt_licm(blocks: i64):
                                 op = mir_instr_op(ins)
                                 if mir_opt_licm_hoistable(op) do
                                     dst = mir_instr_dst(ins)
-                                    can_hoist = mir_opt_licm_operands_invariant(blocks, body_idx, op, ins)
+                                    can_hoist = mir_opt_licm_operands_invariant(blocks, body_idx, op, ins, def_counts)
                                     if can_hoist and mir_opnd_type(dst) == MirOperandType.VReg do
                                         dv = mir_opnd_vreg_id(dst)
                                         if not mir_vreg_defined_in_body(blocks, body_idx, dv, ii) do
@@ -659,11 +758,11 @@ func mir_opt_licm(blocks: i64):
     out blocks
 end.
 
-func mir_opt_operand_loop_invariant(blocks: i64, loop_body_idx: i64, opnd: MirOperand):
+func mir_opt_operand_loop_invariant(blocks: i64, loop_body_idx: i64, opnd: MirOperand, def_counts: i64):
     if mir_opnd_type(opnd) == MirOperandType.Imm do out true end
     if mir_opnd_type(opnd) != MirOperandType.VReg do out false end
     v = mir_opnd_vreg_id(opnd)
-    if count_vreg_defs_mir(blocks, v) != 1 do out false end
+    if mir_vreg_def_count(def_counts, v) != 1 do out false end
     n_blocks = vec_len_rt(blocks)
     var bi = 0
     when bi < n_blocks loop
@@ -929,7 +1028,9 @@ func mir_opt_sccp(blocks: i64):
 
     changed = true
     var iter = 0
-    max_iter = (n_vregs + 1) * (vec_len_rt(blocks) + 1)
+    n_blocks = vec_len_rt(blocks)
+    max_iter = (n_blocks + 1) * 8
+    if max_iter > 512 do max_iter = 512 end
     when changed and iter < max_iter loop
         changed = false
         n_blocks = vec_len_rt(blocks)
@@ -1169,7 +1270,7 @@ func mir_eval_const_binary(op: i64, a: i64, b: i64):
     if op == MirOp.Sub do out (true, a - b) end
     if op == MirOp.Mul do out (true, a * b) end
     if op == MirOp.Div and b != 0 do out (true, a / b) end
-    if op == MirOp.Mod and b != 0 do out (true, a % b) end
+    if op == MirOp.Mod and b != 0 do out (true, a mod b) end
     if op == MirOp.And do out (true, a and b) end
     if op == MirOp.Or do out (true, a or b) end
     if op == MirOp.Xor do out (true, a xor b) end
