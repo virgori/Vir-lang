@@ -62,6 +62,7 @@ def main() -> int:
     data = json.loads(args.manifest.read_text(encoding="utf-8"))
     tests = data["tests"]
     failures: list[str] = []
+    passed = 0
     (ROOT / "dist").mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="vir-bootstrap-regression-", dir=ROOT / "dist") as tmp:
         tmpdir = Path(tmp)
