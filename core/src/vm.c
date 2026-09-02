@@ -31,15 +31,18 @@ static void vm_track_pointer_store(vm_state_t *vm, int64_t base,
 static inline uint32_t vm_call_save_count(const vm_state_t *vm)
 {
     uint32_t nregs = vm->reg_count;
-    if (nregs < VM_CALL_SAVE_MIN)
-        nregs = VM_CALL_SAVE_MIN;
     if (vm->reg_need_by_fidx && vm->module && vm->current_func &&
         vm->current_func >= vm->module->functions &&
         vm->current_func < vm->module->functions + vm->module->func_count) {
         uint32_t fidx = (uint32_t)(vm->current_func - vm->module->functions);
-        if (fidx < vm->label_by_fidx_n && vm->reg_need_by_fidx[fidx] > nregs)
-            nregs = vm->reg_need_by_fidx[fidx];
+        if (fidx < vm->label_by_fidx_n) {
+            uint32_t need = vm->reg_need_by_fidx[fidx];
+            if (need > nregs)
+                nregs = need;
+        }
     }
+    if (nregs < Q_MAX_PARAMS)
+        nregs = Q_MAX_PARAMS;
     if (nregs > VREG_MAX)
         nregs = VREG_MAX;
     return nregs;
@@ -1366,8 +1369,9 @@ static void vm_restore_caller_window(vm_state_t *vm, uint32_t frame_index)
     /* memcpy Call path: pop saved caller regs from the flat save-stack. */
     uint32_t nrestore = vm->func_stack[frame_index].saved_reg_count;
     uint32_t base = vm->func_stack[frame_index].saved_base;
-    for (uint32_t ri = 0; ri < nrestore; ri++)
-        vm->regs[ri] = vm->reg_save_stack[base + ri];
+    if (nrestore > 0) {
+        memcpy(vm->regs, &vm->reg_save_stack[base], (size_t)nrestore * sizeof(int64_t));
+    }
     vm->reg_save_top = base;
     vm->reg_count = vm->func_stack[frame_index].caller_reg_count;
     vm->func_stack[frame_index].saved_reg_count = 0;

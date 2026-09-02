@@ -1,14 +1,14 @@
-##
+#*#
  * vir/compiler/ast_to_mir.vri — AST to MIR Lowering
  * ==============================================================
  * Flattens AST into MIR basic blocks + CFG. Locals map to vregs.
  * Phi insertion is deferred to mir_ssa.vri (this phase emits non-SSA MIR).
  * Coverage / status: MUST_READ_CONTEXT/AST_TO_MIR_LOWERING_CHECKLIST.md
- ##
+ #*#
 
 include types
 include vec_rt
-import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt, vec_pop_rt from vec_rt
 
 include string_rt
 import rt_streq, fat_str_eq, fat_str_len, fat_cstr_eq, fat_str_new, rt_strlen, fat_str_byte_at, sb_new, sb_append, sb_append_int, sb_to_string, sb_free from string_rt
@@ -17,11 +17,17 @@ include parser
 import AstNode, AstType, OpType from parser
 
 include compiler.mir
-import print_str from compiler.context
+import print_str, print_ln from compiler.context
 import MirFunc, MirBlock, MirInstr, MirOp, MirOperand, MirOperandType, mir_opnd_none, mir_opnd_vreg, mir_opnd_imm, mir_opnd_new, mir_instr_new, mir_func_new, mir_block_new, mir_create_block, mir_intern_string, mir_func_id, mir_func_name, mir_func_next_vreg, mir_func_def_uses, mir_func_next_block_id, mir_func_entry_block, mir_func_blocks, mir_func_strings, mir_func_var_buckets, mir_block_id, mir_block_head, mir_block_tail, mir_block_successors, mir_block_preds, mir_block_idom, mir_block_dom_children, mir_block_df, mir_block_next_block, mir_block_phis, MIR_INTR_STR_LIT, MIR_INTR_PRINT, MIR_INTR_ARRAY, MIR_INTR_TUPLE, MIR_INTR_ENTITY, MIR_INTR_ADDR_OF, MIR_INTR_INTERP, MIR_INTR_BUILTIN, MIR_INTR_INDEX, MIR_INTR_FIELD, MIR_INTR_MATCH_PAT, MIR_INTR_INPUT, MIR_INTR_ENUM, MIR_INTR_CAST, MIR_INTR_THROW, MIR_INTR_CANCEL, MIR_INTR_QUIET, MIR_INTR_ARENA, MIR_INTR_ENSURE, MIR_INTR_REVERT, MIR_INTR_INDEX_STORE, MIR_INTR_FIELD_STORE, MIR_INTR_STR_EQ, MIR_INTR_CHECK_CPU, MIR_INTR_PATCH_POINT, MIR_INTR_DECL, MIR_INTR_AWAIT, MIR_INTR_NOP_MARKER, MIR_INTR_TASK, MIR_INTR_WAIT, MIR_INTR_SELECT, MIR_INTR_SEND, MIR_INTR_RECV, MIR_INTR_EMIT, MIR_INTR_ERX, MIR_INTR_TRY, MIR_INTR_RESUME, MIR_INTR_LOCK, MIR_INTR_SWIZZLE, MIR_INTR_INFER, MIR_INTR_TRAIN, MIR_INTR_QUANTIZE, MIR_INTR_AWAIT_PASS, MIR_INTR_SAFE_ACCESS, MIR_INTR_ATOMIC, MIR_INTR_EXIST, MIR_INTR_PATTERN, MIR_INTR_MAP, MIR_INTR_ARR_COMPACT, MIR_INTR_BUNDLE, MIR_INTR_TIMEOUT, MIR_INTR_ISOLATE, MIR_INTR_ERROR, MIR_INTR_PRECOMP, MIR_INTR_REACTIVE, MIR_INTR_MORPH, MIR_INTR_EXPOSE, MIR_INTR_PTR, MIR_INTR_ASYNC, MIR_INTR_ATOMIC_VAR, MIR_INTR_PRINT_STR, MIR_INTR_PARAM from compiler.mir
 
 # Map OpType → MirOp code.
 # Special: Land=-2, Lor=-3, PatternOp=-4 (Intrinsic PATTERN). Unknown=-1.
+var g_ast_lower_verbose: int = 0
+
+func set_ast_lower_verbose(mode: int):
+    g_ast_lower_verbose = mode
+end.
+
 func mir_op_from_optype(op: OpType):
 	if op == OpType.Add do out MirOp.Add as i64 end
 	if op == OpType.Sub do out MirOp.Sub as i64 end
@@ -50,7 +56,7 @@ func mir_op_from_optype(op: OpType):
 	out 0 - 1
 end.
 
-const MIR_VAR_BUCKETS: i64 = 64
+const MIR_VAR_BUCKETS: i64 = 256
 
 entity VarMap:
 	name: string,
@@ -120,8 +126,78 @@ var g_try_revert_block: i64 = 0 - 1
 var g_try_retry_block: i64 = 0 - 1
 var g_try_err_vreg: i64 = 0
 
+var g_entity_hash: i64 = 0
+var g_import_hash: i64 = 0
+var g_field_hash: i64 = 0
+var g_regfield_hash: i64 = 0
+var g_const_names: i64 = 0
+var g_const_values: i64 = 0
+var g_const_hash: i64 = 0
+
+func name_hash_256(name: string):
+    n = fat_str_len(name as int) as i64
+    h = n * 17
+    var i = 0
+    when i < n loop
+        h = h * 131 + (fat_str_byte_at(name as int, i) as i64)
+        i = i + 1
+    end
+    if h < 0 do h = 0 - h end
+    out h mod 256
+end.
+
+func hash_table_new():
+    tab = vec_new_rt()
+    var i = 0
+    when i < 256 loop
+        tab = vec_push_rt(tab, 0)
+        i = i + 1
+    end
+    out tab
+end.
+
+func hash_table_lookup(hash_tab: i64, names: i64, name: string):
+    if hash_tab == 0 || names == 0 do out 0 - 1 end
+    bid = name_hash_256(name)
+    bucket = vec_get_rt(hash_tab, bid)
+    if bucket == 0 do out 0 - 1 end
+    bn = vec_len_rt(bucket)
+    var i = 0
+    when i < bn loop
+        idx = vec_get_rt(bucket, i)
+        if fat_str_eq(vec_get_rt(names, idx) as string, name) == 1 do
+            out idx
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func hash_table_insert(hash_tab: i64, names: i64, name: string, idx: i64):
+    if hash_tab == 0 do out end
+    bid = name_hash_256(name)
+    bucket = vec_get_rt(hash_tab, bid)
+    if bucket == 0 do
+        bucket = vec_new_rt()
+    end
+    bucket = vec_push_rt(bucket, idx)
+    vec_set_rt(hash_tab, bid, bucket)
+end.
+
 func lookup_cached_name(names: i64, name: string):
     if names == 0 do out 0 - 1 end
+    if names == g_field_names && g_field_hash != 0 do
+        out hash_table_lookup(g_field_hash, names, name)
+    end
+    if names == g_entity_names && g_entity_hash != 0 do
+        out hash_table_lookup(g_entity_hash, names, name)
+    end
+    if names == g_import_aliases && g_import_hash != 0 do
+        out hash_table_lookup(g_import_hash, names, name)
+    end
+    if names == g_register_field_names && g_regfield_hash != 0 do
+        out hash_table_lookup(g_regfield_hash, names, name)
+    end
     n = vec_len_rt(names)
     var i = 0
     when i < n loop
@@ -129,6 +205,86 @@ func lookup_cached_name(names: i64, name: string):
         i = i + 1
     end
     out 0 - 1
+end.
+
+func eval_const_expr(node: AstNode):
+    if node == 0 do out 0 end
+    nt = ast_node_type_of(node)
+    if nt == AstType.LiteralInt do
+        out ast_node_int_val(node)
+    end
+    if nt == AstType.LiteralFloat do
+        out ast_node_int_val(node)
+    end
+    if nt == AstType.UnaryMinus do
+        if ast_node_child_count(node) > 0 do
+            out 0 - eval_const_expr(ast_node_child(node, 0))
+        end
+        out 0
+    end
+    if nt == AstType.Identifier do
+        cname = ast_node_name(node)
+        if fat_cstr_eq(cname, "true") == 1 do out 1 end
+        if fat_cstr_eq(cname, "false") == 1 do out 0 end
+        if fat_cstr_eq(cname, "null") == 1 do out 0 end
+        if g_const_hash > 0 do
+            c_idx = hash_table_lookup(g_const_hash, g_const_names, cname)
+            if c_idx >= 0 do
+                out vec_get_rt(g_const_values, c_idx)
+            end
+        end
+        out 0
+    end
+    if nt == AstType.FieldAccess do
+        if ast_node_child_count(node) > 0 do
+            base = ast_node_child(node, 0)
+            if ast_node_type_of(base) == AstType.Identifier do
+                key = fat_str_concat(fat_str_concat(ast_node_name(base), fat_str_new(".")), ast_node_name(node))
+                if g_const_hash > 0 do
+                    c_idx = hash_table_lookup(g_const_hash, g_const_names, key)
+                    if c_idx >= 0 do
+                        out vec_get_rt(g_const_values, c_idx)
+                    end
+                end
+            end
+        end
+        out 0
+    end
+    if nt == AstType.EnumAccess do
+        key = fat_str_concat(fat_str_concat(ast_node_name(node), fat_str_new(".")), ast_node_name2(node))
+        if g_const_hash > 0 do
+            c_idx = hash_table_lookup(g_const_hash, g_const_names, key)
+            if c_idx >= 0 do
+                out vec_get_rt(g_const_values, c_idx)
+            end
+        end
+        out 0
+    end
+    if nt == AstType.BinOp or nt == AstType.Compare do
+        if ast_node_child_count(node) >= 2 do
+            lval = eval_const_expr(ast_node_child(node, 0))
+            rval = eval_const_expr(ast_node_child(node, 1))
+            op = ast_node_op_of(node)
+            if op == OpType.Add do out lval + rval end
+            if op == OpType.Sub do out lval - rval end
+            if op == OpType.Mul do out lval * rval end
+            if op == OpType.Div do
+                if rval != 0 do out lval / rval end
+                out 0
+            end
+            if op == OpType.ModOp or op == OpType.PercentOp do
+                if rval != 0 do out lval mod rval end
+                out 0
+            end
+            if op == OpType.OrOp or op == OpType.Lor do out lval or rval end
+            if op == OpType.AndOp or op == OpType.Land do out lval and rval end
+            if op == OpType.XorOp do out lval xor rval end
+            if op == OpType.ShlOp do out lval shl rval end
+            if op == OpType.ShrOp do out lval shr rval end
+        end
+        out 0
+    end
+    out 0
 end.
 
 func set_global_prog_ast(ast: AstNode):
@@ -142,6 +298,15 @@ func set_global_prog_ast(ast: AstNode):
     g_register_field_starts = vec_new_rt()
     g_register_field_widths = vec_new_rt()
 
+    g_entity_hash = hash_table_new()
+    g_import_hash = hash_table_new()
+    g_field_hash = hash_table_new()
+    g_regfield_hash = hash_table_new()
+
+    g_const_names = vec_new_rt()
+    g_const_values = vec_new_rt()
+    g_const_hash = hash_table_new()
+
     n = ast_node_child_count(ast)
     var i = 0
     when i < n loop
@@ -153,33 +318,72 @@ func set_global_prog_ast(ast: AstNode):
             when j < child_count loop
                 sym = ast_node_child(child, j)
                 alias = ast_node_name2(sym)
-                if fat_str_len(alias) > 0 and lookup_cached_name(g_import_aliases, alias) < 0 do
+                if fat_str_len(alias) > 0 && hash_table_lookup(g_import_hash, g_import_aliases, alias) < 0 do
+                    idx = vec_len_rt(g_import_aliases)
                     g_import_aliases = vec_push_rt(g_import_aliases, alias as i64)
                     g_import_targets = vec_push_rt(g_import_targets, ast_node_name(sym) as i64)
+                    hash_table_insert(g_import_hash, g_import_aliases, alias, idx)
                 end
                 j = j + 1
             end
         end
+        if child_type == AstType.EnumDef do
+            enum_name = ast_node_name(child)
+            v_cnt = ast_node_child_count(child)
+            var vi = 0
+            when vi < v_cnt loop
+                variant = ast_node_child(child, vi)
+                vname = ast_node_name(variant)
+                vval = ast_node_int_val(variant)
+                key = fat_str_concat(fat_str_concat(enum_name, fat_str_new(".")), vname)
+                if hash_table_lookup(g_const_hash, g_const_names, key) < 0 do
+                    idx = vec_len_rt(g_const_names)
+                    g_const_names = vec_push_rt(g_const_names, key as i64)
+                    g_const_values = vec_push_rt(g_const_values, vval)
+                    hash_table_insert(g_const_hash, g_const_names, key, idx)
+                end
+                vi = vi + 1
+            end
+        end
+        if child_type == AstType.ConstDecl do
+            const_name = ast_node_name(child)
+            if ast_node_child_count(child) > 0 do
+                init_expr = ast_node_child(child, 0)
+                val = eval_const_expr(init_expr)
+                if hash_table_lookup(g_const_hash, g_const_names, const_name) < 0 do
+                    idx = vec_len_rt(g_const_names)
+                    g_const_names = vec_push_rt(g_const_names, const_name as i64)
+                    g_const_values = vec_push_rt(g_const_values, val)
+                    hash_table_insert(g_const_hash, g_const_names, const_name, idx)
+                end
+            end
+        end
         if child_type == AstType.EntityDef or child_type == AstType.PackedDef or child_type == AstType.RegisterDef do
             entity_name = ast_node_name(child)
-            if lookup_cached_name(g_entity_names, entity_name) < 0 do
+            if hash_table_lookup(g_entity_hash, g_entity_names, entity_name) < 0 do
+                idx = vec_len_rt(g_entity_names)
                 g_entity_names = vec_push_rt(g_entity_names, entity_name as i64)
+                hash_table_insert(g_entity_hash, g_entity_names, entity_name, idx)
             end
             field_count = ast_node_child_count(child)
             var j = 0
             when j < field_count loop
                 field = ast_node_child(child, j)
                 field_name = ast_node_name(field)
-                if lookup_cached_name(g_field_names, field_name) < 0 do
+                if hash_table_lookup(g_field_hash, g_field_names, field_name) < 0 do
+                    idx = vec_len_rt(g_field_names)
                     g_field_names = vec_push_rt(g_field_names, field_name as i64)
                     g_field_indices = vec_push_rt(g_field_indices, j)
+                    hash_table_insert(g_field_hash, g_field_names, field_name, idx)
                 end
-                if child_type == AstType.RegisterDef and lookup_cached_name(g_register_field_names, field_name) < 0 do
+                if child_type == AstType.RegisterDef && hash_table_lookup(g_regfield_hash, g_register_field_names, field_name) < 0 do
                     width = ast_node_builtin_id(field)
                     if width <= 0 do width = 1 end
+                    idx = vec_len_rt(g_register_field_names)
                     g_register_field_names = vec_push_rt(g_register_field_names, field_name as i64)
                     g_register_field_starts = vec_push_rt(g_register_field_starts, ast_node_int_val(field))
                     g_register_field_widths = vec_push_rt(g_register_field_widths, width)
+                    hash_table_insert(g_regfield_hash, g_register_field_names, field_name, idx)
                 end
                 j = j + 1
             end
@@ -425,17 +629,10 @@ end.
 
 func builder_pop_loop(b: MirBuilder):
     ls = native_read_i64(b as i64, 16)
-	n = vec_len_rt(ls)
-	if n > 0 do
-		nv = vec_new_rt()
-		var i = 0
-		when i < n - 1 loop
-			nv = vec_push_rt(nv, vec_get_rt(ls, i))
-			i = i + 1
-		end
-        native_write_i64(b as i64, 16, nv)
-	end
-	out b
+    if vec_len_rt(ls) > 0 do
+        vec_pop_rt(ls)
+    end
+    out b
 end.
 
 func builder_loop_top(b: MirBuilder):
@@ -824,6 +1021,22 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 		if v >= 0 do
 			out (b, mir_opnd_vreg(v))
 		else
+            if fat_cstr_eq(fname, "true") == 1 do
+                out (b, mir_opnd_imm(1))
+            end
+            if fat_cstr_eq(fname, "false") == 1 do
+                out (b, mir_opnd_imm(0))
+            end
+            if fat_cstr_eq(fname, "null") == 1 do
+                out (b, mir_opnd_imm(0))
+            end
+            if g_const_hash > 0 do
+                c_idx = hash_table_lookup(g_const_hash, g_const_names, fname)
+                if c_idx >= 0 do
+                    c_val = vec_get_rt(g_const_values, c_idx)
+                    out (b, mir_opnd_imm(c_val))
+                end
+            end
 			var (b1, cid) = builder_intern(b, fname)
 			var (b2, dst) = builder_new_vreg(b1)
 			b2 = emit_intrinsic(b2, MIR_INTR_ADDR_OF, mir_opnd_vreg(dst), mir_opnd_imm(cid))
@@ -1191,7 +1404,16 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 	if expr_type == AstType.FieldAccess do
 		nch = ast_node_child_count(expr)
 		if nch >= 1 do
-			var (b2, base) = lower_expr(b, ast_node_child(expr, 0))
+			base_ast = ast_node_child(expr, 0)
+			if ast_node_type_of(base_ast) == AstType.Identifier and g_const_hash > 0 do
+				key = fat_str_concat(fat_str_concat(ast_node_name(base_ast), fat_str_new(".")), ast_node_name(expr))
+				c_idx = hash_table_lookup(g_const_hash, g_const_names, key)
+				if c_idx >= 0 do
+					c_val = vec_get_rt(g_const_values, c_idx)
+					out (b, mir_opnd_imm(c_val))
+				end
+			end
+			var (b2, base) = lower_expr(b, base_ast)
 			fname = ast_node_name(expr)
 			if is_register_field(fname) == 1 do
 				start_bit = get_register_field_start(fname)
@@ -1222,15 +1444,23 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 	end
 
     # 10. EnumAccess — name::name2
- if expr_type == AstType.EnumAccess do
- var (b1, e1) = builder_intern(b, ast_node_name(expr))
- var (b2, e2) = builder_intern(b1, ast_node_name2(expr))
- var (b3, dst) = builder_new_vreg(b2)
- b3 = emit_set_arg(b3, 0, mir_opnd_imm(e1))
- b3 = emit_set_arg(b3, 1, mir_opnd_imm(e2))
- b3 = emit_intrinsic(b3, MIR_INTR_ENUM, mir_opnd_vreg(dst), mir_opnd_none())
- out (b3, mir_opnd_vreg(dst))
- end
+	if expr_type == AstType.EnumAccess do
+		if g_const_hash > 0 do
+			key = fat_str_concat(fat_str_concat(ast_node_name(expr), fat_str_new(".")), ast_node_name2(expr))
+			c_idx = hash_table_lookup(g_const_hash, g_const_names, key)
+			if c_idx >= 0 do
+				c_val = vec_get_rt(g_const_values, c_idx)
+				out (b, mir_opnd_imm(c_val))
+			end
+		end
+		var (b1, e1) = builder_intern(b, ast_node_name(expr))
+		var (b2, e2) = builder_intern(b1, ast_node_name2(expr))
+		var (b3, dst) = builder_new_vreg(b2)
+		b3 = emit_set_arg(b3, 0, mir_opnd_imm(e1))
+		b3 = emit_set_arg(b3, 1, mir_opnd_imm(e2))
+		b3 = emit_intrinsic(b3, MIR_INTR_ENUM, mir_opnd_vreg(dst), mir_opnd_none())
+		out (b3, mir_opnd_vreg(dst))
+	end
 
     # 11. InputExpr
  if expr_type == AstType.InputExpr do
@@ -2059,6 +2289,7 @@ func ast_lower_program(prog: AstNode):
     # Soft/C-VM: keep `var` on the result vec so push reassignments stick.
 	var mir_funcs = vec_new_rt()
 	var child_count = ast_node_child_count(prog)
+	var lowered = 0
 	var i = 0
 	when i < child_count loop
 		var child = ast_node_child(prog, i)
@@ -2079,10 +2310,20 @@ func ast_lower_program(prog: AstNode):
 		if is_func == 1 do
 			var m_func = ast_lower_func(i, child)
 			mir_funcs = vec_push_rt(mir_funcs, m_func)
+			lowered = lowered + 1
+			if g_ast_lower_verbose == 1 do
+				if lowered == 1 || (lowered mod 50) == 0 do
+					var sb = sb_new()
+					sb = sb_append(sb, "virc: pipeline — AST->MIR func ")
+					sb = sb_append_int(sb, lowered)
+					print_ln(sb_to_string(sb))
+					sb_free(sb)
+				end
+			end
 		end
 		i = i + 1
 	end
 	out mir_funcs
 end.
 
-export ast_lower_program, ast_lower_func, name_hash_bucket, get_var_vreg, set_var_vreg, emit_jump, emit_jump_if, emit_jump_if_not, emit_set_arg, emit_intrinsic, emit_move, emit_load, emit_store, lower_aggregate, MIR_VAR_BUCKETS, set_global_prog_ast, find_field_index, is_entity_name, is_register_field, get_register_field_start, get_register_field_width
+export ast_lower_program, ast_lower_func, set_ast_lower_verbose, name_hash_bucket, get_var_vreg, set_var_vreg, emit_jump, emit_jump_if, emit_jump_if_not, emit_set_arg, emit_intrinsic, emit_move, emit_load, emit_store, lower_aggregate, MIR_VAR_BUCKETS, set_global_prog_ast, find_field_index, is_entity_name, is_register_field, get_register_field_start, get_register_field_width

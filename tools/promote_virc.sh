@@ -47,14 +47,46 @@ fi
 SRC="$EXPANDED"
 echo "Source:          $SRC ($(stat -f%z "$SRC" 2>/dev/null || stat -c%s "$SRC") bytes, includes already expanded)"
 echo ""
-echo "Compiling (the default wrapper interprets virc.vri in C-VM)..."
+echo "Compiling full compiler (progress on; set VIRC_PROMOTE_QUIET=1 to silence)..."
+echo "Tip: VIRC_NICE=10 lowers CPU priority; VIRC_PROMOTE_OPTS='-O0' speeds debug builds."
+
+QUIET="${VIRC_PROMOTE_QUIET:-0}"
+NICE_LVL="${VIRC_NICE:-5}"
+EXTRA_OPTS=()
+if [ "$QUIET" = "1" ]; then
+    EXTRA_OPTS+=(-q)
+fi
+if [ -n "${VIRC_PROMOTE_OPTS:-}" ]; then
+    # shellcheck disable=SC2206
+    EXTRA_OPTS+=($VIRC_PROMOTE_OPTS)
+fi
 
 run_compiler() {
-    if [ -n "${VIRC_NICE:-}" ]; then
-        nice -n "$VIRC_NICE" "$STABLE" "$SRC" -o "$OUT" -q
+    (
+        while sleep 60; do
+            echo "[promote] still compiling $(date '+%H:%M:%S') — check virc: lines above for current stage"
+        done
+    ) &
+    local watcher=$!
+    set +e
+    if [ -n "$NICE_LVL" ]; then
+        if [ ${#EXTRA_OPTS[@]} -gt 0 ]; then
+            nice -n "$NICE_LVL" "$STABLE" "$SRC" -o "$OUT" "${EXTRA_OPTS[@]}"
+        else
+            nice -n "$NICE_LVL" "$STABLE" "$SRC" -o "$OUT"
+        fi
     else
-        "$STABLE" "$SRC" -o "$OUT" -q
+        if [ ${#EXTRA_OPTS[@]} -gt 0 ]; then
+            "$STABLE" "$SRC" -o "$OUT" "${EXTRA_OPTS[@]}"
+        else
+            "$STABLE" "$SRC" -o "$OUT"
+        fi
     fi
+    local rc=$?
+    kill "$watcher" 2>/dev/null || true
+    wait "$watcher" 2>/dev/null || true
+    set -e
+    return "$rc"
 }
 
 if run_compiler; then
