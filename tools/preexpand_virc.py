@@ -22,7 +22,7 @@ PRELUDE_MAP = {
     "types": "stdlib/vir/compiler/types_prelude.vri",
     "option": "stdlib/vir/compiler/option_prelude.vri",
     "result": "stdlib/vir/compiler/result_prelude.vri",
-    "alloc": "stdlib/vir/compiler/alloc_prelude.vri",
+    "alloc": "stdlib/vir/rt/alloc.vri",
     "syscall": "stdlib/vir/compiler/syscall_prelude.vri",
     "vec": "stdlib/vir/compiler/vec_prelude.vri",
     "string_rt": "stdlib/vir/compiler/string_rt_prelude.vri",
