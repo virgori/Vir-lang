@@ -27,8 +27,8 @@ import rt_strlen, rt_strcmp, rt_streq, rt_strcat, rt_strdup,
        str_from_cstr, fat_str_len from vir.rt.string_rt
 include vir.rt.io
 import print_str, print_int, print_ln, print_newline, eprint_ln,
-       file_open_read, file_read_all, file_close,
-       write_file_bytes, read_file_str from vir.rt.io
+        file_open_read, file_read_all, file_close,
+        write_file_bytes, write_file_str, read_file_str from vir.rt.io
 include vir.rt.vec_rt
 import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt,
        vec_free_rt, bvec_new, bvec_push, bvec_push_u32_le,
@@ -78,6 +78,14 @@ include vir.compiler.lir_codegen_x86
 import emit_lir_module_x86_64 from vir.compiler.lir_codegen_x86
 include vir.compiler.codegen_wasm
 import wasm_compile_module, wasm_write_module, QIRFunc from vir.compiler.codegen_wasm
+include vir.compiler.mc
+import AsmDialect, MCInst from vir.compiler.mc
+include vir.compiler.target_triple
+import parse_target_triple, get_host_triple from vir.compiler.target_triple
+include vir.compiler.mc_printer
+import print_mc_inst, print_mc_function_header, print_mc_function_footer, print_mc_assembly_prologue, print_mc_runtime_stubs from vir.compiler.mc_printer
+include vir.compiler.lir_to_mc
+import lir_func_to_mc from vir.compiler.lir_to_mc
 include vir.compiler.main
 import codegen_emit_module, emit_macho_executable, emit_macho_with_entry, FuncLayout, expand_includes_text, expand_imports_text, text_ascii_sanitize, g_inc_base, g_inc_err from vir.compiler.main
 include vec
@@ -95,7 +103,50 @@ entity CompilerConfig:
     output_path:    int;    # string pointer
     target:         int;    # 0=ARM64, 1=x86_64
     out_fmt:        int;    # 0=Mach-O, 1=ELF
-    verbose:        int    # 0=quiet, 1=verbose
+    verbose:        int;    # 0=quiet, 1=verbose
+    emit_asm:       int    # 0=binary, 1=assembly text (-S)
+end.
+
+func cfg_get_input_path(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 0)
+end.
+func cfg_set_input_path(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 0, val)
+end.
+
+func cfg_get_output_path(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 8)
+end.
+func cfg_set_output_path(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 8, val)
+end.
+
+func cfg_get_target(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 16)
+end.
+func cfg_set_target(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 16, val)
+end.
+
+func cfg_get_out_fmt(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 24)
+end.
+func cfg_set_out_fmt(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 24, val)
+end.
+
+func cfg_get_verbose(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 32)
+end.
+func cfg_set_verbose(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 32, val)
+end.
+
+func cfg_get_emit_asm(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 40)
+end.
+func cfg_set_emit_asm(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 40, val)
 end.
 
 # C-VM bootstrap CALLs may clobber locals that hold aggregate values.  Keep
@@ -105,13 +156,14 @@ var g_virc_diag_file: i64 = 0
 var g_virc_diag_line: i64 = 0
 
 func default_config:
-    out CompilerConfig (
-        input_path:  0,
-        output_path: 0,
-        target:      0,        # ARM64 (default on macOS)
-        out_fmt:     0,        # Mach-O (default on macOS)
-        verbose:     1
-    )
+    let p = vir_alloc(48)
+    native_write_i64(p, 0, 0)
+    native_write_i64(p, 8, 0)
+    native_write_i64(p, 16, 0)
+    native_write_i64(p, 24, 0)
+    native_write_i64(p, 32, 1)
+    native_write_i64(p, 40, 0)
+    out p as CompilerConfig
 end.
 func cstr_ends_with_vri(s: int):
     if s == 0 do out 0 end
@@ -212,10 +264,10 @@ func parse_args:
     end
 
     # First positional argument is the input file
-    cfg.input_path = get_arg(base_idx)
+    cfg_set_input_path(cfg, get_arg(base_idx))
 
     # Default output: a.out
-    cfg.output_path = "a.out"
+    cfg_set_output_path(cfg, "a.out" as int)
 
     var i = base_idx + 1
     when i < argc loop
@@ -224,24 +276,43 @@ func parse_args:
         if rt_streq(arg, "-o") do
             if i + 1 < argc do
                 i = i + 1
-                cfg.output_path = get_arg(i)
+                cfg_set_output_path(cfg, get_arg(i))
             else
                 print_ln("virc: error_msg: -o requires an argument")
                 exit_prog(1)
             end
 
+        eif rt_streq(arg, "-S") do
+            cfg_set_emit_asm(cfg, 1)
+
         eif rt_streq(arg, "--target") do
             if i + 1 < argc do
                 i = i + 1
                 let tgt = get_arg(i)
-                if rt_streq(tgt, "arm64") or rt_streq(tgt, "aarch64") do
-                    cfg.target = 0
+                if rt_streq(tgt, "macos-arm64") or rt_streq(tgt, "arm64-apple-darwin") or rt_streq(tgt, "darwin-arm64") do
+                    cfg_set_target(cfg, 0)
+                    cfg_set_out_fmt(cfg, 0)
+                eif rt_streq(tgt, "linux-arm64") or rt_streq(tgt, "aarch64-linux") or rt_streq(tgt, "aarch64-unknown-linux-gnu") do
+                    cfg_set_target(cfg, 0)
+                    cfg_set_out_fmt(cfg, 1)
+                eif rt_streq(tgt, "linux-x86_64") or rt_streq(tgt, "x86_64-linux") or rt_streq(tgt, "x86_64-unknown-linux-gnu") do
+                    cfg_set_target(cfg, 1)
+                    cfg_set_out_fmt(cfg, 1)
+                eif rt_streq(tgt, "linux-riscv64") or rt_streq(tgt, "riscv64-linux") or rt_streq(tgt, "riscv64-unknown-linux-gnu") do
+                    cfg_set_target(cfg, 3)
+                    cfg_set_out_fmt(cfg, 1)
+                eif rt_streq(tgt, "wasm32-wasi-p1") or rt_streq(tgt, "wasm32-wasi") or rt_streq(tgt, "wasm32") or rt_streq(tgt, "wasm") do
+                    cfg_set_target(cfg, 2)
+                    cfg_set_out_fmt(cfg, 2)
+                eif rt_streq(tgt, "arm64") or rt_streq(tgt, "aarch64") do
+                    cfg_set_target(cfg, 0)
                 eif rt_streq(tgt, "x86_64") or rt_streq(tgt, "x86-64") do
-                    cfg.target = 1
-                eif rt_streq(tgt, "wasm32") or rt_streq(tgt, "wasm") do
-                    cfg.target = 2
+                    cfg_set_target(cfg, 1)
+                eif rt_streq(tgt, "riscv64") or rt_streq(tgt, "riscv") do
+                    cfg_set_target(cfg, 3)
+                    cfg_set_out_fmt(cfg, 1)
                 else
-                    print_ln("virc: error_msg: unknown target (use arm64, x86_64 or wasm32)")
+                    print_ln("virc: error_msg: unknown target (use macos-arm64, linux-arm64, linux-x86_64, linux-riscv64, wasm32)")
                     exit_prog(1)
                 end
             end
@@ -251,13 +322,15 @@ func parse_args:
                 i = i + 1
                 let fmt = get_arg(i)
                 if rt_streq(fmt, "macho") do
-                    cfg.out_fmt = 0
+                    cfg_set_out_fmt(cfg, 0)
                 eif rt_streq(fmt, "elf") do
-                    cfg.out_fmt = 1
+                    cfg_set_out_fmt(cfg, 1)
                 eif rt_streq(fmt, "wasm") do
-                    cfg.out_fmt = 2
+                    cfg_set_out_fmt(cfg, 2)
+                eif rt_streq(fmt, "asm") or rt_streq(fmt, "s") do
+                    cfg_set_emit_asm(cfg, 1)
                 else
-                    print_ln("virc: error_msg: unknown format (use macho, elf or wasm)")
+                    print_ln("virc: error_msg: unknown format (use macho, elf, wasm or asm)")
                     exit_prog(1)
                 end
             end
@@ -278,7 +351,7 @@ func parse_args:
             set_pipeline_opt_level(3)
 
         eif rt_streq(arg, "-q") or rt_streq(arg, "--quiet") do
-            cfg.verbose = 0
+            cfg_set_verbose(cfg, 0)
 
         eif rt_streq(arg, "-v") or rt_streq(arg, "--version") do
             print_ln(VERSION)
@@ -311,21 +384,24 @@ end.
 # ═══════════════════════════════════════════════════════
 
 func virc_compile(cfg: CompilerConfig):
-
-
-    let verbose = cfg.verbose
+    let input_path = cfg_get_input_path(cfg)
+    let output_path = cfg_get_output_path(cfg)
+    let target = cfg_get_target(cfg)
+    let out_fmt = cfg_get_out_fmt(cfg)
+    let verbose = cfg_get_verbose(cfg)
+    let emit_asm = cfg_get_emit_asm(cfg)
 
     # ── Read source file ──
     if verbose == 1 do
         var sb = sb_new()
         sb = sb_append(sb, "virc: reading ")
-        sb = sb_append(sb, cfg.input_path)
+        sb = sb_append(sb, input_path)
         sb = sb_append(sb, "...")
         print_ln(sb_to_string(sb))
         sb_free(sb)
     end
 
-    let source_raw = read_file_str(cfg.input_path)
+    let source_raw = read_file_str(input_path)
     if source_raw == 0 do
         print_ln("virc: error_msg: cannot read input file")
         exit_prog(1)
@@ -344,9 +420,9 @@ func virc_compile(cfg: CompilerConfig):
     # ── Step 0: Preprocess includes + imports ──
     var last_slash = -1
     var pi = 0
-    let path_len = rt_strlen(cfg.input_path)
+    let path_len = rt_strlen(input_path)
     when pi < path_len loop
-        if native_read_u8(cfg.input_path, pi) == 47 do
+        if native_read_u8(input_path, pi) == 47 do
             last_slash = pi
         end
         pi = pi + 1
@@ -355,7 +431,7 @@ func virc_compile(cfg: CompilerConfig):
         let dbuf = vir_alloc(last_slash + 1)
         pi = 0
         when pi < last_slash loop
-            native_write_u8(dbuf, pi, native_read_u8(cfg.input_path, pi))
+            native_write_u8(dbuf, pi, native_read_u8(input_path, pi))
             pi = pi + 1
         end
         native_write_u8(dbuf, last_slash, 0)
@@ -481,7 +557,7 @@ func virc_compile(cfg: CompilerConfig):
         print_ln("virc: running semantic analysis...")
     end
 
-    let sem_errors = semantic_run(ast, cfg.input_path, verbose)
+    let sem_errors = semantic_run(ast, input_path, verbose)
     if sem_errors > 0 do
         let sb_sem = sb_new()
         sb_sem = sb_append(sb_sem, "virc: compilation aborted — ")
@@ -493,25 +569,29 @@ func virc_compile(cfg: CompilerConfig):
     end
 
     # ── Step 3: Target + pipeline (AST -> MIR -> SSA -> MIR Opt -> LIR -> RegAlloc) ──
-    let target_arch = TargetArch.ARM64
-    let target_name = "ARM64"
-    let container_arch = 0
-    if cfg.target == 1 do
+    var target_arch = TargetArch.ARM64
+    var target_name = "ARM64"
+    var container_arch = 0
+    if target == 1 do
         target_arch = TargetArch.X86_64
         target_name = "x86_64"
         container_arch = 1
-    eif cfg.target == 2 do
+    eif target == 2 do
         target_arch = TargetArch.Wasm32
         target_name = "wasm32"
         container_arch = 2
+    eif target == 3 do
+        target_arch = TargetArch.RISCV64
+        target_name = "riscv64"
+        container_arch = 0
     end
-    set_codegen_target(target_arch as int)
+    set_codegen_target(target as int)
 
     if verbose == 1 do
         print_ln("virc: lowering via v2.0 MIR/SSA/LIR pipeline...")
     end
 
-    let lir_funcs = compile_pipeline(cfg.input_path, ast, verbose)
+    let lir_funcs = compile_pipeline(input_path, ast, verbose)
 
     let n_funcs = vec_len_rt(lir_funcs)
 
@@ -579,6 +659,73 @@ func virc_compile(cfg: CompilerConfig):
         end
     end
 
+    # ── Step 4.5: Assembly emission via MCInst pipeline (-S / --format asm) ──
+    if emit_asm == 1 do
+        if verbose == 1 do
+            var sb_v = sb_new()
+            sb_v = sb_append(sb_v, "virc: emitting ")
+            sb_v = sb_append(sb_v, target_name)
+            sb_v = sb_append(sb_v, " assembly (MCInst pipeline)...")
+            print_ln(sb_to_string(sb_v))
+            sb_free(sb_v)
+        end
+
+        var dialect = AsmDialect.DarwinAsm
+        if target == 1 do
+            dialect = AsmDialect.Intel_X86
+        eif target == 3 do
+            dialect = AsmDialect.GNU_RISCV
+        eif out_fmt == 1 do
+            dialect = AsmDialect.GNU_ELF
+        end
+
+        var asm_b = bvec_new()
+        asm_b = print_mc_assembly_prologue(dialect, asm_b)
+
+        var f_asm_idx = 0
+        when f_asm_idx < n_funcs loop
+            let f_obj = vec_get_rt(lir_funcs, f_asm_idx)
+            let f_fat = native_read_i64(f_obj as i64, 8)
+            var f_name = f_fat
+            if f_fat != 0 do
+                f_name = native_read_i64(f_fat, 0)
+            end
+            asm_b = print_mc_function_header(f_name as int, dialect, asm_b)
+
+            let mc_insts = lir_func_to_mc(f_obj, 0 - 1, target as int)
+            let n_mc = vec_len_rt(mc_insts)
+            var mc_i = 0
+            when mc_i < n_mc loop
+                let mc_ins = vec_get_rt(mc_insts, mc_i)
+                asm_b = print_mc_inst(mc_ins as MCInst, dialect, asm_b)
+                mc_i = mc_i + 1
+            end
+
+            asm_b = print_mc_function_footer(f_name as int, dialect, asm_b)
+            f_asm_idx = f_asm_idx + 1
+        end
+
+        asm_b = print_mc_runtime_stubs(dialect, asm_b)
+
+        var out_asm_path = output_path
+        if rt_streq(out_asm_path, "a.out") do
+            out_asm_path = "a.s"
+        end
+
+        write_file_bytes(out_asm_path, asm_b, bvec_len(asm_b), 0o644)
+        bvec_free(asm_b)
+
+        if verbose == 1 do
+            var sb_done = sb_new()
+            sb_done = sb_append(sb_done, "virc: done! ")
+            sb_done = sb_append(sb_done, out_asm_path)
+            sb_done = sb_append(sb_done, " (assembly)")
+            print_ln(sb_to_string(sb_done))
+            sb_free(sb_done)
+        end
+        out 0
+    end
+
     # ── Step 5: Code Generation directly from LIR ──
     if verbose == 1 do
         var sb = sb_new()
@@ -591,7 +738,7 @@ func virc_compile(cfg: CompilerConfig):
 
     var code = codebuf_new(target_arch)
     var is_linux = 0
-    if cfg.out_fmt == 1 do
+    if out_fmt == 1 do
         is_linux = 1
     end
     if target_arch == TargetArch.ARM64 do
@@ -615,9 +762,9 @@ func virc_compile(cfg: CompilerConfig):
     # ── Step 6: Emit executable ──
     if verbose == 1 do
         var fmt_name = "Mach-O"
-        if cfg.out_fmt == 1 do
+        if out_fmt == 1 do
             fmt_name = "ELF"
-        eif cfg.out_fmt == 2 or cfg.target == 2 do
+        eif out_fmt == 2 or target == 2 do
             fmt_name = "WASM"
         end
         var sb = sb_new()
@@ -630,7 +777,7 @@ func virc_compile(cfg: CompilerConfig):
         sb_free(sb)
     end
 
-    if cfg.target == 2 or cfg.out_fmt == 2 do
+    if target == 2 or out_fmt == 2 do
         # WASM output: build QIRFunc list from LIR, emit .wasm
         var wasm_funcs = vec_new<QIRFunc>()
         var wfi = 0
@@ -644,8 +791,8 @@ func virc_compile(cfg: CompilerConfig):
             ))
             wfi = wfi + 1
         end
-        wasm_write_module(wasm_funcs, cfg.output_path)
-    eif cfg.out_fmt == 0 do
+        wasm_write_module(wasm_funcs, output_path)
+    eif out_fmt == 0 do
         # Mach-O
         # Use the target value already selected for codegen. Reloading the
         # aggregate cfg.target after the long pipeline is unsafe in native
@@ -655,21 +802,21 @@ func virc_compile(cfg: CompilerConfig):
         let c_entry = native_read_i64(code as i64, 24)
         native_write_i64(mb as i64, 24, c_data)
         native_write_i64(mb as i64, 40, c_entry)
-        macho_write_to_file(mb, cfg.output_path)
+        macho_write_to_file(mb, output_path)
     else
         # ELF
         let eb = elf_new(container_arch)
         let c_data = native_read_i64(code as i64, 8)
         let c_entry = native_read_i64(code as i64, 24)
-        native_write_i64(eb as i64, 16, c_data)
-        native_write_i64(eb as i64, 32, c_entry)
-        elf_write_to_file(eb, cfg.output_path)
+        native_write_i64(eb as i64, 24, c_data)
+        native_write_i64(eb as i64, 40, c_entry)
+        elf_write_to_file(eb, output_path)
     end
 
     if verbose == 1 do
         var sb = sb_new()
         sb = sb_append(sb, "virc: done! ")
-        sb = sb_append(sb, cfg.output_path)
+        sb = sb_append(sb, output_path)
         sb = sb_append(sb, " (")
         sb = sb_append_int(sb, code_size)
         sb = sb_append(sb, " bytes code)")
