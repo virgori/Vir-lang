@@ -103,7 +103,7 @@ fi
 virc_sign "$OUT"
 
 echo "Smoke: cg_arith..."
-SMOKE=/tmp/virc_promote_smoke
+SMOKE=dist/virc_promote_smoke
 rm -f "$SMOKE"
 if "$OUT" tests/bootstrap_codegen/cg_arith.vri -o "$SMOKE"; then
     :
