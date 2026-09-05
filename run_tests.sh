@@ -302,5 +302,8 @@ run_test "tests/vri/test_member_access_chain.vri" "$(printf '100\n200\n5\n999\n8
 # Category I: Integer literal boundary (Lexer boundary)
 run_test "tests/vri/test_int_literal_boundary.vri" "$(printf '9223372036854775807\n9223372036854775806\n0\n1\n-9223372036854775807')"
 
+# Category J: Lexical block scoping (Shadowing in blocks)
+run_test "tests/vri/test_nested_block_scoping.vri" "$(printf '3\n2\n1')"
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
