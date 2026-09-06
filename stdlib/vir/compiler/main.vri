@@ -40,7 +40,7 @@ import Slice, slice_new from slice
 include vir.rt.alloc
 import vir_alloc from vir.rt.alloc
 include vir.rt.string_rt
-import fat_str_new, fat_str_len, fat_str_byte_at, fat_cstr_eq, fat_str_concat, fat_str_eq, rt_streq, str_from_cstr, rt_strlen from vir.rt.string_rt
+import fat_str_new, fat_str_len, fat_str_byte_at, fat_cstr_eq, fat_str_concat, fat_str_eq, rt_streq, str_from_cstr, rt_strlen, rt_itoa, vir_free from vir.rt.string_rt
 include vir.rt.vec_rt
 import bvec_len, bvec_get, vec_len_rt, vec_get_rt, vec_new_rt, vec_push_rt from vir.rt.vec_rt
 include vir.rt.io
@@ -934,6 +934,10 @@ var g_imp_syms = 0
 var g_imp_aliases = 0
 var g_imp_sym_count = 0
 var g_imp_alias = 0;  # optional rename for single-symbol import … as X
+var g_inc_resolved_path = 0;   # C-string of last successfully read file path
+var g_inc_main_file = 0;       # C-string of root input file
+var g_inc_cur_parent_file = 0; # C-string of current file being expanded
+var g_inc_cur_parent_line = 0; # Line number of current include in parent
 
 func g_inc_init:
     if g_inc_tab == 0 do
@@ -941,6 +945,9 @@ func g_inc_init:
     end
     native_write_i64(g_inc_tab, 0, 0)
     g_inc_err = 0
+    g_inc_resolved_path = 0
+    g_inc_cur_parent_file = 0
+    g_inc_cur_parent_line = 0
 end.
 
 func g_inc_norm_key(name: string):
@@ -1107,6 +1114,7 @@ func try_read_file(path_fat: string):
     if raw == 0 do
         out 0
     end
+    g_inc_resolved_path = cstr
     out str_from_cstr(raw)
 end.
 
@@ -1553,41 +1561,301 @@ func text_ascii_sanitize(source: string):
     out str_from_cstr(buf)
 end.
 
+func inc_locate_marker_before(source: string, at: int):
+    data = native_read_i64(source as i64, 0)
+    n = native_read_i64(source as i64, 8)
+    var limit = at
+    if limit > n do
+        limit = n
+    end
+    var pos = 0
+    var cur_line = 1
+    var cur_file = "<main>" as i64
+    if g_inc_main_file != 0 do
+        cur_file = g_inc_main_file
+    end
+
+    when pos < limit loop
+        let line_start = pos
+        when pos < limit and native_read_u8(data, pos) != 10 loop
+            pos = pos + 1
+        end
+        let line_end = pos
+
+        # Check for "# @vir_source " (14 bytes)
+        var is_marker = 0
+        if line_end - line_start >= 15 do
+            if native_read_u8(data, line_start) == 35 and native_read_u8(data, line_start + 1) == 32 and native_read_u8(data, line_start + 2) == 64 and native_read_u8(data, line_start + 3) == 118 and native_read_u8(data, line_start + 4) == 105 and native_read_u8(data, line_start + 5) == 114 and native_read_u8(data, line_start + 6) == 95 and native_read_u8(data, line_start + 7) == 115 and native_read_u8(data, line_start + 8) == 111 and native_read_u8(data, line_start + 9) == 117 and native_read_u8(data, line_start + 10) == 114 and native_read_u8(data, line_start + 11) == 99 and native_read_u8(data, line_start + 12) == 101 and native_read_u8(data, line_start + 13) == 32 do
+                is_marker = 1
+            end
+        end
+
+        if is_marker == 1 do
+            let path_start = line_start + 14
+            var sep = path_start
+            when sep < line_end and native_read_u8(data, sep) != 32 loop
+                sep = sep + 1
+            end
+            let path_len = sep - path_start
+            let path_buf = vir_alloc(path_len + 1)
+            var j = 0
+            when j < path_len loop
+                native_write_u8(path_buf, j, native_read_u8(data, path_start + j))
+                j = j + 1
+            end
+            native_write_u8(path_buf, path_len, 0)
+            cur_file = path_buf
+            cur_line = 0
+            var k = sep + 1
+            when k < line_end loop
+                let c = native_read_u8(data, k)
+                if c >= 48 and c <= 57 do
+                    cur_line = cur_line * 10 + c - 48
+                end
+                k = k + 1
+            end
+        else
+            cur_line = cur_line + 1
+        end
+
+        if pos < limit and native_read_u8(data, pos) == 10 do
+            pos = pos + 1
+        end
+    end
+
+    g_inc_cur_parent_file = cur_file
+    g_inc_cur_parent_line = cur_line
+    out 0
+end.
+
+func inc_prepend_root_marker(source: string):
+    let sdata = native_read_i64(source as i64, 0)
+    let slen = native_read_i64(source as i64, 8)
+    if slen >= 15 do
+        if native_read_u8(sdata, 0) == 35 and native_read_u8(sdata, 1) == 32 and native_read_u8(sdata, 2) == 64 do
+            out source
+        end
+    end
+    var root_f = "<main>" as i64
+    if g_inc_main_file != 0 do
+        root_f = g_inc_main_file
+    end
+    let flen = rt_strlen(root_f)
+    let total = 17 + flen + slen
+    let buf = vir_alloc(total + 1)
+    native_write_u8(buf, 0, 35)
+    native_write_u8(buf, 1, 32)
+    native_write_u8(buf, 2, 64)
+    native_write_u8(buf, 3, 118)
+    native_write_u8(buf, 4, 105)
+    native_write_u8(buf, 5, 114)
+    native_write_u8(buf, 6, 95)
+    native_write_u8(buf, 7, 115)
+    native_write_u8(buf, 8, 111)
+    native_write_u8(buf, 9, 117)
+    native_write_u8(buf, 10, 114)
+    native_write_u8(buf, 11, 99)
+    native_write_u8(buf, 12, 101)
+    native_write_u8(buf, 13, 32)
+    var i = 0
+    when i < flen loop
+        native_write_u8(buf, 14 + i, native_read_u8(root_f, i))
+        i = i + 1
+    end
+    native_write_u8(buf, 14 + flen, 32)
+    native_write_u8(buf, 15 + flen, 49)
+    native_write_u8(buf, 16 + flen, 10)
+    i = 0
+    when i < slen loop
+        native_write_u8(buf, 17 + flen + i, native_read_u8(sdata, i))
+        i = i + 1
+    end
+    native_write_u8(buf, total, 0)
+    out str_from_cstr(buf)
+end.
+
+func inc_wrap_source(body: string, r_path: int, p_file: int, p_line: int):
+    let bdata = native_read_i64(body as i64, 0)
+    let blen = native_read_i64(body as i64, 8)
+    let rlen = rt_strlen(r_path)
+    let plen = rt_strlen(p_file)
+    let pline_str = rt_itoa(p_line)
+    let pline_len = rt_strlen(pline_str)
+    var need_nl = 0
+    if blen > 0 and native_read_u8(bdata, blen - 1) != 10 do
+        need_nl = 1
+    end
+    let total = 17 + rlen + blen + need_nl + 16 + plen + pline_len
+    let buf = vir_alloc(total + 1)
+    native_write_u8(buf, 0, 35)
+    native_write_u8(buf, 1, 32)
+    native_write_u8(buf, 2, 64)
+    native_write_u8(buf, 3, 118)
+    native_write_u8(buf, 4, 105)
+    native_write_u8(buf, 5, 114)
+    native_write_u8(buf, 6, 95)
+    native_write_u8(buf, 7, 115)
+    native_write_u8(buf, 8, 111)
+    native_write_u8(buf, 9, 117)
+    native_write_u8(buf, 10, 114)
+    native_write_u8(buf, 11, 99)
+    native_write_u8(buf, 12, 101)
+    native_write_u8(buf, 13, 32)
+    var out_i = 14
+    var i = 0
+    when i < rlen loop
+        native_write_u8(buf, out_i, native_read_u8(r_path, i))
+        out_i = out_i + 1
+        i = i + 1
+    end
+    native_write_u8(buf, out_i, 32)
+    native_write_u8(buf, out_i + 1, 49)
+    native_write_u8(buf, out_i + 2, 10)
+    out_i = out_i + 3
+    i = 0
+    when i < blen loop
+        native_write_u8(buf, out_i, native_read_u8(bdata, i))
+        out_i = out_i + 1
+        i = i + 1
+    end
+    if need_nl == 1 do
+        native_write_u8(buf, out_i, 10)
+        out_i = out_i + 1
+    end
+    native_write_u8(buf, out_i, 35)
+    native_write_u8(buf, out_i + 1, 32)
+    native_write_u8(buf, out_i + 2, 64)
+    native_write_u8(buf, out_i + 3, 118)
+    native_write_u8(buf, out_i + 4, 105)
+    native_write_u8(buf, out_i + 5, 114)
+    native_write_u8(buf, out_i + 6, 95)
+    native_write_u8(buf, out_i + 7, 115)
+    native_write_u8(buf, out_i + 8, 111)
+    native_write_u8(buf, out_i + 9, 117)
+    native_write_u8(buf, out_i + 10, 114)
+    native_write_u8(buf, out_i + 11, 99)
+    native_write_u8(buf, out_i + 12, 101)
+    native_write_u8(buf, out_i + 13, 32)
+    out_i = out_i + 14
+    i = 0
+    when i < plen loop
+        native_write_u8(buf, out_i, native_read_u8(p_file, i))
+        out_i = out_i + 1
+        i = i + 1
+    end
+    native_write_u8(buf, out_i, 32)
+    out_i = out_i + 1
+    i = 0
+    when i < pline_len loop
+        native_write_u8(buf, out_i, native_read_u8(pline_str, i))
+        out_i = out_i + 1
+        i = i + 1
+    end
+    native_write_u8(buf, out_i, 10)
+    out_i = out_i + 1
+    native_write_u8(buf, out_i, 0)
+    vir_free(pline_str)
+    out str_from_cstr(buf)
+end.
+
+func inc_make_dup_comment(iname_cstr: int):
+    let ilen = rt_strlen(iname_cstr)
+    let total = 29 + ilen
+    let buf = vir_alloc(total + 1)
+    native_write_u8(buf, 0, 35)
+    native_write_u8(buf, 1, 32)
+    native_write_u8(buf, 2, 91)
+    native_write_u8(buf, 3, 105)
+    native_write_u8(buf, 4, 110)
+    native_write_u8(buf, 5, 99)
+    native_write_u8(buf, 6, 108)
+    native_write_u8(buf, 7, 117)
+    native_write_u8(buf, 8, 100)
+    native_write_u8(buf, 9, 101)
+    native_write_u8(buf, 10, 32)
+    var i = 0
+    when i < ilen loop
+        native_write_u8(buf, 11 + i, native_read_u8(iname_cstr, i))
+        i = i + 1
+    end
+    let p2 = 11 + ilen
+    native_write_u8(buf, p2 + 0, 32)
+    native_write_u8(buf, p2 + 1, 97)
+    native_write_u8(buf, p2 + 2, 108)
+    native_write_u8(buf, p2 + 3, 114)
+    native_write_u8(buf, p2 + 4, 101)
+    native_write_u8(buf, p2 + 5, 97)
+    native_write_u8(buf, p2 + 6, 100)
+    native_write_u8(buf, p2 + 7, 121)
+    native_write_u8(buf, p2 + 8, 32)
+    native_write_u8(buf, p2 + 9, 101)
+    native_write_u8(buf, p2 + 10, 120)
+    native_write_u8(buf, p2 + 11, 112)
+    native_write_u8(buf, p2 + 12, 97)
+    native_write_u8(buf, p2 + 13, 110)
+    native_write_u8(buf, p2 + 14, 100)
+    native_write_u8(buf, p2 + 15, 101)
+    native_write_u8(buf, p2 + 16, 100)
+    native_write_u8(buf, p2 + 17, 93)
+    native_write_u8(buf, total, 0)
+    out str_from_cstr(buf)
+end.
+
 func expand_includes_text(source: string):
     g_inc_init()
-    guard = 0
+    g_inc_resolved_path = 0
+
+    let first_inc = text_find_include(source)
+    if first_inc < 0 do
+        out source
+    end
+
+    source = inc_prepend_root_marker(source)
+
+    var guard = 0
     when guard < G_PREPROCESS_MAX loop
         guard = guard + 1
-        at = text_find_include(source)
+        let at = text_find_include(source)
         if at < 0 do
             out source
         end
-        iname = text_parse_include_name(source, at)
+        let iname = text_parse_include_name(source, at)
         if iname == 0 do
             print_str("virc: include error: failed to parse include statement name\n")
             g_inc_err = 1
             out source
         end
         if g_inc_has(iname) == 1 do
-            # Already expanded — drop the duplicate include line.
-            end_at = text_skip_include_stmt(source, at)
-            ebuf = vir_alloc(1)
-            native_write_u8(ebuf, 0, 0)
-            empty = str_from_cstr(ebuf)
-            source = text_splice_at(source, at, end_at, empty)
+            let end_at = text_skip_include_stmt(source, at)
+            let dup_str = inc_make_dup_comment(native_read_i64(iname as i64, 0))
+            source = text_splice_at(source, at, end_at, dup_str)
         else
             g_inc_mark(iname)
-            body = read_include_source(iname)
+            g_inc_resolved_path = 0
+            var body = read_include_source(iname)
             if body == 0 do
+                inc_locate_marker_before(source, at)
                 print_str("virc: include fail: module not found: '")
-                print_str(native_read_i64(iname, 0))
-                print_str("'\n")
+                print_str(native_read_i64(iname as i64, 0))
+                print_str("' requested at ")
+                print_str(g_inc_cur_parent_file)
+                print_str(":")
+                print_int(g_inc_cur_parent_line)
+                print_str("\n")
                 g_inc_err = 1
                 out source
             end
             body = text_ascii_sanitize(body)
-            end_at = text_skip_include_stmt(source, at)
-            source = text_splice_at(source, at, end_at, body)
+            let end_at = text_skip_include_stmt(source, at)
+            inc_locate_marker_before(source, at)
+            let p_file = g_inc_cur_parent_file
+            let p_line = g_inc_cur_parent_line
+            var r_path = g_inc_resolved_path
+            if r_path == 0 do
+                r_path = native_read_i64(iname as i64, 0)
+            end
+            let wrapped_body = inc_wrap_source(body, r_path, p_file, p_line + 1)
+            source = text_splice_at(source, at, end_at, wrapped_body)
         end
     end
     if guard >= G_PREPROCESS_MAX do
@@ -2460,4 +2728,4 @@ func compiler_legacy_main:
     result = compile(source, output_path)
     out result
 end.
-export compile, main, codegen_emit_module, emit_runtime_arm64, emit_macho_executable, emit_macho_with_entry, FuncLayout, expand_includes_text, expand_imports_text, text_ascii_sanitize, g_inc_base, g_inc_err
+export compile, main, codegen_emit_module, emit_runtime_arm64, emit_macho_executable, emit_macho_with_entry, FuncLayout, expand_includes_text, expand_imports_text, text_ascii_sanitize, g_inc_base, g_inc_err, g_inc_main_file

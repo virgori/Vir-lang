@@ -35,17 +35,8 @@ echo ""
 mkdir -p dist
 rm -f "$OUT"
 
-echo "Pre-expand includes (offline, no C-VM)..."
-if ! python3 tools/preexpand_virc.py; then
-    echo "FAIL: preexpand_virc.py"
-    exit 1
-fi
-if [ ! -f "$EXPANDED" ]; then
-    echo "FAIL: missing $EXPANDED"
-    exit 1
-fi
-SRC="$EXPANDED"
-echo "Source:          $SRC ($(stat -f%z "$SRC" 2>/dev/null || stat -c%s "$SRC") bytes, includes already expanded)"
+SRC="stdlib/vir/compiler/virc.vri"
+echo "Source:          $SRC ($(stat -f%z "$SRC" 2>/dev/null || stat -c%s "$SRC") bytes, compiler self-expands includes)"
 echo ""
 echo "Compiling full compiler (progress on; set VIRC_PROMOTE_QUIET=1 to silence)..."
 echo "Tip: VIRC_NICE=10 lowers CPU priority; VIRC_PROMOTE_OPTS='-O0' speeds debug builds."

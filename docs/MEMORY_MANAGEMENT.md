@@ -1,217 +1,166 @@
 # Vir Memory Management Architecture & Specification
 
-**Language Version**: v2.1.0  
-**Target Architectures**: Apple Silicon ARM64, Linux x86_64, WebAssembly WASM32  
-**Specification Level**: Master Technical Reference (Spec §11)
+**Language baseline**: v2.1.0
+**Scope**: Memory architecture, allocator cost model, and implementation boundaries (Spec §11)
+**Target scope**: Native OS-backed allocation and target-specific backends; WebAssembly requires a separate linear-memory implementation.
+
+This document distinguishes design intent from implementation observations. The presence of an API or compiler pass does not establish that every backend implements its contract. Performance and safety claims require validation against a particular compiler build, target, and workload.
 
 ---
 
-## 1. Executive Summary & Design Philosophy
+## 1. Design Philosophy
 
-The Vir programming language is engineered for systems-level execution where memory safety, deterministic latency, and maximum hardware throughput are critical. Unlike managed languages (Java, Go, C#) that rely on a runtime Garbage Collector (GC), and unlike pure manual languages (C) that lack compile-time lifecycle guarantees, **Vir employs a Multi-Tier Deterministic Memory Architecture**:
+Vir separates memory management into five layers with different lifetime and cost models:
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                       VIR HYBRID MEMORY ARCHITECTURE                         │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  1. Compile-Time Escape & Borrow Analysis (Zero-Cost Stack / SROA)          │
-│  2. Region-Based Bump Arena Allocator (O(1) Sequential + Batch Reset)       │
-│  3. Free-List Coalescing Heap Allocator (General Dynamic Lifetime)          │
-│  4. Size-Class Slab Allocator (High-Throughput IO / Tensor Buffers)         │
-│  5. Direct Kernel Page Allocator (mmap / munmap / madvise / mbind)          │
-└─────────────────────────────────────────────────────────────────────────────┘
+1. Compile-time escape analysis / SROA → registers or stack where eligible
+2. Region-based bump arenas           → phase or request lifetime
+3. Free-list heap                     → independent dynamic lifetimes
+4. Size-class slab pools              → repeated buffer allocation and reuse
+5. Platform page allocator            → backing virtual memory
 ```
 
-### Core Tenets:
-1. **Zero Garbage Collection (0 ms GC Pause):** No background tracing, no Stop-The-World (STW) pauses, and zero runtime thread stalls.
-2. **Zero-Libc Kernel Discipline:** Memory allocation directly interfaces with OS kernel supervisor calls (`mmap` / `munmap` on macOS Darwin and Linux), completely bypassing C runtime `malloc`/`free`.
-3. **Hardware-Aligned Coalescing:** All heap allocations enforce **16-byte alignment** for SIMD (ARM64 NEON / x86 AVX2) instructions.
-4. **Predictable Deallocation:** Every memory region has a strictly defined lifecycle bound to lexical scopes, arenas, or explicit ownership transfers.
+These are cooperating mechanisms, not five mandatory steps for every allocation. Slab pools and general heaps can obtain backing memory directly from the platform layer.
+
+The intended rule is: **non-escaping entities are candidates for scalar/register/stack placement; escaping data requires an allocator and an explicit lifetime policy.** Escape alone does not choose the allocator: an escaping object may still fit a caller-owned arena. The arena must outlive every use of that object.
+
+### Core principles
+
+- **No required tracing GC in these allocator paths.** This removes tracing-GC pauses, not all latency: allocation can still incur page faults, kernel work, synchronization, or scheduling delays.
+- **Explicit allocation paths.** `arena_alloc` expresses region lifetime; general heap allocation requires a matching ownership and release policy. API names alone do not prove the selected backend implementation.
+- **Backend-specific runtime dependencies.** The native `vir/rt/alloc` path uses syscall-backed allocation. The separate `vir/mem/alloc` interface calls `native_malloc`, `native_calloc`, `native_realloc`, and `native_free`; their lowering determines the actual runtime dependency. Zero-libc is not a blanket guarantee for every Vir allocation API.
+- **Alignment is a contract.** The native runtime declares 16-byte alignment. This does not satisfy every possible SIMD or over-aligned type requirement; those require an appropriate aligned-allocation path.
+- **Defined lifetimes.** Stack, arena, and heap lifetimes must be respected. Raw-pointer operations require additional care beyond what static analysis can establish.
 
 ---
 
 ## 2. Compile-Time Memory Passes
 
-Vir's self-hosted modular compiler (`virc`) eliminates runtime allocation overhead through static optimization passes:
+### 2.1. Escape analysis and SROA
 
-### 2.1. Escape Analysis & SROA (Scalar Replacement of Aggregates)
-- The compiler analyzes whether an `entity` or temporary buffer escapes the local function frame.
-- **Non-escaping entities** are flattened into scalar CPU registers or placed on the call stack frame (`[SP, #offset]`), reducing heap allocation rate to zero for local variables.
+Escape analysis and scalar replacement can remove eligible aggregate allocations, place scalars in registers, or reserve stack storage. Non-escaping status is an optimization opportunity, not a guarantee that every local entity or temporary buffer avoids the heap. Address-taking, aliasing, representation constraints, and backend support affect the result.
 
-### 2.2. Lexical Borrow & Ownership Tracking (`sem_pass8_borrow.vri`)
-- Tracks pointer provenance and lifetimes across lexical blocks.
-- Flags double-free and use-after-free conditions statically before machine code emission.
+Verify allocation elimination in generated IR or machine code for the exact build and optimization settings. Stack placement still consumes stack space; register values may spill.
+
+### 2.2. Borrow and ownership analysis
+
+`sem_pass8_borrow.vri` is the compiler's borrow-analysis pass. Its existence does not establish complete pointer-provenance tracking or universal detection of double-free and use-after-free. Document guarantees only for cases supported and exercised by regression tests, particularly around raw pointers, casts, foreign calls, and explicit allocator operations.
 
 ---
 
-## 3. Runtime Allocator Architecture (`stdlib/vir/rt/alloc.vri`)
+## 3. Runtime Allocator Architecture
 
-The Vir runtime provides three built-in allocation mechanisms:
+### 3.1. Platform page allocation
+
+`stdlib/vir/rt/alloc.vri` provides `page_alloc` and `page_free` as backing-memory operations for the native runtime.
+
+**Page size belongs to the target platform, not the instruction-set name alone.** The current source declares `PAGE_SIZE = 16384` with a macOS ARM64 comment. Treat this as a target-specific implementation choice, not a universal constant. An ARM64 target does not by itself establish a 4 KiB or 16 KiB page size.
+
+A portable backend must obtain the applicable granularity from platform initialization or a validated target configuration. A future query such as `platform_page_size()` would be an API proposal, not an existing API asserted by this document. WebAssembly linear-memory pages must be handled under its own backend contract.
+
+The required allocation contract is:
+
+1. Validate the size and check for overflow before rounding.
+2. Round to the applicable allocation granularity.
+3. Request backing memory and interpret failure using the platform syscall/error convention.
+4. Preserve the mapping extent needed for release.
+
+Do not assume a raw syscall failure is always represented by a negative integer. The platform adapter must normalize errors consistently with callers.
+
+Mapping or unmapping memory involves OS work. Reserving virtual memory does not guarantee that all pages are resident or that later accesses avoid page faults.
+
+### 3.2. Region-based bump arenas
+
+An arena groups allocations under one lifetime. Its bookkeeping is:
 
 ```text
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                            KERNEL VIRTUAL MEMORY                            │
-│                      (sys_mmap / sys_munmap / PROT_RW)                      │
-└──────────────────────┬───────────────────────────────┬──────────────────────┘
-                       │                               │
-                       ▼                               ▼
-       ┌───────────────────────────────┐ ┌───────────────────────────┐
-       │   Arena Allocator (Bump)      │ │  Heap Allocator (Free-List│
-       │   [Base | Capacity | Offset]  │ │  [Header | Coalescing]    │
-       └───────────────┬───────────────┘ └─────────────┬─────────────┘
-                       │                               │
-                       ▼                               ▼
-            O(1) Compiler Phases,              General Dynamic
-            Request Lifecycles, AST            Data Structures
+[base address | capacity | current offset]
+
+base → [allocated, aligned ranges][remaining capacity] ← base + capacity
 ```
 
----
+- **`arena_new(size)`** obtains backing memory. The current native implementation enforces a minimum backing size, so a small request need not produce an equally small mapping.
+- **`arena_alloc(arena, size)`** checks capacity and advances an aligned offset. Within an existing arena, allocator bookkeeping is O(1); touching the returned memory may still fault. The current implementation returns 0 when capacity is insufficient.
+- **`arena_reset(arena)`** resets the offset and invalidates prior allocations for further use. Bookkeeping is O(1), with no per-object walk in this implementation. It does not zero memory, run object cleanup, or release the mapping. “One CPU cycle” is not a valid latency guarantee.
+- **`arena_destroy(arena)`** releases the backing mapping. It is independent of the number of objects allocated inside a single arena, but `munmap` has kernel and virtual-memory costs. It is not a constant-cycle operation. A future arena with multiple segments must also account for those segments.
 
-### 3.1. Direct Page Allocator (Kernel Layer)
+Before reset or destruction, finish all uses of the arena's objects and release any non-memory resources they own. Releasing an arena does not automatically close file descriptors or perform arbitrary per-object cleanup.
 
-The foundation of all memory in Vir is the low-level page allocator:
+A request can allocate a 1 KiB input buffer and a 4 KiB parse workspace from the same arena, check both allocation results, use them, and destroy the arena when the request finishes. This expresses the intended lifetime without promising that the entire operation has constant latency.
 
-```vir
-# Low-level mmap/munmap interface (Pure Vir, Zero Libc)
-const PAGE_SIZE:      16384;      # 16KB on Apple Silicon ARM64, 4KB on x86_64
-const MIN_ARENA_SIZE: 1048576;    # 1MB minimum backing segment
+### 3.3. Free-list heap
 
-func page_alloc(size: int):
-    let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE
-    let actual = pages * PAGE_SIZE
-    let ptr = sys_mmap(0, actual, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0)
-    if ptr < 0 do out 0 end
-    out ptr
-end.
+The native runtime implements a first-fit free list for independently released allocations.
 
-func page_free(ptr: int, size: int):
-    let pages = (size + PAGE_SIZE - 1) / PAGE_SIZE
-    let actual = pages * PAGE_SIZE
-    sys_munmap(ptr, actual)
-end.
-```
+The current 16-byte header has a size word and a second word used as free-list linkage when the block is free. It must not be described as a complete boundary-tag layout:
 
----
-
-### 3.2. Region-Based Bump Arena Allocator
-
-The **Arena Allocator** is the fastest memory pattern in Vir ($O(1)$ allocation, $O(1)$ batch reset). It is used extensively across the compiler (AST nodes, token buffers, IR quads) and in high-throughput network handlers.
-
-#### Memory Layout:
 ```text
-┌───────────────────────────────────┬────────────────────────────────────────┐
-│ Allocated Objects (16-byte align) │ Free Capacity (offset -> capacity)     │
-└───────────────────────────────────┴────────────────────────────────────────┘
-▲                                   ▲                                        ▲
-base                                offset                                capacity
+[size: total block bytes][next free pointer when free][payload]
+          8 bytes                 8 bytes             starts at +16
 ```
 
-#### Operations:
-- **`arena_new(size)`**: Obtains memory directly from `sys_mmap`.
-- **`arena_alloc(arena, size)`**: Advances `offset` forward by 16-byte aligned `size`. Zero search cost ($O(1)$).
-- **`arena_reset(arena)`**: Sets `offset = 0` in a single CPU cycle ($O(1)$), reusing the entire block without OS kernel context switches.
-- **`arena_destroy(arena)`**: Releases the backing virtual memory pages via `sys_munmap`.
+Allocation searches free blocks and may split a sufficiently large block. First-fit search is O(F) in the number of free-list entries examined, not unconditionally O(1).
+
+**Current coalescing limitation:** `heap_free` merges with the immediately following physical block only when that block equals `g_heap.free_head`; otherwise it pushes the released block onto the list. This is not general bidirectional coalescing.
+
+A bidirectional design needs a way to identify the preceding physical block: for example, boundary tags, `prev_size`, an address-ordered search, or external metadata. The two-word layout above alone does not provide O(1) backward-neighbor lookup. Any proposed metadata must also specify region boundaries and split/merge updates.
+
+Coalescing can reduce external fragmentation; it does not eliminate it. Alignment, minimum block size, and splitting policy also introduce internal fragmentation. Workload measurements are needed to quantify both.
+
+### 3.4. Size-class slab pools
+
+`core/src/slab_alloc.c` contains a C implementation of reusable size-class pools. Its presence does not establish that a particular self-hosted native compiler uses this path.
+
+The configured region classes are 64 KiB, 1 MiB, 8 MiB, and 64 MiB. Headers occupy part of these regions; class size must not be presented as an unconditional usable-payload size. Oversized allocations use a separate mapping path.
+
+Reusing a cached region requires O(1) stack bookkeeping. Pool misses obtain fresh backing memory; oversized frees and frees to a full cache may release mappings.
+
+Reuse can avoid a new mapping syscall and often reuses resident pages. It does **not** guarantee absence of page faults: memory pressure or explicit page reclamation can make future accesses fault again.
+
+The current implementation uses a global singleton with ordinary pool counters and free-stack accesses. Do not describe it as a lock-free thread-local allocator or promise safe concurrent use without a defined synchronization or ownership policy.
 
 ---
 
-### 3.3. Free-List Coalescing Heap Allocator
+## 4. Standard Library API Boundaries
 
-For long-lived, dynamically resized objects with heterogeneous lifetimes, Vir provides a **First-Fit Free-List Heap Allocator** with automatic block coalescing.
+`vir/mem/alloc` and `vir/rt/alloc` are distinct interfaces. Resolve the imported module and backend before reasoning about an allocation's implementation.
 
-#### Block Layout:
-```text
-┌──────────────────┬──────────────────┬──────────────────────────────────────┐
-│  size: i64       │  flags: i64      │  User Payload (16-byte aligned)      │
-│  (Total bytes)   │  (FREE or USED)  │  (returned pointer)                  │
-└──────────────────┴──────────────────┴──────────────────────────────────────┘
-▲                                     ▲
-block_ptr                             user_ptr (block_ptr + 16)
-```
+The general-memory interface provides `alloc`, `alloc_zeroed`, `try_alloc`, `realloc`, and `free` through native allocation hooks. The native runtime defines arena operations `arena_new`, `arena_alloc`, `arena_reset`, and `arena_destroy`, along with its heap and page operations. This listing describes API roles, not interchangeable signatures or a guarantee of identical failure semantics.
 
-#### Coalescing & Splitting Algorithm:
-1. **Allocation (`heap_alloc`)**:
-   - Traverses the singly-linked free list (`free_head`).
-   - If a free block of `size >= needed` is found:
-     * If `remainder >= 32 bytes`: **Splits** the block into `USED` block and a new `FREE` block.
-     * Otherwise: Marks the entire block as `USED`.
-2. **Deallocation (`heap_free`)**:
-   - Marks block as `BLOCK_FREE`.
-   - **Bidirectional Coalescing**: Inspects adjacent physical neighbors; merges consecutive free blocks into a single large continuous chunk to eliminate external memory fragmentation.
+A complete allocator contract must state:
+
+- Zero-size and allocation-failure behavior.
+- Alignment and overflow handling.
+- Whether memory is initialized.
+- Ownership, valid release operations, and behavior on failed reallocation.
+- Thread-safety and backend dependencies.
+
+Read source together with the selected native-hook lowering to determine the concrete memory path. Generated code and runtime tests establish whether the intended path is actually taken.
 
 ---
 
-### 3.4. Size-Class Slab Allocator (High-Throughput IO)
+## 5. Cost Model and Comparison Method
 
-For high-concurrency network servers and tensor computations, Vir includes a dedicated **Slab Allocator** (`core/src/slab_alloc.c`):
+No fixed runtime-size or pause-time ranking is specified here. Allocator/runtime code occupies space even without a GC; binary size also depends on linking, optimization, enabled features, and the target.
 
-| Size Class | Buffer Size | Target Workload |
-| :--- | :---: | :--- |
-| **Class 0** | 64 KB | Network packet buffers, JSON parse chunks |
-| **Class 1** | 1 MB | Standard file slurp buffers, AST tables |
-| **Class 2** | 8 MB | Matrix / Tensor intermediate buffers |
-| **Class 3** | 64 MB | Large audio/video buffers, batch neural layers |
+Useful distinctions are:
 
-- **Allocation Speed:** $O(1)$ pop from lock-free thread-local free-stacks.
-- **Zero Kernel Overhead:** Reuses pre-allocated virtual memory slabs without triggering page faults.
+- **Scalar/stack placement:** can eliminate a heap operation for eligible values; does not imply zero instructions or zero memory use.
+- **Arena reset:** constant bookkeeping for one arena; does not perform object-specific cleanup.
+- **Arena destruction:** releases backing mappings; measure OS cost separately from object count.
+- **General heap:** search, fragmentation, and release costs depend on implementation and allocation history.
+- **Slab reuse:** cheap cached allocation, with retained-memory and size-class tradeoffs.
 
----
+Language ownership rules alone do not determine fragmentation. Cross-language comparisons must name the actual allocator, runtime version, target, build flags, and workload. Compare equivalent resource-cleanup semantics rather than treating bulk arena release, individual destruction, and tracing collection as identical operations.
 
-## 4. Standard Library Memory API (`vir/mem/alloc`)
-
-### 4.1. Core Functions
-
-```vir
-# General Heap Allocation
-func alloc(size: int) -> ptr
-func alloc_zeroed(size: int) -> ptr
-func try_alloc(size: int) -> Result[ptr, AllocError]
-func realloc(p: ptr, new_size: int) -> ptr
-func free(p: ptr)
-
-# Region Arena Management
-func arena_new(size: int) -> Arena
-func arena_alloc(arena: Arena, size: int) -> ptr
-func arena_reset(arena: Arena) -> Arena
-func arena_destroy(arena: Arena)
-```
-
-### 4.2. Concrete Usage Example
-
-```vir
-func process_request:
-    # 1. Create a 64KB local request arena
-    let arena = arena_new(65536)
-
-    # 2. Fast sequential allocation (O(1))
-    let req_buf = arena_alloc(arena, 1024)
-    let json_tree = arena_alloc(arena, 4096)
-
-    # 3. Use buffers...
-    write_byte(req_buf, 0, 123)
-
-    # 4. Instant O(1) cleanup — frees all allocations simultaneously
-    arena_destroy(arena)
-end.
-```
+For reproducible measurements, record binary size and runtime dependencies, allocation throughput, tail latency, peak/resident memory, retained pool capacity, page faults, and syscall counts. Separate warmed-cache results from first-touch and pool-growth behavior.
 
 ---
 
-## 5. Comparative Memory Matrix
+## 6. Verification and Memory Diagnostics
 
-| Metric | Vir (v2.1.0) | C (malloc/free) | Rust (Ownership/Borrow) | Go (GC) |
-| :--- | :---: | :---: | :---: | :---: |
-| **Garbage Collector** | **None (Zero-GC)** | None | None | Tracing Concurrent GC |
-| **Pause Time (STW)** | **0.0 ms** | 0.0 ms | 0.0 ms | 0.5 – 5.0 ms |
-| **Runtime Overhead** | **0 KB** | ~8 KB (`libc`) | ~30 KB (`libstd`) | ~1.2 MB (GC runtime) |
-| **Syscall Interface** | **Direct Kernel (`mmap`)** | `brk` / `mmap` via libc | Allocator API via libc | Direct Syscalls |
-| **Bulk Free Complexity** | **$O(1)$ (Arena)** | $O(N)$ individual free | $O(N)$ Drop traversal | $O(N)$ Mark-and-Sweep |
-| **Memory Fragmentation** | **Low (Arena + Slab)** | High (Classic heap) | Low to Medium | Low (Compacting/Slab) |
+Validation should cover zero-initialization, alignment, allocation isolation, capacity exhaustion, size overflow, failure propagation, realloc behavior, and arena lifetime boundaries. Tests must assert expected results; the existence of a test file is not evidence of a passing implementation.
 
----
+Inspect IR or machine code to verify stack/SROA claims. Test actual coalescing cases and free-list invariants before claiming stronger heap behavior. Concurrent use requires separate synchronization tests.
 
-## 6. Verification & Memory Diagnostics
-
-Vir provides built-in memory isolation testing:
-- **`cg_mem_alloc_zero.vri`**: Verifies zero-initialization semantics.
-- **`cg_mem_alloc_isolation.vri`**: Verifies 16-byte alignment and boundary isolation between consecutive memory blocks.
-- **Valgrind / AddressSanitizer Compatibility**: Memory maps are tracked with native ASan annotations when compiling with debugging symbols.
+Debug symbols alone do not enable AddressSanitizer instrumentation or make a custom allocator visible to Valgrind. Tool support depends on the backend, platform, generated instrumentation, and any custom-allocator integration. No automatic sanitizer integration is guaranteed by this document.

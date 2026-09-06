@@ -80,6 +80,8 @@ void signer_key_fingerprint(const signer_t *s,
 
 /* Random bytes (platform-agnostic) */
 int vir_random_bytes(void *buf, size_t len);
+/* Vir stdlib FFI alias (crypto/rng.vri, crypto/crypto.vri) */
+int native_getrandom(void *buf, size_t len);
 
 /* Hex conversion */
 void vir_hex_encode(const uint8_t *data, size_t len,

@@ -29,10 +29,34 @@ const fallbackKeywords = [
   "grad",
   "embed",
   "train",
+  "and",
+  "or",
   "xor",
+  "not",
+  "shl",
   "shr",
-  "shl"
+  "mod",
+  "bit_and",
+  "bit_or",
+  "bit_xor",
+  "bit_shl",
+  "bit_shr"
 ];
+
+const bitwiseOps = new Set([
+  "and",
+  "or",
+  "xor",
+  "not",
+  "shl",
+  "shr",
+  "mod",
+  "bit_and",
+  "bit_or",
+  "bit_xor",
+  "bit_shl",
+  "bit_shr"
+]);
 
 function registerFallbackCompletion(context: vscode.ExtensionContext): void {
   const provider = vscode.languages.registerCompletionItemProvider(
@@ -44,8 +68,8 @@ function registerFallbackCompletion(context: vscode.ExtensionContext): void {
           if (["matmul", "grad", "embed", "train"].includes(k)) {
             item.detail = "Vir AI op";
           }
-          if (["xor", "shr", "shl"].includes(k)) {
-            item.detail = "Vir system op";
+          if (bitwiseOps.has(k)) {
+            item.detail = "Vir bitwise / word operator";
           }
           return item;
         });
@@ -62,7 +86,19 @@ function registerFallbackHover(context: vscode.ExtensionContext): void {
     ["embed", "`embed(x)` projects symbols/tokens into embedding space."],
     ["train", "`train(params, grads)` applies a training/update step."],
     ["Matrix", "`Matrix<rows, cols>` tensor type with static shape metadata."],
-    ["Vector", "`Vector<n>` one-dimensional tensor type."]
+    ["Vector", "`Vector<n>` one-dimensional tensor type."],
+    ["and", "`a and b` — bitwise AND (Vir keyword; not C `&&`)."],
+    ["or", "`a or b` — bitwise OR (Vir keyword; not C `|` alone for this form)."],
+    ["xor", "`a xor b` — bitwise XOR."],
+    ["not", "`not a` — bitwise NOT."],
+    ["shl", "`a shl n` — shift left. Prefer keyword over `<<`."],
+    ["shr", "`a shr n` — shift right. **`>>` is type cast**, not shift."],
+    ["mod", "`a mod b` — integer remainder."],
+    ["bit_and", "`bit_and` — alias of bitwise `and`."],
+    ["bit_or", "`bit_or` — alias of bitwise `or`."],
+    ["bit_xor", "`bit_xor` — alias of bitwise `xor`."],
+    ["bit_shl", "`bit_shl` — alias of `shl`."],
+    ["bit_shr", "`bit_shr` — alias of `shr`."]
   ]);
 
   const provider = vscode.languages.registerHoverProvider({ language: "vir", scheme: "file" }, {
