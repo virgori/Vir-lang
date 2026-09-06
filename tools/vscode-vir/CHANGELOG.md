@@ -2,6 +2,14 @@
 
 All notable changes to the Vir Language Support extension will be documented in this file.
 
+## [4.5.7] - 2026-09-04
+
+### Fixed
+
+- Semantic tokens, completion, and hover cover full bitwise / word operators:
+  `and` `or` `xor` `not` `shl` `shr` `mod` and `bit_*` aliases.
+- Hover notes that **`>>` is type cast**, not shift (`shr`).
+
 ## [4.5.6] - 2026-09-01
 
 ### Fixed

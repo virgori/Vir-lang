@@ -61,7 +61,21 @@ const keywordSet = new Set(["entity", "func", "enum", "if", "elif", "else", "for
 const importKeywordSet = new Set(["import", "export", "get"]);
 const terminatorKeywordSet = new Set(["end"]);
 const aiOps = new Set(["matmul", "grad", "embed", "train"]);
-const systemOps = new Set(["xor", "shr", "shl"]);
+/** Bitwise / word operators (Vir keywords — not C `<<`/`>>`; `>>` is cast). */
+const systemOps = new Set([
+    "and",
+    "or",
+    "xor",
+    "not",
+    "shl",
+    "shr",
+    "mod",
+    "bit_and",
+    "bit_or",
+    "bit_xor",
+    "bit_shl",
+    "bit_shr"
+]);
 const tensorTypes = new Set(["Matrix", "Vector"]);
 const scalarTypes = new Set(["int", "float", "bool", "string"]);
 const typePattern = /\b(Matrix|Vector|int|float|bool|string)\b/g;
@@ -128,7 +142,13 @@ function collectFunctionUsage(document) {
             if (/\bfunc\s+$/.test(before)) {
                 continue;
             }
-            if (keywordSet.has(name) || importKeywordSet.has(name) || terminatorKeywordSet.has(name) || tensorTypes.has(name) || scalarTypes.has(name)) {
+            if (keywordSet.has(name) ||
+                importKeywordSet.has(name) ||
+                terminatorKeywordSet.has(name) ||
+                tensorTypes.has(name) ||
+                scalarTypes.has(name) ||
+                systemOps.has(name) ||
+                aiOps.has(name)) {
                 continue;
             }
             called.add(name);
@@ -196,7 +216,13 @@ function registerSemanticTokens(context) {
                     if (/\bfunc\s+$/.test(before)) {
                         continue;
                     }
-                    if (keywordSet.has(fnName) || importKeywordSet.has(fnName) || terminatorKeywordSet.has(fnName) || tensorTypes.has(fnName) || scalarTypes.has(fnName)) {
+                    if (keywordSet.has(fnName) ||
+                        importKeywordSet.has(fnName) ||
+                        terminatorKeywordSet.has(fnName) ||
+                        tensorTypes.has(fnName) ||
+                        scalarTypes.has(fnName) ||
+                        systemOps.has(fnName) ||
+                        aiOps.has(fnName)) {
                         continue;
                     }
                     builder.push(lineNo, start, fnName.length, tokenTypes.indexOf("functionCall"), 0);

@@ -10,6 +10,8 @@
  * Pure Vir implementation — no external dependencies.
  ##
 
+module vir.crypto.chacha20
+
 include types
 include vec
 import Vec, vec_new, vec_push, vec_get, vec_set, vec_len from vec
@@ -218,7 +220,7 @@ func chacha20_decrypt:
     out chacha20_crypt(key, nonce, ciphertext, 1)
 end.
 # ═══════════════════════════════════════════════════════
-# Poly1305 MAC
+# Poly1305 MAC (RFC 8439 / poly1305-donna 32-bit limbs)
 # ═══════════════════════════════════════════════════════
 
 entity Poly1305State:
@@ -226,19 +228,19 @@ entity Poly1305State:
         h0: int; h1: int; h2: int; h3: int; h4: int,
         pad0: int; pad1: int; pad2: int; pad3: int
 end.
-func _poly1305_init(key: Vec):
-    # r = key[0..16] clamped
-    r0 = _le_u32(key, 0) % 67108864;    # & 0x3ffffff
-    r1 = (_le_u32(key, 3) / 4) % 67108864
-    r2 = (_le_u32(key, 6) / 16) % 67108864
-    r3 = (_le_u32(key, 9) / 64) % 67108864
-    r4 = (_le_u32(key, 12) / 256) % 67108864
 
-    # Clamp r
-    r0 = r0 % 67108864
-    r1 = r1 % 67043328
-    r2 = r2 % 67108864
-    r3 = r3 % 67043328
+func _poly1305_init(key: Vec):
+    # r = key[0..15] clamped; s = key[16..31]
+    t0 = _le_u32(key, 0)
+    t1 = _le_u32(key, 4)
+    t2 = _le_u32(key, 8)
+    t3 = _le_u32(key, 12)
+
+    r0 = t0 bit_and 0x3ffffff
+    r1 = ((t0 shr 26) bit_or (t1 shl 6)) bit_and 0x3ffff03
+    r2 = ((t1 shr 20) bit_or (t2 shl 12)) bit_and 0x3ffc0ff
+    r3 = ((t2 shr 14) bit_or (t3 shl 18)) bit_and 0x3f03fff
+    r4 = (t3 shr 8) bit_and 0x00fffff
 
     out Poly1305State (
         r0: r0, r1: r1, r2: r2, r3: r3, r4: r4,
@@ -249,46 +251,117 @@ func _poly1305_init(key: Vec):
         pad3: _le_u32(key, 28)
     )
 end.
-func poly1305_mac(key: Vec, msg: Vec):
-    st = _poly1305_init(key)
 
-    # Process 16-byte blocks
-    pos = 0
-    when pos + 16 <= vec_len(msg) loop
-        # Read block
-        n0 = _le_u32(msg, pos)
-        n1 = _le_u32(msg, pos + 4)
-        n2 = _le_u32(msg, pos + 8)
-        n3 = _le_u32(msg, pos + 12)
+func _poly1305_blocks(st: Poly1305State, msg: Vec, pos: int, bytes: int, hibit: int):
+    # Process `bytes` starting at msg[pos]. hibit=1<<24 for full blocks, 0 for final.
+    r0 = st.r0; r1 = st.r1; r2 = st.r2; r3 = st.r3; r4 = st.r4
+    s1 = r1 * 5; s2 = r2 * 5; s3 = r3 * 5; s4 = r4 * 5
+    h0 = st.h0; h1 = st.h1; h2 = st.h2; h3 = st.h3; h4 = st.h4
 
-        # Add to h (with high bit for full block)
-        st.h0 = st.h0 + n0 % 67108864
-        st.h1 = st.h1 + ((n0 / 67108864 + n1 * 64) % 67108864)
-        st.h2 = st.h2 + ((n1 / 262144 + n2 * 16384) % 67108864)
-        st.h3 = st.h3 + ((n2 / 4096 + n3 * 1048576) % 67108864)
-        st.h4 = st.h4 + n3 / 16777216 + 16777216;  # high bit
+    offset = 0
+    when offset < bytes loop
+        t0 = _le_u32(msg, pos + offset)
+        t1 = _le_u32(msg, pos + offset + 4)
+        t2 = _le_u32(msg, pos + offset + 8)
+        t3 = _le_u32(msg, pos + offset + 12)
 
-        # Multiply h * r (simplified modular)
-        st.h0 = (st.h0 * st.r0) % 67108864
-        st.h1 = (st.h1 * st.r1) % 67108864
-        st.h2 = (st.h2 * st.r2) % 67108864
-        st.h3 = (st.h3 * st.r3) % 67108864
-        st.h4 = (st.h4 * st.r4) % 67108864
+        h0 = h0 + (t0 bit_and 0x3ffffff)
+        h1 = h1 + (((t0 shr 26) bit_or (t1 shl 6)) bit_and 0x3ffffff)
+        h2 = h2 + (((t1 shr 20) bit_or (t2 shl 12)) bit_and 0x3ffffff)
+        h3 = h3 + (((t2 shr 14) bit_or (t3 shl 18)) bit_and 0x3ffffff)
+        h4 = h4 + ((t3 shr 8) bit_and 0x3ffffff) + hibit
 
-        pos = pos + 16
+        # h *= r  (mod 2^130 - 5), schoolbook with 26-bit limbs
+        d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1
+        d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2
+        d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3
+        d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4
+        d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0
+
+        c = d0 shr 26; h0 = d0 bit_and 0x3ffffff; d1 = d1 + c
+        c = d1 shr 26; h1 = d1 bit_and 0x3ffffff; d2 = d2 + c
+        c = d2 shr 26; h2 = d2 bit_and 0x3ffffff; d3 = d3 + c
+        c = d3 shr 26; h3 = d3 bit_and 0x3ffffff; d4 = d4 + c
+        c = d4 shr 26; h4 = d4 bit_and 0x3ffffff; h0 = h0 + c * 5
+        c = h0 shr 26; h0 = h0 bit_and 0x3ffffff; h1 = h1 + c
+
+        offset = offset + 16
     end
 
-    # Final tag: h + pad
-    tag = vec_new()
-    f = st.h0 + st.pad0
-    _u32_to_le(tag, f % 4294967296)
-    f = st.h1 + st.pad1 + f / 4294967296
-    _u32_to_le(tag, f % 4294967296)
-    f = st.h2 + st.pad2 + f / 4294967296
-    _u32_to_le(tag, f % 4294967296)
-    f = st.h3 + st.pad3 + f / 4294967296
-    _u32_to_le(tag, f % 4294967296)
+    st.h0 = h0; st.h1 = h1; st.h2 = h2; st.h3 = h3; st.h4 = h4
+end.
 
+func poly1305_mac(key: Vec, msg: Vec):
+    st = _poly1305_init(key)
+    msg_len = vec_len(msg)
+    full = (msg_len / 16) * 16
+    if full > 0 do
+        _poly1305_blocks(st, msg, 0, full, 1 shl 24)
+    end
+
+    # Final partial block (pad with 0x01 then zeros) — MUST NOT be skipped
+    if full < msg_len do
+        block = vec_new()
+        i = full
+        when i < msg_len loop
+            vec_push(block, vec_get(msg, i))
+            i = i + 1
+        end
+        vec_push(block, 1)
+        when vec_len(block) < 16 loop
+            vec_push(block, 0)
+        end
+        _poly1305_blocks(st, block, 0, 16, 0)
+    end
+
+    # Fully carry h
+    h0 = st.h0; h1 = st.h1; h2 = st.h2; h3 = st.h3; h4 = st.h4
+    c = h1 shr 26; h1 = h1 bit_and 0x3ffffff; h2 = h2 + c
+    c = h2 shr 26; h2 = h2 bit_and 0x3ffffff; h3 = h3 + c
+    c = h3 shr 26; h3 = h3 bit_and 0x3ffffff; h4 = h4 + c
+    c = h4 shr 26; h4 = h4 bit_and 0x3ffffff; h0 = h0 + c * 5
+    c = h0 shr 26; h0 = h0 bit_and 0x3ffffff; h1 = h1 + c
+
+    # h + -p
+    g0 = h0 + 5
+    c = g0 shr 26; g0 = g0 bit_and 0x3ffffff
+    g1 = h1 + c; c = g1 shr 26; g1 = g1 bit_and 0x3ffffff
+    g2 = h2 + c; c = g2 shr 26; g2 = g2 bit_and 0x3ffffff
+    g3 = h3 + c; c = g3 shr 26; g3 = g3 bit_and 0x3ffffff
+    g4 = (h4 + c) bit_and 0x3ffffff
+    # mask select: if g4 has bit 26 cleared relative to h, use g
+    mask = (g4 shr 26) bit_xor 1
+    mask = 0 - mask
+    g0 = g0 bit_and mask; g1 = g1 bit_and mask; g2 = g2 bit_and mask
+    g3 = g3 bit_and mask; g4 = g4 bit_and mask
+    mask = mask bit_xor (-1)
+    h0 = (h0 bit_and mask) bit_or g0
+    h1 = (h1 bit_and mask) bit_or g1
+    h2 = (h2 bit_and mask) bit_or g2
+    h3 = (h3 bit_and mask) bit_or g3
+    h4 = (h4 bit_and mask) bit_or g4
+
+    # h = h % (2^128)
+    h0 = ((h0) bit_or (h1 shl 26)) bit_and 0xFFFFFFFF
+    h1 = ((h1 shr 6) bit_or (h2 shl 20)) bit_and 0xFFFFFFFF
+    h2 = ((h2 shr 12) bit_or (h3 shl 14)) bit_and 0xFFFFFFFF
+    h3 = ((h3 shr 18) bit_or (h4 shl 8)) bit_and 0xFFFFFFFF
+
+    # tag = (h + pad) mod 2^128
+    f = h0 + st.pad0
+    h0 = f bit_and 0xFFFFFFFF
+    f = h1 + st.pad1 + (f shr 32)
+    h1 = f bit_and 0xFFFFFFFF
+    f = h2 + st.pad2 + (f shr 32)
+    h2 = f bit_and 0xFFFFFFFF
+    f = h3 + st.pad3 + (f shr 32)
+    h3 = f bit_and 0xFFFFFFFF
+
+    tag = vec_new()
+    _u32_to_le(tag, h0)
+    _u32_to_le(tag, h1)
+    _u32_to_le(tag, h2)
+    _u32_to_le(tag, h3)
     out tag
 end.
 # ═══════════════════════════════════════════════════════
@@ -395,17 +468,29 @@ func chacha20_poly1305_decrypt:
 
     computed_tag = poly1305_mac(mac_key, mac_input)
 
-    # Constant-time compare
+    # CRITICAL: reject wrong tag length (empty tag must NOT authenticate)
+    if vec_len(tag) != POLY1305_TAG_LEN do
+        out vec_new()
+    end
+    if vec_len(computed_tag) != POLY1305_TAG_LEN do
+        out vec_new()
+    end
+
+    # Constant-time compare over exactly 16 bytes
     diff = 0
     i = 0
-    when i < 16 and i < vec_len(tag) and i < vec_len(computed_tag) loop
-        diff = diff + _u32_xor(vec_get(tag, i), vec_get(computed_tag, i))
+    when i < POLY1305_TAG_LEN loop
+        diff = diff bit_or _u32_xor(vec_get(tag, i), vec_get(computed_tag, i))
         i = i + 1
     end
 
     if diff != 0 do
-        out vec_new();   # authentication failed
+        out vec_new()
     end
 
     out chacha20_decrypt(key, nonce, ciphertext)
 end.
+
+export CHACHA_ROUNDS, CHACHA_KEY_LEN, CHACHA_NONCE_LEN, POLY1305_TAG_LEN
+export chacha20_crypt, chacha20_encrypt, chacha20_decrypt
+export poly1305_mac, chacha20_poly1305_encrypt, chacha20_poly1305_decrypt

@@ -42,6 +42,12 @@ int vir_random_bytes(void *buf, size_t len)
 #endif
 }
 
+/* Vir stdlib FFI alias used by crypto/crypto.vri and crypto/rng.vri */
+int native_getrandom(void *buf, size_t len)
+{
+    return vir_random_bytes(buf, len);
+}
+
 /* ═══════════════════════════════════════════════════════
  * Hex Encoding
  * ═══════════════════════════════════════════════════════ */

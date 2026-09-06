@@ -31,8 +31,8 @@ Virgori Core adds first-class editing support for the **Virgori (VIR)** language
 - Tensor types: `Matrix`, `Vector`
 - Scalar types: `int`, `float`, `bool`, `string`
 - AI ops: `matmul`, `grad`, `embed`, `train`
-- System ops: `xor`, `shr`, `shl`
-- Operators including `->`, `^`, `>>`, `$`
+- System / bitwise ops: `and` `or` `xor` `not` `shl` `shr` `mod` (+ `bit_*` aliases)
+- Operators including `->`, `^`, `$` — note **`>>` is type cast**, use `shr` for shift
 
 ## Settings
 

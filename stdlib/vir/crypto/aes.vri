@@ -16,7 +16,11 @@
  * which uses constant-time CPU instructions.
  *
  * WARNING: ECB mode is insecure for most uses. Prefer GCM.
+ * WARNING: software AES S-box remains cache-timing sensitive — prefer
+ * aes_encrypt_block_hw() / AES-NI for local-attacker threat models.
  ##
+
+module vir.crypto.aes
 
 include types
 include result
@@ -232,32 +236,34 @@ end.
 # AES-CTR Mode — Stream cipher from block cipher
 # ═══════════════════════════════════════════════════════
 
-func aes_ctr_encrypt:
+func aes_ctr_encrypt_from:
     in  ctx: AesKey
         nonce: [int]
         data: [int]
         data_len: int
         output: [int]
-    # nonce: 12 bytes. Counter is nonce || 32-bit big-endian counter.
+        start_counter: int
+    # CTR with explicit 32-bit start counter (GCM uses 2).
     var counter_block: [int; 16]
     i = 0
     when i < 12 loop counter_block[i] = nonce[i]; i = i + 1 end
-    counter_block[12] = 0; counter_block[13] = 0
-    counter_block[14] = 0; counter_block[15] = 1
-    
+    counter_block[12] = (start_counter shr 24) bit_and 255
+    counter_block[13] = (start_counter shr 16) bit_and 255
+    counter_block[14] = (start_counter shr 8) bit_and 255
+    counter_block[15] = start_counter bit_and 255
+
     var keystream: [int; 16]
     offset = 0
-    
+
     when offset < data_len loop
         aes_encrypt_block(ctx, counter_block, keystream)
-        
+
         j = 0
         when j < 16 and offset + j < data_len loop
             output[offset + j] = data[offset + j]  xor  keystream[j]
             j = j + 1
         end
-        
-        # Increment counter (big-endian)
+
         counter_block[15] = counter_block[15] + 1
         if counter_block[15] > 255 do
             counter_block[15] = 0
@@ -265,11 +271,25 @@ func aes_ctr_encrypt:
             if counter_block[14] > 255 do
                 counter_block[14] = 0
                 counter_block[13] = counter_block[13] + 1
+                if counter_block[13] > 255 do
+                    counter_block[13] = 0
+                    counter_block[12] = counter_block[12] + 1
+                end
             end
         end
-        
+
         offset = offset + 16
     end
+end.
+
+func aes_ctr_encrypt:
+    in  ctx: AesKey
+        nonce: [int]
+        data: [int]
+        data_len: int
+        output: [int]
+    # Default CTR starts at counter=1 (non-GCM stream use).
+    aes_ctr_encrypt_from(ctx, nonce, data, data_len, output, 1)
 end.
 # AES-CTR decrypt is same as encrypt (XOR is self-inverse)
 func aes_ctr_decrypt:
@@ -345,13 +365,10 @@ func aes_gcm_encrypt:
     when i < 12 loop J0[i] = nonce[i]; i = i + 1 end
     J0[12] = 0; J0[13] = 0; J0[14] = 0; J0[15] = 1
     
-    # 3. Encrypt plaintext with CTR (starting from J0 + 1)
+    # 3. Encrypt plaintext with CTR starting at counter=2 (NIST SP 800-38D)
     result = AesGcmResult ( ciphertext: vec_new(), tag: [0; 16] )
     var ct_buf: [int; pt_len]
-    var J1: [int; 16]
-    mem_copy(J1, J0, 16)
-    _inc32(J1)
-    aes_ctr_encrypt(ctx, nonce, plaintext, pt_len, ct_buf)
+    aes_ctr_encrypt_from(ctx, nonce, plaintext, pt_len, ct_buf, 2)
     
     i = 0
     when i < pt_len loop
@@ -365,19 +382,28 @@ func aes_gcm_encrypt:
     _ghash_update(tag, H, aad, aad_len)
     _ghash_update(tag, H, ct_buf, pt_len)
     
-    # Append lengths (in bits, big-endian 64-bit)
+    # Append lengths (in bits, big-endian 64-bit || 64-bit)
     var len_block: [int; 16]
     mem_set(len_block, 0, 16)
     aad_bits = aad_len * 8
     pt_bits = pt_len * 8
-    len_block[4]  = (aad_bits  shr  24) & 0xFF
-    len_block[5]  = (aad_bits  shr  16) & 0xFF
-    len_block[6]  = (aad_bits  shr  8)  & 0xFF
-    len_block[7]  = aad_bits & 0xFF
-    len_block[12] = (pt_bits  shr  24) & 0xFF
-    len_block[13] = (pt_bits  shr  16) & 0xFF
-    len_block[14] = (pt_bits  shr  8)  & 0xFF
-    len_block[15] = pt_bits & 0xFF
+    # high 32 bits of aad_bits (bytes 0..3) — zero for lengths < 2^29 bytes
+    len_block[0] = (aad_bits shr 56) bit_and 255
+    len_block[1] = (aad_bits shr 48) bit_and 255
+    len_block[2] = (aad_bits shr 40) bit_and 255
+    len_block[3] = (aad_bits shr 32) bit_and 255
+    len_block[4] = (aad_bits shr 24) bit_and 255
+    len_block[5] = (aad_bits shr 16) bit_and 255
+    len_block[6] = (aad_bits shr 8) bit_and 255
+    len_block[7] = aad_bits bit_and 255
+    len_block[8] = (pt_bits shr 56) bit_and 255
+    len_block[9] = (pt_bits shr 48) bit_and 255
+    len_block[10] = (pt_bits shr 40) bit_and 255
+    len_block[11] = (pt_bits shr 32) bit_and 255
+    len_block[12] = (pt_bits shr 24) bit_and 255
+    len_block[13] = (pt_bits shr 16) bit_and 255
+    len_block[14] = (pt_bits shr 8) bit_and 255
+    len_block[15] = pt_bits bit_and 255
     _ghash_block(tag, H, len_block)
     
     # 5. Tag = GHASH ^ AES(K, J0)
@@ -483,3 +509,7 @@ func aes_encrypt_block_hw:
         aes_encrypt_block(ctx, input, output)
     end
 end.
+
+export AES_BLOCK_SIZE, aes_key_expand, aes_encrypt_block, aes_encrypt_block_hw
+export aes_ctr_encrypt, aes_ctr_decrypt, aes_gcm_encrypt
+export aes128_encrypt, aes256_encrypt, constant_time_eq
