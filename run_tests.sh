@@ -305,5 +305,9 @@ run_test "tests/vri/test_int_literal_boundary.vri" "$(printf '922337203685477580
 # Category J: Lexical block scoping (Shadowing in blocks)
 run_test "tests/vri/test_nested_block_scoping.vri" "$(printf '3\n2\n1')"
 
+# Category K: Multi-Target Architecture & Memory Paging Isolation
+run_test "tests/vri/test_target_paging.vri" "PASS: target paging and segment alignment verified"
+run_test "tests/vri/test_lir_target_isolation.vri" "PASS: target architecture isolation and triple routing verified"
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
