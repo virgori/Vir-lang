@@ -30,12 +30,18 @@ zero and requires exact interpolation of both a string and an integer.
 
 ### wasm32-wasi-p1
 
-This is a compiler defect, not a missing local runtime. Node.js is available
-as a local WASM host, but compiling `test_interp_v2.vri` with
-`--target wasm32-wasi-p1` currently terminates with `SIGSEGV` before creating
-the `.wasm` file. The active driver still constructs placeholder empty
-`QIRFunc` bodies instead of lowering active LIR/MIR into WASM instructions.
-It cannot be described as end-to-end implemented.
+Fixed after the original report: the driver now lowers active LIR directly to
+a self-contained WASI Preview 1 module. It imports
+`wasi_snapshot_preview1.fd_write`, exports `_start` and memory, emits a data
+segment/string pool, and implements the interpolation runtime path
+(`str_cat`, non-negative `int_to_str`, and newline-printing). Node's local
+WASI Preview 1 host validates and runs `tests/test_interp_v2.vri` with exact
+output and exit status 0.
+
+The retired QIR placeholder is no longer used. This establishes the tested
+interpolation E2E path; unsupported general LIR CFG, arbitrary calls, and
+negative integer formatting must remain diagnosed as backend work rather
+than being silently compiled as no-ops.
 
 ### Float literals
 
