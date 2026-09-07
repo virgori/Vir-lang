@@ -14,12 +14,14 @@
 
 include vir.core.types
 include vir.rt.vec_rt
-import bvec_new, bvec_push, bvec_push_u32_le, bvec_push_u64_le,
+import bvec_new, bvec_push, bvec_push_u16_le, bvec_push_u32_le, bvec_push_u64_le,
     bvec_len, bvec_get, bvec_set, bvec_patch_u32_le, bvec_data_ptr, bvec_free from vir.rt.vec_rt
 include vir.rt.io
 import write_file_bytes from vir.rt.io
 include vir.rt.string_rt
-import rt_strlen from vir.rt.string_rt
+import rt_strlen, fat_str_new, fat_str_eq, fat_str_len, fat_str_byte_at from vir.rt.string_rt
+include vir.compiler.ffi_imports
+import ffi_import_used_count, ffi_import_used_at, ffi_import_name, ffi_import_source, ffi_source_is_os, ffi_arm64_stub_offset from vir.compiler.ffi_imports
 
 extern func native_sha256(data: i64, len: i64, out_addr: i64)
 
@@ -77,6 +79,8 @@ const S_ATTR_PURE_INSTRUCTIONS: 0x80000000
 const S_ATTR_SOME_INSTRUCTIONS: 0x00000400
 const S_REGULAR:        0x00000000
 const S_ZEROFILL:       0x00000001
+const S_NON_LAZY_SYMBOL_POINTERS: 0x00000006
+const S_SYMBOL_STUBS:   0x00000008
 
 # Page sizes
 const PAGE_SIZE_ARM64:  0x4000;     # 16KB
@@ -140,6 +144,26 @@ func macho_write_header(b: MachOBuilder, ncmds: i64, sizeofcmds: i64)
     # Reserved (64-bit header)
     buf = bvec_push_u32_le(buf, 0)
 
+    b.buf = buf
+    out b
+end.
+
+func macho_write_dynamic_header(b: MachOBuilder, ncmds: i64, sizeofcmds: i64)
+    let buf = b.buf
+    buf = bvec_push_u32_le(buf, MH_MAGIC_64)
+    if b.macho_arch == 0 do
+        buf = bvec_push_u32_le(buf, CPU_TYPE_ARM64)
+        buf = bvec_push_u32_le(buf, CPU_SUB_ARM64_ALL)
+    else
+        buf = bvec_push_u32_le(buf, CPU_TYPE_X86_64)
+        buf = bvec_push_u32_le(buf, CPU_SUB_ALL)
+    end
+    buf = bvec_push_u32_le(buf, MH_EXECUTE)
+    buf = bvec_push_u32_le(buf, ncmds)
+    buf = bvec_push_u32_le(buf, sizeofcmds)
+    # Undefined external nlists are expected in a dyld-linked image.
+    buf = bvec_push_u32_le(buf, MH_PIE | MH_DYLDLINK | MH_TWOLEVEL)
+    buf = bvec_push_u32_le(buf, 0)
     b.buf = buf
     out b
 end.
@@ -333,7 +357,252 @@ end.
 # Emit Complete Mach-O Executable
 # ═══════════════════════════════════════════════════════
 
+func macho_push_uleb(v: i64, value: i64):
+    var n = value
+    when n >= 128 loop
+        v = bvec_push(v, (n mod 128) | 0x80)
+        n = n / 128
+    end
+    out bvec_push(v, n)
+end.
+
+func macho_ffi_library_for_source(source: string):
+    if ffi_source_is_os(source) == 1 do out fat_str_new("/usr/lib/libSystem.B.dylib") end
+    out source
+end.
+
+func macho_ffi_library_index(libs: i64, library: string):
+    var i = 0
+    when i < vec_len_rt(libs) loop
+        if fat_str_eq(vec_get_rt(libs, i) as string, library) == 1 do out i end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func macho_write_section_indirect(b: MachOBuilder, sectname: i64, segname: i64,
+       addr: i64, size: i64, offset: i64, align: i64,
+       flags: i64, indirect_start: i64, stub_size: i64)
+    b = macho_write_section(b, sectname, segname, addr, size, offset, align, flags)
+    # The generic writer emitted reserved1/reserved2 as zero.  Patch them in
+    # place: they occupy the final 12 bytes of section_64.
+    let section_end = bvec_len(b.buf)
+    bvec_patch_u32_le(b.buf, section_end - 12, indirect_start)
+    bvec_patch_u32_le(b.buf, section_end - 8, stub_size)
+    out b
+end.
+
+func macho_write_dylib_fat(b: MachOBuilder, path: string):
+    let plen = fat_str_len(path)
+    let cmdsize = 24 + ((plen + 1 + 7) / 8) * 8
+    b.buf = bvec_push_u32_le(b.buf, LC_LOAD_DYLIB)
+    b.buf = bvec_push_u32_le(b.buf, cmdsize)
+    b.buf = bvec_push_u32_le(b.buf, 24)
+    b.buf = bvec_push_u32_le(b.buf, 0)
+    b.buf = bvec_push_u32_le(b.buf, 0x00010000)
+    b.buf = bvec_push_u32_le(b.buf, 0x00010000)
+    var i = 0
+    when i < cmdsize - 24 loop
+        if i < plen do
+            b.buf = bvec_push(b.buf, fat_str_byte_at(path, i))
+        else
+            b.buf = bvec_push(b.buf, 0)
+        end
+        i = i + 1
+    end
+    out b
+end.
+
+# Dynamic Mach-O path for ARM64 C ABI imports.  It deliberately uses the
+# stable LC_DYLD_INFO_ONLY bind stream instead of chained fixups: the same
+# target-neutral registry can later feed ELF DT_NEEDED/.plt and PE IAT.
+func macho_emit_ffi(b: MachOBuilder, entry_off_param: i64)
+    let nimp = ffi_import_used_count()
+    if nimp <= 0 do out b end
+    if b.macho_arch != 0 do out b end
+
+    var libs = vec_new_rt()
+    var ii = 0
+    when ii < nimp loop
+        import_id = ffi_import_used_at(ii)
+        lib = macho_ffi_library_for_source(ffi_import_source(import_id))
+        if macho_ffi_library_index(libs, lib) < 0 do libs = vec_push_rt(libs, lib) end
+        ii = ii + 1
+    end
+    let nlibs = vec_len_rt(libs)
+
+    # dyld bind opcodes: ordinal, symbol, pointer type, __DATA offset, bind.
+    var bind = bvec_new()
+    ii = 0
+    when ii < nimp loop
+        import_id = ffi_import_used_at(ii)
+        name = ffi_import_name(import_id)
+        lib = macho_ffi_library_for_source(ffi_import_source(import_id))
+        ord = macho_ffi_library_index(libs, lib) + 1
+        bind = bvec_push(bind, 0x10 | ord)       # SET_DYLIB_ORDINAL_IMM
+        bind = bvec_push(bind, 0x40)             # SET_SYMBOL_TRAILING_FLAGS_IMM
+        bind = bvec_push(bind, 95)               # Darwin C external spelling: _name
+        var ni = 0
+        when ni < fat_str_len(name) loop
+            bind = bvec_push(bind, fat_str_byte_at(name, ni))
+            ni = ni + 1
+        end
+        bind = bvec_push(bind, 0)
+        bind = bvec_push(bind, 0x51)             # SET_TYPE_IMM(pointer)
+        bind = bvec_push(bind, 0x72)             # SET_SEGMENT_AND_OFFSET_ULEB, __DATA
+        bind = macho_push_uleb(bind, ii * 8)
+        bind = bvec_push(bind, 0x90)             # DO_BIND
+        ii = ii + 1
+    end
+    bind = bvec_push(bind, 0)                    # DONE
+    let bind_size = bvec_len(bind)
+
+    # Mach-O nlist strings are independent from dyld bind strings.
+    var str_size = 1
+    ii = 0
+    when ii < nimp loop
+        str_size = str_size + 2 + fat_str_len(ffi_import_name(ffi_import_used_at(ii)))
+        ii = ii + 1
+    end
+
+    # Four segments and ten fixed commands; dylib commands vary by path.
+    var dylib_cmd_bytes = 0
+    ii = 0
+    when ii < nlibs loop
+        dylib_cmd_bytes = dylib_cmd_bytes + 24 + ((fat_str_len(vec_get_rt(libs, ii) as string) + 1 + 7) / 8) * 8
+        ii = ii + 1
+    end
+    let ncmds = 10 + nlibs
+    let sizeofcmds = 840 + dylib_cmd_bytes
+    let code_offset = 32 + sizeofcmds
+    let code_size = bvec_len(b.text_code)
+    let stub_start = ffi_arm64_stub_offset(0)
+    let stubs_size = nimp * 12
+    let entry_file_offset = code_offset + entry_off_param
+    let text_raw = code_offset + code_size
+    let text_size = ((text_raw + b.page_size - 1) / b.page_size) * b.page_size
+    let data_fileoff = text_size
+    let data_size = b.page_size
+    let linkedit_fileoff = data_fileoff + data_size
+    let symoff = linkedit_fileoff + bind_size
+    let indirectoff = symoff + nimp * 16
+    let stroff = indirectoff + nimp * 4
+    let linkedit_size = bind_size + nimp * 16 + nimp * 4 + str_size
+    let linkedit_vmsize = ((linkedit_size + b.page_size - 1) / b.page_size) * b.page_size
+    let text_vm = TEXT_BASE
+    let data_vm = TEXT_BASE + data_fileoff
+    let linkedit_vm = TEXT_BASE + linkedit_fileoff
+
+    # Patch each position-independent thunk after final section layout is known.
+    ii = 0
+    when ii < nimp loop
+        import_id = ffi_import_used_at(ii)
+        stub = ffi_arm64_stub_offset(import_id)
+        pc = TEXT_BASE + code_offset + stub
+        target = data_vm + ii * 8
+        delta_pages = ((target and (0 - 4096)) - (pc and (0 - 4096))) / 4096
+        page_imm = delta_pages and 0x1FFFFF
+        adrp = 0x90000010 or ((page_imm and 3) shl 29) or (((page_imm shr 2) and 0x7FFFF) shl 5)
+        ldr = 0xF9400210 or (((target and 0xFFF) / 8) shl 10)
+        bvec_patch_u32_le(b.text_code, stub, adrp)
+        bvec_patch_u32_le(b.text_code, stub + 4, ldr)
+        ii = ii + 1
+    end
+
+    b = macho_write_dynamic_header(b, ncmds, sizeofcmds)
+    b = macho_write_segment(b, "__PAGEZERO", 0, TEXT_BASE, 0, 0, 0, 0, 0)
+    b = macho_write_segment(b, "__TEXT", text_vm, text_size, 0, text_size,
+                            VM_PROT_READ | VM_PROT_EXECUTE, VM_PROT_READ | VM_PROT_EXECUTE, 3)
+    b = macho_write_section(b, "__text", "__TEXT", text_vm + code_offset, stub_start, code_offset, 2,
+                            S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS)
+    b = macho_write_section_indirect(b, "__stubs", "__TEXT", text_vm + code_offset + stub_start,
+                            stubs_size, code_offset + stub_start, 2, S_SYMBOL_STUBS | S_ATTR_PURE_INSTRUCTIONS,
+                            0, 12)
+    let tail_off = stub_start + stubs_size
+    let tail_size = code_size - tail_off
+    b = macho_write_section(b, "__const", "__TEXT", text_vm + code_offset + tail_off,
+                            tail_size, code_offset + tail_off, 2, S_REGULAR)
+    b = macho_write_segment(b, "__DATA", data_vm, data_size, data_fileoff, data_size,
+                            VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE, 1)
+    b = macho_write_section_indirect(b, "__la_symbol_ptr", "__DATA", data_vm, nimp * 8,
+                            data_fileoff, 3, S_NON_LAZY_SYMBOL_POINTERS, 0, 0)
+    b = macho_write_segment(b, "__LINKEDIT", linkedit_vm, linkedit_vmsize,
+                            linkedit_fileoff, linkedit_size, VM_PROT_READ, VM_PROT_READ, 0)
+
+    b.buf = bvec_push_u32_le(b.buf, LC_DYLD_INFO_ONLY)
+    b.buf = bvec_push_u32_le(b.buf, 48)
+    b.buf = bvec_push_u32_le(b.buf, 0); b.buf = bvec_push_u32_le(b.buf, 0)
+    b.buf = bvec_push_u32_le(b.buf, linkedit_fileoff); b.buf = bvec_push_u32_le(b.buf, bind_size)
+    var zi = 0
+    when zi < 6 loop b.buf = bvec_push_u32_le(b.buf, 0); zi = zi + 1 end
+    b.buf = bvec_push_u32_le(b.buf, LC_SYMTAB); b.buf = bvec_push_u32_le(b.buf, 24)
+    b.buf = bvec_push_u32_le(b.buf, symoff); b.buf = bvec_push_u32_le(b.buf, nimp)
+    b.buf = bvec_push_u32_le(b.buf, stroff); b.buf = bvec_push_u32_le(b.buf, str_size)
+    b.buf = bvec_push_u32_le(b.buf, LC_DYSYMTAB); b.buf = bvec_push_u32_le(b.buf, 80)
+    # ilocal/nlocal, iextdef/nextdef, iundef/nundef, toc/mod/extref.
+    b.buf = bvec_push_u32_le(b.buf, 0); b.buf = bvec_push_u32_le(b.buf, 0)
+    b.buf = bvec_push_u32_le(b.buf, 0); b.buf = bvec_push_u32_le(b.buf, 0)
+    b.buf = bvec_push_u32_le(b.buf, 0); b.buf = bvec_push_u32_le(b.buf, nimp)
+    zi = 0
+    when zi < 6 loop b.buf = bvec_push_u32_le(b.buf, 0); zi = zi + 1 end
+    b.buf = bvec_push_u32_le(b.buf, indirectoff); b.buf = bvec_push_u32_le(b.buf, nimp)
+    b.buf = bvec_push_u32_le(b.buf, 0); b.buf = bvec_push_u32_le(b.buf, 0)
+    b.buf = bvec_push_u32_le(b.buf, 0); b.buf = bvec_push_u32_le(b.buf, 0)
+    b.buf = bvec_push_u32_le(b.buf, LC_LOAD_DYLINKER); b.buf = bvec_push_u32_le(b.buf, 32)
+    b.buf = bvec_push_u32_le(b.buf, 12)
+    let dyld_path = "/usr/lib/dyld"
+    zi = 0
+    when zi < 20 loop
+        if zi < 13 do b.buf = bvec_push(b.buf, native_read_u8(dyld_path, zi)) else b.buf = bvec_push(b.buf, 0) end
+        zi = zi + 1
+    end
+    b.buf = bvec_push_u32_le(b.buf, LC_UUID); b.buf = bvec_push_u32_le(b.buf, 24)
+    zi = 1
+    when zi <= 16 loop b.buf = bvec_push(b.buf, zi); zi = zi + 1 end
+    b = macho_write_lc_main(b, entry_file_offset)
+    ii = 0
+    when ii < nlibs loop b = macho_write_dylib_fat(b, vec_get_rt(libs, ii) as string); ii = ii + 1 end
+
+    var cur = bvec_len(b.buf)
+    when cur < code_offset loop b.buf = bvec_push(b.buf, 0); cur = cur + 1 end
+    ii = 0
+    when ii < code_size loop b.buf = bvec_push(b.buf, bvec_get(b.text_code, ii)); ii = ii + 1 end
+    cur = bvec_len(b.buf)
+    when cur < data_fileoff loop b.buf = bvec_push(b.buf, 0); cur = cur + 1 end
+    # __la_symbol_ptr: dyld replaces zero pointers using the bind stream.
+    ii = 0
+    when ii < nimp loop b.buf = bvec_push_u64_le(b.buf, 0); ii = ii + 1 end
+    cur = bvec_len(b.buf)
+    when cur < linkedit_fileoff loop b.buf = bvec_push(b.buf, 0); cur = cur + 1 end
+    ii = 0
+    when ii < bind_size loop b.buf = bvec_push(b.buf, bvec_get(bind, ii)); ii = ii + 1 end
+    var strx = 1
+    ii = 0
+    when ii < nimp loop
+        b.buf = bvec_push_u32_le(b.buf, strx); b.buf = bvec_push(b.buf, 1)
+        b.buf = bvec_push(b.buf, 0); b.buf = bvec_push_u16_le(b.buf, 0); b.buf = bvec_push_u64_le(b.buf, 0)
+        strx = strx + 2 + fat_str_len(ffi_import_name(ffi_import_used_at(ii)))
+        ii = ii + 1
+    end
+    ii = 0
+    when ii < nimp loop b.buf = bvec_push_u32_le(b.buf, ii); ii = ii + 1 end
+    b.buf = bvec_push(b.buf, 0)
+    ii = 0
+    when ii < nimp loop
+        name = ffi_import_name(ffi_import_used_at(ii))
+        b.buf = bvec_push(b.buf, 95)
+        ni = 0
+        when ni < fat_str_len(name) loop b.buf = bvec_push(b.buf, fat_str_byte_at(name, ni)); ni = ni + 1 end
+        b.buf = bvec_push(b.buf, 0)
+        ii = ii + 1
+    end
+    out b
+end.
+
 func macho_emit(b: MachOBuilder, entry_off_param: i64)
+    if ffi_import_used_count() > 0 and b.macho_arch == 0 do
+        out macho_emit_ffi(b, entry_off_param)
+    end
     let page = b.page_size
     let code_size = bvec_len(b.text_code)
 

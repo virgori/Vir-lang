@@ -2192,6 +2192,22 @@ end.
 - Kiểu trả về dùng `-> type` sau danh sách tham số
 - Kết thúc bằng `end.` (stub `@bind` là khối định nghĩa)
 
+### 15.1.1 Khai báo import trực tiếp
+
+Backend native cũng chấp nhận khai báo gọn, không có thân hàm:
+
+```vir
+extern from os func getpid() -> int
+extern from "/usr/lib/libSystem.B.dylib" func getuid() -> int
+```
+
+- `from os` là provider C chuẩn của target (`libSystem.B.dylib` trên macOS,
+  `libc.so.6` khi backend ELF được chọn).
+- Chuỗi là đường dẫn/tên dylib tường minh và được giữ nguyên làm dependency.
+- `extern func name(...)` tương đương `extern from os func name(...)`, để mã
+  cũ vẫn hợp lệ.
+- Extern là declaration-only; không phát sinh thân `ret` trong MIR/LIR.
+
 **Sử dụng:**
 
 ```vir

@@ -2221,6 +2221,22 @@ end.
 - Return type uses `-> type` after the parameter list
 - Terminated with `end.` (`@bind` stubs are definition blocks)
 
+### 15.1.1 Direct import declaration
+
+Native backends also accept a compact declaration with no function body:
+
+```vir
+extern from os func getpid() -> int
+extern from "/usr/lib/libSystem.B.dylib" func getuid() -> int
+```
+
+- `from os` selects the target's standard C provider (`libSystem.B.dylib` on
+  macOS and `libc.so.6` when the ELF backend is selected).
+- A string is an explicit dylib path/name and is preserved as a dependency.
+- `extern func name(...)` is shorthand for `extern from os func name(...)`.
+- An extern is declaration-only; MIR/LIR never materialize an empty `ret`
+  function for it.
+
 **Usage:**
 
 ```vir
