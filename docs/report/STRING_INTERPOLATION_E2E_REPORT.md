@@ -39,9 +39,14 @@ It cannot be described as end-to-end implemented.
 
 ### Float literals
 
-`tests/test_literals_v2.vri` is intentionally strict and currently fails at
-its `3.14 != 0.0` guard. `native_parse_float` has no self-hosted runtime
-implementation, so the lexer stores `3.14` as zero before MIR lowering. The
-ARM64 MC printer now materializes arbitrary i64 immediates correctly with
-`movz`/`movk`, but that cannot repair a value lost during lexing. Boolean and
-`none` literal checks pass before the float guard.
+Fixed after the original report: the lexer now converts decimal/scientific
+source to an exact, rounded IEEE-754 binary64 payload in the self-hosted
+compiler, and parser transport preserves that payload with raw word copies.
+`3.14` now reaches code generation as `0x40091EB851EB851F`; the boundary
+regression also verifies `1e-300` (`0x01A56E1FC2F8F359`), the smallest
+subnormal `5e-324` (`0x0000000000000001`), and `1e308`
+(`0x7FE1CCF385EBC8A0`).
+
+This resolves the literal-loss defect only. It does not change the separate
+work needed to make native arithmetic and comparison select scalar floating
+point instructions rather than the current integer-payload lane.
