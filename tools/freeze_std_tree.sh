@@ -11,6 +11,8 @@
 #   bash tools/freeze_std_tree.sh verify frozen/release/v2.2.0
 set -euo pipefail
 cd "$(dirname "$0")/.."
+mkdir -p dist
+export TMPDIR="$(pwd)/dist"
 
 ROOT_FREEZE="${VIR_FREEZE_ROOT:-frozen}"
 IDENT_CODESIGN="${VIR_FREEZE_IDENT:-virc-bootstrap}"
@@ -25,7 +27,8 @@ freeze_std_tree.sh — versioned filesystem freeze for std + compiler trees
   bash tools/freeze_std_tree.sh verify <freeze-dir>
 
 Options:
-  --with-bin         Copy dist/virc-next (or $VIRC) into freeze/bin/virc
+  --with-bin         Build a versioned compiler, smoke-test it, then freeze it
+  --version <semver> Compiler version for experimental freezes (release: inferred)
   --with-expanded    Copy dist/virc-expanded.vri
   --with-stage1      Copy virc_stage1.vri + dist/virc-stage1 if present
   --readonly         chmod -R a-w on the freeze tree after write
@@ -34,7 +37,7 @@ Options:
 Env:
   VIR_FREEZE_ROOT    Root dir (default: frozen/)
   VIR_STDLIB_SRC     Source stdlib directory (default: stdlib)
-  VIRC               Compiler binary to copy with --with-bin
+  VIRC               Native compiler seed used to build --with-bin
 EOF
 }
 
@@ -52,7 +55,7 @@ git_meta() {
   local commit branch dirty
   commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
   branch="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-  if git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null; then
+  if git diff --quiet --ignore-submodules 2>/dev/null && git diff --cached --quiet --ignore-submodules 2>/dev/null; then
     dirty=0
   else
     dirty=1
@@ -79,7 +82,7 @@ copy_tree() {
 }
 
 write_manifest() {
-  local dest="$1" kind="$2" name="$3"
+  local dest="$1" kind="$2" name="$3" compiler_version="$4"
   local meta commit branch dirty
   meta="$(git_meta)"
   commit="$(printf '%s' "$meta" | cut -f1)"
@@ -93,7 +96,8 @@ write_manifest() {
   tmp_hashes="$(mktemp)"
   (
     cd "$dest"
-    find stdlib compiler_src bin -type f 2>/dev/null | LC_ALL=C sort | while read -r f; do
+    find . -type f ! -name MANIFEST.json ! -name SHA256SUMS 2>/dev/null \
+      | sed 's#^./##' | LC_ALL=C sort | while read -r f; do
       printf '%s  %s\n' "$(sha_file "$f")" "$f"
     done
   ) >"$tmp_hashes"
@@ -111,6 +115,7 @@ write_manifest() {
   "git_commit": "$commit",
   "git_branch": "$branch",
   "git_dirty": $dirty,
+  "compiler_version": "v$compiler_version",
   "paths": {
     "stdlib": "stdlib/",
     "compiler_src": "compiler_src/",
@@ -129,6 +134,72 @@ EOF
   rm -f "$tmp_hashes"
   echo "MANIFEST: $dest/MANIFEST.json"
   echo "SHA256SUMS: $dest/SHA256SUMS ($stdlib_files stdlib files, $compiler_files compiler_src files)"
+}
+
+source_version() {
+  sed -nE 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*Multi-Target Matrix.*/\1/p' "$1" | head -n 1
+  sed -nE 's/.*v([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' "$1" | head -n 1
+}
+
+set_source_version() {
+  local src="$1" version="$2" tmp
+  tmp="$(mktemp)"
+  sed -E \
+    -e "s/(const VERSION: \"virc )[0-9]+\.[0-9]+\.[0-9]+/\\1$version/" \
+    -e "s/(print_ln\(\"  )v[0-9]+\.[0-9]+\.[0-9]+( — Multi-Target Matrix & LIR Pipeline\"\))/\\1v$version\\2/" \
+    -e "s/(print_ln\(\"  )v[0-9]+\.[0-9]+\.[0-9]+( — .*\")/\\1v$version\\2/" \
+    "$src" >"$tmp"
+  mv "$tmp" "$src"
+  [ "$(source_version "$src")" = "$version" ] || \
+    die "failed to stamp compiler source version v$version: $src"
+}
+
+build_freeze_bin() {
+  local dest="$1" version="$2" seed src output smoke_src smoke_bin banner
+  seed="${VIRC:-bin/virc}"
+  if [ ! -x "$seed" ]; then
+    seed="dist/virc-next"
+  fi
+  [ -x "$seed" ] || die "--with-bin: no executable native seed (set VIRC or provide bin/virc)"
+  seed="$(cd "$(dirname "$seed")" && pwd -P)/$(basename "$seed")"
+
+  src="$dest/stdlib/vir/compiler/virc.vri"
+  output="$dest/bin/virc"
+  [ -f "$src" ] || die "--with-bin: missing compiler source: $src"
+  set_source_version "$src" "$version"
+  set_source_version "$dest/compiler_src/stdlib_vir_compiler/virc.vri" "$version"
+
+  echo "Building bin/virc v$version with seed $seed ..."
+  (cd "$dest" && "$seed" stdlib/vir/compiler/virc.vri -o bin/virc -q)
+  [ -x "$output" ] || die "--with-bin: build succeeded but produced no executable: $output"
+  if command -v codesign >/dev/null 2>&1; then
+    codesign -f -s - -i "$IDENT_CODESIGN" "$output" >/dev/null 2>&1 || true
+  fi
+
+  banner="$("$output" --version 2>&1 || true)"
+  grep -Eq "v${version}[[:space:]]+Multi-Target Matrix & LIR Pipeline" <<<"$banner" || \
+  grep -Eq "v${version}[[:space:]]+" <<<"$banner" || \
+    die "--with-bin: built compiler banner does not contain v$version"
+
+  smoke_src="$dest/.virc-freeze-smoke.vri"
+  smoke_bin="$dest/.virc-freeze-smoke"
+  cat >"$smoke_src" <<'EOF'
+func main:
+    print 30
+    print 90
+    out 0
+end.
+EOF
+  "$output" "$smoke_src" -o "$smoke_bin" >/dev/null
+  [ -x "$smoke_bin" ] || die "--with-bin: smoke compile produced no executable"
+  if command -v codesign >/dev/null 2>&1; then
+    codesign -f -s - "$smoke_bin" >/dev/null 2>&1 || true
+  fi
+  [ "$("$smoke_bin" 2>&1 | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')" = "30 90" ] || \
+    die "--with-bin: frozen compiler smoke test failed"
+  rm -f "$smoke_src" "$smoke_bin"
+
+  echo "✓ bin/virc v$version ($(stat -f%z "$output" 2>/dev/null || stat -c%s "$output") bytes, built + smoke-tested)"
 }
 
 cmd_list() {
@@ -157,12 +228,17 @@ cmd_verify() {
 do_freeze() {
   local kind="$1" name="$2"
   shift 2
-  local with_bin=0 with_expanded=0 with_stage1=0 readonly=0 force=0
+  local with_bin=0 with_expanded=0 with_stage1=0 readonly=0 force=0 requested_version=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --with-bin) with_bin=1 ;;
       --with-expanded) with_expanded=1 ;;
       --with-stage1) with_stage1=1 ;;
+      --version)
+        [ $# -ge 2 ] || die "--version needs a semver"
+        requested_version="${2#v}"
+        shift
+        ;;
       --readonly) readonly=1 ;;
       --force) force=1 ;;
       -h|--help) usage; exit 0 ;;
@@ -183,9 +259,27 @@ do_freeze() {
     *) die "kind must be release|experimental" ;;
   esac
 
+  local compiler_version
+  if [ "$kind" = release ]; then
+    compiler_version="${name#v}"
+    if [ -n "$requested_version" ] && [ "$requested_version" != "$compiler_version" ]; then
+      die "--version v$requested_version does not match release $name"
+    fi
+  elif [ -n "$requested_version" ]; then
+    compiler_version="$requested_version"
+  else
+    compiler_version="$(source_version "${VIR_STDLIB_SRC:-stdlib}/vir/compiler/virc.vri")"
+    [ -n "$compiler_version" ] || die "cannot detect compiler version; pass --version"
+  fi
+  [[ "$compiler_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]] || \
+    die "compiler version must be semver-like (got: $compiler_version)"
+
   local dest="$ROOT_FREEZE/$kind/$name"
   if [ -e "$dest" ] && [ "$force" -ne 1 ]; then
     die "exists: $dest (pass --force to replace)"
+  fi
+  if [ -e "$dest" ]; then
+    chmod -R u+w "$dest" 2>/dev/null || true
   fi
   rm -rf "$dest"
   mkdir -p "$dest"
@@ -213,15 +307,7 @@ do_freeze() {
 
   mkdir -p "$dest/bin"
   if [ "$with_bin" -eq 1 ]; then
-    local bin_src="${VIRC:-dist/virc-next}"
-    [ -x "$bin_src" ] || die "--with-bin: not executable: $bin_src"
-    cp -a "$bin_src" "$dest/bin/virc"
-    chmod +x "$dest/bin/virc"
-    # Ad-hoc sign with fixed Identifier so signed compares stay stable.
-    if command -v codesign >/dev/null 2>&1; then
-      codesign -f -s - -i "$IDENT_CODESIGN" "$dest/bin/virc" >/dev/null 2>&1 || true
-    fi
-    echo "✓ bin/virc ($(stat -f%z "$dest/bin/virc" 2>/dev/null || stat -c%s "$dest/bin/virc") bytes)"
+    build_freeze_bin "$dest" "$compiler_version"
   fi
 
   if [ "$with_expanded" -eq 1 ]; then
@@ -260,7 +346,7 @@ EOF
     echo "✓ BOOTSTRAP_REPORT.md"
   fi
 
-  write_manifest "$dest" "$kind" "$name"
+  write_manifest "$dest" "$kind" "$name" "$compiler_version"
 
   if [ "$readonly" -eq 1 ]; then
     chmod -R a-w "$dest"

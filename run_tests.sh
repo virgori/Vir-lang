@@ -318,5 +318,8 @@ run_test "tests/vri/test_lir_target_isolation.vri" "PASS: target architecture is
 # Category L: Section 26 - N-Dimensional Tensor & ML Operators Engine
 run_test "tests/vri/test_tensor_ml_ops.vri" "PASS: all tensor & ML operator verification suites passed"
 
+# Category M: FFI Extern Imports & Dynamic Linking (Mach-O ARM64)
+run_test "tests/test_extern_from_os.vri" "PASS: ffi extern getpid verified"
+
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="
