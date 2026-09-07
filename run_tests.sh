@@ -287,6 +287,12 @@ run_compile_fail_test "tests/vri/test_reserved_keyword_port_rejected_as_local_va
 run_compile_fail_test "tests/vri/test_reserved_keyword_port_rejected_as_function_name.vri" "skipping semantic analysis for partial AST"
 run_compile_fail_test "tests/vri/test_reserved_keywords_rejected_as_identifiers.vri" "skipping semantic analysis for partial AST"
 
+# Borrow checker hardening regressions
+run_compile_fail_test "tests/test_borrow_move_on_call.vri" "E5001"
+run_compile_fail_test "tests/test_borrow_if_move.vri" "E5001"
+run_compile_fail_test "tests/test_borrow_arena_escape.vri" "E5005"
+run_compile_fail_test "tests/test_borrow_rebind_conflict.vri" "E5002"
+
 # Category E: Parameter shadowing allowed (Positive test)
 run_test "tests/vri/test_parameter_same_name_as_entity_field_allowed.vri" "$(printf '42\n99\n100\n200')"
 
