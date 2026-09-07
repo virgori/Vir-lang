@@ -272,7 +272,10 @@ func eval_const_expr(node: AstNode):
         out ast_node_int_val(node)
     end
     if nt == AstType.LiteralFloat do
-        out ast_node_int_val(node)
+        # Float constants travel through the integer MIR immediate lane as their
+        # IEEE-754 payload. `int_val` is a distinct AST field and is zero for a
+        # float token, so using it silently rewrites every float const to 0.0.
+        out native_read_i64(node as i64, 48)
     end
     if nt == AstType.UnaryMinus do
         if ast_node_child_count(node) > 0 do
@@ -1393,15 +1396,32 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 		out (b2, mir_opnd_vreg(v))
 	end
 
-    # 2. Literal Float (raw bits in int_val for now)
+    # 2. Literal Float (raw 64-bit IEEE 754 bits from offset 48)
 	if expr_type == AstType.LiteralFloat do
+		var (b2, v) = builder_new_vreg(b)
+		f_bits = native_read_i64(expr as i64, 48)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(f_bits), mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out (b2, mir_opnd_vreg(v))
+	end
+
+    # 2b. Literal Bool
+	if expr_type == AstType.LiteralBool do
 		var (b2, v) = builder_new_vreg(b)
 		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(ast_node_int_val(expr)), mir_opnd_none())
 		b2 = builder_add_instr(b2, ins)
 		out (b2, mir_opnd_vreg(v))
 	end
 
-    # 3. Literal Str — src1 = string-pool id
+    # 2c. Literal None
+	if expr_type == AstType.LiteralNone do
+		var (b2, v) = builder_new_vreg(b)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(0), mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out (b2, mir_opnd_vreg(v))
+	end
+
+    # 3. Literal Str — src1 = string-pool id (100% static, zero runtime alloc)
 	if expr_type == AstType.LiteralStr do
 		var (b1, sid) = builder_intern(b, ast_node_name(expr))
 		var (b2, v) = builder_new_vreg(b1)
@@ -1409,12 +1429,79 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 		out (b2, mir_opnd_vreg(v))
 	end
 
-    # 3b. InterpExpr
+    # 3b. InterpExpr — lowered to str_cat (bid 11) and int_to_str (bid 19) in Arena
 	if expr_type == AstType.InterpExpr do
-		var (b1, sid) = builder_intern(b, ast_node_name(expr))
-		var (b2, v) = builder_new_vreg(b1)
-		b2 = emit_intrinsic(b2, MIR_INTR_INTERP, mir_opnd_vreg(v), mir_opnd_imm(sid))
-		out (b2, mir_opnd_vreg(v))
+		n_segs = ast_node_child_count(expr)
+		if n_segs == 0 do
+			var (b1, sid) = builder_intern(b, fat_str_new(""))
+			var (b2, v) = builder_new_vreg(b1)
+			b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
+			out (b2, mir_opnd_vreg(v))
+		end
+
+		# Lower first segment
+		first_child = ast_node_child(expr, 0)
+		first_type = ast_node_type_of(first_child)
+		var b_cur = b
+		var cur_opnd = mir_opnd_none()
+		if first_type == AstType.LiteralStr do
+			var (b1, sid) = builder_intern(b_cur, ast_node_name(first_child))
+			var (b2, v) = builder_new_vreg(b1)
+			b_cur = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
+			cur_opnd = mir_opnd_vreg(v)
+		else
+			var (b1, val_opnd) = lower_expr(b_cur, first_child)
+			let f_ty = ast_node_builtin_id(first_child)
+			if f_ty == 1 or f_ty == 3 do # Int or Bool -> int_to_str (bid 19)
+				b1 = emit_set_arg(b1, 0, val_opnd)
+				var (b2, dst_v) = builder_new_vreg(b1)
+				b_cur = emit_intrinsic(b2, MIR_INTR_BUILTIN, mir_opnd_vreg(dst_v), mir_opnd_imm(19))
+				cur_opnd = mir_opnd_vreg(dst_v)
+			else
+				b_cur = b1
+				cur_opnd = val_opnd
+			end
+		end
+
+		# If only 1 segment and already evaluated:
+		if n_segs == 1 do
+			out (b_cur, cur_opnd)
+		end
+
+		# Concatenate subsequent segments using str_cat (bid 11)
+		var si = 1
+		when si < n_segs loop
+			seg_child = ast_node_child(expr, si)
+			seg_type = ast_node_type_of(seg_child)
+			var seg_opnd = mir_opnd_none()
+			if seg_type == AstType.LiteralStr do
+				var (b1, sid) = builder_intern(b_cur, ast_node_name(seg_child))
+				var (b2, v) = builder_new_vreg(b1)
+				b_cur = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
+				seg_opnd = mir_opnd_vreg(v)
+			else
+				var (b1, val_opnd) = lower_expr(b_cur, seg_child)
+				let s_ty = ast_node_builtin_id(seg_child)
+				if s_ty == 1 or s_ty == 3 do # Int or Bool -> int_to_str (bid 19)
+					b1 = emit_set_arg(b1, 0, val_opnd)
+					var (b2, dst_v) = builder_new_vreg(b1)
+					b_cur = emit_intrinsic(b2, MIR_INTR_BUILTIN, mir_opnd_vreg(dst_v), mir_opnd_imm(19))
+					seg_opnd = mir_opnd_vreg(dst_v)
+				else
+					b_cur = b1
+					seg_opnd = val_opnd
+				end
+			end
+
+			# Call str_cat(cur_opnd, seg_opnd) (bid 11)
+			b_cur = emit_set_arg(b_cur, 0, cur_opnd)
+			b_cur = emit_set_arg(b_cur, 1, seg_opnd)
+			var (b_cat, res_v) = builder_new_vreg(b_cur)
+			b_cur = emit_intrinsic(b_cat, MIR_INTR_BUILTIN, mir_opnd_vreg(res_v), mir_opnd_imm(11))
+			cur_opnd = mir_opnd_vreg(res_v)
+			si = si + 1
+		end
+		out (b_cur, cur_opnd)
 	end
 
     # 4. Identifier
@@ -1813,15 +1900,18 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 	end
 
     # 8. Aggregate literals — SetArg each element then Intrinsic
- if expr_type == AstType.ArrayLiteral do
- out lower_aggregate(b, MIR_INTR_ARRAY, expr)
- end
- if expr_type == AstType.TupleExpr do
- out lower_aggregate(b, MIR_INTR_TUPLE, expr)
- end
- if expr_type == AstType.EntityLiteral do
- out lower_aggregate(b, MIR_INTR_ENTITY, expr)
- end
+	if expr_type == AstType.ArrayLiteral do
+		out lower_aggregate(b, MIR_INTR_ARRAY, expr)
+	end
+	if expr_type == AstType.DictLiteral do
+		out lower_aggregate(b, MIR_INTR_ARRAY, expr)
+	end
+	if expr_type == AstType.TupleExpr do
+		out lower_aggregate(b, MIR_INTR_TUPLE, expr)
+	end
+	if expr_type == AstType.EntityLiteral do
+		out lower_aggregate(b, MIR_INTR_ENTITY, expr)
+	end
 
     # 9. Index — shapes: children[base,idx] OR name=base + children[idx]
 	if expr_type == AstType.IndexAccess or expr_type == AstType.ExprIndex do
