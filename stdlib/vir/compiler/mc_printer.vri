@@ -12,9 +12,11 @@ module vir.compiler.mc_printer
 
 include types
 include string_rt
-import rt_strlen, native_read_u8, native_read_i64, native_write_i64 from string_rt
+import rt_strlen, fat_str_len, fat_str_byte_at, native_read_u8, native_read_i64, native_write_i64 from string_rt
 include vir.rt.vec_rt
-import bvec_new, bvec_push, bvec_len, bvec_data_ptr from vir.rt.vec_rt
+import bvec_new, bvec_push, bvec_len, bvec_data_ptr, vec_get_rt, vec_len_rt from vir.rt.vec_rt
+include compiler.lir
+import LirFunc, lir_func_id, lir_func_strings from compiler.lir
 include compiler.mc
 import AsmDialect, MCOpcode, MCOperandKind, RelocKind, MCInst, MCOperand, mc_inst_opc, mc_inst_op0, mc_inst_op1, mc_inst_op2, mc_inst_op3, mc_inst_flags, mc_opnd_kind, mc_opnd_reg_val, mc_opnd_imm_val, mc_opnd_mem_base, mc_opnd_mem_off, mc_opnd_mem_scale, mc_opnd_mem_idx, mc_opnd_sym_name, mc_opnd_reloc, mc_opnd_addend from compiler.mc
 
@@ -166,6 +168,13 @@ func append_label(b: int, label_id: int, dialect: int):
     out bvec_emit_int(b, bid)
 end.
 
+func append_string_label(b: int, func_id: int, sid: int):
+    b = bvec_emit_cstr(b, "vir_str_")
+    b = bvec_emit_int(b, func_id)
+    b = bvec_emit_cstr(b, "_")
+    out bvec_emit_int(b, sid)
+end.
+
 func print_mc_inst_x86(inst: MCInst, dialect: int, b: int):
     let opc = mc_inst_opc(inst)
     if opc == MCOpcode.X86_64_MOV_RR do
@@ -183,6 +192,13 @@ func print_mc_inst_x86(inst: MCInst, dialect: int, b: int):
         b = bvec_emit_int(b, mc_opnd_imm_val(mc_inst_op1(inst)))
         out bvec_emit_cstr(b, "
 ")
+    end
+    if opc == MCOpcode.X86_64_LEA_RIP do
+        b = bvec_emit_cstr(b, "    lea ")
+        b = bvec_emit_cstr(b, x86_reg_name(mc_opnd_reg_val(mc_inst_op0(inst))))
+        b = bvec_emit_cstr(b, ", [rip + ")
+        b = bvec_emit_cstr(b, mc_opnd_sym_name(mc_inst_op1(inst)))
+        out bvec_emit_cstr(b, "]\n")
     end
     if opc == MCOpcode.X86_64_MOV_LOAD do
         b = bvec_emit_cstr(b, "    mov ")
@@ -355,6 +371,13 @@ end.
 
 func print_mc_inst_riscv(inst: MCInst, dialect: int, b: int):
     let opc = mc_inst_opc(inst)
+    if opc == MCOpcode.RISCV_LA do
+        b = bvec_emit_cstr(b, "    la ")
+        b = bvec_emit_cstr(b, riscv_reg_name(mc_opnd_reg_val(mc_inst_op0(inst))))
+        b = bvec_emit_cstr(b, ", ")
+        b = bvec_emit_cstr(b, mc_opnd_sym_name(mc_inst_op1(inst)))
+        out bvec_emit_cstr(b, "\n")
+    end
     if opc == MCOpcode.RISCV_ADDI do
         b = bvec_emit_cstr(b, "    addi ")
         b = bvec_emit_cstr(b, riscv_reg_name(mc_opnd_reg_val(mc_inst_op0(inst))))
@@ -589,6 +612,33 @@ func print_mc_inst(inst: MCInst, dialect: int, b: int):
 ")
     end
 
+    if opc == MCOpcode.ARM64_ADRP do
+        b = bvec_emit_cstr(b, "    adrp ")
+        b = bvec_emit_cstr(b, reg_name(mc_opnd_reg_val(mc_inst_op0(inst))))
+        b = bvec_emit_cstr(b, ", ")
+        b = bvec_emit_cstr(b, mc_opnd_sym_name(mc_inst_op1(inst)))
+        if dialect == AsmDialect.DarwinAsm do
+            b = bvec_emit_cstr(b, "@PAGE")
+        end
+        out bvec_emit_cstr(b, "\n")
+    end
+
+    if opc == MCOpcode.ARM64_ADD_LO12 do
+        b = bvec_emit_cstr(b, "    add ")
+        b = bvec_emit_cstr(b, reg_name(mc_opnd_reg_val(mc_inst_op0(inst))))
+        b = bvec_emit_cstr(b, ", ")
+        b = bvec_emit_cstr(b, reg_name(mc_opnd_reg_val(mc_inst_op1(inst))))
+        b = bvec_emit_cstr(b, ", ")
+        if dialect == AsmDialect.DarwinAsm do
+            b = bvec_emit_cstr(b, mc_opnd_sym_name(mc_inst_op2(inst)))
+            b = bvec_emit_cstr(b, "@PAGEOFF")
+        else
+            b = bvec_emit_cstr(b, ":lo12:")
+            b = bvec_emit_cstr(b, mc_opnd_sym_name(mc_inst_op2(inst)))
+        end
+        out bvec_emit_cstr(b, "\n")
+    end
+
     if opc == MCOpcode.ARM64_ADD_IMM or opc == MCOpcode.ARM64_SUB_IMM do
         if opc == MCOpcode.ARM64_ADD_IMM do b = bvec_emit_cstr(b, "    add ") else b = bvec_emit_cstr(b, "    sub ") end
         b = bvec_emit_cstr(b, reg_name(mc_opnd_reg_val(mc_inst_op0(inst))))
@@ -601,12 +651,32 @@ func print_mc_inst(inst: MCInst, dialect: int, b: int):
     end
 
     if opc == MCOpcode.ARM64_MOVZ do
-        b = bvec_emit_cstr(b, "    mov ")
+        # `mov xN, #imm` is only an assembler pseudo instruction for values
+        # expressible by MOVZ/MOVN or a logical immediate.  MC immediates are
+        # full i64 values (including f64 IEEE payloads), so print a canonical
+        # MOVZ/MOVK sequence instead of truncating or asking the assembler to
+        # accept an out-of-range pseudo immediate.
+        let mov_imm = mc_opnd_imm_val(mc_inst_op1(inst))
+        b = bvec_emit_cstr(b, "    movz ")
         b = bvec_emit_cstr(b, reg_name(mc_opnd_reg_val(mc_inst_op0(inst))))
         b = bvec_emit_cstr(b, ", #")
-        b = bvec_emit_int(b, mc_opnd_imm_val(mc_inst_op1(inst)))
-        out bvec_emit_cstr(b, "
-")
+        b = bvec_emit_int(b, mov_imm and 65535)
+        b = bvec_emit_cstr(b, "\n")
+        var mov_shift = 16
+        when mov_shift <= 48 loop
+            let mov_part = (mov_imm shr mov_shift) and 65535
+            if mov_part != 0 do
+                b = bvec_emit_cstr(b, "    movk ")
+                b = bvec_emit_cstr(b, reg_name(mc_opnd_reg_val(mc_inst_op0(inst))))
+                b = bvec_emit_cstr(b, ", #")
+                b = bvec_emit_int(b, mov_part)
+                b = bvec_emit_cstr(b, ", lsl #")
+                b = bvec_emit_int(b, mov_shift)
+                b = bvec_emit_cstr(b, "\n")
+            end
+            mov_shift = mov_shift + 16
+        end
+        out b
     end
 
     if opc == MCOpcode.ARM64_CMP_RR do
@@ -927,12 +997,106 @@ _rt_print_str:
     mov x16, #4
     movk x16, #0x200, lsl #16
     svc #0x80
+    mov w3, #10
+    strb w3, [sp, #16]
+    mov x0, #1
+    add x1, sp, #16
+    mov x2, #1
+    mov x16, #4
+    movk x16, #0x200, lsl #16
+    svc #0x80
 ")
         b = bvec_emit_cstr(b, "    ldr x19, [sp, #0]
     ldr x20, [sp, #8]
     add sp, sp, #32
     ldp fp, lr, [sp], #16
     ret
+")
+        b = bvec_emit_cstr(b, ".globl _rt_str_cat
+.p2align 2
+_rt_str_cat:
+    mov x9, x0
+1:  ldrb w13, [x9]
+    cbz w13, 2f
+    add x9, x9, #1
+    b 1b
+2:  sub x2, x9, x0
+    mov x10, x1
+3:  ldrb w13, [x10]
+    cbz w13, 4f
+    add x10, x10, #1
+    b 3b
+4:  sub x3, x10, x1
+    add x4, x2, x3
+    add x4, x4, #8
+    and x4, x4, #-8
+    adrp x14, _vir_heap_curr@PAGE
+    add x14, x14, _vir_heap_curr@PAGEOFF
+    ldr x11, [x14]
+    cbnz x11, 5f
+    adrp x11, _vir_heap_start@PAGE
+    add x11, x11, _vir_heap_start@PAGEOFF
+5:  add x12, x11, x4
+    str x12, [x14]
+    mov x12, x11
+    mov x9, x0
+6:  ldrb w13, [x9]
+    cbz w13, 7f
+    strb w13, [x12]
+    add x9, x9, #1
+    add x12, x12, #1
+    b 6b
+7:  mov x10, x1
+8:  ldrb w13, [x10]
+    cbz w13, 9f
+    strb w13, [x12]
+    add x10, x10, #1
+    add x12, x12, #1
+    b 8b
+9:  strb wzr, [x12]
+    mov x0, x11
+    ret
+
+.globl _rt_int_to_str
+.p2align 2
+_rt_int_to_str:
+    adrp x14, _vir_heap_curr@PAGE
+    add x14, x14, _vir_heap_curr@PAGEOFF
+    ldr x11, [x14]
+    cbnz x11, 1f
+    adrp x11, _vir_heap_start@PAGE
+    add x11, x11, _vir_heap_start@PAGEOFF
+1:  add x12, x11, #32
+    str x12, [x14]
+    add x10, x11, #31
+    strb wzr, [x10]
+    mov x9, x0
+    mov x12, #0
+    cmp x9, #0
+    b.ge 2f
+    mov x12, #1
+    neg x9, x9
+2:  mov x15, #10
+3:  udiv x13, x9, x15
+    msub x14, x13, x15, x9
+    add x14, x14, #48
+    sub x10, x10, #1
+    strb w14, [x10]
+    mov x9, x13
+    cbnz x9, 3b
+    cbz x12, 4f
+    mov x15, #45
+    sub x10, x10, #1
+    strb w15, [x10]
+4:  mov x0, x10
+    ret
+
+.section __DATA,__bss
+.p2align 3
+_vir_heap_start:
+    .space 1048576
+_vir_heap_curr:
+    .quad 0
 ")
     eif dialect == AsmDialect.Intel_X86 do
         b = bvec_emit_cstr(b, ".globl rt_exit
@@ -1049,6 +1213,12 @@ rt_print_str:
     mov eax, 1
     mov edi, 1
     syscall
+    mov byte ptr [rsp+16], 10
+    mov eax, 1
+    mov edi, 1
+    lea rsi, [rsp+16]
+    mov edx, 1
+    syscall
 ")
         b = bvec_emit_cstr(b, "    mov rsi, [rsp+0]
     mov rdx, [rsp+8]
@@ -1056,6 +1226,111 @@ rt_print_str:
     pop rbp
     ret
 .size rt_print_str, .-rt_print_str
+")
+        b = bvec_emit_cstr(b, ".globl rt_str_cat
+.type rt_str_cat, @function
+.p2align 4
+rt_str_cat:
+    mov r8, rdi
+.L_xca_len:
+    cmp byte ptr [r8], 0
+    je .L_xca_done
+    inc r8
+    jmp .L_xca_len
+.L_xca_done:
+    mov r10, r8
+    sub r10, rdi
+    mov r9, rsi
+.L_xcb_len:
+    cmp byte ptr [r9], 0
+    je .L_xcb_done
+    inc r9
+    jmp .L_xcb_len
+.L_xcb_done:
+    mov r11, r9
+    sub r11, rsi
+    lea rcx, [r10 + r11 + 8]
+    and rcx, -8
+    lea r15, [rip + _vir_heap_curr]
+    mov rax, [r15]
+    test rax, rax
+    jnz .L_xcat_h1
+    lea rax, [rip + _vir_heap_start]
+.L_xcat_h1:
+    mov rdx, rax
+    add rdx, rcx
+    mov [r15], rdx
+    mov rdx, rax
+    mov r8, rdi
+.L_xca_cp:
+    cmp byte ptr [r8], 0
+    je .L_xca_cp_done
+    mov cl, [r8]
+    mov [rdx], cl
+    inc r8
+    inc rdx
+    jmp .L_xca_cp
+.L_xca_cp_done:
+    mov r9, rsi
+.L_xcb_cp:
+    cmp byte ptr [r9], 0
+    je .L_xcb_cp_done
+    mov cl, [r9]
+    mov [rdx], cl
+    inc r9
+    inc rdx
+    jmp .L_xcb_cp
+.L_xcb_cp_done:
+    mov byte ptr [rdx], 0
+    ret
+.size rt_str_cat, .-rt_str_cat
+
+.globl rt_int_to_str
+.type rt_int_to_str, @function
+.p2align 4
+rt_int_to_str:
+    lea r15, [rip + _vir_heap_curr]
+    mov rax, [r15]
+    test rax, rax
+    jnz .L_xits_h1
+    lea rax, [rip + _vir_heap_start]
+.L_xits_h1:
+    lea rcx, [rax + 32]
+    mov [r15], rcx
+    lea r8, [rax + 31]
+    mov byte ptr [r8], 0
+    mov rcx, rdi
+    xor r9d, r9d
+    test rcx, rcx
+    jns .L_xits_pos
+    mov r9d, 1
+    neg rcx
+.L_xits_pos:
+    mov rax, rcx
+    mov r10, 10
+.L_xits_loop:
+    xor edx, edx
+    div r10
+    add dl, 48
+    dec r8
+    mov [r8], dl
+    test rax, rax
+    jnz .L_xits_loop
+    test r9d, r9d
+    jz .L_xits_done
+    dec r8
+    mov byte ptr [r8], 45
+.L_xits_done:
+    mov rax, r8
+    ret
+.size rt_int_to_str, .-rt_int_to_str
+
+.section .bss
+.p2align 3
+_vir_heap_start:
+    .space 1048576
+_vir_heap_curr:
+    .quad 0
 ")
     eif dialect == AsmDialect.GNU_RISCV do
         b = bvec_emit_cstr(b, ".globl rt_exit
@@ -1167,6 +1442,13 @@ rt_print_str:
     li a7, 64
     li a0, 1
     ecall
+    li t0, 10
+    sb t0, 24(sp)
+    li a0, 1
+    addi a1, sp, 24
+    li a2, 1
+    li a7, 64
+    ecall
 ")
         b = bvec_emit_cstr(b, "    ld a1, 0(sp)
     ld a2, 8(sp)
@@ -1174,6 +1456,111 @@ rt_print_str:
     addi sp, sp, 32
     ret
 .size rt_print_str, .-rt_print_str
+")
+        b = bvec_emit_cstr(b, ".globl rt_str_cat
+.type rt_str_cat, %function
+.p2align 2
+rt_str_cat:
+    la t0, _vir_heap_curr
+    ld t1, 0(t0)
+    bnez t1, 1f
+    la t1, _vir_heap_start
+    sd t1, 0(t0)
+1:
+    mv t2, zero
+2:
+    add t3, a0, t2
+    lbu t4, 0(t3)
+    beqz t4, 3f
+    addi t2, t2, 1
+    j 2b
+3:
+    mv t3, zero
+4:
+    add t4, a1, t3
+    lbu t5, 0(t4)
+    beqz t5, 5f
+    addi t3, t3, 1
+    j 4b
+5:
+    add t4, t2, t3
+    addi t4, t4, 8
+    andi t4, t4, -8
+    mv a2, t1
+    add t5, t1, t4
+    sd t5, 0(t0)
+    mv t4, zero
+6:
+    bge t4, t2, 7f
+    add t5, a0, t4
+    lbu t6, 0(t5)
+    add t5, a2, t4
+    sb t6, 0(t5)
+    addi t4, t4, 1
+    j 6b
+7:
+    mv t5, zero
+8:
+    bge t5, t3, 9f
+    add t6, a1, t5
+    lbu a3, 0(t6)
+    add a4, a2, t2
+    add a4, a4, t5
+    sb a3, 0(a4)
+    addi t5, t5, 1
+    j 8b
+9:
+    add a4, a2, t2
+    add a4, a4, t3
+    sb zero, 0(a4)
+    mv a0, a2
+    ret
+.size rt_str_cat, .-rt_str_cat
+
+.globl rt_int_to_str
+.type rt_int_to_str, %function
+.p2align 2
+rt_int_to_str:
+    la t0, _vir_heap_curr
+    ld t1, 0(t0)
+    bnez t1, 1f
+    la t1, _vir_heap_start
+    sd t1, 0(t0)
+1:
+    mv a2, t1
+    addi t2, t1, 32
+    sd t2, 0(t0)
+    addi t3, a2, 31
+    sb zero, 0(t3)
+    mv t4, a0
+    li t5, 0
+    bge t4, zero, 2f
+    li t5, 1
+    neg t4, t4
+2:
+    li t6, 10
+3:
+    rem a3, t4, t6
+    div t4, t4, t6
+    addi a3, a3, 48
+    addi t3, t3, -1
+    sb a3, 0(t3)
+    bnez t4, 3b
+    beqz t5, 4f
+    li a3, 45
+    addi t3, t3, -1
+    sb a3, 0(t3)
+4:
+    mv a0, t3
+    ret
+.size rt_int_to_str, .-rt_int_to_str
+
+.section .bss
+.p2align 3
+_vir_heap_start:
+    .space 1048576
+_vir_heap_curr:
+    .quad 0
 ")
     else
         b = bvec_emit_cstr(b, ".globl rt_exit
@@ -1295,6 +1682,13 @@ rt_print_str:
     mov x2, x20
     mov x8, #64
     svc #0
+    mov w3, #10
+    strb w3, [sp, #16]
+    mov x0, #1
+    add x1, sp, #16
+    mov x2, #1
+    mov x8, #64
+    svc #0
 ")
         b = bvec_emit_cstr(b, "    ldr x19, [sp, #0]
     ldr x20, [sp, #8]
@@ -1303,8 +1697,146 @@ rt_print_str:
     ret
 .size rt_print_str, .-rt_print_str
 ")
+        b = bvec_emit_cstr(b, ".globl rt_str_cat
+.type rt_str_cat, %function
+.p2align 2
+rt_str_cat:
+    mov x9, x0
+.L_gelf_ca1:
+    ldrb w13, [x9]
+    cbz w13, .L_gelf_ca2
+    add x9, x9, #1
+    b .L_gelf_ca1
+.L_gelf_ca2:
+    sub x2, x9, x0
+    mov x10, x1
+.L_gelf_cb1:
+    ldrb w13, [x10]
+    cbz w13, .L_gelf_cb2
+    add x10, x10, #1
+    b .L_gelf_cb1
+.L_gelf_cb2:
+    sub x3, x10, x1
+    add x4, x2, x3
+    add x4, x4, #8
+    and x4, x4, #-8
+    adrp x14, _vir_heap_curr
+    add x14, x14, :lo12:_vir_heap_curr
+    ldr x11, [x14]
+    cbnz x11, .L_gelf_ch1
+    adrp x11, _vir_heap_start
+    add x11, x11, :lo12:_vir_heap_start
+.L_gelf_ch1:
+    add x12, x11, x4
+    str x12, [x14]
+    mov x12, x11
+    mov x9, x0
+.L_gelf_cca:
+    ldrb w13, [x9]
+    cbz w13, .L_gelf_ccb
+    strb w13, [x12]
+    add x9, x9, #1
+    add x12, x12, #1
+    b .L_gelf_cca
+.L_gelf_ccb:
+    mov x10, x1
+.L_gelf_ccb1:
+    ldrb w13, [x10]
+    cbz w13, .L_gelf_cce
+    strb w13, [x12]
+    add x10, x10, #1
+    add x12, x12, #1
+    b .L_gelf_ccb1
+.L_gelf_cce:
+    strb wzr, [x12]
+    mov x0, x11
+    ret
+.size rt_str_cat, .-rt_str_cat
+
+.globl rt_int_to_str
+.type rt_int_to_str, %function
+.p2align 2
+rt_int_to_str:
+    adrp x14, _vir_heap_curr
+    add x14, x14, :lo12:_vir_heap_curr
+    ldr x11, [x14]
+    cbnz x11, .L_gelf_ih1
+    adrp x11, _vir_heap_start
+    add x11, x11, :lo12:_vir_heap_start
+.L_gelf_ih1:
+    add x12, x11, #32
+    str x12, [x14]
+    add x10, x11, #31
+    strb wzr, [x10]
+    mov x9, x0
+    mov x12, #0
+    cmp x9, #0
+    b.ge .L_gelf_ipos
+    mov x12, #1
+    neg x9, x9
+.L_gelf_ipos:
+    mov x15, #10
+.L_gelf_iloop:
+    udiv x13, x9, x15
+    msub x14, x13, x15, x9
+    add x14, x14, #48
+    sub x10, x10, #1
+    strb w14, [x10]
+    mov x9, x13
+    cbnz x9, .L_gelf_iloop
+    cbz x12, .L_gelf_idone
+    mov x15, #45
+    sub x10, x10, #1
+    strb w15, [x10]
+.L_gelf_idone:
+    mov x0, x10
+    ret
+.size rt_int_to_str, .-rt_int_to_str
+
+.section .bss
+.p2align 3
+_vir_heap_start:
+    .space 1048576
+_vir_heap_curr:
+    .quad 0
+")
     end
     out b
 end.
 
-export print_mc_inst, print_mc_function_header, print_mc_function_footer, print_mc_assembly_prologue, print_mc_runtime_stubs
+# Emits literal data after code/runtime sections. Byte directives avoid quoting
+# and escaping differences between Darwin, GNU x86-64 and GNU RISC-V assemblers.
+func print_mc_string_pool(lir_funcs: int, dialect: int, b: int):
+    if dialect == AsmDialect.DarwinAsm do
+        b = bvec_emit_cstr(b, "\n.section __TEXT,__cstring,cstring_literals\n")
+    else
+        b = bvec_emit_cstr(b, "\n.section .rodata\n")
+    end
+    var fi = 0
+    let nf = vec_len_rt(lir_funcs)
+    when fi < nf loop
+        let f = vec_get_rt(lir_funcs, fi) as LirFunc
+        let strings = lir_func_strings(f)
+        let ns = vec_len_rt(strings)
+        var sid = 0
+        when sid < ns loop
+            let s = vec_get_rt(strings, sid)
+            b = append_string_label(b, lir_func_id(f), sid)
+            b = bvec_emit_cstr(b, ":\n    .byte ")
+            let nbytes = fat_str_len(s)
+            var bi = 0
+            when bi < nbytes loop
+                if bi > 0 do b = bvec_emit_cstr(b, ", ") end
+                b = bvec_emit_int(b, fat_str_byte_at(s, bi))
+                bi = bi + 1
+            end
+            if nbytes > 0 do b = bvec_emit_cstr(b, ", ") end
+            b = bvec_emit_cstr(b, "0\n")
+            sid = sid + 1
+        end
+        fi = fi + 1
+    end
+    out b
+end.
+
+export print_mc_inst, print_mc_function_header, print_mc_function_footer, print_mc_assembly_prologue, print_mc_runtime_stubs, print_mc_string_pool
