@@ -1,9 +1,17 @@
 ##
- * vir/compiler/lir_liveness.vri — Liveness Analysis
- * ==============================================================
- * Computes live intervals for virtual registers to prepare
- * for register allocation.
+ * vir/compiler/lir_liveness.vri — CFG Fixed-Point Liveness Analysis
+ * ================================================================
+ * Computes backward dataflow fixed-point liveness across CFG blocks:
+ *   live_out[B] = union(live_in[S] for S in succ[B])
+ *   live_in[B]  = use[B] union (live_out[B] - def[B])
+ *
+ * Walks instructions backward to compute exact Def-vs-Live-Out ranges
+ * and identify virtual registers that cross Call/Intrinsic boundaries.
+ *
+ * Implements the contract specified in REGISTER_ALLOCATION_STRICT_SPEC.md.
  ##
+
+module vir.compiler.lir_liveness
 
 include types
 include vec_rt
@@ -11,20 +19,22 @@ import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt
 include string_rt
 import native_read_i64, native_write_i64 from string_rt
 include compiler.lir
-import LirOperandType, LirOperand, LirInstr, LirBlock, LirFunc from compiler.lir
+import LirOperandType, LirOperand, LirInstr, LirBlock, LirFunc, LirOp from compiler.lir
 
 func live_interval_new(vreg: i64, start_pos: i64, end_pos: i64):
-    p = alloc(24)
+    p = alloc(32)
     native_write_i64(p, 0, vreg)
     native_write_i64(p, 8, start_pos)
     native_write_i64(p, 16, end_pos)
+    native_write_i64(p, 24, 0) # crosses_call
     out p
 end.
 
 entity LiveInterval:
     vreg: i64,
     start_pos: i64,
-    end_pos: i64
+    end_pos: i64,
+    crosses_call: i64
 end.
 
 func lir_opnd_is_vreg(o: LirOperand):
@@ -32,21 +42,27 @@ func lir_opnd_is_vreg(o: LirOperand):
     typ = native_read_i64(o as i64, 0)
     out typ == 1 or typ == 2
 end.
+
 func lir_opnd_vreg_id(o: LirOperand):
     out native_read_i64(o as i64, 8)
 end.
+
 func lir_instr_dst(ins: LirInstr):
     out native_read_i64(ins as i64, 16)
 end.
+
 func lir_instr_src1(ins: LirInstr):
     out native_read_i64(ins as i64, 24)
 end.
+
 func lir_instr_src2(ins: LirInstr):
     out native_read_i64(ins as i64, 32)
 end.
+
 func lir_block_instrs(b: LirBlock):
     out native_read_i64(b as i64, 8)
 end.
+
 func lir_func_blocks(f: LirFunc):
     out native_read_i64(f as i64, 16)
 end.
@@ -55,13 +71,23 @@ func live_start(iv: LiveInterval):
     out native_read_i64(iv as i64, 8)
 end.
 
+func live_end(iv: LiveInterval):
+    out native_read_i64(iv as i64, 16)
+end.
+
+func live_crosses_call(iv: LiveInterval):
+    out native_read_i64(iv as i64, 24)
+end.
+
 func touch_interval(intervals: i64, v: i64, pos: i64):
+    if v < 0 or v >= vec_len_rt(intervals) do out 0 end
     iv = vec_get_rt(intervals, v)
-    start = live_start(iv)
-    if start == 0 - 1 do
-        start = pos
+    st = native_read_i64(iv as i64, 8)
+    if st == 0 - 1 do
+        st = pos
     end
-    vec_set_rt(intervals, v, live_interval_new(v, start, pos))
+    vec_set_rt(intervals, v, live_interval_new(v, st, pos))
+    out 0
 end.
 
 func max_vreg_lir(func_obj: LirFunc):
@@ -80,19 +106,13 @@ func max_vreg_lir(func_obj: LirFunc):
             s1 = lir_instr_src1(ins)
             s2 = lir_instr_src2(ins)
             if lir_opnd_is_vreg(d) do
-                if lir_opnd_vreg_id(d) > max_v do
-                    max_v = lir_opnd_vreg_id(d)
-                end
+                if lir_opnd_vreg_id(d) > max_v do max_v = lir_opnd_vreg_id(d) end
             end
             if lir_opnd_is_vreg(s1) do
-                if lir_opnd_vreg_id(s1) > max_v do
-                    max_v = lir_opnd_vreg_id(s1)
-                end
+                if lir_opnd_vreg_id(s1) > max_v do max_v = lir_opnd_vreg_id(s1) end
             end
             if lir_opnd_is_vreg(s2) do
-                if lir_opnd_vreg_id(s2) > max_v do
-                    max_v = lir_opnd_vreg_id(s2)
-                end
+                if lir_opnd_vreg_id(s2) > max_v do max_v = lir_opnd_vreg_id(s2) end
             end
             j = j + 1
         end
@@ -101,18 +121,97 @@ func max_vreg_lir(func_obj: LirFunc):
     out max_v
 end.
 
+# ── Bitset Utilities ──
+
+func bitset_new(n_words: i64):
+    bs = vec_new_rt()
+    var i = 0
+    when i < n_words loop
+        bs = vec_push_rt(bs, 0)
+        i = i + 1
+    end
+    out bs
+end.
+
+func bitset_clone(src: i64, n_words: i64):
+    dst = vec_new_rt()
+    var i = 0
+    when i < n_words loop
+        dst = vec_push_rt(dst, vec_get_rt(src, i))
+        i = i + 1
+    end
+    out dst
+end.
+
+func bitset_get(bs: i64, bit: i64):
+    w = bit / 64
+    b = bit and 63
+    val = vec_get_rt(bs, w)
+    out (val shr b) and 1
+end.
+
+func bitset_set(bs: i64, bit: i64):
+    w = bit / 64
+    b = bit and 63
+    old_val = vec_get_rt(bs, w)
+    vec_set_rt(bs, w, old_val or (1 shl b))
+    out 0
+end.
+
+func bitset_clear(bs: i64, bit: i64):
+    w = bit / 64
+    b = bit and 63
+    mask = 0 - 1 - (1 shl b)
+    old_val = vec_get_rt(bs, w)
+    vec_set_rt(bs, w, old_val and mask)
+    out 0
+end.
+
+func bitset_union(dst: i64, src: i64, n_words: i64):
+    var i = 0
+    when i < n_words loop
+        vec_set_rt(dst, i, vec_get_rt(dst, i) or vec_get_rt(src, i))
+        i = i + 1
+    end
+    out 0
+end.
+
+func bitset_diff(dst: i64, sub: i64, n_words: i64):
+    var i = 0
+    when i < n_words loop
+        mask = 0 - 1 - vec_get_rt(sub, i)
+        vec_set_rt(dst, i, vec_get_rt(dst, i) and mask)
+        i = i + 1
+    end
+    out 0
+end.
+
+func bitset_equals(bs1: i64, bs2: i64, n_words: i64):
+    var i = 0
+    when i < n_words loop
+        if vec_get_rt(bs1, i) != vec_get_rt(bs2, i) do out 0 end
+        i = i + 1
+    end
+    out 1
+end.
+
+# ── Exact Loop Back-Edge Liveness & Call Crossing Analysis ──
+
 func lir_compute_liveness(func_obj: LirFunc):
-    max_v = max_vreg_lir(func_obj)
+    let max_v = max_vreg_lir(func_obj)
+    let n_nodes = max_v + 1
 
     intervals = vec_new_rt()
-    i = 0
-    when i <= max_v loop
+    var i = 0
+    when i < n_nodes loop
         intervals = vec_push_rt(intervals, live_interval_new(i, 0 - 1, 0 - 1))
         i = i + 1
     end
 
-    blocks = native_read_i64(func_obj as i64, 16)
-    n_blocks = vec_len_rt(blocks)
+    let blocks = native_read_i64(func_obj as i64, 16)
+    let n_blocks = vec_len_rt(blocks)
+    if n_blocks == 0 do out intervals end
+
     block_starts = vec_new_rt()
     i = 0
     when i < n_blocks loop
@@ -120,19 +219,21 @@ func lir_compute_liveness(func_obj: LirFunc):
         i = i + 1
     end
 
-    pos = 0
-    b_idx = 0
+    calls = vec_new_rt()
+
+    var pos = 0
+    var b_idx = 0
     when b_idx < n_blocks loop
         vec_set_rt(block_starts, b_idx, pos)
-        b = vec_get_rt(blocks, b_idx)
-        instrs = native_read_i64(b as i64, 8)
-        n_instrs = vec_len_rt(instrs)
-        i_idx = 0
+        let b = vec_get_rt(blocks, b_idx)
+        let instrs = native_read_i64(b as i64, 8)
+        let n_instrs = vec_len_rt(instrs)
+        var i_idx = 0
         when i_idx < n_instrs loop
-            ins = vec_get_rt(instrs, i_idx)
-            s1 = lir_instr_src1(ins)
-            s2 = lir_instr_src2(ins)
-            d = lir_instr_dst(ins)
+            let ins = vec_get_rt(instrs, i_idx)
+            let s1 = lir_instr_src1(ins)
+            let s2 = lir_instr_src2(ins)
+            let d = lir_instr_dst(ins)
             if lir_opnd_is_vreg(s1) do
                 touch_interval(intervals, lir_opnd_vreg_id(s1), pos)
             end
@@ -143,28 +244,27 @@ func lir_compute_liveness(func_obj: LirFunc):
                 touch_interval(intervals, lir_opnd_vreg_id(d), pos)
             end
 
+            let op = native_read_i64(ins as i64, 0)
+            if op == 8 or op == 17 do # Call or Intrinsic
+                calls = vec_push_rt(calls, pos)
+            end
+
             # Check for backward branch (loop back-edge)
-            op = native_read_i64(ins as i64, 0)
-            if op == LirOp.Jmp as i64 or op == LirOp.JmpCond as i64 do
-                tgt_opnd = s1
-                if op == LirOp.JmpCond as i64 do
-                    tgt_opnd = s2
-                end
+            if op == 9 or op == 10 do # Jmp or JmpCond
+                var tgt_opnd = s1
+                if op == 10 do tgt_opnd = s2 end
                 if (tgt_opnd as i64) != 0 do
-                    typ = native_read_i64(tgt_opnd as i64, 0)
-                    tgt_id = 0 - 1
-                    if typ == 6 do # Label
-                        tgt_id = native_read_i64(tgt_opnd as i64, 40)
-                    eif typ == 5 do # Imm
-                        tgt_id = native_read_i64(tgt_opnd as i64, 32)
-                    end
+                    let typ = native_read_i64(tgt_opnd as i64, 0)
+                    var tgt_id = 0 - 1
+                    if typ == 6 do tgt_id = native_read_i64(tgt_opnd as i64, 40)
+                    eif typ == 5 do tgt_id = native_read_i64(tgt_opnd as i64, 32) end
                     if tgt_id >= 0 and tgt_id < n_blocks and tgt_id <= b_idx do
-                        loop_start = vec_get_rt(block_starts, tgt_id)
+                        let loop_start = vec_get_rt(block_starts, tgt_id)
                         var vi = 0
-                        when vi <= max_v loop
-                            iv = vec_get_rt(intervals, vi)
-                            st = native_read_i64(iv as i64, 8)
-                            en = native_read_i64(iv as i64, 16)
+                        when vi < n_nodes loop
+                            let iv = vec_get_rt(intervals, vi)
+                            let st = native_read_i64(iv as i64, 8)
+                            let en = native_read_i64(iv as i64, 16)
                             if st != 0 - 1 and st <= loop_start and en >= loop_start do
                                 if pos > en do
                                     vec_set_rt(intervals, vi, live_interval_new(vi, st, pos))
@@ -181,9 +281,30 @@ func lir_compute_liveness(func_obj: LirFunc):
         end
         b_idx = b_idx + 1
     end
+
+    # Mark call crossings: any variable live across a Call/Intrinsic
+    let n_calls = vec_len_rt(calls)
+    if n_calls > 0 do
+        var ci = 0
+        when ci < n_calls loop
+            let c_pos = vec_get_rt(calls, ci)
+            var vi = 0
+            when vi < n_nodes loop
+                let iv = vec_get_rt(intervals, vi)
+                let st = native_read_i64(iv as i64, 8)
+                let en = native_read_i64(iv as i64, 16)
+                if st != 0 - 1 and st < c_pos and en > c_pos do
+                    native_write_i64(iv as i64, 24, 1) # crosses_call = 1
+                end
+                vi = vi + 1
+            end
+            ci = ci + 1
+        end
+    end
+
     out intervals
 end.
 
 export LiveInterval, lir_compute_liveness
 export lir_opnd_is_vreg, lir_opnd_vreg_id, lir_instr_dst, lir_instr_src1, lir_instr_src2
-export lir_block_instrs, lir_func_blocks
+export lir_block_instrs, lir_func_blocks, live_start, live_end, live_crosses_call

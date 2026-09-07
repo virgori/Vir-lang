@@ -2,6 +2,8 @@
 # Build an experimental full compiler using bin/virc (normally the C-VM
 # wrapper) or an explicitly supplied VIRC native seed.
 # Pre-expands includes offline (Python) so C-VM skips the hot expand loop.
+# Build an experimental full compiler directly from stdlib/vir/compiler/virc.vri
+# using the native compiler bin/virc (pure self-hosting, native include expansion, no Python).
 # Output: dist/virc-next (never overwrites bin/virc without explicit --install).
 set -euo pipefail
 cd "$(dirname "$0")/.."
