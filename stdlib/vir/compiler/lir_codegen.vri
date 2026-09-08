@@ -1904,11 +1904,10 @@ func emit_lir_rt_matmul_stub(cb: CodeBuf):
 end.
 
 func emit_lir_rt_fma_stub(cb: CodeBuf):
-    # X0 = A * B + C (MADD X0, X0, X1, X2)
-    cb = codebuf_emit_u32(cb, 0x9B010800 or (2 shl 16) or (1 shl 5) or 0)
-    out arm64_ret(cb)
-    # X0 = X2 + X0 * X1
-    out arm64_ret(arm64_madd_rrrr(cb, 0, 0, 1, 2))
+    # `a >< b` is a tensor dot-product/matmul whose inner accumulation uses
+    # MADD/FMA.  It has the same ABI as the general matmul kernel:
+    # X0=A, X1=B, X2=M, X3=K, X4=N.  There is no hidden/stale X2 accumulator.
+    out emit_lir_rt_matmul_stub(cb)
 end.
 
 func emit_lir_rt_port_create_stub(cb: CodeBuf):
@@ -2827,9 +2826,6 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
                 var dim_m = (ins_aux shr 32) and 65535
                 var dim_k = (ins_aux shr 16) and 65535
                 var dim_n = ins_aux and 65535
-                if dim_m <= 0 do dim_m = 2 end
-                if dim_k <= 0 do dim_k = 2 end
-                if dim_n <= 0 do dim_n = 2 end
                 cb = arm64_mov_imm16(cb, 2, dim_m as int)
                 cb = arm64_mov_imm16(cb, 3, dim_k as int)
                 cb = arm64_mov_imm16(cb, 4, dim_n as int)
@@ -2839,7 +2835,28 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
                 end
                 last_cmp_pred = 0 - 1
             eif op == LirOp.Fma do
+                a_fma = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                b_fma = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if a_fma == 1 and b_fma == 0 do
+                    cb = arm64_mov_rr(cb, SCR, 0)
+                    cb = arm64_mov_rr(cb, 0, 1)
+                    cb = arm64_mov_rr(cb, 1, SCR)
+                eif a_fma == 1 do
+                    cb = arm64_mov_rr(cb, 0, 1)
+                    if b_fma >= 0 and b_fma != 1 do cb = arm64_mov_rr(cb, 1, b_fma as int) end
+                else
+                    if a_fma >= 0 and a_fma != 0 do cb = arm64_mov_rr(cb, 0, a_fma as int) end
+                    if b_fma >= 0 and b_fma != 1 do cb = arm64_mov_rr(cb, 1, b_fma as int) end
+                end
+                fma_aux = native_read_i64(ins as i64, 40)
+                fma_m = (fma_aux shr 32) and 65535
+                fma_k = (fma_aux shr 16) and 65535
+                fma_n = fma_aux and 65535
+                cb = arm64_mov_imm16(cb, 2, fma_m as int)
+                cb = arm64_mov_imm16(cb, 3, fma_k as int)
+                cb = arm64_mov_imm16(cb, 4, fma_n as int)
                 cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_FMA, rd)
+                if rd < 0 and ins_dst != 0 do cb = emit_spill_store(cb, ins_dst as i64, 0) end
                 last_cmp_pred = 0 - 1
             # TCO: self-recursive tail-call — emit B <func_entry> instead of BL+RET.
             # Arguments must already be in X0..X7 via preceding SetArg instructions.
@@ -3130,6 +3147,7 @@ func emit_lir_module_arm64(lir_funcs: i64, is_linux: i64):
     var va_base = 0x100000268
     if is_linux == 1 do
         va_base = 0x401000
+        va_base = 0x410000
     eif ffi_import_used_count() > 0 do
         va_base = 0x100000800
     end
@@ -3222,7 +3240,11 @@ func emit_lir_module_arm64(lir_funcs: i64, is_linux: i64):
         main_off = vec_get_rt(func_offs, main_idx)
         cb = patch_bl_site(cb, at, main_off)
     end
-    cb = arm64_mov_imm16(cb, 0, 0)
+    # Preserve main's result in X0 so the process exit status reflects the
+    # program result.  Only synthesize success when there is no entry function.
+    if n_funcs <= 0 do
+        cb = arm64_mov_imm16(cb, 0, 0)
+    end
     if is_linux == 1 do
         cb = arm64_mov_imm16(cb, 8, 93)        # X8 = 93 (SYS_exit on Linux)
         cb = arm64_svc(cb, 0)
