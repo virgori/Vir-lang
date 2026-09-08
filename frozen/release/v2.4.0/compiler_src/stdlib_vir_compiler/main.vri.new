@@ -1,0 +1,1189 @@
+##
+ * vir/compiler/main.vri — Vir Self-Hosting Compiler Driver
+ * =========================================================
+ * Phase 5: Bootstrap — Vir compiles itself to a standalone binary.
+ *
+ * Pipeline:
+ *   source.vri → lex → parse → lower → regalloc → codegen → link → Mach-O
+ *
+ * Produces a standalone Mach-O ARM64 executable that uses direct
+ * BSD syscalls — no Python, no C library, no external linker needed.
+ *
+ * Usage (Stage 1 — bootstrapped via C runtime):
+ *   vir jit stdlib/vir/compiler/main.vri <input.vri> [-o output]
+ *
+ * Usage (Stage 2 — self-hosted):
+ *   ./virc <input.vri> [-o output]
+ *
+ * Date: 9/3/2026
+ ##
+
+include lexer;
+include parser;
+include ir_optimizer;
+include codegen;
+include binary;
+import Arch, ByteBuffer, buf_new, buf_write_u8 from binary;
+    buf_write_u32_le, buf_write_u64_le, buf_write_zeros,;
+    buf_write_string_padded, buf_write_bytes, buf_size, buf_align;
+include linker;
+import link_single_kernel from linker;
+include file;
+import File, FileMode, file_open, file_read_all from file;
+    file_create, file_write_all, file_close;
+include slice;
+import Slice, slice_new from slice;
+include string_rt;
+import rt_strlen, rt_streq, rt_strcat, rt_strdup, rt_itoa from string_rt;
+
+
+# ═══════════════════════════════════════════════════════
+# Mach-O Constants (macOS ARM64)
+# ═══════════════════════════════════════════════════════
+
+const MACHO_MAGIC: 0xFEEDFACF;
+const CPU_ARM64: 0x0100000C;
+const CPU_SUB_ALL: 0x00000000;
+const MH_EXECUTE: 2;
+const MH_FLAGS: 0x00200085    # PIE | TWOLEVEL | DYLDLINK;
+const LC_SEGMENT_64: 0x19;
+const LC_MAIN: 0x80000028;
+const LC_SYMTAB: 0x02;
+const TEXT_BASE: 0x100000000;
+const PAGE_SIZE: 0x4000;
+
+# macOS BSD syscall numbers (add 0x2000000 for BSD layer)
+const SYS_EXIT: 0x2000001;
+const SYS_WRITE: 0x2000004;
+const SYS_CHMOD: 0x200000F;
+
+
+# ═══════════════════════════════════════════════════════
+# Module-Level Code Emission
+# ═══════════════════════════════════════════════════════
+# Emits all functions from a Q-IR module into a single
+# code buffer with cross-function call resolution.
+
+entity FuncLayout:
+    name:       string;
+    code_off:   int    # byte offset in the code buffer;
+    fsize:      int;
+end
+
+# Emit the ARM64 runtime stubs that compiled programs need:
+#   offset 0: _rt_print_i64  — print integer to stdout + newline
+#   offset N: _rt_exit       — exit process
+# Returns (cb, print_offset, exit_offset, total_runtime_size)
+
+func emit_runtime_arm64:
+    in(cb:CodeBuf)
+    print_offset = codebuf_offset(cb);
+
+    # ── _rt_print_i64: X0 = value to print ──
+    # Prologue: save frame + callee-saved registers
+    cb = arm64_stp_pre(cb, 29, 30, 31, -160)    # STP X29, X30, [SP, #-160]!;
+    cb = arm64_mov_sp_to(cb, 29)               # MOV X29, SP;
+    # Save callee-saved registers X19-X26
+    # STP X19, X20, [SP, #16]
+    cb = codebuf_emit_u32(cb, 0xA90153F3);
+    # STP X21, X22, [SP, #32]
+    cb = codebuf_emit_u32(cb, 0xA9025BF5);
+    # STP X23, X24, [SP, #48]
+    cb = codebuf_emit_u32(cb, 0xA90363F7);
+    # STP X25, X26, [SP, #64]
+    cb = codebuf_emit_u32(cb, 0xA9046BF9);
+    # STP X27, X28, [SP, #80]
+    cb = codebuf_emit_u32(cb, 0xA90573FB);
+    cb = arm64_mov_rr(cb, 19, 0)               # MOV X19, X0 (save value);
+    cb = arm64_mov_rr(cb, 27, 0)               # MOV X27, X0 (preserve for caller);
+
+    # Buffer at SP+96, X20 = buffer base, X21 = position
+    # ADD X20, SP, #96
+    # ARM64 ADD immediate: 0x91000000 | (imm12 << 10) | (Rn << 5) | Rd
+    cb = codebuf_emit_u32(cb, 0x91000000 | (96 << 10) | (31 << 5) | 20);
+    cb = arm64_mov_imm16(cb, 21, 0)            # MOV X21, #0 (position);
+    cb = arm64_mov_imm16(cb, 22, 0)            # MOV X22, #0 (is_neg);
+
+    # Handle negative: if X19 < 0
+    # CMP X19, #0
+    cb = arm64_cmp_imm0(cb, 19);
+    # B.GE +3 instructions (skip negate)
+    # B.GE is B.cond with cond=0b1010=10, imm19 = 3
+    cb = codebuf_emit_u32(cb, 0x5400006A)   # B.GE +3*4;
+    # NEG X19, X19 → SUB X19, XZR, X19
+    cb = codebuf_emit_u32(cb, 0xCB1303F3)   # SUB X19, XZR, X19;
+    # MOV X22, #1 (is_neg = true)
+    cb = arm64_mov_imm16(cb, 22, 1);
+
+    # Handle zero: CBZ X19, .is_zero → 4 instructions forward to .is_zero
+    # CBZ X19 = 0xB4000000 | (imm19 << 5) | 19
+    # .is_zero is after the digit loop, need forward ref
+    # Use placeholder, will back-patch
+    zero_check_patch = codebuf_offset(cb);
+    cb = codebuf_emit_u32(cb, 0xB4000013)       # CBZ X19, placeholder;
+
+    # Digit conversion loop
+    cb = arm64_mov_imm16(cb, 23, 10)             # MOV X23, #10;
+    # .digit_loop:
+    digit_loop = codebuf_offset(cb);
+    # CBZ X19, .digits_done
+    digits_done_patch = codebuf_offset(cb);
+    cb = codebuf_emit_u32(cb, 0xB4000013)       # CBZ X19, placeholder;
+
+    # UDIV X24, X19, X23
+    cb = codebuf_emit_u32(cb, 0x9AD70A78)       # UDIV X24, X19, X23;
+    # MSUB X25, X24, X23, X19 → X25 = X19 - X24*X23
+    cb = codebuf_emit_u32(cb, 0x9B17CF19)       # MSUB X25, X24, X23, X19;
+    # ADD X25, X25, #48 ('0')
+    cb = codebuf_emit_u32(cb, 0x9100C339)       # ADD X25, X25, #48;
+    # STRB W25, [X20, X21]
+    cb = codebuf_emit_u32(cb, 0x38356A99)       # STRB W25, [X20, X21];
+    # ADD X21, X21, #1
+    cb = codebuf_emit_u32(cb, 0x910006B5)       # ADD X21, X21, #1;
+    # MOV X19, X24 (quotient)
+    cb = arm64_mov_rr(cb, 19, 24);
+    # B .digit_loop
+    back = (digit_loop - codebuf_offset(cb)) / 4;
+    cb = codebuf_emit_u32(cb, 0x14000000 | (back & 0x03FFFFFF));
+    # B .reverse (skip .is_zero)
+    skip_zero_patch = codebuf_offset(cb);
+    cb = codebuf_emit_u32(cb, 0x14000000)        # B placeholder;
+
+    # .is_zero: store '0'
+    is_zero = codebuf_offset(cb);
+    cb = arm64_mov_imm16(cb, 25, 48)             # MOV X25, #'0';
+    cb = codebuf_emit_u32(cb, 0x38356A99)        # STRB W25, [X20, X21];
+    cb = codebuf_emit_u32(cb, 0x910006B5)        # ADD X21, X21, #1;
+
+    # .digits_done / .reverse:
+    reverse_start = codebuf_offset(cb);
+
+    # Patch zero_check_patch → .is_zero
+    zc_off = (is_zero - zero_check_patch) / 4;
+    cb = codebuf_patch_u32(cb, zero_check_patch,;
+        0xB4000013 | ((zc_off & 0x7FFFF) << 5));
+
+    # Patch digits_done_patch → reverse_start
+    dd_off = (reverse_start - digits_done_patch) / 4;
+    cb = codebuf_patch_u32(cb, digits_done_patch,;
+        0xB4000013 | ((dd_off & 0x7FFFF) << 5));
+
+    # Patch skip_zero_patch → reverse_start
+    sz_off = (reverse_start - skip_zero_patch) / 4;
+    cb = codebuf_patch_u32(cb, skip_zero_patch,;
+        0x14000000 | (sz_off & 0x03FFFFFF));
+
+    # Add '-' if negative
+    # CBZ X22, .skip_minus
+    skip_minus_patch = codebuf_offset(cb);
+    cb = codebuf_emit_u32(cb, 0xB4000016)       # CBZ X22, placeholder;
+    cb = arm64_mov_imm16(cb, 25, 45)            # MOV X25, #'-';
+    cb = codebuf_emit_u32(cb, 0x38356A99)       # STRB W25, [X20, X21];
+    cb = codebuf_emit_u32(cb, 0x910006B5)       # ADD X21, X21, #1;
+    # .skip_minus:
+    skip_minus = codebuf_offset(cb);
+    sm_off = (skip_minus - skip_minus_patch) / 4;
+    cb = codebuf_patch_u32(cb, skip_minus_patch,;
+        0xB4000016 | ((sm_off & 0x7FFFF) << 5));
+
+    # Reverse the digit string in-place
+    cb = arm64_mov_imm16(cb, 23, 0)             # X23 = left = 0;
+    cb = arm64_mov_rr(cb, 24, 21)               # X24 = right = X21 (len);
+    cb = codebuf_emit_u32(cb, 0xD1000718)       # SUB X24, X24, #1;
+
+    # .rev_loop:
+    rev_loop = codebuf_offset(cb);
+    # CMP X23, X24
+    cb = codebuf_emit_u32(cb, 0xEB1802FF)       # CMP X23, X24;
+    # B.GE .rev_done
+    rev_done_patch = codebuf_offset(cb);
+    cb = codebuf_emit_u32(cb, 0x5400000A)       # B.GE placeholder;
+
+    # LDRB W25, [X20, X23]
+    cb = codebuf_emit_u32(cb, 0x38776A99)       # LDRB W25, [X20, X23];
+    # LDRB W26, [X20, X24]
+    cb = codebuf_emit_u32(cb, 0x38786A9A)       # LDRB W26, [X20, X24];
+    # STRB W26, [X20, X23]
+    cb = codebuf_emit_u32(cb, 0x38376A9A)       # STRB W26, [X20, X23];
+    # STRB W25, [X20, X24]
+    cb = codebuf_emit_u32(cb, 0x38386A99)       # STRB W25, [X20, X24];
+    # ADD X23, X23, #1
+    cb = codebuf_emit_u32(cb, 0x910006F7)       # ADD X23, X23, #1;
+    # SUB X24, X24, #1
+    cb = codebuf_emit_u32(cb, 0xD1000718)       # SUB X24, X24, #1;
+    # B .rev_loop
+    rv_off = (rev_loop - codebuf_offset(cb)) / 4;
+    cb = codebuf_emit_u32(cb, 0x14000000 | (rv_off & 0x03FFFFFF));
+
+    # .rev_done:
+    rev_done = codebuf_offset(cb);
+    rd_off = (rev_done - rev_done_patch) / 4;
+    cb = codebuf_patch_u32(cb, rev_done_patch,;
+        0x5400000A | ((rd_off & 0x7FFFF) << 5));
+
+    # Append newline: '\n' = 10
+    cb = arm64_mov_imm16(cb, 25, 10);
+    cb = codebuf_emit_u32(cb, 0x38356A99)       # STRB W25, [X20, X21];
+    cb = codebuf_emit_u32(cb, 0x910006B5)       # ADD X21, X21, #1;
+
+    # syscall write(1, X20, X21)
+    cb = arm64_mov_imm16(cb, 0, 1)              # fd = stdout;
+    cb = arm64_mov_rr(cb, 1, 20)                # buf;
+    cb = arm64_mov_rr(cb, 2, 21)                # len;
+    # MOV X16, #0x2000004 (SYS_WRITE with BSD offset)
+    cb = arm64_mov_imm16(cb, 16, 4)             # low 16 bits;
+    cb = codebuf_emit_u32(cb, 0xF2A04010)       # MOVK X16, #0x200, LSL#16;
+
+    cb = arm64_svc(cb, 128)                      # SVC #0x80;
+
+    # Restore X0 so caller's vreg0 is preserved
+    cb = arm64_mov_rr(cb, 0, 27)               # MOV X0, X27;
+
+    # Restore callee-saved registers X19-X28
+    # LDP X19, X20, [SP, #16]
+    cb = codebuf_emit_u32(cb, 0xA94153F3);
+    # LDP X21, X22, [SP, #32]
+    cb = codebuf_emit_u32(cb, 0xA9425BF5);
+    # LDP X23, X24, [SP, #48]
+    cb = codebuf_emit_u32(cb, 0xA94363F7);
+    # LDP X25, X26, [SP, #64]
+    cb = codebuf_emit_u32(cb, 0xA9446BF9);
+    # LDP X27, X28, [SP, #80]
+    cb = codebuf_emit_u32(cb, 0xA94573FB);
+
+    # Epilogue
+    cb = arm64_ldp_post(cb, 29, 30, 31, 160)     # LDP X29, X30, [SP], #160;
+    cb = arm64_ret(cb);
+
+    print_size = codebuf_offset(cb) - print_offset;
+
+    # ── _rt_print_str: X0 = char ptr, X1 = length ──
+    printstr_offset = codebuf_offset(cb);
+    # STP X29, X30, [SP, #-16]!
+    cb = arm64_stp_pre(cb, 29, 30, 31, -16);
+    # MOV buffer and length to syscall args
+    # write(1, buf, len) → X0=fd, X1=buf, X2=len
+    cb = arm64_mov_rr(cb, 2, 1);               # X2 = len;
+    cb = arm64_mov_rr(cb, 1, 0);               # X1 = buf;
+    cb = arm64_mov_imm16(cb, 0, 1);            # X0 = 1 (stdout);
+    cb = arm64_mov_imm16(cb, 16, 4);           # X16 = SYS_WRITE;
+    cb = codebuf_emit_u32(cb, 0xF2A04010);     # MOVK X16, #0x200, LSL#16;
+    cb = arm64_svc(cb, 128);
+    # Print newline: write(1, "\n", 1)
+    # Store '\n' on stack: MOV W17, #10; STRB W17, [SP, #-1]!
+    cb = arm64_mov_imm16(cb, 17, 10);
+    # STR byte on stack: SUB SP, SP, #16; STRB W17, [SP]
+    cb = codebuf_emit_u32(cb, 0xD10043FF);     # SUB SP, SP, #16;
+    cb = codebuf_emit_u32(cb, 0x390003F1);     # STRB W17, [SP];
+    cb = arm64_mov_imm16(cb, 0, 1);            # fd = stdout;
+    cb = arm64_mov_sp_to(cb, 1);               # buf = SP;
+    cb = arm64_mov_imm16(cb, 2, 1);            # len = 1;
+    cb = arm64_mov_imm16(cb, 16, 4);
+    cb = codebuf_emit_u32(cb, 0xF2A04010);
+    cb = arm64_svc(cb, 128);
+    cb = codebuf_emit_u32(cb, 0x910043FF);     # ADD SP, SP, #16;
+    cb = arm64_ldp_post(cb, 29, 30, 31, 16);
+    cb = arm64_ret(cb);
+
+    # ── _rt_exit: X0 = exit code (already in X0) ──
+    exit_offset = codebuf_offset(cb);
+    # MOV X16, #0x2000001 (SYS_EXIT with BSD offset)
+    cb = arm64_mov_imm16(cb, 16, 1)             # low bits;
+    cb = codebuf_emit_u32(cb, 0xF2A04010)       # MOVK X16, #0x200, LSL#16;
+    cb = arm64_svc(cb, 128)                      # SVC #0x80;
+
+    out (cb, print_offset, exit_offset, printstr_offset);
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Module Codegen
+# ═══════════════════════════════════════════════════════
+# Emits all functions in a QModule into a single CodeBuf.
+# Cross-function calls are resolved via the FuncLayout table.
+
+func codegen_emit_module:
+    in(module:QModule; arch:TargetArch)
+    # Phase 1: Emit runtime stubs + all functions
+    cb = codebuf_new(arch);
+    layouts = vec_new_rt();
+    layout_count = 0;
+    fixup_offsets = vec_new_rt();
+    fixup_targets = vec_new_rt();
+    fixup_count = 0;
+    main_idx = -1;
+
+    # Reserve globals slots for string data pointers
+    # Each string needs 2 slots: [ptr, len]
+    # Start after globals[0] (heap ptr)
+    str_count = vec_len_rt(module.strings);
+    str_globals_base = 1;  # globals[0] = heap, strings start at globals[1]
+    str_adr_patches = vec_new_rt();   # offsets of ADR instructions to patch
+    str_adr_indices = vec_new_rt();   # corresponding string index
+
+    # Emit runtime stubs first
+    var (cb2, rt_print_off, rt_exit_off, rt_printstr_off) = emit_runtime_arm64(cb);
+    cb = cb2;
+    runtime_size = codebuf_offset(cb);
+
+    # Emit each function
+    fi = 0;
+    nfuncs = vec_len_rt(module.functions);
+    when fi < nfuncs loop
+        qfn = vec_get_rt(module.functions, fi);
+        bodylen = vec_len_rt(qfn.body);
+        func_start = codebuf_offset(cb);
+
+        # Track main function
+        if rt_streq(qfn.name, "main") or rt_streq(qfn.name, "__main__"):
+            main_idx = fi;
+        end
+
+        # All user functions need a stack frame since vregs map to callee-saved x19+
+        needs_frame = 1;
+
+        # Emit prologue
+        if needs_frame == 1:
+            # Save frame pointer, link register, and callee-saved x19-x28
+            # Frame = 160 bytes: 16(fp/lr) + 80(x19-x28) + 64(call spill area for x9-x14)
+            cb = arm64_stp_pre(cb, 29, 30, 31, -160);
+            cb = arm64_mov_sp_to(cb, 29);
+            # Save x19-x28 (callee-saved regs used for vregs)
+            cb = codebuf_emit_u32(cb, 0xA90153F3);   # STP X19, X20, [SP, #16];
+            cb = codebuf_emit_u32(cb, 0xA9025BF5);   # STP X21, X22, [SP, #32];
+            cb = codebuf_emit_u32(cb, 0xA90363F7);   # STP X23, X24, [SP, #48];
+            cb = codebuf_emit_u32(cb, 0xA9046BF9);   # STP X25, X26, [SP, #64];
+            cb = codebuf_emit_u32(cb, 0xA90573FB);   # STP X27, X28, [SP, #80];
+        end
+
+        # Move function arguments from x0-x7 to callee-saved registers
+        # vreg0=x19, vreg1=x20, etc.
+        nparams = qfn.param_count;
+        if nparams > 0:
+            cb = arm64_mov_rr(cb, 19, 0);
+        end
+        if nparams > 1:
+            cb = arm64_mov_rr(cb, 20, 1);
+        end
+        if nparams > 2:
+            cb = arm64_mov_rr(cb, 21, 2);
+        end
+        if nparams > 3:
+            cb = arm64_mov_rr(cb, 22, 3);
+        end
+        if nparams > 4:
+            cb = arm64_mov_rr(cb, 23, 4);
+        end
+        if nparams > 5:
+            cb = arm64_mov_rr(cb, 24, 5);
+        end
+        if nparams > 6:
+            cb = arm64_mov_rr(cb, 25, 6);
+        end
+        if nparams > 7:
+            cb = arm64_mov_rr(cb, 26, 7);
+        end
+
+        # Emit instructions
+        ps = patch_new();
+        j = 0;
+        when j < vec_len_rt(qfn.body) loop
+            ins = vec_get_rt(qfn.body, j);
+
+            # Handle critical opcodes separately to avoid deep if/eif nesting
+            handled = 0;
+            if ins.opcode == QOp::Print:
+                if ins.src1.op_type == OperandType::VReg:
+                    cb = arm64_mov_rr(cb, 0, vreg_to_arm(ins.src1.vreg));
+                end
+                # Save caller-saved vregs x9-x14 before print call
+                cb = codebuf_emit_u32(cb, 0xA9062BE9);   # STP X9, X10, [SP, #96];
+                cb = codebuf_emit_u32(cb, 0xA90733EB);   # STP X11, X12, [SP, #112];
+                cb = codebuf_emit_u32(cb, 0xA9083BED);   # STP X13, X14, [SP, #128];
+                print_bl_off = codebuf_offset(cb);
+                delta = (rt_print_off - print_bl_off) / 4;
+                cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF));
+                # Restore caller-saved vregs x9-x14 after print call
+                cb = codebuf_emit_u32(cb, 0xA9462BE9);   # LDP X9, X10, [SP, #96];
+                cb = codebuf_emit_u32(cb, 0xA94733EB);   # LDP X11, X12, [SP, #112];
+                cb = codebuf_emit_u32(cb, 0xA9483BED);   # LDP X13, X14, [SP, #128];
+                handled = 1;
+            end
+            if ins.opcode == QOp::Ret:
+                if ins.src1.op_type == OperandType::VReg and vreg_to_arm(ins.src1.vreg) != 0:
+                    cb = arm64_mov_rr(cb, 0, vreg_to_arm(ins.src1.vreg));
+                end
+                if needs_frame == 1:
+                    cb = codebuf_emit_u32(cb, 0xA94153F3);   # LDP X19, X20, [SP, #16];
+                    cb = codebuf_emit_u32(cb, 0xA9425BF5);   # LDP X21, X22, [SP, #32];
+                    cb = codebuf_emit_u32(cb, 0xA94363F7);   # LDP X23, X24, [SP, #48];
+                    cb = codebuf_emit_u32(cb, 0xA9446BF9);   # LDP X25, X26, [SP, #64];
+                    cb = codebuf_emit_u32(cb, 0xA94573FB);   # LDP X27, X28, [SP, #80];
+                    cb = arm64_ldp_post(cb, 29, 30, 31, 160);
+                end
+                cb = arm64_ret(cb);
+                handled = 1;
+            end
+            if ins.opcode == QOp::Exit:
+                if ins.src1.op_type == OperandType::VReg:
+                    cb = arm64_mov_rr(cb, 0, vreg_to_arm(ins.src1.vreg));
+                end
+                exit_bl_off = codebuf_offset(cb);
+                delta = (rt_exit_off - exit_bl_off) / 4;
+                cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF));
+                handled = 1;
+            end
+            if ins.opcode == QOp::Halt:
+                cb = arm64_mov_imm16(cb, 0, 0);
+                cb = arm64_ret(cb);
+                handled = 1;
+            end
+            if ins.opcode == QOp::Label:
+                ps = patch_add_label(ps, ins.dest.vreg, codebuf_offset(cb));
+                handled = 1;
+            end
+            if ins.opcode == QOp::Jump:
+                if ins.src1.op_type == OperandType::LabelRef:
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src1.vreg, 0);
+                end
+                cb = arm64_b_imm26(cb, 0);
+                handled = 1;
+            end
+            if ins.opcode == QOp::JumpIfNot:
+                if ins.src1.op_type == OperandType::VReg:
+                    cb = arm64_cmp_imm0(cb, vreg_to_arm(ins.src1.vreg));
+                end
+                if ins.src2.op_type == OperandType::LabelRef:
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src2.vreg, 1);
+                end
+                cb = arm64_beq_imm19(cb, 0);
+                handled = 1;
+            end
+            if ins.opcode == QOp::JumpIf:
+                if ins.src1.op_type == OperandType::VReg:
+                    cb = arm64_cmp_imm0(cb, vreg_to_arm(ins.src1.vreg));
+                end
+                if ins.src2.op_type == OperandType::LabelRef:
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src2.vreg, 1);
+                end
+                cb = arm64_bne_imm19(cb, 0);
+                handled = 1;
+            end
+            if ins.opcode == QOp::SetArg:
+                # SetArg: dest.vreg = ABI arg index (0..3), src1.vreg = value vreg
+                cb = arm64_mov_rr(cb, ins.dest.vreg, vreg_to_arm(ins.src1.vreg));
+                handled = 1;
+            end
+            if ins.opcode == QOp::Call or ins.opcode == QOp::CallFunc:
+                # Save caller-saved vregs x9-x14 before call
+                cb = codebuf_emit_u32(cb, 0xA9062BE9);   # STP X9, X10, [SP, #96];
+                cb = codebuf_emit_u32(cb, 0xA90733EB);   # STP X11, X12, [SP, #112];
+                cb = codebuf_emit_u32(cb, 0xA9083BED);   # STP X13, X14, [SP, #128];
+                if ins.src1.op_type == OperandType::LabelRef:
+                    ps = patch_add_fixup(ps, codebuf_offset(cb), ins.src1.vreg, 0);
+                eif ins.src1.op_type == OperandType::FuncIdx:
+                    fixup_offsets = vec_push_rt(fixup_offsets, codebuf_offset(cb));
+                    fixup_targets = vec_push_rt(fixup_targets, ins.src1.vreg);
+                    fixup_count = fixup_count + 1;
+                end
+                cb = arm64_bl_imm26(cb, 0);
+                # Restore caller-saved vregs x9-x14 after call
+                cb = codebuf_emit_u32(cb, 0xA9462BE9);   # LDP X9, X10, [SP, #96];
+                cb = codebuf_emit_u32(cb, 0xA94733EB);   # LDP X11, X12, [SP, #112];
+                cb = codebuf_emit_u32(cb, 0xA9483BED);   # LDP X13, X14, [SP, #128];
+                # Move return value from x0 directly into dest vreg
+                if ins.dest.op_type == OperandType::VReg:
+                    cb = arm64_mov_rr(cb, vreg_to_arm(ins.dest.vreg), 0);
+                end
+                handled = 1;
+            end
+            if ins.opcode == QOp::LoadGlobal:
+                # LoadGlobal: dest = globals[src1.imm]
+                # X15 = globals base, globals[0] reserved for heap ptr, user globals at idx+1
+                gidx = ins.src1.imm_val + 1;
+                cb = arm64_movz_imm64(cb, 17, gidx >> int);
+                cb = arm64_ldr_reg(cb, vreg_to_arm(ins.dest.vreg), 15, 17);
+                handled = 1;
+            end
+            if ins.opcode == QOp::StoreGlobal:
+                # StoreGlobal: globals[src1.imm] = src2.vreg
+                gidx = ins.src1.imm_val + 1;
+                cb = arm64_movz_imm64(cb, 17, gidx >> int);
+                cb = arm64_str_reg(cb, vreg_to_arm(ins.src2.vreg), 15, 17);
+                handled = 1;
+            end
+            if ins.opcode == QOp::Alloc:
+                # Alloc: dest = bump_alloc(src1.vreg bytes)
+                # globals[0] = heap pointer (in X15)
+                cb = arm64_ldr_imm(cb, 17, 15, 0);               # LDR X17, [X15, #0] — heap ptr;
+                cb = arm64_mov_rr(cb, vreg_to_arm(ins.dest.vreg), 17);  # dest = current heap ptr;
+                cb = arm64_add_rrr(cb, 17, 17, vreg_to_arm(ins.src1.vreg));  # X17 += size;
+                cb = arm64_str_imm(cb, 17, 15, 0);               # STR X17, [X15, #0] — update heap ptr;
+                handled = 1;
+            end
+            if ins.opcode == QOp::ArrNew:
+                # ArrNew: dest = new array with capacity src1.vreg
+                # Layout: [cap, len, data...] — (cap+2)*8 bytes
+                # Use X17 for temp calculations
+                cb = arm64_add_imm(cb, 17, vreg_to_arm(ins.src1.vreg), 2);  # X17 = cap + 2;
+                # Multiply by 8: LSL X17, X17, #3
+                cb = codebuf_emit_u32(cb, 0xD37DF231);           # LSL X17, X17, #3 → UBFM X17,X17,#61,#60;
+                # Bump alloc
+                rd = vreg_to_arm(ins.dest.vreg);
+                cb = arm64_ldr_imm(cb, rd, 15, 0);               # LDR Xd, [X15] — heap ptr;
+                cb = arm64_add_rrr(cb, 17, rd, 17);              # X17 = heap + total_bytes;
+                cb = arm64_str_imm(cb, 17, 15, 0);               # STR X17, [X15] — update heap;
+                # Store capacity at [arr+0], length 0 at [arr+8]
+                cb = arm64_str_imm(cb, vreg_to_arm(ins.src1.vreg), rd, 0);  # [arr] = cap;
+                cb = arm64_mov_imm16(cb, 17, 0);                 # X17 = 0;
+                cb = arm64_str_imm(cb, 17, rd, 8);               # [arr+8] = 0 (len=0);
+                handled = 1;
+            end
+            if ins.opcode == QOp::ArrPush:
+                # ArrPush: src1=arr, src2=element — arr[len++] = elem
+                arr_reg = vreg_to_arm(ins.src1.vreg);
+                elem_reg = vreg_to_arm(ins.src2.vreg);
+                cb = arm64_ldr_imm(cb, 17, arr_reg, 8);          # X17 = len;
+                cb = arm64_add_imm(cb, 17, 17, 2);               # X17 = len + 2 (skip header);
+                cb = arm64_str_reg(cb, elem_reg, arr_reg, 17);   # [arr + X17*8] = elem;
+                cb = arm64_ldr_imm(cb, 17, arr_reg, 8);          # reload len;
+                cb = arm64_add_imm(cb, 17, 17, 1);               # len++;
+                cb = arm64_str_imm(cb, 17, arr_reg, 8);          # [arr+8] = new len;
+                handled = 1;
+            end
+            if ins.opcode == QOp::ArrGet:
+                # ArrGet: dest = arr[idx] — dest.vreg = src1.vreg[src2.vreg]
+                arr_reg = vreg_to_arm(ins.src1.vreg);
+                idx_reg = vreg_to_arm(ins.src2.vreg);
+                cb = arm64_add_imm(cb, 17, idx_reg, 2);          # X17 = idx + 2;
+                cb = arm64_ldr_reg(cb, vreg_to_arm(ins.dest.vreg), arr_reg, 17);  # dest = [arr + X17*8];
+                handled = 1;
+            end
+            if ins.opcode == QOp::ArrSet:
+                # ArrSet: arr[idx] = val — src1.vreg[src2.vreg] = dest.vreg
+                arr_reg = vreg_to_arm(ins.src1.vreg);
+                idx_reg = vreg_to_arm(ins.src2.vreg);
+                cb = arm64_add_imm(cb, 17, idx_reg, 2);          # X17 = idx + 2;
+                cb = arm64_str_reg(cb, vreg_to_arm(ins.dest.vreg), arr_reg, 17);  # [arr + X17*8] = val;
+                handled = 1;
+            end
+            if ins.opcode == QOp::PrintStr:
+                # PrintStr: src1 = StringRef → string index
+                # String data is embedded after code; pointers stored in globals
+                # globals[str_base + idx*2] = ptr, globals[str_base + idx*2 + 1] = len
+                # We emit a BL to _rt_print_str with X0=ptr, X1=len
+                str_idx = ins.src1.vreg;  # StringRef stores index in vreg field
+                # Load string ptr from globals: globals[str_globals_base + idx*2]
+                slot = str_globals_base + str_idx * 2;
+                cb = arm64_movz_imm64(cb, 17, slot);
+                cb = arm64_ldr_reg(cb, 0, 15, 17);     # X0 = globals[slot] = str ptr;
+                slot_len = slot + 1;
+                cb = arm64_movz_imm64(cb, 17, slot_len);
+                cb = arm64_ldr_reg(cb, 1, 15, 17);     # X1 = globals[slot+1] = str len;
+                # Save caller-saved vregs x9-x14 before call
+                cb = codebuf_emit_u32(cb, 0xA9062BE9);
+                cb = codebuf_emit_u32(cb, 0xA90733EB);
+                cb = codebuf_emit_u32(cb, 0xA9083BED);
+                ps_bl_off = codebuf_offset(cb);
+                ps_delta = (rt_printstr_off - ps_bl_off) / 4;
+                cb = codebuf_emit_u32(cb, 0x94000000 | (ps_delta & 0x03FFFFFF));
+                cb = codebuf_emit_u32(cb, 0xA9462BE9);
+                cb = codebuf_emit_u32(cb, 0xA94733EB);
+                cb = codebuf_emit_u32(cb, 0xA9483BED);
+                handled = 1;
+            end
+            if ins.opcode == QOp::ArrLen:
+                # ArrLen: dest = length of array src1
+                # Array layout: [cap, len, data...] — len is at offset 8
+                cb = arm64_ldr_imm(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), 8);
+                handled = 1;
+            end
+
+            if handled == 0:
+
+            if ins.opcode == QOp::Nop:
+                cb = arm64_nop(cb);
+
+            eif ins.opcode == QOp::Load:
+                rd = vreg_to_arm(ins.dest.vreg);
+                if ins.src1.op_type == OperandType::Immediate:
+                    cb = arm64_movz_imm64(cb, rd, ins.src1.imm_val >> int);
+                eif ins.src1.op_type == OperandType::StringRef:
+                    # Load string pointer from globals table
+                    slot = str_globals_base + ins.src1.vreg * 2;
+                    cb = arm64_movz_imm64(cb, 17, slot);
+                    cb = arm64_ldr_reg(cb, rd, 15, 17);
+                end
+
+            eif ins.opcode == QOp::Move:
+                cb = arm64_mov_rr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg));
+
+            eif ins.opcode == QOp::Add:
+                cb = arm64_add_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::Sub:
+                cb = arm64_sub_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::Mul:
+                cb = arm64_mul_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::Div:
+                cb = arm64_sdiv_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::Mod:
+                # ARM64: dest = src1 - (src1/src2)*src2
+                # SDIV X17, Xs1, Xs2
+                # MSUB Xd, X17, Xs2, Xs1 → Xd = Xs1 - X17*Xs2
+                rd = vreg_to_arm(ins.dest.vreg);
+                rs1 = vreg_to_arm(ins.src1.vreg);
+                rs2 = vreg_to_arm(ins.src2.vreg);
+                cb = arm64_sdiv_rrr(cb, 17, rs1, rs2);
+                msub = 0x9B008000 | (rs2 << 16) | (rs1 << 10) | (17 << 5) | rd;
+                cb = codebuf_emit_u32(cb, msub);
+
+            eif ins.opcode == QOp::CmpEq:
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+                cb = arm64_cset_eq(cb, vreg_to_arm(ins.dest.vreg));
+
+            eif ins.opcode == QOp::CmpNe:
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+                # CSET NE = CSINC Xd, XZR, XZR, EQ  → 0x9A9F07E0
+                cb = codebuf_emit_u32(cb, 0x9A9F07E0 | (vreg_to_arm(ins.dest.vreg) & 0x1F));
+
+            eif ins.opcode == QOp::CmpGt:
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+                cb = arm64_cset_gt(cb, vreg_to_arm(ins.dest.vreg));
+
+            eif ins.opcode == QOp::CmpLt:
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+                cb = arm64_cset_lt(cb, vreg_to_arm(ins.dest.vreg));
+
+            eif ins.opcode == QOp::CmpGe:
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+                cb = arm64_cset_ge(cb, vreg_to_arm(ins.dest.vreg));
+
+            eif ins.opcode == QOp::CmpLe:
+                cb = arm64_cmp_rr(cb, vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+                cb = arm64_cset_le(cb, vreg_to_arm(ins.dest.vreg));
+
+            eif ins.opcode == QOp::And:
+                cb = arm64_and_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::Or:
+                cb = arm64_orr_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::Xor:
+                cb = arm64_eor_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::Shl:
+                cb = arm64_lsl_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::Shr:
+                cb = arm64_asr_rrr(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::LoadByte:
+                cb = arm64_ldrb_reg(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::StoreByte:
+                cb = arm64_strb_reg(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::LoadWord:
+                cb = arm64_ldr_reg(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::StoreWord:
+                cb = arm64_str_reg(cb, vreg_to_arm(ins.dest.vreg), vreg_to_arm(ins.src1.vreg), vreg_to_arm(ins.src2.vreg));
+
+            eif ins.opcode == QOp::PatchPoint:
+                cb = arm64_nop(cb);
+
+            else
+                cb = arm64_nop(cb);
+            end
+
+            end # if handled == 0
+
+            j = j + 1;
+        end
+
+        # If function has no explicit RET, add one
+        if vec_len_rt(qfn.body) == 0 or vec_get_rt(qfn.body, vec_len_rt(qfn.body) - 1).opcode != QOp::Ret:
+            if needs_frame == 1:
+                cb = codebuf_emit_u32(cb, 0xA94153F3);   # LDP X19, X20, [SP, #16];
+                cb = codebuf_emit_u32(cb, 0xA9425BF5);   # LDP X21, X22, [SP, #32];
+                cb = codebuf_emit_u32(cb, 0xA94363F7);   # LDP X23, X24, [SP, #48];
+                cb = codebuf_emit_u32(cb, 0xA9446BF9);   # LDP X25, X26, [SP, #64];
+                cb = codebuf_emit_u32(cb, 0xA94573FB);   # LDP X27, X28, [SP, #80];
+                cb = arm64_ldp_post(cb, 29, 30, 31, 160);
+            end
+            cb = arm64_ret(cb);
+        end
+
+        # Back-patch intra-function jumps
+        cb = backpatch_arm64(cb, ps);
+
+        func_size = codebuf_offset(cb) - func_start;
+        fl = FuncLayout {;
+            name:   qfn.name,;
+            code_off: func_start,;
+            fsize:   func_size;
+        };
+        layouts = vec_push_rt(layouts, fl);
+        layout_count = layout_count + 1;
+
+        fi = fi + 1;
+    end
+
+    # Phase 2: Resolve cross-function calls
+    fxi = 0;
+    when fxi < fixup_count loop
+        patch_at = vec_get_rt(fixup_offsets, fxi);
+        target_idx = vec_get_rt(fixup_targets, fxi);
+        if target_idx >= 0 and target_idx < layout_count:
+            target_layout = vec_get_rt(layouts, target_idx);
+            target_off = target_layout.code_off;
+            byte_offset = target_off - patch_at;
+            imm26 = (byte_offset / 4) & 0x03FFFFFF;
+            cb = codebuf_patch_u32(cb, patch_at, 0x94000000 | imm26);
+        end
+        fxi = fxi + 1;
+    end
+
+    # Phase 3: Emit _start entry point
+    # _start calls main(), then exits with return value
+    start_offset = codebuf_offset(cb);
+    # STP X29, X30, [SP, #-16]!
+    cb = arm64_stp_pre(cb, 29, 30, 31, -16);
+    cb = arm64_mov_sp_to(cb, 29);
+
+    # ── Allocate globals area via mmap (result → X15) ──
+    cb = arm64_mov_imm16(cb, 0, 0);              # x0 = 0 (any address);
+    cb = codebuf_emit_u32(cb, 0xD2A00021);        # MOVZ X1, #1, LSL#16 (= 64KB);
+    cb = arm64_mov_imm16(cb, 2, 3);              # x2 = PROT_READ|PROT_WRITE;
+    cb = arm64_mov_imm16(cb, 3, 4098);           # x3 = MAP_ANON|MAP_PRIVATE (0x1002);
+    cb = codebuf_emit_u32(cb, 0xAA3F03E4);        # MVN X4, XZR (fd = -1);
+    cb = arm64_mov_imm16(cb, 5, 0);              # x5 = 0 (offset);
+    cb = arm64_mov_imm16(cb, 16, 197);            # x16 = SYS_mmap (197);
+    cb = codebuf_emit_u32(cb, 0xF2A04010);        # MOVK X16, #0x200, LSL#16;
+    cb = arm64_svc(cb, 128);
+    cb = arm64_mov_rr(cb, 15, 0);                # x15 = mmap result (globals base);
+
+    # ── Allocate heap area via mmap (result → globals[0]) ──
+    cb = arm64_mov_imm16(cb, 0, 0);              # x0 = 0;
+    cb = codebuf_emit_u32(cb, 0xD2A00201);        # MOVZ X1, #0x10, LSL#16 (= 1MB);
+    cb = arm64_mov_imm16(cb, 2, 3);              # x2 = PROT_READ|PROT_WRITE;
+    cb = arm64_mov_imm16(cb, 3, 4098);           # x3 = MAP_ANON|MAP_PRIVATE;
+    cb = codebuf_emit_u32(cb, 0xAA3F03E4);        # MVN X4, XZR;
+    cb = arm64_mov_imm16(cb, 5, 0);              # x5 = 0;
+    cb = arm64_mov_imm16(cb, 16, 197);            # x16 = SYS_mmap;
+    cb = codebuf_emit_u32(cb, 0xF2A04010);        # MOVK X16, #0x200, LSL#16;
+    cb = arm64_svc(cb, 128);
+    cb = arm64_str_imm(cb, 0, 15, 0);            # STR X0, [X15, #0] — globals[0] = heap ptr;
+
+    # ── Initialize string data pointers in globals ──
+    # For each string in the module, we embedded its bytes after _start/exit.
+    # Use ADR to compute runtime address of each string data block.
+    si = 0;
+    when si < str_count loop
+        str_val = vec_get_rt(module.strings, si);
+        slen = rt_strlen(str_val);
+        slot = str_globals_base + si * 2;
+        slot_len = slot + 1;
+
+        # ADR X17, string_data_offset — will be patched later
+        str_adr_patches = vec_push_rt(str_adr_patches, codebuf_offset(cb));
+        str_adr_indices = vec_push_rt(str_adr_indices, si);
+        cb = codebuf_emit_u32(cb, 0x10000011);   # ADR X17, #0 (placeholder);
+
+        # Store ptr in globals[slot]
+        cb = arm64_movz_imm64(cb, 16, slot);
+        cb = arm64_str_reg(cb, 17, 15, 16);      # globals[slot] = str ptr;
+
+        # Store length in globals[slot+1]
+        cb = arm64_movz_imm64(cb, 17, slen);
+        cb = arm64_movz_imm64(cb, 16, slot_len);
+        cb = arm64_str_reg(cb, 17, 15, 16);      # globals[slot+1] = strlen;
+
+        si = si + 1;
+    end
+
+    if main_idx >= 0:
+        # BL to main function
+        main_layout = vec_get_rt(layouts, main_idx);
+        main_off = main_layout.code_off;
+        main_bl = codebuf_offset(cb);
+        delta = (main_off - main_bl) / 4;
+        cb = codebuf_emit_u32(cb, 0x94000000 | (delta & 0x03FFFFFF));
+    else
+        # No main found — return 0
+        cb = arm64_mov_imm16(cb, 0, 0);
+    end
+
+    # Exit with code 0
+    cb = arm64_mov_imm16(cb, 0, 0);
+    exit_bl = codebuf_offset(cb);
+    exit_delta = (rt_exit_off - exit_bl) / 4;
+    cb = codebuf_emit_u32(cb, 0x94000000 | (exit_delta & 0x03FFFFFF));
+
+    # LDP + RET (fallback, shouldn't reach)
+    cb = arm64_ldp_post(cb, 29, 30, 31, 16);
+    cb = arm64_ret(cb);
+
+    # ── Phase 4: Embed string data after code ──
+    # Store offset of each string's data bytes, then emit the bytes
+    str_data_offsets = vec_new_rt();
+    si = 0;
+    when si < str_count loop
+        str_val = vec_get_rt(module.strings, si);
+        slen = rt_strlen(str_val);
+        # Record the byte offset where this string's data starts
+        str_data_offsets = vec_push_rt(str_data_offsets, codebuf_offset(cb));
+        # Emit string bytes
+        ci = 0;
+        when ci < slen loop
+            ch = str_get(str_val, ci);
+            cb = codebuf_emit_byte(cb, ch);
+            ci = ci + 1;
+        end
+        # Align to 4 bytes (ARM64 instruction alignment)
+        when (codebuf_offset(cb) % 4) != 0 loop
+            cb = codebuf_emit_byte(cb, 0);
+        end
+        si = si + 1;
+    end
+
+    # ── Phase 5: Patch ADR instructions for string pointers ──
+    pi = 0;
+    when pi < vec_len_rt(str_adr_patches) loop
+        adr_off = vec_get_rt(str_adr_patches, pi);
+        sidx = vec_get_rt(str_adr_indices, pi);
+        data_off = vec_get_rt(str_data_offsets, sidx);
+        # ADR Xd, offset: encodes PC-relative offset
+        # ADR X17: opcode = 0x10000011
+        # imm = data_off - adr_off
+        adr_imm = data_off - adr_off;
+        # ADR encoding: immlo = imm[1:0] at bits [30:29], immhi = imm[20:2] at bits [23:5]
+        immlo = adr_imm & 3;
+        immhi = (adr_imm >> 2) & 0x7FFFF;
+        adr_enc = 0x10000011 | (immlo << 29) | (immhi << 5);
+        cb = codebuf_patch_u32(cb, adr_off, adr_enc);
+        pi = pi + 1;
+    end
+
+    cb.start_offset = start_offset;
+    out cb;
+end
+# Produces a minimal Mach-O ARM64 executable:
+#   __PAGEZERO + __TEXT (code) + LC_MAIN + LC_SYMTAB
+
+func emit_macho_executable:
+    in(code:CodeBuf)
+    obuf = buf_new();
+    code_size = codebuf_offset(code) >> int;
+
+    # Page-align the code segment
+    if PAGE_SIZE == 0:
+        text_filesize = code_size;
+    else
+        text_filesize = ((code_size + PAGE_SIZE - 1) / PAGE_SIZE) * PAGE_SIZE;
+    end
+
+    # Layout: [header 32B] [PAGEZERO 72B] [TEXT seg 72+80B] [LC_MAIN 24B] [LC_SYMTAB 24B]
+    ncmds = 4 >> int;
+    cmds_size = (72 + 72 + 80 + 24 + 24) >> int   # 272 bytes;
+    header_plus_cmds = 32 + cmds_size >> int;
+
+    # Entry point = start of code (_start is at end of module, but we want
+    # the _start function which is the last thing emitted in codegen_emit_module)
+    # Actually the entry offset is relative to __TEXT segment start
+    # Since code starts right after header+cmds, entry = offset of _start in code
+    # For simplicity, entry at offset 0 (runtime stubs are first, _start is last)
+    # We need to pass the _start offset... for now, use the code layout
+
+    # ── Mach-O Header (32 bytes) ──
+    obuf = buf_write_u32_le(obuf, MACHO_MAGIC);
+    obuf = buf_write_u32_le(obuf, CPU_ARM64);
+    obuf = buf_write_u32_le(obuf, CPU_SUB_ALL);
+    obuf = buf_write_u32_le(obuf, MH_EXECUTE);
+    obuf = buf_write_u32_le(obuf, ncmds);
+    obuf = buf_write_u32_le(obuf, cmds_size);
+    obuf = buf_write_u32_le(obuf, MH_FLAGS);
+    obuf = buf_write_u32_le(obuf, 0)               # reserved;
+
+    # ── LC_SEGMENT_64: __PAGEZERO (72 bytes) ──
+    obuf = buf_write_u32_le(obuf, LC_SEGMENT_64);
+    obuf = buf_write_u32_le(obuf, 72);
+    obuf = buf_write_string_padded(obuf, "__PAGEZERO", 16);
+    obuf = buf_write_u64_le(obuf, 0)               # vmaddr;
+    obuf = buf_write_u64_le(obuf, TEXT_BASE)        # vmsize = 4GB;
+    obuf = buf_write_u64_le(obuf, 0)               # fileoff;
+    obuf = buf_write_u64_le(obuf, 0)               # filesize;
+    obuf = buf_write_u32_le(obuf, 0)               # maxprot;
+    obuf = buf_write_u32_le(obuf, 0)               # initprot;
+    obuf = buf_write_u32_le(obuf, 0)               # nsects;
+    obuf = buf_write_u32_le(obuf, 0)               # flags;
+
+    # ── LC_SEGMENT_64: __TEXT (72 + 80 = 152 bytes) ──
+    obuf = buf_write_u32_le(obuf, LC_SEGMENT_64);
+    obuf = buf_write_u32_le(obuf, 152)             # 72 + 1 section * 80;
+    obuf = buf_write_string_padded(obuf, "__TEXT", 16);
+    obuf = buf_write_u64_le(obuf, TEXT_BASE)        # vmaddr;
+    obuf = buf_write_u64_le(obuf, text_filesize)   # vmsize;
+    obuf = buf_write_u64_le(obuf, 0)               # fileoff;
+    obuf = buf_write_u64_le(obuf, header_plus_cmds + text_filesize)  # filesize;
+    obuf = buf_write_u32_le(obuf, 5)               # maxprot (r-x);
+    obuf = buf_write_u32_le(obuf, 5)               # initprot (r-x);
+    obuf = buf_write_u32_le(obuf, 1)               # nsects;
+    obuf = buf_write_u32_le(obuf, 0)               # flags;
+
+    # __text section header (80 bytes)
+    obuf = buf_write_string_padded(obuf, "__text", 16)       # sectname;
+    obuf = buf_write_string_padded(obuf, "__TEXT", 16)       # segname;
+    obuf = buf_write_u64_le(obuf, TEXT_BASE + header_plus_cmds)       # addr;
+    obuf = buf_write_u64_le(obuf, code_size)                          # size;
+    obuf = buf_write_u32_le(obuf, header_plus_cmds >> int)            # offset;
+    obuf = buf_write_u32_le(obuf, 2)               # align = 2^2 = 4 bytes;
+    obuf = buf_write_u32_le(obuf, 0)               # reloff;
+    obuf = buf_write_u32_le(obuf, 0)               # nreloc;
+    obuf = buf_write_u32_le(obuf, 0x80000400)      # flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS;
+    obuf = buf_write_u32_le(obuf, 0)               # reserved1;
+    obuf = buf_write_u32_le(obuf, 0)               # reserved2;
+    obuf = buf_write_u32_le(obuf, 0)               # reserved3;
+
+    # ── LC_MAIN (24 bytes) ──
+    obuf = buf_write_u32_le(obuf, LC_MAIN);
+    obuf = buf_write_u32_le(obuf, 24);
+    # Entry offset = code starts at header_plus_cmds, _start is a known offset
+    # For now, we put the _start at the beginning of code
+    # Actually _start is the LAST thing in the code... we need its offset.
+    # We'll pass it as a parameter. For now, entry at 0 = runtime stubs start.
+    obuf = buf_write_u64_le(obuf, 0)               # entryoff (will be patched);
+    obuf = buf_write_u64_le(obuf, 0)               # stacksize;
+
+    # ── LC_SYMTAB (24 bytes, empty) ──
+    obuf = buf_write_u32_le(obuf, LC_SYMTAB);
+    obuf = buf_write_u32_le(obuf, 24);
+    obuf = buf_write_u32_le(obuf, 0)               # symoff;
+    obuf = buf_write_u32_le(obuf, 0)               # nsyms;
+    obuf = buf_write_u32_le(obuf, 0)               # stroff;
+    obuf = buf_write_u32_le(obuf, 0)               # strsize;
+
+    # ── Pad to page boundary ──
+    current = buf_size(obuf);
+    pad_needed = header_plus_cmds >> int - current;
+    if pad_needed > 0:
+        obuf = buf_write_zeros(obuf, pad_needed >> int);
+    end
+
+    # ── Code data ──
+    cdata = code.data;
+    ci = 0;
+    when ci < code_size loop
+        obuf = buf_write_u8(obuf, cdata[ci] >> int);
+        ci = ci + 1;
+    end
+
+    # ── Pad code to page ──
+    code_pad = text_filesize >> int - code_size >> int;
+    if code_pad > 0:
+        obuf = buf_write_zeros(obuf, code_pad >> int);
+    end
+
+    out obuf;
+end
+
+# Emit with known _start offset
+func emit_macho_with_entry:
+    in(code:CodeBuf; start_offset:int)
+    obuf = emit_macho_executable(code);
+
+    # Patch LC_MAIN entryoff
+    # LC_MAIN is at offset: 32 (header) + 72 (PAGEZERO) + 152 (TEXT+sect) + 8 (cmd+cmdsize)
+    # = 264
+    lc_main_entryoff = 264 >> int;
+    # Entry offset in file = header_plus_cmds + start_offset
+    header_plus_cmds = 304 >> int       # 32 + 72 + 152 + 24 + 24 = 304;
+
+    # The entryoff field is at byte 264 (after cmd and cmdsize)
+    # Entryoff = file offset relative to __TEXT vmaddr mapping
+    # Since __TEXT maps from file offset 0 with vmaddr TEXT_BASE,
+    # entryoff = header_plus_cmds + start_offset
+    # No — LC_MAIN.entryoff is relative to __TEXT file offset which is 0
+    # So entryoff = offset of _start code in the file = header_plus_cmds + start_offset
+
+    # Actually looking at Apple docs: LC_MAIN.entryoff is the file offset
+    # of the entry point from the start of the __TEXT segment.
+    # __TEXT segment starts at file offset 0, so entryoff = header_plus_cmds + start_offset
+
+    # Patch the entry offset in the output buffer
+    # LC_MAIN starts at offset 256 (32+72+152), entryoff is at +8
+    entry_patch_off = 32 + 72 + 152 + 8;
+    entryoff_val = header_plus_cmds + start_offset;
+
+    # Write little-endian u64 at entry_patch_off
+    obuf.data = vec_set_at(obuf.data, entry_patch_off, (entryoff_val & 0xFF) >> int);
+    obuf.data = vec_set_at(obuf.data, entry_patch_off + 1, ((entryoff_val >> 8) & 0xFF) >> int);
+    obuf.data = vec_set_at(obuf.data, entry_patch_off + 2, ((entryoff_val >> 16) & 0xFF) >> int);
+    obuf.data = vec_set_at(obuf.data, entry_patch_off + 3, ((entryoff_val >> 24) & 0xFF) >> int);
+    obuf.data = vec_set_at(obuf.data, entry_patch_off + 4, 0);
+    obuf.data = vec_set_at(obuf.data, entry_patch_off + 5, 0);
+    obuf.data = vec_set_at(obuf.data, entry_patch_off + 6, 0);
+    obuf.data = vec_set_at(obuf.data, entry_patch_off + 7, 0);
+
+    out obuf;
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Compile Pipeline
+# ═══════════════════════════════════════════════════════
+
+func compile:
+    in(source:string; output_path:string)
+    # Step 1: Tokenize
+    print "virc: tokenizing...";
+    lex = lexer_new(source);
+    lex = tokenize(lex);
+
+    if rt_strlen(lex.error) > 0:
+        print "virc: lex error: " + lex.error;
+        out 1;
+    end
+
+    tok_count = vec_len_rt(lex.tokens);
+    print "virc: " + str_from_i64(tok_count) + " tokens";
+
+    # Step 2: Parse
+    print "virc: parsing...";
+    parser = parser_new(lex.tokens);
+    var (parser2, ast) = parse_program(parser);
+
+    if ast.node_type == AstType::Program and vec_len_rt(ast.children) == 0:
+        print "virc: parse error: empty program";
+        out 1;
+    end
+
+    # Step 3: Lower to Q-IR
+    print "virc: lowering to Q-IR...";
+    ctx = lower_ctx_new("main");
+    ctx = lower_program(ctx, ast);
+
+    if ctx.error_count > 0:
+        print "virc: lower error: " + ctx.last_error;
+        out 1;
+    end
+
+    func_count = vec_len_rt(ctx.module.functions);
+    print "virc: " + str_from_i64(func_count) + " functions";
+
+    # Step 4: Optimize — TCO + register allocation per function
+    print "virc: optimizing...";
+    fi = 0;
+    when fi < func_count loop
+        qfn = vec_get_rt(ctx.module.functions, fi);
+
+        # Tail-call optimization
+        var (func2, tco_count) = tco_pass(qfn);
+        qfn = func2
+
+        # Liveness analysis + register allocation
+        intervals = compute_liveness(qfn);
+        allocated = regalloc_linear_scan(intervals, 14)    # 14 GPRs;
+
+        vec_set_rt(ctx.module.functions, fi, qfn);
+        fi = fi + 1;
+    end
+
+    # Step 5: Code generation (ARM64)
+    print "virc: generating ARM64 machine code...";
+    code = codegen_emit_module(ctx.module, TargetArch::ARM64);
+    code_size = codebuf_offset(code);
+    print "virc: " + str_from_i64(code_size) + " bytes of machine code";
+
+    # The _start entry point is at the known offset
+    # (it's the last thing emitted by codegen_emit_module)
+    # We need to find it... _start is after all functions + runtime
+    # For now, record it as a return value from codegen_emit_module or calculate
+
+    # Step 6: Link into Mach-O executable
+    print "virc: linking Mach-O ARM64 executable...";
+    binary = emit_macho_executable(code);
+
+    # Step 7: Write output
+    print "virc: writing " + output_path + "...";
+    f = file_create(output_path);
+    if is_err(f):
+        print "virc: error: cannot create output file";
+        out 1;
+    end
+
+    file = unwrap(f);
+    data_slice = slice_new(binary.data.data, vec_len_rt(binary.data));
+    file_write_all(file, data_slice);
+    file_close(file);
+
+    # Step 8: Make executable (chmod +x)
+    # syscall(SYS_CHMOD, path, 0755)
+    # For now this is handled by the build script
+
+    file_size = vec_len_rt(binary.data);
+    print "virc: done! " + output_path + " (" + str_from_i64(file_size) + " bytes)";
+    out 0;
+end
+
+
+# ═══════════════════════════════════════════════════════
+# Main Entry Point
+# ═══════════════════════════════════════════════════════
+
+func virc_legacy_main:
+    print "╔══════════════════════════════════════════════╗";
+    print "║  virc — Vir Self-Hosting Compiler v1.2      ║";
+    print "║  Phase 5: Bootstrap Binary                   ║";
+    print "╚══════════════════════════════════════════════╝";
+
+    if arg_count() < 1:
+        print "Usage: virc <input.vri> [-o output]";
+        print "";
+        print "Compiles a Vir source file to a standalone";
+        print "Mach-O ARM64 binary. No Python, no C runtime.";
+        out 1;
+    end
+
+    input_path = get_arg(0);
+    output_path = "a.out";
+
+    # Parse -o flag
+    if arg_count() >= 3:
+        if rt_streq(get_arg(1), "-o"):
+            output_path = get_arg(2);
+        end
+    end
+
+    # Read source file
+    print "virc: reading " + input_path + "...";
+    f = file_open(input_path, FileMode::Read);
+    if is_err(f):
+        print "virc: error: cannot open " + input_path;
+        out 1;
+    end
+
+    file = unwrap(f);
+    source_result = file_read_all(file);
+    file_close(file);
+
+    if is_err(source_result):
+        print "virc: error: cannot read " + input_path;
+        out 1;
+    end
+
+    source = unwrap(source_result);
+    print "virc: " + str_from_i64(rt_strlen(source)) + " bytes source";
+
+    # Compile!
+    result = compile(source, output_path);
+    out result;
+end
+
+export compile, virc_legacy_main, codegen_emit_module;
+export emit_runtime_arm64, emit_macho_executable, emit_macho_with_entry;
+export FuncLayout;

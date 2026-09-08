@@ -1,0 +1,374 @@
+##
+ * vir/compiler/mc.vri — Unified Machine Instruction (MCInst) & Relocation Layer
+ * ==============================================================================
+ * Bridges Register Allocation (post-RA LIR) with Binary Emission and Assembly Output.
+ *
+ * Pipeline:
+ *   LIR (post-RA) → MCInst stream → ┬─ BinaryEncoder (CodeBuf)
+ *                                   └─ AsmPrinter (assembly text)
+ ##
+
+module vir.compiler.mc
+
+include types
+include string_rt
+import native_read_i64, native_write_i64 from string_rt
+
+# ═══════════════════════════════════════════════════════
+# Target Dimensions & Enums
+# ═══════════════════════════════════════════════════════
+
+enum TargetArch:
+    Unknown = 0
+    X86_64  = 1
+    ARM64   = 2
+    RISCV64 = 3
+    Wasm32  = 4
+end.
+
+enum TargetOS:
+    Unknown   = 0
+    Darwin    = 1
+    Linux     = 2
+    WASI_P1   = 3
+    Baremetal = 4
+end.
+
+enum TargetABI:
+    Unknown    = 0
+    AAPCS64    = 1
+    SysV_AMD64 = 2
+    RV64D      = 3
+    WasmMVP    = 4
+end.
+
+enum ObjectFormat:
+    Unknown = 0
+    MachO   = 1
+    ELF     = 2
+    Wasm    = 3
+end.
+
+enum AsmDialect:
+    Unknown   = 0
+    DarwinAsm = 1   # macOS clang/llvm
+    GNU_ELF   = 2   # Linux gas/gcc/clang
+    Intel_X86 = 3   # .intel_syntax noprefix
+    WasmWAT   = 4   # WebAssembly text
+    GNU_RISCV = 5   # Linux riscv64 gas/gcc/clang
+end.
+
+enum EmitKind:
+    Executable = 1
+    Object     = 2
+    Assembly   = 3
+end.
+
+# ═══════════════════════════════════════════════════════
+# TargetTriple
+# ═══════════════════════════════════════════════════════
+
+entity TargetTriple:
+    arch:    int;
+    os:      int;
+    abi:     int;
+    format:  int;
+    dialect: int
+end.
+
+func target_triple_new(arch: int, os: int, abi: int, format: int, dialect: int):
+    p = alloc(40)
+    native_write_i64(p, 0, arch)
+    native_write_i64(p, 8, os)
+    native_write_i64(p, 16, abi)
+    native_write_i64(p, 24, format)
+    native_write_i64(p, 32, dialect)
+    out p
+end.
+
+func triple_arch(t: TargetTriple):    out native_read_i64(t as i64, 0) end.
+func triple_os(t: TargetTriple):      out native_read_i64(t as i64, 8) end.
+func triple_abi(t: TargetTriple):     out native_read_i64(t as i64, 16) end.
+func triple_format(t: TargetTriple):  out native_read_i64(t as i64, 24) end.
+func triple_dialect(t: TargetTriple): out native_read_i64(t as i64, 32) end.
+
+# ═══════════════════════════════════════════════════════
+# Relocation Model
+# ═══════════════════════════════════════════════════════
+
+enum RelocKind:
+    None            = 0
+    ARM64_PAGE21    = 1   # ADRP page (Mach-O @PAGE / ELF sym)
+    ARM64_PAGEOFF12 = 2   # ADD/LDR page offset (Mach-O @PAGEOFF / ELF :lo12:sym)
+    ARM64_CALL26    = 3   # BL / B branch target
+    X86_64_PC32     = 4   # RIP-relative 32-bit
+    X86_64_PLT32    = 5   # Call @PLT
+    X86_64_GOTPCREL = 6   # @GOTPCREL
+    RISCV_HI20      = 7   # %hi(symbol)
+    RISCV_LO12      = 8   # %lo(symbol)
+    RISCV_CALL      = 9   # jal / call
+end.
+
+# ═══════════════════════════════════════════════════════
+# Machine Instruction Opcodes (ARM64)
+# ═══════════════════════════════════════════════════════
+
+enum MCOpcode:
+    # Meta / Pseudo
+    NOP               = 0
+    COMMENT           = 1
+    LABEL_DEF         = 2
+
+    # Data processing (register)
+    ARM64_ADD_RRR     = 10
+    ARM64_SUB_RRR     = 11
+    ARM64_MUL_RRR     = 12
+    ARM64_SDIV_RRR    = 13
+    ARM64_MADD_RRRR   = 14
+    ARM64_MSUB_RRRR   = 15
+    ARM64_AND_RRR     = 16
+    ARM64_ORR_RRR     = 17
+    ARM64_EOR_RRR     = 18
+    ARM64_LSL_RRR     = 19
+    ARM64_LSR_RRR     = 20
+    ARM64_MOV_RR      = 21
+    ARM64_MVN_RR      = 22
+
+    # Data processing (immediate)
+    ARM64_ADD_IMM     = 30
+    ARM64_SUB_IMM     = 31
+    ARM64_MOVZ        = 32
+    ARM64_MOVK        = 33
+    ARM64_LSL_IMM     = 34
+    ARM64_LSR_IMM     = 35
+
+    # Comparison and condition
+    ARM64_CMP_RR      = 40
+    ARM64_CMP_IMM0    = 41
+    ARM64_CSET_EQ     = 42
+    ARM64_CSET_NE     = 43
+    ARM64_CSET_GT     = 44
+    ARM64_CSET_LT     = 45
+    ARM64_CSET_GE     = 46
+    ARM64_CSET_LE     = 47
+    ARM64_CSEL        = 48
+
+    # Branch
+    ARM64_B           = 50
+    ARM64_BEQ         = 51
+    ARM64_BNE         = 52
+    ARM64_BGE         = 53
+    ARM64_BLT         = 54
+    ARM64_BGT         = 55
+    ARM64_BLE         = 56
+    ARM64_BL          = 57
+    ARM64_BLR         = 58
+    ARM64_CBZ         = 59
+    ARM64_CBNZ        = 60
+    ARM64_RET         = 61
+
+    # Load / Store
+    ARM64_LDR_UOFF    = 70
+    ARM64_STR_UOFF    = 71
+    ARM64_LDR_REG     = 72
+    ARM64_STR_REG     = 73
+    ARM64_LDRB_UOFF   = 74
+    ARM64_STRB_UOFF   = 75
+    ARM64_LDRB_REG    = 76
+    ARM64_STRB_REG    = 77
+    ARM64_LDP_POST    = 78
+    ARM64_STP_PRE     = 79
+    ARM64_LDR_REG_LSL3 = 80
+    ARM64_STR_REG_LSL3 = 81
+
+    # Address generation & System
+    ARM64_ADRP        = 90
+    ARM64_MOV_FROM_SP = 91
+    ARM64_SVC         = 92
+
+    # ── x86_64 Opcodes ──
+    X86_64_MOV_RR     = 100
+    X86_64_MOV_RI     = 101
+    X86_64_ADD_RR     = 102
+    X86_64_ADD_RI     = 103
+    X86_64_SUB_RR     = 104
+    X86_64_SUB_RI     = 105
+    X86_64_IMUL_RR    = 106
+    X86_64_CQO        = 107
+    X86_64_IDIV       = 108
+    X86_64_AND_RR     = 109
+    X86_64_OR_RR      = 110
+    X86_64_XOR_RR     = 111
+    X86_64_SHL_CL     = 112
+    X86_64_SHR_CL     = 113
+    X86_64_NOT_R      = 114
+    X86_64_CMP_RR     = 115
+    X86_64_CMP_RI     = 116
+    X86_64_TEST_RR    = 117
+    X86_64_SETE       = 118
+    X86_64_SETNE      = 119
+    X86_64_SETG       = 120
+    X86_64_SETL       = 121
+    X86_64_SETGE      = 122
+    X86_64_SETLE      = 123
+    X86_64_JMP        = 124
+    X86_64_JE         = 125
+    X86_64_JNE        = 126
+    X86_64_JG         = 127
+    X86_64_JL         = 128
+    X86_64_JGE        = 129
+    X86_64_JLE        = 130
+    X86_64_CALL       = 131
+    X86_64_CALL_R     = 132
+    X86_64_RET        = 133
+    X86_64_PUSH_R     = 134
+    X86_64_POP_R      = 135
+    X86_64_MOV_LOAD   = 136
+    X86_64_MOV_STORE  = 137
+    X86_64_SYSCALL    = 138
+    X86_64_SUB_RSP_IMM = 139
+    X86_64_ADD_RSP_IMM = 140
+
+    # ── RISC-V 64 Opcodes ──
+    RISCV_ADD         = 200
+    RISCV_ADDI        = 201
+    RISCV_SUB         = 202
+    RISCV_MUL         = 203
+    RISCV_DIV         = 204
+    RISCV_REM         = 205
+    RISCV_AND         = 206
+    RISCV_OR          = 207
+    RISCV_XOR         = 208
+    RISCV_SLL         = 209
+    RISCV_SRL         = 210
+    RISCV_SLT         = 211
+    RISCV_BEQ         = 212
+    RISCV_BNE         = 213
+    RISCV_BLT         = 214
+    RISCV_BGE         = 215
+    RISCV_BGT         = 216
+    RISCV_BLE         = 217
+    RISCV_JAL         = 218
+    RISCV_JALR        = 219
+    RISCV_LD          = 220
+    RISCV_SD          = 221
+    RISCV_LI          = 222
+    RISCV_MV          = 223
+    RISCV_ECALL       = 224
+    RISCV_RET         = 225
+    RISCV_SLTIU       = 226
+    RISCV_SLTU        = 227
+    RISCV_XORI        = 228
+end.
+
+# ═══════════════════════════════════════════════════════
+# MCOperand
+# ═══════════════════════════════════════════════════════
+
+enum MCOperandKind:
+    None   = 0
+    Reg    = 1
+    Imm    = 2
+    Mem    = 3
+    Symbol = 4
+    Label  = 5
+end.
+
+entity MCOperand:
+    kind:        int;
+    reg:         int;
+    imm:         int;
+    mem_base:    int;
+    mem_offset:  int;
+    mem_scale:   int;
+    mem_index:   int;
+    symbol_name: int;
+    reloc_kind:  int;
+    addend:      int
+end.
+
+func mc_opnd_new(kind: int, reg: int, imm: int, base: int, off: int, scale: int, idx: int, sym: int, reloc: int, addend: int):
+    p = alloc(80)
+    native_write_i64(p, 0, kind)
+    native_write_i64(p, 8, reg)
+    native_write_i64(p, 16, imm)
+    native_write_i64(p, 24, base)
+    native_write_i64(p, 32, off)
+    native_write_i64(p, 40, scale)
+    native_write_i64(p, 48, idx)
+    native_write_i64(p, 56, sym)
+    native_write_i64(p, 64, reloc)
+    native_write_i64(p, 72, addend)
+    out p
+end.
+
+func mc_opnd_none():
+    out mc_opnd_new(0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+end.
+
+func mc_opnd_reg(r: int):
+    out mc_opnd_new(1, r, 0, 0, 0, 0, 0, 0, 0, 0)
+end.
+
+func mc_opnd_imm(v: int):
+    out mc_opnd_new(2, 0, v, 0, 0, 0, 0, 0, 0, 0)
+end.
+
+func mc_opnd_mem(base: int, off: int):
+    out mc_opnd_new(3, 0, 0, base, off, 0, 0 - 1, 0, 0, 0)
+end.
+
+func mc_opnd_mem_indexed(base: int, idx: int, scale: int):
+    out mc_opnd_new(3, 0, 0, base, 0, scale, idx, 0, 0, 0)
+end.
+
+func mc_opnd_symbol(sym_name: int, reloc: int, addend: int):
+    out mc_opnd_new(4, 0, 0, 0, 0, 0, 0, sym_name, reloc, addend)
+end.
+
+func mc_opnd_label(label_id: int):
+    out mc_opnd_new(5, 0, label_id, 0, 0, 0, 0, 0, 0, 0)
+end.
+
+func mc_opnd_kind(op: MCOperand):    out native_read_i64(op as i64, 0) end.
+func mc_opnd_reg_val(op: MCOperand): out native_read_i64(op as i64, 8) end.
+func mc_opnd_imm_val(op: MCOperand): out native_read_i64(op as i64, 16) end.
+func mc_opnd_mem_base(op: MCOperand): out native_read_i64(op as i64, 24) end.
+func mc_opnd_mem_off(op: MCOperand):  out native_read_i64(op as i64, 32) end.
+func mc_opnd_mem_scale(op: MCOperand): out native_read_i64(op as i64, 40) end.
+func mc_opnd_mem_idx(op: MCOperand):  out native_read_i64(op as i64, 48) end.
+func mc_opnd_sym_name(op: MCOperand): out native_read_i64(op as i64, 56) end.
+func mc_opnd_reloc(op: MCOperand):    out native_read_i64(op as i64, 64) end.
+func mc_opnd_addend(op: MCOperand):   out native_read_i64(op as i64, 72) end.
+
+# ═══════════════════════════════════════════════════════
+# MCInst
+# ═══════════════════════════════════════════════════════
+
+entity MCInst:
+    opcode: int;
+    op0:    MCOperand;
+    op1:    MCOperand;
+    op2:    MCOperand;
+    op3:    MCOperand;
+    flags:  int
+end.
+
+func mc_inst_new(opc: int, op0: MCOperand, op1: MCOperand, op2: MCOperand, op3: MCOperand, flags: int):
+    p = alloc(48)
+    native_write_i64(p, 0, opc)
+    native_write_i64(p, 8, op0 as i64)
+    native_write_i64(p, 16, op1 as i64)
+    native_write_i64(p, 24, op2 as i64)
+    native_write_i64(p, 32, op3 as i64)
+    native_write_i64(p, 40, flags)
+    out p
+end.
+
+func mc_inst_opc(inst: MCInst):   out native_read_i64(inst as i64, 0) end.
+func mc_inst_op0(inst: MCInst):   out native_read_i64(inst as i64, 8) as MCOperand end.
+func mc_inst_op1(inst: MCInst):   out native_read_i64(inst as i64, 16) as MCOperand end.
+func mc_inst_op2(inst: MCInst):   out native_read_i64(inst as i64, 24) as MCOperand end.
+func mc_inst_op3(inst: MCInst):   out native_read_i64(inst as i64, 32) as MCOperand end.
+func mc_inst_flags(inst: MCInst): out native_read_i64(inst as i64, 40) end.
+
