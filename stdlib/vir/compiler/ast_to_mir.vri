@@ -188,6 +188,39 @@ func get_var_type(var_name: string):
     out 0
 end.
 
+# Lightweight lowering-time type recovery for inferred locals.  The semantic
+# passes already validate compatibility; this table is needed by representation-
+# sensitive lowering such as interpolation and tensor result metadata.
+func infer_expr_type_name(node: AstNode):
+    if node == 0 do out fat_str_new("") end
+    nt = ast_node_type_of(node)
+    if nt == AstType.LiteralInt do out fat_str_new("int") end
+    if nt == AstType.LiteralFloat do out fat_str_new("float") end
+    if nt == AstType.LiteralBool do out fat_str_new("bool") end
+    if nt == AstType.LiteralNone do out fat_str_new("none") end
+    if nt == AstType.LiteralStr or nt == AstType.InterpExpr do out fat_str_new("string") end
+    if nt == AstType.Identifier do
+        vt = get_var_type(ast_node_name(node))
+        if vt != 0 do out vt end
+        out fat_str_new("")
+    end
+    if nt == AstType.Compare do out fat_str_new("bool") end
+    if nt == AstType.BinOp and ast_node_child_count(node) >= 2 do
+        op = ast_node_op_of(node)
+        if op == OpType.Eq or op == OpType.Ne or op == OpType.Gt or op == OpType.Lt or op == OpType.Ge or op == OpType.Le or op == OpType.SafeEq or op == OpType.SafeNe or op == OpType.Land or op == OpType.Lor do
+            out fat_str_new("bool")
+        end
+        left_t = infer_expr_type_name(ast_node_child(node, 0))
+        right_t = infer_expr_type_name(ast_node_child(node, 1))
+        if op == OpType.MatMulOp or op == OpType.FmaOp do out left_t end
+        if fat_cstr_eq(left_t, "float") == 1 or fat_cstr_eq(right_t, "float") == 1 do out fat_str_new("float") end
+        if fat_cstr_eq(left_t, "string") == 1 and fat_cstr_eq(right_t, "string") == 1 do out fat_str_new("string") end
+        if fat_str_len(left_t) > 0 do out left_t end
+        out right_t
+    end
+    out fat_str_new("")
+end.
+
 func name_hash_256(name: string):
     n = fat_str_len(name as int) as i64
     h = n * 17
@@ -1385,6 +1418,72 @@ func lower_call_args(b: MirBuilder, expr: AstNode, start_child: i64, arg_base: i
 	out (b_mut, ai)
 end.
 
+func interp_type_is_int(type_name: string):
+    if fat_cstr_eq(type_name, "int") == 1 or fat_cstr_eq(type_name, "i64") == 1 or fat_cstr_eq(type_name, "i32") == 1 or fat_cstr_eq(type_name, "i16") == 1 or fat_cstr_eq(type_name, "i8") == 1 do out true end
+    if fat_cstr_eq(type_name, "u64") == 1 or fat_cstr_eq(type_name, "u32") == 1 or fat_cstr_eq(type_name, "u16") == 1 or fat_cstr_eq(type_name, "u8") == 1 do out true end
+    out false
+end.
+
+func lower_interp_segment(b: MirBuilder, node: AstNode):
+    nt = ast_node_type_of(node)
+    if nt == AstType.LiteralStr do
+        var (b1, sid) = builder_intern(b, ast_node_name(node))
+        var (b2, dst) = builder_new_vreg(b1)
+        b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(dst), mir_opnd_imm(sid))
+        out (b2, mir_opnd_vreg(dst))
+    end
+    if nt == AstType.LiteralBool or nt == AstType.LiteralNone do
+        text = fat_str_new("none")
+        if nt == AstType.LiteralBool do
+            text = fat_str_new("false")
+            if ast_node_int_val(node) != 0 do text = fat_str_new("true") end
+        end
+        var (b1, sid) = builder_intern(b, text)
+        var (b2, dst) = builder_new_vreg(b1)
+        b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(dst), mir_opnd_imm(sid))
+        out (b2, mir_opnd_vreg(dst))
+    end
+
+    var (b1, value) = lower_expr(b, node)
+    type_name = infer_expr_type_name(node)
+    if fat_cstr_eq(type_name, "none") == 1 do
+        var (b_none, none_sid) = builder_intern(b1, fat_str_new("none"))
+        var (b_none2, none_dst) = builder_new_vreg(b_none)
+        b_none2 = emit_intrinsic(b_none2, MIR_INTR_STR_LIT, mir_opnd_vreg(none_dst), mir_opnd_imm(none_sid))
+        out (b_none2, mir_opnd_vreg(none_dst))
+    end
+    if interp_type_is_int(type_name) do
+        b1 = emit_set_arg(b1, 0, value)
+        var (b2, dst) = builder_new_vreg(b1)
+        b2 = emit_intrinsic(b2, MIR_INTR_BUILTIN, mir_opnd_vreg(dst), mir_opnd_imm(19))
+        out (b2, mir_opnd_vreg(dst))
+    end
+    if fat_cstr_eq(type_name, "bool") == 1 do
+        var (b2, dst) = builder_new_vreg(b1)
+        var (b3, true_id) = builder_add_block(b2)
+        var (b4, false_id) = builder_add_block(b3)
+        var (b5, end_id) = builder_add_block(b4)
+        b5 = emit_jump_if(b5, value, true_id, false_id)
+
+        b5 = builder_set_current_block(b5, true_id)
+        var (b6, true_sid) = builder_intern(b5, fat_str_new("true"))
+        var (b7, true_v) = builder_new_vreg(b6)
+        b7 = emit_intrinsic(b7, MIR_INTR_STR_LIT, mir_opnd_vreg(true_v), mir_opnd_imm(true_sid))
+        b7 = emit_move(b7, dst, mir_opnd_vreg(true_v))
+        b7 = emit_jump(b7, end_id)
+
+        b7 = builder_set_current_block(b7, false_id)
+        var (b8, false_sid) = builder_intern(b7, fat_str_new("false"))
+        var (b9, false_v) = builder_new_vreg(b8)
+        b9 = emit_intrinsic(b9, MIR_INTR_STR_LIT, mir_opnd_vreg(false_v), mir_opnd_imm(false_sid))
+        b9 = emit_move(b9, dst, mir_opnd_vreg(false_v))
+        b9 = emit_jump(b9, end_id)
+        b9 = builder_set_current_block(b9, end_id)
+        out (b9, mir_opnd_vreg(dst))
+    end
+    out (b1, value)
+end.
+
 func lower_expr_impl(b: MirBuilder, expr: AstNode):
 	expr_type = ast_node_type_of(expr)
 
@@ -1439,29 +1538,9 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 			out (b2, mir_opnd_vreg(v))
 		end
 
-		# Lower first segment
+		# Lower first segment and convert non-string values deterministically.
 		first_child = ast_node_child(expr, 0)
-		first_type = ast_node_type_of(first_child)
-		var b_cur = b
-		var cur_opnd = mir_opnd_none()
-		if first_type == AstType.LiteralStr do
-			var (b1, sid) = builder_intern(b_cur, ast_node_name(first_child))
-			var (b2, v) = builder_new_vreg(b1)
-			b_cur = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
-			cur_opnd = mir_opnd_vreg(v)
-		else
-			var (b1, val_opnd) = lower_expr(b_cur, first_child)
-			let f_ty = ast_node_builtin_id(first_child)
-			if f_ty == 1 or f_ty == 3 do # Int or Bool -> int_to_str (bid 19)
-				b1 = emit_set_arg(b1, 0, val_opnd)
-				var (b2, dst_v) = builder_new_vreg(b1)
-				b_cur = emit_intrinsic(b2, MIR_INTR_BUILTIN, mir_opnd_vreg(dst_v), mir_opnd_imm(19))
-				cur_opnd = mir_opnd_vreg(dst_v)
-			else
-				b_cur = b1
-				cur_opnd = val_opnd
-			end
-		end
+		var (b_cur, cur_opnd) = lower_interp_segment(b, first_child)
 
 		# If only 1 segment and already evaluated:
 		if n_segs == 1 do
@@ -1472,26 +1551,8 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 		var si = 1
 		when si < n_segs loop
 			seg_child = ast_node_child(expr, si)
-			seg_type = ast_node_type_of(seg_child)
-			var seg_opnd = mir_opnd_none()
-			if seg_type == AstType.LiteralStr do
-				var (b1, sid) = builder_intern(b_cur, ast_node_name(seg_child))
-				var (b2, v) = builder_new_vreg(b1)
-				b_cur = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
-				seg_opnd = mir_opnd_vreg(v)
-			else
-				var (b1, val_opnd) = lower_expr(b_cur, seg_child)
-				let s_ty = ast_node_builtin_id(seg_child)
-				if s_ty == 1 or s_ty == 3 do # Int or Bool -> int_to_str (bid 19)
-					b1 = emit_set_arg(b1, 0, val_opnd)
-					var (b2, dst_v) = builder_new_vreg(b1)
-					b_cur = emit_intrinsic(b2, MIR_INTR_BUILTIN, mir_opnd_vreg(dst_v), mir_opnd_imm(19))
-					seg_opnd = mir_opnd_vreg(dst_v)
-				else
-					b_cur = b1
-					seg_opnd = val_opnd
-				end
-			end
+			var (b_seg, seg_opnd) = lower_interp_segment(b_cur, seg_child)
+			b_cur = b_seg
 
 			# Call str_cat(cur_opnd, seg_opnd) (bid 11)
 			b_cur = emit_set_arg(b_cur, 0, cur_opnd)
@@ -1621,10 +1682,12 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 			if mop_i == 30 do m_op = MirOp.Fma end
 			if mop_i == 4 do m_op = MirOp.Add end
 			ins = mir_instr_new(m_op, mir_opnd_vreg(dst), opnd_l, opnd_r)
-			if mop_i == 29 do
-				var dim_m = 2
-				var dim_k = 2
-				var dim_n = 2
+			if mop_i == 29 or mop_i == 30 do
+				# Semantic pass 6 guarantees known rank-2 operands.  Zero is an
+				# invalid sentinel, never a guessed 2x2 shape.
+				var dim_m = 0
+				var dim_k = 0
+				var dim_n = 0
 				var left_t = ""
 				var right_t = ""
 				if ast_node_type_of(left) == AstType.Identifier do
@@ -2034,8 +2097,6 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 			stride = 1
 			if is_tensor_type_str(vtype) do
 				stride = parse_tensor_stride(vtype, k)
-			else
-				if k == 0 and num_idx == 2 do stride = 2 end
 			end
 			term_op = idx_op
 			if stride > 1 do
@@ -2249,13 +2310,22 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 			var var_t = ast_node_name2(stmt)
 			if var_t == 0 or fat_str_len(var_t) == 0 do
 				var expr_nt = ast_node_type_of(expr)
+				var_t = infer_expr_type_name(expr)
+				# Keep literal inference direct here: ConstDecl (`let`) nodes are
+				# pre-indexed before lowering, and older bootstrap binaries can
+				# otherwise retain their empty placeholder type.
+				if expr_nt == AstType.LiteralInt do var_t = fat_str_new("int") end
+				if expr_nt == AstType.LiteralFloat do var_t = fat_str_new("float") end
+				if expr_nt == AstType.LiteralBool do var_t = fat_str_new("bool") end
+				if expr_nt == AstType.LiteralNone do var_t = fat_str_new("none") end
+				if expr_nt == AstType.LiteralStr or expr_nt == AstType.InterpExpr do var_t = fat_str_new("string") end
 				if expr_nt == AstType.EntityLiteral or expr_nt == AstType.Call do
 					var cname = resolve_callee_alias(ast_node_name(expr))
 					if is_entity_name(cname) == 1 do
 						var_t = cname
 					end
 				end
-				if expr_nt == AstType.BinOp and ast_node_op_of(expr) == OpType.MatMulOp do
+				if expr_nt == AstType.BinOp and (ast_node_op_of(expr) == OpType.MatMulOp or ast_node_op_of(expr) == OpType.FmaOp) do
 					left_n = ast_node_child(expr, 0)
 					right_n = ast_node_child(expr, 1)
 					left_t = get_var_type(ast_node_name(left_n))
@@ -2287,6 +2357,16 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 						end
 					end
 				end
+			end
+			# `let` is a ConstDecl and may carry an internal non-empty placeholder
+			# in name2.  Literal inference must override that placeholder.
+			if ast_node_type_of(stmt) == AstType.ConstDecl do
+				expr_nt_const = ast_node_type_of(expr)
+				if expr_nt_const == AstType.LiteralInt do var_t = fat_str_new("int"); set_var_type(ast_node_name(stmt), var_t) end
+				if expr_nt_const == AstType.LiteralFloat do var_t = fat_str_new("float"); set_var_type(ast_node_name(stmt), var_t) end
+				if expr_nt_const == AstType.LiteralBool do var_t = fat_str_new("bool"); set_var_type(ast_node_name(stmt), var_t) end
+				if expr_nt_const == AstType.LiteralNone do var_t = fat_str_new("none"); set_var_type(ast_node_name(stmt), var_t) end
+				if expr_nt_const == AstType.LiteralStr or expr_nt_const == AstType.InterpExpr do var_t = fat_str_new("string"); set_var_type(ast_node_name(stmt), var_t) end
 			end
 			if var_t != 0 and fat_str_len(var_t) > 0 do
 				set_var_type(ast_node_name(stmt), var_t)
@@ -2336,7 +2416,7 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 					set_var_type(target_name, cname)
 				end
 			end
-			if expr_nt == AstType.BinOp and ast_node_op_of(expr) == OpType.MatMulOp do
+			if expr_nt == AstType.BinOp and (ast_node_op_of(expr) == OpType.MatMulOp or ast_node_op_of(expr) == OpType.FmaOp) do
 				left_n = ast_node_child(expr, 0)
 				right_n = ast_node_child(expr, 1)
 				left_t = get_var_type(ast_node_name(left_n))
@@ -2410,8 +2490,6 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 					stride = 1
 					if is_tensor_type_str(vtype) do
 						stride = parse_tensor_stride(vtype, k)
-					else
-						if k == 0 and num_indices == 2 do stride = 2 end
 					end
 					term_op = idx_op
 					if stride > 1 do
@@ -2634,7 +2712,8 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		if child_count > 0 do
 			expr = ast_node_child(stmt, 0)
 			var (b2, val_opnd) = lower_expr(b, expr)
-			if ast_node_type_of(expr) == AstType.LiteralStr or ast_node_type_of(expr) == AstType.InterpExpr do
+			print_type = infer_expr_type_name(expr)
+			if ast_node_type_of(expr) == AstType.LiteralStr or ast_node_type_of(expr) == AstType.InterpExpr or fat_cstr_eq(print_type, "string") == 1 do
 				b2 = emit_intrinsic(b2, MIR_INTR_PRINT_STR, mir_opnd_none(), val_opnd)
 			else
 				b2 = emit_intrinsic(b2, MIR_INTR_PRINT, mir_opnd_none(), val_opnd)
@@ -3238,7 +3317,18 @@ func ast_lower_program(prog: AstNode):
 		if nt == AstType.ExternFunc do
 			# Externs are symbols, not empty executable functions.  The registry
 			# is consumed by target object writers (Mach-O/ELF/PE/Wasm).
-			ffi_import_register(ast_node_name(child), ast_node_name2(child))
+			param_types = vec_new_rt()
+			var epi = 0
+			when epi < ast_node_child_count(child) loop
+				ep = ast_node_child(child, epi)
+				if ast_node_type_of(ep) != AstType.Block do
+					param_types = vec_push_rt(param_types, ast_node_name2(ep))
+				end
+				epi = epi + 1
+			end
+			provider = ast_node_int_val(child) as string
+			if ast_node_int_val(child) == 0 do provider = fat_str_new("os") end
+			ffi_import_register(ast_node_name(child), provider, param_types, ast_node_name2(child))
 		end
 		if is_func == 1 do
 			var m_func = ast_lower_func(i, child)

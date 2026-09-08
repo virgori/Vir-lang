@@ -25,12 +25,17 @@ include context
 import DiagnosticEngine, report_error from context
 
 include type_table
-import TypeKind, TYPE_VOID, TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_STRING, is_tensor_type_str, parse_tensor_shape, parse_tensor_rank from type_table
+import TypeKind, TYPE_VOID, TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_STRING, is_tensor_type_str, parse_tensor_elem_type, parse_tensor_shape, parse_tensor_rank from type_table
 
 # Hash ONLY global scope.  Orphan Func/Block nodes from prior passes would
 # make a dense per-scope 256-bucket table allocate millions of vecs.
 const PASS6_BUCKETS: int = 256
 var g_pass6_global_buckets: i64 = 0
+var g_pass6_extern_names: i64 = 0
+var g_pass6_extern_nodes: i64 = 0
+var g_pass6_ai_mode: int = 0 # 0=normal, 1=infer, 2=train
+var g_pass6_infer_values: i64 = 0
+var g_pass6_train_values: i64 = 0
 
 func pass6_hash_name(name: string):
     n = fat_str_len(name)
@@ -95,7 +100,41 @@ end.
 
 func pass6_typecheck(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode):
     pass6_rebuild_index(symbols, scopes)
+    g_pass6_extern_names = vec_new_rt()
+    g_pass6_extern_nodes = vec_new_rt()
+    g_pass6_ai_mode = 0
+    g_pass6_infer_values = vec_new_rt()
+    g_pass6_train_values = vec_new_rt()
+    pass6_collect_externs(node)
     pass6_walk(symbols, scopes, diag, node)
+end.
+
+func pass6_collect_externs(node: AstNode):
+    if node as i64 == 0 do out 0 end
+    if node.node_type == AstType.ExternFunc and fat_str_len(node.name) > 0 do
+        g_pass6_extern_names = vec_push_rt(g_pass6_extern_names, node.name)
+        g_pass6_extern_nodes = vec_push_rt(g_pass6_extern_nodes, node)
+        out 0
+    end
+    child_count = vec_len_rt(node.children)
+    var i = 0
+    when i < child_count loop
+        pass6_collect_externs(vec_get_rt(node.children, i))
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass6_find_extern(name: string):
+    if g_pass6_extern_names == 0 do out 0 end
+    var i = 0
+    when i < vec_len_rt(g_pass6_extern_names) loop
+        if fat_str_eq(vec_get_rt(g_pass6_extern_names, i) as string, name) do
+            out vec_get_rt(g_pass6_extern_nodes, i)
+        end
+        i = i + 1
+    end
+    out 0
 end.
 
 func pass6_symbol_at(symbols: SymbolTable, id: int):
@@ -180,7 +219,7 @@ func pass6_infer_type(symbols: SymbolTable, scopes: ScopeTree, node: AstNode):
             right = vec_get_rt(node.children, 1)
             lt = pass6_infer_type(symbols, scopes, left)
             rt_type = pass6_infer_type(symbols, scopes, right)
-            if node.op == OpType.MatMulOp do
+            if node.op == OpType.MatMulOp or node.op == OpType.FmaOp do
                 out TypeKind.Tensor
             end
             if node.op == OpType.Eq or node.op == OpType.Ne or node.op == OpType.Gt or node.op == OpType.Lt or node.op == OpType.Ge or node.op == OpType.Le do
@@ -222,12 +261,26 @@ func pass6_infer_type(symbols: SymbolTable, scopes: ScopeTree, node: AstNode):
     if node.node_type == AstType.BuiltinCall do
         out TypeKind.Int
     end
+    if node.node_type == AstType.QuantizeExpr do
+        out TypeKind.QuantizedTensor
+    end
     if node.node_type == AstType.IndexAccess or node.node_type == AstType.FieldAccess or node.node_type == AstType.CastExpr or node.node_type == AstType.UnaryMinus do
         out TypeKind.Int
     end
     if node.node_type == AstType.UnaryNot do
         out TypeKind.Bool
     end
+    out TypeKind.Void
+end.
+
+func pass6_resolve_ffi_type(name: string):
+    if fat_str_len(name) == 0 do out TypeKind.Void end
+    if fat_cstr_eq(name, "int") == 1 or fat_cstr_eq(name, "i8") == 1 or fat_cstr_eq(name, "i16") == 1 or fat_cstr_eq(name, "i32") == 1 or fat_cstr_eq(name, "i64") == 1 or fat_cstr_eq(name, "uint") == 1 or fat_cstr_eq(name, "u8") == 1 or fat_cstr_eq(name, "u16") == 1 or fat_cstr_eq(name, "u32") == 1 or fat_cstr_eq(name, "u64") == 1 do out TypeKind.Int end
+    if fat_cstr_eq(name, "float") == 1 or fat_cstr_eq(name, "f32") == 1 or fat_cstr_eq(name, "f64") == 1 do out TypeKind.Float end
+    if fat_cstr_eq(name, "bool") == 1 do out TypeKind.Bool end
+    if fat_cstr_eq(name, "string") == 1 do out TypeKind.String end
+    if fat_cstr_eq(name, "ptr") == 1 do out TypeKind.Pointer end
+    if fat_cstr_eq(name, "none") == 1 or fat_cstr_eq(name, "void") == 1 do out TypeKind.None end
     out TypeKind.Void
 end.
 
@@ -284,7 +337,86 @@ func pass6_is_logic_bit_operand(k: TypeKind):
     out pass6_is_integer_like(k)
 end.
 
+func pass6_name_in_vec(names: i64, name: string):
+    if names == 0 do out 0 end
+    var i = 0
+    when i < vec_len_rt(names) loop
+        if fat_str_eq(vec_get_rt(names, i) as string, name) do out 1 end
+        i = i + 1
+    end
+    out 0
+end.
+
+# Recover the declared tensor annotation through identifiers and quantize
+# wrappers.  TypeKind alone intentionally does not erase element/shape data.
+func pass6_tensor_type_name(symbols: SymbolTable, scopes: ScopeTree, node: AstNode):
+    if node.node_type == AstType.Identifier do
+        found = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        if found != -1 do
+            sym = pass6_symbol_at(symbols, found)
+            if sym.ast_id != 0 do
+                decl = sym.ast_id as AstNode
+                if is_tensor_type_str(decl.name2) do out decl.name2 end
+                if vec_len_rt(decl.children) > 0 do
+                    out pass6_tensor_type_name(symbols, scopes, vec_get_rt(decl.children, 0))
+                end
+            end
+        end
+    eif node.node_type == AstType.QuantizeExpr and vec_len_rt(node.children) > 0 do
+        out pass6_tensor_type_name(symbols, scopes, vec_get_rt(node.children, 0))
+    end
+    out fat_str_new("")
+end.
+
 func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode):
+
+    if node.node_type == AstType.MethodCall and fat_cstr_eq(node.name, "backward") == 1 do
+        if g_pass6_ai_mode == 1 do
+            report_error(diag, 3009, node.line, 0)
+        eif g_pass6_ai_mode != 2 do
+            report_error(diag, 3017, node.line, 0)
+        else
+            backward_ok = false
+            if vec_len_rt(node.children) > 0 do
+                recv = vec_get_rt(node.children, 0)
+                recv_ty = pass6_infer_type(symbols, scopes, recv)
+                if recv.node_type == AstType.Identifier and pass6_name_in_vec(g_pass6_train_values, recv.name) == 1 and (recv_ty == TypeKind.Float or recv_ty == TypeKind.Tensor) do
+                    backward_ok = true
+                end
+            end
+            if not backward_ok do report_error(diag, 3020, node.line, 0) end
+        end
+    end
+
+    if node.node_type == AstType.QuantizeExpr do
+        q_count = vec_len_rt(node.children)
+        if q_count != 2 do
+            report_error(diag, 3019, node.line, 0)
+        else
+            q_value = vec_get_rt(node.children, 0)
+            q_bits_expr = vec_get_rt(node.children, 1)
+            q_value_type = pass6_infer_type(symbols, scopes, q_value)
+            if q_value_type != TypeKind.Tensor do
+                report_error(diag, 3018, node.line, 0)
+            else
+                q_tensor_name = pass6_tensor_type_name(symbols, scopes, q_value)
+                if not is_tensor_type_str(q_tensor_name) or parse_tensor_elem_type(q_tensor_name) != TypeKind.Float do
+                    report_error(diag, 3018, node.line, 0)
+                end
+            end
+            if q_bits_expr.node_type != AstType.LiteralInt do
+                report_error(diag, 3019, q_bits_expr.line, 0)
+            else
+                q_bits = q_bits_expr.int_val
+                if q_bits != 4 and q_bits != 8 and q_bits != 16 and q_bits != 32 do
+                    report_error(diag, 3019, q_bits_expr.line, 0)
+                end
+            end
+            pass6_walk(symbols, scopes, diag, q_value)
+            pass6_walk(symbols, scopes, diag, q_bits_expr)
+        end
+        out 0
+    end
 
     # String Interpolation Type Check & Node Binding
     if node.node_type == AstType.InterpExpr do
@@ -349,15 +481,15 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                         report_error(diag, 3006, node.line, 0)
                     end
                 end
-                if node.op == OpType.MatMulOp do
+                if node.op == OpType.MatMulOp or node.op == OpType.FmaOp do
                     if lt != TypeKind.Void and lt != TypeKind.Tensor do
                         report_error(diag, 3002, node.line, 0)
                     end
                     if rt_type != TypeKind.Void and rt_type != TypeKind.Tensor do
                         report_error(diag, 3002, node.line, 0)
                     end
-                    var type_a_str = ""
-                    var type_b_str = ""
+                    var type_a_str = fat_str_new("")
+                    var type_b_str = fat_str_new("")
                     if left.node_type == AstType.Identifier do
                         found_a = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), left.name)
                         if found_a != -1 do
@@ -378,9 +510,18 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                             end
                         end
                     end
-                    if is_tensor_type_str(type_a_str) and is_tensor_type_str(type_b_str) do
+                    if not is_tensor_type_str(type_a_str) or not is_tensor_type_str(type_b_str) do
+                        # Matmul/FMA dimensions must be known statically.  Do not
+                        # let lowering invent the historical 2x2 fallback.
+                        report_error(diag, 3014, node.line, 0)
+                    else
                         shape_a = parse_tensor_shape(type_a_str)
                         shape_b = parse_tensor_shape(type_b_str)
+                        elem_a = parse_tensor_elem_type(type_a_str)
+                        elem_b = parse_tensor_elem_type(type_b_str)
+                        if elem_a != elem_b do
+                            report_error(diag, 3007, node.line, 0)
+                        end
                         rank_a = vec_len_rt(shape_a)
                         rank_b = vec_len_rt(shape_b)
                         if rank_a != 2 or rank_b != 2 do
@@ -483,6 +624,28 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                 report_error(diag, 3004, node.line, 0)
             end
         end
+        extern_decl_raw = pass6_find_extern(node.name)
+        if extern_decl_raw != 0 do
+            decl = extern_decl_raw as AstNode
+            var ai = 0
+            var pi = 0
+            when ai < child_count and pi < vec_len_rt(decl.children) loop
+                    param = vec_get_rt(decl.children, pi)
+                    if param.node_type != AstType.Block do
+                        expected = pass6_resolve_ffi_type(param.name2)
+                        actual = pass6_infer_type(symbols, scopes, vec_get_rt(node.children, ai))
+                    # FFI boundaries require exact semantic categories.  The
+                    # general assignment checker intentionally treats several
+                    # pointer-sized values as compatible, which is unsafe for
+                    # a foreign ABI declaration.
+                    if expected != TypeKind.Void and actual != TypeKind.Void and expected != actual do
+                        report_error(diag, 3007, node.line, 0)
+                    end
+                    ai = ai + 1
+                end
+                pi = pi + 1
+            end
+        end
         var i = 0
         when i < child_count loop
             child = vec_get_rt(node.children, i)
@@ -520,6 +683,16 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                 base_ty = pass6_infer_type(symbols, scopes, base_expr)
                 if base_ty == TypeKind.Tensor do
                     is_tensor_base = true
+                    if base_expr.node_type == AstType.Identifier do
+                        found_expr_base = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), base_expr.name)
+                        if found_expr_base != -1 do
+                            expr_sym = pass6_symbol_at(symbols, found_expr_base)
+                            if expr_sym.ast_id != 0 do
+                                expr_ast = expr_sym.ast_id as AstNode
+                                if is_tensor_type_str(expr_ast.name2) do expected_rank = parse_tensor_rank(expr_ast.name2) end
+                            end
+                        end
+                    end
                 end
             end
         end
@@ -564,6 +737,12 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                         if expected_rank > 0 and num_indices != expected_rank do
                             report_error(diag, 3013, node.line, 0)
                         end
+                        value_node = vec_get_rt(node.children, child_count - 1)
+                        value_type = pass6_infer_type(symbols, scopes, value_node)
+                        elem_type = parse_tensor_elem_type(base_ast.name2)
+                        if value_type != TypeKind.Void and value_type != elem_type do
+                            report_error(diag, 3007, node.line, 0)
+                        end
                     end
                 end
             end
@@ -595,20 +774,40 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
     end
 
     if node.node_type == AstType.InferBlock do
+        old_ai_mode = g_pass6_ai_mode
+        if old_ai_mode != 0 do
+            report_error(diag, 3016, node.line, 0)
+        end
+        g_pass6_ai_mode = 1
         child_count = vec_len_rt(node.children)
         var i = 0
         when i < child_count loop
             child = vec_get_rt(node.children, i)
-            if child.node_type == AstType.MethodCall and fat_str_eq(child.name, fat_str_new("backward")) == 1 do
-                report_error(diag, 3009, child.line, 0)
-            end
             pass6_walk(symbols, scopes, diag, child)
             i = i + 1
         end
+        g_pass6_ai_mode = old_ai_mode
         out 0
     end
 
-    if node.node_type == AstType.TrainBlock or node.node_type == AstType.ReactiveDecl or node.node_type == AstType.BundleExpr or node.node_type == AstType.ExposeAttr do
+    if node.node_type == AstType.TrainBlock do
+        old_ai_mode = g_pass6_ai_mode
+        if old_ai_mode != 0 do
+            report_error(diag, 3016, node.line, 0)
+        end
+        g_pass6_ai_mode = 2
+        child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            child = vec_get_rt(node.children, i)
+            pass6_walk(symbols, scopes, diag, child)
+            i = i + 1
+        end
+        g_pass6_ai_mode = old_ai_mode
+        out 0
+    end
+
+    if node.node_type == AstType.ReactiveDecl or node.node_type == AstType.BundleExpr or node.node_type == AstType.ExposeAttr do
         child_count = vec_len_rt(node.children)
         var i = 0
         when i < child_count loop
@@ -701,6 +900,11 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                     native_write_i64(sym as i64, 16, inferred as i64)
                 end
             end
+        end
+        if g_pass6_ai_mode == 1 do
+            g_pass6_infer_values = vec_push_rt(g_pass6_infer_values, node.name)
+        eif g_pass6_ai_mode == 2 do
+            g_pass6_train_values = vec_push_rt(g_pass6_train_values, node.name)
         end
         out 0
     end
