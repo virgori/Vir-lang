@@ -1,0 +1,855 @@
+# vir/compiler/virc.vri — Pure Vir Compiler Driver (Zero C/Python)
+# =================================================================
+# The self-hosting Vir compiler entry point. Uses ONLY the vir/rt/*
+# modules (direct syscalls, mmap allocator, raw I/O). No Python,
+# no C runtime, no libc, no external linker.
+#
+# Pipeline
+#   source.vri → lex → parse → lower → regalloc → codegen → Mach-O/ELF
+#
+# This is the file that gets compiled by the Python compiler (Stage 0),
+# then the resulting binary compiles itself (Stage 1), completing bootstrap.
+#
+# Usage
+#   ./virc <input.vri> [-o output] [--target arm64|x86_64] [--format macho|elf]
+
+module vir.compiler.virc
+
+# ── Runtime layer (pure Vir, no C) ──
+include vir.rt.syscall
+import sys_exit, sys_write, SYS_EXIT, SYS_WRITE from vir.rt.syscall
+include vir.rt.alloc
+import vir_alloc, vir_free, vir_realloc, heap_init from vir.rt.alloc
+include vir.rt.string_rt
+import rt_strlen, rt_strcmp, rt_streq, rt_strcat, rt_strdup,
+       rt_itoa, rt_atoi, StringBuilder, sb_new, sb_append,
+       sb_append_char, sb_append_int, sb_to_string, sb_free,
+       str_from_cstr, fat_str_len from vir.rt.string_rt
+include vir.rt.io
+import print_str, print_int, print_ln, print_newline, eprint_ln,
+        file_open_read, file_read_all, file_close,
+        write_file_bytes, write_file_str, read_file_str from vir.rt.io
+include vir.rt.vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt,
+       vec_free_rt, bvec_new, bvec_push, bvec_push_u32_le,
+       bvec_push_u64_le, bvec_len, bvec_get, bvec_data_ptr,
+       bvec_free from vir.rt.vec_rt
+include vir.rt.start
+import rt_argc, rt_argv from vir.rt.start
+# Note: vir.str.string removed — compiler modules use stdlib/vir/string.vri shim instead
+
+# ── Mach-O/ELF emitters — MUST be BEFORE compiler/main (which includes
+#    binary.vri) so that these definitions win under "first compiled wins" ──
+include vir.rt.macho
+import MachOBuilder, macho_new, macho_write_to_file from vir.rt.macho
+include vir.rt.elf
+import ElfBuilder, elf_new, elf_write_to_file from vir.rt.elf
+
+# ── Compiler modules (self-hosting, pure Vir) ──
+include vir.compiler.lexer
+import Lexer, TokType, Token, lexer_new, tokenize,
+       lexer_token_count, lexer_token_get, lexer_error_message from vir.compiler.lexer
+include vir.compiler.parser
+import Parser, AstNode, AstType, parser_new, parse_program from vir.compiler.parser
+include vir.compiler.semantic
+import semantic_run from vir.compiler.semantic
+include vir.compiler.mir
+include vir.compiler.mir_cfg
+include vir.compiler.mir_ssa
+include vir.compiler.mir_opt
+include vir.compiler.ast_to_mir
+include vir.compiler.lir
+include vir.compiler.lir_liveness
+include vir.compiler.lir_interference
+include vir.compiler.lir_regalloc_color
+include vir.compiler.lir_lower
+include vir.compiler.pipeline
+import compile_pipeline, set_pipeline_hir_mode, set_pipeline_mir_full, set_pipeline_opt_level from vir.compiler.pipeline
+import set_codegen_target from vir.compiler.target
+include vir.compiler.ir_optimizer
+import LowerCtx, QModule, QOp, lower_ctx_new, lower_program, optimize_module from vir.compiler.ir_optimizer
+include vir.compiler.codegen
+import TargetArch, CodeBuf, codebuf_new, codebuf_offset,
+       codebuf_emit_u32, codebuf_patch_u32, codebuf_get_data, lir_emit_module from vir.compiler.codegen
+include vir.compiler.lir_codegen
+import emit_lir_module_arm64, lir_find_func_index from vir.compiler.lir_codegen
+include vir.compiler.codegen_x86
+include vir.compiler.lir_codegen_x86
+import emit_lir_module_x86_64 from vir.compiler.lir_codegen_x86
+include vir.compiler.codegen_wasm
+import wasm_compile_module, wasm_write_module, QIRFunc from vir.compiler.codegen_wasm
+include vir.compiler.mc
+import AsmDialect, MCInst from vir.compiler.mc
+include vir.compiler.target_triple
+import parse_target_triple, get_host_triple from vir.compiler.target_triple
+include vir.compiler.mc_printer
+import print_mc_inst, print_mc_function_header, print_mc_function_footer, print_mc_assembly_prologue, print_mc_runtime_stubs from vir.compiler.mc_printer
+include vir.compiler.lir_to_mc
+import lir_func_to_mc from vir.compiler.lir_to_mc
+include vir.compiler.mc_verify
+import mc_verify_function from vir.compiler.mc_verify
+include vir.compiler.main
+import codegen_emit_module, emit_macho_executable, emit_macho_with_entry, FuncLayout, expand_includes_text, expand_imports_text, text_ascii_sanitize, g_inc_base, g_inc_err from vir.compiler.main
+include vec
+import vec_len, vec_get from vec
+
+
+# ═══════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════
+
+const VERSION: "virc 2.4.0 (self-hosted)"
+
+entity CompilerConfig:
+    input_path:     int;    # string pointer
+    output_path:    int;    # string pointer
+    target:         int;    # 0=ARM64, 1=x86_64
+    out_fmt:        int;    # 0=Mach-O, 1=ELF
+    verbose:        int;    # 0=quiet, 1=verbose
+    emit_asm:       int    # 0=binary, 1=assembly text (-S)
+end.
+
+func cfg_get_input_path(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 0)
+end.
+func cfg_set_input_path(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 0, val)
+end.
+
+func cfg_get_output_path(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 8)
+end.
+func cfg_set_output_path(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 8, val)
+end.
+
+func cfg_get_target(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 16)
+end.
+func cfg_set_target(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 16, val)
+end.
+
+func cfg_get_out_fmt(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 24)
+end.
+func cfg_set_out_fmt(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 24, val)
+end.
+
+func cfg_get_verbose(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 32)
+end.
+func cfg_set_verbose(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 32, val)
+end.
+
+func cfg_get_emit_asm(cfg: CompilerConfig):
+    out native_read_i64(cfg as i64, 40)
+end.
+func cfg_set_emit_asm(cfg: CompilerConfig, val: int):
+    native_write_i64(cfg as i64, 40, val)
+end.
+
+# C-VM bootstrap CALLs may clobber locals that hold aggregate values.  Keep
+# the parser hand-off pointer global so it is reloaded for every use.
+var g_virc_parser_tokens: i64 = 0
+var g_virc_diag_file: i64 = 0
+var g_virc_diag_line: i64 = 0
+
+func default_config:
+    let p = vir_alloc(48)
+    native_write_i64(p, 0, 0)
+    native_write_i64(p, 8, 0)
+    native_write_i64(p, 16, 0)
+    native_write_i64(p, 24, 0)
+    native_write_i64(p, 32, 1)
+    native_write_i64(p, 40, 0)
+    out p as CompilerConfig
+end.
+func cstr_ends_with_vri(s: int):
+    if s == 0 do out 0 end
+    let l = rt_strlen(s)
+    if l < 4 do out 0 end
+    if native_read_u8(s, l - 4) != 46 do out 0 end
+    if native_read_u8(s, l - 3) != 118 do out 0 end
+    if native_read_u8(s, l - 2) != 114 do out 0 end
+    if native_read_u8(s, l - 1) != 105 do out 0 end
+    out 1
+end.
+
+# Resolve an expanded-bundle line through markers emitted by
+# tools/preexpand_virc.py:
+#     # @vir_source path/to/module.vri ORIGINAL_LINE
+func virc_locate_source(source: string, target_line: int):
+    data = native_read_i64(source as i64, 0)
+    n = native_read_i64(source as i64, 8)
+    pos = 0
+    expanded_line = 1
+    original_line = 1
+    g_virc_diag_file = "<expanded>" as i64
+
+    when pos < n loop
+        line_start = pos
+        when pos < n and native_read_u8(data, pos) != 10 loop
+            pos = pos + 1
+        end
+        line_end = pos
+
+        is_marker = line_end - line_start >= 15
+        if is_marker do
+            # "# @vir_source "
+            is_marker = native_read_u8(data, line_start) == 35 and native_read_u8(data, line_start + 1) == 32 and native_read_u8(data, line_start + 2) == 64 and native_read_u8(data, line_start + 3) == 118 and native_read_u8(data, line_start + 4) == 105 and native_read_u8(data, line_start + 5) == 114 and native_read_u8(data, line_start + 6) == 95 and native_read_u8(data, line_start + 7) == 115 and native_read_u8(data, line_start + 8) == 111 and native_read_u8(data, line_start + 9) == 117 and native_read_u8(data, line_start + 10) == 114 and native_read_u8(data, line_start + 11) == 99 and native_read_u8(data, line_start + 12) == 101 and native_read_u8(data, line_start + 13) == 32
+        end
+
+        if is_marker do
+            path_start = line_start + 14
+            sep = path_start
+            when sep < line_end and native_read_u8(data, sep) != 32 loop
+                sep = sep + 1
+            end
+            path_len = sep - path_start
+            path_buf = vir_alloc(path_len + 1)
+            j = 0
+            when j < path_len loop
+                native_write_u8(path_buf, j, native_read_u8(data, path_start + j))
+                j = j + 1
+            end
+            native_write_u8(path_buf, path_len, 0)
+            # Store a raw C-string pointer.  Keeping a fat-string aggregate in
+            # a global is not stable across the many scanner CALLs in C-VM.
+            g_virc_diag_file = path_buf
+            original_line = 0
+            k = sep + 1
+            when k < line_end loop
+                c = native_read_u8(data, k)
+                if c >= 48 and c <= 57 do
+                    original_line = original_line * 10 + c - 48
+                end
+                k = k + 1
+            end
+        else
+            if expanded_line == target_line do
+                g_virc_diag_line = original_line
+                out 0
+            end
+            original_line = original_line + 1
+        end
+
+        if pos < n do
+            pos = pos + 1
+        end
+        expanded_line = expanded_line + 1
+    end
+
+    g_virc_diag_line = original_line
+    out 0
+end.
+
+# ═══════════════════════════════════════════════════════
+# CLI Argument Parsing
+# ═══════════════════════════════════════════════════════
+
+func parse_args:
+    let argc = arg_count()
+    let cfg = default_config()
+
+    var base_idx = 0
+    if argc > 0 and cstr_ends_with_vri(get_arg(0)) == 0 do
+        base_idx = 1
+    end
+
+    if argc <= base_idx do
+        print_ln("virc: error_msg: no input file")
+        print_ln("Usage: virc <input.vri> [-o output] [--target arm64|x86_64] [--format macho|elf]")
+        sys_exit(1)
+    end
+
+    # First positional argument is the input file
+    cfg_set_input_path(cfg, get_arg(base_idx))
+
+    # Default output: a.out
+    cfg_set_output_path(cfg, "a.out" as int)
+
+    var i = base_idx + 1
+    when i < argc loop
+        let arg = get_arg(i)
+
+        if rt_streq(arg, "-o") do
+            if i + 1 < argc do
+                i = i + 1
+                cfg_set_output_path(cfg, get_arg(i))
+            else
+                print_ln("virc: error_msg: -o requires an argument")
+                sys_exit(1)
+            end
+
+        eif rt_streq(arg, "-S") do
+            cfg_set_emit_asm(cfg, 1)
+
+        eif rt_streq(arg, "--target") do
+            if i + 1 < argc do
+                i = i + 1
+                let tgt = get_arg(i)
+                if rt_streq(tgt, "macos-arm64") or rt_streq(tgt, "arm64-apple-darwin") or rt_streq(tgt, "darwin-arm64") do
+                    cfg_set_target(cfg, 0)
+                    cfg_set_out_fmt(cfg, 0)
+                eif rt_streq(tgt, "linux-arm64") or rt_streq(tgt, "aarch64-linux") or rt_streq(tgt, "aarch64-unknown-linux-gnu") do
+                    cfg_set_target(cfg, 0)
+                    cfg_set_out_fmt(cfg, 1)
+                eif rt_streq(tgt, "linux-x86_64") or rt_streq(tgt, "x86_64-linux") or rt_streq(tgt, "x86_64-unknown-linux-gnu") do
+                    cfg_set_target(cfg, 1)
+                    cfg_set_out_fmt(cfg, 1)
+                eif rt_streq(tgt, "linux-riscv64") or rt_streq(tgt, "riscv64-linux") or rt_streq(tgt, "riscv64-unknown-linux-gnu") do
+                    cfg_set_target(cfg, 3)
+                    cfg_set_out_fmt(cfg, 1)
+                eif rt_streq(tgt, "wasm32-wasi-p1") or rt_streq(tgt, "wasm32-wasi") or rt_streq(tgt, "wasm32") or rt_streq(tgt, "wasm") do
+                    cfg_set_target(cfg, 2)
+                    cfg_set_out_fmt(cfg, 2)
+                eif rt_streq(tgt, "arm64") or rt_streq(tgt, "aarch64") do
+                    cfg_set_target(cfg, 0)
+                eif rt_streq(tgt, "x86_64") or rt_streq(tgt, "x86-64") do
+                    cfg_set_target(cfg, 1)
+                eif rt_streq(tgt, "riscv64") or rt_streq(tgt, "riscv") do
+                    cfg_set_target(cfg, 3)
+                    cfg_set_out_fmt(cfg, 1)
+                else
+                    print_ln("virc: error_msg: unknown target (use macos-arm64, linux-arm64, linux-x86_64, linux-riscv64, wasm32)")
+                    sys_exit(1)
+                end
+            end
+
+        eif rt_streq(arg, "--format") do
+            if i + 1 < argc do
+                i = i + 1
+                let fmt = get_arg(i)
+                if rt_streq(fmt, "macho") do
+                    cfg_set_out_fmt(cfg, 0)
+                eif rt_streq(fmt, "elf") do
+                    cfg_set_out_fmt(cfg, 1)
+                eif rt_streq(fmt, "wasm") do
+                    cfg_set_out_fmt(cfg, 2)
+                eif rt_streq(fmt, "asm") or rt_streq(fmt, "s") do
+                    cfg_set_emit_asm(cfg, 1)
+                else
+                    print_ln("virc: error_msg: unknown format (use macho, elf, wasm or asm)")
+                    sys_exit(1)
+                end
+            end
+
+        eif rt_streq(arg, "--hir") do
+            set_pipeline_hir_mode(1)
+
+        eif rt_streq(arg, "--mir-full") do
+            set_pipeline_mir_full(1)
+
+        eif rt_streq(arg, "-O0") do
+            set_pipeline_opt_level(0)
+        eif rt_streq(arg, "-O1") do
+            set_pipeline_opt_level(1)
+        eif rt_streq(arg, "-O2") do
+            set_pipeline_opt_level(2)
+        eif rt_streq(arg, "-O3") do
+            set_pipeline_opt_level(3)
+
+        eif rt_streq(arg, "-q") or rt_streq(arg, "--quiet") do
+            cfg_set_verbose(cfg, 0)
+
+        eif rt_streq(arg, "-v") or rt_streq(arg, "--version") do
+            print_ln(VERSION)
+            sys_exit(0)
+
+        eif rt_streq(arg, "-h") or rt_streq(arg, "--help") do
+            print_ln("virc — Vir Self-Hosting Compiler")
+            print_ln("")
+            print_ln("Usage: virc <input.vri> [-o output] [options]")
+            print_ln("")
+            print_ln("Options:")
+            print_ln("  -o <file>           Output file (default: a.out)")
+            print_ln("  --target <arch>     arm64, x86_64 or wasm32 (default: arm64)")
+            print_ln("  --format <fmt>      macho, elf or wasm (default: macho)")
+            print_ln("  --mir-full          Enable full MIR optimization pipeline (alias -O3)")
+            print_ln("  -O0 .. -O3          Optimization tier (spec §1.2.1, 26 MIR passes)")
+            print_ln("  -q, --quiet         Suppress progress messages")
+            print_ln("  -v, --version       Print version")
+            print_ln("  -h, --help          Print this help")
+            sys_exit(0)
+        end
+
+        i = i + 1
+    end
+
+    out cfg
+end.
+# ═══════════════════════════════════════════════════════
+# Compiler Pipeline
+# ═══════════════════════════════════════════════════════
+
+func virc_compile(cfg: CompilerConfig):
+    let input_path = cfg_get_input_path(cfg)
+    let output_path = cfg_get_output_path(cfg)
+    let target = cfg_get_target(cfg)
+    let out_fmt = cfg_get_out_fmt(cfg)
+    let verbose = cfg_get_verbose(cfg)
+    let emit_asm = cfg_get_emit_asm(cfg)
+
+    # ── Read source file ──
+    if verbose == 1 do
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: reading ")
+        sb = sb_append(sb, input_path)
+        sb = sb_append(sb, "...")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+
+    let source_raw = read_file_str(input_path)
+    if source_raw == 0 do
+        print_ln("virc: error_msg: cannot read input file")
+        sys_exit(1)
+    end
+
+    let src_len = rt_strlen(source_raw)
+    if verbose == 1 do
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: ")
+        sb = sb_append_int(sb, src_len)
+        sb = sb_append(sb, " bytes source")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+
+    # ── Step 0: Preprocess includes + imports ──
+    var last_slash = -1
+    var pi = 0
+    let path_len = rt_strlen(input_path)
+    when pi < path_len loop
+        if native_read_u8(input_path, pi) == 47 do
+            last_slash = pi
+        end
+        pi = pi + 1
+    end
+    if last_slash >= 0 do
+        let dbuf = vir_alloc(last_slash + 1)
+        pi = 0
+        when pi < last_slash loop
+            native_write_u8(dbuf, pi, native_read_u8(input_path, pi))
+            pi = pi + 1
+        end
+        native_write_u8(dbuf, last_slash, 0)
+        g_inc_base = dbuf
+    end
+
+    var source_fat = str_from_cstr(source_raw)
+    source_fat = text_ascii_sanitize(source_fat)
+    var is_preexpanded = false
+    if fat_str_len(source_fat) >= 13 do
+        if fat_str_byte_at(source_fat, 0) == 35 and fat_str_byte_at(source_fat, 2) == 64 do
+            is_preexpanded = true
+        end
+    end
+    if not is_preexpanded do
+        print_ln("virc: expanding includes...")
+        source_fat = expand_includes_text(source_fat)
+        if g_inc_err == 1 do
+            print_ln("virc: include expansion failed")
+            sys_exit(1)
+        end
+    end
+    if verbose == 1 do
+        let sb_pre = sb_new()
+        sb_pre = sb_append(sb_pre, "virc: ")
+        sb_pre = sb_append_int(sb_pre, fat_str_len(source_fat))
+        sb_pre = sb_append(sb_pre, " bytes after preprocess")
+        print_ln(sb_to_string(sb_pre))
+        sb_free(sb_pre)
+    end
+
+    # ── Step 1: Tokenize ──
+    if verbose == 1 do
+        print_ln("virc: tokenizing...")
+    end
+
+    # Snapshot before lexer_new — CALLs above can clobber source_fat (native ABI).
+    held_src = source_fat
+    let lex = lexer_new(held_src)
+    lex = tokenize(lex)
+
+    # Read lexer state through its published Vec/error handles. The Vec is
+    # published by lexer_new before the token loop, so alternate loop exits do
+    # not depend on aggregate return-register preservation.
+    if fat_str_len(lexer_error_message()) > 0 do
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: lex error_msg: ")
+        sb = sb_append(sb, lexer_error_message())
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+        sys_exit(1)
+    end
+
+    # Read and validate the count immediately.  Do not test this local after
+    # the token-copy loop: that loop performs hundreds of thousands of CALLs
+    # in a full self-host and exposed stale/clobbered caller state as a false 0.
+    let tok_count = lexer_token_count()
+    if tok_count <= 0 do
+        print_ln("virc: error: lexer produced no tokens")
+        sys_exit(1)
+    end
+
+    if verbose == 1 do
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: ")
+        sb = sb_append_int(sb, tok_count)
+        sb = sb_append(sb, " tokens")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+
+    # Parser expects rt-vec of token pointers; lexer uses collections Vec.
+    let tok_rt = vec_new_rt()
+    g_virc_parser_tokens = tok_rt
+    let ti = 0
+    when ti < tok_count loop
+        let tok = lexer_token_get(ti)
+        g_virc_parser_tokens = vec_push_rt(g_virc_parser_tokens, tok)
+        ti = ti + 1
+    end
+
+    # ── Step 2: Parse ──
+    if verbose == 1 do
+        print_ln("virc: parsing...")
+    end
+
+    let parser = parser_new(g_virc_parser_tokens)
+    var (parser2, ast) = parse_program(parser)
+
+    if verbose == 1 do
+        let k_count = vec_len_rt(ast.children)
+        let sb_ast = sb_new()
+        sb_ast = sb_append(sb_ast, "virc: ast children ")
+        sb_ast = sb_append_int(sb_ast, k_count)
+        print_ln(sb_to_string(sb_ast))
+        sb_free(sb_ast)
+    end
+
+    # parse_program prints and recovers from individual errors, clearing
+    # error_msg so it can report more than one.  error_line remains non-zero
+    # after any error and must prevent semantic analysis of a partial AST.
+    if parser2.error_line > 0 do
+        if rt_strlen(parser2.error_msg) > 0 do
+            print_ln(parser2.error_msg)
+        end
+        virc_locate_source(source_fat, parser2.error_line)
+        let sb_pe = sb_new()
+        sb_pe = sb_append(sb_pe, "virc: parse warning at ")
+        # g_virc_diag_file is already a raw NUL-terminated C string. Wrapping
+        # it as a fat string makes sb_append read the wrapper bytes as text.
+        sb_pe = sb_append(sb_pe, g_virc_diag_file)
+        sb_pe = sb_append(sb_pe, ":")
+        sb_pe = sb_append_int(sb_pe, g_virc_diag_line)
+        sb_pe = sb_append(sb_pe, " (expanded line ")
+        sb_pe = sb_append_int(sb_pe, parser2.error_line)
+        sb_pe = sb_append(sb_pe, "): skipping semantic analysis for partial AST")
+        print_ln(sb_to_string(sb_pe))
+        sb_free(sb_pe)
+        sys_exit(1)
+        out 1
+    end
+
+    # ── Step 2.5: Semantic Analysis ──
+    if verbose == 1 do
+        print_ln("virc: running semantic analysis...")
+    end
+
+    let sem_errors = semantic_run(ast, input_path, verbose)
+    if sem_errors > 0 do
+        let sb_sem = sb_new()
+        sb_sem = sb_append(sb_sem, "virc: compilation aborted — ")
+        sb_sem = sb_append_int(sb_sem, sem_errors)
+        sb_sem = sb_append(sb_sem, " semantic error(s)")
+        print_ln(sb_to_string(sb_sem))
+        sb_free(sb_sem)
+        sys_exit(1)
+        out 1
+    end
+
+    # ── Step 3: Target + pipeline (AST -> MIR -> SSA -> MIR Opt -> LIR -> RegAlloc) ──
+    var target_arch = TargetArch.ARM64
+    var target_name = "ARM64"
+    var container_arch = 0
+    if target == 1 do
+        target_arch = TargetArch.X86_64
+        target_name = "x86_64"
+        container_arch = 1
+    eif target == 2 do
+        target_arch = TargetArch.Wasm32
+        target_name = "wasm32"
+        container_arch = 2
+    eif target == 3 do
+        target_arch = TargetArch.RISCV64
+        target_name = "riscv64"
+        container_arch = 0
+        container_arch = 3
+    end
+    set_codegen_target(target as int)
+    set_codegen_target(target_arch as int)
+
+    if verbose == 1 do
+        print_ln("virc: lowering via v2.0 MIR/SSA/LIR pipeline...")
+    end
+
+    let lir_funcs = compile_pipeline(input_path, ast, verbose)
+
+    let n_funcs = vec_len_rt(lir_funcs)
+
+    # Executable compilation must never silently accept an empty pipeline.
+    # Without this guard the runtime-only ARM64 stubs form a valid Mach-O that
+    # exits 0 immediately, which looks like a successful compiler promotion.
+    if n_funcs <= 0 do
+        print_ln("virc: error: pipeline produced no LIR functions")
+        sys_exit(1)
+        out 1
+    end
+
+    let main_idx = lir_find_func_index(lir_funcs, fat_str_new("main"))
+    if main_idx < 0 do
+        print_ln("virc: error: executable has no main function in LIR")
+        sys_exit(1)
+        out 1
+    end
+
+    if verbose == 1 do
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: ")
+        sb = sb_append_int(sb, n_funcs)
+        sb = sb_append(sb, " function(s) lowered to LIR")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+        var f_idx = 0
+        when f_idx < n_funcs loop
+            let f_obj = vec_get_rt(lir_funcs, f_idx)
+            let f_name = native_read_i64(f_obj as i64, 8) as string
+            print_str("LIR func ")
+            print_int(f_idx)
+            print_str(": ")
+            print_ln(f_name)
+            let f_blks = native_read_i64(f_obj as i64, 16)
+            print_str("  blocks: ")
+            print_int(vec_len_rt(f_blks))
+            print_ln("")
+            var b_idx = 0
+            when b_idx < vec_len_rt(f_blks) loop
+                let blk = vec_get_rt(f_blks, b_idx)
+                let ins_list = native_read_i64(blk as i64, 8)
+                print_str("    block ")
+                print_int(b_idx)
+                print_str(" instrs: ")
+                print_int(vec_len_rt(ins_list))
+                print_ln("")
+                var in_idx = 0
+                when in_idx < vec_len_rt(ins_list) loop
+                    let in_obj = vec_get_rt(ins_list, in_idx)
+                    print_str("      ins ")
+                    print_int(in_idx)
+                    print_str(": ptr=")
+                    print_int(in_obj as int)
+                    if in_obj != 0 do
+                        print_str(" op=")
+                        print_int(native_read_i64(in_obj as i64, 0))
+                    end
+                    print_ln("")
+                    in_idx = in_idx + 1
+                end
+                b_idx = b_idx + 1
+            end
+            f_idx = f_idx + 1
+        end
+    end
+
+    # ── Step 4.5: Assembly emission via MCInst pipeline (-S / --format asm) ──
+    if emit_asm == 1 do
+        if verbose == 1 do
+            var sb_v = sb_new()
+            sb_v = sb_append(sb_v, "virc: emitting ")
+            sb_v = sb_append(sb_v, target_name)
+            sb_v = sb_append(sb_v, " assembly (MCInst pipeline)...")
+            print_ln(sb_to_string(sb_v))
+            sb_free(sb_v)
+        end
+
+        var dialect = AsmDialect.DarwinAsm
+        if target == 1 do
+            dialect = AsmDialect.Intel_X86
+        eif target == 3 do
+            dialect = AsmDialect.GNU_RISCV
+        eif out_fmt == 1 do
+            dialect = AsmDialect.GNU_ELF
+        end
+
+        var asm_b = bvec_new()
+        asm_b = print_mc_assembly_prologue(dialect, asm_b)
+
+        var f_asm_idx = 0
+        when f_asm_idx < n_funcs loop
+            let f_obj = vec_get_rt(lir_funcs, f_asm_idx)
+            let f_fat = native_read_i64(f_obj as i64, 8)
+            var f_name = f_fat
+            if f_fat != 0 do
+                f_name = native_read_i64(f_fat, 0)
+            end
+            asm_b = print_mc_function_header(f_name as int, dialect, asm_b)
+
+            let mc_insts = lir_func_to_mc(f_obj, 0 - 1, target as int)
+            let v_ok = mc_verify_function(mc_insts, target_arch as int)
+            if v_ok == 0 do
+                print_ln("virc: error: MCInst verification failed")
+                sys_exit(1)
+            end
+            let n_mc = vec_len_rt(mc_insts)
+            var mc_i = 0
+            when mc_i < n_mc loop
+                let mc_ins = vec_get_rt(mc_insts, mc_i)
+                asm_b = print_mc_inst(mc_ins as MCInst, dialect, asm_b)
+                mc_i = mc_i + 1
+            end
+
+            asm_b = print_mc_function_footer(f_name as int, dialect, asm_b)
+            f_asm_idx = f_asm_idx + 1
+        end
+
+        asm_b = print_mc_runtime_stubs(dialect, asm_b)
+
+        var out_asm_path = output_path
+        if rt_streq(out_asm_path, "a.out") do
+            out_asm_path = "a.s"
+        end
+
+        write_file_bytes(out_asm_path, asm_b, bvec_len(asm_b), 0o644)
+
+        if verbose == 1 do
+            var sb_done = sb_new()
+            sb_done = sb_append(sb_done, "virc: done! ")
+            sb_done = sb_append(sb_done, out_asm_path)
+            sb_done = sb_append(sb_done, " (assembly)")
+            print_ln(sb_to_string(sb_done))
+            sb_free(sb_done)
+        end
+        out 0
+    end
+
+    # ── Step 5: Code Generation directly from LIR ──
+    if verbose == 1 do
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: generating ")
+        sb = sb_append(sb, target_name)
+        sb = sb_append(sb, " machine code...")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+
+    var code = codebuf_new(target_arch)
+    var is_linux = 0
+    if out_fmt == 1 do
+        is_linux = 1
+    end
+    if target_arch == TargetArch.ARM64 do
+        code = emit_lir_module_arm64(lir_funcs, is_linux)
+    eif target_arch == TargetArch.X86_64 do
+        code = emit_lir_module_x86_64(lir_funcs)
+    else
+        code = lir_emit_module(lir_funcs, target_arch)
+    end
+    let code_size = codebuf_offset(code)
+
+    if verbose == 1 do
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: ")
+        sb = sb_append_int(sb, code_size)
+        sb = sb_append(sb, " bytes machine code")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+
+    # ── Step 6: Emit executable ──
+    if verbose == 1 do
+        var fmt_name = "Mach-O"
+        if out_fmt == 1 do
+            fmt_name = "ELF"
+        eif out_fmt == 2 or target == 2 do
+            fmt_name = "WASM"
+        end
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: linking ")
+        sb = sb_append(sb, fmt_name)
+        sb = sb_append(sb, " ")
+        sb = sb_append(sb, target_name)
+        sb = sb_append(sb, " executable...")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+
+    if target == 2 or out_fmt == 2 do
+        # WASM output: build QIRFunc list from LIR, emit .wasm
+        var wasm_funcs = vec_new<QIRFunc>()
+        var wfi = 0
+        let wfn = vec_len_rt(lir_funcs)
+        when wfi < wfn loop
+            let lf = vec_get_rt(lir_funcs, wfi)
+            wasm_funcs = vec_push<QIRFunc>(wasm_funcs, QIRFunc (
+                name: "main",
+                param_count: 0,
+                body: []
+            ))
+            wfi = wfi + 1
+        end
+        wasm_write_module(wasm_funcs, output_path)
+    eif out_fmt == 0 do
+        # Mach-O
+        # Use the target value already selected for codegen. Reloading the
+        # aggregate cfg.target after the long pipeline is unsafe in native
+        # self-host builds and previously mislabeled ARM64 code as x86_64.
+        let mb = macho_new(container_arch)
+        let c_data = native_read_i64(code as i64, 8)
+        let c_entry = native_read_i64(code as i64, 24)
+        native_write_i64(mb as i64, 24, c_data)
+        native_write_i64(mb as i64, 40, c_entry)
+        macho_write_to_file(mb, output_path)
+    else
+        # ELF
+        let eb = elf_new(container_arch)
+        let c_data = native_read_i64(code as i64, 8)
+        let c_entry = native_read_i64(code as i64, 24)
+        native_write_i64(eb as i64, 24, c_data)
+        native_write_i64(eb as i64, 40, c_entry)
+        elf_write_to_file(eb, output_path)
+    end
+
+    if verbose == 1 do
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: done! ")
+        sb = sb_append(sb, output_path)
+        sb = sb_append(sb, " (")
+        sb = sb_append_int(sb, code_size)
+        sb = sb_append(sb, " bytes code)")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+
+    out 0
+end.
+# ═══════════════════════════════════════════════════════
+# Entry Point (called from _start via rt/start.vri)
+# ═══════════════════════════════════════════════════════
+
+func main:
+    print_ln("====================================")
+    print_ln("  virc — Vir Self-Hosting Compiler")
+    print_ln("  v2.5.0 — Multi-Target Matrix & LIR Pipeline")
+    print_ln("====================================")
+
+    let cfg = parse_args()
+    let result = virc_compile(cfg)
+    sys_exit(result)
+    out result
+end.
+export vir_main, virc_compile, parse_args, CompilerConfig

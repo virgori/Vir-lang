@@ -1,0 +1,545 @@
+##
+ * vir/compiler/sem_pass5_infer.vri
+ * ==============================================================
+ * Pass 5: Type Inference (Vir v2.0 Complete).
+ * Infers types for variables without explicit annotations,
+ * array/tuple literals, interpolated strings, method calls, and references.
+ ##
+
+include vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt, vec_set_rt from vec_rt
+
+include string_rt
+import rt_streq, fat_str_eq, fat_str_len, fat_str_byte_at, fat_cstr_eq, fat_str_new, rt_strcat, rt_itoa, rt_strlen from string_rt
+
+include parser
+import AstNode, AstType, OpType from parser
+
+include symbol_table
+import SymbolTable, SymbolKind, SymbolNode, symbol_alloc from symbol_table
+
+include scope_tree
+import ScopeTree, ScopeKind, ScopeNode, scope_push, scope_pop, scope_add_symbol, scope_current_id from scope_tree
+
+include type_table
+import TypeKind, TYPE_VOID, TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_STRING from type_table
+
+# Hash ONLY global scope (id 0).  Prior passes leave thousands of orphan
+# Func/Block ScopeNodes in scopes.scopes; allocating 256 buckets per id
+# made rebuild O(scopes×256) vec_new — the real pass-5 hang.
+const PASS5_BUCKETS: int = 256
+var g_pass5_global_buckets: i64 = 0
+
+func pass5_hash_name(name: string):
+    n = fat_str_len(name)
+    if n <= 0 do
+        out 0
+    end
+    # Mix pointer + length — avoids O(len) byte reads on every lookup.
+    h = (name as i64) * 131 + n * 17
+    if h < 0 do
+        h = 0 - h
+    end
+    out h mod PASS5_BUCKETS
+end.
+
+func pass5_global_map_new():
+    buckets = vec_new_rt()
+    var bi = 0
+    when bi < PASS5_BUCKETS loop
+        buckets = vec_push_rt(buckets, vec_new_rt())
+        bi = bi + 1
+    end
+    out buckets
+end.
+
+func pass5_index_global(name: string, sym_id: int):
+    if fat_str_len(name) == 0 do
+        out 0
+    end
+    if g_pass5_global_buckets == 0 do
+        g_pass5_global_buckets = pass5_global_map_new()
+    end
+    bid = pass5_hash_name(name)
+    bucket = vec_get_rt(g_pass5_global_buckets, bid)
+    bucket = vec_push_rt(bucket, sym_id)
+    vec_set_rt(g_pass5_global_buckets, bid, bucket)
+    out 0
+end.
+
+func pass5_rebuild_index(symbols: SymbolTable, scopes: ScopeTree):
+    g_pass5_global_buckets = pass5_global_map_new()
+    scopes_vec = native_read_i64(scopes as i64, 0)
+    syms_vec = native_read_i64(symbols as i64, 0)
+    if vec_len_rt(scopes_vec) == 0 do
+        out 0
+    end
+    # Scope 0 only — holds builtins + top-level decls (the O(n²) hotspot).
+    scope_node = vec_get_rt(scopes_vec, 0)
+    sym_list = native_read_i64(scope_node as i64, 16)
+    count = vec_len_rt(sym_list)
+    var i = 0
+    when i < count loop
+        sym_id = vec_get_rt(sym_list, i)
+        sym = vec_get_rt(syms_vec, sym_id)
+        sym_name = native_read_i64(sym as i64, 8) as string
+        pass5_index_global(sym_name, sym_id)
+        i = i + 1
+    end
+end.
+
+func pass5_infer_types(symbols: SymbolTable, scopes: ScopeTree, node: AstNode):
+    pass5_rebuild_index(symbols, scopes)
+    pass5_walk(symbols, scopes, node)
+end.
+
+func pass5_call_returns_first_arg(name: i64):
+    if fat_cstr_eq(name, "ast_add_child") == 1 do out 1 end
+    if fat_cstr_eq(name, "vec_push_rt") == 1 do out 1 end
+    if fat_cstr_eq(name, "vec_set_rt") == 1 do out 1 end
+    if fat_cstr_eq(name, "vec_push") == 1 do out 1 end
+    if fat_cstr_eq(name, "ast_vec_push") == 1 do out 1 end
+    if fat_cstr_eq(name, "ast_vec_bump_new") == 1 do out 1 end
+    if fat_cstr_eq(name, "codebuf_emit_byte") == 1 do out 1 end
+    if fat_cstr_eq(name, "codebuf_emit_u32") == 1 do out 1 end
+    if fat_cstr_eq(name, "codebuf_emit_u64") == 1 do out 1 end
+    if fat_cstr_eq(name, "codebuf_emit_i32") == 1 do out 1 end
+    if fat_cstr_eq(name, "buf_write_u8") == 1 do out 1 end
+    if fat_cstr_eq(name, "buf_align") == 1 do out 1 end
+    if fat_cstr_eq(name, "bvec_push") == 1 do out 1 end
+    if fat_cstr_eq(name, "text_splice_at") == 1 do out 1 end
+    out 0
+end.
+
+func pass5_infer_call_return(symbols: SymbolTable, scopes: ScopeTree, node: AstNode):
+    if node.node_type != AstType.Call and node.node_type != AstType.MethodCall do
+        out TypeKind.Void
+    end
+    found = pass5_lookup(symbols, scopes, scope_current_id(scopes), node.name)
+    if found != -1 do
+        # Read SymbolTable through its physical layout. Native self-host field
+        # lowering can confuse the nested `symbols.symbols` access with a
+        # same-named field from another entity and load offset 16.
+        call_syms = native_read_i64(symbols as i64, 0)
+        sym = vec_get_rt(call_syms, found)
+        if sym.return_type != 0 do
+            out sym.return_type as TypeKind
+        end
+    end
+    if pass5_call_returns_first_arg(node.name as i64) == 1 do
+        child_count = vec_len_rt(node.children)
+        if child_count > 0 do
+            arg0 = vec_get_rt(node.children, 0)
+            arg0_ty = pass5_infer_expr(symbols, scopes, arg0)
+            if arg0_ty != TypeKind.Void do
+                out arg0_ty
+            end
+        end
+    end
+    out TypeKind.Int
+end.
+
+func pass5_tuple_binder_type(symbols: SymbolTable, scopes: ScopeTree, init: AstNode, index: int):
+    if init.node_type == AstType.TupleExpr do
+        child_count = vec_len_rt(init.children)
+        if index < child_count do
+            elem = vec_get_rt(init.children, index)
+            out pass5_infer_expr(symbols, scopes, elem)
+        end
+        out TypeKind.Int
+    end
+    if init.node_type == AstType.Call or init.node_type == AstType.MethodCall do
+        if index == 0 do
+            child_count = vec_len_rt(init.children)
+            if child_count > 0 do
+                arg0 = vec_get_rt(init.children, 0)
+                arg0_ty = pass5_infer_expr(symbols, scopes, arg0)
+                if arg0_ty != TypeKind.Void do
+                    out arg0_ty
+                end
+            end
+            out TypeKind.Entity
+        end
+        nm = init.name as i64
+        if fat_cstr_eq(nm, "lex_advance") == 1 do
+            out TypeKind.Int
+        end
+        if fat_cstr_eq(nm, "expect_tok") == 1 do
+            if index == 2 do
+                out TypeKind.Bool
+            end
+            out TypeKind.Entity
+        end
+        out TypeKind.Entity
+    end
+    out TypeKind.Int
+end.
+
+func pass5_infer_expr(symbols: SymbolTable, scopes: ScopeTree, node: AstNode):
+    if node.node_type == AstType.LiteralInt do
+        out TypeKind.Int
+    end
+    if node.node_type == AstType.LiteralFloat do
+        out TypeKind.Float
+    end
+    if node.node_type == AstType.LiteralStr or node.node_type == AstType.InterpExpr do
+        out TypeKind.String
+    end
+    if node.node_type == AstType.Identifier do
+        found = pass5_lookup(symbols, scopes, scope_current_id(scopes), node.name)
+        if found != -1 do
+            ident_syms = native_read_i64(symbols as i64, 0)
+            sym = vec_get_rt(ident_syms, found)
+            out sym.type_id as TypeKind
+        end
+        out TypeKind.Void
+    end
+    if node.node_type == AstType.BinOp do
+        child_count = vec_len_rt(node.children)
+        if child_count >= 2 do
+            left = vec_get_rt(node.children, 0)
+            right = vec_get_rt(node.children, 1)
+            lt = pass5_infer_expr(symbols, scopes, left)
+            rt_type = pass5_infer_expr(symbols, scopes, right)
+            if node.op == OpType.MatMulOp do
+                out TypeKind.Tensor
+            end
+            if node.op == OpType.Eq or node.op == OpType.Ne or node.op == OpType.Gt or node.op == OpType.Lt or node.op == OpType.Ge or node.op == OpType.Le do
+                out TypeKind.Bool
+            end
+            if node.op == OpType.Land or node.op == OpType.Lor do
+                out TypeKind.Bool
+            end
+            if node.op == OpType.AndOp or node.op == OpType.OrOp or node.op == OpType.XorOp do
+                if lt == TypeKind.Bool and rt_type == TypeKind.Bool do
+                    out TypeKind.Bool
+                end
+                out TypeKind.Int
+            end
+            if node.op == OpType.ShlOp or node.op == OpType.ShrOp do
+                out TypeKind.Int
+            end
+            if lt == TypeKind.Float or rt_type == TypeKind.Float do
+                out TypeKind.Float
+            end
+            if lt == TypeKind.String and rt_type == TypeKind.String do
+                out TypeKind.String
+            end
+            if lt == TypeKind.Bool or rt_type == TypeKind.Bool do
+                out TypeKind.Bool
+            end
+            if lt != TypeKind.Void do
+                out lt
+            end
+            out rt_type
+        end
+        out TypeKind.Void
+    end
+    if node.node_type == AstType.Compare do
+        out TypeKind.Bool
+    end
+    if node.node_type == AstType.Call or node.node_type == AstType.MethodCall do
+        out pass5_infer_call_return(symbols, scopes, node)
+    end
+    if node.node_type == AstType.ArrayLiteral do
+        child_count = vec_len_rt(node.children)
+        var i = 0
+        var array_elem_type = TypeKind.Void
+        when i < child_count loop
+            elem = vec_get_rt(node.children, i)
+            elem_t = pass5_infer_expr(symbols, scopes, elem)
+            if elem_t != TypeKind.Void do
+                array_elem_type = elem_t
+            end
+            i = i + 1
+        end
+        out TypeKind.Array
+    end
+    if node.node_type == AstType.TupleExpr do
+        out TypeKind.Tuple
+    end
+    if node.node_type == AstType.EntityLiteral do
+        out TypeKind.Entity
+    end
+    if node.node_type == AstType.EnumAccess do
+        out TypeKind.Enum
+    end
+    if node.node_type == AstType.AddrOf do
+        out TypeKind.Ref
+    end
+    if node.node_type == AstType.CastExpr do
+        out TypeKind.Void
+    end
+    if node.node_type == AstType.UnaryMinus do
+        child_count = vec_len_rt(node.children)
+        if child_count > 0 do
+            child = vec_get_rt(node.children, 0)
+            out pass5_infer_expr(symbols, scopes, child)
+        end
+        out TypeKind.Int
+    end
+    if node.node_type == AstType.IndexAccess or node.node_type == AstType.ExprIndex do
+        out TypeKind.Int
+    end
+    out TypeKind.Void
+end.
+func pass5_walk(symbols: SymbolTable, scopes: ScopeTree, node: AstNode):
+
+    if node.node_type == AstType.VarDecl or node.node_type == AstType.ConstDecl do
+        child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            child = vec_get_rt(node.children, i)
+            pass5_walk(symbols, scopes, child)
+            i = i + 1
+        end
+        if node.int_val == 16384 do
+            # Tuple destructure: binders are children[0..n-2], init last.
+            if child_count > 1 do
+                init = vec_get_rt(node.children, child_count - 1)
+                var di = 0
+                when di < child_count - 1 loop
+                    var_ident = vec_get_rt(node.children, di)
+                    if fat_str_len(var_ident.name) > 0 do
+                        binder_ty = pass5_tuple_binder_type(symbols, scopes, init, di)
+                        if binder_ty == TypeKind.Void do
+                            binder_ty = TypeKind.Int
+                        end
+                        pass5_register_local(symbols, scopes, var_ident.name, binder_ty)
+                    end
+                    di = di + 1
+                end
+            end
+        else
+            inferred = TypeKind.Void
+            if child_count > 0 do
+                init = vec_get_rt(node.children, 0)
+                inferred = pass5_infer_expr(symbols, scopes, init)
+            end
+            if inferred == TypeKind.Void do
+                inferred = TypeKind.Int
+            end
+            pass5_register_local(symbols, scopes, node.name, inferred)
+        end
+        out 0
+    end
+
+    # Implicit locals from `x = expr` — same inference as VarDecl.
+    if node.node_type == AstType.Assign do
+        inferred = TypeKind.Void
+        child_count = vec_len_rt(node.children)
+        if child_count > 0 do
+            init = vec_get_rt(node.children, 0)
+            inferred = pass5_infer_expr(symbols, scopes, init)
+            pass5_walk(symbols, scopes, init)
+        end
+        if fat_str_len(node.name) > 0 do
+            if inferred == TypeKind.Void do
+                inferred = TypeKind.Int
+            end
+            found = pass5_lookup(symbols, scopes, scope_current_id(scopes), node.name)
+            if found != -1 do
+                assign_syms = native_read_i64(symbols as i64, 0)
+                sym = vec_get_rt(assign_syms, found)
+                if sym.type_id == 0 do
+                    native_write_i64(sym as i64, 16, inferred as i64)
+                end
+            else
+                pass5_register_local(symbols, scopes, node.name, inferred)
+            end
+        end
+        out 0
+    end
+
+    if node.node_type == AstType.FuncDef do
+        scope_push(scopes, ScopeKind.Func)
+        child_count = vec_len_rt(node.children)
+        body_idx = child_count - 1
+        if body_idx < 0 do
+            body_idx = 0
+        end
+        var bi = 0
+        when bi < child_count loop
+            ch = vec_get_rt(node.children, bi)
+            if ch.node_type == AstType.Block do
+                body_idx = bi
+                bi = child_count
+            else
+                bi = bi + 1
+            end
+        end
+        var pi = 0
+        when pi < body_idx loop
+            param = vec_get_rt(node.children, pi)
+            if fat_str_len(param.name) > 0 do
+                pass5_register_local(symbols, scopes, param.name, TypeKind.Int)
+            end
+            pi = pi + 1
+        end
+        var j = body_idx
+        when j < child_count loop
+            child = vec_get_rt(node.children, j)
+            pass5_walk(symbols, scopes, child)
+            j = j + 1
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    if node.node_type == AstType.ForRange do
+        child_count = vec_len_rt(node.children)
+        if child_count >= 1 do
+            pass5_walk(symbols, scopes, vec_get_rt(node.children, 0))
+        end
+        if child_count >= 2 do
+            pass5_walk(symbols, scopes, vec_get_rt(node.children, 1))
+        end
+        scope_push(scopes, ScopeKind.Loop)
+        if fat_str_len(node.name) > 0 do
+            pass5_register_local(symbols, scopes, node.name, TypeKind.Int)
+        end
+        if child_count >= 3 do
+            pass5_walk(symbols, scopes, vec_get_rt(node.children, 2))
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    if node.node_type == AstType.Block do
+        scope_push(scopes, ScopeKind.Block)
+        child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            child = vec_get_rt(node.children, i)
+            pass5_walk(symbols, scopes, child)
+            i = i + 1
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    # Default recurse
+    child_count = vec_len_rt(node.children)
+    var i = 0
+    when i < child_count loop
+        child = vec_get_rt(node.children, i)
+        pass5_walk(symbols, scopes, child)
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass5_register_local(symbols: SymbolTable, scopes: ScopeTree, name: string, ty: TypeKind):
+    if fat_str_len(name) == 0 do
+        out 0
+    end
+    curr = scope_current_id(scopes)
+    found = pass5_lookup(symbols, scopes, curr, name)
+    if found != -1 do
+        local_syms = native_read_i64(symbols as i64, 0)
+        sym = vec_get_rt(local_syms, found)
+        if sym.type_id == 0 and ty != TypeKind.Void do
+            native_write_i64(sym as i64, 16, ty as i64)
+        end
+        out found
+    end
+    sym = SymbolNode (
+        kind: SymbolKind.Variable,
+        name_id: name as i64,
+        type_id: ty as i64,
+        scope_id: curr,
+        ast_id: 0,
+        is_mutable: true,
+        offset: 0,
+        param_count: 0,
+        return_type: 0,
+        parent_id: -1
+    )
+    sym_id = symbol_alloc(symbols, sym)
+    scope_add_symbol(scopes, curr, sym_id)
+    if curr == 0 do
+        pass5_index_global(name, sym_id)
+    end
+    out sym_id
+end.
+
+func pass5_lookup_global(symbols: SymbolTable, name: string):
+    if g_pass5_global_buckets == 0 do
+        out -1
+    end
+    bid = pass5_hash_name(name)
+    bucket = vec_get_rt(g_pass5_global_buckets, bid)
+    count = vec_len_rt(bucket)
+    syms_vec = native_read_i64(symbols as i64, 0)
+    name_ptr = name as i64
+    var i = 0
+    when i < count loop
+        sym_id = vec_get_rt(bucket, i)
+        sym = vec_get_rt(syms_vec, sym_id)
+        sym_name_ptr = native_read_i64(sym as i64, 8)
+        # Pointer identity first (same AST / register handle).
+        if sym_name_ptr == name_ptr do
+            out sym_id
+        end
+        if fat_str_eq(sym_name_ptr as string, name) == 1 do
+            out sym_id
+        end
+        i = i + 1
+    end
+    out -1
+end.
+
+func pass5_lookup_scope_linear(symbols: SymbolTable, scopes: ScopeTree, scope_id: int, name: string):
+    if scope_id <= 0 do
+        out -1
+    end
+    scopes_vec = native_read_i64(scopes as i64, 0)
+    if scope_id >= vec_len_rt(scopes_vec) do
+        out -1
+    end
+    scope_node = vec_get_rt(scopes_vec, scope_id)
+    sym_list = native_read_i64(scope_node as i64, 16)
+    count = vec_len_rt(sym_list)
+    if count == 0 do
+        out -1
+    end
+    syms_vec = native_read_i64(symbols as i64, 0)
+    name_ptr = name as i64
+    var i = 0
+    when i < count loop
+        sym_id = vec_get_rt(sym_list, i)
+        sym = vec_get_rt(syms_vec, sym_id)
+        sym_name_ptr = native_read_i64(sym as i64, 8)
+        if sym_name_ptr == name_ptr do
+            out sym_id
+        end
+        if fat_str_eq(sym_name_ptr as string, name) == 1 do
+            out sym_id
+        end
+        i = i + 1
+    end
+    out -1
+end.
+
+func pass5_lookup(symbols: SymbolTable, scopes: ScopeTree, start_scope: int, name: string):
+    if fat_str_len(name) == 0 do
+        out -1
+    end
+    # Inner scopes shadow globals (match pass 3 name resolution).
+    curr = start_scope
+    scopes_vec = native_read_i64(scopes as i64, 0)
+    when curr >= 0 loop
+        if curr == 0 do
+            out pass5_lookup_global(symbols, name)
+        end
+        found2 = pass5_lookup_scope_linear(symbols, scopes, curr, name)
+        if found2 != -1 do
+            out found2
+        end
+        scope_node = vec_get_rt(scopes_vec, curr)
+        curr = native_read_i64(scope_node as i64, 8)
+    end
+    out -1
+end.
+
+export pass5_infer_types, pass5_infer_expr
