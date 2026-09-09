@@ -1,325 +1,1190 @@
 #!/bin/bash
-# Quick test runner for virc self-hosting compiler
-cd "$(dirname "$0")"
-VIRC="./bin/virc"
-PASS=0
-FAIL=0
-SKIP=0
+# ==========================================================================
+# Vir Compiler Self-Hosting Test Suite — Categorized by Spec v2.0 (§1 - §31)
+# ==========================================================================
+# Cách sử dụng:
+#   ./run_tests.sh min     # Bộ test cốt lõi nhanh (85 bài / 31 nhóm)
+#   ./run_tests.sh full    # Toàn bộ test suite (> 400 bài không trùng lặp)
+#   ./run_tests.sh <1..31> # Chạy riêng 1 nhóm cụ thể (ví dụ: ./run_tests.sh 26)
+# Mặc định: min
+# ==========================================================================
 
-run_test() {
-    local test="$1"
-    local expected="$2"
+cd "$(dirname "$0")"
+VIRC="${VIRC:-./bin/virc}"
+A_OUT="./scratch/a_test.out"
+mkdir -p scratch
+
+MODE="${1:-min}"
+TARGET_GROUP=""
+
+if [[ "$MODE" =~ ^[0-9]+$ ]]; then
+    TARGET_GROUP="$MODE"
+    if [ "$TARGET_GROUP" -lt 1 ] || [ "$TARGET_GROUP" -gt 31 ]; then
+        echo "Lỗi: Nhóm phải từ 1 đến 31."
+        exit 1
+    fi
+    MODE="single"
+elif [ "$MODE" != "min" ] && [ "$MODE" != "full" ]; then
+    echo "Chế độ không hợp lệ: $MODE"
+    echo "Cách dùng: $0 [min|full|<1..31>]"
+    exit 1
+fi
+
+TOTAL_PASS=0
+TOTAL_FAIL=0
+declare -a GP_PASS
+declare -a GP_FAIL
+for i in $(seq 1 31); do GP_PASS[$i]=0; GP_FAIL[$i]=0; done
+
+run_test_in_group() {
+    local g="$1"
+    local test="$2"
     
-    # Compile with native virc
-    if ! $VIRC "$test" -o ./a.out >/dev/null 2>&1; then
-        echo "FAIL (compile): $test"
-        FAIL=$((FAIL+1))
+    # Bóc tách expected value tự động qua Regex từ comment header
+    local expected
+    expected=$(perl -0777 -ne '
+        if (/#\s*EXPECT_START\n((?:#[^\n]*\n)+?)#\s*EXPECT_END/m) {
+            my $b = $1; $b =~ s/^#[ \t]?//mg; chomp $b; print $b;
+        } elsif (/#\s*EXPECT:\s*\n((?:#[^\n]*\n)+)/m) {
+            my $b = $1; $b =~ s/^#[ \t]?//mg; chomp $b; print $b;
+        } elsif (/#\s*EXPECT:\s*([^\n]+)/m) {
+            my $v = $1; $v =~ s/\\n/\n/g; chomp $v; print $v;
+        }
+    ' "$test")
+
+    # Negative test (compile rejection expected)
+    if [[ "$test" == *_rejected.vri ]] || [[ "$test" == *_rejected_*.vri ]]; then
+        if ! $VIRC "$test" -o "$A_OUT" >/dev/null 2>&1; then
+            echo "  [PASS-REJECT] $test"
+            GP_PASS[$g]=$((GP_PASS[$g]+1))
+            TOTAL_PASS=$((TOTAL_PASS+1))
+        else
+            echo "  [FAIL-EXPECT-REJECT] $test"
+            GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+            TOTAL_FAIL=$((TOTAL_FAIL+1))
+        fi
         return
     fi
-    
-    # Re-sign binary (virc's embedded LC_CODE_SIGNATURE can be stale)
-    codesign -s - -f ./a.out 2>/dev/null
 
-    # Run
-    actual=$(perl -e 'alarm 5; exec @ARGV' -- ./a.out 2>&1)
-    
-    if [ "$actual" = "$expected" ]; then
-        echo "PASS: $test"
-        PASS=$((PASS+1))
+    # Biên dịch với native virc
+    local compile_out
+    if ! compile_out=$($VIRC "$test" -o "$A_OUT" 2>&1); then
+        echo "  [FAIL-COMPILE] $test"
+        echo "    $compile_out"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+        TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+
+    # Ký mã ad-hoc (Apple Silicon arm64 bắt buộc codesign)
+    codesign -s - -f "$A_OUT" >/dev/null 2>&1
+
+    # Thực thi với timeout 5 giây
+    local actual
+    actual=$(perl -e 'alarm 5; exec @ARGV' -- "$A_OUT" 2>&1)
+    local exit_code=$?
+
+    # Chuẩn hoá whitespace
+    actual=$(echo "$actual" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba')
+
+    if [ $exit_code -eq 0 ] && [ "$actual" = "$expected" ]; then
+        echo "  [PASS] $test"
+        GP_PASS[$g]=$((GP_PASS[$g]+1))
+        TOTAL_PASS=$((TOTAL_PASS+1))
     else
-        echo "FAIL: $test"
-        echo "  expected: $(echo "$expected" | tr '\n' ',')"
-        echo "  actual:   $(echo "$actual" | tr '\n' ',')"
-        FAIL=$((FAIL+1))
+        echo "  [FAIL] $test"
+        echo "    kỳ vọng: $(echo "$expected" | tr '\n' ',')"
+        echo "    thực tế: $(echo "$actual" | tr '\n' ',')"
+        echo "    exit_code: $exit_code"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+        TOTAL_FAIL=$((TOTAL_FAIL+1))
     fi
 }
 
-run_compile_fail_test() {
-    local test="$1"
-    local expected_diag="$2"
+echo "=========================================================================="
+if [ "$MODE" = "single" ]; then
+    echo "  VIR COMPILER TEST SUITE — NHÓM $TARGET_GROUP"
+else
+    echo "  VIR COMPILER TEST SUITE — CHẾ ĐỘ [${MODE^^}]"
+fi
+echo "=========================================================================="
+echo ""
 
-    # Compile with native virc (expecting compilation failure)
-    local out
-    out=$($VIRC "$test" -o ./a.out 2>&1)
-    local status=$?
-
-    if [ $status -ne 0 ]; then
-        if [ -n "$expected_diag" ]; then
-            if echo "$out" | grep -q "$expected_diag"; then
-                echo "PASS (compile-fail): $test"
-                PASS=$((PASS+1))
-            else
-                echo "FAIL (compile-fail diagnostic mismatch): $test"
-                echo "  expected diagnostic: $expected_diag"
-                echo "  actual output:       $out"
-                FAIL=$((FAIL+1))
-            fi
-        else
-            echo "PASS (compile-fail): $test"
-            PASS=$((PASS+1))
-        fi
+run_group_1() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm  1: Tổng quan (§1.0 Separator, §1.1 Mở khối, §1.2 Pipeline IR)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 1 "tests/vri/test_48.vri"
+        run_test_in_group 1 "tests/vri/test_add.vri"
+        run_test_in_group 1 "tests/vri/test_add_rt.vri"
     else
-        echo "FAIL (expected compile failure but succeeded): $test"
-        FAIL=$((FAIL+1))
+        run_test_in_group 1 "tests/vri/test_48.vri"
+        run_test_in_group 1 "tests/vri/test_add.vri"
+        run_test_in_group 1 "tests/vri/test_add_rt.vri"
+        run_test_in_group 1 "tests/vri/test_add_rt2.vri"
+        run_test_in_group 1 "tests/vri/test_adv_003_divzero.vri"
+        run_test_in_group 1 "tests/vri/test_adv_008_neg_not.vri"
+        run_test_in_group 1 "tests/vri/test_adv_011_mem_offsets.vri"
+        run_test_in_group 1 "tests/vri/test_adv_012_byte_rw.vri"
+        run_test_in_group 1 "tests/vri/test_adv_015_large_alloc.vri"
+        run_test_in_group 1 "tests/vri/test_adv_016_memset.vri"
+        run_test_in_group 1 "tests/vri/test_adv_019_heap_frag.vri"
+        run_test_in_group 1 "tests/vri/test_adv_020_memcopy.vri"
+        run_test_in_group 1 "tests/vri/test_adv_021_nested5.vri"
+        run_test_in_group 1 "tests/vri/test_adv_027_dead_code.vri"
+        run_test_in_group 1 "tests/vri/test_adv_031_raw_write.vri"
+        run_test_in_group 1 "tests/vri/test_adv_032_bubblesort.vri"
+        run_test_in_group 1 "tests/vri/test_adv_038_hex.vri"
+        run_test_in_group 1 "tests/vri/test_adv_048_linked_list.vri"
+        run_test_in_group 1 "tests/vri/test_adv_050_aliasing.vri"
+        run_test_in_group 1 "tests/vri/test_adv_051_bsearch.vri"
+        run_test_in_group 1 "tests/vri/test_adv_052_gcd.vri"
+        run_test_in_group 1 "tests/vri/test_adv_054_sieve.vri"
+        run_test_in_group 1 "tests/vri/test_adv_060_spill30.vri"
+        run_test_in_group 1 "tests/vri/test_adv_061_dead_store.vri"
+        run_test_in_group 1 "tests/vri/test_adv_062_inline.vri"
+        run_test_in_group 1 "tests/vri/test_adv_064_unused_arg.vri"
+        run_test_in_group 1 "tests/vri/test_adv_065_redundant_load.vri"
+        run_test_in_group 1 "tests/vri/test_adv_066_unroll.vri"
+        run_test_in_group 1 "tests/vri/test_adv_067_bce.vri"
+        run_test_in_group 1 "tests/vri/test_adv_074_minimal.vri"
+        run_test_in_group 1 "tests/vri/test_adv_088_hanoi.vri"
+        run_test_in_group 1 "tests/vri/test_adv_089_minmax.vri"
+        run_test_in_group 1 "tests/vri/test_adv_091_tree.vri"
+        run_test_in_group 1 "tests/vri/test_adv_092_compose.vri"
+        run_test_in_group 1 "tests/vri/test_adv_094_reduce.vri"
+        run_test_in_group 1 "tests/vri/test_adv_095_mutual_deep.vri"
+        run_test_in_group 1 "tests/vri/test_adv_096_digit_sum.vri"
+        run_test_in_group 1 "tests/vri/test_adv_098_large_arr.vri"
+        run_test_in_group 1 "tests/vri/test_dot_simple.vri"
+        run_test_in_group 1 "tests/vri/test_hello.vri"
+        run_test_in_group 1 "tests/vri/test_nested_if.vri"
+        run_test_in_group 1 "tests/vri/test_reassign.vri"
+        run_test_in_group 1 "tests/vri/test_spill.vri"
+        run_test_in_group 1 "tests/vri/test_this.vri"
     fi
+    local pass_cnt=${GP_PASS[1]}
+    local fail_cnt=${GP_FAIL[1]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 1: $pass_cnt/$total_cnt PASS"
+    echo ""
 }
 
-echo "=== virc Test Suite ==="
-echo ""
+run_group_2() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm  2: Chú thích (Comments)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 2 "tests/bootstrap_codegen/cg_comment.vri"
+        run_test_in_group 2 "tests/bootstrap_codegen/cg_edge_comment_eof.vri"
+    else
+        run_test_in_group 2 "tests/bootstrap_codegen/cg_comment.vri"
+        run_test_in_group 2 "tests/bootstrap_codegen/cg_edge_comment_eof.vri"
+    fi
+    local pass_cnt=${GP_PASS[2]}
+    local fail_cnt=${GP_FAIL[2]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 2: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-run_test "tests/vri/test_hello.vri" "hello world"
-run_test "tests/vri/test_arithmetic.vri" "$(printf '30\n90\n75\n15\n5')"
-run_test "tests/vri/test_if_simple.vri" "42"
-run_test "tests/vri/test_if_false.vri" "0"
-run_test "tests/vri/test_if_else.vri" "1"
-run_test "tests/vri/test_reassign.vri" "6"
-run_test "tests/vri/test_while.vri" "$(printf '0\n1\n2\n3\n4')"
-run_test "tests/vri/test_nested_if.vri" "2"
-run_test "tests/vri/test_for_range.vri" "$(printf '0\n1\n2\n3\n4')"
-run_test "tests/vri/test_break.vri" "$(printf '0\n1\n2\n3\n4\n99')"
-run_test "tests/vri/test_skip.vri" "$(printf '1\n3\n5\n7\n9')"
-run_test "tests/vri/test_loop_n.vri" "$(printf '7\n7\n7\n7\n7')"
-run_test "tests/vri/test_eif.vri" "2"
-run_test "tests/vri/test_for_accum.vri" "$(printf '103\n15')"
-run_test "tests/vri/test_func_call.vri" "30"
-run_test "tests/vri/test_multi_func.vri" "25"
-run_test "tests/vri/test_nested_while.vri" "$(printf '0\n1\n2\n10\n11\n12\n20\n21\n22')"
-run_test "tests/vri/test_recursion.vri" "$(printf '120\n3628800')"
-run_test "tests/vri/test_fib.vri" "$(printf '0\n1\n5\n55')"
-run_test "tests/vri/test_mutual_recursion.vri" "$(printf '1\n1\n0\n0')"
-run_test "tests/vri/test_str_var.vri" "hello"
-run_test "tests/vri/test_str_concat.vri" "hello world"
-run_test "tests/vri/test_str_multi.vri" "$(printf 'Vir kills C!\n12\n4')"
-run_test "tests/vri/test_str_func.vri" "$(printf 'Hello, Vir!\n11')"
-run_test "tests/vri/test_str_loop.vri" "$(printf 'xxxxxx\n6')"
-run_test "tests/vri/test_control.vri" "1"
-run_test "tests/vri/test_array_basic.vri" "$(printf '10\n20\n30\n3')"
-run_test "tests/vri/test_array_set.vri" "$(printf '100\n999\n300')"
-run_test "tests/vri/test_array_loop.vri" "$(printf '10\n0\n9\n81\n285')"
-run_test "tests/vri/test_array_literal.vri" "$(printf '10\n20\n30')"
-run_test "tests/vri/test_entity_full.vri" "$(printf '10\n20\n99\n20')"
-run_test "tests/vri/test_entity_advanced.vri" "$(printf '3\n7\n10\n5\n50\n10')"
-run_test "tests/vri/test_entity_rect.vri" "$(printf '10\n5\n0')"
-run_test "tests/vri/test_entity_multi.vri" "$(printf '3\n7\n10\n5')"
-run_test "tests/vri/test_enum_paren.vri" "$(printf '14\n3')"
-run_test "tests/vri/test_arr_after_var.vri" "$(printf '2\n42\n99')"
-run_test "tests/vri/test_dot_simple.vri" "110"
-run_test "tests/vri/test_dot_entity.vri" "110"
-run_test "tests/vri/test_dot_entity2.vri" "110"
-run_test "tests/vri/test_entity_enum_array.vri" "$(printf '3\n4\n10\n20\n13\n110\n255\n128\n0\n64\n2\n3\n3\n110')"
-run_test "tests/vri/test_global.vri" "$(printf '100\n42\n110\n200\n242')"
-run_test "tests/vri/test_global2.vri" "$(printf '30\n45\n59\n2')"
+run_group_3() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm  3: Hệ thống Module (include, import, export)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 3 "tests/bootstrap_codegen/cg_include_basic.vri"
+        run_test_in_group 3 "tests/bootstrap_codegen/cg_include_nested.vri"
+        run_test_in_group 3 "tests/test_expose.vri"
+    else
+        run_test_in_group 3 "tests/bootstrap_codegen/cg_include_basic.vri"
+        run_test_in_group 3 "tests/bootstrap_codegen/cg_include_nested.vri"
+        run_test_in_group 3 "tests/test_expose.vri"
+        run_test_in_group 3 "tests/test_module_system.vri"
+        run_test_in_group 3 "tests/test_vir_pkg_native.vri"
+        run_test_in_group 3 "tests/vri/test_expose.vri"
+    fi
+    local pass_cnt=${GP_PASS[3]}
+    local fail_cnt=${GP_FAIL[3]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 3: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# New tests added this session
-run_test "tests/vri/test_eif_func.vri" "$(printf '100\n25\n30')"
-run_test "tests/vri/test_if_dot.vri" "$(printf '110\n220\n30')"
-run_test "tests/vri/test_virc_all.vri" "$(printf '15\n25\n12\n32\n100\n200\n2\nhello\n5')"
+run_group_4() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm  4: Kiểu dữ liệu (Primitives, Casts, Nil-safety)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 4 "tests/test_adv_001_i64_max.vri"
+        run_test_in_group 4 "tests/test_adv_009_bool_chain.vri"
+        run_test_in_group 4 "tests/test_cast_probe.vri"
+    else
+        run_test_in_group 4 "tests/test_adv_001_i64_max.vri"
+        run_test_in_group 4 "tests/test_adv_009_bool_chain.vri"
+        run_test_in_group 4 "tests/test_cast_probe.vri"
+        run_test_in_group 4 "tests/test_float.vri"
+        run_test_in_group 4 "tests/test_float2.vri"
+        run_test_in_group 4 "tests/test_float3.vri"
+        run_test_in_group 4 "tests/test_float4.vri"
+        run_test_in_group 4 "tests/test_float_check.vri"
+        run_test_in_group 4 "tests/test_float_literal_boundaries.vri"
+        run_test_in_group 4 "tests/test_float_literal_e2e.vri"
+        run_test_in_group 4 "tests/test_float_rw.vri"
+        run_test_in_group 4 "tests/vri/test_adv_001_i64_max.vri"
+        run_test_in_group 4 "tests/vri/test_adv_009_bool_chain.vri"
+    fi
+    local pass_cnt=${GP_PASS[4]}
+    local fail_cnt=${GP_FAIL[4]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 4: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Entity paren syntax, ensure without colon, methods, UFCS
-run_test "tests/vri/test_entity_paren.vri" "$(printf '10\n20\n99')"
-run_test "tests/vri/test_ensure.vri" "$(printf '42\n99')"
-run_test "tests/vri/test_method.vri" "$(printf '11\n16\n26')"
-run_test "tests/vri/test_ufcs.vri" "$(printf '20\n15\n37')"
+run_group_5() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm  5: Biến & Hằng số (var, let, const, Scoping)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 5 "tests/test_10vars.vri"
+        run_test_in_group 5 "tests/test_1p_novar.vri"
+        run_test_in_group 5 "tests/test_adv_018_global_local.vri"
+    else
+        run_test_in_group 5 "tests/test_10vars.vri"
+        run_test_in_group 5 "tests/test_1p_novar.vri"
+        run_test_in_group 5 "tests/test_adv_018_global_local.vri"
+        run_test_in_group 5 "tests/test_adv_059_shadowing.vri"
+        run_test_in_group 5 "tests/test_adv_063_const_prop.vri"
+        run_test_in_group 5 "tests/test_adv_086_global_counter.vri"
+        run_test_in_group 5 "tests/test_global.vri"
+        run_test_in_group 5 "tests/test_global2.vri"
+        run_test_in_group 5 "tests/test_global_do.vri"
+        run_test_in_group 5 "tests/test_ident.vri"
+        run_test_in_group 5 "tests/test_let.vri"
+        run_test_in_group 5 "tests/test_pass_ident.vri"
+        run_test_in_group 5 "tests/vri/test_1p_novar.vri"
+        run_test_in_group 5 "tests/vri/test_adv_018_global_local.vri"
+        run_test_in_group 5 "tests/vri/test_adv_059_shadowing.vri"
+        run_test_in_group 5 "tests/vri/test_adv_063_const_prop.vri"
+        run_test_in_group 5 "tests/vri/test_adv_086_global_counter.vri"
+        run_test_in_group 5 "tests/vri/test_global.vri"
+        run_test_in_group 5 "tests/vri/test_global2.vri"
+        run_test_in_group 5 "tests/vri/test_global_do.vri"
+        run_test_in_group 5 "tests/vri/test_let.vri"
+        run_test_in_group 5 "tests/vri/test_var_expr.vri"
+        run_test_in_group 5 "tests/vri/test_var_ident.vri"
+        run_test_in_group 5 "tests/vri/test_var_literal.vri"
+        run_test_in_group 5 "tests/vri/test_var_one.vri"
+    fi
+    local pass_cnt=${GP_PASS[5]}
+    local fail_cnt=${GP_FAIL[5]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 5: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Stack spilling test (vreg >= 18)
-run_test "tests/vri/test_spill.vri" "210"
-run_test "tests/vri/test_hof.vri" "$(printf '10\n14')"
+run_group_6() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm  6: Hàm (Functions, out, Recursion, TCO)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 6 "tests/boot_in_form2_call.vri"
+        run_test_in_group 6 "tests/test_2var_loop_call.vri"
+        run_test_in_group 6 "tests/test_adv_013_deep_recursion.vri"
+    else
+        run_test_in_group 6 "tests/boot_in_form2_call.vri"
+        run_test_in_group 6 "tests/test_2var_loop_call.vri"
+        run_test_in_group 6 "tests/test_adv_013_deep_recursion.vri"
+        run_test_in_group 6 "tests/test_adv_023_tailcall.vri"
+        run_test_in_group 6 "tests/test_adv_056_callee_save.vri"
+        run_test_in_group 6 "tests/test_adv_057_func_ptr_arr.vri"
+        run_test_in_group 6 "tests/test_adv_068_accum_func.vri"
+        run_test_in_group 6 "tests/test_adv_076_fib_iter.vri"
+        run_test_in_group 6 "tests/vri/test_2var_loop_call.vri"
+        run_test_in_group 6 "tests/vri/test_adv_013_deep_recursion.vri"
+        run_test_in_group 6 "tests/vri/test_adv_023_tailcall.vri"
+        run_test_in_group 6 "tests/vri/test_adv_056_callee_save.vri"
+        run_test_in_group 6 "tests/vri/test_adv_057_func_ptr_arr.vri"
+        run_test_in_group 6 "tests/vri/test_adv_068_accum_func.vri"
+        run_test_in_group 6 "tests/vri/test_adv_076_fib_iter.vri"
+        run_test_in_group 6 "tests/vri/test_adv_085_nested_call.vri"
+        run_test_in_group 6 "tests/vri/test_adv_090_deep_call.vri"
+        run_test_in_group 6 "tests/vri/test_call.vri"
+        run_test_in_group 6 "tests/vri/test_call2.vri"
+        run_test_in_group 6 "tests/vri/test_eif_func.vri"
+        run_test_in_group 6 "tests/vri/test_fib.vri"
+        run_test_in_group 6 "tests/vri/test_fib5.vri"
+        run_test_in_group 6 "tests/vri/test_func.vri"
+        run_test_in_group 6 "tests/vri/test_func_call.vri"
+        run_test_in_group 6 "tests/vri/test_func_simple.vri"
+        run_test_in_group 6 "tests/vri/test_hof.vri"
+        run_test_in_group 6 "tests/vri/test_if_func.vri"
+        run_test_in_group 6 "tests/vri/test_loop_call.vri"
+        run_test_in_group 6 "tests/vri/test_multi_func.vri"
+        run_test_in_group 6 "tests/vri/test_mutual_recursion.vri"
+        run_test_in_group 6 "tests/vri/test_prime.vri"
+        run_test_in_group 6 "tests/vri/test_prime2.vri"
+        run_test_in_group 6 "tests/vri/test_prime3.vri"
+        run_test_in_group 6 "tests/vri/test_prime_simple.vri"
+        run_test_in_group 6 "tests/vri/test_recursion.vri"
+    fi
+    local pass_cnt=${GP_PASS[6]}
+    local fail_cnt=${GP_FAIL[6]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 6: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Phase 7: New intrinsic tests
-run_test "tests/vri/test_intrinsics.vri" "$(printf '59\n2\n3\n-43\n42')"
-run_test "tests/vri/test_syscall.vri" "$(printf 'OK')"
+run_group_7() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm  7: Entity & Packed Entity (Structs, Fields, Methods)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 7 "tests/vri/test_3vars.vri"
+        run_test_in_group 7 "tests/vri/test_6vars.vri"
+        run_test_in_group 7 "tests/vri/test_adv_017_struct_fields.vri"
+    else
+        run_test_in_group 7 "tests/vri/test_3vars.vri"
+        run_test_in_group 7 "tests/vri/test_6vars.vri"
+        run_test_in_group 7 "tests/vri/test_adv_017_struct_fields.vri"
+        run_test_in_group 7 "tests/vri/test_adv_029_algebra.vri"
+        run_test_in_group 7 "tests/vri/test_adv_041_nested_entity.vri"
+        run_test_in_group 7 "tests/vri/test_adv_042_arr_entity.vri"
+        run_test_in_group 7 "tests/vri/test_adv_043_entity_return.vri"
+        run_test_in_group 7 "tests/vri/test_adv_044_entity_param.vri"
+        run_test_in_group 7 "tests/vri/test_adv_045_big_entity.vri"
+        run_test_in_group 7 "tests/vri/test_adv_046_entity_mutate.vri"
+        run_test_in_group 7 "tests/vri/test_adv_058_multi_return.vri"
+        run_test_in_group 7 "tests/vri/test_adv_099_distance.vri"
+        run_test_in_group 7 "tests/vri/test_adv_100_stress.vri"
+        run_test_in_group 7 "tests/vri/test_aggregate_return_large_entity.vri"
+        run_test_in_group 7 "tests/vri/test_aggregate_return_string_field_preserved.vri"
+        run_test_in_group 7 "tests/vri/test_aggregate_return_string_int_combos.vri"
+        run_test_in_group 7 "tests/vri/test_comma.vri"
+        run_test_in_group 7 "tests/vri/test_comma_nl.vri"
+        run_test_in_group 7 "tests/vri/test_complex.vri"
+        run_test_in_group 7 "tests/vri/test_complex2.vri"
+        run_test_in_group 7 "tests/vri/test_dot_entity.vri"
+        run_test_in_group 7 "tests/vri/test_dot_entity2.vri"
+        run_test_in_group 7 "tests/vri/test_eif_entity.vri"
+        run_test_in_group 7 "tests/vri/test_entity.vri"
+        run_test_in_group 7 "tests/vri/test_entity_advanced.vri"
+        run_test_in_group 7 "tests/vri/test_entity_astnode5.vri"
+        run_test_in_group 7 "tests/vri/test_entity_basic.vri"
+        run_test_in_group 7 "tests/vri/test_entity_bug.vri"
+        run_test_in_group 7 "tests/vri/test_entity_bug11_nl.vri"
+        run_test_in_group 7 "tests/vri/test_entity_bug2.vri"
+        run_test_in_group 7 "tests/vri/test_entity_bug3.vri"
+        run_test_in_group 7 "tests/vri/test_entity_full.vri"
+        run_test_in_group 7 "tests/vri/test_entity_multi.vri"
+        run_test_in_group 7 "tests/vri/test_entity_paren.vri"
+        run_test_in_group 7 "tests/vri/test_entity_rect.vri"
+        run_test_in_group 7 "tests/vri/test_if_dot.vri"
+        run_test_in_group 7 "tests/vri/test_method.vri"
+        run_test_in_group 7 "tests/vri/test_packed.vri"
+    fi
+    local pass_cnt=${GP_PASS[7]}
+    local fail_cnt=${GP_FAIL[7]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 7: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-echo ""
-echo "=== Advanced Test Suite (100 tests) ==="
-echo ""
+run_group_8() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm  8: Enum (Tagged unions, Variants)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 8 "tests/test_adv_047_enum_control.vri"
+        run_test_in_group 8 "tests/test_adv_081_multi_enum.vri"
+        run_test_in_group 8 "tests/test_entity_enum_array.vri"
+    else
+        run_test_in_group 8 "tests/test_adv_047_enum_control.vri"
+        run_test_in_group 8 "tests/test_adv_081_multi_enum.vri"
+        run_test_in_group 8 "tests/test_entity_enum_array.vri"
+        run_test_in_group 8 "tests/test_enum_paren.vri"
+        run_test_in_group 8 "tests/vri/test_adv_047_enum_control.vri"
+        run_test_in_group 8 "tests/vri/test_adv_081_multi_enum.vri"
+        run_test_in_group 8 "tests/vri/test_entity_enum_array.vri"
+        run_test_in_group 8 "tests/vri/test_enum_paren.vri"
+    fi
+    local pass_cnt=${GP_PASS[8]}
+    local fail_cnt=${GP_FAIL[8]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 8: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Group 1: Opcode Correctness — Edge Cases (tests 001-010)
-run_test "tests/vri/test_adv_001_i64_max.vri" "$(printf '9223372036854775806\n1\n-9223372036854775807')"
-run_test "tests/vri/test_adv_002_overflow.vri" "-9223372036854775808"
-run_test "tests/vri/test_adv_003_divzero.vri" "0"
-run_test "tests/vri/test_adv_004_bitwise.vri" "$(printf '8\n14\n6\n0\n255')"
-run_test "tests/vri/test_adv_005_shift.vri" "$(printf '42\n1\n0\n8\n2')"
-run_test "tests/vri/test_adv_006_mod_neg.vri" "$(printf '2\n-1')"
-run_test "tests/vri/test_adv_007_bitops_edge.vri" "$(printf '64\n1\n64\n0\n1\n64')"
-run_test "tests/vri/test_adv_008_neg_not.vri" "$(printf '42\n42\n0\n-1')"
-run_test "tests/vri/test_adv_009_bool_chain.vri" "$(printf '1\n0\n1\n1')"
-run_test "tests/vri/test_adv_010_precedence.vri" "$(printf '14\n3\n23')"
+run_group_9() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm  9: Luồng điều khiển (if, eif, else, when, for, skip, break)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 9 "tests/test_2var_loop.vri"
+        run_test_in_group 9 "tests/test_adv_025_nested_break.vri"
+        run_test_in_group 9 "tests/test_adv_075_perf_loop.vri"
+    else
+        run_test_in_group 9 "tests/test_2var_loop.vri"
+        run_test_in_group 9 "tests/test_adv_025_nested_break.vri"
+        run_test_in_group 9 "tests/test_adv_075_perf_loop.vri"
+        run_test_in_group 9 "tests/vri/test_2var_loop.vri"
+        run_test_in_group 9 "tests/vri/test_adv_025_nested_break.vri"
+        run_test_in_group 9 "tests/vri/test_adv_075_perf_loop.vri"
+        run_test_in_group 9 "tests/vri/test_adv_077_collatz.vri"
+        run_test_in_group 9 "tests/vri/test_adv_082_eif_classify.vri"
+        run_test_in_group 9 "tests/vri/test_adv_083_for_break.vri"
+        run_test_in_group 9 "tests/vri/test_adv_084_for_skip.vri"
+        run_test_in_group 9 "tests/vri/test_break.vri"
+        run_test_in_group 9 "tests/vri/test_control.vri"
+        run_test_in_group 9 "tests/vri/test_eif.vri"
+        run_test_in_group 9 "tests/vri/test_eif2.vri"
+        run_test_in_group 9 "tests/vri/test_eif_global.vri"
+        run_test_in_group 9 "tests/vri/test_for_accum.vri"
+        run_test_in_group 9 "tests/vri/test_for_range.vri"
+        run_test_in_group 9 "tests/vri/test_if_assign.vri"
+        run_test_in_group 9 "tests/vri/test_if_else.vri"
+        run_test_in_group 9 "tests/vri/test_if_exit.vri"
+        run_test_in_group 9 "tests/vri/test_if_exit2.vri"
+        run_test_in_group 9 "tests/vri/test_if_false.vri"
+        run_test_in_group 9 "tests/vri/test_if_in_loop.vri"
+        run_test_in_group 9 "tests/vri/test_if_in_loop2.vri"
+        run_test_in_group 9 "tests/vri/test_if_noelse.vri"
+        run_test_in_group 9 "tests/vri/test_if_simple.vri"
+        run_test_in_group 9 "tests/vri/test_if_sub.vri"
+        run_test_in_group 9 "tests/vri/test_if_var.vri"
+        run_test_in_group 9 "tests/vri/test_if_var2.vri"
+        run_test_in_group 9 "tests/vri/test_loop_n.vri"
+        run_test_in_group 9 "tests/vri/test_nested_while.vri"
+        run_test_in_group 9 "tests/vri/test_skip.vri"
+        run_test_in_group 9 "tests/vri/test_var_loop.vri"
+        run_test_in_group 9 "tests/vri/test_while.vri"
+        run_test_in_group 9 "tests/vri/test_while_simple.vri"
+    fi
+    local pass_cnt=${GP_PASS[9]}
+    local fail_cnt=${GP_FAIL[9]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 9: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Group 2: Memory & Pointers (tests 011-020)
-run_test "tests/vri/test_adv_011_mem_offsets.vri" "$(printf '100\n200\n300')"
-run_test "tests/vri/test_adv_012_byte_rw.vri" "$(printf '65\n66\n67\n68')"
-run_test "tests/vri/test_adv_013_deep_recursion.vri" "1000"
-run_test "tests/vri/test_adv_014_many_params.vri" "136"
-run_test "tests/vri/test_adv_015_large_alloc.vri" "$(printf '12345\n99999')"
-run_test "tests/vri/test_adv_016_memset.vri" "$(printf '170\n170\n170\n170')"
-run_test "tests/vri/test_adv_017_struct_fields.vri" "$(printf '1\n2\n3\n4')"
-run_test "tests/vri/test_adv_018_global_local.vri" "$(printf '100\n42\n100')"
-run_test "tests/vri/test_adv_019_heap_frag.vri" "100"
-run_test "tests/vri/test_adv_020_memcopy.vri" "$(printf '10\n20\n30\n40')"
+run_group_10() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 10: Toán tử (Arithmetic, Bitwise, Logic, mod)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 10 "tests/test_adv_002_overflow.vri"
+        run_test_in_group 10 "tests/test_adv_004_bitwise.vri"
+        run_test_in_group 10 "tests/test_adv_005_shift.vri"
+    else
+        run_test_in_group 10 "tests/test_adv_002_overflow.vri"
+        run_test_in_group 10 "tests/test_adv_004_bitwise.vri"
+        run_test_in_group 10 "tests/test_adv_005_shift.vri"
+        run_test_in_group 10 "tests/test_adv_007_bitops_edge.vri"
+        run_test_in_group 10 "tests/test_adv_053_power.vri"
+        run_test_in_group 10 "tests/test_adv_069_shift_chain.vri"
+        run_test_in_group 10 "tests/test_adv_070_bit_arith.vri"
+        run_test_in_group 10 "tests/test_adv_097_bit_manip.vri"
+        run_test_in_group 10 "tests/test_arithmetic.vri"
+        run_test_in_group 10 "tests/test_bit_min.vri"
+        run_test_in_group 10 "tests/test_bit_min2.vri"
+        run_test_in_group 10 "tests/vri/test_adv_002_overflow.vri"
+        run_test_in_group 10 "tests/vri/test_adv_004_bitwise.vri"
+        run_test_in_group 10 "tests/vri/test_adv_005_shift.vri"
+        run_test_in_group 10 "tests/vri/test_adv_007_bitops_edge.vri"
+        run_test_in_group 10 "tests/vri/test_adv_053_power.vri"
+        run_test_in_group 10 "tests/vri/test_adv_069_shift_chain.vri"
+        run_test_in_group 10 "tests/vri/test_adv_070_bit_arith.vri"
+        run_test_in_group 10 "tests/vri/test_adv_097_bit_manip.vri"
+        run_test_in_group 10 "tests/vri/test_arithmetic.vri"
+        run_test_in_group 10 "tests/vri/test_bit_min.vri"
+        run_test_in_group 10 "tests/vri/test_bit_tmp.vri"
+        run_test_in_group 10 "tests/vri/test_int64_overflow_wrapping.vri"
+        run_test_in_group 10 "tests/vri/test_mod_rt.vri"
+        run_test_in_group 10 "tests/vri/test_modulo_kw.vri"
+        run_test_in_group 10 "tests/vri/test_modulo_op.vri"
+        run_test_in_group 10 "tests/vri/test_popcnt_min.vri"
+        run_test_in_group 10 "tests/vri/test_rshift_only.vri"
+        run_test_in_group 10 "tests/vri/test_shift3.vri"
+        run_test_in_group 10 "tests/vri/test_shift5.vri"
+        run_test_in_group 10 "tests/vri/test_shift6.vri"
+        run_test_in_group 10 "tests/vri/test_shift_all_left.vri"
+        run_test_in_group 10 "tests/vri/test_shift_debug.vri"
+        run_test_in_group 10 "tests/vri/test_adv_006_mod_neg.vri"
+    fi
+    local pass_cnt=${GP_PASS[10]}
+    local fail_cnt=${GP_FAIL[10]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 10: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Group 3: Control Flow (tests 021-025)
-run_test "tests/vri/test_adv_021_nested5.vri" "32"
-run_test "tests/vri/test_adv_022_switch_case.vri" "50"
-run_test "tests/vri/test_adv_023_tailcall.vri" "0"
-run_test "tests/vri/test_adv_024_branch_stress.vri" "500"
-run_test "tests/vri/test_adv_025_nested_break.vri" "6"
+run_group_11() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 11: UFCS (Uniform Function Call Syntax)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_wrong_type_rejected.vri"
+    else
+        run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_free_entity_receiver_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_free_receiver_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_missing_member_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_non_callable_field_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_opaque_pointer_member_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_other_entity_method_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_too_many_args_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_wrong_arity_rejected.vri"
+        run_test_in_group 11 "tests/vri/test_ufcs.vri"
+    fi
+    local pass_cnt=${GP_PASS[11]}
+    local fail_cnt=${GP_FAIL[11]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 11: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Group 4: Optimization Verification (tests 026-030)
-run_test "tests/vri/test_adv_026_const_fold.vri" "$(printf '7\n42\n100')"
-run_test "tests/vri/test_adv_027_dead_code.vri" "1"
-run_test "tests/vri/test_adv_028_strength_reduce.vri" "$(printf '16\n64\n256\n1024')"
-run_test "tests/vri/test_adv_029_algebra.vri" "$(printf '42\n42\n0\n42')"
-run_test "tests/vri/test_adv_030_fma.vri" "$(printf '11\n14\n23')"
+run_group_12() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 12: Nội suy chuỗi & Thao tác chuỗi"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 12 "tests/test_adv_024_branch_stress.vri"
+        run_test_in_group 12 "tests/test_adv_028_strength_reduce.vri"
+        run_test_in_group 12 "tests/test_adv_034_strcat_chain.vri"
+    else
+        run_test_in_group 12 "tests/test_adv_024_branch_stress.vri"
+        run_test_in_group 12 "tests/test_adv_028_strength_reduce.vri"
+        run_test_in_group 12 "tests/test_adv_034_strcat_chain.vri"
+        run_test_in_group 12 "tests/test_adv_036_strlen.vri"
+        run_test_in_group 12 "tests/test_adv_037_itoa.vri"
+        run_test_in_group 12 "tests/test_adv_039_streq.vri"
+        run_test_in_group 12 "tests/test_adv_040_str_get.vri"
+        run_test_in_group 12 "tests/test_debug_str.vri"
+        run_test_in_group 12 "tests/test_interp.vri"
+        run_test_in_group 12 "tests/test_itoa.vri"
+        run_test_in_group 12 "tests/test_rt_strcmp_out_in_loop.vri"
+        run_test_in_group 12 "tests/vri/test_adv_024_branch_stress.vri"
+        run_test_in_group 12 "tests/vri/test_adv_028_strength_reduce.vri"
+        run_test_in_group 12 "tests/vri/test_adv_034_strcat_chain.vri"
+        run_test_in_group 12 "tests/vri/test_adv_036_strlen.vri"
+        run_test_in_group 12 "tests/vri/test_adv_037_itoa.vri"
+        run_test_in_group 12 "tests/vri/test_adv_039_streq.vri"
+        run_test_in_group 12 "tests/vri/test_adv_040_str_get.vri"
+        run_test_in_group 12 "tests/vri/test_interp.vri"
+        run_test_in_group 12 "tests/vri/test_str_concat.vri"
+        run_test_in_group 12 "tests/vri/test_str_func.vri"
+        run_test_in_group 12 "tests/vri/test_str_loop.vri"
+        run_test_in_group 12 "tests/vri/test_str_multi.vri"
+        run_test_in_group 12 "tests/vri/test_str_var.vri"
+    fi
+    local pass_cnt=${GP_PASS[12]}
+    local fail_cnt=${GP_FAIL[12]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 12: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Group 5: System & Real-world (tests 031-040)
-run_test "tests/vri/test_adv_031_raw_write.vri" "$(printf 'HELLO')"
-run_test "tests/vri/test_adv_032_bubblesort.vri" "$(printf '1\n2\n3\n4\n5')"
-run_test "tests/vri/test_adv_033_matmul.vri" "$(printf '30\n36\n42\n66\n81\n96\n102\n126\n150')"
-run_test "tests/vri/test_adv_034_strcat_chain.vri" "$(printf 'abc\n3')"
-run_test "tests/vri/test_adv_035_quicksort.vri" "$(printf '1\n2\n3\n4\n5\n6\n7\n8')"
-run_test "tests/vri/test_adv_036_strlen.vri" "$(printf '11\n3\n0')"
-run_test "tests/vri/test_adv_037_itoa.vri" "$(printf '12345\n0\n5')"
-run_test "tests/vri/test_adv_038_hex.vri" "$(printf '255\n3735928559\n170')"
-run_test "tests/vri/test_adv_039_streq.vri" "$(printf '1\n0\n1')"
-run_test "tests/vri/test_adv_040_str_get.vri" "$(printf '104\n101\n108')"
+run_group_13() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 13: Xử lý lỗi (throw, try, ensure, revert)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 13 "tests/test_ensure.vri"
+        run_test_in_group 13 "tests/test_nll_release.vri"
+        run_test_in_group 13 "tests/test_throw.vri"
+    else
+        run_test_in_group 13 "tests/test_ensure.vri"
+        run_test_in_group 13 "tests/test_nll_release.vri"
+        run_test_in_group 13 "tests/test_throw.vri"
+        run_test_in_group 13 "tests/test_try_isolate_retry.vri"
+        run_test_in_group 13 "tests/test_try_revert.vri"
+        run_test_in_group 13 "tests/test_try_timeout.vri"
+        run_test_in_group 13 "tests/vri/test_ensure.vri"
+        run_test_in_group 13 "tests/vri/test_nll_release.vri"
+        run_test_in_group 13 "tests/vri/test_throw.vri"
+        run_test_in_group 13 "tests/vri/test_try_isolate_retry.vri"
+        run_test_in_group 13 "tests/vri/test_try_timeout.vri"
+    fi
+    local pass_cnt=${GP_PASS[13]}
+    local fail_cnt=${GP_FAIL[13]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 13: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Group 6: Advanced Pointers & Data Structures (tests 041-055)
-run_test "tests/vri/test_adv_041_nested_entity.vri" "$(printf '10\n20\n30')"
-run_test "tests/vri/test_adv_042_arr_entity.vri" "$(printf '10\n20\n30\n60')"
-run_test "tests/vri/test_adv_043_entity_return.vri" "$(printf '5\n10\n15')"
-run_test "tests/vri/test_adv_044_entity_param.vri" "$(printf '3\n7\n10')"
-run_test "tests/vri/test_adv_045_big_entity.vri" "$(printf '1\n2\n3\n4\n5\n6\n21')"
-run_test "tests/vri/test_adv_046_entity_mutate.vri" "$(printf '1\n99\n99')"
-run_test "tests/vri/test_adv_047_enum_control.vri" "$(printf 'red\ngreen\nblue')"
-run_test "tests/vri/test_adv_048_linked_list.vri" "$(printf '30\n20\n10')"
-run_test "tests/vri/test_adv_049_arr_init.vri" "$(printf '0\n1\n4\n9\n16')"
-run_test "tests/vri/test_adv_050_aliasing.vri" "$(printf '42\n42\n99\n99')"
-run_test "tests/vri/test_adv_051_bsearch.vri" "$(printf '4\n-1')"
-run_test "tests/vri/test_adv_052_gcd.vri" "$(printf '6\n1\n12')"
-run_test "tests/vri/test_adv_053_power.vri" "$(printf '1\n8\n1024\n1')"
-run_test "tests/vri/test_adv_054_sieve.vri" "$(printf '2\n3\n5\n7\n11\n13\n17\n19\n23\n29\n31\n37\n41\n43\n47')"
-run_test "tests/vri/test_adv_055_str_build.vri" "$(printf 'aaaaaaaaaa\n10')"
+run_group_14() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 14: Tham số (in, ref, out)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 14 "tests/test_4param_global.vri"
+        run_test_in_group 14 "tests/test_4param_rec.vri"
+        run_test_in_group 14 "tests/test_adv_014_many_params.vri"
+    else
+        run_test_in_group 14 "tests/test_4param_global.vri"
+        run_test_in_group 14 "tests/test_4param_rec.vri"
+        run_test_in_group 14 "tests/test_adv_014_many_params.vri"
+        run_test_in_group 14 "tests/test_param_n.vri"
+        run_test_in_group 14 "tests/test_params_nl.vri"
+        run_test_in_group 14 "tests/test_ref.vri"
+        run_test_in_group 14 "tests/vri/test_4param_global.vri"
+        run_test_in_group 14 "tests/vri/test_4param_rec.vri"
+        run_test_in_group 14 "tests/vri/test_adv_014_many_params.vri"
+        run_test_in_group 14 "tests/vri/test_param_n.vri"
+        run_test_in_group 14 "tests/vri/test_ref.vri"
+        run_test_in_group 14 "tests/vri/test_var_2param.vri"
+    fi
+    local pass_cnt=${GP_PASS[14]}
+    local fail_cnt=${GP_FAIL[14]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 14: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Group 7: ABI & Calling Convention (tests 056-060)
-run_test "tests/vri/test_adv_056_callee_save.vri" "$(printf '100\n200\n100\n200')"
-run_test "tests/vri/test_adv_057_func_ptr_arr.vri" "$(printf '10\n30\n50')"
-run_test "tests/vri/test_adv_058_multi_return.vri" "$(printf '5\n2')"
-run_test "tests/vri/test_adv_059_shadowing.vri" "$(printf '10\n42\n10')"
-run_test "tests/vri/test_adv_060_spill30.vri" "465"
+run_group_15() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 15: FFI & Tương tác Hệ điều hành (@bind, syscall, OS)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 15 "tests/strict_v2/test_ffi_macos.vri"
+        run_test_in_group 15 "tests/strict_v2/test_ffi_multi.vri"
+        run_test_in_group 15 "tests/test_extern_from_os.vri"
+    else
+        run_test_in_group 15 "tests/strict_v2/test_ffi_macos.vri"
+        run_test_in_group 15 "tests/strict_v2/test_ffi_multi.vri"
+        run_test_in_group 15 "tests/test_extern_from_os.vri"
+        run_test_in_group 15 "tests/test_syscall.vri"
+        run_test_in_group 15 "tests/vri/test_bind.vri"
+        run_test_in_group 15 "tests/vri/test_syscall.vri"
+        run_test_in_group 15 "tests/test_bind.vri"
+    fi
+    local pass_cnt=${GP_PASS[15]}
+    local fail_cnt=${GP_FAIL[15]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 15: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Group 8: Advanced Optimizations (tests 061-070)
-run_test "tests/vri/test_adv_061_dead_store.vri" "10"
-run_test "tests/vri/test_adv_062_inline.vri" "$(printf '7\n30')"
-run_test "tests/vri/test_adv_063_const_prop.vri" "14"
-run_test "tests/vri/test_adv_064_unused_arg.vri" "10"
-run_test "tests/vri/test_adv_065_redundant_load.vri" "$(printf '42\n42')"
-run_test "tests/vri/test_adv_066_unroll.vri" "10"
-run_test "tests/vri/test_adv_067_bce.vri" "$(printf '0\n1\n4\n9\n16\n25\n36\n49\n64\n81')"
-run_test "tests/vri/test_adv_068_accum_func.vri" "55"
-run_test "tests/vri/test_adv_069_shift_chain.vri" "$(printf '1024\n5120')"
-run_test "tests/vri/test_adv_070_bit_arith.vri" "$(printf '15\n240\n255')"
+run_group_16() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 16: Register & Mold (Bit structures, pack)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 16 "tests/test_register.vri"
+        run_test_in_group 16 "tests/vri/test_register.vri"
+    else
+        run_test_in_group 16 "tests/test_register.vri"
+        run_test_in_group 16 "tests/vri/test_register.vri"
+    fi
+    local pass_cnt=${GP_PASS[16]}
+    local fail_cnt=${GP_FAIL[16]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 16: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Group 9: OS Interaction & Stress (tests 071-080)
-run_test "tests/vri/test_adv_071_exit_code.vri" "done"
-run_test "tests/vri/test_adv_072_mmap.vri" "1"
-run_test "tests/vri/test_adv_073_deep_expr.vri" "100"
-run_test "tests/vri/test_adv_074_minimal.vri" "0"
-run_test "tests/vri/test_adv_075_perf_loop.vri" "50005000"
-run_test "tests/vri/test_adv_076_fib_iter.vri" "832040"
-run_test "tests/vri/test_adv_077_collatz.vri" "111"
-run_test "tests/vri/test_adv_078_reverse.vri" "$(printf '5\n4\n3\n2\n1')"
-run_test "tests/vri/test_adv_079_stack_calc.vri" "42"
-run_test "tests/vri/test_adv_080_hash.vri" "210714636441"
+run_group_17() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 17: Thực thi lúc biên dịch (precomp, const fold)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 17 "tests/test_adv_026_const_fold.vri"
+        run_test_in_group 17 "tests/test_str_len_fold.vri"
+        run_test_in_group 17 "tests/vri/test_adv_026_const_fold.vri"
+    else
+        run_test_in_group 17 "tests/test_adv_026_const_fold.vri"
+        run_test_in_group 17 "tests/test_str_len_fold.vri"
+        run_test_in_group 17 "tests/vri/test_adv_026_const_fold.vri"
+        run_test_in_group 17 "tests/test_precomp.vri"
+    fi
+    local pass_cnt=${GP_PASS[17]}
+    local fail_cnt=${GP_FAIL[17]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 17: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Group 10: Complex Integration (tests 081-100)
-run_test "tests/vri/test_adv_081_multi_enum.vri" "$(printf '1\n3\n10\n20')"
-run_test "tests/vri/test_adv_082_eif_classify.vri" "$(printf 'small\nmedium\nlarge')"
-run_test "tests/vri/test_adv_083_for_break.vri" "$(printf '0\n1\n2')"
-run_test "tests/vri/test_adv_084_for_skip.vri" "$(printf '0\n2\n4\n6\n8')"
-run_test "tests/vri/test_adv_085_nested_call.vri" "15"
-run_test "tests/vri/test_adv_086_global_counter.vri" "$(printf '1\n3\n6')"
-run_test "tests/vri/test_adv_087_isort.vri" "$(printf '1\n2\n3\n4\n5\n6')"
-run_test "tests/vri/test_adv_088_hanoi.vri" "7"
-run_test "tests/vri/test_adv_089_minmax.vri" "$(printf '1\n99')"
-run_test "tests/vri/test_adv_090_deep_call.vri" "120"
-run_test "tests/vri/test_adv_091_tree.vri" "$(printf '1\n2\n3\n4\n5\n6\n7')"
-run_test "tests/vri/test_adv_092_compose.vri" "25"
-run_test "tests/vri/test_adv_093_map.vri" "$(printf '1\n4\n9\n16\n25')"
-run_test "tests/vri/test_adv_094_reduce.vri" "120"
-run_test "tests/vri/test_adv_095_mutual_deep.vri" "1"
-run_test "tests/vri/test_adv_096_digit_sum.vri" "15"
-run_test "tests/vri/test_adv_097_bit_manip.vri" "$(printf '5\n4\n1\n7')"
-run_test "tests/vri/test_adv_098_large_arr.vri" "499500"
-run_test "tests/vri/test_adv_099_distance.vri" "25"
-run_test "tests/vri/test_adv_100_stress.vri" "$(printf '55\n120\n42\nhello\n5\n3\n7\n285\n10')"
+run_group_18() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 18: Điểm nhập (@entry, main, CLI args)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 18 "tests/bootstrap_codegen/cg_getarg.vri"
+        run_test_in_group 18 "tests/test_adv_071_exit_code.vri"
+        run_test_in_group 18 "tests/test_arg_count.vri"
+    else
+        run_test_in_group 18 "tests/bootstrap_codegen/cg_getarg.vri"
+        run_test_in_group 18 "tests/test_adv_071_exit_code.vri"
+        run_test_in_group 18 "tests/test_arg_count.vri"
+        run_test_in_group 18 "tests/test_helper_argc.vri"
+        run_test_in_group 18 "tests/vri/test_adv_071_exit_code.vri"
+        run_test_in_group 18 "tests/test_argc.vri"
+    fi
+    local pass_cnt=${GP_PASS[18]}
+    local fail_cnt=${GP_FAIL[18]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 18: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Phase 8: New Language Features
-run_test "tests/vri/test_interp.vri" "$(printf 'Hello $(name)\nVir is great\nEscaped $$dollar')"
-run_test "tests/vri/test_ufcs.vri" "$(printf '20\n15\n37')"
-run_test "tests/vri/test_throw.vri" "$(printf '5\n3')"
-run_test "tests/vri/test_ensure.vri" "$(printf '42\n99')"
-run_test "tests/vri/test_packed.vri" "$(printf '3\n4\n11')"
-run_test "tests/vri/test_this.vri" "$(printf '21\n7\n10')"
-run_test "tests/vri/test_bind.vri" "$(printf '7\n30\n99')"
+run_group_19() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 19: Mảng (Arrays, Indexing, Slices)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 19 "tests/bootstrap_codegen/cg_array_indexing.vri"
+        run_test_in_group 19 "tests/bootstrap_codegen/cg_array_len.vri"
+        run_test_in_group 19 "tests/bootstrap_codegen/cg_array_literal.vri"
+    else
+        run_test_in_group 19 "tests/bootstrap_codegen/cg_array_indexing.vri"
+        run_test_in_group 19 "tests/bootstrap_codegen/cg_array_len.vri"
+        run_test_in_group 19 "tests/bootstrap_codegen/cg_array_literal.vri"
+        run_test_in_group 19 "tests/test_adv_049_arr_init.vri"
+        run_test_in_group 19 "tests/test_adv_078_reverse.vri"
+        run_test_in_group 19 "tests/test_adv_087_isort.vri"
+        run_test_in_group 19 "tests/test_arr_after_var.vri"
+        run_test_in_group 19 "tests/test_arr_min.vri"
+        run_test_in_group 19 "tests/test_arr_reorder.vri"
+        run_test_in_group 19 "tests/test_array_basic.vri"
+        run_test_in_group 19 "tests/test_array_literal.vri"
+        run_test_in_group 19 "tests/test_array_loop.vri"
+        run_test_in_group 19 "tests/test_array_set.vri"
+        run_test_in_group 19 "tests/test_array_simple.vri"
+        run_test_in_group 19 "tests/test_vec_loop.vri"
+        run_test_in_group 19 "tests/vri/test_adv_049_arr_init.vri"
+        run_test_in_group 19 "tests/vri/test_adv_078_reverse.vri"
+        run_test_in_group 19 "tests/vri/test_adv_079_stack_calc.vri"
+        run_test_in_group 19 "tests/vri/test_adv_087_isort.vri"
+        run_test_in_group 19 "tests/vri/test_array_literal.vri"
+        run_test_in_group 19 "tests/vri/test_array_loop.vri"
+        run_test_in_group 19 "tests/vri/test_array_set.vri"
+        run_test_in_group 19 "tests/test_adv_079_stack_calc.vri"
+        run_test_in_group 19 "tests/vri/test_arr_after_var.vri"
+        run_test_in_group 19 "tests/vri/test_array_basic.vri"
+    fi
+    local pass_cnt=${GP_PASS[19]}
+    local fail_cnt=${GP_FAIL[19]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 19: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-echo ""
-echo "=== Regression Tests: Confirmed Bugs & Edge Cases (Categories A - I) ==="
-echo ""
+run_group_20() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 20: Dict & Map (Key-value collections)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 20 "tests/test_adv_072_mmap.vri"
+        run_test_in_group 20 "tests/test_adv_080_hash.vri"
+        run_test_in_group 20 "tests/test_adv_093_map.vri"
+    else
+        run_test_in_group 20 "tests/test_adv_072_mmap.vri"
+        run_test_in_group 20 "tests/test_adv_080_hash.vri"
+        run_test_in_group 20 "tests/test_adv_093_map.vri"
+        run_test_in_group 20 "tests/test_dict_int.vri"
+        run_test_in_group 20 "tests/vri/test_adv_072_mmap.vri"
+        run_test_in_group 20 "tests/vri/test_adv_080_hash.vri"
+        run_test_in_group 20 "tests/vri/test_adv_093_map.vri"
+        run_test_in_group 20 "tests/vri/test_dict_int.vri"
+    fi
+    local pass_cnt=${GP_PASS[20]}
+    local fail_cnt=${GP_FAIL[20]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 20: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category A: Struct field offset scoping by type (Bug 1)
-run_test "tests/vri/test_struct_field_offset_scoped_by_type.vri" "$(printf '1\n2\n333\n444\n555')"
-run_test "tests/vri/test_struct_field_same_name_diff_offset.vri" "$(printf '200\n7\n404\n503\n1024\n201\n9\n200\n500\n2048')"
-run_test "tests/vri/test_struct_field_three_entities.vri" "$(printf '100\n10\n20\n200\n22\n30\n31\n300\n33\n111\n11\n21\n222\n23\n32\n33\n333\n34')"
-run_test "tests/vri/test_struct_field_boundary_read_write.vri" "$(printf '10\n20\n30\n40\n50\n10\n20\n333\n40\n50\n111\n20\n333\n40\n555')"
+run_group_21() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 21: Biểu thức Case & Pattern Matching"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 21 "tests/bootstrap_codegen/cg_mem_loop_pattern.vri"
+        run_test_in_group 21 "tests/test_adv_022_switch_case.vri"
+        run_test_in_group 21 "tests/test_case_real.vri"
+    else
+        run_test_in_group 21 "tests/bootstrap_codegen/cg_mem_loop_pattern.vri"
+        run_test_in_group 21 "tests/test_adv_022_switch_case.vri"
+        run_test_in_group 21 "tests/test_case_real.vri"
+        run_test_in_group 21 "tests/test_case_spec.vri"
+        run_test_in_group 21 "tests/test_virc_patterns.vri"
+        run_test_in_group 21 "tests/vri/test_adv_022_switch_case.vri"
+        run_test_in_group 21 "tests/vri/test_case_real.vri"
+        run_test_in_group 21 "tests/vri/test_case_spec.vri"
+        run_test_in_group 21 "tests/vri/test_virc_patterns.vri"
+    fi
+    local pass_cnt=${GP_PASS[21]}
+    local fail_cnt=${GP_FAIL[21]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 21: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category B: Aggregate/struct return ABI containing string (Bug 2)
-run_test "tests/vri/test_aggregate_return_string_field_preserved.vri" "$(printf 'api.internal.local\n8080\n1')"
-run_test "tests/vri/test_aggregate_return_string_int_combos.vri" "$(printf 'http_requests\n42\nprod\n200')"
-run_test "tests/vri/test_aggregate_return_large_entity.vri" "$(printf '101\ngateway\n192.168.1.1\n443\nhttps\n1')"
+run_group_22() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 22: Async & Task (Concurrency)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 22 "tests/test_async_call.vri"
+        run_test_in_group 22 "tests/test_await.vri"
+        run_test_in_group 22 "tests/test_await_pass_main.vri"
+    else
+        run_test_in_group 22 "tests/test_async_call.vri"
+        run_test_in_group 22 "tests/test_await.vri"
+        run_test_in_group 22 "tests/test_await_pass_main.vri"
+        run_test_in_group 22 "tests/vri/test_async_call.vri"
+        run_test_in_group 22 "tests/vri/test_async_min.vri"
+        run_test_in_group 22 "tests/vri/test_await.vri"
+        run_test_in_group 22 "tests/vri/test_await_pass.vri"
+        run_test_in_group 22 "tests/vri/test_await_simple.vri"
+        run_test_in_group 22 "tests/vri/test_await_v2.vri"
+        run_test_in_group 22 "tests/test_async_min.vri"
+        run_test_in_group 22 "tests/test_await_pass.vri"
+        run_test_in_group 22 "tests/test_await_simple.vri"
+        run_test_in_group 22 "tests/test_await_v2.vri"
+    fi
+    local pass_cnt=${GP_PASS[22]}
+    local fail_cnt=${GP_FAIL[22]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 22: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category C: Struct layout / alignment / padding (Bug 3)
-run_test "tests/vri/test_struct_layout_string_int_alignment.vri" "$(printf 'deploy_service\n200\nus-east-1 production\n1')"
-run_test "tests/vri/test_struct_layout_alternating_fields.vri" "$(printf '1\nSYN\n200\nDATA_BODY\n9999')"
+run_group_23() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 23: Port & Worker Channels (send, recv)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 23 "tests/bootstrap_codegen/cg_mod_import.vri"
+    else
+        run_test_in_group 23 "tests/bootstrap_codegen/cg_mod_import.vri"
+    fi
+    local pass_cnt=${GP_PASS[23]}
+    local fail_cnt=${GP_FAIL[23]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 23: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category D: Reserved keyword validation (Compile-fail, Parser Bug)
-run_compile_fail_test "tests/vri/test_reserved_keyword_port_rejected_as_parameter.vri" "skipping semantic analysis for partial AST"
-run_compile_fail_test "tests/vri/test_reserved_keyword_port_rejected_as_local_var.vri" "skipping semantic analysis for partial AST"
-run_compile_fail_test "tests/vri/test_reserved_keyword_port_rejected_as_function_name.vri" "skipping semantic analysis for partial AST"
-run_compile_fail_test "tests/vri/test_reserved_keywords_rejected_as_identifiers.vri" "skipping semantic analysis for partial AST"
+run_group_24() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 24: GPU, SIMD & Atomic Primitives"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 24 "tests/test_atomic_isolate.vri"
+        run_test_in_group 24 "tests/test_atomic_var.vri"
+    else
+        run_test_in_group 24 "tests/test_atomic_isolate.vri"
+        run_test_in_group 24 "tests/test_atomic_var.vri"
+    fi
+    local pass_cnt=${GP_PASS[24]}
+    local fail_cnt=${GP_FAIL[24]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 24: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Borrow checker hardening regressions
-run_compile_fail_test "tests/test_borrow_move_on_call.vri" "E5001"
-run_compile_fail_test "tests/test_borrow_if_move.vri" "E5001"
-run_compile_fail_test "tests/test_borrow_arena_escape.vri" "E5005"
-run_compile_fail_test "tests/test_borrow_rebind_conflict.vri" "E5002"
+run_group_25() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 25: UI & Reactive Primitives"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 25 "tests/bootstrap_codegen/cg_str_builtins.vri"
+        run_test_in_group 25 "tests/test_adv_035_quicksort.vri"
+        run_test_in_group 25 "tests/test_reactive.vri"
+    else
+        run_test_in_group 25 "tests/bootstrap_codegen/cg_str_builtins.vri"
+        run_test_in_group 25 "tests/test_adv_035_quicksort.vri"
+        run_test_in_group 25 "tests/test_reactive.vri"
+        run_test_in_group 25 "tests/vri/test_adv_035_quicksort.vri"
+        run_test_in_group 25 "tests/vri/test_adv_055_str_build.vri"
+        run_test_in_group 25 "tests/test_adv_055_str_build.vri"
+    fi
+    local pass_cnt=${GP_PASS[25]}
+    local fail_cnt=${GP_FAIL[25]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 25: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category E: Parameter shadowing allowed (Positive test)
-run_test "tests/vri/test_parameter_same_name_as_entity_field_allowed.vri" "$(printf '42\n99\n100\n200')"
+run_group_26() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 26: AI & Học máy (Tensor, MatMul **, FMA, Infer, Train, Quantize)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 26 "tests/strict_v2/test_spec26_ai_huge_proof.vri"
+        run_test_in_group 26 "tests/strict_v2/test_float_matmul_e2e.vri"
+        run_test_in_group 26 "tests/test_adv_030_fma.vri"
+        run_test_in_group 26 "tests/test_adv_033_matmul.vri"
+    else
+        run_test_in_group 26 "tests/strict_v2/test_spec26_ai_huge_proof.vri"
+        run_test_in_group 26 "tests/strict_v2/test_autodiff_e2e.vri"
+        run_test_in_group 26 "tests/strict_v2/test_quantize_e2e.vri"
+        run_test_in_group 26 "tests/strict_v2/test_float_matmul_e2e.vri"
+        run_test_in_group 26 "tests/test_adv_030_fma.vri"
+        run_test_in_group 26 "tests/test_adv_033_matmul.vri"
+        run_test_in_group 26 "tests/test_arena_api.vri"
+        run_test_in_group 26 "tests/test_first_class_matmul_rect.vri"
+        run_test_in_group 26 "tests/test_neon_matmul_4x4.vri"
+        run_test_in_group 26 "tests/test_print_c.vri"
+        run_test_in_group 26 "tests/test_probe_01.vri"
+        run_test_in_group 26 "tests/vri/test_adv_030_fma.vri"
+        run_test_in_group 26 "tests/vri/test_adv_033_matmul.vri"
+        run_test_in_group 26 "tests/vri/test_spec20_compiler_features.vri"
+        run_test_in_group 26 "tests/vri/test_tensor_matmul.vri"
+        run_test_in_group 26 "tests/vri/test_tensor_ml_ops.vri"
+        run_test_in_group 26 "tests/vri/test_infer_zero_tape.vri"
+        run_test_in_group 26 "tests/test_first_class_tensor.vri"
+    fi
+    local pass_cnt=${GP_PASS[26]}
+    local fail_cnt=${GP_FAIL[26]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 26: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category F: Value-copy semantics on struct indexing (Language Design)
-run_test "tests/vri/test_value_copy_struct_indexing.vri" "$(printf '200\n200\n999\n200\n999\n555')"
+run_group_27() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 27: Intrinsics hệ thống (Memory read/write, low-level)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 27 "tests/test_intrinsics.vri"
+        run_test_in_group 27 "tests/test_native_read_u8.vri"
+        run_test_in_group 27 "tests/test_rw64.vri"
+    else
+        run_test_in_group 27 "tests/test_intrinsics.vri"
+        run_test_in_group 27 "tests/test_native_read_u8.vri"
+        run_test_in_group 27 "tests/test_rw64.vri"
+        run_test_in_group 27 "tests/test_volatile.vri"
+        run_test_in_group 27 "tests/vri/test_intrinsics.vri"
+    fi
+    local pass_cnt=${GP_PASS[27]}
+    local fail_cnt=${GP_FAIL[27]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 27: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category G: Signed integer overflow (Runtime wrapping)
-run_test "tests/vri/test_int64_overflow_wrapping.vri" "$(printf '9223372036854775807\n1\n-9223372036854775807\n-2\n1')"
+run_group_28() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 28: Hỗ trợ đa ngôn ngữ (UTF-8, String encoding)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 28 "tests/virgex_date.vri"
+    else
+        run_test_in_group 28 "tests/virgex_date.vri"
+    fi
+    local pass_cnt=${GP_PASS[28]}
+    local fail_cnt=${GP_FAIL[28]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 28: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category H: Member access chain a.b.c (Parser feature)
-run_test "tests/vri/test_member_access_chain.vri" "$(printf '100\n200\n5\n999\n888\n999\n42')"
+run_group_29() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 29: Từ khoá tham chiếu & Diagnostic Tests"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 29 "tests/test_kw_valid.vri"
+    else
+        run_test_in_group 29 "tests/test_kw_valid.vri"
+    fi
+    local pass_cnt=${GP_PASS[29]}
+    local fail_cnt=${GP_FAIL[29]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 29: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category I: Integer literal boundary (Lexer boundary)
-run_test "tests/vri/test_int_literal_boundary.vri" "$(printf '9223372036854775807\n9223372036854775806\n0\n1\n-9223372036854775807')"
+run_group_30() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 30: Bảng ưu tiên toán tử (Operator Precedence)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 30 "tests/test_adv_073_deep_expr.vri"
+        run_test_in_group 30 "tests/vri/test_adv_010_precedence.vri"
+        run_test_in_group 30 "tests/vri/test_adv_073_deep_expr.vri"
+    else
+        run_test_in_group 30 "tests/test_adv_073_deep_expr.vri"
+        run_test_in_group 30 "tests/vri/test_adv_010_precedence.vri"
+        run_test_in_group 30 "tests/vri/test_adv_073_deep_expr.vri"
+    fi
+    local pass_cnt=${GP_PASS[30]}
+    local fail_cnt=${GP_FAIL[30]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 30: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category J: Lexical block scoping (Shadowing in blocks)
-run_test "tests/vri/test_nested_block_scoping.vri" "$(printf '3\n2\n1')"
+run_group_31() {
+    echo "──────────────────────────────────────────────────────────────────────────"
+    echo "► Nhóm 31: Thay đổi so với v1.2 (Strict v2.0 Conformance)"
+    echo "──────────────────────────────────────────────────────────────────────────"
+    if [ "$MODE" = "min" ]; then
+        run_test_in_group 31 "tests/strict_v2/e2e_interp_matrix.vri"
+        run_test_in_group 31 "tests/strict_v2/e2e_string_interpolation.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_dynamic_primitives.vri"
+    else
+        run_test_in_group 31 "tests/strict_v2/e2e_interp_matrix.vri"
+        run_test_in_group 31 "tests/strict_v2/e2e_string_interpolation.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_dynamic_primitives.vri"
+        run_test_in_group 31 "tests/test_interp_v2.vri"
+    fi
+    local pass_cnt=${GP_PASS[31]}
+    local fail_cnt=${GP_FAIL[31]}
+    local total_cnt=$((pass_cnt + fail_cnt))
+    echo "  ↳ Kết quả Nhóm 31: $pass_cnt/$total_cnt PASS"
+    echo ""
+}
 
-# Category K: Multi-Target Architecture & Memory Paging Isolation
-run_test "tests/vri/test_target_paging.vri" "PASS: target paging and segment alignment verified"
-run_test "tests/vri/test_lir_target_isolation.vri" "PASS: target architecture isolation and triple routing verified"
+if [ "$MODE" = "single" ]; then
+    "run_group_$TARGET_GROUP"
+else
+    run_group_1
+    run_group_2
+    run_group_3
+    run_group_4
+    run_group_5
+    run_group_6
+    run_group_7
+    run_group_8
+    run_group_9
+    run_group_10
+    run_group_11
+    run_group_12
+    run_group_13
+    run_group_14
+    run_group_15
+    run_group_16
+    run_group_17
+    run_group_18
+    run_group_19
+    run_group_20
+    run_group_21
+    run_group_22
+    run_group_23
+    run_group_24
+    run_group_25
+    run_group_26
+    run_group_27
+    run_group_28
+    run_group_29
+    run_group_30
+    run_group_31
+fi
 
-# Category L: Section 26 - N-Dimensional Tensor & ML Operators Engine
-run_test "tests/vri/test_tensor_ml_ops.vri" "PASS: all tensor & ML operator verification suites passed"
+echo "=========================================================================="
+echo "                    BẢNG TỔNG KẾT KẾT QUẢ TEST THEO NHÓM                 "
+echo "=========================================================================="
+printf "%-4s | %-52s | %-5s | %-5s | %-5s\n" "Mục" "Tên Nhóm Phân Loại Spec v2.0" "PASS" "FAIL" "TỔNG"
+echo "-----+------------------------------------------------------+-------+-------+------"
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "1" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 1 "Tổng quan (§1.0 Separator, §1.1 Mở khối, §1.2 Pip..." ${GP_PASS[1]} ${GP_FAIL[1]} $((GP_PASS[1] + GP_FAIL[1]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "2" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 2 "Chú thích (Comments)" ${GP_PASS[2]} ${GP_FAIL[2]} $((GP_PASS[2] + GP_FAIL[2]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "3" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 3 "Hệ thống Module (include, import, export)" ${GP_PASS[3]} ${GP_FAIL[3]} $((GP_PASS[3] + GP_FAIL[3]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "4" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 4 "Kiểu dữ liệu (Primitives, Casts, Nil-safety)" ${GP_PASS[4]} ${GP_FAIL[4]} $((GP_PASS[4] + GP_FAIL[4]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "5" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 5 "Biến & Hằng số (var, let, const, Scoping)" ${GP_PASS[5]} ${GP_FAIL[5]} $((GP_PASS[5] + GP_FAIL[5]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "6" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 6 "Hàm (Functions, out, Recursion, TCO)" ${GP_PASS[6]} ${GP_FAIL[6]} $((GP_PASS[6] + GP_FAIL[6]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "7" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 7 "Entity & Packed Entity (Structs, Fields, Methods)" ${GP_PASS[7]} ${GP_FAIL[7]} $((GP_PASS[7] + GP_FAIL[7]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "8" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 8 "Enum (Tagged unions, Variants)" ${GP_PASS[8]} ${GP_FAIL[8]} $((GP_PASS[8] + GP_FAIL[8]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "9" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 9 "Luồng điều khiển (if, eif, else, when, for, skip,..." ${GP_PASS[9]} ${GP_FAIL[9]} $((GP_PASS[9] + GP_FAIL[9]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "10" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 10 "Toán tử (Arithmetic, Bitwise, Logic, mod)" ${GP_PASS[10]} ${GP_FAIL[10]} $((GP_PASS[10] + GP_FAIL[10]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "11" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 11 "UFCS (Uniform Function Call Syntax)" ${GP_PASS[11]} ${GP_FAIL[11]} $((GP_PASS[11] + GP_FAIL[11]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "12" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 12 "Nội suy chuỗi & Thao tác chuỗi" ${GP_PASS[12]} ${GP_FAIL[12]} $((GP_PASS[12] + GP_FAIL[12]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "13" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 13 "Xử lý lỗi (throw, try, ensure, revert)" ${GP_PASS[13]} ${GP_FAIL[13]} $((GP_PASS[13] + GP_FAIL[13]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "14" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 14 "Tham số (in, ref, out)" ${GP_PASS[14]} ${GP_FAIL[14]} $((GP_PASS[14] + GP_FAIL[14]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "15" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 15 "FFI & Tương tác Hệ điều hành (@bind, syscall, OS)" ${GP_PASS[15]} ${GP_FAIL[15]} $((GP_PASS[15] + GP_FAIL[15]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "16" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 16 "Register & Mold (Bit structures, pack)" ${GP_PASS[16]} ${GP_FAIL[16]} $((GP_PASS[16] + GP_FAIL[16]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "17" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 17 "Thực thi lúc biên dịch (precomp, const fold)" ${GP_PASS[17]} ${GP_FAIL[17]} $((GP_PASS[17] + GP_FAIL[17]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "18" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 18 "Điểm nhập (@entry, main, CLI args)" ${GP_PASS[18]} ${GP_FAIL[18]} $((GP_PASS[18] + GP_FAIL[18]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "19" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 19 "Mảng (Arrays, Indexing, Slices)" ${GP_PASS[19]} ${GP_FAIL[19]} $((GP_PASS[19] + GP_FAIL[19]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "20" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 20 "Dict & Map (Key-value collections)" ${GP_PASS[20]} ${GP_FAIL[20]} $((GP_PASS[20] + GP_FAIL[20]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "21" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 21 "Biểu thức Case & Pattern Matching" ${GP_PASS[21]} ${GP_FAIL[21]} $((GP_PASS[21] + GP_FAIL[21]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "22" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 22 "Async & Task (Concurrency)" ${GP_PASS[22]} ${GP_FAIL[22]} $((GP_PASS[22] + GP_FAIL[22]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "23" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 23 "Port & Worker Channels (send, recv)" ${GP_PASS[23]} ${GP_FAIL[23]} $((GP_PASS[23] + GP_FAIL[23]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "24" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 24 "GPU, SIMD & Atomic Primitives" ${GP_PASS[24]} ${GP_FAIL[24]} $((GP_PASS[24] + GP_FAIL[24]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "25" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 25 "UI & Reactive Primitives" ${GP_PASS[25]} ${GP_FAIL[25]} $((GP_PASS[25] + GP_FAIL[25]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "26" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 26 "AI & Học máy (Tensor, MatMul **, FMA, Infer, Trai..." ${GP_PASS[26]} ${GP_FAIL[26]} $((GP_PASS[26] + GP_FAIL[26]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "27" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 27 "Intrinsics hệ thống (Memory read/write, low-level)" ${GP_PASS[27]} ${GP_FAIL[27]} $((GP_PASS[27] + GP_FAIL[27]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "28" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 28 "Hỗ trợ đa ngôn ngữ (UTF-8, String encoding)" ${GP_PASS[28]} ${GP_FAIL[28]} $((GP_PASS[28] + GP_FAIL[28]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "29" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 29 "Từ khoá tham chiếu & Diagnostic Tests" ${GP_PASS[29]} ${GP_FAIL[29]} $((GP_PASS[29] + GP_FAIL[29]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "30" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 30 "Bảng ưu tiên toán tử (Operator Precedence)" ${GP_PASS[30]} ${GP_FAIL[30]} $((GP_PASS[30] + GP_FAIL[30]))
+fi
+if [ "$MODE" != "single" ] || [ "$TARGET_GROUP" = "31" ]; then
+    printf "§%-3d | %-52s | %-5d | %-5d | %-5d\n" 31 "Thay đổi so với v1.2 (Strict v2.0 Conformance)" ${GP_PASS[31]} ${GP_FAIL[31]} $((GP_PASS[31] + GP_FAIL[31]))
+fi
+echo "-----+------------------------------------------------------+-------+-------+------"
+printf "TỔNG | %-52s | %-5d | %-5d | %-5d\n" "Tất cả các nhóm kiểm thử" "$TOTAL_PASS" "$TOTAL_FAIL" "$((TOTAL_PASS + TOTAL_FAIL))"
+echo "=========================================================================="
 
-# Category M: FFI Extern Imports & Dynamic Linking (Mach-O ARM64)
-run_test "tests/test_extern_from_os.vri" "PASS: ffi extern getpid verified"
-
-echo ""
-echo "=== Results: $PASS passed, $FAIL failed ==="
+if [ "$TOTAL_FAIL" -gt 0 ]; then
+    echo "KẾT QUẢ: THẤT BẠI ($TOTAL_FAIL lỗi phát hiện)"
+    exit 1
+else
+    echo "KẾT QUẢ: THÀNH CÔNG (100% PASS)"
+    exit 0
+fi
