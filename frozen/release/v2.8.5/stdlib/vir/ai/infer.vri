@@ -1,0 +1,252 @@
+##
+ * vir/ai/infer.vri — Forward-Only Inference Engine
+ * ==================================================
+ * Inference primitives that run without autodiff overhead.
+ *
+ * Key properties
+ *   - No tape allocation (no grad tracking)
+ *   - All operations run in-place or return new Tensors
+ *   - Designed for forward-pass-only production inference
+ *
+ * Usage
+ *   include ai/infer
+ *   infer_begin()       # disable grad tracking
+ *   var out = linear(weights, bias, input)
+ *   var pred = softmax(out)
+ *   infer_end()         # restore state
+ *
+ * Note: the infer:/end block syntax will be supported natively
+ * once the AST parser gains block-statement support. Until then,
+ * use the infer_begin()/infer_end() wrapper pattern.
+ ##
+
+include types
+include alloc
+import alloc, alloc_zeroed, free from alloc
+include basic
+import sqrt, exp, log, max_f, abs_f from basic
+include math/tensor
+import Tensor, tensor_zeros, tensor_get_flat, tensor_set_flat,
+    tensor_matmul, tensor_add, tensor_free from tensor
+
+# ===================================================
+# Inference Mode Context
+# ===================================================
+# g_infer_mode: 0 = normal (track grads), 1 = inference (no grads)
+
+var g_infer_mode: int = 0
+
+func infer_begin():
+    g_infer_mode = 1
+end.
+
+func infer_end():
+    g_infer_mode = 0
+end.
+
+func is_infer_mode():
+    out g_infer_mode == 1
+end.
+
+# ===================================================
+# Activation Functions (infer-optimized, no tape)
+# ===================================================
+
+# relu(x) = max(0, x)
+func relu(t: Tensor):
+    out_t = tensor_zeros(t.shape, t.rank)
+    i = 0
+    when i < t.numel loop
+        v = tensor_get_flat(t, i)
+        if v > 0.0 do
+            tensor_set_flat(out_t, i, v)
+        end
+        i = i + 1
+    end
+    out out_t
+end.
+
+# gelu(x) = x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715*x^3)))
+# Fast GELU approximation (used in BERT/GPT)
+func gelu(t: Tensor):
+    out_t = tensor_zeros(t.shape, t.rank)
+    SQRT2_PI = 0.7978845608028654   # sqrt(2/pi)
+    COEFF = 0.044715
+    i = 0
+    when i < t.numel loop
+        x = tensor_get_flat(t, i)
+        inner = SQRT2_PI * (x + COEFF * x * x * x)
+        # tanh approximation via exp: tanh(z) = (e^2z - 1)/(e^2z + 1)
+        e2z = exp(2.0 * inner)
+        th = (e2z - 1.0) / (e2z + 1.0)
+        tensor_set_flat(out_t, i, x * 0.5 * (1.0 + th))
+        i = i + 1
+    end
+    out out_t
+end.
+
+# sigmoid(x) = 1 / (1 + e^(-x))
+func sigmoid(t: Tensor):
+    out_t = tensor_zeros(t.shape, t.rank)
+    i = 0
+    when i < t.numel loop
+        x = tensor_get_flat(t, i)
+        tensor_set_flat(out_t, i, 1.0 / (1.0 + exp(0.0 - x)))
+        i = i + 1
+    end
+    out out_t
+end.
+
+# softmax over last dimension of 1D or 2D tensor
+# For 2D [M, N]: apply softmax over each row
+func softmax(t: Tensor):
+    out_t = tensor_zeros(t.shape, t.rank)
+    if t.rank == 1 do
+        N = t.numel
+        # Find max for numerical stability
+        max_v = tensor_get_flat(t, 0)
+        i = 1
+        when i < N loop
+            v = tensor_get_flat(t, i)
+            if v > max_v do max_v = v end
+            i = i + 1
+        end
+        # Sum of exp(x - max)
+        sum_e = 0.0
+        i = 0
+        when i < N loop
+            sum_e = sum_e + exp(tensor_get_flat(t, i) - max_v)
+            i = i + 1
+        end
+        # Normalize
+        i = 0
+        when i < N loop
+            tensor_set_flat(out_t, i, exp(tensor_get_flat(t, i) - max_v) / sum_e)
+            i = i + 1
+        end
+        out out_t
+    end
+    # 2D: row-wise softmax
+    M = native_load<int>(t.shape, 0)
+    N = native_load<int>(t.shape, 1)
+    row = 0
+    when row < M loop
+        # Find row max
+        max_v = tensor_get_flat(t, row * N)
+        col = 1
+        when col < N loop
+            v = tensor_get_flat(t, row * N + col)
+            if v > max_v do max_v = v end
+            col = col + 1
+        end
+        # Sum exp
+        sum_e = 0.0
+        col = 0
+        when col < N loop
+            sum_e = sum_e + exp(tensor_get_flat(t, row * N + col) - max_v)
+            col = col + 1
+        end
+        # Normalize
+        col = 0
+        when col < N loop
+            tensor_set_flat(out_t, row * N + col,
+                exp(tensor_get_flat(t, row * N + col) - max_v) / sum_e)
+            col = col + 1
+        end
+        row = row + 1
+    end
+    out out_t
+end.
+
+# ===================================================
+# Linear Layer: out = input @ weights.T + bias
+# ===================================================
+# input:   [batch, in_features]
+# weights: [out_features, in_features]  (row = one output neuron)
+# bias:    [out_features] or null
+# out:     [batch, out_features]
+func linear(weights: Tensor, bias: ptr, input: Tensor):
+    # weights transposed: [in_features, out_features]
+    # We compute input @ weights^T directly via inner-loop trick
+    batch = native_load<int>(input.shape, 0)
+    in_feat = native_load<int>(input.shape, 1)
+    out_feat = native_load<int>(weights.shape, 0)
+
+    out_shape = alloc(2 * size_of<int>())
+    native_store<int>(out_shape, 0, batch)
+    native_store<int>(out_shape, 1, out_feat)
+    out_t = tensor_zeros(out_shape, 2)
+    free(out_shape)
+
+    b = 0
+    when b < batch loop
+        o = 0
+        when o < out_feat loop
+            acc = 0.0
+            k = 0
+            when k < in_feat loop
+                acc = acc + tensor_get_flat(input, b * in_feat + k) *
+                            tensor_get_flat(weights, o * in_feat + k)
+                k = k + 1
+            end
+            # Add bias if provided
+            if bias != null do
+                acc = acc + native_load<float>(bias, o)
+            end
+            tensor_set_flat(out_t, b * out_feat + o, acc)
+            o = o + 1
+        end
+        b = b + 1
+    end
+    out out_t
+end.
+
+# ===================================================
+# Layer Norm: normalize over last dim
+# ===================================================
+# x: [*, D], gamma: [D], beta: [D]
+# out: [*, D]  (normalized)
+func layer_norm(x: Tensor, gamma: ptr, beta: ptr, eps: float):
+    D = native_load<int>(x.shape, x.rank - 1)
+    n_rows = x.numel / D
+    out_t = tensor_zeros(x.shape, x.rank)
+
+    row = 0
+    when row < n_rows loop
+        # Mean
+        mean = 0.0
+        d = 0
+        when d < D loop
+            mean = mean + tensor_get_flat(x, row * D + d)
+            d = d + 1
+        end
+        mean = mean / (D as float)
+        # Variance
+        var_sum = 0.0
+        d = 0
+        when d < D loop
+            diff = tensor_get_flat(x, row * D + d) - mean
+            var_sum = var_sum + diff * diff
+            d = d + 1
+        end
+        std = sqrt(var_sum / (D as float) + eps)
+        # Normalize and scale
+        d = 0
+        when d < D loop
+            xn = (tensor_get_flat(x, row * D + d) - mean) / std
+            g = 1.0
+            b_val = 0.0
+            if gamma != null do g = native_load<float>(gamma, d) end
+            if beta != null do b_val = native_load<float>(beta, d) end
+            tensor_set_flat(out_t, row * D + d, xn * g + b_val)
+            d = d + 1
+        end
+        row = row + 1
+    end
+    out out_t
+end.
+
+export g_infer_mode
+export infer_begin, infer_end, is_infer_mode
+export relu, gelu, sigmoid, softmax
+export linear, layer_norm

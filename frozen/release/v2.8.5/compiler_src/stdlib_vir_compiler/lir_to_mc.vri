@@ -1,0 +1,2536 @@
+##
+ * vir/compiler/lir_to_mc.vri — Lower LIR to MCInst Stream
+ * ========================================================
+ * Converts post-regalloc LIR into architecture-specific MCInst sequences.
+ * Supports ARM64, x86_64 (SysV AMD64), and RISC-V 64.
+ ##
+
+module vir.compiler.lir_to_mc
+
+include types
+include vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt
+include string_rt
+import native_read_i64, native_write_i64, sb_new, sb_append, sb_append_int, sb_to_string from string_rt
+include compiler.lir
+import LirOp, LirOperand, LirInstr, LirBlock, LirFunc, lir_func_id, lir_func_name, lir_func_blocks, lir_func_stack_size, lir_block_id, lir_block_instrs, lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_aux, LIR_CMP_EQ, LIR_CMP_NE, LIR_CMP_GT, LIR_CMP_LT, LIR_CMP_GE, LIR_CMP_LE, LIR_JMP_IF, LIR_JMP_IFNOT from compiler.lir
+include compiler.mir
+import MIR_INTR_STR_LIT, MIR_INTR_PRINT, MIR_INTR_PRINT_STR, MIR_INTR_PARAM, MIR_INTR_BUILTIN, MIR_INTR_INDEX, MIR_INTR_INDEX_STORE, MIR_INTR_TRAIN, MIR_INTR_INFER, MIR_INTR_QUANTIZE, MIR_INTR_BACKWARD, MIR_INTR_CAST from compiler.mir
+include compiler.mc
+import TargetArch, MCOpcode, MCOperandKind, RelocKind, MCInst, MCOperand, mc_inst_new, mc_opnd_none, mc_opnd_reg, mc_opnd_imm, mc_opnd_mem, mc_opnd_symbol, mc_opnd_label from compiler.mc
+
+func resolve_mc_reg(opnd: LirOperand, assigned_phys: i64):
+    if (opnd as i64) < 4096 do
+        out 0 - 1
+    end
+    let typ = native_read_i64(opnd as i64, 0)
+    if typ == 1 or typ == 2 do # VReg
+        if assigned_phys >= 0 do
+            let vid = native_read_i64(opnd as i64, 8)
+            if vid >= 0 and vid < vec_len_rt(assigned_phys) do
+                let col = vec_get_rt(assigned_phys, vid)
+                if col >= 0 and col < 9 do
+                    out (col + 19)
+                end
+                out col
+            end
+        end
+        out native_read_i64(opnd as i64, 8)
+    end
+    if typ == 3 do # PhysReg
+        out native_read_i64(opnd as i64, 16)
+    end
+    out 0 - 1
+end.
+
+func is_stack_mem(opnd: LirOperand):
+    if (opnd as i64) <= 4096 do
+        out 0
+    end
+    if native_read_i64(opnd as i64, 0) == 4 do
+        out 1
+    end
+    out 0
+end.
+
+func stack_mem_off(opnd: LirOperand):
+    if (opnd as i64) <= 4096 do
+        out 0
+    end
+    out native_read_i64(opnd as i64, 24)
+end.
+
+# Stable across all MC backends and matched by print_mc_string_pool. A literal
+# is identified by its owning LIR function and that function's MIR string-pool
+# index, not by an address in the compiler process.
+func lir_mc_string_symbol(func_id: i64, sid: i64):
+    var sb = sb_new()
+    sb = sb_append(sb, "vir_str_")
+    sb = sb_append_int(sb, func_id)
+    sb = sb_append(sb, "_")
+    sb = sb_append_int(sb, sid)
+    out sb_to_string(sb)
+end.
+
+# ═══════════════════════════════════════════════════════
+# 1. ARM64 Lowering
+# ═══════════════════════════════════════════════════════
+
+func lir_func_to_mc_arm64(func_obj: LirFunc, assigned_phys: i64):
+    var fid = lir_func_id(func_obj)
+    if fid < 0 do
+        fid = 0
+    else
+        fid = fid + 1
+    end
+    var insts = vec_new_rt()
+    let op_n0 = mc_opnd_none()
+    let op_n1 = mc_opnd_none()
+
+    # ── 1. Function Prologue ──
+    # stp fp, lr, [sp, #-16]!
+    let op_fp = mc_opnd_reg(29)
+    let op_lr = mc_opnd_reg(30)
+    let p_ins0 = mc_inst_new(MCOpcode.ARM64_STP_PRE, op_fp, op_lr, op_n0, op_n1, 0)
+    insts = vec_push_rt(insts, p_ins0 as i64)
+
+    # mov fp, sp
+    let p_ins1 = mc_inst_new(MCOpcode.ARM64_MOV_FROM_SP, op_fp, op_n0, op_n0, op_n1, 0)
+    insts = vec_push_rt(insts, p_ins1 as i64)
+
+    # Save callee-saved registers x19..x26
+    let op_x19 = mc_opnd_reg(19)
+    let op_x20 = mc_opnd_reg(20)
+    let op_x21 = mc_opnd_reg(21)
+    let op_x22 = mc_opnd_reg(22)
+    let op_x23 = mc_opnd_reg(23)
+    let op_x24 = mc_opnd_reg(24)
+    let op_x25 = mc_opnd_reg(25)
+    let op_x26 = mc_opnd_reg(26)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STP_PRE, op_x19, op_x20, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STP_PRE, op_x21, op_x22, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STP_PRE, op_x23, op_x24, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STP_PRE, op_x25, op_x26, op_n0, op_n1, 0) as i64)
+
+    let ssz = lir_func_stack_size(func_obj)
+    var aligned_ssz = ssz
+    if (aligned_ssz mod 16) != 0 do
+        aligned_ssz = aligned_ssz + (16 - (aligned_ssz mod 16))
+    end
+    if aligned_ssz > 0 do
+        # sub sp, sp, #ssz
+        let op_sp = mc_opnd_reg(31)
+        let op_ssz = mc_opnd_imm(aligned_ssz)
+        let p_ins2 = mc_inst_new(MCOpcode.ARM64_SUB_IMM, op_sp, op_sp, op_ssz, op_n0, 0)
+        insts = vec_push_rt(insts, p_ins2 as i64)
+    end
+
+    # ── 2. Blocks & Instructions ──
+    let blocks = lir_func_blocks(func_obj)
+    let n_blocks = vec_len_rt(blocks)
+    var bi = 0
+    var last_cmp_cond = 0 - 1
+    var pending_stack_args = vec_new_rt()
+
+    when bi < n_blocks loop
+        let b = vec_get_rt(blocks, bi)
+        let bid = lir_block_id(b)
+
+        # Label definition for basic block
+        let op_lbl = mc_opnd_imm(fid * 10000 + bid)
+        let ins_lbl = mc_inst_new(MCOpcode.LABEL_DEF, op_lbl, op_n0, op_n0, op_n1, 0)
+        insts = vec_push_rt(insts, ins_lbl as i64)
+
+        let binstrs = lir_block_instrs(b)
+        let n_ins = vec_len_rt(binstrs)
+        var ii = 0
+
+        when ii < n_ins loop
+            let ins = vec_get_rt(binstrs, ii)
+            let op = lir_instr_op(ins)
+            let d = lir_instr_dst(ins)
+            let s1 = lir_instr_src1(ins)
+            let s2 = lir_instr_src2(ins)
+            let rd = resolve_mc_reg(d, assigned_phys)
+            let rs1 = resolve_mc_reg(s1, assigned_phys)
+            let rs2 = resolve_mc_reg(s2, assigned_phys)
+
+            if op == LirOp.Mov do
+                if is_stack_mem(d) do
+                    if is_stack_mem(s1) do
+                        let op_x9 = mc_opnd_reg(9)
+                        let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_ms, op_n0, op_n1, 0) as i64)
+                        let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_x9, op_md, op_n0, op_n1, 0) as i64)
+                    eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        let imm = native_read_i64(s1 as i64, 32)
+                        let op_x9 = mc_opnd_reg(9)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x9, op_i, op_n0, op_n1, 0) as i64)
+                        let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_x9, op_md, op_n0, op_n1, 0) as i64)
+                    eif rs1 >= 0 do
+                        let op_s = mc_opnd_reg(rs1)
+                        let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_s, op_md, op_n0, op_n1, 0) as i64)
+                    end
+                eif rd >= 0 do
+                    if is_stack_mem(s1) do
+                        let op_d = mc_opnd_reg(rd)
+                        let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_d, op_ms, op_n0, op_n1, 0) as i64)
+                    eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        let imm = native_read_i64(s1 as i64, 32)
+                        let op_d = mc_opnd_reg(rd)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_d, op_i, op_n0, op_n1, 0) as i64)
+                    eif rs1 >= 0 and rd != rs1 do
+                        let op_d = mc_opnd_reg(rd)
+                        let op_s = mc_opnd_reg(rs1)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_d, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Add or op == LirOp.Sub do
+                var r_s1 = rs1
+                if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x9, op_i, op_n0, op_n1, 0) as i64)
+                    r_s1 = 9
+                eif is_stack_mem(s1) do
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_ms, op_n0, op_n1, 0) as i64)
+                    r_s1 = 9
+                end
+                var is_imm = 0
+                var imm_val = 0
+                var r_s2 = rs2
+                if (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                    imm_val = native_read_i64(s2 as i64, 32)
+                    if imm_val >= 0 and imm_val <= 4095 do
+                        is_imm = 1
+                    else
+                        let op_x10 = mc_opnd_reg(10)
+                        let op_i = mc_opnd_imm(imm_val)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x10, op_i, op_n0, op_n1, 0) as i64)
+                        r_s2 = 10
+                    end
+                eif is_stack_mem(s2) do
+                    let op_x10 = mc_opnd_reg(10)
+                    let op_ms2 = mc_opnd_mem(29, stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x10, op_ms2, op_n0, op_n1, 0) as i64)
+                    r_s2 = 10
+                end
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 9 end
+                if is_imm == 1 do
+                    var opc = MCOpcode.ARM64_ADD_IMM
+                    if op == LirOp.Sub do opc = MCOpcode.ARM64_SUB_IMM end
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s = mc_opnd_reg(r_s1)
+                    let op_i = mc_opnd_imm(imm_val)
+                    insts = vec_push_rt(insts, mc_inst_new(opc, op_d, op_s, op_i, op_n0, 0) as i64)
+                else
+                    var opc = MCOpcode.ARM64_ADD_RRR
+                    if op == LirOp.Sub do opc = MCOpcode.ARM64_SUB_RRR end
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s1 = mc_opnd_reg(r_s1)
+                    let op_s2 = mc_opnd_reg(r_s2)
+                    insts = vec_push_rt(insts, mc_inst_new(opc, op_d, op_s1, op_s2, op_n0, 0) as i64)
+                end
+                if is_stack_mem(d) do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_d, op_md, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Mul or op == LirOp.Div or op == LirOp.And or op == LirOp.Or or op == LirOp.Xor or op == LirOp.Shl or op == LirOp.Shr do
+                var r_s1 = rs1
+                if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x9, op_i, op_n0, op_n1, 0) as i64)
+                    r_s1 = 9
+                eif is_stack_mem(s1) do
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_ms, op_n0, op_n1, 0) as i64)
+                    r_s1 = 9
+                end
+                var r_s2 = rs2
+                if (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                    let imm = native_read_i64(s2 as i64, 32)
+                    let op_x10 = mc_opnd_reg(10)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x10, op_i, op_n0, op_n1, 0) as i64)
+                    r_s2 = 10
+                eif is_stack_mem(s2) do
+                    let op_x10 = mc_opnd_reg(10)
+                    let op_ms2 = mc_opnd_mem(29, stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x10, op_ms2, op_n0, op_n1, 0) as i64)
+                    r_s2 = 10
+                end
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 9 end
+                var opc = MCOpcode.ARM64_MUL_RRR
+                if op == LirOp.Div do opc = MCOpcode.ARM64_SDIV_RRR end
+                if op == LirOp.And do opc = MCOpcode.ARM64_AND_RRR end
+                if op == LirOp.Or  do opc = MCOpcode.ARM64_ORR_RRR end
+                if op == LirOp.Xor do opc = MCOpcode.ARM64_EOR_RRR end
+                if op == LirOp.Shl do opc = MCOpcode.ARM64_LSL_RRR end
+                if op == LirOp.Shr do opc = MCOpcode.ARM64_LSR_RRR end
+                let op_d = mc_opnd_reg(r_dst)
+                let op_op_s1 = mc_opnd_reg(r_s1)
+                let op_op_s2 = mc_opnd_reg(r_s2)
+                insts = vec_push_rt(insts, mc_inst_new(opc, op_d, op_op_s1, op_op_s2, op_n0, 0) as i64)
+                if is_stack_mem(d) do
+                    let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_d, op_md, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Rem do
+                var r_s1 = rs1
+                if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x9, op_i, op_n0, op_n1, 0) as i64)
+                    r_s1 = 9
+                eif is_stack_mem(s1) do
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_ms, op_n0, op_n1, 0) as i64)
+                    r_s1 = 9
+                end
+                var r_s2 = rs2
+                if (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                    let imm = native_read_i64(s2 as i64, 32)
+                    let op_x10 = mc_opnd_reg(10)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x10, op_i, op_n0, op_n1, 0) as i64)
+                    r_s2 = 10
+                eif is_stack_mem(s2) do
+                    let op_x10 = mc_opnd_reg(10)
+                    let op_ms2 = mc_opnd_mem(29, stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x10, op_ms2, op_n0, op_n1, 0) as i64)
+                    r_s2 = 10
+                end
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 9 end
+                let op_tmp = mc_opnd_reg(16)
+                let op_s1_reg = mc_opnd_reg(r_s1)
+                let op_s2_reg = mc_opnd_reg(r_s2)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_SDIV_RRR, op_tmp, op_s1_reg, op_s2_reg, op_n0, 0) as i64)
+                let op_d = mc_opnd_reg(r_dst)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MSUB_RRRR, op_d, op_tmp, op_s2_reg, op_s1_reg, 0) as i64)
+                if is_stack_mem(d) do
+                    let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_d, op_md, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Load do
+                var r_base = rs1
+                if is_stack_mem(s1) do
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_ms, op_n0, op_n1, 0) as i64)
+                    r_base = 9
+                end
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 10 end
+                if r_dst >= 0 and r_base >= 0 do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_m = mc_opnd_mem(r_base, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_d, op_m, op_n0, op_n1, 0) as i64)
+                end
+                if is_stack_mem(d) do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_d, op_md, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Store do
+                var r_val = rs1
+                if is_stack_mem(s1) do
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_ms, op_n0, op_n1, 0) as i64)
+                    r_val = 9
+                end
+                var r_base = rs2
+                if is_stack_mem(s2) do
+                    let op_x10 = mc_opnd_reg(10)
+                    let op_ms2 = mc_opnd_mem(29, stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x10, op_ms2, op_n0, op_n1, 0) as i64)
+                    r_base = 10
+                end
+                if r_val >= 0 and r_base >= 0 do
+                    let op_s = mc_opnd_reg(r_val)
+                    let op_m = mc_opnd_mem(r_base, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_s, op_m, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Not do
+                var r_s1 = rs1
+                if is_stack_mem(s1) do
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_ms, op_n0, op_n1, 0) as i64)
+                    r_s1 = 9
+                end
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 9 end
+                let op_d = mc_opnd_reg(r_dst)
+                let op_s1_reg = mc_opnd_reg(r_s1)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MVN_RR, op_d, op_s1_reg, op_n0, op_n1, 0) as i64)
+                if is_stack_mem(d) do
+                    let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_d, op_md, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Cmp do
+                var r_s1 = rs1
+                if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x9, op_i, op_n0, op_n1, 0) as i64)
+                    r_s1 = 9
+                eif is_stack_mem(s1) do
+                    let op_x9 = mc_opnd_reg(9)
+                    let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_ms, op_n0, op_n1, 0) as i64)
+                    r_s1 = 9
+                end
+                var r_s2 = rs2
+                if (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                    let imm = native_read_i64(s2 as i64, 32)
+                    let op_x10 = mc_opnd_reg(10)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x10, op_i, op_n0, op_n1, 0) as i64)
+                    r_s2 = 10
+                eif is_stack_mem(s2) do
+                    let op_x10 = mc_opnd_reg(10)
+                    let op_ms2 = mc_opnd_mem(29, stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x10, op_ms2, op_n0, op_n1, 0) as i64)
+                    r_s2 = 10
+                end
+                let op_s1_reg = mc_opnd_reg(r_s1)
+                let op_s2_reg = mc_opnd_reg(r_s2)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_CMP_RR, op_s1_reg, op_s2_reg, op_n0, op_n1, 0) as i64)
+                last_cmp_cond = lir_instr_aux(ins)
+                if rd >= 0 or is_stack_mem(d) do
+                    var r_dst = rd
+                    if is_stack_mem(d) do r_dst = 9 end
+                    var cset_opc = MCOpcode.ARM64_CSET_EQ
+                    if last_cmp_cond == LIR_CMP_EQ do cset_opc = MCOpcode.ARM64_CSET_EQ end
+                    if last_cmp_cond == LIR_CMP_NE do cset_opc = MCOpcode.ARM64_CSET_NE end
+                    if last_cmp_cond == LIR_CMP_GT do cset_opc = MCOpcode.ARM64_CSET_GT end
+                    if last_cmp_cond == LIR_CMP_LT do cset_opc = MCOpcode.ARM64_CSET_LT end
+                    if last_cmp_cond == LIR_CMP_GE do cset_opc = MCOpcode.ARM64_CSET_GE end
+                    if last_cmp_cond == LIR_CMP_LE do cset_opc = MCOpcode.ARM64_CSET_LE end
+                    let op_d = mc_opnd_reg(r_dst)
+                    insts = vec_push_rt(insts, mc_inst_new(cset_opc, op_d, op_n0, op_n0, op_n1, 0) as i64)
+                    if is_stack_mem(d) do
+                        let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_d, op_md, op_n0, op_n1, 0) as i64)
+                    end
+                end
+            eif op == LirOp.Jmp do
+                var tgt = 0 - 1
+                if (s1 as i64) > 4096 do
+                    let s1_typ = native_read_i64(s1 as i64, 0)
+                    if s1_typ == 6 do tgt = native_read_i64(s1 as i64, 40) end
+                    if s1_typ == 5 do tgt = native_read_i64(s1 as i64, 32) end
+                end
+                if tgt >= 0 do
+                    let op_jmp = mc_opnd_imm(fid * 10000 + tgt)
+                    let ins_b = mc_inst_new(MCOpcode.ARM64_B, op_jmp, op_n0, op_n0, op_n1, 0)
+                    insts = vec_push_rt(insts, ins_b as i64)
+                end
+            eif op == LirOp.JmpCond do
+                var tgt = 0 - 1
+                if (s2 as i64) > 4096 do
+                    let s2_typ = native_read_i64(s2 as i64, 0)
+                    if s2_typ == 6 do tgt = native_read_i64(s2 as i64, 40) end
+                    if s2_typ == 5 do tgt = native_read_i64(s2 as i64, 32) end
+                end
+                if tgt >= 0 do
+                    let op_target = mc_opnd_imm(fid * 10000 + tgt)
+                    let aux = lir_instr_aux(ins)
+                    var b_opc = MCOpcode.ARM64_BNE
+                    if aux == LIR_JMP_IF do
+                        b_opc = MCOpcode.ARM64_BNE
+                        if last_cmp_cond == LIR_CMP_EQ do b_opc = MCOpcode.ARM64_BEQ end
+                        if last_cmp_cond == LIR_CMP_GT do b_opc = MCOpcode.ARM64_BGT end
+                        if last_cmp_cond == LIR_CMP_LT do b_opc = MCOpcode.ARM64_BLT end
+                        if last_cmp_cond == LIR_CMP_GE do b_opc = MCOpcode.ARM64_BGE end
+                        if last_cmp_cond == LIR_CMP_LE do b_opc = MCOpcode.ARM64_BLE end
+                    else
+                        b_opc = MCOpcode.ARM64_BEQ
+                        if last_cmp_cond == LIR_CMP_EQ do b_opc = MCOpcode.ARM64_BNE end
+                        if last_cmp_cond == LIR_CMP_GT do b_opc = MCOpcode.ARM64_BLE end
+                        if last_cmp_cond == LIR_CMP_LT do b_opc = MCOpcode.ARM64_BGE end
+                        if last_cmp_cond == LIR_CMP_GE do b_opc = MCOpcode.ARM64_BLT end
+                        if last_cmp_cond == LIR_CMP_LE do b_opc = MCOpcode.ARM64_BGT end
+                    end
+                    let ins_cond = mc_inst_new(b_opc, op_target, op_n0, op_n0, op_n1, 0)
+                    insts = vec_push_rt(insts, ins_cond as i64)
+                end
+            eif op == LirOp.Call do
+                let n_stk = vec_len_rt(pending_stack_args)
+                var stk_bytes = 0
+                if n_stk > 0 do
+                    stk_bytes = (n_stk * 8) + 15
+                    stk_bytes = stk_bytes - (stk_bytes mod 16)
+                    let op_sp = mc_opnd_reg(31)
+                    let op_ssz = mc_opnd_imm(stk_bytes)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_SUB_IMM, op_sp, op_sp, op_ssz, op_n0, 0) as i64)
+                    var si = 0
+                    when si < n_stk loop
+                        let s_ins = vec_get_rt(pending_stack_args, si)
+                        let s_s2 = native_read_i64(s_ins as i64, 32)
+                        let s_rs2 = resolve_mc_reg(s_s2 as LirOperand, assigned_phys)
+                        var r_val = s_rs2
+                        if is_stack_mem(s_s2 as LirOperand) do
+                            let op_x9 = mc_opnd_reg(9)
+                            let op_mem_src = mc_opnd_mem(29, stack_mem_off(s_s2 as LirOperand))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_mem_src, op_n0, op_n1, 0) as i64)
+                            r_val = 9
+                        eif (s_s2 as i64) > 4096 and native_read_i64(s_s2 as i64, 0) == 5 do
+                            let imm = native_read_i64(s_s2 as i64, 32)
+                            let op_x9 = mc_opnd_reg(9)
+                            let op_imm = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x9, op_imm, op_n0, op_n1, 0) as i64)
+                            r_val = 9
+                        end
+                        let op_val = mc_opnd_reg(r_val)
+                        let op_mem = mc_opnd_mem(31, si * 8)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_val, op_mem, op_n0, op_n1, 0) as i64)
+                        si = si + 1
+                    end
+                    pending_stack_args = vec_new_rt()
+                end
+
+                let sid = native_read_i64(ins as i64, 40)
+                let ins_src2 = native_read_i64(ins as i64, 32)
+                var is_dynamic = 0
+                if sid < 0 do
+                    is_dynamic = 1
+                eif ins_src2 > 4096 do
+                    let s2_typ = native_read_i64(ins_src2, 0)
+                    if s2_typ == 1 or s2_typ == 2 or s2_typ == 3 do
+                        is_dynamic = 1
+                    end
+                end
+                if is_dynamic == 1 do
+                    var r_target = rs2
+                    if r_target < 0 do r_target = 16 end
+                    let op_r = mc_opnd_reg(r_target)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_BLR, op_r, op_n0, op_n0, op_n1, 0) as i64)
+                else
+                    let f_strings = native_read_i64(func_obj as i64, 32)
+                    var cname_str = 0
+                    if f_strings > 0 and sid >= 0 and sid < vec_len_rt(f_strings) do
+                        let fat_cname = vec_get_rt(f_strings, sid)
+                        if fat_cname != 0 do
+                            cname_str = native_read_i64(fat_cname, 0)
+                        end
+                    end
+                    if cname_str != 0 do
+                        let op_sym = mc_opnd_symbol(cname_str, RelocKind.ARM64_CALL26, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_BL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    end
+                end
+                if stk_bytes > 0 do
+                    let op_sp = mc_opnd_reg(31)
+                    let op_ssz = mc_opnd_imm(stk_bytes)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_ADD_IMM, op_sp, op_sp, op_ssz, op_n0, 0) as i64)
+                end
+                if rd >= 0 and rd != 0 do
+                    let op_d = mc_opnd_reg(rd)
+                    let op_ret = mc_opnd_reg(0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_d, op_ret, op_n0, op_n1, 0) as i64)
+                eif is_stack_mem(d) do
+                    let op_ret = mc_opnd_reg(0)
+                    let op_m = mc_opnd_mem(29, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_ret, op_m, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.SetArg do
+                let ai = native_read_i64(ins as i64, 40)
+                if ai >= 0 and ai < 8 do
+                    if is_stack_mem(s2) do
+                        let op_ar = mc_opnd_reg(ai)
+                        let op_m = mc_opnd_mem(29, stack_mem_off(s2))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_ar, op_m, op_n0, op_n1, 0) as i64)
+                    eif (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                        let imm = native_read_i64(s2 as i64, 32)
+                        let op_ar = mc_opnd_reg(ai)
+                        let op_imm = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_ar, op_imm, op_n0, op_n1, 0) as i64)
+                    eif rs2 >= 0 and rs2 != ai do
+                        let op_ar = mc_opnd_reg(ai)
+                        let op_s = mc_opnd_reg(rs2)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_ar, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                else
+                    pending_stack_args = vec_push_rt(pending_stack_args, ins)
+                end
+            eif op == LirOp.Intrinsic do
+                let kind = native_read_i64(ins as i64, 40)
+                if kind == MIR_INTR_PARAM do
+                    if (s1 as i64) > 4096 do
+                        let abi = native_read_i64(s1 as i64, 32)
+                        if abi >= 0 and abi < 8 do
+                            if rd >= 0 and rd != abi do
+                                let op_d = mc_opnd_reg(rd)
+                                let op_ar = mc_opnd_reg(abi)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_d, op_ar, op_n0, op_n1, 0) as i64)
+                            eif is_stack_mem(d) do
+                                let op_ar = mc_opnd_reg(abi)
+                                let op_m = mc_opnd_mem(29, stack_mem_off(d))
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_ar, op_m, op_n0, op_n1, 0) as i64)
+                            end
+                        eif abi >= 8 do
+                            let off = 16 + ((abi - 8) * 8)
+                            if rd >= 0 do
+                                let op_d = mc_opnd_reg(rd)
+                                let op_mem = mc_opnd_mem(29, off)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_d, op_mem, op_n0, op_n1, 0) as i64)
+                            eif is_stack_mem(d) do
+                                let op_x9 = mc_opnd_reg(9)
+                                let op_mem_src = mc_opnd_mem(29, off)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_mem_src, op_n0, op_n1, 0) as i64)
+                                let op_mem_dst = mc_opnd_mem(29, stack_mem_off(d))
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_x9, op_mem_dst, op_n0, op_n1, 0) as i64)
+                            end
+                        end
+                    end
+                eif kind == MIR_INTR_PRINT do
+                    var target_src = s1
+                    if (target_src as i64) <= 4096 or native_read_i64(target_src as i64, 0) == 0 do
+                        target_src = s2
+                    end
+                    if (target_src as i64) > 4096 do
+                        let t_typ = native_read_i64(target_src as i64, 0)
+                        if is_stack_mem(target_src as LirOperand) do
+                            let op_ar = mc_opnd_reg(0)
+                            let op_m = mc_opnd_mem(29, stack_mem_off(target_src as LirOperand))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_ar, op_m, op_n0, op_n1, 0) as i64)
+                        eif t_typ == 5 do # Imm
+                            let imm = native_read_i64(target_src as i64, 32)
+                            let op_ar = mc_opnd_reg(0)
+                            let op_imm = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_ar, op_imm, op_n0, op_n1, 0) as i64)
+                        else
+                            let r = resolve_mc_reg(target_src as LirOperand, assigned_phys)
+                            if r >= 0 and r != 0 do
+                                let op_ar = mc_opnd_reg(0)
+                                let op_s = mc_opnd_reg(r)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_ar, op_s, op_n0, op_n1, 0) as i64)
+                            end
+                        end
+                    end
+                    let op_sym = mc_opnd_symbol("rt_print_int", RelocKind.ARM64_CALL26, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_BL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                eif kind == MIR_INTR_PRINT_STR do
+                    var target_src2 = s1
+                    if (target_src2 as i64) <= 4096 or native_read_i64(target_src2 as i64, 0) == 0 do
+                        target_src2 = s2
+                    end
+                    if (target_src2 as i64) > 4096 do
+                        let t_typ = native_read_i64(target_src2 as i64, 0)
+                        if is_stack_mem(target_src2 as LirOperand) do
+                            let op_ar = mc_opnd_reg(0)
+                            let op_m = mc_opnd_mem(29, stack_mem_off(target_src2 as LirOperand))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_ar, op_m, op_n0, op_n1, 0) as i64)
+                        eif t_typ == 5 do # Imm
+                            let imm = native_read_i64(target_src2 as i64, 32)
+                            let op_ar = mc_opnd_reg(0)
+                            let op_imm = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_ar, op_imm, op_n0, op_n1, 0) as i64)
+                        else
+                            let r = resolve_mc_reg(target_src2 as LirOperand, assigned_phys)
+                            if r >= 0 and r != 0 do
+                                let op_ar = mc_opnd_reg(0)
+                                let op_s = mc_opnd_reg(r)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_ar, op_s, op_n0, op_n1, 0) as i64)
+                            end
+                        end
+                    end
+                    let op_sym = mc_opnd_symbol("rt_print_str", RelocKind.ARM64_CALL26, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_BL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                eif kind == MIR_INTR_STR_LIT do
+                    var sid = 0
+                    if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        sid = native_read_i64(s1 as i64, 32)
+                    end
+                    var r_dst = rd
+                    if is_stack_mem(d) do r_dst = 9 end
+                    if r_dst >= 0 do
+                        let sym = lir_mc_string_symbol(lir_func_id(func_obj), sid)
+                        let op_d = mc_opnd_reg(r_dst)
+                        let op_sym_page = mc_opnd_symbol(sym, RelocKind.ARM64_PAGE21, 0)
+                        let op_sym_off = mc_opnd_symbol(sym, RelocKind.ARM64_PAGEOFF12, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_ADRP, op_d, op_sym_page, op_n0, op_n1, 0) as i64)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_ADD_LO12, op_d, op_d, op_sym_off, op_n1, 0) as i64)
+                        if is_stack_mem(d) do
+                            let op_m = mc_opnd_mem(29, stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_d, op_m, op_n0, op_n1, 0) as i64)
+                        end
+                    end
+                eif kind == MIR_INTR_BUILTIN do
+                    var bid = 0
+                    if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        bid = native_read_i64(s1 as i64, 32)
+                    end
+                    if bid == 11 do
+                        let op_sym = mc_opnd_symbol("rt_str_cat", RelocKind.ARM64_CALL26, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_BL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    eif bid == 19 do
+                        let op_sym = mc_opnd_symbol("rt_int_to_str", RelocKind.ARM64_CALL26, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_BL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    end
+                    if rd >= 0 and rd != 0 do
+                        let op_d = mc_opnd_reg(rd)
+                        let op_ret = mc_opnd_reg(0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_d, op_ret, op_n0, op_n1, 0) as i64)
+                    eif is_stack_mem(d) do
+                        let op_ret = mc_opnd_reg(0)
+                        let op_m = mc_opnd_mem(29, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_ret, op_m, op_n0, op_n1, 0) as i64)
+                    end
+                eif kind == MIR_INTR_CAST do
+                    if is_stack_mem(d) do
+                        if is_stack_mem(s1) do
+                            let op_x9 = mc_opnd_reg(9)
+                            let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_x9, op_ms, op_n0, op_n1, 0) as i64)
+                            let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_x9, op_md, op_n0, op_n1, 0) as i64)
+                        eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                            let imm = native_read_i64(s1 as i64, 32)
+                            let op_x9 = mc_opnd_reg(9)
+                            let op_i = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_x9, op_i, op_n0, op_n1, 0) as i64)
+                            let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_x9, op_md, op_n0, op_n1, 0) as i64)
+                        eif rs1 >= 0 do
+                            let op_s = mc_opnd_reg(rs1)
+                            let op_md = mc_opnd_mem(29, stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_STR_UOFF, op_s, op_md, op_n0, op_n1, 0) as i64)
+                        end
+                    eif rd >= 0 do
+                        if is_stack_mem(s1) do
+                            let op_d = mc_opnd_reg(rd)
+                            let op_ms = mc_opnd_mem(29, stack_mem_off(s1))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_d, op_ms, op_n0, op_n1, 0) as i64)
+                        eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                            let imm = native_read_i64(s1 as i64, 32)
+                            let op_d = mc_opnd_reg(rd)
+                            let op_i = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_d, op_i, op_n0, op_n1, 0) as i64)
+                        eif rs1 >= 0 and rd != rs1 do
+                            let op_d = mc_opnd_reg(rd)
+                            let op_s = mc_opnd_reg(rs1)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_d, op_s, op_n0, op_n1, 0) as i64)
+                        end
+                    end
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Ret do
+                if is_stack_mem(s1) do
+                    let op_ar = mc_opnd_reg(0)
+                    let op_m = mc_opnd_mem(29, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDR_UOFF, op_ar, op_m, op_n0, op_n1, 0) as i64)
+                eif (s1 as i64) > 4096 do
+                    let s1_typ = native_read_i64(s1 as i64, 0)
+                    if s1_typ == 5 do # Imm
+                        let imm_val = native_read_i64(s1 as i64, 32)
+                        let op_ar = mc_opnd_reg(0)
+                        let op_imm = mc_opnd_imm(imm_val)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_ar, op_imm, op_n0, op_n1, 0) as i64)
+                    eif rs1 >= 0 and rs1 != 0 do
+                        let op_ar = mc_opnd_reg(0)
+                        let op_s = mc_opnd_reg(rs1)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_ar, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                eif rs1 >= 0 and rs1 != 0 do
+                    let op_ar = mc_opnd_reg(0)
+                    let op_s = mc_opnd_reg(rs1)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_ar, op_s, op_n0, op_n1, 0) as i64)
+                end
+                let op_sp = mc_opnd_reg(31)
+                let op_fp = mc_opnd_reg(29)
+                let op_lr = mc_opnd_reg(30)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_sp, op_fp, op_n0, op_n1, 0) as i64)
+                let op_64 = mc_opnd_imm(64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_SUB_IMM, op_sp, op_sp, op_64, op_n0, 0) as i64)
+                let op_x19 = mc_opnd_reg(19)
+                let op_x20 = mc_opnd_reg(20)
+                let op_x21 = mc_opnd_reg(21)
+                let op_x22 = mc_opnd_reg(22)
+                let op_x23 = mc_opnd_reg(23)
+                let op_x24 = mc_opnd_reg(24)
+                let op_x25 = mc_opnd_reg(25)
+                let op_x26 = mc_opnd_reg(26)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x25, op_x26, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x23, op_x24, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x21, op_x22, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x19, op_x20, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_fp, op_lr, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+                last_cmp_cond = 0 - 1
+            end
+
+            ii = ii + 1
+        end
+        bi = bi + 1
+    end
+
+    # Fall-through epilogue
+    let op_ret = mc_opnd_reg(0)
+    let op_imm0 = mc_opnd_imm(0)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOVZ, op_ret, op_imm0, op_n0, op_n1, 0) as i64)
+    let op_sp = mc_opnd_reg(31)
+    let op_fp = mc_opnd_reg(29)
+    let op_lr = mc_opnd_reg(30)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_sp, op_fp, op_n0, op_n1, 0) as i64)
+    let op_64 = mc_opnd_imm(64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_SUB_IMM, op_sp, op_sp, op_64, op_n0, 0) as i64)
+    let op_x19 = mc_opnd_reg(19)
+    let op_x20 = mc_opnd_reg(20)
+    let op_x21 = mc_opnd_reg(21)
+    let op_x22 = mc_opnd_reg(22)
+    let op_x23 = mc_opnd_reg(23)
+    let op_x24 = mc_opnd_reg(24)
+    let op_x25 = mc_opnd_reg(25)
+    let op_x26 = mc_opnd_reg(26)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x25, op_x26, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x23, op_x24, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x21, op_x22, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x19, op_x20, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_fp, op_lr, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.ARM64_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+
+    out insts
+end.
+
+# ═══════════════════════════════════════════════════════
+# 2. x86_64 Lowering (System V AMD64)
+# ═══════════════════════════════════════════════════════
+
+func x86_mc_arg_reg(idx: int):
+    if idx == 0 do out 7 end # RDI
+    if idx == 1 do out 6 end # RSI
+    if idx == 2 do out 2 end # RDX
+    if idx == 3 do out 1 end # RCX
+    if idx == 4 do out 8 end # R8
+    if idx == 5 do out 9 end # R9
+    out 0 # RAX
+end.
+
+func lir_func_to_mc_x86_64(func_obj: LirFunc, assigned_phys: i64):
+    var fid = lir_func_id(func_obj)
+    if fid < 0 do
+        fid = 0
+    else
+        fid = fid + 1
+    end
+    var insts = vec_new_rt()
+    let op_n0 = mc_opnd_none()
+    let op_n1 = mc_opnd_none()
+
+    # ── Prologue ──
+    # push rbp
+    let op_rbp = mc_opnd_reg(5)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_PUSH_R, op_rbp, op_n0, op_n0, op_n1, 0) as i64)
+    # mov rbp, rsp
+    let op_rsp = mc_opnd_reg(4)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_rbp, op_rsp, op_n0, op_n1, 0) as i64)
+
+    # push callee-saved registers: rbx(3), r12(12), r13(13), r14(14)
+    let op_rbx = mc_opnd_reg(3)
+    let op_r12 = mc_opnd_reg(12)
+    let op_r13 = mc_opnd_reg(13)
+    let op_r14 = mc_opnd_reg(14)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_PUSH_R, op_rbx, op_n0, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_PUSH_R, op_r12, op_n0, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_PUSH_R, op_r13, op_n0, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_PUSH_R, op_r14, op_n0, op_n0, op_n1, 0) as i64)
+
+    let ssz = lir_func_stack_size(func_obj)
+    var aligned_ssz = ssz
+    if (aligned_ssz mod 16) != 0 do
+        aligned_ssz = aligned_ssz + (16 - (aligned_ssz mod 16))
+    end
+    if aligned_ssz > 0 do
+        let op_ssz = mc_opnd_imm(aligned_ssz)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_SUB_RSP_IMM, op_ssz, op_n0, op_n0, op_n1, 0) as i64)
+    end
+
+    # ── Blocks & Instructions ──
+    let blocks = lir_func_blocks(func_obj)
+    let n_blocks = vec_len_rt(blocks)
+    var bi = 0
+    var last_cmp_cond = 0 - 1
+    var pending_stack_args = vec_new_rt()
+
+    when bi < n_blocks loop
+        let b = vec_get_rt(blocks, bi)
+        let bid = lir_block_id(b)
+
+        let op_lbl = mc_opnd_imm(fid * 10000 + bid)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.LABEL_DEF, op_lbl, op_n0, op_n0, op_n1, 0) as i64)
+
+        let binstrs = lir_block_instrs(b)
+        let n_ins = vec_len_rt(binstrs)
+        var ii = 0
+
+        when ii < n_ins loop
+            let ins = vec_get_rt(binstrs, ii)
+            let op = lir_instr_op(ins)
+            let d = lir_instr_dst(ins)
+            let s1 = lir_instr_src1(ins)
+            let s2 = lir_instr_src2(ins)
+            let rd = resolve_mc_reg(d, assigned_phys)
+            let rs1 = resolve_mc_reg(s1, assigned_phys)
+            let rs2 = resolve_mc_reg(s2, assigned_phys)
+
+            if op == LirOp.Mov do
+                if is_stack_mem(d) do
+                    if is_stack_mem(s1) do
+                        let op_r10 = mc_opnd_reg(10)
+                        let op_mem_s = mc_opnd_mem(5, stack_mem_off(s1))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_r10, op_mem_s, op_n0, op_n1, 0) as i64)
+                        let op_mem_d = mc_opnd_mem(5, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_mem_d, op_r10, op_n0, op_n1, 0) as i64)
+                    eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        let imm = native_read_i64(s1 as i64, 32)
+                        let op_r10 = mc_opnd_reg(10)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_r10, op_i, op_n0, op_n1, 0) as i64)
+                        let op_mem_d = mc_opnd_mem(5, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_mem_d, op_r10, op_n0, op_n1, 0) as i64)
+                    eif rs1 >= 0 do
+                        let op_s = mc_opnd_reg(rs1)
+                        let op_mem_d = mc_opnd_mem(5, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_mem_d, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                eif rd >= 0 do
+                    if is_stack_mem(s1) do
+                        let op_d = mc_opnd_reg(rd)
+                        let op_mem_s = mc_opnd_mem(5, stack_mem_off(s1))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_d, op_mem_s, op_n0, op_n1, 0) as i64)
+                    eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        let imm = native_read_i64(s1 as i64, 32)
+                        let op_d = mc_opnd_reg(rd)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_d, op_i, op_n0, op_n1, 0) as i64)
+                    eif rs1 >= 0 and rd != rs1 do
+                        let op_d = mc_opnd_reg(rd)
+                        let op_s = mc_opnd_reg(rs1)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_d, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Add or op == LirOp.Sub or op == LirOp.Mul or op == LirOp.And or op == LirOp.Or or op == LirOp.Xor do
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 10 end
+
+                # Step 1: load/mov s1 into r_dst
+                if is_stack_mem(s1) do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_ms = mc_opnd_mem(5, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_d, op_ms, op_n0, op_n1, 0) as i64)
+                eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_d, op_i, op_n0, op_n1, 0) as i64)
+                eif rs1 >= 0 and rs1 != r_dst do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s = mc_opnd_reg(rs1)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_d, op_s, op_n0, op_n1, 0) as i64)
+                end
+
+                # Step 2: apply s2 to r_dst
+                if (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                    let imm = native_read_i64(s2 as i64, 32)
+                    if (op == LirOp.Add or op == LirOp.Sub) and (imm >= 0 - 2147483648 and imm <= 2147483647) do
+                        var alu_ri = MCOpcode.X86_64_ADD_RI
+                        if op == LirOp.Sub do alu_ri = MCOpcode.X86_64_SUB_RI end
+                        let op_d = mc_opnd_reg(r_dst)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(alu_ri, op_d, op_i, op_n0, op_n1, 0) as i64)
+                    else
+                        let op_r11 = mc_opnd_reg(11)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_r11, op_i, op_n0, op_n1, 0) as i64)
+                        var alu_rr = MCOpcode.X86_64_ADD_RR
+                        if op == LirOp.Sub do alu_rr = MCOpcode.X86_64_SUB_RR end
+                        if op == LirOp.Mul do alu_rr = MCOpcode.X86_64_IMUL_RR end
+                        if op == LirOp.And do alu_rr = MCOpcode.X86_64_AND_RR end
+                        if op == LirOp.Or  do alu_rr = MCOpcode.X86_64_OR_RR end
+                        if op == LirOp.Xor do alu_rr = MCOpcode.X86_64_XOR_RR end
+                        let op_d = mc_opnd_reg(r_dst)
+                        insts = vec_push_rt(insts, mc_inst_new(alu_rr, op_d, op_r11, op_n0, op_n1, 0) as i64)
+                    end
+                eif is_stack_mem(s2) do
+                    let op_r11 = mc_opnd_reg(11)
+                    let op_ms2 = mc_opnd_mem(5, stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_r11, op_ms2, op_n0, op_n1, 0) as i64)
+                    var alu_rr = MCOpcode.X86_64_ADD_RR
+                    if op == LirOp.Sub do alu_rr = MCOpcode.X86_64_SUB_RR end
+                    if op == LirOp.Mul do alu_rr = MCOpcode.X86_64_IMUL_RR end
+                    if op == LirOp.And do alu_rr = MCOpcode.X86_64_AND_RR end
+                    if op == LirOp.Or  do alu_rr = MCOpcode.X86_64_OR_RR end
+                    if op == LirOp.Xor do alu_rr = MCOpcode.X86_64_XOR_RR end
+                    let op_d = mc_opnd_reg(r_dst)
+                    insts = vec_push_rt(insts, mc_inst_new(alu_rr, op_d, op_r11, op_n0, op_n1, 0) as i64)
+                else
+                    var alu_rr = MCOpcode.X86_64_ADD_RR
+                    if op == LirOp.Sub do alu_rr = MCOpcode.X86_64_SUB_RR end
+                    if op == LirOp.Mul do alu_rr = MCOpcode.X86_64_IMUL_RR end
+                    if op == LirOp.And do alu_rr = MCOpcode.X86_64_AND_RR end
+                    if op == LirOp.Or  do alu_rr = MCOpcode.X86_64_OR_RR end
+                    if op == LirOp.Xor do alu_rr = MCOpcode.X86_64_XOR_RR end
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s2 = mc_opnd_reg(rs2)
+                    insts = vec_push_rt(insts, mc_inst_new(alu_rr, op_d, op_s2, op_n0, op_n1, 0) as i64)
+                end
+
+                # Step 3: if d is StackMem, store back
+                if is_stack_mem(d) do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_d, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Div or op == LirOp.Rem do
+                let op_rax = mc_opnd_reg(0)
+                if is_stack_mem(s1) do
+                    let op_ms = mc_opnd_mem(5, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_rax, op_ms, op_n0, op_n1, 0) as i64)
+                eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_imm = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_rax, op_imm, op_n0, op_n1, 0) as i64)
+                eif rs1 >= 0 and rs1 != 0 do
+                    let op_s1 = mc_opnd_reg(rs1)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_rax, op_s1, op_n0, op_n1, 0) as i64)
+                end
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CQO, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+                let op_rcx = mc_opnd_reg(1)
+                if is_stack_mem(s2) do
+                    let op_ms2 = mc_opnd_mem(5, stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_rcx, op_ms2, op_n0, op_n1, 0) as i64)
+                eif (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                    let imm = native_read_i64(s2 as i64, 32)
+                    let op_imm = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_rcx, op_imm, op_n0, op_n1, 0) as i64)
+                eif rs2 >= 0 and rs2 != 1 do
+                    let op_s2 = mc_opnd_reg(rs2)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_rcx, op_s2, op_n0, op_n1, 0) as i64)
+                end
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_IDIV, op_rcx, op_n0, op_n0, op_n1, 0) as i64)
+                if op == LirOp.Div do
+                    if is_stack_mem(d) do
+                        let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_rax, op_n0, op_n1, 0) as i64)
+                    eif rd >= 0 and rd != 0 do
+                        let op_d = mc_opnd_reg(rd)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_d, op_rax, op_n0, op_n1, 0) as i64)
+                    end
+                else
+                    let op_rdx = mc_opnd_reg(2)
+                    if is_stack_mem(d) do
+                        let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_rdx, op_n0, op_n1, 0) as i64)
+                    eif rd >= 0 and rd != 2 do
+                        let op_d = mc_opnd_reg(rd)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_d, op_rdx, op_n0, op_n1, 0) as i64)
+                    end
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Shl or op == LirOp.Shr do
+                let op_rcx = mc_opnd_reg(1)
+                if is_stack_mem(s2) do
+                    let op_ms2 = mc_opnd_mem(5, stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_rcx, op_ms2, op_n0, op_n1, 0) as i64)
+                eif (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                    let imm = native_read_i64(s2 as i64, 32)
+                    let op_imm = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_rcx, op_imm, op_n0, op_n1, 0) as i64)
+                eif rs2 >= 0 and rs2 != 1 do
+                    let op_s2 = mc_opnd_reg(rs2)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_rcx, op_s2, op_n0, op_n1, 0) as i64)
+                end
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 10 end
+                if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_imm = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_d, op_imm, op_n0, op_n1, 0) as i64)
+                eif is_stack_mem(s1) do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_ms = mc_opnd_mem(5, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_d, op_ms, op_n0, op_n1, 0) as i64)
+                eif rs1 >= 0 and rs1 != r_dst do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s = mc_opnd_reg(rs1)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_d, op_s, op_n0, op_n1, 0) as i64)
+                end
+                var sh_opc = MCOpcode.X86_64_SHL_CL
+                if op == LirOp.Shr do sh_opc = MCOpcode.X86_64_SHR_CL end
+                let op_d = mc_opnd_reg(r_dst)
+                insts = vec_push_rt(insts, mc_inst_new(sh_opc, op_d, op_n0, op_n0, op_n1, 0) as i64)
+                if is_stack_mem(d) do
+                    let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_d, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Not do
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 10 end
+                if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_imm = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_d, op_imm, op_n0, op_n1, 0) as i64)
+                eif is_stack_mem(s1) do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_ms = mc_opnd_mem(5, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_d, op_ms, op_n0, op_n1, 0) as i64)
+                eif rs1 >= 0 and rs1 != r_dst do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s = mc_opnd_reg(rs1)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_d, op_s, op_n0, op_n1, 0) as i64)
+                end
+                let op_d = mc_opnd_reg(r_dst)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_NOT_R, op_d, op_n0, op_n0, op_n1, 0) as i64)
+                if is_stack_mem(d) do
+                    let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_d, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Cmp do
+                var r_s1 = rs1
+                if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_r10 = mc_opnd_reg(10)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_r10, op_i, op_n0, op_n1, 0) as i64)
+                    r_s1 = 10
+                eif is_stack_mem(s1) do
+                    let op_r10 = mc_opnd_reg(10)
+                    let op_ms = mc_opnd_mem(5, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_r10, op_ms, op_n0, op_n1, 0) as i64)
+                    r_s1 = 10
+                end
+                if is_stack_mem(s2) do
+                    let op_r11 = mc_opnd_reg(11)
+                    let op_ms2 = mc_opnd_mem(5, stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_r11, op_ms2, op_n0, op_n1, 0) as i64)
+                    let op_s1 = mc_opnd_reg(r_s1)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CMP_RR, op_s1, op_r11, op_n0, op_n1, 0) as i64)
+                eif (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                    let imm = native_read_i64(s2 as i64, 32)
+                    if imm >= 0 - 2147483648 and imm <= 2147483647 do
+                        let op_s1 = mc_opnd_reg(r_s1)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CMP_RI, op_s1, op_i, op_n0, op_n1, 0) as i64)
+                    else
+                        let op_r11 = mc_opnd_reg(11)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_r11, op_i, op_n0, op_n1, 0) as i64)
+                        let op_s1 = mc_opnd_reg(r_s1)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CMP_RR, op_s1, op_r11, op_n0, op_n1, 0) as i64)
+                    end
+                else
+                    let op_s1 = mc_opnd_reg(r_s1)
+                    let op_s2 = mc_opnd_reg(rs2)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CMP_RR, op_s1, op_s2, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = lir_instr_aux(ins)
+                if rd >= 0 or is_stack_mem(d) do
+                    var r_dst = rd
+                    if is_stack_mem(d) do r_dst = 10 end
+                    var set_opc = MCOpcode.X86_64_SETE
+                    if last_cmp_cond == LIR_CMP_EQ do set_opc = MCOpcode.X86_64_SETE end
+                    if last_cmp_cond == LIR_CMP_NE do set_opc = MCOpcode.X86_64_SETNE end
+                    if last_cmp_cond == LIR_CMP_GT do set_opc = MCOpcode.X86_64_SETG end
+                    if last_cmp_cond == LIR_CMP_LT do set_opc = MCOpcode.X86_64_SETL end
+                    if last_cmp_cond == LIR_CMP_GE do set_opc = MCOpcode.X86_64_SETGE end
+                    if last_cmp_cond == LIR_CMP_LE do set_opc = MCOpcode.X86_64_SETLE end
+                    let op_d = mc_opnd_reg(r_dst)
+                    insts = vec_push_rt(insts, mc_inst_new(set_opc, op_d, op_n0, op_n0, op_n1, 0) as i64)
+                    if is_stack_mem(d) do
+                        let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_d, op_n0, op_n1, 0) as i64)
+                    end
+                end
+            eif op == LirOp.Load do
+                var r_base = rs1
+                if is_stack_mem(s1) do
+                    let op_r10 = mc_opnd_reg(10)
+                    let op_ms = mc_opnd_mem(5, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_r10, op_ms, op_n0, op_n1, 0) as i64)
+                    r_base = 10
+                end
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 10 end
+                if r_dst >= 0 and r_base >= 0 do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_m = mc_opnd_mem(r_base, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_d, op_m, op_n0, op_n1, 0) as i64)
+                end
+                if is_stack_mem(d) do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_d, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Store do
+                var r_val = rs1
+                if is_stack_mem(s1) do
+                    let op_r10 = mc_opnd_reg(10)
+                    let op_ms = mc_opnd_mem(5, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_r10, op_ms, op_n0, op_n1, 0) as i64)
+                    r_val = 10
+                end
+                var r_base = rs2
+                if is_stack_mem(s2) do
+                    let op_r11 = mc_opnd_reg(11)
+                    let op_ms2 = mc_opnd_mem(5, stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_r11, op_ms2, op_n0, op_n1, 0) as i64)
+                    r_base = 11
+                end
+                if r_val >= 0 and r_base >= 0 do
+                    let op_s = mc_opnd_reg(r_val)
+                    let op_m = mc_opnd_mem(r_base, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_m, op_s, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Jmp do
+                var tgt = 0 - 1
+                if (s1 as i64) > 4096 do
+                    let s1_typ = native_read_i64(s1 as i64, 0)
+                    if s1_typ == 6 do tgt = native_read_i64(s1 as i64, 40) end
+                    if s1_typ == 5 do tgt = native_read_i64(s1 as i64, 32) end
+                end
+                if tgt >= 0 do
+                    let op_jmp = mc_opnd_imm(fid * 10000 + tgt)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_JMP, op_jmp, op_n0, op_n0, op_n1, 0) as i64)
+                end
+            eif op == LirOp.JmpCond do
+                var tgt = 0 - 1
+                if (s2 as i64) > 4096 do
+                    let s2_typ = native_read_i64(s2 as i64, 0)
+                    if s2_typ == 6 do tgt = native_read_i64(s2 as i64, 40) end
+                    if s2_typ == 5 do tgt = native_read_i64(s2 as i64, 32) end
+                end
+                if tgt >= 0 do
+                    let op_target = mc_opnd_imm(fid * 10000 + tgt)
+                    let aux = lir_instr_aux(ins)
+                    var b_opc = MCOpcode.X86_64_JNE
+                    if aux == LIR_JMP_IF do
+                        b_opc = MCOpcode.X86_64_JNE
+                        if last_cmp_cond == LIR_CMP_EQ do b_opc = MCOpcode.X86_64_JE end
+                        if last_cmp_cond == LIR_CMP_GT do b_opc = MCOpcode.X86_64_JG end
+                        if last_cmp_cond == LIR_CMP_LT do b_opc = MCOpcode.X86_64_JL end
+                        if last_cmp_cond == LIR_CMP_GE do b_opc = MCOpcode.X86_64_JGE end
+                        if last_cmp_cond == LIR_CMP_LE do b_opc = MCOpcode.X86_64_JLE end
+                    else
+                        b_opc = MCOpcode.X86_64_JE
+                        if last_cmp_cond == LIR_CMP_EQ do b_opc = MCOpcode.X86_64_JNE end
+                        if last_cmp_cond == LIR_CMP_GT do b_opc = MCOpcode.X86_64_JLE end
+                        if last_cmp_cond == LIR_CMP_LT do b_opc = MCOpcode.X86_64_JGE end
+                        if last_cmp_cond == LIR_CMP_GE do b_opc = MCOpcode.X86_64_JL end
+                        if last_cmp_cond == LIR_CMP_LE do b_opc = MCOpcode.X86_64_JG end
+                    end
+                    insts = vec_push_rt(insts, mc_inst_new(b_opc, op_target, op_n0, op_n0, op_n1, 0) as i64)
+                end
+            eif op == LirOp.Call do
+                let n_stk = vec_len_rt(pending_stack_args)
+                var stk_bytes = 0
+                if n_stk > 0 do
+                    stk_bytes = (n_stk * 8) + 15
+                    stk_bytes = stk_bytes - (stk_bytes mod 16)
+                    let op_ssz = mc_opnd_imm(stk_bytes)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_SUB_RSP_IMM, op_ssz, op_n0, op_n0, op_n1, 0) as i64)
+                    var si = 0
+                    when si < n_stk loop
+                        let s_ins = vec_get_rt(pending_stack_args, si)
+                        let s_s2 = native_read_i64(s_ins as i64, 32)
+                        let s_rs2 = resolve_mc_reg(s_s2 as LirOperand, assigned_phys)
+                        var r_val = s_rs2
+                        if is_stack_mem(s_s2 as LirOperand) do
+                            let op_r10 = mc_opnd_reg(10)
+                            let op_mem_src = mc_opnd_mem(5, stack_mem_off(s_s2 as LirOperand))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_r10, op_mem_src, op_n0, op_n1, 0) as i64)
+                            r_val = 10
+                        eif (s_s2 as i64) > 4096 and native_read_i64(s_s2 as i64, 0) == 5 do
+                            let imm = native_read_i64(s_s2 as i64, 32)
+                            let op_r10 = mc_opnd_reg(10)
+                            let op_imm = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_r10, op_imm, op_n0, op_n1, 0) as i64)
+                            r_val = 10
+                        end
+                        let op_val = mc_opnd_reg(r_val)
+                        let op_mem = mc_opnd_mem(4, si * 8) # rsp is 4
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_mem, op_val, op_n0, op_n1, 0) as i64)
+                        si = si + 1
+                    end
+                    pending_stack_args = vec_new_rt()
+                end
+
+                let sid = native_read_i64(ins as i64, 40)
+                let ins_src2 = native_read_i64(ins as i64, 32)
+                var is_dynamic = 0
+                if sid < 0 do
+                    is_dynamic = 1
+                eif ins_src2 > 4096 do
+                    let s2_typ = native_read_i64(ins_src2, 0)
+                    if s2_typ == 1 or s2_typ == 2 or s2_typ == 3 do
+                        is_dynamic = 1
+                    end
+                end
+                if is_dynamic == 1 do
+                    var r_target = rs2
+                    if r_target < 0 do r_target = 10 end # R10
+                    let op_r = mc_opnd_reg(r_target)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CALL_R, op_r, op_n0, op_n0, op_n1, 0) as i64)
+                else
+                    let f_strings = native_read_i64(func_obj as i64, 32)
+                    var cname_str = 0
+                    if f_strings > 0 and sid >= 0 and sid < vec_len_rt(f_strings) do
+                        let fat_cname = vec_get_rt(f_strings, sid)
+                        if fat_cname != 0 do
+                            cname_str = native_read_i64(fat_cname, 0)
+                        end
+                    end
+                    if cname_str != 0 do
+                        let op_sym = mc_opnd_symbol(cname_str, RelocKind.X86_64_PLT32, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CALL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    end
+                end
+                if stk_bytes > 0 do
+                    let op_ssz = mc_opnd_imm(stk_bytes)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_ADD_RSP_IMM, op_ssz, op_n0, op_n0, op_n1, 0) as i64)
+                end
+                if rd >= 0 and rd != 0 do
+                    let op_d = mc_opnd_reg(rd)
+                    let op_rax = mc_opnd_reg(0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_d, op_rax, op_n0, op_n1, 0) as i64)
+                eif is_stack_mem(d) do
+                    let op_rax = mc_opnd_reg(0)
+                    let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_rax, op_n0, op_n1, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.SetArg do
+                let ai = native_read_i64(ins as i64, 40)
+                if ai >= 0 and ai < 6 do
+                    let arg_r = x86_mc_arg_reg(ai)
+                    if is_stack_mem(s2) do
+                        let op_ar = mc_opnd_reg(arg_r)
+                        let op_ms = mc_opnd_mem(5, stack_mem_off(s2))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_ar, op_ms, op_n0, op_n1, 0) as i64)
+                    eif (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                        let imm = native_read_i64(s2 as i64, 32)
+                        let op_ar = mc_opnd_reg(arg_r)
+                        let op_imm = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_ar, op_imm, op_n0, op_n1, 0) as i64)
+                    eif rs2 >= 0 and rs2 != arg_r do
+                        let op_ar = mc_opnd_reg(arg_r)
+                        let op_s = mc_opnd_reg(rs2)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_ar, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                else
+                    pending_stack_args = vec_push_rt(pending_stack_args, ins)
+                end
+            eif op == LirOp.Intrinsic do
+                let kind = native_read_i64(ins as i64, 40)
+                if kind == MIR_INTR_PARAM do
+                    if (s1 as i64) > 4096 do
+                        let abi = native_read_i64(s1 as i64, 32)
+                        if abi >= 0 and abi < 6 do
+                            let arg_r = x86_mc_arg_reg(abi)
+                            if rd >= 0 and rd != arg_r do
+                                let op_d = mc_opnd_reg(rd)
+                                let op_ar = mc_opnd_reg(arg_r)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_d, op_ar, op_n0, op_n1, 0) as i64)
+                            eif is_stack_mem(d) do
+                                let op_ar = mc_opnd_reg(arg_r)
+                                let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_ar, op_n0, op_n1, 0) as i64)
+                            end
+                        eif abi >= 6 do
+                            let off = 16 + ((abi - 6) * 8)
+                            if rd >= 0 do
+                                let op_d = mc_opnd_reg(rd)
+                                let op_mem = mc_opnd_mem(5, off) # rbp is 5
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_d, op_mem, op_n0, op_n1, 0) as i64)
+                            eif is_stack_mem(d) do
+                                let op_r10 = mc_opnd_reg(10)
+                                let op_mem_src = mc_opnd_mem(5, off)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_r10, op_mem_src, op_n0, op_n1, 0) as i64)
+                                let op_mem_dst = mc_opnd_mem(5, stack_mem_off(d))
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_mem_dst, op_r10, op_n0, op_n1, 0) as i64)
+                            end
+                        end
+                    end
+                eif kind == MIR_INTR_PRINT do
+                    var target_src = s1
+                    if (target_src as i64) <= 4096 or native_read_i64(target_src as i64, 0) == 0 do
+                        target_src = s2
+                    end
+                    if (target_src as i64) > 4096 do
+                        let t_typ = native_read_i64(target_src as i64, 0)
+                        if is_stack_mem(target_src as LirOperand) do
+                            let op_ar = mc_opnd_reg(7) # RDI
+                            let op_mem = mc_opnd_mem(5, stack_mem_off(target_src as LirOperand))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_ar, op_mem, op_n0, op_n1, 0) as i64)
+                        eif t_typ == 5 do # Imm
+                            let imm = native_read_i64(target_src as i64, 32)
+                            let op_ar = mc_opnd_reg(7) # RDI
+                            let op_imm = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_ar, op_imm, op_n0, op_n1, 0) as i64)
+                        else
+                            let r = resolve_mc_reg(target_src as LirOperand, assigned_phys)
+                            if r >= 0 and r != 7 do
+                                let op_ar = mc_opnd_reg(7) # RDI
+                                let op_s = mc_opnd_reg(r)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_ar, op_s, op_n0, op_n1, 0) as i64)
+                            end
+                        end
+                    end
+                    let op_sym = mc_opnd_symbol("rt_print_int", RelocKind.X86_64_PLT32, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CALL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                eif kind == MIR_INTR_PRINT_STR do
+                    var target_src2 = s1
+                    if (target_src2 as i64) <= 4096 or native_read_i64(target_src2 as i64, 0) == 0 do
+                        target_src2 = s2
+                    end
+                    if (target_src2 as i64) > 4096 do
+                        let t_typ = native_read_i64(target_src2 as i64, 0)
+                        if is_stack_mem(target_src2 as LirOperand) do
+                            let op_ar = mc_opnd_reg(7) # RDI
+                            let op_mem = mc_opnd_mem(5, stack_mem_off(target_src2 as LirOperand))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_ar, op_mem, op_n0, op_n1, 0) as i64)
+                        eif t_typ == 5 do # Imm
+                            let imm = native_read_i64(target_src2 as i64, 32)
+                            let op_ar = mc_opnd_reg(7) # RDI
+                            let op_imm = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_ar, op_imm, op_n0, op_n1, 0) as i64)
+                        else
+                            let r = resolve_mc_reg(target_src2 as LirOperand, assigned_phys)
+                            if r >= 0 and r != 7 do
+                                let op_ar = mc_opnd_reg(7) # RDI
+                                let op_s = mc_opnd_reg(r)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_ar, op_s, op_n0, op_n1, 0) as i64)
+                            end
+                        end
+                    end
+                    let op_sym = mc_opnd_symbol("rt_print_str", RelocKind.X86_64_PLT32, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CALL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                eif kind == MIR_INTR_STR_LIT do
+                    var sid = 0
+                    if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        sid = native_read_i64(s1 as i64, 32)
+                    end
+                    var r_dst = rd
+                    if is_stack_mem(d) do r_dst = 10 end
+                    if r_dst >= 0 do
+                        let sym = lir_mc_string_symbol(lir_func_id(func_obj), sid)
+                        let op_d = mc_opnd_reg(r_dst)
+                        let op_sym = mc_opnd_symbol(sym, RelocKind.X86_64_PC32, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_LEA_RIP, op_d, op_sym, op_n0, op_n1, 0) as i64)
+                        if is_stack_mem(d) do
+                            let op_m = mc_opnd_mem(5, stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_m, op_d, op_n0, op_n1, 0) as i64)
+                        end
+                    end
+                eif kind == MIR_INTR_BUILTIN do
+                    var bid = 0
+                    if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        bid = native_read_i64(s1 as i64, 32)
+                    end
+                    if bid == 11 do
+                        let op_sym = mc_opnd_symbol("rt_str_cat", RelocKind.X86_64_PLT32, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CALL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    eif bid == 19 do
+                        let op_sym = mc_opnd_symbol("rt_int_to_str", RelocKind.X86_64_PLT32, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_CALL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    end
+                    if rd >= 0 and rd != 0 do
+                        let op_d = mc_opnd_reg(rd)
+                        let op_rax = mc_opnd_reg(0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_d, op_rax, op_n0, op_n1, 0) as i64)
+                    eif is_stack_mem(d) do
+                        let op_rax = mc_opnd_reg(0)
+                        let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_rax, op_n0, op_n1, 0) as i64)
+                    end
+                eif kind == MIR_INTR_CAST do
+                    if is_stack_mem(d) do
+                        if is_stack_mem(s1) do
+                            let op_rax = mc_opnd_reg(0)
+                            let op_ms = mc_opnd_mem(5, stack_mem_off(s1))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_rax, op_ms, op_n0, op_n1, 0) as i64)
+                            let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_rax, op_n0, op_n1, 0) as i64)
+                        eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                            let imm = native_read_i64(s1 as i64, 32)
+                            let op_r10 = mc_opnd_reg(10)
+                            let op_i = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_r10, op_i, op_n0, op_n1, 0) as i64)
+                            let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_r10, op_n0, op_n1, 0) as i64)
+                        eif rs1 >= 0 do
+                            let op_s = mc_opnd_reg(rs1)
+                            let op_md = mc_opnd_mem(5, stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_STORE, op_md, op_s, op_n0, op_n1, 0) as i64)
+                        end
+                    eif rd >= 0 do
+                        if is_stack_mem(s1) do
+                            let op_d = mc_opnd_reg(rd)
+                            let op_ms = mc_opnd_mem(5, stack_mem_off(s1))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_d, op_ms, op_n0, op_n1, 0) as i64)
+                        eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                            let imm = native_read_i64(s1 as i64, 32)
+                            let op_d = mc_opnd_reg(rd)
+                            let op_i = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_d, op_i, op_n0, op_n1, 0) as i64)
+                        eif rs1 >= 0 and rd != rs1 do
+                            let op_d = mc_opnd_reg(rd)
+                            let op_s = mc_opnd_reg(rs1)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_d, op_s, op_n0, op_n1, 0) as i64)
+                        end
+                    end
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Ret do
+                if is_stack_mem(s1) do
+                    let op_rax = mc_opnd_reg(0)
+                    let op_ms = mc_opnd_mem(5, stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_LOAD, op_rax, op_ms, op_n0, op_n1, 0) as i64)
+                eif (s1 as i64) > 4096 do
+                    let s1_typ = native_read_i64(s1 as i64, 0)
+                    if s1_typ == 5 do # Imm
+                        let imm_val = native_read_i64(s1 as i64, 32)
+                        let op_rax = mc_opnd_reg(0)
+                        let op_imm = mc_opnd_imm(imm_val)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_rax, op_imm, op_n0, op_n1, 0) as i64)
+                    eif rs1 >= 0 and rs1 != 0 do
+                        let op_rax = mc_opnd_reg(0)
+                        let op_s = mc_opnd_reg(rs1)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_rax, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                eif rs1 >= 0 and rs1 != 0 do
+                    let op_rax = mc_opnd_reg(0)
+                    let op_s = mc_opnd_reg(rs1)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_rax, op_s, op_n0, op_n1, 0) as i64)
+                end
+                let op_rsp = mc_opnd_reg(4)
+                let op_rbp = mc_opnd_reg(5)
+                let op_rbx = mc_opnd_reg(3)
+                let op_r12 = mc_opnd_reg(12)
+                let op_r13 = mc_opnd_reg(13)
+                let op_r14 = mc_opnd_reg(14)
+                let op_32 = mc_opnd_imm(32)
+
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_rsp, op_rbp, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_SUB_RSP_IMM, op_32, op_n0, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r14, op_n0, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r13, op_n0, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r12, op_n0, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_rbx, op_n0, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_rbp, op_n0, op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+                last_cmp_cond = 0 - 1
+            end
+
+            ii = ii + 1
+        end
+        bi = bi + 1
+    end
+
+    # Fall-through epilogue
+    let op_rax = mc_opnd_reg(0)
+    let op_imm0 = mc_opnd_imm(0)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_rax, op_imm0, op_n0, op_n1, 0) as i64)
+    let op_rsp = mc_opnd_reg(4)
+    let op_rbp = mc_opnd_reg(5)
+    let op_rbx = mc_opnd_reg(3)
+    let op_r12 = mc_opnd_reg(12)
+    let op_r13 = mc_opnd_reg(13)
+    let op_r14 = mc_opnd_reg(14)
+    let op_32 = mc_opnd_imm(32)
+
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_rsp, op_rbp, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_SUB_RSP_IMM, op_32, op_n0, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r14, op_n0, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r13, op_n0, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r12, op_n0, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_rbx, op_n0, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_rbp, op_n0, op_n0, op_n1, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+
+    out insts
+end.
+
+# ═══════════════════════════════════════════════════════
+# 3. RISC-V 64 Lowering
+# ═══════════════════════════════════════════════════════
+
+func riscv_mc_arg_reg(idx: int):
+    if idx >= 0 and idx < 8 do
+        out 10 + idx # a0..a7
+    end
+    out 10 # a0
+end.
+
+func emit_riscv_stack_adjust(insts: i64, op_reg: MCInstOperand, delta: int, op_n0: MCInstOperand):
+    if delta < 0 do
+        var rem = 0 - delta
+        when rem > 2000 loop
+            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADDI, op_reg, op_reg, mc_opnd_imm(0 - 2000), op_n0, 0) as i64)
+            rem = rem - 2000
+        end
+        if rem > 0 do
+            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADDI, op_reg, op_reg, mc_opnd_imm(0 - rem), op_n0, 0) as i64)
+        end
+    else
+        var rem = delta
+        when rem > 2000 loop
+            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADDI, op_reg, op_reg, mc_opnd_imm(2000), op_n0, 0) as i64)
+            rem = rem - 2000
+        end
+        if rem > 0 do
+            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADDI, op_reg, op_reg, mc_opnd_imm(rem), op_n0, 0) as i64)
+        end
+    end
+    out insts
+end.
+
+func lir_func_to_mc_riscv64(func_obj: LirFunc, assigned_phys: i64):
+    var fid = lir_func_id(func_obj)
+    if fid < 0 do
+        fid = 0
+    else
+        fid = fid + 1
+    end
+    var insts = vec_new_rt()
+    let op_n0 = mc_opnd_none()
+    let op_n1 = mc_opnd_none()
+
+    let ssz = lir_func_stack_size(func_obj)
+    var aligned_ssz = ssz
+    if (aligned_ssz mod 16) != 0 do
+        aligned_ssz = aligned_ssz + (16 - (aligned_ssz mod 16))
+    end
+    # ra(1), s0(8), s2..s9(18..25): total 10 regs = 80 bytes.
+    let total_ssz = aligned_ssz + 80
+
+    # ── Prologue ──
+    let op_sp = mc_opnd_reg(2)
+    insts = emit_riscv_stack_adjust(insts, op_sp, 0 - total_ssz, op_n0)
+    # sd ra, 0(sp)
+    let op_ra = mc_opnd_reg(1)
+    let op_off_ra = mc_opnd_imm(0)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_ra, op_sp, op_off_ra, op_n0, 0) as i64)
+    # sd s0, 8(sp)
+    let op_s0 = mc_opnd_reg(8)
+    let op_off_s0 = mc_opnd_imm(8)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_s0, op_sp, op_off_s0, op_n0, 0) as i64)
+    # Save s2..s9
+    var si_cs = 0
+    when si_cs < 8 loop
+        let op_sr = mc_opnd_reg(18 + si_cs)
+        let off_sr = mc_opnd_imm(16 + (si_cs * 8))
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_sr, op_sp, off_sr, op_n0, 0) as i64)
+        si_cs = si_cs + 1
+    end
+    # addi s0, sp, total_ssz
+    if total_ssz <= 2047 do
+        let op_p_ssz = mc_opnd_imm(total_ssz)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADDI, op_s0, op_sp, op_p_ssz, op_n0, 0) as i64)
+    else
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADDI, op_s0, op_sp, mc_opnd_imm(0), op_n0, 0) as i64)
+        insts = emit_riscv_stack_adjust(insts, op_s0, total_ssz, op_n0)
+    end
+
+    # ── Blocks & Instructions ──
+    let blocks = lir_func_blocks(func_obj)
+    let n_blocks = vec_len_rt(blocks)
+    var bi = 0
+    var last_cmp_cond = 0 - 1
+    var last_cmp_rs1 = 0 - 1
+    var last_cmp_rs2 = 0 - 1
+    var pending_stack_args = vec_new_rt()
+
+    when bi < n_blocks loop
+        let b = vec_get_rt(blocks, bi)
+        let bid = lir_block_id(b)
+
+        let op_lbl = mc_opnd_imm(fid * 10000 + bid)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.LABEL_DEF, op_lbl, op_n0, op_n0, op_n1, 0) as i64)
+
+        let binstrs = lir_block_instrs(b)
+        let n_ins = vec_len_rt(binstrs)
+        var ii = 0
+
+        when ii < n_ins loop
+            let ins = vec_get_rt(binstrs, ii)
+            let op = lir_instr_op(ins)
+            let d = lir_instr_dst(ins)
+            let s1 = lir_instr_src1(ins)
+            let s2 = lir_instr_src2(ins)
+            let rd = resolve_mc_reg(d, assigned_phys)
+            let rs1 = resolve_mc_reg(s1, assigned_phys)
+            let rs2 = resolve_mc_reg(s2, assigned_phys)
+
+            if op == LirOp.Mov do
+                if is_stack_mem(d) do
+                    if is_stack_mem(s1) do
+                        let op_t0 = mc_opnd_reg(5)
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off_s, op_n0, 0) as i64)
+                        let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_t0, op_s0_b, op_off_d, op_n0, 0) as i64)
+                    eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        let imm = native_read_i64(s1 as i64, 32)
+                        let op_t0 = mc_opnd_reg(5)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_t0, op_i, op_n0, op_n1, 0) as i64)
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_t0, op_s0_b, op_off_d, op_n0, 0) as i64)
+                    eif rs1 >= 0 do
+                        let op_s = mc_opnd_reg(rs1)
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_s, op_s0_b, op_off_d, op_n0, 0) as i64)
+                    end
+                eif rd >= 0 do
+                    if is_stack_mem(s1) do
+                        let op_d = mc_opnd_reg(rd)
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_d, op_s0_b, op_off_s, op_n0, 0) as i64)
+                    eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        let imm = native_read_i64(s1 as i64, 32)
+                        let op_d = mc_opnd_reg(rd)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_d, op_i, op_n0, op_n1, 0) as i64)
+                    eif rs1 >= 0 and rd != rs1 do
+                        let op_d = mc_opnd_reg(rd)
+                        let op_s = mc_opnd_reg(rs1)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_d, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Add or op == LirOp.Sub or op == LirOp.Mul or op == LirOp.Div or op == LirOp.Rem or op == LirOp.And or op == LirOp.Or or op == LirOp.Xor or op == LirOp.Shl or op == LirOp.Shr do
+                var r_s1 = rs1
+                if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_t0 = mc_opnd_reg(5)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_t0, op_i, op_n0, op_n1, 0) as i64)
+                    r_s1 = 5
+                eif is_stack_mem(s1) do
+                    let op_t0 = mc_opnd_reg(5)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off_s, op_n0, 0) as i64)
+                    r_s1 = 5
+                end
+                var r_s2 = rs2
+                var is_imm_addi = 0
+                var addi_imm = 0
+                if (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                    let imm = native_read_i64(s2 as i64, 32)
+                    if op == LirOp.Add and (imm >= 0 - 2048 and imm <= 2047) do
+                        is_imm_addi = 1
+                        addi_imm = imm
+                    eif op == LirOp.Sub and ((0 - imm) >= 0 - 2048 and (0 - imm) <= 2047) do
+                        is_imm_addi = 1
+                        addi_imm = 0 - imm
+                    else
+                        let op_t1 = mc_opnd_reg(6)
+                        let op_i = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_t1, op_i, op_n0, op_n1, 0) as i64)
+                        r_s2 = 6
+                    end
+                eif is_stack_mem(s2) do
+                    let op_t1 = mc_opnd_reg(6)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_s2 = mc_opnd_imm(stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t1, op_s0_b, op_off_s2, op_n0, 0) as i64)
+                    r_s2 = 6
+                end
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 5 end
+                if is_imm_addi == 1 do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s1_reg = mc_opnd_reg(r_s1)
+                    let op_i = mc_opnd_imm(addi_imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADDI, op_d, op_s1_reg, op_i, op_n0, 0) as i64)
+                else
+                    var opc = MCOpcode.RISCV_ADD
+                    if op == LirOp.Sub do opc = MCOpcode.RISCV_SUB end
+                    if op == LirOp.Mul do opc = MCOpcode.RISCV_MUL end
+                    if op == LirOp.Div do opc = MCOpcode.RISCV_DIV end
+                    if op == LirOp.Rem do opc = MCOpcode.RISCV_REM end
+                    if op == LirOp.And do opc = MCOpcode.RISCV_AND end
+                    if op == LirOp.Or  do opc = MCOpcode.RISCV_OR end
+                    if op == LirOp.Xor do opc = MCOpcode.RISCV_XOR end
+                    if op == LirOp.Shl do opc = MCOpcode.RISCV_SLL end
+                    if op == LirOp.Shr do opc = MCOpcode.RISCV_SRL end
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s1_reg = mc_opnd_reg(r_s1)
+                    let op_s2_reg = mc_opnd_reg(r_s2)
+                    insts = vec_push_rt(insts, mc_inst_new(opc, op_d, op_s1_reg, op_s2_reg, op_n0, 0) as i64)
+                end
+                if is_stack_mem(d) do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_d, op_s0_b, op_off_d, op_n0, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.MatMul or op == LirOp.Fma do
+                let ins_aux = native_read_i64(ins as i64, 40)
+                let dim_m = (ins_aux shr 32) and 65535
+                let dim_k = (ins_aux shr 16) and 65535
+                let dim_n = ins_aux and 65535
+
+                if is_stack_mem(s1) do
+                    let op_a0 = mc_opnd_reg(10)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_a0, op_s0_b, op_off_s, op_n0, 0) as i64)
+                eif rs1 >= 0 and rs1 != 10 do
+                    let op_a0 = mc_opnd_reg(10)
+                    let op_s = mc_opnd_reg(rs1)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_a0, op_s, op_n0, op_n1, 0) as i64)
+                end
+
+                if is_stack_mem(s2) do
+                    let op_a1 = mc_opnd_reg(11)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_s = mc_opnd_imm(stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_a1, op_s0_b, op_off_s, op_n0, 0) as i64)
+                eif rs2 >= 0 and rs2 != 11 do
+                    let op_a1 = mc_opnd_reg(11)
+                    let op_s = mc_opnd_reg(rs2)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_a1, op_s, op_n0, op_n1, 0) as i64)
+                end
+
+                let op_a2 = mc_opnd_reg(12)
+                let op_a3 = mc_opnd_reg(13)
+                let op_a4 = mc_opnd_reg(14)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_a2, mc_opnd_imm(dim_m), op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_a3, mc_opnd_imm(dim_k), op_n0, op_n1, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_a4, mc_opnd_imm(dim_n), op_n0, op_n1, 0) as i64)
+
+                var sym_name = "rt_matmul"
+                if op == LirOp.Fma do sym_name = "rt_fma" end
+                let op_sym = mc_opnd_symbol(sym_name, RelocKind.RISCV_CALL, 0)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JAL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+
+                if rd >= 0 and rd != 10 do
+                    let op_d = mc_opnd_reg(rd)
+                    let op_a0 = mc_opnd_reg(10)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_d, op_a0, op_n0, op_n1, 0) as i64)
+                eif is_stack_mem(d) do
+                    let op_a0 = mc_opnd_reg(10)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_a0, op_s0_b, op_off_d, op_n0, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Load do
+                var r_base = rs1
+                if is_stack_mem(s1) do
+                    let op_t0 = mc_opnd_reg(5)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off_s, op_n0, 0) as i64)
+                    r_base = 5
+                end
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 6 end
+                if r_dst >= 0 and r_base >= 0 do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_b = mc_opnd_reg(r_base)
+                    let op_off = mc_opnd_imm(0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_d, op_b, op_off, op_n0, 0) as i64)
+                end
+                if is_stack_mem(d) do
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_d, op_s0_b, op_off_d, op_n0, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Store do
+                var r_val = rs1
+                if is_stack_mem(s1) do
+                    let op_t0 = mc_opnd_reg(5)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off_s, op_n0, 0) as i64)
+                    r_val = 5
+                end
+                var r_base = rs2
+                if is_stack_mem(s2) do
+                    let op_t1 = mc_opnd_reg(6)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_s2 = mc_opnd_imm(stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t1, op_s0_b, op_off_s2, op_n0, 0) as i64)
+                    r_base = 6
+                end
+                if r_val >= 0 and r_base >= 0 do
+                    let op_s = mc_opnd_reg(r_val)
+                    let op_b = mc_opnd_reg(r_base)
+                    let op_off = mc_opnd_imm(0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_s, op_b, op_off, op_n0, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Not do
+                var r_s1 = rs1
+                if is_stack_mem(s1) do
+                    let op_t0 = mc_opnd_reg(5)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off_s, op_n0, 0) as i64)
+                    r_s1 = 5
+                end
+                var r_dst = rd
+                if is_stack_mem(d) do r_dst = 5 end
+                let op_d = mc_opnd_reg(r_dst)
+                let op_s1_reg = mc_opnd_reg(r_s1)
+                let op_m1 = mc_opnd_imm(0 - 1)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_XORI, op_d, op_s1_reg, op_m1, op_n0, 0) as i64)
+                if is_stack_mem(d) do
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_d, op_s0_b, op_off_d, op_n0, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Cmp do
+                var r_s1 = rs1
+                if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                    let imm = native_read_i64(s1 as i64, 32)
+                    let op_t0 = mc_opnd_reg(5)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_t0, op_i, op_n0, op_n1, 0) as i64)
+                    r_s1 = 5
+                eif is_stack_mem(s1) do
+                    let op_t0 = mc_opnd_reg(5)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off_s, op_n0, 0) as i64)
+                    r_s1 = 5
+                end
+                var r_s2 = rs2
+                if (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                    let imm = native_read_i64(s2 as i64, 32)
+                    let op_t1 = mc_opnd_reg(6)
+                    let op_i = mc_opnd_imm(imm)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_t1, op_i, op_n0, op_n1, 0) as i64)
+                    r_s2 = 6
+                eif is_stack_mem(s2) do
+                    let op_t1 = mc_opnd_reg(6)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_s2 = mc_opnd_imm(stack_mem_off(s2))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t1, op_s0_b, op_off_s2, op_n0, 0) as i64)
+                    r_s2 = 6
+                end
+                last_cmp_cond = lir_instr_aux(ins)
+                last_cmp_rs1 = r_s1
+                last_cmp_rs2 = r_s2
+                if rd >= 0 or is_stack_mem(d) do
+                    var r_dst = rd
+                    if is_stack_mem(d) do r_dst = 5 end
+                    let op_d = mc_opnd_reg(r_dst)
+                    let op_s1_reg = mc_opnd_reg(r_s1)
+                    let op_s2_reg = mc_opnd_reg(r_s2)
+                    let op_zero = mc_opnd_reg(0)
+                    if last_cmp_cond == LIR_CMP_LT do
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SLT, op_d, op_s1_reg, op_s2_reg, op_n0, 0) as i64)
+                    eif last_cmp_cond == LIR_CMP_GT do
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SLT, op_d, op_s2_reg, op_s1_reg, op_n0, 0) as i64)
+                    eif last_cmp_cond == LIR_CMP_EQ do
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SUB, op_d, op_s1_reg, op_s2_reg, op_n0, 0) as i64)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SLTIU, op_d, op_d, mc_opnd_imm(1), op_n0, 0) as i64)
+                    eif last_cmp_cond == LIR_CMP_NE do
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SUB, op_d, op_s1_reg, op_s2_reg, op_n0, 0) as i64)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SLTU, op_d, op_zero, op_d, op_n0, 0) as i64)
+                    eif last_cmp_cond == LIR_CMP_GE do
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SLT, op_d, op_s1_reg, op_s2_reg, op_n0, 0) as i64)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_XORI, op_d, op_d, mc_opnd_imm(1), op_n0, 0) as i64)
+                    eif last_cmp_cond == LIR_CMP_LE do
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SLT, op_d, op_s2_reg, op_s1_reg, op_n0, 0) as i64)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_XORI, op_d, op_d, mc_opnd_imm(1), op_n0, 0) as i64)
+                    end
+                    if is_stack_mem(d) do
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_d, op_s0_b, op_off_d, op_n0, 0) as i64)
+                    end
+                end
+            eif op == LirOp.Jmp do
+                var tgt = 0 - 1
+                if (s1 as i64) > 4096 do
+                    let s1_typ = native_read_i64(s1 as i64, 0)
+                    if s1_typ == 6 do tgt = native_read_i64(s1 as i64, 40) end
+                    if s1_typ == 5 do tgt = native_read_i64(s1 as i64, 32) end
+                end
+                if tgt >= 0 do
+                    let op_jmp = mc_opnd_imm(fid * 10000 + tgt)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JAL, op_jmp, op_n0, op_n0, op_n1, 0) as i64)
+                end
+            eif op == LirOp.JmpCond do
+                var tgt = 0 - 1
+                if (s2 as i64) > 4096 do
+                    let s2_typ = native_read_i64(s2 as i64, 0)
+                    if s2_typ == 6 do tgt = native_read_i64(s2 as i64, 40) end
+                    if s2_typ == 5 do tgt = native_read_i64(s2 as i64, 32) end
+                end
+                if tgt >= 0 do
+                    let op_target = mc_opnd_imm(fid * 10000 + tgt)
+                    let aux = lir_instr_aux(ins)
+                    var b_opc = MCOpcode.RISCV_BNE
+                    var r1 = last_cmp_rs1
+                    var r2 = last_cmp_rs2
+                    if r1 < 0 do r1 = 0 end
+                    if r2 < 0 do r2 = 0 end
+                    if aux == LIR_JMP_IF do
+                        b_opc = MCOpcode.RISCV_BNE
+                        if last_cmp_cond == LIR_CMP_EQ do b_opc = MCOpcode.RISCV_BEQ end
+                        if last_cmp_cond == LIR_CMP_LT do b_opc = MCOpcode.RISCV_BLT end
+                        if last_cmp_cond == LIR_CMP_GE do b_opc = MCOpcode.RISCV_BGE end
+                        if last_cmp_cond == LIR_CMP_GT do
+                            b_opc = MCOpcode.RISCV_BLT
+                            let tmp = r1
+                            r1 = r2
+                            r2 = tmp
+                        end
+                        if last_cmp_cond == LIR_CMP_LE do
+                            b_opc = MCOpcode.RISCV_BGE
+                            let tmp = r1
+                            r1 = r2
+                            r2 = tmp
+                        end
+                    else
+                        b_opc = MCOpcode.RISCV_BEQ
+                        if last_cmp_cond == LIR_CMP_EQ do b_opc = MCOpcode.RISCV_BNE end
+                        if last_cmp_cond == LIR_CMP_LT do b_opc = MCOpcode.RISCV_BGE end
+                        if last_cmp_cond == LIR_CMP_GE do b_opc = MCOpcode.RISCV_BLT end
+                        if last_cmp_cond == LIR_CMP_GT do
+                            b_opc = MCOpcode.RISCV_BGE
+                            let tmp = r1
+                            r1 = r2
+                            r2 = tmp
+                        end
+                        if last_cmp_cond == LIR_CMP_LE do
+                            b_opc = MCOpcode.RISCV_BLT
+                            let tmp = r1
+                            r1 = r2
+                            r2 = tmp
+                        end
+                    end
+                    let op_s1 = mc_opnd_reg(r1)
+                    let op_s2 = mc_opnd_reg(r2)
+                    insts = vec_push_rt(insts, mc_inst_new(b_opc, op_s1, op_s2, op_target, op_n0, 0) as i64)
+                end
+            eif op == LirOp.Call do
+                let n_stk = vec_len_rt(pending_stack_args)
+                var stk_bytes = 0
+                if n_stk > 0 do
+                    stk_bytes = (n_stk * 8) + 15
+                    stk_bytes = stk_bytes - (stk_bytes mod 16)
+                    let op_sp = mc_opnd_reg(2)
+                    let op_ssz = mc_opnd_imm(0 - stk_bytes)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADDI, op_sp, op_sp, op_ssz, op_n0, 0) as i64)
+                    var si = 0
+                    when si < n_stk loop
+                        let s_ins = vec_get_rt(pending_stack_args, si)
+                        let s_s2 = native_read_i64(s_ins as i64, 32)
+                        let s_rs2 = resolve_mc_reg(s_s2 as LirOperand, assigned_phys)
+                        var r_val = s_rs2
+                        if is_stack_mem(s_s2 as LirOperand) do
+                            let op_t0 = mc_opnd_reg(5)
+                            let op_s0_b = mc_opnd_reg(8)
+                            let op_off_src = mc_opnd_imm(stack_mem_off(s_s2 as LirOperand))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off_src, op_n0, 0) as i64)
+                            r_val = 5
+                        eif (s_s2 as i64) > 4096 and native_read_i64(s_s2 as i64, 0) == 5 do
+                            let imm = native_read_i64(s_s2 as i64, 32)
+                            let op_t0 = mc_opnd_reg(5)
+                            let op_imm = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_t0, op_imm, op_n0, op_n1, 0) as i64)
+                            r_val = 5
+                        end
+                        let op_val = mc_opnd_reg(r_val)
+                        let op_off = mc_opnd_imm(si * 8)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_val, op_sp, op_off, op_n0, 0) as i64)
+                        si = si + 1
+                    end
+                    pending_stack_args = vec_new_rt()
+                end
+
+                let sid = native_read_i64(ins as i64, 40)
+                let ins_src2 = native_read_i64(ins as i64, 32)
+                var is_dynamic = 0
+                if sid < 0 do
+                    is_dynamic = 1
+                eif ins_src2 > 4096 do
+                    let s2_typ = native_read_i64(ins_src2, 0)
+                    if s2_typ == 1 or s2_typ == 2 or s2_typ == 3 do
+                        is_dynamic = 1
+                    end
+                end
+                if is_dynamic == 1 do
+                    var r_target = rs2
+                    if r_target < 0 do r_target = 5 end # t0
+                    let op_r = mc_opnd_reg(r_target)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JALR, op_r, op_n0, op_n0, op_n1, 0) as i64)
+                else
+                    let f_strings = native_read_i64(func_obj as i64, 32)
+                    var cname_str = 0
+                    if f_strings > 0 and sid >= 0 and sid < vec_len_rt(f_strings) do
+                        let fat_cname = vec_get_rt(f_strings, sid)
+                        if fat_cname != 0 do
+                            cname_str = native_read_i64(fat_cname, 0)
+                        end
+                    end
+                    if cname_str != 0 do
+                        let op_sym = mc_opnd_symbol(cname_str, RelocKind.RISCV_CALL, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JAL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    end
+                end
+                if stk_bytes > 0 do
+                    let op_sp = mc_opnd_reg(2)
+                    let op_ssz = mc_opnd_imm(stk_bytes)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADDI, op_sp, op_sp, op_ssz, op_n0, 0) as i64)
+                end
+                if rd >= 0 and rd != 10 do # a0
+                    let op_d = mc_opnd_reg(rd)
+                    let op_a0 = mc_opnd_reg(10)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_d, op_a0, op_n0, op_n1, 0) as i64)
+                eif is_stack_mem(d) do
+                    let op_a0 = mc_opnd_reg(10)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_a0, op_s0_b, op_off_d, op_n0, 0) as i64)
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.SetArg do
+                let ai = native_read_i64(ins as i64, 40)
+                if ai >= 0 and ai < 8 do
+                    let arg_r = riscv_mc_arg_reg(ai)
+                    if is_stack_mem(s2) do
+                        let op_ar = mc_opnd_reg(arg_r)
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off_s = mc_opnd_imm(stack_mem_off(s2))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_ar, op_s0_b, op_off_s, op_n0, 0) as i64)
+                    eif (s2 as i64) > 4096 and native_read_i64(s2 as i64, 0) == 5 do
+                        let imm = native_read_i64(s2 as i64, 32)
+                        let op_ar = mc_opnd_reg(arg_r)
+                        let op_imm = mc_opnd_imm(imm)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_ar, op_imm, op_n0, op_n1, 0) as i64)
+                    eif rs2 >= 0 and rs2 != arg_r do
+                        let op_ar = mc_opnd_reg(arg_r)
+                        let op_s = mc_opnd_reg(rs2)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_ar, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                else
+                    pending_stack_args = vec_push_rt(pending_stack_args, ins)
+                end
+            eif op == LirOp.Intrinsic do
+                let kind = native_read_i64(ins as i64, 40)
+                if kind == MIR_INTR_PARAM do
+                    if (s1 as i64) > 4096 do
+                        let abi = native_read_i64(s1 as i64, 32)
+                        if abi >= 0 and abi < 8 do
+                            let arg_r = riscv_mc_arg_reg(abi)
+                            if rd >= 0 and rd != arg_r do
+                                let op_d = mc_opnd_reg(rd)
+                                let op_ar = mc_opnd_reg(arg_r)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_d, op_ar, op_n0, op_n1, 0) as i64)
+                            eif is_stack_mem(d) do
+                                let op_ar = mc_opnd_reg(arg_r)
+                                let op_s0_b = mc_opnd_reg(8)
+                                let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_ar, op_s0_b, op_off_d, op_n0, 0) as i64)
+                            end
+                        eif abi >= 8 do
+                            let off = (abi - 8) * 8
+                            if rd >= 0 do
+                                let op_d = mc_opnd_reg(rd)
+                                let op_s0_b = mc_opnd_reg(8)
+                                let op_off = mc_opnd_imm(off)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_d, op_s0_b, op_off, op_n0, 0) as i64)
+                            eif is_stack_mem(d) do
+                                let op_t0 = mc_opnd_reg(5)
+                                let op_s0_b = mc_opnd_reg(8)
+                                let op_off_src = mc_opnd_imm(off)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off_src, op_n0, 0) as i64)
+                                let op_off_dst = mc_opnd_imm(stack_mem_off(d))
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_t0, op_s0_b, op_off_dst, op_n0, 0) as i64)
+                            end
+                        end
+                    end
+                eif kind == MIR_INTR_PRINT do
+                    var target_src = s1
+                    if (target_src as i64) <= 4096 or native_read_i64(target_src as i64, 0) == 0 do
+                        target_src = s2
+                    end
+                    if (target_src as i64) > 4096 do
+                        let t_typ = native_read_i64(target_src as i64, 0)
+                        if is_stack_mem(target_src as LirOperand) do
+                            let op_a0 = mc_opnd_reg(10)
+                            let op_s0_b = mc_opnd_reg(8)
+                            let op_off = mc_opnd_imm(stack_mem_off(target_src as LirOperand))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_a0, op_s0_b, op_off, op_n0, 0) as i64)
+                        eif t_typ == 5 do # Imm
+                            let imm = native_read_i64(target_src as i64, 32)
+                            let op_a0 = mc_opnd_reg(10)
+                            let op_imm = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_a0, op_imm, op_n0, op_n1, 0) as i64)
+                        else
+                            let r = resolve_mc_reg(target_src as LirOperand, assigned_phys)
+                            if r >= 0 and r != 10 do
+                                let op_a0 = mc_opnd_reg(10)
+                                let op_s = mc_opnd_reg(r)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_a0, op_s, op_n0, op_n1, 0) as i64)
+                            end
+                        end
+                    end
+                    let op_sym = mc_opnd_symbol("rt_print_int", RelocKind.RISCV_CALL, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JAL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                eif kind == MIR_INTR_PRINT_STR do
+                    var target_src2 = s1
+                    if (target_src2 as i64) <= 4096 or native_read_i64(target_src2 as i64, 0) == 0 do
+                        target_src2 = s2
+                    end
+                    if (target_src2 as i64) > 4096 do
+                        let t_typ = native_read_i64(target_src2 as i64, 0)
+                        if is_stack_mem(target_src2 as LirOperand) do
+                            let op_a0 = mc_opnd_reg(10)
+                            let op_s0_b = mc_opnd_reg(8)
+                            let op_off = mc_opnd_imm(stack_mem_off(target_src2 as LirOperand))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_a0, op_s0_b, op_off, op_n0, 0) as i64)
+                        eif t_typ == 5 do # Imm
+                            let imm = native_read_i64(target_src2 as i64, 32)
+                            let op_a0 = mc_opnd_reg(10)
+                            let op_imm = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_a0, op_imm, op_n0, op_n1, 0) as i64)
+                        else
+                            let r = resolve_mc_reg(target_src2 as LirOperand, assigned_phys)
+                            if r >= 0 and r != 10 do
+                                let op_a0 = mc_opnd_reg(10)
+                                let op_s = mc_opnd_reg(r)
+                                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_a0, op_s, op_n0, op_n1, 0) as i64)
+                            end
+                        end
+                    end
+                    let op_sym = mc_opnd_symbol("rt_print_str", RelocKind.RISCV_CALL, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JAL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                eif kind == MIR_INTR_INDEX do
+                    var r_base = rs1
+                    if is_stack_mem(s1) do
+                        let op_t0 = mc_opnd_reg(5)
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off = mc_opnd_imm(stack_mem_off(s1))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off, op_n0, 0) as i64)
+                        r_base = 5
+                    end
+                    let op_t1 = mc_opnd_reg(6)
+                    let op_a0 = mc_opnd_reg(10)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_t1, mc_opnd_imm(3), op_n0, op_n1, 0) as i64)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SLL, op_t1, op_a0, op_t1, op_n0, 0) as i64)
+                    let op_base = mc_opnd_reg(r_base)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADD, op_t1, op_t1, op_base, op_n0, 0) as i64)
+                    var r_dst = rd
+                    if is_stack_mem(d) do r_dst = 5 end
+                    if r_dst >= 0 do
+                        let op_d = mc_opnd_reg(r_dst)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_d, op_t1, mc_opnd_imm(16), op_n0, 0) as i64)
+                        if is_stack_mem(d) do
+                            let op_s0_b = mc_opnd_reg(8)
+                            let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_d, op_s0_b, op_off_d, op_n0, 0) as i64)
+                        end
+                    end
+                eif kind == MIR_INTR_INDEX_STORE do
+                    var r_base = rs1
+                    if is_stack_mem(s1) do
+                        let op_t0 = mc_opnd_reg(5)
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off = mc_opnd_imm(stack_mem_off(s1))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off, op_n0, 0) as i64)
+                        r_base = 5
+                    end
+                    let op_t1 = mc_opnd_reg(6)
+                    let op_a0 = mc_opnd_reg(10)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_t1, mc_opnd_imm(3), op_n0, op_n1, 0) as i64)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SLL, op_t1, op_a0, op_t1, op_n0, 0) as i64)
+                    let op_base = mc_opnd_reg(r_base)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADD, op_t1, op_t1, op_base, op_n0, 0) as i64)
+                    let op_a1 = mc_opnd_reg(11)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_a1, op_t1, mc_opnd_imm(16), op_n0, 0) as i64)
+                eif kind == MIR_INTR_STR_LIT do
+                    var sid = 0
+                    if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        sid = native_read_i64(s1 as i64, 32)
+                    end
+                    var r_dst = rd
+                    if is_stack_mem(d) do r_dst = 5 end
+                    if r_dst >= 0 do
+                        let sym = lir_mc_string_symbol(lir_func_id(func_obj), sid)
+                        let op_d = mc_opnd_reg(r_dst)
+                        let op_sym = mc_opnd_symbol(sym, RelocKind.RISCV_HI20, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LA, op_d, op_sym, op_n0, op_n1, 0) as i64)
+                        if is_stack_mem(d) do
+                            let op_s0_b = mc_opnd_reg(8)
+                            let op_off = mc_opnd_imm(stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_d, op_s0_b, op_off, op_n1, 0) as i64)
+                        end
+                    end
+                eif kind == MIR_INTR_BUILTIN do
+                    var bid = 0
+                    if (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                        bid = native_read_i64(s1 as i64, 32)
+                    end
+                    if bid == 3 do
+                        let op_sym = mc_opnd_symbol("rt_alloc", RelocKind.RISCV_CALL, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JAL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    eif bid == 5 or bid == 10 do # read_byte / str_get / native_read_u8
+                        let op_t0 = mc_opnd_reg(5)
+                        let op_a0 = mc_opnd_reg(10)
+                        let op_a1 = mc_opnd_reg(11)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADD, op_t0, op_a0, op_a1, op_n0, 0) as i64)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LBU, op_a0, op_t0, mc_opnd_imm(0), op_n0, 0) as i64)
+                    eif bid == 6 do # write_byte / native_write_u8
+                        let op_t0 = mc_opnd_reg(5)
+                        let op_a0 = mc_opnd_reg(10)
+                        let op_a1 = mc_opnd_reg(11)
+                        let op_a2 = mc_opnd_reg(12)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADD, op_t0, op_a0, op_a1, op_n0, 0) as i64)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SB, op_a2, op_t0, mc_opnd_imm(0), op_n0, 0) as i64)
+                    eif bid == 7 or bid == 46 do # read_word / native_read_i64
+                        let op_t0 = mc_opnd_reg(5)
+                        let op_a0 = mc_opnd_reg(10)
+                        let op_a1 = mc_opnd_reg(11)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADD, op_t0, op_a0, op_a1, op_n0, 0) as i64)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_a0, op_t0, mc_opnd_imm(0), op_n0, 0) as i64)
+                    eif bid == 8 or bid == 47 do # write_word / native_write_i64
+                        let op_t0 = mc_opnd_reg(5)
+                        let op_a0 = mc_opnd_reg(10)
+                        let op_a1 = mc_opnd_reg(11)
+                        let op_a2 = mc_opnd_reg(12)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_ADD, op_t0, op_a0, op_a1, op_n0, 0) as i64)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_a2, op_t0, mc_opnd_imm(0), op_n0, 0) as i64)
+                    eif bid == 11 do
+                        let op_sym = mc_opnd_symbol("rt_str_cat", RelocKind.RISCV_CALL, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JAL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    eif bid == 19 do
+                        let op_sym = mc_opnd_symbol("rt_int_to_str", RelocKind.RISCV_CALL, 0)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JAL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    end
+                    if rd >= 0 and rd != 10 do
+                        let op_d = mc_opnd_reg(rd)
+                        let op_a0 = mc_opnd_reg(10)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_d, op_a0, op_n0, op_n1, 0) as i64)
+                    eif is_stack_mem(d) do
+                        let op_a0 = mc_opnd_reg(10)
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_a0, op_s0_b, op_off_d, op_n0, 0) as i64)
+                    end
+                eif kind == MIR_INTR_TRAIN do
+                    let op_t0 = mc_opnd_reg(5)
+                    let op_t1 = mc_opnd_reg(6)
+                    let op_zero = mc_opnd_reg(0)
+                    let op_sym = mc_opnd_symbol("_vir_train_active", RelocKind.RISCV_HI20, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LA, op_t0, op_sym, op_n0, op_n1, 0) as i64)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_t1, mc_opnd_imm(1), op_n0, op_n1, 0) as i64)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_t1, op_t0, mc_opnd_imm(0), op_n0, 0) as i64)
+                    let op_sym_w = mc_opnd_symbol("_vir_train_w", RelocKind.RISCV_HI20, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LA, op_t0, op_sym_w, op_n0, op_n1, 0) as i64)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_zero, op_t0, mc_opnd_imm(0), op_n0, 0) as i64)
+                    let op_sym_x = mc_opnd_symbol("_vir_train_x", RelocKind.RISCV_HI20, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LA, op_t0, op_sym_x, op_n0, op_n1, 0) as i64)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_zero, op_t0, mc_opnd_imm(0), op_n0, 0) as i64)
+                eif kind == MIR_INTR_INFER do
+                    let op_t0 = mc_opnd_reg(5)
+                    let op_zero = mc_opnd_reg(0)
+                    let op_sym = mc_opnd_symbol("_vir_train_active", RelocKind.RISCV_HI20, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LA, op_t0, op_sym, op_n0, op_n1, 0) as i64)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_zero, op_t0, mc_opnd_imm(0), op_n0, 0) as i64)
+                eif kind == MIR_INTR_QUANTIZE do
+                    let op_a0 = mc_opnd_reg(10)
+                    let op_a1 = mc_opnd_reg(11)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_a1, op_a0, op_n0, op_n1, 0) as i64)
+                    if is_stack_mem(s1) do
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_a0, op_s0_b, op_off_s, op_n0, 0) as i64)
+                    eif rs1 >= 0 and rs1 != 10 do
+                        let op_s = mc_opnd_reg(rs1)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_a0, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                    let op_sym = mc_opnd_symbol("rt_quantize", RelocKind.RISCV_CALL, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JAL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                    if rd >= 0 and rd != 10 do
+                        let op_d = mc_opnd_reg(rd)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_d, op_a0, op_n0, op_n1, 0) as i64)
+                    eif is_stack_mem(d) do
+                        let op_s0_b = mc_opnd_reg(8)
+                        let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_a0, op_s0_b, op_off_d, op_n0, 0) as i64)
+                    end
+                eif kind == MIR_INTR_BACKWARD do
+                    let op_sym = mc_opnd_symbol("rt_backward", RelocKind.RISCV_CALL, 0)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_JAL, op_sym, op_n0, op_n0, op_n1, 0) as i64)
+                eif kind == MIR_INTR_CAST do
+                    if is_stack_mem(d) do
+                        if is_stack_mem(s1) do
+                            let op_t0 = mc_opnd_reg(5)
+                            let op_s0_b = mc_opnd_reg(8)
+                            let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_t0, op_s0_b, op_off_s, op_n0, 0) as i64)
+                            let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_t0, op_s0_b, op_off_d, op_n0, 0) as i64)
+                        eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                            let imm = native_read_i64(s1 as i64, 32)
+                            let op_t0 = mc_opnd_reg(5)
+                            let op_i = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_t0, op_i, op_n0, op_n1, 0) as i64)
+                            let op_s0_b = mc_opnd_reg(8)
+                            let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_t0, op_s0_b, op_off_d, op_n0, 0) as i64)
+                        eif rs1 >= 0 do
+                            let op_s = mc_opnd_reg(rs1)
+                            let op_s0_b = mc_opnd_reg(8)
+                            let op_off_d = mc_opnd_imm(stack_mem_off(d))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_SD, op_s, op_s0_b, op_off_d, op_n0, 0) as i64)
+                        end
+                    eif rd >= 0 do
+                        if is_stack_mem(s1) do
+                            let op_d = mc_opnd_reg(rd)
+                            let op_s0_b = mc_opnd_reg(8)
+                            let op_off_s = mc_opnd_imm(stack_mem_off(s1))
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_d, op_s0_b, op_off_s, op_n0, 0) as i64)
+                        eif (s1 as i64) > 4096 and native_read_i64(s1 as i64, 0) == 5 do
+                            let imm = native_read_i64(s1 as i64, 32)
+                            let op_d = mc_opnd_reg(rd)
+                            let op_i = mc_opnd_imm(imm)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_d, op_i, op_n0, op_n1, 0) as i64)
+                        eif rs1 >= 0 and rd != rs1 do
+                            let op_d = mc_opnd_reg(rd)
+                            let op_s = mc_opnd_reg(rs1)
+                            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_d, op_s, op_n0, op_n1, 0) as i64)
+                        end
+                    end
+                end
+                last_cmp_cond = 0 - 1
+            eif op == LirOp.Ret do
+                if is_stack_mem(s1) do
+                    let op_a0 = mc_opnd_reg(10)
+                    let op_s0_b = mc_opnd_reg(8)
+                    let op_off = mc_opnd_imm(stack_mem_off(s1))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_a0, op_s0_b, op_off, op_n0, 0) as i64)
+                eif (s1 as i64) > 4096 do
+                    let s1_typ = native_read_i64(s1 as i64, 0)
+                    if s1_typ == 5 do # Imm
+                        let imm_val = native_read_i64(s1 as i64, 32)
+                        let op_a0 = mc_opnd_reg(10)
+                        let op_imm = mc_opnd_imm(imm_val)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_a0, op_imm, op_n0, op_n1, 0) as i64)
+                    eif rs1 >= 0 and rs1 != 10 do
+                        let op_a0 = mc_opnd_reg(10)
+                        let op_s = mc_opnd_reg(rs1)
+                        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_a0, op_s, op_n0, op_n1, 0) as i64)
+                    end
+                eif rs1 >= 0 and rs1 != 10 do
+                    let op_a0 = mc_opnd_reg(10)
+                    let op_s = mc_opnd_reg(rs1)
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_MV, op_a0, op_s, op_n0, op_n1, 0) as i64)
+                end
+                let op_sp = mc_opnd_reg(2)
+                let op_ra = mc_opnd_reg(1)
+                let op_s0 = mc_opnd_reg(8)
+                let op_off_ra = mc_opnd_imm(0)
+                let op_off_s0 = mc_opnd_imm(8)
+                var si_ld = 0
+                when si_ld < 8 loop
+                    let op_sr = mc_opnd_reg(18 + si_ld)
+                    let off_sr = mc_opnd_imm(16 + (si_ld * 8))
+                    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_sr, op_sp, off_sr, op_n0, 0) as i64)
+                    si_ld = si_ld + 1
+                end
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_ra, op_sp, op_off_ra, op_n0, 0) as i64)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_s0, op_sp, op_off_s0, op_n0, 0) as i64)
+                insts = emit_riscv_stack_adjust(insts, op_sp, total_ssz, op_n0)
+                insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+                last_cmp_cond = 0 - 1
+            end
+
+            ii = ii + 1
+        end
+        bi = bi + 1
+    end
+
+    # Fall-through epilogue
+    let op_a0 = mc_opnd_reg(10)
+    let op_imm0 = mc_opnd_imm(0)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_a0, op_imm0, op_n0, op_n1, 0) as i64)
+    let op_sp = mc_opnd_reg(2)
+    let op_ra = mc_opnd_reg(1)
+    let op_s0 = mc_opnd_reg(8)
+    let op_off_ra = mc_opnd_imm(0)
+    let op_off_s0 = mc_opnd_imm(8)
+    var si_ld_ft = 0
+    when si_ld_ft < 8 loop
+        let op_sr = mc_opnd_reg(18 + si_ld_ft)
+        let off_sr = mc_opnd_imm(16 + (si_ld_ft * 8))
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_sr, op_sp, off_sr, op_n0, 0) as i64)
+        si_ld_ft = si_ld_ft + 1
+    end
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_ra, op_sp, op_off_ra, op_n0, 0) as i64)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_s0, op_sp, op_off_s0, op_n0, 0) as i64)
+    insts = emit_riscv_stack_adjust(insts, op_sp, total_ssz, op_n0)
+    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+
+    out insts
+end.
+
+# ═══════════════════════════════════════════════════════
+# 4. Unified LIR-to-MC Dispatcher
+# ═══════════════════════════════════════════════════════
+
+func lir_func_to_mc(func_obj: LirFunc, assigned_phys: i64, arch: int):
+    if arch == TargetArch.X86_64 or arch == 1 do
+        out lir_func_to_mc_x86_64(func_obj, assigned_phys)
+    eif arch == TargetArch.RISCV64 or arch == 3 do
+        out lir_func_to_mc_riscv64(func_obj, assigned_phys)
+    end
+    out lir_func_to_mc_arm64(func_obj, assigned_phys)
+end.
+
+export lir_func_to_mc_arm64, lir_func_to_mc_x86_64, lir_func_to_mc_riscv64, lir_func_to_mc
