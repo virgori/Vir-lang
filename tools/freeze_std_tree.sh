@@ -170,7 +170,11 @@ build_freeze_bin() {
   set_source_version "$dest/compiler_src/stdlib_vir_compiler/virc.vri" "$version"
 
   echo "Building bin/virc v$version with seed $seed ..."
-  (cd "$dest" && "$seed" stdlib/vir/compiler/virc.vri -o bin/virc -q)
+  if [ -f "dist/virc-expanded.vri" ]; then
+    "$seed" dist/virc-expanded.vri -o "$output" -q
+  else
+    (cd "$dest" && "$seed" stdlib/vir/compiler/virc.vri -o bin/virc -q)
+  fi
   [ -x "$output" ] || die "--with-bin: build succeeded but produced no executable: $output"
   if command -v codesign >/dev/null 2>&1; then
     codesign -f -s - -i "$IDENT_CODESIGN" "$output" >/dev/null 2>&1 || true

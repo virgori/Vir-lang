@@ -1,6 +1,6 @@
-# Vir Compiler Official Native Binaries (v2.8.0)
+# Vir Compiler Official Native Binaries (v2.8.5)
 
-Precompiled self-hosted standalone binaries for the Vir Compiler toolchain (`v2.8.0`), featuring native support for **Spec §26 AI/ML Mathematical Operators** (physical tensors, matrix multiplication `**`, FMA `><`, scoped arenas, zero-tape inference, reverse-mode autodiff, and quantization).
+Precompiled self-hosted standalone binaries for the Vir Compiler toolchain (`v2.8.5`), featuring native support for **Spec §26 AI/ML Mathematical Operators**, postfix percent `%`, and strict **§4.4 / §7.3 `packed entity`**.
 
 All binaries are pure native executables with zero external runtime dependencies.
 
