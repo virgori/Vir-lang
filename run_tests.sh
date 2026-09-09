@@ -344,6 +344,8 @@ run_group_7() {
         run_test_in_group 7 "tests/vri/test_3vars.vri"
         run_test_in_group 7 "tests/vri/test_6vars.vri"
         run_test_in_group 7 "tests/vri/test_adv_017_struct_fields.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_layout_mixed_width_e2e.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_missing_field_type_rejected.vri"
     else
         run_test_in_group 7 "tests/vri/test_3vars.vri"
         run_test_in_group 7 "tests/vri/test_6vars.vri"
@@ -383,6 +385,23 @@ run_group_7() {
         run_test_in_group 7 "tests/vri/test_if_dot.vri"
         run_test_in_group 7 "tests/vri/test_method.vri"
         run_test_in_group 7 "tests/vri/test_packed.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_layout_mixed_width_e2e.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_named_initializer_order_e2e.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_unaligned_mutation_e2e.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_signed_load_e2e.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_nested_layout_e2e.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_method_layout_e2e.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_sizeof_e2e.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_missing_field_type_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_dynamic_field_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_nonpacked_nested_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_recursive_layout_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_shorthand_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_constructor_missing_field_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_constructor_duplicate_field_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_constructor_unknown_field_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_u8_overflow_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/packed_u8_underflow_rejected.vri"
     fi
     local pass_cnt=${GP_PASS[7]}
     local fail_cnt=${GP_FAIL[7]}
