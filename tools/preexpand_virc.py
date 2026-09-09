@@ -24,8 +24,10 @@ PRELUDE_MAP = {
     "result": "stdlib/vir/compiler/result_prelude.vri",
     "alloc": "stdlib/vir/rt/alloc.vri",
     "syscall": "stdlib/vir/compiler/syscall_prelude.vri",
+    "syscall": "stdlib/vir/rt/syscall.vri",
     "vec": "stdlib/vir/compiler/vec_prelude.vri",
     "string_rt": "stdlib/vir/compiler/string_rt_prelude.vri",
+    "string_rt": "stdlib/vir/rt/string_rt.vri",
     "error": "stdlib/vir/error/error.vri",
 }
 
@@ -76,7 +78,11 @@ def resolve(name: str, parent: Path | None = None) -> Path | None:
 def expand_file(path: Path, seen_names: set[str], seen_paths: set[Path]) -> str:
     if path in seen_paths:
         return ""
+    canon = path.resolve()
+    if canon in seen_paths:
+        return ""
     seen_paths.add(path)
+    seen_paths.add(canon)
 
     display_path = path.relative_to(ROOT).as_posix()
     out: list[str] = [f"# @vir_source {display_path} 1"]

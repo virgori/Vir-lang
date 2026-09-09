@@ -366,3 +366,4 @@ Vir does not seek to reproduce the syntactic conventions of C, Rust, or Python. 
 1. **Determinism & Low Latency:** Replaces non-deterministic GC pauses with $O(1)$ `arena:` scopes and direct kernel syscalls.
 2. **Ergonomic Safety:** Enforces compile-time ownership and aliasing rules while freeing developers from verbose lifetime annotations.
 3. **Mathematical & Hardware Precision:** Restores unambiguous semantics to operators: `%` is percentage, `mod` is modulo, `**` is matrix multiplication, `><` is hardware FMA, `^` is power, and bitwise keywords (`and`/`or`/`xor`) are strictly separated from boolean logic (`&`/`||`).
+
