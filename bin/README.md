@@ -8,11 +8,11 @@ All binaries are pure native executables with zero external runtime dependencies
 
 | Target Architecture | Binary | File Size | Binary Format & ABI | SHA-256 Checksum |
 | :--- | :--- | :--- | :--- | :--- |
-| **macOS Apple Silicon** | `virc` (or `virc-macos-arm64`) | 2.0 MB | Mach-O 64-bit arm64 | `34f769132b10d357049112825717a02a583f0204032d00043d536a5be6852d19` |
-| **Linux ARM64** | `virc-linux-arm64` | 2.0 MB | ELF 64-bit LSB aarch64 (static, stripped) | `32fed169a00ac062614e99b41b9ec26448a93ad6883f56b2f8bcf481b0b903bd` |
-| **Linux x86_64** | `virc-linux-x86_64` | 1.4 MB | ELF 64-bit LSB x86-64 (static, stripped) | `2a3ddc4dcb37d818239e6b13194c697b651ee5234d43611c2ec75f38f8eaad08` |
-| **Linux RISC-V 64** | `virc-linux-riscv64` | 2.0 MB | ELF 64-bit LSB riscv64 (RVC, double-float ABI, static) | `52f095953209f166eb417ca476f570b45a42ccf7f896ac68726231c0f3822b45` |
-| **WebAssembly** | `virc-wasm32.wasm` | 754 B | WebAssembly binary module (MVP) | `eae339254dd270ff1dafc4fb194ded5cc1c03f7afaa5d01693525fd3989bbb03` |
+| **macOS Apple Silicon** | `virc` (or `virc-macos-arm64`) | 2.0 MB | Mach-O 64-bit arm64 | `bd09638d33312a0c1f393df339601ec47478106350bb2c7ff59234be45300f87` |
+| **Linux ARM64** | `virc-linux-arm64` | 2.0 MB | ELF 64-bit LSB aarch64 (static, stripped) | `7889429a720ab175c83f79b4ea93b5ae1f49bb9b81155aa08f7fde1f82308808` |
+| **Linux x86_64** | `virc-linux-x86_64` | 1.4 MB | ELF 64-bit LSB x86-64 (static, stripped) | `ebe23a5ec45337fe2abf2a9c3f332a74e6a45d02e24300a7fa36692f0056676a` |
+| **Linux RISC-V 64** | `virc-linux-riscv64` | 2.0 MB | ELF 64-bit LSB riscv64 (RVC, double-float ABI, static) | `84d84830d109ff0285a2ee602b7a9716c775dc99abd7807fc0d176df37661f4c` |
+| **WebAssembly** | `virc-wasm32.wasm` | 754 B | WebAssembly binary module (MVP) | `e2dc2f81ec6acf51dd23d71ed7fe72e989a9f5f3a9c1a7eb1a73691fc2e21038` |
 
 ## Usage
 
