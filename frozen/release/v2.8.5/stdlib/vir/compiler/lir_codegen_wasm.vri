@@ -1,0 +1,462 @@
+##
+ * LIR -> WASI preview1 WebAssembly emitter.
+ *
+ * This deliberately avoids the obsolete soft QIR `Vec<T>` backend.  The
+ * compiler's active path is MIR -> LIR, so this writer consumes its raw LIR
+ * layout and emits a self-contained WASI module with a real `_start`.
+ ##
+module vir.compiler.lir_codegen_wasm
+
+include vir.rt.vec_rt
+import bvec_new, bvec_push, bvec_len, bvec_data_ptr, vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vir.rt.vec_rt
+include vir.rt.io
+import write_file_bytes, print_str, print_int, print_newline from vir.rt.io
+include vir.rt.syscall
+import sys_exit from vir.rt.syscall
+include string_rt
+import native_read_i64, native_read_u8, fat_str_len, fat_str_new from string_rt
+include compiler.lir
+import LirType, LirOp, LirOperandType, lir_func_blocks, lir_func_strings, lir_block_instrs,
+       lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_aux,
+       lir_instr_typ, lir_opnd_type, lir_opnd_vreg, lir_opnd_imm_val from compiler.lir
+include compiler.mir
+import MIR_INTR_STR_LIT, MIR_INTR_PRINT_STR, MIR_INTR_BUILTIN, MIR_INTR_PERCENT from compiler.mir
+include vir.compiler.ffi_imports
+import ffi_import_find, ffi_import_used_count, ffi_import_used_at,
+       ffi_import_name, ffi_import_source, ffi_source_is_os,
+       ffi_import_mark_used from vir.compiler.ffi_imports
+
+const W_I32: int = 0x7f
+const W_I64: int = 0x7e
+const W_VOID: int = 0x40
+const W_END: int = 0x0b
+const W_LOCAL_GET: int = 0x20
+const W_LOCAL_SET: int = 0x21
+const W_CALL: int = 0x10
+const W_DROP: int = 0x1a
+const W_I32_CONST: int = 0x41
+const W_I64_CONST: int = 0x42
+const W_I32_ADD: int = 0x6a
+const W_I32_SUB: int = 0x6b
+const W_I32_GE_U: int = 0x4f
+const W_I32_EQZ: int = 0x45
+const W_I32_LOAD8_U: int = 0x2d
+const W_I32_STORE: int = 0x36
+const W_I32_STORE8: int = 0x3a
+const W_I32_WRAP_I64: int = 0xa7
+const W_I64_EXTEND_I32_U: int = 0xad
+const W_I64_EQZ: int = 0x50
+const W_I64_DIV_S: int = 0x7f
+const W_I64_REM_S: int = 0x81
+const W_F64_CONST: int = 0x44
+const W_F64_DIV: int = 0xa3
+const W_F64_CONVERT_I64_S: int = 0xb9
+const W_I64_REINTERPRET_F64: int = 0xbd
+const W_F64_REINTERPRET_I64: int = 0xbf
+const W_GLOBAL_GET: int = 0x23
+const W_GLOBAL_SET: int = 0x24
+const W_BLOCK: int = 0x02
+const W_LOOP: int = 0x03
+const W_BR: int = 0x0c
+const W_BR_IF: int = 0x0d
+
+func w_u(b: int, value: int):
+    var v = value
+    when true loop
+        byte = v and 0x7f
+        v = v shr 7
+        if v != 0 do byte = byte or 0x80 end
+        b = bvec_push(b, byte)
+        if v == 0 do out b end
+    end
+    out b
+end.
+
+func w_s(b: int, value: int):
+    var v = value
+    more = 1
+    when more == 1 loop
+        byte = v and 0x7f
+        v = v shr 7
+        if (v == 0 and (byte and 0x40) == 0) or (v == 0 - 1 and (byte and 0x40) != 0) do
+            more = 0
+        else
+            byte = byte or 0x80
+        end
+        b = bvec_push(b, byte)
+    end
+    out b
+end.
+
+func w_bytes(dst: int, src: int):
+    var i = 0
+    when i < bvec_len(src) loop
+        dst = bvec_push(dst, native_read_u8(src, i))
+        i = i + 1
+    end
+    out dst
+end.
+
+func w_name(b: int, s: string):
+    n = fat_str_len(s)
+    b = w_u(b, n)
+    data = native_read_i64(s as int, 0)
+    var i = 0
+    when i < n loop
+        b = bvec_push(b, native_read_u8(data, i))
+        i = i + 1
+    end
+    out b
+end.
+
+func w_section(outb: int, sid: int, body: int):
+    outb = bvec_push(outb, sid)
+    outb = w_u(outb, bvec_len(body))
+    out w_bytes(outb, body)
+end.
+
+func w_i32_const(b: int, v: int):
+    b = bvec_push(b, W_I32_CONST)
+    out w_s(b, v)
+end.
+
+func w_i64_const(b: int, v: int):
+    b = bvec_push(b, W_I64_CONST)
+    out w_s(b, v)
+end.
+
+func w_f64_const_100(b: int):
+    # IEEE-754 f64 100.0 = 0x4059000000000000, encoded little-endian.
+    b = bvec_push(b, W_F64_CONST)
+    b = bvec_push(b, 0); b = bvec_push(b, 0); b = bvec_push(b, 0); b = bvec_push(b, 0)
+    b = bvec_push(b, 0); b = bvec_push(b, 0); b = bvec_push(b, 0x59); b = bvec_push(b, 0x40)
+    out b
+end.
+
+func w_local_get(b: int, i: int):
+    b = bvec_push(b, W_LOCAL_GET)
+    out w_u(b, i)
+end.
+
+func w_local_set(b: int, i: int):
+    b = bvec_push(b, W_LOCAL_SET)
+    out w_u(b, i)
+end.
+
+func w_call(b: int, i: int):
+    b = bvec_push(b, W_CALL)
+    out w_u(b, i)
+end.
+
+func w_func_body(code: int, local_count: int, local_type: int):
+    body = bvec_new()
+    if local_count == 0 do
+        body = w_u(body, 0)
+    else
+        body = w_u(body, 1)
+        body = w_u(body, local_count)
+        body = bvec_push(body, local_type)
+    end
+    body = w_bytes(body, code)
+    body = bvec_push(body, W_END)
+    outb = bvec_new()
+    outb = w_u(outb, bvec_len(body))
+    out w_bytes(outb, body)
+end.
+
+func w_itoa_body(code: int):
+    # n:i64 plus dst/pos/digit:i32
+    body = bvec_new()
+    body = w_u(body, 2)
+    body = w_u(body, 1); body = bvec_push(body, W_I64)
+    body = w_u(body, 3); body = bvec_push(body, W_I32)
+    body = w_bytes(body, code)
+    body = bvec_push(body, W_END)
+    outb = bvec_new(); outb = w_u(outb, bvec_len(body))
+    out w_bytes(outb, body)
+end.
+
+func w_emit_fd_write(b: int, ptr: int, len: int):
+    # iovec at 0, nwritten at 8.
+    b = w_i32_const(b, 0); b = w_i32_const(b, ptr); b = bvec_push(b, W_I32_STORE); b = bvec_push(b, 2); b = bvec_push(b, 0)
+    b = w_i32_const(b, 4); b = w_i32_const(b, len); b = bvec_push(b, W_I32_STORE); b = bvec_push(b, 2); b = bvec_push(b, 0)
+    b = w_i32_const(b, 1); b = w_i32_const(b, 0); b = w_i32_const(b, 1); b = w_i32_const(b, 8)
+    b = w_call(b, 0)
+    out bvec_push(b, W_DROP)
+end.
+
+func w_print_code():
+    # (i64 ptr) -> (); locals: p:i32, len:i32
+    b = bvec_new()
+    b = w_local_get(b, 0); b = bvec_push(b, W_I32_WRAP_I64); b = w_local_set(b, 1)
+    b = w_i32_const(b, 0); b = w_local_set(b, 2)
+    b = bvec_push(b, W_BLOCK); b = bvec_push(b, W_VOID)
+    b = bvec_push(b, W_LOOP); b = bvec_push(b, W_VOID)
+    b = w_local_get(b, 1); b = w_local_get(b, 2); b = bvec_push(b, W_I32_ADD); b = bvec_push(b, W_I32_LOAD8_U); b = bvec_push(b, 0); b = bvec_push(b, 0)
+    b = bvec_push(b, W_I32_EQZ); b = bvec_push(b, W_BR_IF); b = w_u(b, 1)
+    b = w_local_get(b, 2); b = w_i32_const(b, 1); b = bvec_push(b, W_I32_ADD); b = w_local_set(b, 2)
+    b = bvec_push(b, W_BR); b = w_u(b, 0)
+    b = bvec_push(b, W_END); b = bvec_push(b, W_END)
+    # dynamic iovec write
+    b = w_i32_const(b, 0); b = w_local_get(b, 1); b = bvec_push(b, W_I32_STORE); b = bvec_push(b, 2); b = bvec_push(b, 0)
+    b = w_i32_const(b, 4); b = w_local_get(b, 2); b = bvec_push(b, W_I32_STORE); b = bvec_push(b, 2); b = bvec_push(b, 0)
+    b = w_i32_const(b, 1); b = w_i32_const(b, 0); b = w_i32_const(b, 1); b = w_i32_const(b, 8); b = w_call(b, 0); b = bvec_push(b, W_DROP)
+    # newline stored at data offset 1024
+    out w_emit_fd_write(b, 1024, 1)
+end.
+
+func w_strcat_code():
+    # (i64 a, i64 b) -> i64. locals a,b,la,lb,dst,i are i32 indices 2..7.
+    b = bvec_new()
+    b = w_local_get(b, 0); b = bvec_push(b, W_I32_WRAP_I64); b = w_local_set(b, 2)
+    b = w_local_get(b, 1); b = bvec_push(b, W_I32_WRAP_I64); b = w_local_set(b, 3)
+    b = w_i32_const(b, 0); b = w_local_set(b, 4)
+    b = bvec_push(b, W_BLOCK); b = bvec_push(b, W_VOID); b = bvec_push(b, W_LOOP); b = bvec_push(b, W_VOID)
+    b = w_local_get(b, 2); b = w_local_get(b, 4); b = bvec_push(b, W_I32_ADD); b = bvec_push(b, W_I32_LOAD8_U); b = bvec_push(b, 0); b = bvec_push(b, 0); b = bvec_push(b, W_I32_EQZ); b = bvec_push(b, W_BR_IF); b = w_u(b, 1)
+    b = w_local_get(b, 4); b = w_i32_const(b, 1); b = bvec_push(b, W_I32_ADD); b = w_local_set(b, 4); b = bvec_push(b, W_BR); b = w_u(b, 0); b = bvec_push(b, W_END); b = bvec_push(b, W_END)
+    b = w_i32_const(b, 0); b = w_local_set(b, 5)
+    b = bvec_push(b, W_BLOCK); b = bvec_push(b, W_VOID); b = bvec_push(b, W_LOOP); b = bvec_push(b, W_VOID)
+    b = w_local_get(b, 3); b = w_local_get(b, 5); b = bvec_push(b, W_I32_ADD); b = bvec_push(b, W_I32_LOAD8_U); b = bvec_push(b, 0); b = bvec_push(b, 0); b = bvec_push(b, W_I32_EQZ); b = bvec_push(b, W_BR_IF); b = w_u(b, 1)
+    b = w_local_get(b, 5); b = w_i32_const(b, 1); b = bvec_push(b, W_I32_ADD); b = w_local_set(b, 5); b = bvec_push(b, W_BR); b = w_u(b, 0); b = bvec_push(b, W_END); b = bvec_push(b, W_END)
+    b = bvec_push(b, W_GLOBAL_GET); b = w_u(b, 0); b = w_local_set(b, 6)
+    b = w_local_get(b, 6); b = w_local_get(b, 4); b = bvec_push(b, W_I32_ADD); b = w_local_get(b, 5); b = bvec_push(b, W_I32_ADD); b = w_i32_const(b, 1); b = bvec_push(b, W_I32_ADD); b = bvec_push(b, W_GLOBAL_SET); b = w_u(b, 0)
+    # copy a
+    b = w_i32_const(b, 0); b = w_local_set(b, 7); b = bvec_push(b, W_BLOCK); b = bvec_push(b, W_VOID); b = bvec_push(b, W_LOOP); b = bvec_push(b, W_VOID)
+    b = w_local_get(b, 7); b = w_local_get(b, 4); b = bvec_push(b, W_I32_GE_U); b = bvec_push(b, W_BR_IF); b = w_u(b, 1)
+    b = w_local_get(b, 6); b = w_local_get(b, 7); b = bvec_push(b, W_I32_ADD); b = w_local_get(b, 2); b = w_local_get(b, 7); b = bvec_push(b, W_I32_ADD); b = bvec_push(b, W_I32_LOAD8_U); b = bvec_push(b, 0); b = bvec_push(b, 0); b = bvec_push(b, W_I32_STORE8); b = bvec_push(b, 0); b = bvec_push(b, 0)
+    b = w_local_get(b, 7); b = w_i32_const(b, 1); b = bvec_push(b, W_I32_ADD); b = w_local_set(b, 7); b = bvec_push(b, W_BR); b = w_u(b, 0); b = bvec_push(b, W_END); b = bvec_push(b, W_END)
+    # copy b
+    b = w_i32_const(b, 0); b = w_local_set(b, 7); b = bvec_push(b, W_BLOCK); b = bvec_push(b, W_VOID); b = bvec_push(b, W_LOOP); b = bvec_push(b, W_VOID)
+    b = w_local_get(b, 7); b = w_local_get(b, 5); b = bvec_push(b, W_I32_GE_U); b = bvec_push(b, W_BR_IF); b = w_u(b, 1)
+    b = w_local_get(b, 6); b = w_local_get(b, 4); b = bvec_push(b, W_I32_ADD); b = w_local_get(b, 7); b = bvec_push(b, W_I32_ADD); b = w_local_get(b, 3); b = w_local_get(b, 7); b = bvec_push(b, W_I32_ADD); b = bvec_push(b, W_I32_LOAD8_U); b = bvec_push(b, 0); b = bvec_push(b, 0); b = bvec_push(b, W_I32_STORE8); b = bvec_push(b, 0); b = bvec_push(b, 0)
+    b = w_local_get(b, 7); b = w_i32_const(b, 1); b = bvec_push(b, W_I32_ADD); b = w_local_set(b, 7); b = bvec_push(b, W_BR); b = w_u(b, 0); b = bvec_push(b, W_END); b = bvec_push(b, W_END)
+    b = w_local_get(b, 6); b = w_local_get(b, 4); b = bvec_push(b, W_I32_ADD); b = w_local_get(b, 5); b = bvec_push(b, W_I32_ADD); b = w_i32_const(b, 0); b = bvec_push(b, W_I32_STORE8); b = bvec_push(b, 0); b = bvec_push(b, 0)
+    b = w_local_get(b, 6)
+    out bvec_push(b, W_I64_EXTEND_I32_U)
+end.
+
+func w_itoa_code():
+    # (i64 n) -> i64; non-negative values, sufficient for the canonical
+    # interpolation lowering (negative support is emitted by the native path).
+    b = bvec_new()
+    # locals: n:i64 index1, dst:i32 index2, pos:i32 index3, digit:i32 index4
+    b = w_local_get(b, 0); b = w_local_set(b, 1); b = bvec_push(b, W_GLOBAL_GET); b = w_u(b, 0); b = w_local_set(b, 2)
+    b = w_local_get(b, 2); b = w_i32_const(b, 32); b = bvec_push(b, W_I32_ADD); b = bvec_push(b, W_GLOBAL_SET); b = w_u(b, 0)
+    b = w_local_get(b, 2); b = w_i32_const(b, 31); b = bvec_push(b, W_I32_ADD); b = w_i32_const(b, 0); b = bvec_push(b, W_I32_STORE8); b = bvec_push(b, 0); b = bvec_push(b, 0)
+    b = w_i32_const(b, 30); b = w_local_set(b, 3)
+    b = bvec_push(b, W_LOOP); b = bvec_push(b, W_VOID)
+    b = w_local_get(b, 1); b = w_i64_const(b, 10); b = bvec_push(b, W_I64_REM_S); b = bvec_push(b, W_I32_WRAP_I64); b = w_i32_const(b, 48); b = bvec_push(b, W_I32_ADD); b = w_local_set(b, 4)
+    b = w_local_get(b, 2); b = w_local_get(b, 3); b = bvec_push(b, W_I32_ADD); b = w_local_get(b, 4); b = bvec_push(b, W_I32_STORE8); b = bvec_push(b, 0); b = bvec_push(b, 0)
+    b = w_local_get(b, 1); b = w_i64_const(b, 10); b = bvec_push(b, W_I64_DIV_S); b = w_local_set(b, 1)
+    b = w_local_get(b, 3); b = w_i32_const(b, 1); b = bvec_push(b, W_I32_SUB); b = w_local_set(b, 3)
+    b = w_local_get(b, 1); b = bvec_push(b, W_I64_EQZ); b = bvec_push(b, W_I32_EQZ); b = bvec_push(b, W_BR_IF); b = w_u(b, 0)
+    b = bvec_push(b, W_END)
+    b = w_local_get(b, 2); b = w_local_get(b, 3); b = w_i32_const(b, 1); b = bvec_push(b, W_I32_ADD); b = bvec_push(b, W_I32_ADD); b = bvec_push(b, W_I64_EXTEND_I32_U)
+    out b
+end.
+
+func w_opnd(b: int, op: int):
+    typ = lir_opnd_type(op)
+    if typ == LirOperandType.VRegInt as int or typ == LirOperandType.VRegFloat as int do out w_local_get(b, lir_opnd_vreg(op)) end
+    if typ == LirOperandType.Imm as int do out w_i64_const(b, lir_opnd_imm_val(op)) end
+    out w_i64_const(b, 0)
+end.
+
+func wasm_lir_unsupported(op: int, detail: int):
+    print_str("virc: error [E-WASM-UNSUPPORTED]: wasm32-wasi-p1 backend cannot lower LIR op ")
+    print_int(op)
+    if detail >= 0 do
+        print_str(" (detail ")
+        print_int(detail)
+        print_str(")")
+    end
+    print_newline()
+    sys_exit(1)
+end.
+
+func wasm_lir_validate_supported(mainf: int):
+    blocks = lir_func_blocks(mainf)
+    var bi = 0
+    when bi < vec_len_rt(blocks) loop
+        insv = lir_block_instrs(vec_get_rt(blocks, bi))
+        var ii = 0
+        when ii < vec_len_rt(insv) loop
+            ins = vec_get_rt(insv, ii)
+            op = lir_instr_op(ins)
+            var supported = op == LirOp.Mov as int or op == LirOp.Add as int or op == LirOp.Sub as int or op == LirOp.Mul as int or op == LirOp.Div as int or op == LirOp.SetArg as int or op == LirOp.Ret as int
+            if op == LirOp.Call as int do
+                sid = lir_instr_aux(ins)
+                strings = lir_func_strings(mainf)
+                if sid >= 0 and sid < vec_len_rt(strings) do
+                    cname = vec_get_rt(strings, sid)
+                    ffi_id = ffi_import_find(cname)
+                    if ffi_id >= 0 do
+                        ffi_import_mark_used(ffi_id as int)
+                        supported = 1
+                    end
+                end
+            eif op == LirOp.Intrinsic as int do
+                kind = lir_instr_aux(ins)
+                supported = kind == MIR_INTR_STR_LIT or kind == MIR_INTR_PRINT_STR or kind == MIR_INTR_PERCENT
+                if kind == MIR_INTR_BUILTIN do
+                    bid = lir_opnd_imm_val(lir_instr_src1(ins))
+                    supported = bid == 11 or bid == 19
+                end
+                if not supported do wasm_lir_unsupported(op, kind) end
+            eif not supported do
+                wasm_lir_unsupported(op, 0 - 1)
+            end
+            ii = ii + 1
+        end
+        bi = bi + 1
+    end
+end.
+
+func wasm_lir_write_module(lir_funcs: int, path: int):
+    # The active frontend always emits global-init then main; use main's LIR
+    # body and real vreg operands. Unsupported CFG/function features remain a
+    # compiler diagnostic concern, never an empty placeholder body.
+    mainf = 0
+    var fi = 0
+    when fi <  vec_len_rt(lir_funcs) loop
+        f = vec_get_rt(lir_funcs, fi)
+        # main is normally the final user function; global init has no strings.
+        if vec_len_rt(lir_func_strings(f)) > 0 do mainf = f end
+        fi = fi + 1
+    end
+    if mainf == 0 do mainf = vec_get_rt(lir_funcs, vec_len_rt(lir_funcs) - 1) end
+    wasm_lir_validate_supported(mainf)
+    let n_ffi = ffi_import_used_count()
+    strings = lir_func_strings(mainf)
+    data = bvec_new(); data = bvec_push(data, 10); data = bvec_push(data, 0)
+    offsets = vec_new_rt(); off = 1026
+    var si = 0
+    when si < vec_len_rt(strings) loop
+        s = vec_get_rt(strings, si) as string
+        offsets = vec_push_rt(offsets, off)
+        sp = native_read_i64(s as int, 0); sl = fat_str_len(s)
+        var bi = 0
+        when bi < sl loop data = bvec_push(data, native_read_u8(sp, bi)); bi = bi + 1 end
+        data = bvec_push(data, 0); off = off + sl + 1; si = si + 1
+    end
+    heap = off + 16
+    code = bvec_new(); maxr = 0; args_base = 128
+    blocks = lir_func_blocks(mainf)
+    var bi = 0
+    when bi < vec_len_rt(blocks) loop
+        insv = lir_block_instrs(vec_get_rt(blocks, bi))
+        var ii = 0
+        when ii < vec_len_rt(insv) loop
+            ins = vec_get_rt(insv, ii); dst = lir_instr_dst(ins); src1 = lir_instr_src1(ins); src2 = lir_instr_src2(ins)
+            if (lir_opnd_type(dst) == LirOperandType.VRegInt as int or lir_opnd_type(dst) == LirOperandType.VRegFloat as int) and lir_opnd_vreg(dst) > maxr do maxr = lir_opnd_vreg(dst) end
+            op = lir_instr_op(ins)
+            if op == LirOp.Mov as int do
+                code = w_opnd(code, src1); code = w_local_set(code, lir_opnd_vreg(dst))
+            eif op == LirOp.Add as int or op == LirOp.Sub as int or op == LirOp.Mul as int or op == LirOp.Div as int do
+                code = w_opnd(code, src1); code = w_opnd(code, src2)
+                if op == LirOp.Add as int do code = bvec_push(code, 0x7c) end
+                if op == LirOp.Sub as int do code = bvec_push(code, 0x7d) end
+                if op == LirOp.Mul as int do code = bvec_push(code, 0x7e) end
+                if op == LirOp.Div as int do code = bvec_push(code, W_I64_DIV_S) end
+                code = w_local_set(code, lir_opnd_vreg(dst))
+            eif op == LirOp.SetArg as int do
+                code = w_opnd(code, src2); code = w_local_set(code, args_base + lir_opnd_imm_val(src1))
+            eif op == LirOp.Call as int do
+                sid = lir_instr_aux(ins)
+                if sid >= 0 and sid < vec_len_rt(strings) do
+                    cname = vec_get_rt(strings, sid)
+                    ffi_id = ffi_import_find(cname)
+                    if ffi_id >= 0 do
+                        var ffi_dense = 0 - 1
+                        var ffi_k = 0
+                        when ffi_k < n_ffi loop
+                            if ffi_import_used_at(ffi_k) == ffi_id do
+                                ffi_dense = ffi_k
+                            end
+                            ffi_k = ffi_k + 1
+                        end
+                        if ffi_dense >= 0 do
+                            call_target = 1 + ffi_dense
+                            code = w_call(code, call_target)
+                            code = bvec_push(code, W_I64_EXTEND_I32_U)
+                            if lir_opnd_type(dst) == LirOperandType.VRegInt as int do
+                                code = w_local_set(code, lir_opnd_vreg(dst))
+                            else
+                                code = bvec_push(code, W_DROP)
+                            end
+                        end
+                    end
+                end
+            eif op == LirOp.Intrinsic as int do
+                kind = lir_instr_aux(ins)
+                if kind == MIR_INTR_STR_LIT do
+                    sid = lir_opnd_imm_val(src1); ptr = 0
+                    if sid >= 0 and sid < vec_len_rt(offsets) do ptr = vec_get_rt(offsets, sid) end
+                    code = w_i64_const(code, ptr); code = w_local_set(code, lir_opnd_vreg(dst))
+                eif kind == MIR_INTR_PRINT_STR do
+                    print_op = src1
+                    if lir_opnd_type(print_op) == LirOperandType.None as int do print_op = src2 end
+                    code = w_opnd(code, print_op); code = w_call(code, 1 + n_ffi)
+                eif kind == MIR_INTR_BUILTIN do
+                    bid = lir_opnd_imm_val(src1)
+                    if bid == 11 do
+                        code = w_local_get(code, args_base); code = w_local_get(code, args_base + 1); code = w_call(code, 2 + n_ffi); code = w_local_set(code, lir_opnd_vreg(dst))
+                    eif bid == 19 do
+                        code = w_local_get(code, args_base); code = w_call(code, 3 + n_ffi); code = w_local_set(code, lir_opnd_vreg(dst))
+                    end
+                eif kind == MIR_INTR_PERCENT do
+                    code = w_opnd(code, src1)
+                    if lir_instr_typ(ins) == LirType.F64 as int do
+                        code = bvec_push(code, W_F64_REINTERPRET_I64)
+                    else
+                        code = bvec_push(code, W_F64_CONVERT_I64_S)
+                    end
+                    code = w_f64_const_100(code)
+                    code = bvec_push(code, W_F64_DIV)
+                    code = bvec_push(code, W_I64_REINTERPRET_F64)
+                    code = w_local_set(code, lir_opnd_vreg(dst))
+                end
+            end
+            ii = ii + 1
+        end
+        bi = bi + 1
+    end
+    # Header
+    outb = bvec_new(); outb = bvec_push(outb, 0); outb = bvec_push(outb, 97); outb = bvec_push(outb, 115); outb = bvec_push(outb, 109); outb = bvec_push(outb, 1); outb = bvec_push(outb, 0); outb = bvec_push(outb, 0); outb = bvec_push(outb, 0)
+    # types: fd_write, print, strcat, itoa, _start, wasi_fn
+    t = bvec_new(); t = w_u(t, 6)
+    t = bvec_push(t, 0x60); t = w_u(t, 4); t = bvec_push(t,W_I32); t=bvec_push(t,W_I32); t=bvec_push(t,W_I32); t=bvec_push(t,W_I32); t=w_u(t,1); t=bvec_push(t,W_I32)
+    t = bvec_push(t,0x60); t=w_u(t,1); t=bvec_push(t,W_I64); t=w_u(t,0)
+    t = bvec_push(t,0x60); t=w_u(t,2); t=bvec_push(t,W_I64); t=bvec_push(t,W_I64); t=w_u(t,1); t=bvec_push(t,W_I64)
+    t = bvec_push(t,0x60); t=w_u(t,1); t=bvec_push(t,W_I64); t=w_u(t,1); t=bvec_push(t,W_I64)
+    t = bvec_push(t,0x60); t=w_u(t,0); t=w_u(t,0)
+    t = bvec_push(t,0x60); t=w_u(t,0); t=w_u(t,1); t=bvec_push(t,W_I32); outb=w_section(outb,1,t)
+    im = bvec_new(); im = w_u(im, 1 + n_ffi)
+    im = w_name(im, fat_str_new("wasi_snapshot_preview1")); im = w_name(im, fat_str_new("fd_write")); im = bvec_push(im, 0); im = w_u(im, 0)
+    var ffi_w = 0
+    when ffi_w < n_ffi loop
+        let u_id = ffi_import_used_at(ffi_w)
+        var s_mod = ffi_import_source(u_id)
+        if ffi_source_is_os(s_mod) == 1 do
+            s_mod = fat_str_new("wasi_snapshot_preview1")
+        end
+        let s_fun = ffi_import_name(u_id)
+        im = w_name(im, s_mod)
+        im = w_name(im, s_fun)
+        im = bvec_push(im, 0)
+        im = w_u(im, 5)
+        ffi_w = ffi_w + 1
+    end
+    outb = w_section(outb, 2, im)
+    fs = bvec_new(); fs = w_u(fs, 4); fs = w_u(fs, 1); fs = w_u(fs, 2); fs = w_u(fs, 3); fs = w_u(fs, 4); outb = w_section(outb, 3, fs)
+    mem = bvec_new(); mem = w_u(mem, 1); mem = bvec_push(mem, 0); mem = w_u(mem, 1); outb = w_section(outb, 5, mem)
+    gl = bvec_new(); gl = w_u(gl, 1); gl = bvec_push(gl, W_I32); gl = bvec_push(gl, 1); gl = w_i32_const(gl, heap); gl = bvec_push(gl, W_END); outb = w_section(outb, 6, gl)
+    ex = bvec_new(); ex = w_u(ex, 2); ex = w_name(ex, fat_str_new("_start")); ex = bvec_push(ex, 0); ex = w_u(ex, 4 + n_ffi); ex = w_name(ex, fat_str_new("memory")); ex = bvec_push(ex, 2); ex = w_u(ex, 0); outb = w_section(outb, 7, ex)
+    local_count = maxr + 1
+    if local_count < args_base + 2 do local_count = args_base + 2 end
+    cs=bvec_new(); cs=w_u(cs,4); cs=w_bytes(cs,w_func_body(w_print_code(),2,W_I32)); cs=w_bytes(cs,w_func_body(w_strcat_code(),6,W_I32)); cs=w_bytes(cs,w_itoa_body(w_itoa_code())); cs=w_bytes(cs,w_func_body(code,local_count,W_I64)); outb=w_section(outb,10,cs)
+    ds=bvec_new(); ds=w_u(ds,1); ds=bvec_push(ds,0); ds=w_i32_const(ds,1024); ds=bvec_push(ds,W_END); ds=w_u(ds,bvec_len(data)); ds=w_bytes(ds,data); outb=w_section(outb,11,ds)
+    write_file_bytes(path, bvec_data_ptr(outb), bvec_len(outb), 0o644)
+end.
+
+export wasm_lir_write_module
