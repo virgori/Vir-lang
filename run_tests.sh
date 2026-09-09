@@ -476,6 +476,13 @@ run_group_10() {
         run_test_in_group 10 "tests/test_adv_002_overflow.vri"
         run_test_in_group 10 "tests/test_adv_004_bitwise.vri"
         run_test_in_group 10 "tests/test_adv_005_shift.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_operator_e2e.vri"
+        run_test_in_group 10 "tests/strict_v2/test_percent_combination_e2e.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_codegen_smoke_e2e.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_binary_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_prefix_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_string_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_bool_rejected.vri"
     else
         run_test_in_group 10 "tests/test_adv_002_overflow.vri"
         run_test_in_group 10 "tests/test_adv_004_bitwise.vri"
@@ -488,6 +495,13 @@ run_group_10() {
         run_test_in_group 10 "tests/test_arithmetic.vri"
         run_test_in_group 10 "tests/test_bit_min.vri"
         run_test_in_group 10 "tests/test_bit_min2.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_operator_e2e.vri"
+        run_test_in_group 10 "tests/strict_v2/test_percent_combination_e2e.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_codegen_smoke_e2e.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_binary_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_prefix_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_string_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/percent_bool_rejected.vri"
         run_test_in_group 10 "tests/vri/test_adv_002_overflow.vri"
         run_test_in_group 10 "tests/vri/test_adv_004_bitwise.vri"
         run_test_in_group 10 "tests/vri/test_adv_005_shift.vri"
@@ -1034,10 +1048,12 @@ run_group_30() {
         run_test_in_group 30 "tests/test_adv_073_deep_expr.vri"
         run_test_in_group 30 "tests/vri/test_adv_010_precedence.vri"
         run_test_in_group 30 "tests/vri/test_adv_073_deep_expr.vri"
+        run_test_in_group 30 "tests/strict_v2/test_percent_combination_e2e.vri"
     else
         run_test_in_group 30 "tests/test_adv_073_deep_expr.vri"
         run_test_in_group 30 "tests/vri/test_adv_010_precedence.vri"
         run_test_in_group 30 "tests/vri/test_adv_073_deep_expr.vri"
+        run_test_in_group 30 "tests/strict_v2/test_percent_combination_e2e.vri"
     fi
     local pass_cnt=${GP_PASS[30]}
     local fail_cnt=${GP_FAIL[30]}
