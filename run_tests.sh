@@ -53,7 +53,7 @@ run_test_in_group() {
     ' "$test")
 
     # Negative test (compile rejection expected)
-    if [[ "$test" == *_rejected.vri ]] || [[ "$test" == *_rejected_*.vri ]]; then
+    if [[ "$test" == *_rejected.vri ]] || [[ "$test" == *_rejected_*.vri ]] || [[ "$test" == *_negative.vri ]]; then
         if ! $VIRC "$test" -o "$A_OUT" >/dev/null 2>&1; then
             echo "  [PASS-REJECT] $test"
             GP_PASS[$g]=$((GP_PASS[$g]+1))
@@ -537,8 +537,13 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_non_callable_field_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_opaque_pointer_member_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_other_entity_method_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_pointer_field_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_port_missing_member_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_port_wrong_arity_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_port_wrong_type_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_too_many_args_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_wrong_arity_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_wrong_type_rejected.vri"
         run_test_in_group 11 "tests/vri/test_ufcs.vri"
     fi
     local pass_cnt=${GP_PASS[11]}
@@ -918,14 +923,33 @@ run_group_26() {
     echo "──────────────────────────────────────────────────────────────────────────"
     if [ "$MODE" = "min" ]; then
         run_test_in_group 26 "tests/strict_v2/test_spec26_ai_huge_proof.vri"
+        run_test_in_group 26 "tests/strict_v2/fma_tensor_e2e.vri"
+        run_test_in_group 26 "tests/strict_v2/fma_float_rectangular_e2e.vri"
         run_test_in_group 26 "tests/strict_v2/test_float_matmul_e2e.vri"
         run_test_in_group 26 "tests/test_adv_030_fma.vri"
         run_test_in_group 26 "tests/test_adv_033_matmul.vri"
     else
         run_test_in_group 26 "tests/strict_v2/test_spec26_ai_huge_proof.vri"
+        run_test_in_group 26 "tests/strict_v2/fma_tensor_e2e.vri"
+        run_test_in_group 26 "tests/strict_v2/fma_float_rectangular_e2e.vri"
         run_test_in_group 26 "tests/strict_v2/test_autodiff_e2e.vri"
         run_test_in_group 26 "tests/strict_v2/test_quantize_e2e.vri"
+        run_test_in_group 26 "tests/strict_v2/quantize_frontend_positive.vri"
         run_test_in_group 26 "tests/strict_v2/test_float_matmul_e2e.vri"
+        run_test_in_group 26 "tests/strict_v2/backward_outside_train_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/fma_element_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/fma_scalar_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/fma_shape_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/infer_backward_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/infer_train_nested_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/quantize_bits_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/quantize_dynamic_bits_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/quantize_input_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/quantize_integer_tensor_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/tensor_empty_shape_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/tensor_zero_dimension_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/train_backward_external_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/train_backward_integer_negative.vri"
         run_test_in_group 26 "tests/test_adv_030_fma.vri"
         run_test_in_group 26 "tests/test_adv_033_matmul.vri"
         run_test_in_group 26 "tests/test_arena_api.vri"
