@@ -3,6 +3,8 @@
 **Spec:** Vir v2.0  
 Path map: `A.B.C` → `A/B/C.vri` from project roots / stdlib.
 
+The dot `.` is the only module-path separator. `A::B` is invalid Vir syntax.
+
 ## Declaration order (module level)
 
 ```text
