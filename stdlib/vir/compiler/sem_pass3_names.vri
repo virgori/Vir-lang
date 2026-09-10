@@ -40,6 +40,22 @@ const PASS3_GLOBAL_BUCKET_MASK: int = 4095
 var g_pass3_global_heads: i64 = 0
 var g_pass3_global_next: i64 = 0
 var g_pass3_global_indexed_count: i64 = 0
+var g_pass3_import_aliases: i64 = 0
+var g_pass3_import_targets: i64 = 0
+
+func pass3_resolve_import_alias(name: string):
+    if g_pass3_import_aliases == 0 or fat_str_len(name) == 0 do out name end
+    var i = 0
+    let n = vec_len_rt(g_pass3_import_aliases)
+    when i < n loop
+        al = vec_get_rt(g_pass3_import_aliases, i) as string
+        if fat_str_eq(al, name) == 1 do
+            out vec_get_rt(g_pass3_import_targets, i) as string
+        end
+        i = i + 1
+    end
+    out name
+end.
 
 func pass3_name_bucket(name: string):
     n = fat_str_len(name)
@@ -192,24 +208,122 @@ func pass3_register_pattern_binders(symbols: SymbolTable, scopes: ScopeTree, dia
     out 0
 end.
 
+func pass3_rewrite_variant(node: AstNode, sym: SymbolNode, syms_vec: i64):
+    node_ptr = node as i64
+    saved_name = native_read_i64(node_ptr, 0)
+    saved_op = native_read_i64(node_ptr, 24)
+    saved_line = native_read_i64(node_ptr, 32)
+    saved_float = native_read_i64(node_ptr, 48)
+    saved_children = native_read_i64(node_ptr, 64)
+    sym_ptr = sym as i64
+    variant_ast = native_read_i64(sym_ptr, 32)
+    variant_tag = native_read_i64(variant_ast, 40)
+    variant_arity = native_read_i64(sym_ptr, 56)
+    parent_id = native_read_i64(sym_ptr, 72)
+    enum_name = fat_str_new("")
+    if parent_id >= 0 do
+        parent = vec_get_rt(syms_vec, parent_id)
+        enum_name = native_read_i64(parent as i64, 8) as string
+    end
+    # No calls after this point: publish the complete AST rewrite atomically
+    # with respect to the bootstrap aggregate-return ABI.
+    native_write_i64(node_ptr, 0, saved_name)
+    native_write_i64(node_ptr, 8, enum_name as i64)
+    native_write_i64(node_ptr, 16, AstType.EnumConstruct as i64)
+    native_write_i64(node_ptr, 24, saved_op)
+    native_write_i64(node_ptr, 32, saved_line)
+    native_write_i64(node_ptr, 40, variant_tag)
+    native_write_i64(node_ptr, 48, saved_float)
+    native_write_i64(node_ptr, 56, variant_arity)
+    native_write_i64(node_ptr, 64, saved_children)
+    out 0
+end.
+
 func pass3_resolve_names(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode):
+    g_pass3_import_aliases = vec_new_rt()
+    g_pass3_import_targets = vec_new_rt()
     pass3_build_global_index(symbols, scopes)
     pass3_walk(symbols, scopes, diag, node)
 end.
 func pass3_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode):
 
+    # Import children are declaration names, never value expressions. Walking
+    # them as identifiers would rewrite `import Some, Ok, Err ...` into three
+    # zero-argument enum constructions.
+    # Import children are declaration names, never value expressions. Collect
+    # aliases so `import Enum as Alias` resolves properly.
+    if node.node_type == AstType.ImportStmt do
+        child_count = vec_len_rt(node.children)
+        var ii = 0
+        when ii < child_count loop
+            sym_ch = vec_get_rt(node.children, ii) as AstNode
+            if fat_str_len(sym_ch.name2) > 0 do
+                g_pass3_import_aliases = vec_push_rt(g_pass3_import_aliases, sym_ch.name2 as i64)
+                g_pass3_import_targets = vec_push_rt(g_pass3_import_targets, sym_ch.name as i64)
+            end
+            ii = ii + 1
+        end
+        out 0
+    end
+    if node.node_type == AstType.ExportStmt or node.node_type == AstType.IncludeStmt or node.node_type == AstType.ModuleStmt do
+        out 0
+    end
+
     if node.node_type == AstType.Identifier do
-        nm = node.name as i64
-        if fat_cstr_eq(nm, "null") or fat_cstr_eq(nm, "void") or fat_cstr_eq(nm, "true") or fat_cstr_eq(nm, "false") or fat_cstr_eq(nm, "None") do
+        saved_node_ptr = node as i64
+        saved_node_name = native_read_i64(saved_node_ptr, 0)
+        saved_node_name2 = native_read_i64(saved_node_ptr, 8)
+        saved_node_type = native_read_i64(saved_node_ptr, 16)
+        saved_node_op = native_read_i64(saved_node_ptr, 24)
+        saved_node_line = native_read_i64(saved_node_ptr, 32)
+        saved_node_int = native_read_i64(saved_node_ptr, 40)
+        saved_node_float = native_read_i64(saved_node_ptr, 48)
+        saved_node_bid = native_read_i64(saved_node_ptr, 56)
+        saved_node_children = native_read_i64(saved_node_ptr, 64)
+        nm = saved_node_name
+        if fat_cstr_eq(nm, "null") or fat_cstr_eq(nm, "void") or fat_cstr_eq(nm, "true") or fat_cstr_eq(nm, "false") do
             out 0
         end
-        found = pass3_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        found = pass3_lookup_chain(symbols, scopes, scope_current_id(scopes), saved_node_name as string)
         if found == -1 do
             # `this` in a method body: register if the parser used ThisKw.
             if fat_cstr_eq(nm, "this") == 1 do
                 pass3_register_local(symbols, scopes, fat_str_new("this"), SymbolKind.Param, node.line)
             else
                 report_error(diag, 2001, node.line, 0)
+            end
+        else
+            syms_vec = native_read_i64(symbols as i64, 0)
+            sym = vec_get_rt(syms_vec, found) as SymbolNode
+            if sym.kind == SymbolKind.Variant do
+                native_write_i64(saved_node_ptr, 0, saved_node_name)
+                native_write_i64(saved_node_ptr, 8, saved_node_name2)
+                native_write_i64(saved_node_ptr, 16, saved_node_type)
+                native_write_i64(saved_node_ptr, 24, saved_node_op)
+                native_write_i64(saved_node_ptr, 32, saved_node_line)
+                native_write_i64(saved_node_ptr, 40, saved_node_int)
+                native_write_i64(saved_node_ptr, 48, saved_node_float)
+                native_write_i64(saved_node_ptr, 56, saved_node_bid)
+                native_write_i64(saved_node_ptr, 64, saved_node_children)
+                pass3_rewrite_variant(node, sym, syms_vec)
+                native_write_i64(saved_node_ptr, 32, saved_node_line)
+                native_write_i64(saved_node_ptr, 64, saved_node_children)
+                if sym.parent_id == 0 - 2 do
+                    report_error(diag, 3038, node.line, 0)
+                else
+                    native_write_i64(saved_node_ptr, 0, saved_node_name)
+                    native_write_i64(saved_node_ptr, 8, saved_node_name2)
+                    native_write_i64(saved_node_ptr, 16, saved_node_type)
+                    native_write_i64(saved_node_ptr, 24, saved_node_op)
+                    native_write_i64(saved_node_ptr, 32, saved_node_line)
+                    native_write_i64(saved_node_ptr, 40, saved_node_int)
+                    native_write_i64(saved_node_ptr, 48, saved_node_float)
+                    native_write_i64(saved_node_ptr, 56, saved_node_bid)
+                    native_write_i64(saved_node_ptr, 64, saved_node_children)
+                    pass3_rewrite_variant(node, sym, syms_vec)
+                    native_write_i64(saved_node_ptr, 32, saved_node_line)
+                    native_write_i64(saved_node_ptr, 64, saved_node_children)
+                end
             end
         end
         out 0
@@ -229,9 +343,52 @@ func pass3_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
     end
 
     if node.node_type == AstType.Call do
-        found = pass3_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
-        if found == -1 and pass3_is_soft_call_name(node.name) == 0 do
+        saved_node_ptr = node as i64
+        saved_node_name = native_read_i64(saved_node_ptr, 0)
+        saved_node_name2 = native_read_i64(saved_node_ptr, 8)
+        saved_node_type = native_read_i64(saved_node_ptr, 16)
+        saved_node_op = native_read_i64(saved_node_ptr, 24)
+        saved_node_line = native_read_i64(saved_node_ptr, 32)
+        saved_node_int = native_read_i64(saved_node_ptr, 40)
+        saved_node_float = native_read_i64(saved_node_ptr, 48)
+        saved_node_bid = native_read_i64(saved_node_ptr, 56)
+        saved_node_children = native_read_i64(saved_node_ptr, 64)
+        found = pass3_lookup_chain(symbols, scopes, scope_current_id(scopes), saved_node_name as string)
+        if found == -1 and pass3_is_soft_call_name(saved_node_name as string) == 0 do
             report_error(diag, 1003, node.line, 0)
+        eif found != -1 do
+            syms_vec = native_read_i64(symbols as i64, 0)
+            sym = vec_get_rt(syms_vec, found) as SymbolNode
+            if sym.kind == SymbolKind.Variant do
+                native_write_i64(saved_node_ptr, 0, saved_node_name)
+                native_write_i64(saved_node_ptr, 8, saved_node_name2)
+                native_write_i64(saved_node_ptr, 16, saved_node_type)
+                native_write_i64(saved_node_ptr, 24, saved_node_op)
+                native_write_i64(saved_node_ptr, 32, saved_node_line)
+                native_write_i64(saved_node_ptr, 40, saved_node_int)
+                native_write_i64(saved_node_ptr, 48, saved_node_float)
+                native_write_i64(saved_node_ptr, 56, saved_node_bid)
+                native_write_i64(saved_node_ptr, 64, saved_node_children)
+                pass3_rewrite_variant(node, sym, syms_vec)
+                native_write_i64(saved_node_ptr, 32, saved_node_line)
+                native_write_i64(saved_node_ptr, 64, saved_node_children)
+                if sym.parent_id == 0 - 2 do
+                    report_error(diag, 3038, node.line, 0)
+                else
+                    native_write_i64(saved_node_ptr, 0, saved_node_name)
+                    native_write_i64(saved_node_ptr, 8, saved_node_name2)
+                    native_write_i64(saved_node_ptr, 16, saved_node_type)
+                    native_write_i64(saved_node_ptr, 24, saved_node_op)
+                    native_write_i64(saved_node_ptr, 32, saved_node_line)
+                    native_write_i64(saved_node_ptr, 40, saved_node_int)
+                    native_write_i64(saved_node_ptr, 48, saved_node_float)
+                    native_write_i64(saved_node_ptr, 56, saved_node_bid)
+                    native_write_i64(saved_node_ptr, 64, saved_node_children)
+                    pass3_rewrite_variant(node, sym, syms_vec)
+                    native_write_i64(saved_node_ptr, 32, saved_node_line)
+                    native_write_i64(saved_node_ptr, 64, saved_node_children)
+                end
+            end
         end
         # Resolve arguments
         child_count = vec_len_rt(node.children)
@@ -245,6 +402,67 @@ func pass3_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
     end
 
     if node.node_type == AstType.MethodCall do
+        # `Enum.Variant(args...)` reaches the parser as MethodCall.  Resolve it
+        # against the receiver enum before applying ordinary UFCS semantics,
+        # and remove the synthetic receiver from the constructor payload list.
+        node_ptr = node as i64
+        saved_name = native_read_i64(node_ptr, 0)
+        saved_op = native_read_i64(node_ptr, 24)
+        saved_line = native_read_i64(node_ptr, 32)
+        saved_float = native_read_i64(node_ptr, 48)
+        original_children = native_read_i64(node_ptr, 64)
+        child_count = vec_len_rt(original_children)
+        if child_count > 0 do
+            receiver = vec_get_rt(original_children, 0) as AstNode
+            if receiver.node_type == AstType.Identifier do
+                receiver_name = native_read_i64(receiver as i64, 0) as string
+                receiver_name = pass3_resolve_import_alias(receiver_name)
+                enum_found = pass3_lookup_chain(symbols, scopes, scope_current_id(scopes), receiver_name)
+                if enum_found == -1 do
+                    enum_found = pass3_lookup_chain(symbols, scopes, 0, receiver_name)
+                end
+                if enum_found >= 0 do
+                    syms_vec = native_read_i64(symbols as i64, 0)
+                    enum_sym = vec_get_rt(syms_vec, enum_found) as SymbolNode
+                    if enum_sym.kind == SymbolKind.Enum do
+                        enum_ast = enum_sym.ast_id as AstNode
+                        var vi = 0
+                        when vi < vec_len_rt(enum_ast.children) loop
+                            variant_ast = vec_get_rt(enum_ast.children, vi) as AstNode
+                            variant_name = native_read_i64(variant_ast as i64, 0) as string
+                            if fat_str_eq(variant_name, saved_name as string) == 1 do
+                                variant_tag = native_read_i64(variant_ast as i64, 40)
+                                variant_children = native_read_i64(variant_ast as i64, 64)
+                                variant_arity = vec_len_rt(variant_children)
+                                # Keep the parser's receiver child in the internal AST.
+                                # Rebuilding this vector here triggers the bootstrap
+                                # compiler's aggregate-return clobber bug.  Lowering
+                                # recognizes and skips this one synthetic child.
+                                var ri = 1
+                                when ri < child_count loop
+                                    payload_child = vec_get_rt(original_children, ri)
+                                    pass3_walk(symbols, scopes, diag, payload_child)
+                                    ri = ri + 1
+                                end
+                                # Restore/write raw words after nested calls.  This is
+                                # the same soft-ABI discipline used by ast_add_child.
+                                native_write_i64(node_ptr, 0, saved_name)
+                                native_write_i64(node_ptr, 8, receiver_name as i64)
+                                native_write_i64(node_ptr, 16, AstType.EnumConstruct as i64)
+                                native_write_i64(node_ptr, 24, saved_op)
+                                native_write_i64(node_ptr, 32, saved_line)
+                                native_write_i64(node_ptr, 40, variant_tag)
+                                native_write_i64(node_ptr, 48, saved_float)
+                                native_write_i64(node_ptr, 56, variant_arity)
+                                native_write_i64(node_ptr, 64, original_children)
+                                out 0
+                            end
+                            vi = vi + 1
+                        end
+                    end
+                end
+            end
+        end
         # UFCS / Callable field: receiver is children[0]. Missing free function
         # is allowed because callable record fields lower dynamically.
         found = pass3_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
