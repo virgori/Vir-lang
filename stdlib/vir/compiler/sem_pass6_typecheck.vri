@@ -323,6 +323,80 @@ func pass6_infer_type(symbols: SymbolTable, scopes: ScopeTree, node: AstNode):
     out TypeKind.Void
 end.
 
+# Deep inference is intentionally interpolation-local. Applying entity field
+# and method return inference to all assignments changes legacy self-host type
+# compatibility; interpolation needs the precision only to select stringify.
+func pass6_infer_interp_type(symbols: SymbolTable, scopes: ScopeTree, node: AstNode):
+    if node.node_type == AstType.Identifier do
+        ident_id = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        if ident_id != -1 do
+            ident_sym = pass6_symbol_at(symbols, ident_id)
+            if ident_sym.ast_id != 0 do
+                ident_decl = ident_sym.ast_id as AstNode
+                explicit_kind = pass6_resolve_ffi_type(ident_decl.name2)
+                if explicit_kind != TypeKind.Void do out explicit_kind end
+                if ident_decl.node_type == AstType.VarDecl and vec_len_rt(ident_decl.children) > 0 do
+                    ident_init = vec_get_rt(ident_decl.children, 0)
+                    if ident_init.node_type != AstType.Identifier or fat_str_eq(ident_init.name, node.name) == 0 do
+                        out pass6_infer_interp_type(symbols, scopes, ident_init)
+                    end
+                end
+            end
+        end
+        out pass6_infer_type(symbols, scopes, node)
+    end
+    if node.node_type == AstType.IndexAccess do
+        base_id = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        if base_id != -1 do
+            base_sym = pass6_symbol_at(symbols, base_id)
+            if base_sym.ast_id != 0 do
+                base_decl = base_sym.ast_id as AstNode
+                if vec_len_rt(base_decl.children) > 0 do
+                    base_init = vec_get_rt(base_decl.children, 0)
+                    if base_init.node_type == AstType.ArrayLiteral and vec_len_rt(base_init.children) > 0 do
+                        out pass6_infer_interp_type(symbols, scopes, vec_get_rt(base_init.children, 0))
+                    end
+                end
+            end
+        end
+        # Preserve the existing integer-array default when element metadata is
+        # unavailable (parameters, extern buffers, and dynamically built arrays).
+        out TypeKind.Int
+    end
+    if node.node_type == AstType.FieldAccess do
+        field_type_name = pass6_get_receiver_entity_name(symbols, scopes, node)
+        field_kind = pass6_resolve_ffi_type(field_type_name)
+        if field_kind != TypeKind.Void do out field_kind end
+        if pass6_find_entity_ast(symbols, scopes, field_type_name) != 0 do out TypeKind.Entity end
+        out TypeKind.Void
+    end
+    if node.node_type == AstType.MethodCall and fat_str_len(node.name2) > 0 do
+        owner_ast = pass6_find_entity_ast(symbols, scopes, node.name2)
+        if owner_ast != 0 do
+            owner_children = vec_len_rt(owner_ast.children)
+            var owner_i = 0
+            when owner_i < owner_children loop
+                owner_child = vec_get_rt(owner_ast.children, owner_i)
+                if node.builtin_id == 201 and owner_child.node_type == AstType.FuncDef and fat_str_eq(owner_child.name, node.name) == 1 do
+                    method_ret_kind = pass6_resolve_ffi_type(owner_child.name2)
+                    if method_ret_kind != TypeKind.Void do out method_ret_kind end
+                    if pass6_find_entity_ast(symbols, scopes, owner_child.name2) != 0 do out TypeKind.Entity end
+                    out TypeKind.Void
+                end
+                if node.builtin_id == 202 and (owner_child.node_type == AstType.Identifier or owner_child.node_type == AstType.VarDecl) and fat_str_eq(owner_child.name, node.name) == 1 do
+                    callable_ret_name = pass6_callable_return_type(owner_child.name2)
+                    callable_ret_kind = pass6_resolve_ffi_type(callable_ret_name)
+                    if callable_ret_kind != TypeKind.Void do out callable_ret_kind end
+                    if pass6_find_entity_ast(symbols, scopes, callable_ret_name) != 0 do out TypeKind.Entity end
+                    out TypeKind.Void
+                end
+                owner_i = owner_i + 1
+            end
+        end
+    end
+    out pass6_infer_type(symbols, scopes, node)
+end.
+
 func pass6_resolve_ffi_type(name: string):
     if fat_str_len(name) == 0 do out TypeKind.Void end
     if fat_cstr_eq(name, "int") == 1 or fat_cstr_eq(name, "i8") == 1 or fat_cstr_eq(name, "i16") == 1 or fat_cstr_eq(name, "i32") == 1 or fat_cstr_eq(name, "i64") == 1 or fat_cstr_eq(name, "uint") == 1 or fat_cstr_eq(name, "u8") == 1 or fat_cstr_eq(name, "u16") == 1 or fat_cstr_eq(name, "u32") == 1 or fat_cstr_eq(name, "u64") == 1 do out TypeKind.Int end
@@ -1244,9 +1318,15 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
             child = vec_get_rt(node.children, i)
             pass6_walk(symbols, scopes, diag, child)
             if child.node_type != AstType.LiteralStr do
-                ct = pass6_infer_type(symbols, scopes, child)
-                child.builtin_id = ct as int
-                if ct != TypeKind.Void and ct != TypeKind.String and pass6_is_integer_like(ct) == 0 and ct != TypeKind.Bool and ct != TypeKind.Float do
+                ct = pass6_infer_interp_type(symbols, scopes, child)
+                # Preserve call/method builtin_id metadata. int_val is unused on
+                # non-literal interpolation children and carries the checked
+                # TypeKind across the semantic arena into AST-to-MIR.
+                child.int_val = ct as int
+                # Spec §12 defines string, integer, bool and none formatting.
+                # Other representations must be rejected rather than passed to
+                # str_cat as raw pointers. Float formatting has no Spec contract.
+                if ct != TypeKind.String and ct != TypeKind.Int and ct != TypeKind.Bool and ct != TypeKind.None do
                     report_error(diag, 3001, child.line, 0)
                 end
             end

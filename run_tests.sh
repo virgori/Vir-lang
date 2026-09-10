@@ -154,6 +154,64 @@ run_ufcs_mc_target() {
     TOTAL_FAIL=$((TOTAL_FAIL+1))
 }
 
+run_interp_wasm_target() {
+    local g=31
+    local test="$1"
+    local expected="$2"
+    local label="$3"
+    local wasm_path="./scratch/interp_${label}.wasm"
+    local compile_out
+    local actual
+    local rc
+    if ! command -v node >/dev/null 2>&1; then
+        echo "  [FAIL-WASM] $label (node runtime unavailable)"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+    if ! compile_out=$($VIRC "$test" --target wasm32 -q -o "$wasm_path" 2>&1); then
+        echo "  [FAIL-WASM-COMPILE] $label"
+        echo "$compile_out" | sed 's/^/    /' | head -20
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+    actual=$(node --no-warnings --experimental-wasi-unstable-preview1 -e '
+        const fs = require("fs");
+        const { WASI } = require("wasi");
+        const wasi = new WASI({ version: "preview1", args: [], env: {} });
+        WebAssembly.instantiate(fs.readFileSync(process.argv[1]), {
+            wasi_snapshot_preview1: wasi.wasiImport
+        }).then(({ instance }) => wasi.start(instance));
+    ' "$wasm_path" 2>&1)
+    rc=$?
+    if [ $rc -eq 0 ] && [ "$actual" = "$expected" ]; then
+        echo "  [PASS-WASM] $label"
+        GP_PASS[$g]=$((GP_PASS[$g]+1)); TOTAL_PASS=$((TOTAL_PASS+1))
+    else
+        echo "  [FAIL-WASM-RUNTIME] $label (exit code: $rc)"
+        echo "    Kỳ vọng: '$expected'"
+        echo "    Thực tế: '$actual'"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+    fi
+}
+
+run_interp_mc_target() {
+    local g=31
+    local target="$1"
+    local asm_path="./scratch/interp_${target}.s"
+    local symbol="rt_bool_to_str"
+    local compile_out
+    if [ "$target" = "macos-arm64" ]; then symbol="_rt_bool_to_str"; fi
+    if compile_out=$($VIRC "tests/strict_v2/interpolation_dynamic_primitives.vri" --target "$target" -S -o "$asm_path" -q 2>&1) \
+        && [ "$(grep -Fc "$symbol" "$asm_path")" -ge 2 ]; then
+        echo "  [PASS-MC] interpolation $target assembly"
+        GP_PASS[$g]=$((GP_PASS[$g]+1)); TOTAL_PASS=$((TOTAL_PASS+1))
+        return
+    fi
+    echo "  [FAIL-MC] interpolation $target assembly"
+    if [ -n "$compile_out" ]; then echo "$compile_out" | sed 's/^/    /' | head -20; fi
+    GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+}
+
 echo "=========================================================================="
 if [ "$MODE" = "single" ]; then
     echo "  VIR COMPILER TEST SUITE — NHÓM $TARGET_GROUP"
@@ -1161,12 +1219,27 @@ run_group_31() {
         run_test_in_group 31 "tests/strict_v2/e2e_interp_matrix.vri"
         run_test_in_group 31 "tests/strict_v2/e2e_string_interpolation.vri"
         run_test_in_group 31 "tests/strict_v2/interpolation_dynamic_primitives.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_edge_values_e2e.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_negative_integer_e2e.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_float_rejected.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_array_shorthand_rejected.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_malformed_rejected.vri"
     else
         run_test_in_group 31 "tests/strict_v2/e2e_interp_matrix.vri"
         run_test_in_group 31 "tests/strict_v2/e2e_string_interpolation.vri"
         run_test_in_group 31 "tests/strict_v2/interpolation_dynamic_primitives.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_edge_values_e2e.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_negative_integer_e2e.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_float_rejected.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_array_shorthand_rejected.vri"
+        run_test_in_group 31 "tests/strict_v2/interpolation_malformed_rejected.vri"
         run_test_in_group 31 "tests/test_interp_v2.vri"
     fi
+    run_interp_wasm_target "tests/strict_v2/interpolation_dynamic_primitives.vri" "n=42; ok=true; nope=false; nothing=none; sum=43" "dynamic_primitives"
+    run_interp_wasm_target "tests/strict_v2/interpolation_negative_integer_e2e.vri" "negative=-42" "negative_integer"
+    run_interp_mc_target "macos-arm64"
+    run_interp_mc_target "linux-x86_64"
+    run_interp_mc_target "linux-riscv64"
     local pass_cnt=${GP_PASS[31]}
     local fail_cnt=${GP_FAIL[31]}
     local total_cnt=$((pass_cnt + fail_cnt))
