@@ -1309,14 +1309,15 @@ end.
 
 ### 8.3 Cú pháp khởi tạo (Constructor)
 
-Có thể khởi tạo variant thông qua 3 hình thức:
+Có thể khởi tạo variant thông qua 2 hình thức:
 1. **Dấu chấm (`Enum.Variant`)**: `Option.Some(42)`
-2. **Hai dấu hai chấm (`Enum::Variant`)**: `Option::Some(42)`
-3. **Không định danh tiền tố (`Variant`)**: `Some(42)` (chỉ hợp lệ khi tên variant là duy nhất trong phạm vi chương trình).
+2. **Không định danh tiền tố (`Variant`)**: `Some(42)` (chỉ hợp lệ khi tên variant là duy nhất trong phạm vi chương trình).
+
+`Enum::Variant` **không phải cú pháp enum hợp lệ**. Dấu `::` chỉ còn được lexer/parser nhận diện cho đường dẫn module legacy; compiler phải từ chối nó khi dùng để khởi tạo hoặc khớp variant.
 
 ```vir
 let a = Option.Some(10)
-let b = Option::Some(20)
+let b = Some(20)
 let c = Option.None
 ```
 

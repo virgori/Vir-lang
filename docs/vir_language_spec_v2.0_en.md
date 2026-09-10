@@ -1255,7 +1255,11 @@ print v.x                 # → 3
 
 ---
 
-## 8. Enum
+## 8. Enum & Tagged Union
+
+Vir supports both fieldless enums (unboxed integer values) and payload enums (tagged unions).
+
+### 8.1 Fieldless Enum
 
 ```vir
 enum Color:
@@ -1281,6 +1285,54 @@ end
 ```
 
 Enum values are integer constants starting from 0.
+
+### 8.2 Tagged Union / Payload Enum
+
+An enum with at least one payload-bearing variant is a tagged union. Variants may carry one or more typed fields and may use generic type parameters.
+
+```vir
+enum Option<T>:
+    Some(value: T)
+    None
+end.
+
+enum Result<T, E>:
+    Ok(value: T)
+    Err(error: E)
+end.
+```
+
+### 8.3 Construction Syntax
+
+Variants may be constructed in two forms:
+
+1. Qualified with a dot: `Option.Some(42)`.
+2. Unqualified: `Some(42)`, only when the variant name is unique in program scope.
+
+`Enum::Variant` is **not valid enum syntax**. The `::` token is retained only for legacy module paths and must be rejected for enum construction and matching.
+
+```vir
+let a = Option.Some(10)
+let b = Some(20)
+let c = Option.None
+```
+
+### 8.4 `case` Pattern Matching
+
+Use `case` to destructure tagged-union payloads:
+
+```vir
+case a
+    Option.Some(value):
+        print(value)
+    Option.None:
+        print(0)
+end
+```
+
+- Binder types are inferred from the variant declaration.
+- `else:` may be used as the default arm.
+- Direct `==` or `!=` comparison between payload-bearing tagged-union values is forbidden (`E3043`); use `case` instead.
 
 ---
 
