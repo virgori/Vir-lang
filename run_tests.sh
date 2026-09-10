@@ -99,10 +99,12 @@ run_test_in_group() {
     fi
 
     # Biên dịch với native virc
+    # Positive test: compile
     local compile_out
     if ! compile_out=$($VIRC "$test" -o "$A_OUT" 2>&1); then
         echo "  [FAIL-COMPILE] $test"
         echo "    $compile_out"
+        echo "$compile_out" | sed 's/^/    /' | head -20
         GP_FAIL[$g]=$((GP_FAIL[$g]+1))
         TOTAL_FAIL=$((TOTAL_FAIL+1))
         return
@@ -110,26 +112,45 @@ run_test_in_group() {
 
     # Ký mã ad-hoc (Apple Silicon arm64 bắt buộc codesign)
     codesign -s - -f "$A_OUT" >/dev/null 2>&1
+    # Codesign on macOS Mach-O
+    if [ "$(uname -s)" = "Darwin" ]; then
+        codesign -s - -f "$A_OUT" >/dev/null 2>&1 || true
+    fi
 
     # Thực thi với timeout 5 giây
+    # Positive test: run
     local actual
     actual=$(perl -e 'alarm 5; exec @ARGV' -- "$A_OUT" 2>&1)
     local exit_code=$?
+    actual=$("$A_OUT" 2>&1)
+    local rc=$?
 
     # Chuẩn hoá whitespace
     actual=$(echo "$actual" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba')
+    if [ $rc -ne 0 ]; then
+        echo "  [FAIL-RUNTIME] $test (exit code: $rc)"
+        echo "    Output: $actual"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+        TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
 
-    if [ $exit_code -eq 0 ] && [ "$actual" = "$expected" ]; then
+    if [ -n "$expected" ]; then
+        if [ "$actual" = "$expected" ]; then
+            echo "  [PASS] $test"
+            GP_PASS[$g]=$((GP_PASS[$g]+1))
+            TOTAL_PASS=$((TOTAL_PASS+1))
+        else
+            echo "  [FAIL-OUTPUT] $test"
+            echo "    Kỳ vọng: '$expected'"
+            echo "    Thực tế: '$actual'"
+            GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+            TOTAL_FAIL=$((TOTAL_FAIL+1))
+        fi
+    else
         echo "  [PASS] $test"
         GP_PASS[$g]=$((GP_PASS[$g]+1))
         TOTAL_PASS=$((TOTAL_PASS+1))
-    else
-        echo "  [FAIL] $test"
-        echo "    kỳ vọng: $(echo "$expected" | tr '\n' ',')"
-        echo "    thực tế: $(echo "$actual" | tr '\n' ',')"
-        echo "    exit_code: $exit_code"
-        GP_FAIL[$g]=$((GP_FAIL[$g]+1))
-        TOTAL_FAIL=$((TOTAL_FAIL+1))
     fi
 }
 
@@ -530,11 +551,47 @@ run_group_8() {
         run_test_in_group 8 "tests/test_adv_047_enum_control.vri"
         run_test_in_group 8 "tests/test_adv_081_multi_enum.vri"
         run_test_in_group 8 "tests/test_entity_enum_array.vri"
+        run_test_in_group 8 "tests/strict_v2/test_enum_tagged_union_e2e.vri"
+        run_test_in_group 8 "tests/strict_v2/test_option_result_enum_e2e.vri"
+        run_test_in_group 8 "tests/strict_v2/test_enum_double_colon.vri"
+        run_test_in_group 8 "tests/strict_v2/test_enum_qualified_collision.vri"
+        run_test_in_group 8 "tests/strict_v2/test_enum_complex_payload_e2e.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_constructor_arity_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_wrong_binder_count_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_unknown_variant_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_wrong_enum_qualifier_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_duplicate_arm_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_unreachable_arm_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_non_exhaustive_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_duplicate_binder_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_duplicate_tag_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_invalid_tag_range_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_generic_type_mismatch_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_payload_equality_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_ambiguous_unqualified_rejected.vri"
     else
         run_test_in_group 8 "tests/test_adv_047_enum_control.vri"
         run_test_in_group 8 "tests/test_adv_081_multi_enum.vri"
         run_test_in_group 8 "tests/test_entity_enum_array.vri"
         run_test_in_group 8 "tests/test_enum_paren.vri"
+        run_test_in_group 8 "tests/strict_v2/test_enum_tagged_union_e2e.vri"
+        run_test_in_group 8 "tests/strict_v2/test_option_result_enum_e2e.vri"
+        run_test_in_group 8 "tests/strict_v2/test_enum_double_colon.vri"
+        run_test_in_group 8 "tests/strict_v2/test_enum_qualified_collision.vri"
+        run_test_in_group 8 "tests/strict_v2/test_enum_complex_payload_e2e.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_constructor_arity_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_wrong_binder_count_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_unknown_variant_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_wrong_enum_qualifier_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_duplicate_arm_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_unreachable_arm_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_non_exhaustive_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_duplicate_binder_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_duplicate_tag_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_invalid_tag_range_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_generic_type_mismatch_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_payload_equality_rejected.vri"
+        run_test_in_group 8 "tests/strict_v2/enum_ambiguous_unqualified_rejected.vri"
         run_test_in_group 8 "tests/vri/test_adv_047_enum_control.vri"
         run_test_in_group 8 "tests/vri/test_adv_081_multi_enum.vri"
         run_test_in_group 8 "tests/vri/test_entity_enum_array.vri"

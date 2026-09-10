@@ -1248,7 +1248,13 @@ print(v.x)                 # → 3
 
 ---
 
-## 8. Enum
+## 8. Enum & Tagged Union
+
+Vir hỗ trợ hai dạng Enum: **Fieldless Enum** (enum không mang payload, unboxed integer) và **Tagged Union** (enum mang payload, arena-allocated struct).
+
+### 8.1 Fieldless Enum (Immediate Integer)
+
+Fieldless enum là tập hợp các hằng số nguyên bắt đầu từ `0` (hoặc tag tùy biến). Giá trị được lưu trực tiếp dưới dạng số nguyên 64-bit unboxed (`Copy` semantics), hoàn toàn không tốn chi phí cấp phát bộ nhớ heap.
 
 ```vir
 enum Color:
@@ -1264,7 +1270,7 @@ enum Priority:
 end.
 ```
 
-**Truy cập:**
+**Truy cập và so sánh:**
 
 ```vir
 var c = Color.Red
@@ -1273,7 +1279,96 @@ if c == Color.Green do
 end
 ```
 
-Giá trị enum là hằng số nguyên bắt đầu từ 0.
+### 8.2 Tagged Union / Payload Enum
+
+Khi một enum có ít nhất một biến thể (variant) mang tham số (payload), enum đó trở thành **Tagged Union**. Biến thể có thể chứa một hoặc nhiều trường dữ liệu, đồng thời hỗ trợ tham số kiểu tổng quát (Generics).
+
+```vir
+enum Option<T>:
+    Some(value: T)
+    None
+end.
+
+enum Result<T, E>:
+    Ok(value: T)
+    Err(error: E)
+end.
+
+entity Point:
+    x: int
+    y: int
+end.
+
+enum Event:
+    Click(x: int, y: int)
+    Message(content: string)
+    Located(pos: Point)
+    Idle
+end.
+```
+
+### 8.3 Cú pháp khởi tạo (Constructor)
+
+Có thể khởi tạo variant thông qua 3 hình thức:
+1. **Dấu chấm (`Enum.Variant`)**: `Option.Some(42)`
+2. **Hai dấu hai chấm (`Enum::Variant`)**: `Option::Some(42)`
+3. **Không định danh tiền tố (`Variant`)**: `Some(42)` (chỉ hợp lệ khi tên variant là duy nhất trong phạm vi chương trình).
+
+```vir
+let a = Option.Some(10)
+let b = Option::Some(20)
+let c = Option.None
+```
+
+### 8.4 Khớp mẫu `case` (Pattern Matching)
+
+Để giải nén dữ liệu từ Tagged Union, sử dụng cấu trúc điều khiển `case`:
+
+```vir
+case a
+    Option.Some(val):
+        print(val)
+    Option.None:
+        print(0)
+end
+```
+
+- Các biến binder (`val`) tự động suy diễn kiểu dữ liệu theo khai báo của variant (`string`, `Point`, `int`, v.v.).
+- Hỗ trợ nhánh mặc định `else:` cho các trường hợp còn lại.
+- **Cấm so sánh trực tiếp**: Không cho phép dùng toán tử `==` hoặc `!=` trực tiếp trên hai biểu thức Tagged Union mang payload (báo lỗi `E3043`), bắt buộc phải sử dụng `case`.
+
+### 8.5 Bố cục bộ nhớ & ABI (ABI Memory Layout)
+
+Mọi instance của Tagged Union được cấp phát thông qua bump allocator `rt_alloc`:
+
+| Offset (Byte) | Kích thước | Trường | Ý nghĩa |
+|---|---|---|---|
+| `0` | 4 byte | `tag` (`u32`) | Chỉ số variant (0, 1, 2, ...), giới hạn trong phạm vi `u32`. |
+| `4` | 4 byte | `padding` | Đệm 4 byte để đảm bảo căn chỉnh 8-byte cho payload. |
+| `8 + i * 8` | 8 byte | `slot[i]` | Từ 64-bit lưu trữ tham số thứ `i` (nguyên, thực, con trỏ chuỗi hoặc entity). |
+
+- Biến thể không mang payload trong Tagged Union (ví dụ `Option.None`) cũng được cấp phát ô nhớ 8-byte với `tag = 1` và 0 payload slot để đảm bảo an toàn con trỏ.
+- Dung lượng cấp phát cho mọi biến thể của cùng một enum bằng `8 + max_variant_payload_slots * 8`.
+
+### 8.6 Danh mục Mã Lỗi Semantic (Diagnostics)
+
+Trình biên dịch Vir kiểm tra chặt chẽ các quy tắc sau ở giai đoạn Semantic Analysis:
+
+| Mã lỗi | Mô tả |
+|---|---|
+| `E3031` | Sai số lượng tham số trong lệnh gọi constructor của enum. |
+| `E3032` | Khớp mẫu `case` không vét cạn (non-exhaustive) thiếu biến thể và không có nhánh `else`. |
+| `E3033` | Biến thể không tồn tại trong enum (`Unknown variant`). |
+| `E3034` | Tiền tố enum không khớp với kiểu của biểu thức `case` (`Wrong enum qualifier`). |
+| `E3035` | Trùng lặp nhánh kiểm tra biến thể trong `case` (`Duplicate arm`). |
+| `E3036` | Nhánh `case` không thể chạm tới vì nằm sau nhánh `else` (`Unreachable arm`). |
+| `E3037` | Sai số lượng biến binder hứng payload trong mẫu `case`. |
+| `E3038` | Tên biến thể không định danh bị nhập nhằng giữa nhiều enum (`Ambiguous unqualified variant`). |
+| `E3039` | Trùng lặp tag số nguyên khi định nghĩa enum. |
+| `E3040` | Tag enum vượt quá giới hạn biểu diễn của `u32` (`Invalid tag range`). |
+| `E3041` | Trùng lặp tên biến binder trong cùng một mẫu `case`. |
+| `E3042` | Xung đột tham số kiểu generic giữa enum và giá trị truyền vào (`Generic type mismatch`). |
+| `E3043` | Dùng toán tử so sánh bằng/khác trên Tagged Union mang payload thay vì dùng `case`. |
 
 ---
 

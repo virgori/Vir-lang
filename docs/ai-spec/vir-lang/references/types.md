@@ -30,7 +30,8 @@ end.
 |---|---|---|
 | `entity` | Named record | Move |
 | `packed entity` | No padding (FFI/mmap) | Move |
-| `enum` | Named ints from 0 | Copy |
+| `enum` (fieldless) | Named ints from 0 | Copy |
+| `enum` (with payload) | Tagged union (arena-allocated) | Move / Arena |
 | `register` / `mold` | Bit layouts | Copy |
 | `array` / list `[…]` | Dynamic | Move |
 | `dict` `["k": v]` | Key-value | Move |
@@ -43,15 +44,23 @@ entity User:
     age: int
 end.
 
+# Fieldless enum (immediate integer)
 enum Color:
     Red
     Green
     Blue
 end.
 
-packed entity Vec2:
-    x: int
-    y: int
+# Tagged union / Payload enum (generic or non-generic)
+enum Option<T>:
+    Some(value: T)
+    None
+end.
+
+enum Shape:
+    Circle(radius: float)
+    Rect(w: int, h: int)
+    Point
 end.
 ```
 
@@ -59,9 +68,54 @@ Construction / access:
 
 ```vir
 var u = User(name: "Alice", age: 30)
-var c = Color.Red
-u.age = 31
+var c = Color.Red # fieldless immediate integer
+var opt = Option.Some(42) # qualified with dot
+var opt2 = Option::Some(42) # qualified with double-colon
+var opt3 = Some(42) # unqualified when unique in scope
 ```
+
+### Tagged Union ABI & Memory Layout
+
+When an `enum` contains any variant with payload, instances are allocated via the runtime arena allocator (`rt_alloc(8 + max_payload_slots * 8)`):
+
+| Byte Offset | Size | Field | Description |
+|---|---|---|---|
+| `0` | 4 bytes | `tag` (`u32`) | Variant index / tag ID (0, 1, 2, ...). |
+| `4` | 4 bytes | `padding` | Zero padding for 8-byte alignment. |
+| `8 + i * 8` | 8 bytes | `slot[i]` | 64-bit payload word for parameter `i` (pointer, int, or float). |
+
+- **Fieldless variants** inside a tagged union (e.g., `Option.None`) also allocate an 8-byte cell with `tag = 1` and 0 payload slots, or use 0-length payload.
+- **Pure fieldless enums** (having zero payload variants, like `Color`) are unboxed immediate 64-bit integers with zero heap allocation overhead (`Copy` semantics).
+
+### Tagged Union Pattern Matching & Diagnostics
+
+Pattern matching on enums is performed using `case`:
+
+```vir
+case opt
+    Option.Some(val):
+        print(val)
+    Option.None:
+        print(0)
+end
+```
+
+- Qualified syntax `Enum.Variant` and `Enum::Variant` are both supported.
+- Unqualified `Variant` is supported when unambiguous across all enums in scope.
+- **Diagnostics**:
+  - `E3031`: Constructor arity mismatch.
+  - `E3032`: Non-exhaustive `case` (missing variant and no `else`).
+  - `E3033`: Unknown variant name.
+  - `E3034`: Wrong enum qualifier.
+  - `E3035`: Duplicate variant arm in `case`.
+  - `E3036`: Unreachable arm after `else`.
+  - `E3037`: Wrong pattern binder count.
+  - `E3038`: Ambiguous unqualified variant name.
+  - `E3039`: Duplicate explicit tag.
+  - `E3040`: Invalid tag range (must fit in `u32`).
+  - `E3041`: Duplicate binder variable name in pattern.
+  - `E3042`: Generic type argument mismatch.
+  - `E3043`: Direct equality comparison `==` on payload enum (must use `case` pattern matching).
 
 ## Ownership (summary)
 
