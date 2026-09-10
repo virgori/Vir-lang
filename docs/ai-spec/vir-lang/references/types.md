@@ -70,8 +70,7 @@ Construction / access:
 var u = User(name: "Alice", age: 30)
 var c = Color.Red # fieldless immediate integer
 var opt = Option.Some(42) # qualified with dot
-var opt2 = Option::Some(42) # qualified with double-colon
-var opt3 = Some(42) # unqualified when unique in scope
+var opt2 = Some(42) # unqualified when unique in scope
 ```
 
 ### Tagged Union ABI & Memory Layout
@@ -100,7 +99,7 @@ case opt
 end
 ```
 
-- Qualified syntax `Enum.Variant` and `Enum::Variant` are both supported.
+- Qualified enum syntax is `Enum.Variant`. `Enum::Variant` is invalid; `::` is reserved for legacy module paths.
 - Unqualified `Variant` is supported when unambiguous across all enums in scope.
 - **Diagnostics**:
   - `E3031`: Constructor arity mismatch.
