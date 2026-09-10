@@ -1,6 +1,6 @@
-# Vir Compiler Official Native Binaries (v2.8.5)
+# Vir Compiler Official Native Binaries (v2.8.6)
 
-Precompiled self-hosted standalone binaries for the Vir Compiler toolchain (`v2.8.5`), featuring native support for **Spec §26 AI/ML Mathematical Operators**, postfix percent `%`, and strict **§4.4 / §7.3 `packed entity`**.
+Precompiled self-hosted standalone binaries for the Vir Compiler toolchain (`v2.8.6`), featuring native support for **Spec §26 AI/ML Mathematical Operators**, postfix percent `%`, and strict **§4.4 / §7.3 `packed entity`**.
 
 All binaries are pure native executables with zero external runtime dependencies.
 
