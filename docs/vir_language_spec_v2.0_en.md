@@ -429,6 +429,8 @@ include net.http as web;         # loads net/http.vri, namespace = web
 
 **Resolution:** `A.B.C` → searches for `A/B/C.vri` from project root.
 
+The dot `.` is the only module-path separator. `A::B` is not valid Vir syntax and must be rejected in every context.
+
 ### 3.3 Import — Bring Functions into Scope
 
 ```vir
@@ -1309,7 +1311,7 @@ Variants may be constructed in two forms:
 1. Qualified with a dot: `Option.Some(42)`.
 2. Unqualified: `Some(42)`, only when the variant name is unique in program scope.
 
-`Enum::Variant` is **not valid enum syntax**. The `::` token is retained only for legacy module paths and must be rejected for enum construction and matching.
+`Enum::Variant` is **not valid Vir syntax**. There is no `::` token in the language; the compiler must reject it in every syntactic context.
 
 ```vir
 let a = Option.Some(10)

@@ -426,6 +426,8 @@ include math, io.file as file, net.http as web; # nhúng nhiều module trên 1 
 
 **Cơ chế ánh xạ:** `A.B.C` → tìm file `A/B/C.vri` từ gốc dự án.
 
+Dấu chấm `.` là dấu phân cách duy nhất của đường dẫn module. `A::B` không phải cú pháp Vir hợp lệ và compiler phải từ chối ở mọi ngữ cảnh.
+
 ### 3.3 Import — Nhập symbol đã export vào scope hiện tại
 
 `import` **không yêu cầu phải include trước**. Nó chỉ lấy các symbol đã `export` từ file/module đích vào phạm vi hiện tại.
@@ -1313,7 +1315,7 @@ Có thể khởi tạo variant thông qua 2 hình thức:
 1. **Dấu chấm (`Enum.Variant`)**: `Option.Some(42)`
 2. **Không định danh tiền tố (`Variant`)**: `Some(42)` (chỉ hợp lệ khi tên variant là duy nhất trong phạm vi chương trình).
 
-`Enum::Variant` **không phải cú pháp enum hợp lệ**. Dấu `::` chỉ còn được lexer/parser nhận diện cho đường dẫn module legacy; compiler phải từ chối nó khi dùng để khởi tạo hoặc khớp variant.
+`Enum::Variant` **không phải cú pháp Vir hợp lệ**. Token `::` không tồn tại trong ngôn ngữ; compiler phải từ chối nó ở mọi ngữ cảnh cú pháp.
 
 ```vir
 let a = Option.Some(10)

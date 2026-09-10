@@ -99,7 +99,7 @@ case opt
 end
 ```
 
-- Qualified enum syntax is `Enum.Variant`. `Enum::Variant` is invalid; `::` is reserved for legacy module paths.
+- Qualified enum syntax is `Enum.Variant`. `Enum::Variant` is invalid because Vir has no `::` token.
 - Unqualified `Variant` is supported when unambiguous across all enums in scope.
 - **Diagnostics**:
   - `E3031`: Constructor arity mismatch.
