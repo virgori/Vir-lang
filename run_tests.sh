@@ -175,6 +175,24 @@ run_ufcs_mc_target() {
     TOTAL_FAIL=$((TOTAL_FAIL+1))
 }
 
+run_enum_mc_target() {
+    local g=8
+    local target="$1"
+    local asm_path="./scratch/enum_${target}.s"
+    local compile_out
+    if compile_out=$($VIRC "tests/strict_v2/test_enum_tagged_union_e2e.vri" --target "$target" -S -o "$asm_path" -q 2>&1) \
+        && [ -s "$asm_path" ]; then
+        echo "  [PASS-MC] Enum $target assembly"
+        GP_PASS[$g]=$((GP_PASS[$g]+1))
+        TOTAL_PASS=$((TOTAL_PASS+1))
+        return
+    fi
+    echo "  [FAIL-MC] Enum $target assembly"
+    if [ -n "$compile_out" ]; then echo "$compile_out" | sed 's/^/    /' | head -20; fi
+    GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+    TOTAL_FAIL=$((TOTAL_FAIL+1))
+}
+
 run_interp_wasm_target() {
     local g=31
     local test="$1"
@@ -556,6 +574,8 @@ run_group_8() {
         run_test_in_group 8 "tests/strict_v2/test_enum_double_colon.vri"
         run_test_in_group 8 "tests/strict_v2/test_enum_qualified_collision.vri"
         run_test_in_group 8 "tests/strict_v2/test_enum_complex_payload_e2e.vri"
+        run_test_in_group 8 "tests/strict_v2/test_explicit_tags.vri"
+        run_test_in_group 8 "tests/strict_v2/test_no_tags.vri"
         run_test_in_group 8 "tests/strict_v2/enum_constructor_arity_rejected.vri"
         run_test_in_group 8 "tests/strict_v2/enum_wrong_binder_count_rejected.vri"
         run_test_in_group 8 "tests/strict_v2/enum_unknown_variant_rejected.vri"
@@ -579,6 +599,8 @@ run_group_8() {
         run_test_in_group 8 "tests/strict_v2/test_enum_double_colon.vri"
         run_test_in_group 8 "tests/strict_v2/test_enum_qualified_collision.vri"
         run_test_in_group 8 "tests/strict_v2/test_enum_complex_payload_e2e.vri"
+        run_test_in_group 8 "tests/strict_v2/test_explicit_tags.vri"
+        run_test_in_group 8 "tests/strict_v2/test_no_tags.vri"
         run_test_in_group 8 "tests/strict_v2/enum_constructor_arity_rejected.vri"
         run_test_in_group 8 "tests/strict_v2/enum_wrong_binder_count_rejected.vri"
         run_test_in_group 8 "tests/strict_v2/enum_unknown_variant_rejected.vri"
@@ -597,6 +619,9 @@ run_group_8() {
         run_test_in_group 8 "tests/vri/test_entity_enum_array.vri"
         run_test_in_group 8 "tests/vri/test_enum_paren.vri"
     fi
+    run_enum_mc_target "macos-arm64"
+    run_enum_mc_target "linux-x86_64"
+    run_enum_mc_target "linux-riscv64"
     local pass_cnt=${GP_PASS[8]}
     local fail_cnt=${GP_FAIL[8]}
     local total_cnt=$((pass_cnt + fail_cnt))
