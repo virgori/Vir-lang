@@ -43,6 +43,7 @@ var g_pass6_func_nodes: i64 = 0
 var g_pass6_current_entity_name: i64 = 0
 var g_pass6_var_names: i64 = 0
 var g_pass6_var_types: i64 = 0
+var g_pass6_quantized_tensor_type: i64 = fat_str_new("QuantizedTensor") as i64
 
 
 func pass6_hash_name(name: string):
@@ -763,6 +764,29 @@ func pass6_callable_param_type(type_str: string, wanted: int):
     out fat_str_new("")
 end.
 
+func pass6_callable_return_type(type_str: string):
+    slen = fat_str_len(type_str)
+    var pos = 0
+    when pos < slen and fat_str_byte_at(type_str, pos) != 41 loop
+        pos = pos + 1
+    end
+    if pos >= slen do out fat_str_new("") end
+    pos = pos + 1
+    when pos < slen and (fat_str_byte_at(type_str, pos) == 32 or fat_str_byte_at(type_str, pos) == 9) loop
+        pos = pos + 1
+    end
+    # The self-host token spelling currently compacts `func(int) -> Box` as
+    # `func(int)Box`; accept an explicit arrow too for parser compatibility.
+    if pos + 1 < slen and fat_str_byte_at(type_str, pos) == 45 and fat_str_byte_at(type_str, pos + 1) == 62 do
+        pos = pos + 2
+    end
+    when pos < slen and (fat_str_byte_at(type_str, pos) == 32 or fat_str_byte_at(type_str, pos) == 9) loop
+        pos = pos + 1
+    end
+    if pos >= slen do out fat_str_new("") end
+    out fat_str_slice(type_str as i64, pos, slen - pos) as string
+end.
+
 func pass6_get_receiver_entity_name(symbols: SymbolTable, scopes: ScopeTree, recv: AstNode):
     if recv == 0 do out fat_str_new("") end
     nt = recv.node_type
@@ -807,7 +831,7 @@ func pass6_get_receiver_entity_name(symbols: SymbolTable, scopes: ScopeTree, rec
         out recv.name
     end
     if nt == AstType.BuiltinCall & fat_cstr_eq(recv.name, "port") == 1 do
-        out fat_str_new("Port")
+        out recv.name
     end
     if nt == AstType.Call do
         ent_chk3 = pass6_find_entity_ast(symbols, scopes, recv.name)
@@ -842,8 +866,39 @@ func pass6_get_receiver_entity_name(symbols: SymbolTable, scopes: ScopeTree, rec
         out fat_str_new("")
     end
     if nt == AstType.MethodCall and vec_len_rt(recv.children) > 0 do
+        # A resolved free-function UFCS call carries the free callee in `name`.
+        # Preserve an entity return type so the next link in a chain can resolve
+        # against that entity's method set (for example: 9.to_box().score()).
+        if recv.builtin_id == 203 do
+            free_call_ast = pass6_find_free_function(recv.name)
+            if free_call_ast != 0 do
+                free_call_ret = free_call_ast.name2
+                if fat_str_len(free_call_ret) > 0 do
+                    free_call_ret_ent = pass6_find_entity_ast(symbols, scopes, free_call_ret)
+                    if free_call_ret_ent != 0 do out free_call_ret end
+                end
+            end
+        end
         m_recv = vec_get_rt(recv.children, 0)
         m_recv_ent = pass6_get_receiver_entity_name(symbols, scopes, m_recv)
+        if recv.builtin_id == 202 and fat_str_len(m_recv_ent) > 0 do
+            callable_owner = pass6_find_entity_ast(symbols, scopes, m_recv_ent)
+            if callable_owner != 0 do
+                callable_child_count = vec_len_rt(callable_owner.children)
+                var callable_i = 0
+                when callable_i < callable_child_count loop
+                    callable_field = vec_get_rt(callable_owner.children, callable_i)
+                    if (callable_field.node_type == AstType.Identifier or callable_field.node_type == AstType.VarDecl) and fat_str_eq(callable_field.name, recv.name) == 1 do
+                        callable_ret = pass6_callable_return_type(callable_field.name2)
+                        callable_ret_ent = pass6_find_entity_ast(symbols, scopes, callable_ret)
+                        if callable_ret_ent != 0 do out callable_ret_ent.name end
+                        callable_i = callable_child_count
+                    else
+                        callable_i = callable_i + 1
+                    end
+                end
+            end
+        end
         if fat_str_len(m_recv_ent) > 0 do
             m_base_ast = pass6_find_entity_ast(symbols, scopes, m_recv_ent)
             if m_base_ast != 0 do
@@ -942,7 +997,10 @@ func pass6_check_method_call(symbols: SymbolTable, scopes: ScopeTree, diag: Diag
                     ai = ai + 1
                 end
                 node.builtin_id = 201
-                node.name2 = fat_str_concat(fat_str_concat(recv_ent_name, fat_str_new(".")), mname)
+                # Keep only the parser-owned receiver type across the semantic
+                # arena boundary. AST-to-MIR rebuilds the qualified method name
+                # from its persistent scoped-method table.
+                node.name2 = recv_ent_name
                 out 0
             end
 
@@ -994,7 +1052,7 @@ func pass6_check_method_call(symbols: SymbolTable, scopes: ScopeTree, diag: Diag
 
     # Builtin Port UFCS is intentionally narrow: only values produced by
     # `port(...)` receive the send/recv surface.  Opaque pointers never do.
-    if fat_cstr_eq(recv_ent_name, "Port") == 1 do
+    if fat_cstr_eq(recv_ent_name, "port") == 1 do
         if fat_cstr_eq(mname, "send") == 1 do
             if nargs != 1 do
                 report_error(diag, 3022, node.line, 0)
@@ -1007,7 +1065,7 @@ func pass6_check_method_call(symbols: SymbolTable, scopes: ScopeTree, diag: Diag
                 out 0
             end
             node.builtin_id = 203
-            node.name2 = fat_str_new("send")
+            node.name2 = mname
             out 0
         end
         if fat_cstr_eq(mname, "recv") == 1 do
@@ -1016,7 +1074,7 @@ func pass6_check_method_call(symbols: SymbolTable, scopes: ScopeTree, diag: Diag
                 out 0
             end
             node.builtin_id = 203
-            node.name2 = fat_str_new("recv")
+            node.name2 = mname
             out 0
         end
     end
@@ -1718,7 +1776,7 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
             child0 = vec_get_rt(node.children, 0)
             initializer_type = pass6_get_receiver_entity_name(symbols, scopes, child0)
             if child0.node_type == AstType.QuantizeExpr do
-                initializer_type = fat_str_new("QuantizedTensor")
+                initializer_type = g_pass6_quantized_tensor_type as string
             end
         end
         if fat_str_len(initializer_type) > 0 do

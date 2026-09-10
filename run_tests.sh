@@ -52,12 +52,44 @@ run_test_in_group() {
         }
     ' "$test")
 
+    local expected_diag
+    expected_diag=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC:[[:space:]]*//p' "$test" | head -1)
+    local expected_line
+    expected_line=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC_LINE:[[:space:]]*//p' "$test" | head -1)
+    local expected_member
+    expected_member=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC_MEMBER:[[:space:]]*//p' "$test" | head -1)
+    local expected_receiver
+    expected_receiver=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC_RECEIVER:[[:space:]]*//p' "$test" | head -1)
+
     # Negative test (compile rejection expected)
     if [[ "$test" == *_rejected.vri ]] || [[ "$test" == *_rejected_*.vri ]] || [[ "$test" == *_negative.vri ]]; then
-        if ! $VIRC "$test" -o "$A_OUT" >/dev/null 2>&1; then
-            echo "  [PASS-REJECT] $test"
-            GP_PASS[$g]=$((GP_PASS[$g]+1))
-            TOTAL_PASS=$((TOTAL_PASS+1))
+        local reject_out
+        reject_out=$($VIRC "$test" -o "$A_OUT" 2>&1)
+        local reject_rc=$?
+        if [ $reject_rc -ne 0 ]; then
+            local fail_reason=""
+            if [ -n "$expected_diag" ] && ! grep -Fq "[$expected_diag]" <<<"$reject_out"; then
+                fail_reason="kỳ vọng diagnostic code: $expected_diag"
+            elif [ -n "$expected_line" ] && ! grep -E -i -q "([Ll]ine[[:space:]]*:[[:space:]]*$expected_line\b|[Ll]ine[[:space:]]+$expected_line\b)" <<<"$reject_out"; then
+                fail_reason="kỳ vọng diagnostic line: $expected_line"
+            elif [ -n "$expected_member" ] && ! grep -Fq "$expected_member" <<<"$reject_out"; then
+                fail_reason="kỳ vọng diagnostic member: $expected_member"
+            elif [ -n "$expected_receiver" ] && ! grep -Fq "$expected_receiver" <<<"$reject_out"; then
+                fail_reason="kỳ vọng diagnostic receiver: $expected_receiver"
+            fi
+
+            if [ -n "$fail_reason" ]; then
+                echo "  [FAIL-WRONG-DIAGNOSTIC] $test"
+                echo "    kỳ vọng diagnostic: $expected_diag"
+                echo "    $fail_reason"
+                echo "    thực tế: $(echo "$reject_out" | grep -m1 -E 'Code[[:space:]]*:' || true)"
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+                TOTAL_FAIL=$((TOTAL_FAIL+1))
+            else
+                echo "  [PASS-REJECT] $test"
+                GP_PASS[$g]=$((GP_PASS[$g]+1))
+                TOTAL_PASS=$((TOTAL_PASS+1))
+            fi
         else
             echo "  [FAIL-EXPECT-REJECT] $test"
             GP_FAIL[$g]=$((GP_FAIL[$g]+1))
@@ -101,11 +133,33 @@ run_test_in_group() {
     fi
 }
 
+run_ufcs_mc_target() {
+    local g=11
+    local target="$1"
+    local asm_path="./scratch/ufcs_${target}.s"
+    local compile_out
+    if compile_out=$($VIRC "tests/strict_v2/ufcs_cross_type_chain_e2e.vri" --target "$target" -S -o "$asm_path" -q 2>&1) \
+        && grep -Fq "Box.score" "$asm_path" \
+        && grep -Fq "Wrapper.to_box" "$asm_path"; then
+        if [ "$target" != "linux-riscv64" ] || { grep -Eq '^[[:space:]]*la[[:space:]].*make_box' "$asm_path" && grep -Eq '^[[:space:]]*jalr[[:space:]]' "$asm_path"; }; then
+            echo "  [PASS-MC] UFCS $target assembly"
+            GP_PASS[$g]=$((GP_PASS[$g]+1))
+            TOTAL_PASS=$((TOTAL_PASS+1))
+            return
+        fi
+    fi
+    echo "  [FAIL-MC] UFCS $target assembly"
+    if [ -n "$compile_out" ]; then echo "    $compile_out"; fi
+    GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+    TOTAL_FAIL=$((TOTAL_FAIL+1))
+}
+
 echo "=========================================================================="
 if [ "$MODE" = "single" ]; then
     echo "  VIR COMPILER TEST SUITE — NHÓM $TARGET_GROUP"
 else
-    echo "  VIR COMPILER TEST SUITE — CHẾ ĐỘ [${MODE^^}]"
+    MODE_UPPER=$(echo "$MODE" | tr '[:lower:]' '[:upper:]')
+    echo "  VIR COMPILER TEST SUITE — CHẾ ĐỘ [$MODE_UPPER]"
 fi
 echo "=========================================================================="
 echo ""
@@ -560,6 +614,11 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_receiver_forms_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_eval_order_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_cross_type_chain_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_declaration_order_e2e.vri"
+        run_test_in_group 11 "tests/bootstrap_codegen/cg_ufcs_strict_resolution.vri"
     else
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
@@ -577,8 +636,21 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_too_many_args_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_receiver_forms_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_eval_order_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_cross_type_chain_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_declaration_order_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_method_field_same_name_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_private_module_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_receiver_mutation_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_nested_reg_pressure_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_optional_chaining_rejected.vri"
+        run_test_in_group 11 "tests/bootstrap_codegen/cg_ufcs_strict_resolution.vri"
         run_test_in_group 11 "tests/vri/test_ufcs.vri"
     fi
+    run_ufcs_mc_target "linux-arm64"
+    run_ufcs_mc_target "linux-x86_64"
+    run_ufcs_mc_target "linux-riscv64"
     local pass_cnt=${GP_PASS[11]}
     local fail_cnt=${GP_FAIL[11]}
     local total_cnt=$((pass_cnt + fail_cnt))
