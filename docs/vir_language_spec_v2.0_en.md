@@ -1321,7 +1321,7 @@ let c = Option.None
 
 ### 8.4 `case` Pattern Matching
 
-Use `case` to destructure tagged-union payloads:
+Use `case` to destructure tagged-union payloads (full grammar: §21):
 
 ```vir
 case a
@@ -1329,12 +1329,14 @@ case a
         print(value)
     Option.None:
         print(0)
+    else print(-1)
 end
 ```
 
 - Binder types are inferred from the variant declaration.
-- `else:` may be used as the default arm.
+- Default arm: `else …` — a **continuation**, **no** colon (not `else:`; see §21).
 - Direct `==` or `!=` comparison between payload-bearing tagged-union values is forbidden (`E3043`); use `case` instead.
+- Arm boundaries follow the **case-pattern grammar** (`pattern ":"`), not arbitrary `expr:` — so statements inside an arm are not mistaken for new arms (§21.1).
 
 ---
 
@@ -2781,11 +2783,54 @@ end
 
 `case` is a **control-flow** block — close with `end` (not `end.`).
 
-Canonical rules follow the Vietnamese spec (`docs/vir_language_spec_v2.0_vi.md` §21).
+`:` marks only the **start of an arm** (after `pattern`). The arm body is a normal Vir `statement-list`: separator `;` or `NEWLINE` (§1.0). No `do`, `=>`, or `{}`.
 
-`case` arms are a **list** under the unified separator (§1.0): `;` or newline. Multiple arms on one line require `;`.
+`else` is a **continuation / default arm**, not a pattern — **no** colon (same rule as `else` in `if`, §1.1).
 
-### 21.1 Standard form
+### 21.1 Grammar
+
+```text
+case-expression :=
+    "case" expression
+    case-arm+
+    ["else" statement-list]
+    "end"
+
+case-arm :=
+    pattern ":" statement-list
+
+statement-list :=
+    statement (separator statement)*
+
+separator :=
+    NEWLINE | ";"
+```
+
+**Arm-boundary rule (important):** the parser must **not** treat every arbitrary `expr:` as a new arm. A new arm starts only when the token sequence at the start of a logical statement matches the **case-pattern grammar** (`pattern ":"`) or the keyword `else`. `Pattern` is the set of patterns allowed in `case`, **not** an arbitrary expression — this avoids ambiguity with later statements such as `something: value` inside an arm body (typed constructs / maps / labels).
+
+Inside `case`, `pattern :` at the start of a logical statement begins a new arm; `else` ends the current arm and starts the default arm.
+
+### 21.2 Allowed patterns
+
+In Spec v2.0, `pattern` in a `case-arm` includes (not expanded to arbitrary expressions):
+
+| Form | Examples |
+|---|---|
+| Numeric / string / bool literals | `0`, `1`, `"red"`, `true`, `false` |
+| Enum / tagged-union variants (with or without binders) | `Option.None`, `Option.Some(val)`, `Some(x)` |
+| Wildcard (when allowed in patterns) | `_` |
+
+Tagged-union matching details: §8.4. Exhaustiveness / diagnostics: `E3032`–`E3043` (§8.6).
+
+### 21.3 Standard form
+
+```vir
+case x
+    1: print("one")
+    2: print("two")
+    else print("other")
+end
+```
 
 ```vir
 case v.virgex_fullmatch(pattern, p)
@@ -2794,25 +2839,34 @@ case v.virgex_fullmatch(pattern, p)
 end
 ```
 
+Multiple statements in one arm — same line (`;`) or multiple lines:
+
 ```vir
-case v.virgex_fullmatch(pattern, p)
-    true: print("✅ $p");
-    false: print("❌ $p")
+case x
+    1: foo(); bar()
+    2: baz()
 end
 ```
+
+```vir
+case x
+    1:
+        print("one")
+        out 1
+    2:
+        print("two")
+end
+```
+
+**A newline immediately after `:` is allowed** (separator / formatting only). Indentation is **not** semantic.
+
+Multiple arms on one line require `;` between arms:
 
 ```vir
 case x
     1: print("one"); 2: print("two")
 end
 ```
-
-**Rules:**
-- `case <expr>` then arms `pattern: …`
-- Between arms: `;` or `NEWLINE` (§1.0)
-- Default arm: `else …` — `else` is a **continuation** (§1.1), **no** colon (same as `else` in `if`)
-- Close with `end`
-- A new arm starts when the next item is `pattern:` / `else` — multiple statements in the same arm also use the same separator until the next arm
 
 ```vir
 case color
@@ -2821,6 +2875,22 @@ case color
     else log("unknown", 0); out 0
 end
 ```
+
+### 21.4 Mandatory rules
+
+1. `case <expression>`, then at least one `case-arm`; optional one `else` statement-list; close with `end`.
+2. Separators inside an arm and between arms: `;` or `NEWLINE` (§1.0).
+3. Default arm: `else …` — do **not** write `else:`.
+4. **Empty arms are illegal** — after `pattern:` there must be at least one statement before the next arm / `else` / `end`. The following is a **syntax error** (must not treat `2:` as belonging to the body of `1`):
+
+```vir
+case x
+    1:
+    2: foo()
+end
+```
+
+5. Do not use indentation to split arms; arm boundaries follow only the `pattern ":"` / `else` grammar at the start of a logical statement.
 
 ---
 

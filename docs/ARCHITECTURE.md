@@ -570,8 +570,8 @@ The following program demonstrates canonical Vir v2.0 syntax, strict English key
 
 module demo.ai
 
-include vir.rt.io
-import print_ln, print_int from vir.rt.io
+include rt.io
+import print_ln, print_int from rt.io
 
 func matrix_multiply_demo:
     # 1. Declare two 2x2 floating-point tensors
