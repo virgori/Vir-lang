@@ -193,6 +193,25 @@ run_enum_mc_target() {
     TOTAL_FAIL=$((TOTAL_FAIL+1))
 }
 
+run_case_mc_target() {
+    local g=21
+    local target="$1"
+    local asm_path="./scratch/case_${target}.s"
+    local compile_out
+    if compile_out=$($VIRC "tests/strict_v2/test_case_grammar_e2e.vri" --target "$target" -S -o "$asm_path" -q 2>&1) \
+        && [ -s "$asm_path" ] \
+        && grep -Fq "rt_str_eq" "$asm_path"; then
+        echo "  [PASS-MC] Case $target assembly"
+        GP_PASS[$g]=$((GP_PASS[$g]+1))
+        TOTAL_PASS=$((TOTAL_PASS+1))
+        return
+    fi
+    echo "  [FAIL-MC] Case $target assembly"
+    if [ -n "$compile_out" ]; then echo "$compile_out" | sed 's/^/    /' | head -20; fi
+    GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+    TOTAL_FAIL=$((TOTAL_FAIL+1))
+}
+
 run_interp_wasm_target() {
     local g=31
     local test="$1"
@@ -1067,6 +1086,12 @@ run_group_21() {
         run_test_in_group 21 "tests/bootstrap_codegen/cg_mem_loop_pattern.vri"
         run_test_in_group 21 "tests/test_adv_022_switch_case.vri"
         run_test_in_group 21 "tests/test_case_real.vri"
+        run_test_in_group 21 "tests/strict_v2/test_case_grammar_e2e.vri"
+        run_test_in_group 21 "tests/strict_v2/test_case_control_flow_e2e.vri"
+        run_test_in_group 21 "tests/strict_v2/case_else_colon_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_empty_arm_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_binder_scope_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_literal_type_mismatch_rejected.vri"
     else
         run_test_in_group 21 "tests/bootstrap_codegen/cg_mem_loop_pattern.vri"
         run_test_in_group 21 "tests/test_adv_022_switch_case.vri"
@@ -1077,7 +1102,27 @@ run_group_21() {
         run_test_in_group 21 "tests/vri/test_case_real.vri"
         run_test_in_group 21 "tests/vri/test_case_spec.vri"
         run_test_in_group 21 "tests/vri/test_virc_patterns.vri"
+        run_test_in_group 21 "tests/strict_v2/test_case_grammar_e2e.vri"
+        run_test_in_group 21 "tests/strict_v2/test_case_control_flow_e2e.vri"
+        run_test_in_group 21 "tests/strict_v2/case_else_colon_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_missing_arm_colon_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_empty_arm_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_repeated_keyword_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_no_pattern_arm_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_empty_else_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_header_colon_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_binder_scope_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_literal_type_mismatch_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_bool_type_mismatch_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_arbitrary_expr_pattern_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_duplicate_else_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_arm_after_else_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_end_dot_rejected.vri"
+        run_test_in_group 21 "tests/strict_v2/case_missing_end_rejected.vri"
     fi
+    run_case_mc_target "linux-arm64"
+    run_case_mc_target "linux-x86_64"
+    run_case_mc_target "linux-riscv64"
     local pass_cnt=${GP_PASS[21]}
     local fail_cnt=${GP_FAIL[21]}
     local total_cnt=$((pass_cnt + fail_cnt))
