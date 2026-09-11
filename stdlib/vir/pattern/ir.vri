@@ -1,0 +1,328 @@
+##
+ * vir/pattern/ir.vri -- Shared Pattern Intermediate Representation (Pattern IR)
+ * ============================================================================
+ * Internal IR common to both Virgex (VPS) and traditional Regex frontends.
+ * Both frontends compile AST directly into this Pattern IR without intermediate
+ * cross-syntax string conversion.
+ *
+ * Designed for linear-time Thompson NFA / Pike VM execution.
+ ##
+
+include types
+include vec
+include syscall
+include vir.pattern.string
+
+# Pattern modules are compiled as a standalone stdlib slice by production
+# virc.  Their transitive collection/string guards call `panic`, while the
+# full compiler driver normally provides that symbol.  Keep the slice
+# fail-fast without pulling the compiler driver into user programs.
+func panic(msg: string):
+    print(msg)
+    sys_exit(1)
+end.
+
+# -------------------------------------------------------
+# Pattern IR Operations
+# -------------------------------------------------------
+
+enum PatternOp:
+    Literal     = 1    # Match exact byte (val = byte code)
+    Dot         = 2    # Match any byte except newline (\n)
+    CharClass   = 3    # Match byte in chars or ranges
+    Sequence    = 4    # Ordered concatenation of child node indices
+    Alternation = 5    # Branch choice between child node indices
+    Repeat      = 6    # Quantifier on child: val = child_id, val2 = max (-1 = unbounded), val3 = min
+    Group       = 7    # Group wrapper: val = child_id, val2 = capture_id (0 = none), val3 = is_atom (1/0)
+    AnchorStart = 8    # Start of string (^ / leading |)
+    AnchorEnd   = 9    # End of string ($ / trailing |)
+end.
+
+# -------------------------------------------------------
+# Pattern IR Node
+# -------------------------------------------------------
+
+entity PatternNode:
+    op:          int,          # PatternOp
+    val:         int,          # byte code / child index
+    val2:        int,          # max count / capture_id
+    val3:        int,          # min count / is_atom flag
+    chars:       Vec<int>,     # discrete character codes
+    ranges:      Vec<int>,     # pairs of [lo, hi, lo, hi...]
+    is_negated:  bool,         # true if negated character class
+    children:    Vec<int>      # child indices for Sequence and Alternation
+end.
+
+# -------------------------------------------------------
+# Character Class Range Utilities
+# -------------------------------------------------------
+
+func char_class_match(chars: Vec<int>, ranges: Vec<int>, is_negated: bool, b: int):
+    # 1. Check ranges
+    var i = 0
+    let rlen = vec_len<int>(ranges)
+    when i + 1 < rlen loop
+        let lo = vec_get<int>(ranges, i)
+        let hi = vec_get<int>(ranges, i + 1)
+        if b >= lo & b <= hi do
+            if is_negated do out false else out true end
+        end
+        i = i + 2
+    end
+
+    # 2. Check individual chars
+    i = 0
+    let clen = vec_len<int>(chars)
+    when i < clen loop
+        if vec_get<int>(chars, i) == b do
+            if is_negated do out false else out true end
+        end
+        i = i + 1
+    end
+
+    if is_negated do out true else out false end
+end.
+
+func ranges_digits():
+    var r = vec_new<int>()
+    vec_push<int>(r, 48)
+    vec_push<int>(r, 57)
+    out r
+end.
+
+func ranges_upper():
+    var r = vec_new<int>()
+    vec_push<int>(r, 65)
+    vec_push<int>(r, 90)
+    out r
+end.
+
+func ranges_lower():
+    var r = vec_new<int>()
+    vec_push<int>(r, 97)
+    vec_push<int>(r, 122)
+    out r
+end.
+
+func ranges_alpha():
+    var r = vec_new<int>()
+    vec_push<int>(r, 65)
+    vec_push<int>(r, 90)
+    vec_push<int>(r, 97)
+    vec_push<int>(r, 122)
+    out r
+end.
+
+func ranges_alnum():
+    var r = vec_new<int>()
+    vec_push<int>(r, 48)
+    vec_push<int>(r, 57)
+    vec_push<int>(r, 65)
+    vec_push<int>(r, 90)
+    vec_push<int>(r, 97)
+    vec_push<int>(r, 122)
+    out r
+end.
+
+func chars_word_extra():
+    var c = vec_new<int>()
+    vec_push<int>(c, 95) # '_'
+    out c
+end.
+
+func chars_space():
+    var c = vec_new<int>()
+    vec_push<int>(c, 32) # ' '
+    vec_push<int>(c, 9)  # '\t'
+    vec_push<int>(c, 10) # '\n'
+    vec_push<int>(c, 13) # '\r'
+    vec_push<int>(c, 12) # '\f'
+    out c
+end.
+
+# -------------------------------------------------------
+# IR Arena Node Constructors
+# -------------------------------------------------------
+
+func pattern_arena_new():
+    out vec_new<PatternNode>()
+end.
+
+func pattern_node_op_at(arena: Vec<PatternNode>, index: int) -> int:
+    let node: PatternNode = vec_get<PatternNode>(arena, index)
+    out node.op
+end.
+
+func pattern_node_val_at(arena: Vec<PatternNode>, index: int) -> int:
+    let node: PatternNode = vec_get<PatternNode>(arena, index)
+    out node.val
+end.
+
+func pattern_node_val2_at(arena: Vec<PatternNode>, index: int) -> int:
+    let node: PatternNode = vec_get<PatternNode>(arena, index)
+    out node.val2
+end.
+
+func pattern_node_val3_at(arena: Vec<PatternNode>, index: int) -> int:
+    let node: PatternNode = vec_get<PatternNode>(arena, index)
+    out node.val3
+end.
+
+func pattern_node_children_len(arena: Vec<PatternNode>, index: int) -> int:
+    let node: PatternNode = vec_get<PatternNode>(arena, index)
+    out vec_len<int>(node.children)
+end.
+
+func pattern_node_child_at(arena: Vec<PatternNode>, index: int, child_idx: int) -> int:
+    let node: PatternNode = vec_get<PatternNode>(arena, index)
+    out vec_get<int>(node.children, child_idx)
+end.
+
+func pattern_node_literal(arena: Vec<PatternNode>, byte_val: int) -> int:
+    let idx = vec_len<PatternNode>(arena)
+    let node = PatternNode (
+        op: PatternOp.Literal,
+        val: byte_val,
+        val2: 0,
+        val3: 0,
+        chars: vec_new<int>(),
+        ranges: vec_new<int>(),
+        is_negated: false,
+        children: vec_new<int>()
+    )
+    vec_push<PatternNode>(arena, node)
+    out vec_len<PatternNode>(arena) - 1
+end.
+
+func pattern_node_dot(arena: Vec<PatternNode>) -> int:
+    let idx = vec_len<PatternNode>(arena)
+    let node = PatternNode (
+        op: PatternOp.Dot,
+        val: 0,
+        val2: 0,
+        val3: 0,
+        chars: vec_new<int>(),
+        ranges: vec_new<int>(),
+        is_negated: false,
+        children: vec_new<int>()
+    )
+    vec_push<PatternNode>(arena, node)
+    out vec_len<PatternNode>(arena) - 1
+end.
+
+func pattern_node_charclass(arena: Vec<PatternNode>, chars: Vec<int>, ranges: Vec<int>, is_negated: bool) -> int:
+    let idx = vec_len<PatternNode>(arena)
+    let node = PatternNode (
+        op: PatternOp.CharClass,
+        val: 0,
+        val2: 0,
+        val3: 0,
+        chars: chars,
+        ranges: ranges,
+        is_negated: is_negated,
+        children: vec_new<int>()
+    )
+    vec_push<PatternNode>(arena, node)
+    out vec_len<PatternNode>(arena) - 1
+end.
+
+func pattern_node_sequence(arena: Vec<PatternNode>, children: Vec<int>) -> int:
+    let idx = vec_len<PatternNode>(arena)
+    let node = PatternNode (
+        op: PatternOp.Sequence,
+        val: 0,
+        val2: 0,
+        val3: 0,
+        chars: vec_new<int>(),
+        ranges: vec_new<int>(),
+        is_negated: false,
+        children: children
+    )
+    vec_push<PatternNode>(arena, node)
+    out vec_len<PatternNode>(arena) - 1
+end.
+
+func pattern_node_alternation(arena: Vec<PatternNode>, branches: Vec<int>) -> int:
+    let idx = vec_len<PatternNode>(arena)
+    let node = PatternNode (
+        op: PatternOp.Alternation,
+        val: 0,
+        val2: 0,
+        val3: 0,
+        chars: vec_new<int>(),
+        ranges: vec_new<int>(),
+        is_negated: false,
+        children: branches
+    )
+    vec_push<PatternNode>(arena, node)
+    out vec_len<PatternNode>(arena) - 1
+end.
+
+func pattern_node_repeat(arena: Vec<PatternNode>, child_id: int, min_val: int, max_val: int) -> int:
+    # Preserve scalar arguments across the empty-Vec allocations below on the
+    # production native backend.
+    var saved: [int; 3] = [child_id, min_val, max_val]
+    let idx = vec_len<PatternNode>(arena)
+    let node = PatternNode (
+        op: PatternOp.Repeat,
+        val: saved[0],
+        val2: saved[2],
+        val3: saved[1],
+        chars: vec_new<int>(),
+        ranges: vec_new<int>(),
+        is_negated: false,
+        children: vec_new<int>()
+    )
+    vec_push<PatternNode>(arena, node)
+    out vec_len<PatternNode>(arena) - 1
+end.
+
+func pattern_node_group(arena: Vec<PatternNode>, child_id: int, capture_id: int, is_atom: bool) -> int:
+    let idx = vec_len<PatternNode>(arena)
+    var atom_flag = 0
+    if is_atom do atom_flag = 1 end
+    let node = PatternNode (
+        op: PatternOp.Group,
+        val: child_id,
+        val2: capture_id,
+        val3: atom_flag,
+        chars: vec_new<int>(),
+        ranges: vec_new<int>(),
+        is_negated: false,
+        children: vec_new<int>()
+    )
+    vec_push<PatternNode>(arena, node)
+    out vec_len<PatternNode>(arena) - 1
+end.
+
+func pattern_node_anchor_start(arena: Vec<PatternNode>) -> int:
+    let idx = vec_len<PatternNode>(arena)
+    let node = PatternNode (
+        op: PatternOp.AnchorStart,
+        val: 0,
+        val2: 0,
+        val3: 0,
+        chars: vec_new<int>(),
+        ranges: vec_new<int>(),
+        is_negated: false,
+        children: vec_new<int>()
+    )
+    vec_push<PatternNode>(arena, node)
+    out vec_len<PatternNode>(arena) - 1
+end.
+
+func pattern_node_anchor_end(arena: Vec<PatternNode>) -> int:
+    let idx = vec_len<PatternNode>(arena)
+    let node = PatternNode (
+        op: PatternOp.AnchorEnd,
+        val: 0,
+        val2: 0,
+        val3: 0,
+        chars: vec_new<int>(),
+        ranges: vec_new<int>(),
+        is_negated: false,
+        children: vec_new<int>()
+    )
+    vec_push<PatternNode>(arena, node)
+    out vec_len<PatternNode>(arena) - 1
+end.

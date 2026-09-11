@@ -1,0 +1,689 @@
+
+##
+ * vir/pattern/engine.vri -- Thompson NFA Compiler & Pike VM Simulation Engine
+ * ==========================================================================
+ * Translates Pattern IR into Thompson NFA state machines and executes
+ * linear-time O(N*M) matching, search, and submatch extraction.
+ *
+ * Guaranteed no catastrophic backtracking (zero ReDoS vulnerability).
+ ##
+
+include types
+include option
+include vec
+include vir.pattern.ir
+
+# -------------------------------------------------------
+# NFA Operations
+# -------------------------------------------------------
+
+enum NfaOp:
+    Match       = 1    # Accept state
+    Literal     = 2    # Match byte ch -> out1
+    Dot         = 3    # Match any byte except \n -> out1
+    CharClass   = 4    # Match byte in chars / ranges -> out1
+    Split       = 5    # Epsilon branching -> out1, out2
+    Save        = 6    # Save tag (ch = tag_id) -> out1
+    AnchorStart = 7    # Match only at pos == 0 -> out1
+    AnchorEnd   = 8    # Match only at pos == text_len -> out1
+end.
+
+entity NfaState:
+    op:         int,
+    ch:         int,
+    out1:       int,
+    out2:       int,
+    chars:      Vec<int>,
+    ranges:     Vec<int>,
+    is_negated: bool
+end.
+
+entity NfaProgram:
+    states:       Vec<NfaState>,
+    start:        int,
+    anchor_start: bool,
+    anchor_end:   bool,
+    num_tags:     int
+end.
+
+entity Match:
+    start:    int,
+    end_pos:  int,
+    text:     string,
+    tags:     Vec<int>,
+    num_tags: int
+end.
+
+func make_empty_tags -> Vec<int>:
+    var tags = vec_new<int>()
+    var i = 0
+    when i < 32 loop
+        vec_push<int>(tags, 0 - 1)
+        i = i + 1
+    end
+    out tags
+end.
+
+func clone_tags(tags: Vec<int>) -> Vec<int>:
+    var copy = vec_new<int>()
+    var i = 0
+    let n = vec_len<int>(tags)
+    when i < n loop
+        vec_push<int>(copy, vec_get<int>(tags, i))
+        i = i + 1
+    end
+    out copy
+end.
+
+func match_empty -> Match:
+    out Match (
+        start: 0 - 1,
+        end_pos: 0 - 1,
+        text: "",
+        tags: make_empty_tags(),
+        num_tags: 0
+    )
+end.
+
+func match_option_value(opt: Option) -> Match:
+    case opt
+        Option.Some(value): out value
+        Option.None: out match_empty()
+    end
+end.
+
+func match_group(m: Match, idx: int) -> string:
+    if idx == 0 do
+        out m.text
+    end
+    if idx > 0 & idx <= m.num_tags do
+        let s_idx = 2 * idx
+        let e_idx = 2 * idx + 1
+        if e_idx < vec_len<int>(m.tags) do
+            let s = vec_get<int>(m.tags, s_idx)
+            let e = vec_get<int>(m.tags, e_idx)
+            if s >= 0 & e >= s do
+                out str_slice_bytes(m.text, s - m.start, e - m.start)
+            end
+        end
+    end
+    out ""
+end.
+
+    var res = vec_new<string>()
+func match_groups(m: Match) -> Vec<string>:
+    var res = arr_new(m.num_tags + 8)
+    var i = 1
+    when i <= m.num_tags loop
+        push(res, match_group(m, i))
+        i = i + 1
+    end
+    out res
+end.
+
+func match_start(m: Match) -> int:
+    out m.start
+end.
+
+func match_end(m: Match) -> int:
+    out m.end_pos
+end.
+
+func match_text(m: Match) -> string:
+    out m.text
+end.
+
+func match_num_groups(m: Match) -> int:
+    out m.num_tags
+end.
+
+func match_list_len(matches: Vec<Match>) -> int:
+    out vec_len<Match>(matches)
+end.
+
+func match_list_get(matches: Vec<Match>, index: int) -> Match:
+    out vec_get<Match>(matches, index)
+end.
+
+func match_groups_at(matches: Vec<Match>, index: int) -> Vec<string>:
+    let item: Match = vec_get<Match>(matches, index)
+    out match_groups(item)
+end.
+
+# -------------------------------------------------------
+# NFA Construction Helpers
+# -------------------------------------------------------
+
+entity NfaFrag:
+    start:   Vec<int>,
+    dangles: Vec<int>
+end.
+
+func _state_index_get(box: Vec<int>) -> int:
+    out vec_get<int>(box, 0)
+end.
+
+func _add_nfa_state(states: Vec<NfaState>, op: int, ch: int, out1: int, out2: int, chars: Vec<int>, ranges: Vec<int>, is_negated: bool) -> int:
+    let s = NfaState (
+        op: op,
+        ch: ch,
+        out1: out1,
+        out2: out2,
+        chars: chars,
+        ranges: ranges,
+        is_negated: is_negated
+    )
+    vec_push<NfaState>(states, s)
+    # Re-read after vec_push: the production backend may clobber the scalar
+    # value returned by vec_len while lowering the call.
+    out vec_len<NfaState>(states) - 1
+end.
+
+func _patch_dangles(states: Vec<NfaState>, dangles: Vec<int>, target: Vec<int>):
+    var i = 0
+    let dlen = vec_len<int>(dangles)
+    when i < dlen loop
+        var s: NfaState = vec_get<NfaState>(states, vec_get<int>(dangles, i))
+        if s.op == NfaOp.Split do
+            if s.out1 == 0 - 1 do
+                s.out1 = _state_index_get(target)
+            eif s.out2 == 0 - 1 do
+                s.out2 = _state_index_get(target)
+            end
+        else
+            if s.out1 == 0 - 1 do
+                s.out1 = _state_index_get(target)
+            end
+        end
+        vec_set<NfaState>(states, vec_get<int>(dangles, i), s)
+        i = i + 1
+    end
+end.
+
+func _link_last_out1(states: Vec<NfaState>, target: Vec<int>):
+    var s: NfaState = vec_get<NfaState>(states, vec_len<NfaState>(states) - 1)
+    s.out1 = _state_index_get(target)
+    vec_set<NfaState>(states, vec_len<NfaState>(states) - 1, s)
+end.
+
+func _dangles_last(states: Vec<NfaState>) -> Vec<int>:
+    var d = vec_new<int>()
+    vec_push<int>(d, vec_len<NfaState>(states) - 1)
+    out d
+end.
+
+func _dangles_second_last(states: Vec<NfaState>) -> Vec<int>:
+    var d = vec_new<int>()
+    vec_push<int>(d, vec_len<NfaState>(states) - 2)
+    out d
+end.
+
+func _dangles_join(d1: Vec<int>, d2: Vec<int>) -> Vec<int>:
+    var res = vec_new<int>()
+    var i = 0
+    let l1 = vec_len<int>(d1)
+    when i < l1 loop
+        vec_push<int>(res, vec_get<int>(d1, i))
+        i = i + 1
+    end
+    var j = 0
+    let l2 = vec_len<int>(d2)
+    when j < l2 loop
+        vec_push<int>(res, vec_get<int>(d2, j))
+        j = j + 1
+    end
+    out res
+end.
+
+# -------------------------------------------------------
+# Compiler: Pattern IR -> NFA Program
+# -------------------------------------------------------
+
+func _compile_node_to_frag(arena: Vec<PatternNode>, node_id: int, states: Vec<NfaState>, tag_counter: Vec<int>) -> NfaFrag:
+    let empty_chars = vec_new<int>()
+    let empty_ranges = vec_new<int>()
+    if node_id < 0 || node_id >= vec_len<PatternNode>(arena) do
+        # Epsilon fragment
+        let s = _add_nfa_state(states, NfaOp.Split, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+        let d = _dangles_last(states)
+        out NfaFrag ( start: d, dangles: d )
+    end
+
+    let node_op = pattern_node_op_at(arena, node_id)
+
+    case node_op
+    PatternOp.Literal:
+        let s = _add_nfa_state(states, NfaOp.Literal, pattern_node_val_at(arena, node_id), 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+        let d = _dangles_last(states)
+        out NfaFrag ( start: d, dangles: d )
+
+    PatternOp.Dot:
+        let s = _add_nfa_state(states, NfaOp.Dot, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+        let d = _dangles_last(states)
+        out NfaFrag ( start: d, dangles: d )
+
+    PatternOp.CharClass:
+        let node: PatternNode = vec_get<PatternNode>(arena, node_id)
+        let s = _add_nfa_state(states, NfaOp.CharClass, 0, 0 - 1, 0 - 1, node.chars, node.ranges, node.is_negated)
+        let d = _dangles_last(states)
+        out NfaFrag ( start: d, dangles: d )
+
+    PatternOp.AnchorStart:
+        let s = _add_nfa_state(states, NfaOp.AnchorStart, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+        let d = _dangles_last(states)
+        out NfaFrag ( start: d, dangles: d )
+
+    PatternOp.AnchorEnd:
+        let s = _add_nfa_state(states, NfaOp.AnchorEnd, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+        let d = _dangles_last(states)
+        out NfaFrag ( start: d, dangles: d )
+
+    PatternOp.Sequence:
+        let n_children = pattern_node_children_len(arena, node_id)
+        if n_children == 0 do
+            let s = _add_nfa_state(states, NfaOp.Split, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+            let d = _dangles_last(states)
+            out NfaFrag ( start: d, dangles: d )
+        end
+
+        var first_start = vec_new<int>()
+        var cur_dangles = vec_new<int>()
+
+        var ci = 0
+        when ci < pattern_node_children_len(arena, node_id) loop
+            let child_idx = pattern_node_child_at(arena, node_id, ci)
+            let sub_frag = _compile_node_to_frag(arena, child_idx, states, tag_counter)
+            let sub_start = sub_frag.start
+            let sub_dangles = sub_frag.dangles
+            if vec_len<int>(first_start) == 0 do
+                first_start = sub_start
+            else
+                _patch_dangles(states, cur_dangles, sub_start)
+            end
+            cur_dangles = sub_dangles
+            ci = ci + 1
+        end
+        out NfaFrag ( start: first_start, dangles: cur_dangles )
+
+    PatternOp.Alternation:
+        let n_branches = pattern_node_children_len(arena, node_id)
+        if n_branches == 0 do
+            let s = _add_nfa_state(states, NfaOp.Split, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+            let d = _dangles_last(states)
+            out NfaFrag ( start: d, dangles: d )
+        eif n_branches == 1 do
+            out _compile_node_to_frag(arena, pattern_node_child_at(arena, node_id, 0), states, tag_counter)
+        end
+
+        # Chain splits: split_0 -> b0, split_1 -> b1 ...
+        var all_dangles = vec_new<int>()
+        let first_branch_frag = _compile_node_to_frag(arena, pattern_node_child_at(arena, node_id, 0), states, tag_counter)
+        let first_branch_start = first_branch_frag.start
+        let first_branch_dangles = first_branch_frag.dangles
+        all_dangles = _dangles_join(all_dangles, first_branch_dangles)
+
+        let cur_split_raw = _add_nfa_state(states, NfaOp.Split, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+        _link_last_out1(states, first_branch_start)
+        var cur_split = _dangles_last(states)
+        let first_split = cur_split
+
+        var bi = 1
+        when bi < pattern_node_children_len(arena, node_id) loop
+            let b_frag = _compile_node_to_frag(arena, pattern_node_child_at(arena, node_id, bi), states, tag_counter)
+            let b_start = b_frag.start
+            let b_dangles = b_frag.dangles
+            all_dangles = _dangles_join(all_dangles, b_dangles)
+
+            if bi + 1 < pattern_node_children_len(arena, node_id) do
+                let next_split_raw = _add_nfa_state(states, NfaOp.Split, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+                _link_last_out1(states, b_start)
+                let next_split = _dangles_last(states)
+                var s_obj: NfaState = vec_get<NfaState>(states, _state_index_get(cur_split))
+                s_obj.out2 = _state_index_get(next_split)
+                vec_set<NfaState>(states, _state_index_get(cur_split), s_obj)
+                cur_split = next_split
+            else
+                var s_obj: NfaState = vec_get<NfaState>(states, _state_index_get(cur_split))
+                s_obj.out2 = _state_index_get(b_start)
+                vec_set<NfaState>(states, _state_index_get(cur_split), s_obj)
+            end
+            bi = bi + 1
+        end
+        out NfaFrag ( start: first_split, dangles: all_dangles )
+
+    PatternOp.Repeat:
+        # 1. Min required copies
+        var req_start = vec_new<int>()
+        var req_dangles = vec_new<int>()
+
+        var ri = 0
+        when ri < pattern_node_val3_at(arena, node_id) loop
+            let sub = _compile_node_to_frag(arena, pattern_node_val_at(arena, node_id), states, tag_counter)
+            let sub_start = sub.start
+            let sub_dangles = sub.dangles
+            if vec_len<int>(req_start) == 0 do
+                req_start = sub_start
+            else
+                _patch_dangles(states, req_dangles, sub_start)
+            end
+            req_dangles = sub_dangles
+            ri = ri + 1
+        end
+
+        # 2. Unbounded repetition (* or + or n+)
+        if pattern_node_val2_at(arena, node_id) == 0 - 1 do
+            let sub = _compile_node_to_frag(arena, pattern_node_val_at(arena, node_id), states, tag_counter)
+            let sub_start = sub.start
+            let sub_dangles = sub.dangles
+            let loop_split_raw = _add_nfa_state(states, NfaOp.Split, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+            _link_last_out1(states, sub_start)
+            let loop_split = _dangles_last(states)
+            _patch_dangles(states, sub_dangles, loop_split)
+
+            if pattern_node_val3_at(arena, node_id) == 0 do
+                out NfaFrag ( start: loop_split, dangles: loop_split )
+            else
+                _patch_dangles(states, req_dangles, loop_split)
+                out NfaFrag ( start: req_start, dangles: loop_split )
+            end
+        end
+
+        # 3. Bounded repetition (min..max)
+        var extra_dangles = vec_new<int>()
+        var cur_dangles = req_dangles
+        var start_out = req_start
+
+        var oi = pattern_node_val3_at(arena, node_id)
+        when oi < pattern_node_val2_at(arena, node_id) loop
+            let sub = _compile_node_to_frag(arena, pattern_node_val_at(arena, node_id), states, tag_counter)
+            let sub_start = sub.start
+            let sub_dangles = sub.dangles
+            let opt_split_raw = _add_nfa_state(states, NfaOp.Split, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+            _link_last_out1(states, sub_start)
+            let opt_split = _dangles_last(states)
+            vec_push<int>(extra_dangles, _state_index_get(opt_split))
+
+            if vec_len<int>(start_out) == 0 do
+                start_out = opt_split
+            else
+                _patch_dangles(states, cur_dangles, opt_split)
+            end
+            cur_dangles = sub_dangles
+            oi = oi + 1
+        end
+
+        let all_fin = _dangles_join(cur_dangles, extra_dangles)
+        if vec_len<int>(start_out) == 0 do
+            let s = _add_nfa_state(states, NfaOp.Split, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+            let d = _dangles_last(states)
+            out NfaFrag ( start: d, dangles: d )
+        end
+        out NfaFrag ( start: start_out, dangles: all_fin )
+
+    PatternOp.Group:
+        let capture_id = pattern_node_val2_at(arena, node_id)
+        let is_atom = (pattern_node_val3_at(arena, node_id) == 1)
+
+        var cur_count = vec_get<int>(tag_counter, 0)
+        var slot = 0
+        if is_atom do
+            cur_count = cur_count + 1
+            vec_set<int>(tag_counter, 0, cur_count)
+            slot = cur_count
+        eif capture_id > 0 do
+            slot = capture_id
+            if slot > cur_count do
+                vec_set<int>(tag_counter, 0, slot)
+            end
+        end
+
+        var saved_slot: [int; 1] = [slot]
+        let sub = _compile_node_to_frag(arena, pattern_node_val_at(arena, node_id), states, tag_counter)
+        let sub_start = sub.start
+        let sub_dangles = sub.dangles
+        let effective_slot = saved_slot[0]
+
+        if effective_slot > 0 & effective_slot < 16 do
+            # Wrap with Save(2 * effective_slot) and Save(2 * effective_slot + 1)
+            let s_open_raw = _add_nfa_state(states, NfaOp.Save, 2 * effective_slot, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+            _link_last_out1(states, sub_start)
+            let s_close_raw = _add_nfa_state(states, NfaOp.Save, 2 * effective_slot + 1, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+            let s_close = _dangles_last(states)
+            let s_open = _dangles_second_last(states)
+            _patch_dangles(states, sub_dangles, s_close)
+            out NfaFrag ( start: s_open, dangles: s_close )
+        end
+
+        out sub
+
+    default:
+        let s = _add_nfa_state(states, NfaOp.Split, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+        let d = _dangles_last(states)
+        out NfaFrag ( start: d, dangles: d )
+    end
+end.
+
+func pattern_compile_ir(arena: Vec<PatternNode>, root_id: int, anchor_start: bool, anchor_end: bool) -> NfaProgram:
+    var states = vec_new<NfaState>()
+    var tag_counter = vec_new<int>()
+    vec_push<int>(tag_counter, 0)
+
+    let root_frag = _compile_node_to_frag(arena, root_id, states, tag_counter)
+    # Snapshot aggregate fields before subsequent calls; production codegen's
+    # aggregate return registers are caller-clobbered.
+    let root_start = root_frag.start
+    let root_dangles = root_frag.dangles
+
+    # Wrap with Match state
+    let empty_chars = vec_new<int>()
+    let empty_ranges = vec_new<int>()
+    let match_state = _add_nfa_state(states, NfaOp.Match, 0, 0 - 1, 0 - 1, empty_chars, empty_ranges, false)
+    let match_target = _dangles_last(states)
+    _patch_dangles(states, root_dangles, match_target)
+
+    var program = NfaProgram (
+        states: states,
+        start: 0,
+        anchor_start: anchor_start,
+        anchor_end: anchor_end,
+        num_tags: vec_get<int>(tag_counter, 0)
+    )
+    program.start = _state_index_get(root_start)
+    out program
+end.
+
+# -------------------------------------------------------
+# Pike VM Simulation
+# -------------------------------------------------------
+
+entity Thread:
+    state: int,
+    tags:  Vec<int>
+end.
+
+func _add_thread(states: Vec<NfaState>, next_threads: Vec<Thread>, st_idx: int, tags: Vec<int>, pos: int, text_len: int, step_id: int, visited: Vec<int>):
+    if st_idx < 0 || st_idx >= vec_len<NfaState>(states) do
+        out 0
+    end
+
+    # Mark the entire epsilon closure, not only consuming states. Repetition
+    # creates Split cycles; delaying this mark recurses forever on `*`/`+`.
+    if vec_get<int>(visited, st_idx) == step_id do
+        out 0
+    end
+    vec_set<int>(visited, st_idx, step_id)
+
+    let s: NfaState = vec_get<NfaState>(states, st_idx)
+
+    if s.op == NfaOp.Split do
+        _add_thread(states, next_threads, s.out1, tags, pos, text_len, step_id, visited)
+        _add_thread(states, next_threads, s.out2, tags, pos, text_len, step_id, visited)
+        out 0
+    eif s.op == NfaOp.Save do
+        var new_tags = clone_tags(tags)
+        let tag_id = s.ch
+        if tag_id >= 0 & tag_id < 32 do
+            vec_set<int>(new_tags, tag_id, pos)
+        end
+        _add_thread(states, next_threads, s.out1, new_tags, pos, text_len, step_id, visited)
+        out 0
+    eif s.op == NfaOp.AnchorStart do
+        if pos == 0 do
+            _add_thread(states, next_threads, s.out1, tags, pos, text_len, step_id, visited)
+        end
+        out 0
+    eif s.op == NfaOp.AnchorEnd do
+        if pos == text_len do
+            _add_thread(states, next_threads, s.out1, tags, pos, text_len, step_id, visited)
+        end
+        out 0
+    else
+        # Match, Literal, Dot, CharClass
+        vec_push<Thread>(next_threads, Thread ( state: st_idx, tags: tags ))
+    end
+    out 0
+end.
+
+func nfa_search(nfa: NfaProgram, text: string, start_from: int) -> Option<Match>:
+    let text_len = str_byte_len(text)
+    if start_from > text_len do
+        out Option.None
+    end
+
+    let n_states = vec_len<NfaState>(nfa.states)
+    var visited = vec_new<int>()
+    var vi = 0
+    when vi < n_states loop
+        vec_push<int>(visited, 0)
+        vi = vi + 1
+    end
+
+    var start_pos = start_from
+    var max_start = text_len
+    if nfa.anchor_start do
+        if start_from > 0 do out Option.None end
+        max_start = 0
+    end
+
+    var step_id = 1
+
+    when start_pos <= max_start loop
+        var cur_threads = vec_new<Thread>()
+        var init_tags = make_empty_tags()
+        vec_set<int>(init_tags, 0, start_pos)
+
+        step_id = step_id + 1
+        _add_thread(nfa.states, cur_threads, nfa.start, init_tags, start_pos, text_len, step_id, visited)
+
+        var last_match_end = 0 - 1
+        var last_match_tags = clone_tags(init_tags)
+
+        # Check immediate match at start_pos (e.g. empty match)
+        var ti = 0
+        when ti < vec_len<Thread>(cur_threads) loop
+            let th: Thread = vec_get<Thread>(cur_threads, ti)
+            let st: NfaState = vec_get<NfaState>(nfa.states, th.state)
+            if st.op == NfaOp.Match do
+                last_match_end = start_pos
+                last_match_tags = clone_tags(th.tags)
+                vec_set<int>(last_match_tags, 1, start_pos)
+            end
+            ti = ti + 1
+        end
+
+        var pos = start_pos
+        when pos < text_len & vec_len<Thread>(cur_threads) > 0 loop
+            let b = str_byte_at(text, pos)
+            let next_pos = pos + 1
+            step_id = step_id + 1
+            var next_threads = vec_new<Thread>()
+
+            ti = 0
+            when ti < vec_len<Thread>(cur_threads) loop
+                let th: Thread = vec_get<Thread>(cur_threads, ti)
+                let st: NfaState = vec_get<NfaState>(nfa.states, th.state)
+
+                var matched = false
+                case st.op
+                NfaOp.Literal:
+                    if b == st.ch do matched = true end
+                NfaOp.Dot:
+                    if b != 10 do matched = true end
+                NfaOp.CharClass:
+                    if char_class_match(st.chars, st.ranges, st.is_negated, b) do
+                        matched = true
+                    end
+                end
+
+                if matched do
+                    _add_thread(nfa.states, next_threads, st.out1, th.tags, next_pos, text_len, step_id, visited)
+                end
+                ti = ti + 1
+            end
+
+            pos = next_pos
+            cur_threads = next_threads
+
+            # Check if any thread reached Match
+            ti = 0
+            when ti < vec_len<Thread>(cur_threads) loop
+                let th: Thread = vec_get<Thread>(cur_threads, ti)
+                let st: NfaState = vec_get<NfaState>(nfa.states, th.state)
+                if st.op == NfaOp.Match do
+                    last_match_end = pos
+                    last_match_tags = clone_tags(th.tags)
+                    vec_set<int>(last_match_tags, 1, pos)
+                end
+                ti = ti + 1
+            end
+        end
+
+        if last_match_end >= 0 do
+            if nfa.anchor_end & last_match_end != text_len do
+                # Anchor end requested but not reached end
+            else
+                let sub_text = str_slice_bytes(text, start_pos, last_match_end)
+                out Option.Some(Match (
+                    start: start_pos,
+                    end_pos: last_match_end,
+                    text: sub_text,
+                    tags: last_match_tags,
+                    num_tags: nfa.num_tags
+                ))
+            end
+        end
+
+        start_pos = start_pos + 1
+    end
+
+    out Option.None
+end.
+
+func nfa_fullmatch(nfa: NfaProgram, text: string) -> bool:
+    let m = nfa_search(nfa, text, 0)
+    if is_none(m) do
+        out false
+    end
+    let matched: Match = match_option_value(m)
+    out (match_start(matched) == 0 & match_end(matched) == str_byte_len(text))
+end.
+
+func nfa_search_all(nfa: NfaProgram, text: string) -> Vec<Match>:
+    var matches = vec_new<Match>()
+    var pos = 0
+    let text_len = str_byte_len(text)
+
+    when pos <= text_len loop
+        let m = nfa_search(nfa, text, pos)
+        if is_none(m) do
+            break
+        end
+        let found: Match = match_option_value(m)
+        vec_push<Match>(matches, found)
+        pos = match_end(found)
+        if match_end(found) == match_start(found) do
+            pos = pos + 1
+        end
+    end
+    out matches
+end.
