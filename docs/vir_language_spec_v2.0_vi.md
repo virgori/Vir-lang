@@ -1325,7 +1325,7 @@ let c = Option.None
 
 ### 8.4 Khớp mẫu `case` (Pattern Matching)
 
-Để giải nén dữ liệu từ Tagged Union, sử dụng cấu trúc điều khiển `case`:
+Để giải nén dữ liệu từ Tagged Union, sử dụng cấu trúc điều khiển `case` (grammar đầy đủ: §21):
 
 ```vir
 case a
@@ -1333,12 +1333,14 @@ case a
         print(val)
     Option.None:
         print(0)
+    else print(-1)
 end
 ```
 
 - Các biến binder (`val`) tự động suy diễn kiểu dữ liệu theo khai báo của variant (`string`, `Point`, `int`, v.v.).
-- Hỗ trợ nhánh mặc định `else:` cho các trường hợp còn lại.
+- Nhánh mặc định: `else …` — **continuation**, **không** có dấu hai chấm (`else:`, xem §21).
 - **Cấm so sánh trực tiếp**: Không cho phép dùng toán tử `==` hoặc `!=` trực tiếp trên hai biểu thức Tagged Union mang payload (báo lỗi `E3043`), bắt buộc phải sử dụng `case`.
+- Ranh giới arm theo **case-pattern grammar** (`pattern ":"`), không phải arbitrary `expr:` — tránh nhầm statement trong thân arm với arm mới (§21.1).
 
 ### 8.5 Bố cục bộ nhớ & ABI (ABI Memory Layout)
 
@@ -2795,9 +2797,54 @@ end
 
 `case` là khối **điều khiển** — đóng bằng `end` (không dùng `end.`).
 
-Nhánh `case` là một **danh sách** theo separator thống nhất (§1.0): `;` hoặc xuống dòng. Cùng dòng nhiều nhánh → bắt buộc `;`.
+`:` chỉ đánh dấu **đầu arm** (sau `pattern`). Thân arm là `statement-list` bình thường của Vir: separator `;` hoặc `NEWLINE` (§1.0). Không cần `do`, `=>`, hay `{}`.
 
-### 21.1 Dạng chuẩn
+`else` là **continuation / default arm**, không phải pattern — **không** có dấu hai chấm (cùng luật `else` trong `if`, §1.1).
+
+### 21.1 Grammar
+
+```text
+case-expression :=
+    "case" expression
+    case-arm+
+    ["else" statement-list]
+    "end"
+
+case-arm :=
+    pattern ":" statement-list
+
+statement-list :=
+    statement (separator statement)*
+
+separator :=
+    NEWLINE | ";"
+```
+
+**Rule phân nhánh (quan trọng):** parser **không** coi mọi `expr:` tùy ý là arm mới. Arm mới chỉ bắt đầu khi token sequence ở đầu một logical statement khớp **case-pattern grammar** (`pattern ":"`) hoặc keyword `else`. `Pattern` là tập cú pháp pattern được phép của `case`, **không** phải arbitrary expression — tránh ambiguity với statement kiểu `something: value` bên trong thân arm (typed construct / map / label sau này).
+
+Trong `case`, `pattern :` ở đầu một logical statement bắt đầu arm mới; `else` kết thúc arm hiện tại và bắt đầu default arm.
+
+### 21.2 Pattern được phép
+
+Ở Spec v2.0, `pattern` trong `case-arm` gồm (không mở rộng thành arbitrary expression):
+
+| Dạng | Ví dụ |
+|---|---|
+| Literal số / chuỗi / bool | `0`, `1`, `"red"`, `true`, `false` |
+| Enum / tagged-union variant (có hoặc không binder) | `Option.None`, `Option.Some(val)`, `Some(x)` |
+| Wildcard (nếu ngôn ngữ cho phép trong pattern) | `_` |
+
+Chi tiết khớp mẫu tagged union: §8.4. Exhaustiveness / diagnostics: `E3032`–`E3043` (§8.6).
+
+### 21.3 Dạng chuẩn
+
+```vir
+case x
+    1: print("one")
+    2: print("two")
+    else print("other")
+end
+```
 
 ```vir
 case v.virgex_fullmatch(pattern, p)
@@ -2806,25 +2853,34 @@ case v.virgex_fullmatch(pattern, p)
 end
 ```
 
+Nhiều statement trong một arm — cùng dòng (`;`) hoặc nhiều dòng:
+
 ```vir
-case v.virgex_fullmatch(pattern, p)
-    true: print("✅ $p");
-    false: print("❌ $p")
+case x
+    1: foo(); bar()
+    2: baz()
 end
 ```
+
+```vir
+case x
+    1:
+        print("one")
+        out 1
+    2:
+        print("two")
+end
+```
+
+**Newline ngay sau `:` được phép** (chỉ separator / formatting). Indentation **không** mang ngữ nghĩa.
+
+Cùng dòng nhiều arm → bắt buộc `;` giữa các arm:
 
 ```vir
 case x
     1: print("one"); 2: print("two")
 end
 ```
-
-**Quy tắc:**
-- `case <biểu_thức>` rồi các nhánh `mẫu: …`
-- Giữa các nhánh: `;` hoặc `NEWLINE` (§1.0)
-- Nhánh mặc định: `else …` — `else` là **continuation** (§1.1), **không** có dấu hai chấm (giống `else` trong `if`)
-- Đóng khối bằng `end`
-- Nhánh mới bắt đầu khi phần tử tiếp theo là `mẫu:` / `else` — nhiều câu lệnh trong cùng nhánh cũng dùng cùng separator (`;` / xuống dòng) cho đến khi gặp nhánh mới
 
 ```vir
 case color
@@ -2833,6 +2889,22 @@ case color
     else log("unknown", 0); out 0
 end
 ```
+
+### 21.4 Quy tắc bắt buộc
+
+1. `case <biểu_thức>` rồi ít nhất một `case-arm`; tùy chọn một `else` statement-list; đóng bằng `end`.
+2. Separator giữa statement trong arm và giữa các arm: `;` hoặc `NEWLINE` (§1.0).
+3. Default arm: `else …` — **không** viết `else:`.
+4. **Branch rỗng không hợp lệ** — sau `pattern:` phải có ít nhất một statement trước arm tiếp theo / `else` / `end`. Ví dụ sau là **syntax error** (không được hiểu `2:` thuộc body của `1`):
+
+```vir
+case x
+    1:
+    2: foo()
+end
+```
+
+5. Không dựa vào indentation để chia arm; ranh giới arm chỉ theo grammar `pattern ":"` / `else` ở đầu logical statement.
 
 ---
 

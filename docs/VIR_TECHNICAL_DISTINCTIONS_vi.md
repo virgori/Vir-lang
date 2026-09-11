@@ -316,8 +316,8 @@ Trong Vir, phép gán **`=`** là một cấu trúc độc lập, không phải 
 ```vir
 module demo.distinctions
 
-include vir.rt.io
-import print_ln, print_int from vir.rt.io
+include rt.io
+import print_ln, print_int from rt.io
 
 func compute_workload:
     # 1. Khối bộ nhớ Arena: Cấp phát siêu tốc O(1), tự thu hồi sạch sẽ ở 'end'

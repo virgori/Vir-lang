@@ -8,6 +8,20 @@ Vir is a programming language developed by Virgori Labs.
 - Sources: `docs/vir_language_spec_v2.0_vi.md`, compiler under `stdlib/vir/`
 - Extension: **`.vri`**
 
+## Spec freeze (critical)
+
+**Do not create, edit, delete, or “improve” the Vir language specification** unless
+the user **explicitly** asks to change the spec in that turn (e.g. “sửa spec”,
+“update language spec”, “đổi AI spec”).
+
+Frozen unless explicitly requested: `docs/ai-spec/vir-lang/**`,
+`docs/vir_language_spec_v2.0_vi.md`, `docs/vir_language_spec_v2.0_en.md`, and
+skill mirrors that define language rules.
+
+Allowed without a spec request: `stdlib/vir/`, tests, tools, compiler, non-spec
+docs. If a feature is missing from the spec, **state the gap** — do not silently
+amend the spec to match code.
+
 ## Rules
 
 When writing Vir code:
@@ -18,6 +32,8 @@ When writing Vir code:
 4. Consult the supplied Vir references when uncertain.
 5. Prefer documented Vir idioms over equivalents from other languages.
 6. If a requested feature is unsupported by Vir, state that explicitly.
+7. Do not modify the language spec (paths above) unless the user explicitly
+   requested a spec change.
 
 ## References
 

@@ -312,8 +312,8 @@ In Vir, assignment **`=`** is strictly a statement-level construct and never an 
 ```vir
 module demo.distinctions
 
-include vir.rt.io
-import print_ln, print_int from vir.rt.io
+include rt.io
+import print_ln, print_int from rt.io
 
 func compute_workload:
     # 1. Arena scope: O(1) allocation, instantaneous pointer-rewind on 'end'

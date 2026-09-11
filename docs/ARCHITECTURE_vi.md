@@ -577,8 +577,8 @@ Dưới đây là mã nguồn Vir v2.0 minh hoạ tính năng AI và cú pháp c
 
 module demo.ai
 
-include vir.rt.io
-import print_ln, print_int from vir.rt.io
+include rt.io
+import print_ln, print_int from rt.io
 
 func matrix_multiply_demo:
     # 1. Khai báo tensor 2 chiều kích thước 2x2
