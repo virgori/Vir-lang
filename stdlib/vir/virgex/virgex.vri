@@ -1,0 +1,638 @@
+##
+ * vir/virgex/virgex.vri -- Vir Pattern Syntax (VPS) Frontend
+ * =========================================================
+ * First-class pattern language for Vir standard library.
+ * Direct compilation: VPS Source -> VPS Parser -> Pattern IR -> Shared Engine.
+ *
+ * Spec: aligned with VPS Specification v2.0 (Virgori Labs)
+ ##
+
+include types
+include option
+include result
+include char
+include vec
+
+include vir.pattern.ir
+include vir.pattern.engine
+include vir.pattern.pattern
+
+# -------------------------------------------------------
+# VPS Token Types
+# -------------------------------------------------------
+
+enum VpsTok:
+    GroupOpen   = 1     # :(
+    GroupClose  = 2     # :)
+    Atom        = 3     # @Az, @-Az, @0, @-0, etc.
+    Quantifier  = 4     # !n, !n~m, !n~, !~
+    Question    = 5     # ?
+    Pipe        = 6     # |
+    SpaceToken  = 7     # -
+    EscapeChar  = 8     # $x
+    EscapeBlock = 9     # $. ... .$
+    Literal     = 10    # data
+    Eof         = 11
+end.
+
+entity VpsToken:
+    tag:        int,
+    value:      string,
+    pos:        int,
+    atom_name:  string,
+    is_negated: bool,
+    qmin:       int,
+    qmax:       int
+end.
+
+func _make_vps_tok(tag: int, val: string, pos: int) -> VpsToken:
+    out VpsToken (
+        tag: tag,
+        value: val,
+        pos: pos,
+        atom_name: "",
+        is_negated: false,
+        qmin: 0,
+        qmax: 0
+    )
+end.
+
+# -------------------------------------------------------
+# VPS Lexer
+# -------------------------------------------------------
+
+func _vps_skip_ws(src: string, pos: int, slen: int) -> int:
+    var p = pos
+    when p < slen loop
+        let ch = native_read_u8(src as int, p)
+        if ch == 32 do
+            p = p + 1
+            skip
+        end
+        if ch == 9 do
+            p = p + 1
+            skip
+        end
+        if ch == 10 do
+            p = p + 1
+            skip
+        end
+        if ch == 13 do
+            p = p + 1
+            skip
+        end
+        break
+    end
+    out p
+end.
+
+func vps_tokenize(source: string) -> Result:
+    var tokens = vec_new<VpsToken>()
+    let slen = str_byte_len(source)
+    var pos = 0
+
+    when pos < slen loop
+        pos = _vps_skip_ws(source, pos, slen)
+        if pos >= slen do break end
+
+        let start = pos
+        let ch = str_byte_at(source, pos)
+
+        # :( Group Open or :) Group Close or : Atom / Colon
+        if ch == 58 do # ':'
+            if pos + 1 < slen do
+                let next_c = str_byte_at(source, pos + 1)
+                if next_c == 40 do # '('
+                    vec_push<VpsToken>(tokens, _make_vps_tok(VpsTok.GroupOpen, ":(", start))
+                    pos = pos + 2
+                    skip
+                eif next_c == 41 do # ')'
+                    vec_push<VpsToken>(tokens, _make_vps_tok(VpsTok.GroupClose, ":)", start))
+                    pos = pos + 2
+                    skip
+                end
+            end
+        end
+
+        if ch == 41 do # bare ')' check for :) if preceding was :
+            # Normal literal
+        end
+
+        # @ Atom
+        if ch == 64 do # '@'
+            pos = pos + 1
+            var is_neg = false
+            if pos < slen & str_byte_at(source, pos) == 45 do # '-'
+                is_neg = true
+                pos = pos + 1
+            end
+
+            let atom_start = pos
+            when pos < slen loop
+                let c = str_byte_at(source, pos)
+                if is_alnum(c) do
+                    pos = pos + 1
+                else
+                    break
+                end
+            end
+
+            if pos == atom_start do
+                out Result.Err("Invalid empty atom after @")
+            end
+
+            let aname = str_slice_bytes(source, atom_start, pos)
+            let tok = VpsToken (
+                tag: VpsTok.Atom,
+                value: str_slice_bytes(source, start, pos),
+                pos: start,
+                atom_name: aname,
+                is_negated: is_neg,
+                qmin: 0,
+                qmax: 0
+            )
+            vec_push<VpsToken>(tokens, tok)
+            skip
+        end
+
+        # ! Quantifier (!n, !n~m, !n~, !~)
+        if ch == 33 do # '!'
+            pos = pos + 1
+            if pos >= slen do
+                out Result.Err("Unexpected end after !")
+            end
+
+            # Case: !~ (0 or more: *)
+            if str_byte_at(source, pos) == 126 do # '~'
+                pos = pos + 1
+                let tok = VpsToken (
+                    tag: VpsTok.Quantifier,
+                    value: "!~",
+                    pos: start,
+                    atom_name: "",
+                    is_negated: false,
+                    qmin: 0,
+                    qmax: 0 - 1
+                )
+                vec_push<VpsToken>(tokens, tok)
+                skip
+            end
+
+            # Read first integer n
+            var n_val = 0
+            let n_pos = pos
+            when pos < slen loop
+                let c = str_byte_at(source, pos)
+                if is_digit(c) do
+                    n_val = n_val * 10 + (c - 48)
+                    pos = pos + 1
+                else
+                    break
+                end
+            end
+
+            if pos == n_pos do
+                out Result.Err("Expected digits after !")
+            end
+
+            # Check for range: ~
+            if pos < slen & str_byte_at(source, pos) == 126 do # '~'
+                pos = pos + 1
+                # Case: !n~ (n or more)
+                if pos >= slen || (!is_digit(str_byte_at(source, pos))) do
+                    let tok = VpsToken (
+                        tag: VpsTok.Quantifier,
+                        value: str_slice_bytes(source, start, pos),
+                        pos: start,
+                        atom_name: "",
+                        is_negated: false,
+                        qmin: n_val,
+                        qmax: 0 - 1
+                    )
+                    vec_push<VpsToken>(tokens, tok)
+                    skip
+                end
+
+                # Case: !n~m (range)
+                var m_val = 0
+                when pos < slen loop
+                    let c = str_byte_at(source, pos)
+                    if is_digit(c) do
+                        m_val = m_val * 10 + (c - 48)
+                        pos = pos + 1
+                    else
+                        break
+                    end
+                end
+
+                let tok = VpsToken (
+                    tag: VpsTok.Quantifier,
+                    value: str_slice_bytes(source, start, pos),
+                    pos: start,
+                    atom_name: "",
+                    is_negated: false,
+                    qmin: n_val,
+                    qmax: m_val
+                )
+                vec_push<VpsToken>(tokens, tok)
+                skip
+            end
+
+            # Exact !n
+            let tok = VpsToken (
+                tag: VpsTok.Quantifier,
+                value: str_slice_bytes(source, start, pos),
+                pos: start,
+                atom_name: "",
+                is_negated: false,
+                qmin: n_val,
+                qmax: n_val
+            )
+            vec_push<VpsToken>(tokens, tok)
+            skip
+        end
+
+        # ? Boolean optional
+        if ch == 63 do # '?'
+            vec_push<VpsToken>(tokens, _make_vps_tok(VpsTok.Question, "?", start))
+            pos = pos + 1
+            skip
+        end
+
+        # | Pipe
+        if ch == 124 do # '|'
+            vec_push<VpsToken>(tokens, _make_vps_tok(VpsTok.Pipe, "|", start))
+            pos = pos + 1
+            skip
+        end
+
+        # - Space token
+        if ch == 45 do # '-'
+            vec_push<VpsToken>(tokens, _make_vps_tok(VpsTok.SpaceToken, "-", start))
+            pos = pos + 1
+            skip
+        end
+
+        # $ Escape
+        if ch == 36 do # '$'
+            pos = pos + 1
+            if pos >= slen do
+                out Result.Err("Unexpected end after $")
+            end
+
+            if str_byte_at(source, pos) == 46 do # '.' -> block escape $. ... .$
+                pos = pos + 1
+                var closed = false
+                when pos + 1 < slen loop
+                    if str_byte_at(source, pos) == 46 & str_byte_at(source, pos + 1) == 36 do
+                        pos = pos + 2
+                        closed = true
+                        break
+                    end
+                    pos = pos + 1
+                end
+                if !closed do
+                    out Result.Err("Unterminated block escape $. ... .$")
+                end
+                let tok = VpsToken (
+                    tag: VpsTok.EscapeBlock,
+                    value: str_slice_bytes(source, start + 2, pos - 2),
+                    pos: start,
+                    atom_name: "",
+                    is_negated: false,
+                    qmin: 0,
+                    qmax: 0
+                )
+                vec_push<VpsToken>(tokens, tok)
+                skip
+            else
+                # Single escape $x
+                let esc_str = str_slice_bytes(source, pos, pos + 1)
+                pos = pos + 1
+                let tok = VpsToken (
+                    tag: VpsTok.EscapeChar,
+                    value: esc_str,
+                    pos: start,
+                    atom_name: "",
+                    is_negated: false,
+                    qmin: 0,
+                    qmax: 0
+                )
+                vec_push<VpsToken>(tokens, tok)
+                skip
+            end
+        end
+
+        # Literal character
+        let lit_str = str_slice_bytes(source, pos, pos + 1)
+        pos = pos + 1
+        vec_push<VpsToken>(tokens, _make_vps_tok(VpsTok.Literal, lit_str, start))
+    end
+
+    vec_push<VpsToken>(tokens, _make_vps_tok(VpsTok.Eof, "", pos))
+    out Result.Ok(tokens)
+end.
+
+func _vps_tokens_or_panic(result: Result) -> Vec<VpsToken>:
+    case result
+        Result.Ok(tokens): out tokens
+        Result.Err(message): panic(message)
+    end
+end.
+
+# -------------------------------------------------------
+# Atom Range / Chars Builder
+# -------------------------------------------------------
+
+func _build_atom_classes(name: string, chars: Vec<int>, ranges: Vec<int>):
+    if str_eq(name, "Az0") do
+        let r = ranges_alnum()
+        var i = 0
+        let n = vec_len<int>(r)
+        when i < n loop
+            vec_push<int>(ranges, vec_get<int>(r, i))
+            i = i + 1
+        end
+    eif str_eq(name, "Az") do
+        let r = ranges_alpha()
+        var i = 0
+        let n = vec_len<int>(r)
+        when i < n loop
+            vec_push<int>(ranges, vec_get<int>(r, i))
+            i = i + 1
+        end
+    eif str_eq(name, "AZ") do
+        let r = ranges_upper()
+        var i = 0
+        let n = vec_len<int>(r)
+        when i < n loop
+            vec_push<int>(ranges, vec_get<int>(r, i))
+            i = i + 1
+        end
+    eif str_eq(name, "az") do
+        let r = ranges_lower()
+        var i = 0
+        let n = vec_len<int>(r)
+        when i < n loop
+            vec_push<int>(ranges, vec_get<int>(r, i))
+            i = i + 1
+        end
+    eif str_eq(name, "0") do
+        let r = ranges_digits()
+        var i = 0
+        let n = vec_len<int>(r)
+        when i < n loop
+            vec_push<int>(ranges, vec_get<int>(r, i))
+            i = i + 1
+        end
+    eif str_byte_len(name) == 2 do
+        let d0 = str_byte_at(name, 0)
+        let d1 = str_byte_at(name, 1)
+        if is_digit(d0) & is_digit(d1) & d0 <= d1 do
+            vec_push<int>(ranges, d0)
+            vec_push<int>(ranges, d1)
+        end
+    end
+end.
+
+# -------------------------------------------------------
+# VPS Parser & IR Lowering Entity
+# -------------------------------------------------------
+
+entity VpsParser:
+    arena:  Vec<PatternNode>,
+    tokens: Vec<VpsToken>,
+    pos:    int,
+    tlen:   int
+
+    method parse_expr() -> int:
+        if this.pos >= this.tlen do
+            out 0 - 1
+        end
+
+        let tok: VpsToken = vec_get<VpsToken>(this.tokens, this.pos)
+
+        # Prefix ? (Boolean optional)
+        if tok.tag == VpsTok.Question do
+            this.pos = this.pos + 1
+            let inner = this.parse_expr()
+            if inner < 0 do out 0 - 1 end
+            out pattern_node_repeat(this.arena, inner, 0, 1)
+        end
+
+        var base_node = 0 - 1
+        var is_atom_tok = false
+
+        if tok.tag == VpsTok.Atom do
+            this.pos = this.pos + 1
+            var chars = vec_new<int>()
+            var ranges = vec_new<int>()
+            _build_atom_classes(tok.atom_name, chars, ranges)
+            base_node = pattern_node_charclass(this.arena, chars, ranges, tok.is_negated)
+            is_atom_tok = true
+        eif tok.tag == VpsTok.SpaceToken do
+            this.pos = this.pos + 1
+            base_node = pattern_node_literal(this.arena, 32) # ' '
+        eif tok.tag == VpsTok.EscapeChar do
+            this.pos = this.pos + 1
+            base_node = pattern_node_literal(this.arena, str_byte_at(tok.value, 0))
+        eif tok.tag == VpsTok.EscapeBlock do
+            this.pos = this.pos + 1
+            var lits = vec_new<int>()
+            var bi = 0
+            let blen = str_byte_len(tok.value)
+            when bi < blen loop
+                vec_push<int>(lits, pattern_node_literal(this.arena, str_byte_at(tok.value, bi)))
+                bi = bi + 1
+            end
+            base_node = pattern_node_sequence(this.arena, lits)
+        eif tok.tag == VpsTok.Literal do
+            this.pos = this.pos + 1
+            base_node = pattern_node_literal(this.arena, str_byte_at(tok.value, 0))
+        eif tok.tag == VpsTok.GroupOpen do
+            this.pos = this.pos + 1
+            var branches = vec_new<int>()
+            var grp_running = true
+            when grp_running loop
+                let branch_seq = this.parse_sequence()
+                vec_push<int>(branches, branch_seq)
+
+                if this.pos < this.tlen do
+                    let curr: VpsToken = vec_get<VpsToken>(this.tokens, this.pos)
+                    if curr.tag == VpsTok.Pipe do
+                        this.pos = this.pos + 1 # consume |
+                    eif curr.tag == VpsTok.GroupClose do
+                        this.pos = this.pos + 1 # consume :)
+                        grp_running = false
+                    else
+                        grp_running = false
+                    end
+                else
+                    grp_running = false
+                end
+            end
+            base_node = pattern_node_alternation(this.arena, branches)
+        else
+            out 0 - 1
+        end
+
+        # Postfix quantifier !
+        if this.pos < this.tlen do
+            let next_tok: VpsToken = vec_get<VpsToken>(this.tokens, this.pos)
+            if next_tok.tag == VpsTok.Quantifier do
+                this.pos = this.pos + 1
+                base_node = pattern_node_repeat(this.arena, base_node, next_tok.qmin, next_tok.qmax)
+            end
+        end
+
+        if is_atom_tok do
+            # Wrap entire atom (with quantifier, e.g. @AZ!2) in atom group for extraction
+            base_node = pattern_node_group(this.arena, base_node, 0, true)
+        end
+
+        out base_node
+    end.
+
+    method parse_sequence() -> int:
+        var items = vec_new<int>()
+
+        when this.pos < this.tlen loop
+            let tok: VpsToken = vec_get<VpsToken>(this.tokens, this.pos)
+            if tok.tag == VpsTok.Eof || tok.tag == VpsTok.GroupClose || tok.tag == VpsTok.Pipe do
+                break
+            end
+
+            let node = this.parse_expr()
+            if node >= 0 do
+                vec_push<int>(items, node)
+            else
+                break
+            end
+        end
+
+        if vec_len<int>(items) == 1 do
+            out vec_get<int>(items, 0)
+        end
+        out pattern_node_sequence(this.arena, items)
+    end.
+end.
+
+func vps_compile_to_pattern(source: string) -> Pattern:
+    let tokens_res = vps_tokenize(source)
+    let tokens = _vps_tokens_or_panic(tokens_res)
+    let tlen = vec_len<VpsToken>(tokens)
+    var pos = 0
+    var anchor_start = false
+    var anchor_end = false
+
+    # Leading | anchor
+    if pos < tlen do
+        let first: VpsToken = vec_get<VpsToken>(tokens, pos)
+        if first.tag == VpsTok.Pipe do
+            anchor_start = true
+            pos = pos + 1
+        end
+    end
+
+    var arena = pattern_arena_new()
+    var parser = VpsParser ( arena: arena, tokens: tokens, pos: pos, tlen: tlen )
+    let body_node = parser.parse_sequence()
+    pos = parser.pos
+
+    # Trailing | anchor
+    if pos < tlen do
+        let curr: VpsToken = vec_get<VpsToken>(tokens, pos)
+        if curr.tag == VpsTok.Pipe do
+            if pos + 1 < tlen do
+                let next_tok: VpsToken = vec_get<VpsToken>(tokens, pos + 1)
+                if next_tok.tag == VpsTok.Eof do
+                    anchor_end = true
+                    pos = pos + 1
+                end
+            end
+        end
+    end
+
+    let nfa = pattern_compile_ir(arena, body_node, anchor_start, anchor_end)
+    out Pattern (
+        source: source,
+        engine_kind: 1, # Virgex
+        nfa: nfa
+    )
+end.
+
+# -------------------------------------------------------
+# Public Virgex API
+# -------------------------------------------------------
+
+func virgex_compile(source: string) -> Pattern:
+    out vps_compile_to_pattern(source)
+end.
+
+func compile(source: string) -> Pattern:
+    out vps_compile_to_pattern(source)
+end.
+
+func virgex_fullmatch(pattern_str: string, text: string) -> bool:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_match(pat, text)
+end.
+
+func virgex_match(pattern_str: string, text: string) -> Option<Match>:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_find_match(pat, text)
+end.
+
+func virgex_search(pattern_str: string, text: string) -> Option<Match>:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_find_match(pat, text)
+end.
+
+func virgex_find(pattern_str: string, text: string) -> string:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_find(pat, text)
+end.
+
+func virgex_find_all(pattern_str: string, text: string) -> Vec<string>:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_find_all(pat, text)
+end.
+
+func virgex_findall(pattern_str: string, text: string) -> Vec<string>:
+    out virgex_find_all(pattern_str, text)
+end.
+
+func virgex_extract(pattern_str: string, text: string) -> Vec<string>:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_extract(pat, text)
+end.
+
+func virgex_extract_all(pattern_str: string, text: string) -> Vec:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_extract_all(pat, text)
+end.
+
+func virgex_replace(pattern_str: string, text: string, rep: string) -> string:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_replace(pat, text, rep)
+end.
+
+func virgex_replace_all(pattern_str: string, text: string, rep: string) -> string:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_replace_all(pat, text, rep)
+end.
+
+func virgex_split(pattern_str: string, text: string) -> Vec<string>:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_split(pat, text)
+end.
+
+func virgex_tokenize(pattern_str: string, text: string) -> Vec<string>:
+    let pat = vps_compile_to_pattern(pattern_str)
+    out pattern_tokenize(pat, text)
+end.
+
+# Compatibility inspection helper
+func virgex_to_regex(pattern_str: string):
+    out Result.Ok(pattern_str)
+end.
