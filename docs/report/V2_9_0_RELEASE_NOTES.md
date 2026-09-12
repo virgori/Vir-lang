@@ -16,6 +16,11 @@ Vir 2.9.0 consolidates the language and compiler around one strict, self-hosted 
 ## Release artifacts
 
 - `virc-2.9.0-macos-arm64`: promoted native compiler for Apple Silicon macOS.
+- `virc-2.9.0-linux-arm64`: static native compiler for Linux AArch64.
+- `virc-2.9.0-linux-x86_64`: static native compiler for Linux x86-64.
+- `virc-2.9.0-wasm32.wasm`: WebAssembly compiler module.
 - `vir-2.9.0-freeze-macos-arm64.tar.gz`: read-only release freeze containing the standard library, compiler sources, expanded compiler source, manifest, checksums, and a smoke-tested native compiler.
+
+The Linux RISC-V 64 compiler binary is not shipped in 2.9.0: the compiler-sized RISC-V output currently fails the release gate because stack offsets exceed the ISA immediate range. The release never substitutes or relabels the older 2.8.5 binary.
 
 The frozen tree contains its originating Git commit and per-file SHA-256 checksums in `MANIFEST.json` and `SHA256SUMS`.
