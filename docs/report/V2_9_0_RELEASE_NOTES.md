@@ -9,6 +9,8 @@ Vir 2.9.0 consolidates the language and compiler around one strict, self-hosted 
 - **AI/ML runtime:** the native tensor, autodiff, inference, training, and quantization pipeline is included in the unified standard library and compiler release.
 - **Case expressions:** pattern arms use `pattern: statement-list`, default arms use `else` without a colon, empty arms are rejected, and arm boundaries are grammar-driven rather than indentation-driven.
 - **Regex and Virgex:** Regex and Virgex now share the unified pattern IR and matching engine while retaining their respective regular-expression and VPS-facing semantics.
+- **UFCS:** hardened semantic resolution and lowering across machine-code targets. Entity methods, callable fields, and free-function UFCS calls now follow a deterministic resolution order while preserving receiver and argument evaluation order; invalid visibility, arity, type, pointer, and optional-chaining cases receive strict diagnostics.
+- **String interpolation:** hardened lexing, type checking, MIR/LIR lowering, and native/Wasm code generation end to end. Interpolation handles strings, integers (including negative and boundary values), booleans, and `none`, while malformed or unsupported interpolation forms are rejected consistently.
 - **Self-hosting:** the promoted `virc` 2.9.0 compiler reached a bit-identical three-stage fixed point and passed post-promotion smoke and focused language tests.
 
 ## Release artifacts
