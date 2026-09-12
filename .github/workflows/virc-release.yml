@@ -1,0 +1,169 @@
+name: Virc Multi-Target Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and update
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: virc-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  macos-arm64:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Build and smoke-test virc
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag || github.ref_name }}'
+          version="${tag#v}"
+          mkdir -p dist/release-binaries
+          chmod +x bin/virc
+          bin/virc stdlib/vir/compiler/virc.vri \
+            -o "dist/release-binaries/virc-${version}-macos-arm64" -q
+          codesign -f -s - -i virc-bootstrap \
+            "dist/release-binaries/virc-${version}-macos-arm64"
+          "dist/release-binaries/virc-${version}-macos-arm64" \
+            tests/bootstrap_codegen/cg_arith.vri -o dist/release-binaries/smoke
+          codesign -f -s - dist/release-binaries/smoke
+          test "$(dist/release-binaries/smoke | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')" = '30'
+          strings "dist/release-binaries/virc-${version}-macos-arm64" | grep -q "v${version}"
+          rm dist/release-binaries/smoke
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: virc-macos-arm64
+          path: dist/release-binaries/virc-*-macos-arm64
+          if-no-files-found: error
+
+  linux-targets:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+
+      - name: Install cross-target verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu \
+            qemu-user wabt file
+
+      - name: Build target binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag || github.ref_name }}'
+          version="${tag#v}"
+          out=dist/release-binaries
+          mkdir -p "$out"
+          chmod +x bin/virc-linux-x86_64
+
+          # Rebuild the host compiler first so all release outputs use the
+          # compiler source associated with this tag rather than the seed's version.
+          bin/virc-linux-x86_64 stdlib/vir/compiler/virc.vri \
+            -o "$out/virc-stage1-linux-x86_64" \
+            --target linux-x86_64 --format elf -q
+          chmod +x "$out/virc-stage1-linux-x86_64"
+          seed="$out/virc-stage1-linux-x86_64"
+
+          "$seed" stdlib/vir/compiler/virc.vri \
+            -o "$out/virc-${version}-linux-x86_64" \
+            --target linux-x86_64 --format elf -q
+          "$seed" stdlib/vir/compiler/virc.vri \
+            -o "$out/virc-${version}-linux-arm64" \
+            --target linux-arm64 --format elf -q
+          "$seed" stdlib/vir/compiler/virc.vri \
+            -o "$out/virc-${version}-wasm32.wasm" \
+            --target wasm32-wasi-p1 --format wasm -q
+
+          # The RISC-V binary encoder intentionally rejects compiler-sized
+          # output today. Emit canonical GNU assembly and cross-link it.
+          "$seed" stdlib/vir/compiler/virc.vri \
+            -o "$out/virc-${version}-linux-riscv64.s" \
+            --target linux-riscv64 -S -q
+          riscv64-linux-gnu-gcc -nostdlib -static -Wl,-e,_start \
+            -o "$out/virc-${version}-linux-riscv64" \
+            "$out/virc-${version}-linux-riscv64.s"
+
+          rm "$out/virc-stage1-linux-x86_64" \
+             "$out/virc-${version}-linux-riscv64.s"
+          chmod +x "$out"/virc-${version}-linux-*
+
+      - name: Verify formats, versions, and execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ inputs.tag || github.ref_name }}'
+          version="${tag#v}"
+          out=dist/release-binaries
+          file "$out"/virc-${version}-*
+          for binary in \
+            "$out/virc-${version}-linux-x86_64" \
+            "$out/virc-${version}-linux-arm64" \
+            "$out/virc-${version}-linux-riscv64" \
+            "$out/virc-${version}-wasm32.wasm"; do
+            strings "$binary" | grep -q "v${version}"
+          done
+          wasm-validate "$out/virc-${version}-wasm32.wasm"
+
+          "$out/virc-${version}-linux-x86_64" \
+            tests/bootstrap_codegen/cg_arith.vri -o "$out/smoke-x86_64"
+          test "$("$out/smoke-x86_64" | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')" = '30'
+
+          qemu-aarch64 "$out/virc-${version}-linux-arm64" \
+            tests/bootstrap_codegen/cg_arith.vri \
+            -o "$out/smoke-arm64" --target linux-arm64 --format elf
+          test "$(qemu-aarch64 "$out/smoke-arm64" | tr '\n' ' ' | sed -E 's/[[:space:]]+$//')" = '30'
+
+          qemu-riscv64 "$out/virc-${version}-linux-riscv64" \
+            tests/bootstrap_codegen/cg_arith.vri \
+            -o "$out/smoke-riscv64" --target linux-riscv64 -S
+          test -s "$out/smoke-riscv64"
+          rm "$out"/smoke-*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: virc-linux-and-wasm
+          path: |
+            dist/release-binaries/virc-*-linux-arm64
+            dist/release-binaries/virc-*-linux-x86_64
+            dist/release-binaries/virc-*-linux-riscv64
+            dist/release-binaries/virc-*-wasm32.wasm
+          if-no-files-found: error
+
+  publish:
+    needs: [macos-arm64, linux-targets]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-binaries
+          merge-multiple: true
+
+      - name: Upload binaries to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" release-binaries/virc-* \
+            --repo "$GITHUB_REPOSITORY" --clobber
