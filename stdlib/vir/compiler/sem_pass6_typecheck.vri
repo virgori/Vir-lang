@@ -44,6 +44,7 @@ var g_pass6_current_entity_name: i64 = 0
 var g_pass6_var_names: i64 = 0
 var g_pass6_var_types: i64 = 0
 var g_pass6_quantized_tensor_type: i64 = fat_str_new("QuantizedTensor") as i64
+var g_pass6_assigned_vars: i64 = 0
 
 
 func pass6_hash_name(name: string):
@@ -121,6 +122,7 @@ func pass6_typecheck(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEn
     g_pass6_ai_mode = 0
     g_pass6_infer_values = vec_new_rt()
     g_pass6_train_values = vec_new_rt()
+    g_pass6_assigned_vars = vec_new_rt()
     pass6_collect_externs(node)
     pass6_collect_entities(node)
     pass6_collect_free_functions(node)
@@ -1838,6 +1840,7 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                 if not sym.is_mutable do
                     report_error(diag, 3003, node.line, 0)
                 end
+                g_pass6_assigned_vars = vec_push_rt(g_pass6_assigned_vars, node.name)
                 if child_count >= 1 do
                     rhs = vec_get_rt(node.children, 0)
                     rhs_type = pass6_infer_type(symbols, scopes, rhs)
@@ -1884,7 +1887,7 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                         sym = pass6_symbol_at(symbols, found)
                     end
                     if not sym.is_mutable do
-                        report_error(diag, 3003, node.line, 0)
+                        report_error(diag, 3003, node.line, 1893)
                     end
                     rhs_type = pass6_infer_type(symbols, scopes, rhs)
                     var_ty = pass6_get_var_type(lhs.name)
@@ -1983,6 +1986,122 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                     ai = ai + 1
                 end
                 pi = pi + 1
+            end
+        end
+        call_ast = pass6_find_free_function(node.name)
+        if (call_ast as i64) != 0 do
+            var fn_params = vec_new_rt()
+            var fpi = 0
+            when fpi < vec_len_rt(call_ast.children) loop
+                p_ch = vec_get_rt(call_ast.children, fpi)
+                nt_p = p_ch.node_type
+                if nt_p == AstType.ParamDef or nt_p == AstType.RefParam or nt_p == AstType.OutParam or nt_p == AstType.Identifier do
+                    fn_params = vec_push_rt(fn_params, p_ch)
+                end
+                fpi = fpi + 1
+            end
+
+            var mut_args_seen = vec_new_rt()
+            var ai = 0
+            when ai < child_count and ai < vec_len_rt(fn_params) loop
+                param_def = vec_get_rt(fn_params, ai) as AstNode
+                arg_expr = vec_get_rt(node.children, ai) as AstNode
+                is_ref_p = param_def.node_type == AstType.RefParam or param_def.int_val == 1
+                is_out_p = param_def.node_type == AstType.OutParam or param_def.int_val == 2
+                is_mut_p = is_ref_p or is_out_p
+
+                if is_mut_p do
+                    # 1. Lvalue check (temporary / literal check) -> E3048
+                    is_lval = arg_expr.node_type == AstType.Identifier or arg_expr.node_type == AstType.FieldAccess or arg_expr.node_type == AstType.IndexAccess or arg_expr.node_type == AstType.ExprIndex
+                    if not is_lval do
+                        report_error(diag, 3048, node.line, 0)
+                    end
+
+                    # 2. Type mismatch -> E3007
+                    if fat_str_len(param_def.name2) > 0 do
+                        expected_ty = pass6_resolve_ffi_type(param_def.name2)
+                        actual_ty = pass6_infer_type(symbols, scopes, arg_expr)
+                        if expected_ty != TypeKind.Void and actual_ty != TypeKind.Void and expected_ty != actual_ty do
+                            report_error(diag, 3007, node.line, 0)
+                        end
+                    end
+
+                    # 3. Identifier checks: mutability, uninitialized, aliasing
+                    if arg_expr.node_type == AstType.Identifier do
+                        # Check aliasing (two mutable references to same variable) -> E5003
+                        var was_seen = false
+                        var si = 0
+                        when si < vec_len_rt(mut_args_seen) loop
+                            if fat_str_eq(vec_get_rt(mut_args_seen, si) as string, arg_expr.name) == 1 do
+                                was_seen = true
+                            end
+                            si = si + 1
+                        end
+                        if was_seen do
+                            report_error(diag, 5003, node.line, 0)
+                        else
+                            mut_args_seen = vec_push_rt(mut_args_seen, arg_expr.name)
+                        end
+
+                        # Lookup symbol
+                        arg_sym_idx = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), arg_expr.name)
+                        if arg_sym_idx == -1 do
+                            syms_vec_find = native_read_i64(symbols as i64, 0)
+                            var si = vec_len_rt(syms_vec_find) - 1
+                            when si >= 0 loop
+                                s_sym = vec_get_rt(syms_vec_find, si)
+                                s_name_ptr = native_read_i64(s_sym as i64, 8)
+                                if fat_str_eq(s_name_ptr as string, arg_expr.name) == 1 do
+                                    arg_sym_idx = si
+                                    si = -1
+                                else
+                                    si = si - 1
+                                end
+                            end
+                        end
+                        if arg_sym_idx != -1 do
+                            sym_ptr = pass6_symbol_at(symbols, arg_sym_idx) as i64
+                            sym_kind = native_read_i64(sym_ptr, 0)
+                            is_mut = native_read_i64(sym_ptr, 40)
+                            ast_ptr = native_read_i64(sym_ptr, 32)
+
+                            # Immutability check -> E3003
+                            var is_immutable = false
+                            if sym_kind == (SymbolKind.Const as i64) or is_mut == 0 do
+                                is_immutable = true
+                            eif ast_ptr != 0 do
+                                decl_node_imm = ast_ptr as AstNode
+                                if decl_node_imm.node_type == AstType.ConstDecl do
+                                    is_immutable = true
+                                end
+                            end
+                            if is_immutable do
+                                report_error(diag, 3003, node.line, 0)
+                            end
+
+                            # Uninitialized check for ref -> E3049
+                            if is_ref_p and (sym_kind == (SymbolKind.Variable as i64) or sym_kind == (SymbolKind.Param as i64)) do
+                                if ast_ptr != 0 do
+                                    decl_node = ast_ptr as AstNode
+                                    if vec_len_rt(decl_node.children) == 0 do
+                                        var was_assigned = false
+                                        var as_i = 0
+                                        when as_i < vec_len_rt(g_pass6_assigned_vars) loop
+                                            if fat_str_eq(vec_get_rt(g_pass6_assigned_vars, as_i) as string, arg_expr.name) == 1 do
+                                                was_assigned = true
+                                            end
+                                            as_i = as_i + 1
+                                        end
+                                        if not was_assigned do
+                                            report_error(diag, 3049, node.line, 0)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                ai = ai + 1
             end
         end
         var i = 0
@@ -2176,6 +2295,7 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
 
     # 5. FuncDef Scope & Local Parameter Registration
     if node.node_type == AstType.FuncDef do
+        g_pass6_assigned_vars = vec_new_rt()
         scope_push(scopes, ScopeKind.Func)
         child_count = vec_len_rt(node.children)
         body_idx = child_count - 1

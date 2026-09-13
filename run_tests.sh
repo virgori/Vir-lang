@@ -39,6 +39,7 @@ for i in $(seq 1 31); do GP_PASS[$i]=0; GP_FAIL[$i]=0; done
 run_test_in_group() {
     local g="$1"
     local test="$2"
+    rm -f "$A_OUT"
     
     # Bóc tách expected value tự động qua Regex từ comment header
     local expected
@@ -68,7 +69,9 @@ run_test_in_group() {
         local reject_rc=$?
         if [ $reject_rc -ne 0 ]; then
             local fail_reason=""
-            if [ -n "$expected_diag" ] && ! grep -Fq "[$expected_diag]" <<<"$reject_out"; then
+            if [ -e "$A_OUT" ]; then
+                fail_reason="compiler vẫn sinh artifact cho negative test"
+            elif [ -n "$expected_diag" ] && ! grep -Fq "[$expected_diag]" <<<"$reject_out"; then
                 fail_reason="kỳ vọng diagnostic code: $expected_diag"
             elif [ -n "$expected_line" ] && ! grep -E -i -q "([Ll]ine[[:space:]]*:[[:space:]]*$expected_line\b|[Ll]ine[[:space:]]+$expected_line\b)" <<<"$reject_out"; then
                 fail_reason="kỳ vọng diagnostic line: $expected_line"
@@ -121,8 +124,6 @@ run_test_in_group() {
     # Positive test: run
     local actual
     actual=$(perl -e 'alarm 5; exec @ARGV' -- "$A_OUT" 2>&1)
-    local exit_code=$?
-    actual=$("$A_OUT" 2>&1)
     local rc=$?
 
     # Chuẩn hoá whitespace
@@ -901,10 +902,38 @@ run_group_14() {
     echo "► Nhóm 14: Tham số (in, ref, out)"
     echo "──────────────────────────────────────────────────────────────────────────"
     if [ "$MODE" = "min" ]; then
+        run_test_in_group 14 "tests/strict_v2/param_in_value_isolation_e2e.vri"
+        run_test_in_group 14 "tests/strict_v2/param_ref_parenthesized_e2e.vri"
+        run_test_in_group 14 "tests/strict_v2/param_groups_in_ref_out_e2e.vri"
+        run_test_in_group 14 "tests/strict_v2/param_in_parentheses_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_ref_temporary_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_out_read_before_write_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_out_not_assigned_rejected.vri"
         run_test_in_group 14 "tests/test_4param_global.vri"
         run_test_in_group 14 "tests/test_4param_rec.vri"
         run_test_in_group 14 "tests/test_adv_014_many_params.vri"
     else
+        run_test_in_group 14 "tests/strict_v2/param_in_value_isolation_e2e.vri"
+        run_test_in_group 14 "tests/strict_v2/param_ref_parenthesized_e2e.vri"
+        run_test_in_group 14 "tests/strict_v2/param_groups_in_ref_out_e2e.vri"
+        run_test_in_group 14 "tests/strict_v2/param_group_semicolon_e2e.vri"
+        run_test_in_group 14 "tests/strict_v2/param_out_all_paths_e2e.vri"
+        run_test_in_group 14 "tests/strict_v2/param_ref_field_index_e2e.vri"
+        run_test_in_group 14 "tests/strict_v2/param_ref_many_args_e2e.vri"
+        run_test_in_group 14 "tests/strict_v2/param_in_parentheses_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_out_parentheses_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_empty_group_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_orphan_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_legacy_group_syntax_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_ref_temporary_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_out_temporary_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_ref_immutable_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_ref_uninitialized_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_out_read_before_write_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_out_not_assigned_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_overlapping_mutable_args_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_duplicate_name_rejected.vri"
+        run_test_in_group 14 "tests/strict_v2/param_ref_type_mismatch_rejected.vri"
         run_test_in_group 14 "tests/test_4param_global.vri"
         run_test_in_group 14 "tests/test_4param_rec.vri"
         run_test_in_group 14 "tests/test_adv_014_many_params.vri"
