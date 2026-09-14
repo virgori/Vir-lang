@@ -25,6 +25,11 @@ include context
 import DiagnosticEngine, report_error, report_warning from context
 
 var g_pass7_func_asts: i64 = 0
+var g_pass7_error_in_func: i64 = 0
+var g_pass7_error_clause: i64 = 0
+var g_pass7_error_try_depth: i64 = 0
+var g_pass7_error_locals: i64 = 0
+var g_pass7_error_atomics: i64 = 0
 
 func pass7_analyze_cfa(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode):
     g_pass7_func_asts = vec_new_rt()
@@ -38,8 +43,200 @@ func pass7_analyze_cfa(symbols: SymbolTable, scopes: ScopeTree, diag: Diagnostic
             fi = fi + 1
         end
     end
+    g_pass7_error_in_func = 0
+    g_pass7_error_clause = 0
+    g_pass7_error_try_depth = 0
+    g_pass7_error_locals = vec_new_rt()
+    g_pass7_error_atomics = vec_new_rt()
+    pass7_validate_error_flow(diag, node)
     # Start with loop_depth=0, in_func=0
     pass7_walk(symbols, scopes, diag, node, 0, 0)
+end.
+
+func pass7_collect_decl_names(node: AstNode, include_try: int):
+    if (node as i64) == 0 do out 0 end
+    if node.node_type == AstType.TryStmt and include_try == 0 do out 0 end
+    if node.node_type == AstType.VarDecl or node.node_type == AstType.ConstDecl do
+        if fat_str_len(node.name) > 0 and pass7_vec_contains(g_pass7_error_locals, node.name) == 0 do
+            g_pass7_error_locals = vec_push_rt(g_pass7_error_locals, node.name as i64)
+        end
+    end
+    if node.node_type == AstType.AtomicVarDecl and vec_len_rt(node.children) > 0 do
+        decl = vec_get_rt(node.children, 0) as AstNode
+        if fat_str_len(decl.name) > 0 do
+            if pass7_vec_contains(g_pass7_error_locals, decl.name) == 0 do
+                g_pass7_error_locals = vec_push_rt(g_pass7_error_locals, decl.name as i64)
+            end
+            if pass7_vec_contains(g_pass7_error_atomics, decl.name) == 0 do
+                g_pass7_error_atomics = vec_push_rt(g_pass7_error_atomics, decl.name as i64)
+            end
+        end
+    end
+    var i = 0
+    when i < vec_len_rt(node.children) loop
+        pass7_collect_decl_names(vec_get_rt(node.children, i) as AstNode, include_try)
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass7_collect_assign_names(node: AstNode, names: int):
+    if (node as i64) == 0 do out names end
+    if node.node_type == AstType.Assign or node.node_type == AstType.IndexAssign or node.node_type == AstType.FieldAssign do
+        if fat_str_len(node.name) > 0 and pass7_vec_contains(names, node.name) == 0 do
+            names = vec_push_rt(names, node.name as i64)
+        end
+    end
+    var i = 0
+    when i < vec_len_rt(node.children) loop
+        names = pass7_collect_assign_names(vec_get_rt(node.children, i) as AstNode, names)
+        i = i + 1
+    end
+    out names
+end.
+
+func pass7_has_resume_retry(node: AstNode):
+    if (node as i64) == 0 do out 0 end
+    if node.node_type == AstType.ResumeStmt and fat_cstr_eq(node.name, "retry") == 1 do out 1 end
+    var i = 0
+    when i < vec_len_rt(node.children) loop
+        if pass7_has_resume_retry(vec_get_rt(node.children, i) as AstNode) do out 1 end
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass7_validate_try(diag: DiagnosticEngine, node: AstNode):
+    var isolate_names = vec_new_rt()
+    var try_body = 0 as AstNode
+    var revert_body = 0 as AstNode
+    var ci = 0
+    when ci < vec_len_rt(node.children) loop
+        ch = vec_get_rt(node.children, ci) as AstNode
+        if ch.node_type == AstType.IsolateClause do
+            if vec_len_rt(ch.children) != 1 do
+                report_error(diag, 3071, ch.line, 0)
+            else
+                list = vec_get_rt(ch.children, 0) as AstNode
+                if list.node_type != AstType.ArrayLiteral do
+                    report_error(diag, 3071, ch.line, 0)
+                else
+                    var ii = 0
+                    when ii < vec_len_rt(list.children) loop
+                        item = vec_get_rt(list.children, ii) as AstNode
+                        if item.node_type != AstType.Identifier or pass7_vec_contains(g_pass7_error_locals, item.name) == 0 or pass7_vec_contains(g_pass7_error_atomics, item.name) == 1 or pass7_vec_contains(isolate_names, item.name) == 1 do
+                            report_error(diag, 3071, item.line, 0)
+                        else
+                            isolate_names = vec_push_rt(isolate_names, item.name as i64)
+                        end
+                        ii = ii + 1
+                    end
+                end
+            end
+        eif ch.node_type == AstType.TimeoutClause do
+            # Type/range validation belongs to pass 6; no error-flow child.
+        else
+            if (try_body as i64) == 0 do try_body = ch else revert_body = ch end
+        end
+        ci = ci + 1
+    end
+    if (try_body as i64) == 0 or (revert_body as i64) == 0 do
+        report_error(diag, 3069, node.line, 0)
+    end
+
+    saved_clause = g_pass7_error_clause
+    saved_depth = g_pass7_error_try_depth
+    g_pass7_error_clause = 0
+    g_pass7_error_try_depth = saved_depth + 1
+    if (try_body as i64) != 0 do pass7_validate_error_flow(diag, try_body) end
+    g_pass7_error_clause = 3
+    if (revert_body as i64) != 0 do pass7_validate_error_flow(diag, revert_body) end
+    g_pass7_error_clause = saved_clause
+    g_pass7_error_try_depth = saved_depth
+
+    if (try_body as i64) != 0 and (revert_body as i64) != 0 and pass7_has_resume_retry(revert_body) do
+        mutated = pass7_collect_assign_names(try_body, vec_new_rt())
+        reset = pass7_collect_assign_names(revert_body, vec_new_rt())
+        var mi = 0
+        when mi < vec_len_rt(mutated) loop
+            mname = vec_get_rt(mutated, mi) as string
+            if pass7_vec_contains(isolate_names, mname) == 0 and pass7_vec_contains(g_pass7_error_atomics, mname) == 0 and pass7_vec_contains(reset, mname) == 0 do
+                report_warning(diag, 302, node.line, 0)
+            end
+            mi = mi + 1
+        end
+    end
+    out 0
+end.
+
+func pass7_validate_error_flow(diag: DiagnosticEngine, node: AstNode):
+    if (node as i64) == 0 do out 0 end
+    if node.node_type == AstType.FuncDef do
+        saved_in = g_pass7_error_in_func
+        saved_clause = g_pass7_error_clause
+        saved_depth = g_pass7_error_try_depth
+        saved_locals = g_pass7_error_locals
+        saved_atomics = g_pass7_error_atomics
+        g_pass7_error_in_func = 1
+        g_pass7_error_clause = 0
+        g_pass7_error_try_depth = 0
+        g_pass7_error_locals = vec_new_rt()
+        g_pass7_error_atomics = vec_new_rt()
+        var pi = 0
+        when pi < vec_len_rt(node.children) loop
+            pc = vec_get_rt(node.children, pi) as AstNode
+            if pc.node_type == AstType.ParamDef or pc.node_type == AstType.RefParam or pc.node_type == AstType.OutParam or pc.node_type == AstType.Identifier do
+                g_pass7_error_locals = vec_push_rt(g_pass7_error_locals, pc.name as i64)
+            eif pc.node_type == AstType.Block do
+                pass7_collect_decl_names(pc, 0)
+            end
+            pi = pi + 1
+        end
+        var fi = 0
+        when fi < vec_len_rt(node.children) loop
+            fc = vec_get_rt(node.children, fi) as AstNode
+            if fc.node_type == AstType.EnsureBlock do
+                g_pass7_error_clause = 1
+                pass7_validate_error_flow(diag, fc)
+            eif fc.node_type == AstType.RevertBlock do
+                g_pass7_error_clause = 2
+                pass7_validate_error_flow(diag, fc)
+            else
+                g_pass7_error_clause = 0
+                pass7_validate_error_flow(diag, fc)
+            end
+            fi = fi + 1
+        end
+        g_pass7_error_in_func = saved_in
+        g_pass7_error_clause = saved_clause
+        g_pass7_error_try_depth = saved_depth
+        g_pass7_error_locals = saved_locals
+        g_pass7_error_atomics = saved_atomics
+        out 0
+    end
+    if node.node_type == AstType.TryStmt do
+        if g_pass7_error_in_func == 0 do report_error(diag, 3075, node.line, 0) end
+        out pass7_validate_try(diag, node)
+    end
+    if node.node_type == AstType.ErxExpr do
+        if g_pass7_error_clause == 0 do report_error(diag, 3060, node.line, 0) end
+        out 0
+    end
+    if node.node_type == AstType.ResumeStmt do
+        if g_pass7_error_clause != 3 or g_pass7_error_try_depth <= 0 do
+            report_error(diag, 3061, node.line, 0)
+        end
+        out 0
+    end
+    if node.node_type == AstType.ThrowStmt and g_pass7_error_in_func == 0 do
+        report_error(diag, 3074, node.line, 0)
+    end
+    var i = 0
+    when i < vec_len_rt(node.children) loop
+        pass7_validate_error_flow(diag, vec_get_rt(node.children, i) as AstNode)
+        i = i + 1
+    end
+    out 0
 end.
 func pass7_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode, loop_depth: int, in_func: int):
 

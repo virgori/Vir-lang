@@ -137,7 +137,12 @@ var g_mir_scratch_top: i64 = 0
 # and restored around each TryStmt lowering so nested try blocks work.
 var g_try_revert_block: i64 = 0 - 1
 var g_try_retry_block: i64 = 0 - 1
-var g_try_err_vreg: i64 = 0
+var g_try_err_vreg: i64 = 0 - 1
+var g_try_parent_err_vreg: i64 = 0 - 1
+var g_func_return_block: i64 = 0 - 1
+var g_func_normal_ensure_block: i64 = 0 - 1
+var g_func_ret_vreg: i64 = 0 - 1
+var g_in_func_cleanup: i64 = 0
 
 var g_entity_hash: i64 = 0
 var g_import_hash: i64 = 0
@@ -2114,6 +2119,29 @@ func lower_interp_segment(b: MirBuilder, node: AstNode):
     out (b1, value)
 end.
 
+func lower_check_call_error(b: MirBuilder):
+    if g_try_revert_block < 0 do out b end
+    var (b_err, call_err_vreg) = builder_new_vreg(b)
+    b_err = emit_intrinsic(b_err, MIR_INTR_ERX, mir_opnd_vreg(call_err_vreg), mir_opnd_none())
+    var (b_ok, call_ok_id) = builder_add_block(b_err)
+    var (b_fail, call_fail_id) = builder_add_block(b_ok)
+    b_err = emit_jump_if_not(b_fail, mir_opnd_vreg(call_err_vreg), call_ok_id, call_fail_id)
+    b_err = builder_set_current_block(b_err, call_fail_id)
+    if g_try_err_vreg >= 0 do
+        b_err = emit_move(b_err, g_try_err_vreg, mir_opnd_vreg(call_err_vreg))
+    end
+    b_err = emit_jump(b_err, g_try_revert_block)
+    b_err = builder_set_current_block(b_err, call_ok_id)
+    out b_err
+end.
+
+func lower_prepare_call_error(b: MirBuilder):
+    if g_try_revert_block < 0 do out b end
+    # A foreign/runtime callee does not implement Vir's erx ABI. Clear the
+    # register at the call boundary so only an explicit Vir throw survives.
+    out emit_intrinsic(b, MIR_INTR_ERX, mir_opnd_none(), mir_opnd_none())
+end.
+
 func lower_call_with_ref_support_ast(b: MirBuilder, expr: AstNode, callee: string, cid: i64, callee_vreg: i64, fn_ast: AstNode):
     var has_ref_params = false
     n_args = ast_node_child_count(expr)
@@ -2136,7 +2164,9 @@ func lower_call_with_ref_support_ast(b: MirBuilder, expr: AstNode, callee: strin
         else
             ins = mir_instr_new(MirOp.Call, mir_opnd_vreg(dst), mir_opnd_imm(nargs), mir_opnd_imm(cid))
         end
+        b3 = lower_prepare_call_error(b3)
         b3 = builder_add_instr(b3, ins)
+        b3 = lower_check_call_error(b3)
         out (b3, mir_opnd_vreg(dst))
     end
 
@@ -2244,7 +2274,9 @@ func lower_call_with_ref_support_ast(b: MirBuilder, expr: AstNode, callee: strin
     else
         ins_c = mir_instr_new(MirOp.Call, mir_opnd_vreg(dst_v), mir_opnd_imm(n_args), mir_opnd_imm(cid))
     end
+    b_call = lower_prepare_call_error(b_call)
     b_call = builder_add_instr(b_call, ins_c)
+    b_call = lower_check_call_error(b_call)
 
     var wb_i = 0
     let n_wb = vec_len_rt(writeback_vnames)
@@ -2579,6 +2611,9 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 
     # 5d. Erx / Task / Wait / Quantize
 	if expr_type == AstType.ErxExpr do
+		if g_try_err_vreg >= 0 do
+			out (b, mir_opnd_vreg(g_try_err_vreg))
+		end
 		var (b1, dst) = builder_new_vreg(b)
 		out (emit_intrinsic(b1, MIR_INTR_ERX, mir_opnd_vreg(dst), mir_opnd_none()), mir_opnd_vreg(dst))
 	end
@@ -3748,6 +3783,20 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
     # 6. ReturnStmt
 	if stmt_type == AstType.ReturnStmt do
 		child_count = ast_node_child_count(stmt)
+		if g_func_return_block >= 0 and g_in_func_cleanup == 0 do
+			var b_ret = b
+			if child_count > 0 do
+				var (b_value, ret_value) = lower_expr(b_ret, ast_node_child(stmt, 0))
+				b_ret = emit_move(b_value, g_func_ret_vreg, ret_value)
+			end
+			if g_func_normal_ensure_block >= 0 do
+				b_ret = emit_jump(b_ret, g_func_normal_ensure_block)
+			else
+				b_ret = emit_jump(b_ret, g_func_return_block)
+			end
+			var (b_dead, dead_return_id) = builder_add_block(b_ret)
+			out builder_set_current_block(b_dead, dead_return_id)
+		end
 		if child_count > 0 do
 			var (b2, ret_opnd) = lower_expr(b, ast_node_child(stmt, 0))
 			ins = mir_instr_new(MirOp.Return, mir_opnd_none(), ret_opnd, mir_opnd_none())
@@ -4097,18 +4146,47 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		var ci = 0
 		var try_body = 0 - 1
 		var revert_body = 0 - 1
+		var isolate_names = vec_new_rt()
+		var isolate_targets = vec_new_rt()
+		var isolate_snapshots = vec_new_rt()
+		var timeout_immediate = false
 		when ci < nch loop
 			ch = ast_node_child(stmt, ci)
 			ct = ast_node_type_of(ch)
 			if ct == AstType.TimeoutClause do
 				if ast_node_child_count(ch) > 0 do
-					var (bt2, tv2) = lower_expr(b, ast_node_child(ch, 0))
+					timeout_expr = ast_node_child(ch, 0)
+					if ast_node_type_of(timeout_expr) == AstType.LiteralInt and ast_node_int_val(timeout_expr) <= 0 do
+						timeout_immediate = true
+					end
+					var (bt2, tv2) = lower_expr(b, timeout_expr)
 					b = emit_intrinsic(bt2, MIR_INTR_TIMEOUT, mir_opnd_none(), tv2)
 				else
 					b = emit_intrinsic(b, MIR_INTR_TIMEOUT, mir_opnd_none(), mir_opnd_none())
 				end
 			eif ct == AstType.IsolateClause do
 				b = emit_intrinsic(b, MIR_INTR_ISOLATE, mir_opnd_none(), mir_opnd_none())
+				if ast_node_child_count(ch) > 0 do
+					iso_list = ast_node_child(ch, 0)
+					if ast_node_type_of(iso_list) == AstType.ArrayLiteral do
+						var iso_i = 0
+						when iso_i < ast_node_child_count(iso_list) loop
+							iso_item = ast_node_child(iso_list, iso_i)
+							if ast_node_type_of(iso_item) == AstType.Identifier do
+								iso_name = ast_node_name(iso_item)
+								target_vreg = get_var_vreg(b, iso_name)
+								if target_vreg >= 0 do
+									var (b_snap, snapshot_vreg) = builder_new_vreg(b)
+									b = emit_move(b_snap, snapshot_vreg, mir_opnd_vreg(target_vreg))
+									isolate_names = vec_push_rt(isolate_names, iso_name as i64)
+									isolate_targets = vec_push_rt(isolate_targets, target_vreg)
+									isolate_snapshots = vec_push_rt(isolate_snapshots, snapshot_vreg)
+								end
+							end
+							iso_i = iso_i + 1
+						end
+					end
+				end
 			else
                 # First Block is the try body; the second is the revert handler.
 				if try_body == 0 - 1 do
@@ -4130,16 +4208,30 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		var (b_try, try_entry_id) = builder_add_block(b)
 		var (b_rv, revert_id) = builder_add_block(b_try)
 		var (b_en, end_id) = builder_add_block(b_rv)
-		b = emit_jump(b_en, try_entry_id)
+		b = b_en
+		var retry_id = try_entry_id
+		if vec_len_rt(isolate_targets) > 0 do
+			var (b_retry, retry_block_id) = builder_add_block(b)
+			b = b_retry
+			retry_id = retry_block_id
+		end
+		if timeout_immediate do
+			b = emit_move(b, err_v, mir_opnd_imm(2))
+			b = emit_jump(b, revert_id)
+		else
+			b = emit_jump(b, try_entry_id)
+		end
 		b = builder_set_current_block(b, try_entry_id)
 
         # Install try context (save outer for nesting).
 		saved_retry = g_try_retry_block
 		saved_block = g_try_revert_block
 		saved_err = g_try_err_vreg
-		g_try_retry_block = try_entry_id
+		saved_parent_err = g_try_parent_err_vreg
+		g_try_retry_block = retry_id
 		g_try_revert_block = revert_id
 		g_try_err_vreg = err_v
+		g_try_parent_err_vreg = 0 - 1
 
         # Try body: on normal completion jump past the handler.
 		if (try_body as i64) != (0 - 1) do
@@ -4149,16 +4241,33 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 
         # Revert handler: outer revert block is active for nested throw / resume revert.
 		g_try_revert_block = saved_block
+		g_try_parent_err_vreg = saved_err
 		b = builder_set_current_block(b, revert_id)
 		if (revert_body as i64) != (0 - 1) do
 			b = lower_stmt(b, revert_body)
 		end
 		b = emit_jump(b, end_id)
 
+		# Retry restores each isolated outer variable from its original snapshot
+		# before control re-enters the try body.  Snapshot vregs are retained for
+		# subsequent retries.
+		if retry_id != try_entry_id do
+			b = builder_set_current_block(b, retry_id)
+			var restore_i = 0
+			when restore_i < vec_len_rt(isolate_targets) loop
+				target_restore = vec_get_rt(isolate_targets, restore_i)
+				snapshot_restore = vec_get_rt(isolate_snapshots, restore_i)
+				b = emit_move(b, target_restore, mir_opnd_vreg(snapshot_restore))
+				restore_i = restore_i + 1
+			end
+			b = emit_jump(b, try_entry_id)
+		end
+
         # Restore outer try context before continuing past try block.
 		g_try_retry_block = saved_retry
 		g_try_revert_block = saved_block
 		g_try_err_vreg = saved_err
+		g_try_parent_err_vreg = saved_parent_err
 
 		b = builder_set_current_block(b, end_id)
 		out b
@@ -4192,6 +4301,9 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 			end
 		eif fat_cstr_eq(rname, "revert") == 1 or fat_cstr_eq(rname, "ResumeRevert") == 1 do
 			if g_try_revert_block >= 0 do
+				if g_try_parent_err_vreg >= 0 and g_try_err_vreg >= 0 do
+					b = emit_move(b, g_try_parent_err_vreg, mir_opnd_vreg(g_try_err_vreg))
+				end
 				b = emit_jump(b, g_try_revert_block)
 				var (bd2, dead_id2) = builder_add_block(b)
 				out builder_set_current_block(bd2, dead_id2)
@@ -4363,6 +4475,25 @@ func ast_lower_func(func_id: int, ast_func: AstNode):
 	g_func_ref_param_modes = vec_new_rt()
 	g_func_ref_param_hash = hash_table_new()
 
+	# Separate the executable body from function-level cleanup clauses.  Cleanup
+	# gets dedicated CFG blocks so early `out` and `throw` cannot bypass it.
+	var body_node = 0 as AstNode
+	var ensure_node = 0 as AstNode
+	var revert_node = 0 as AstNode
+	var scan_i = 0
+	when scan_i < child_count loop
+		scan_ch = ast_node_child(ast_func, scan_i)
+		scan_nt = ast_node_type_of(scan_ch)
+		if scan_nt == AstType.Block and (body_node as i64) == 0 do
+			body_node = scan_ch
+		eif scan_nt == AstType.EnsureBlock do
+			ensure_node = scan_ch
+		eif scan_nt == AstType.RevertBlock do
+			revert_node = scan_ch
+		end
+		scan_i = scan_i + 1
+	end
+
 	if child_count > 0 do
 		var pi = 0
 		when pi < child_count loop
@@ -4390,14 +4521,114 @@ func ast_lower_func(func_id: int, ast_func: AstNode):
 					hash_table_insert(g_func_ref_param_hash, g_func_ref_param_names, pname, r_idx)
 				end
 				param_idx = param_idx + 1
-			else
-				b = lower_stmt(b, ch)
 			end
 			pi = pi + 1
 		end
 	end
-    ins_ret = mir_instr_new(MirOp.Return, mir_opnd_none(), mir_opnd_none(), mir_opnd_none())
-    b = builder_add_instr(b, ins_ret)
+
+	# Stable return/error slots survive every cleanup edge.
+	var (b_ret_slot, ret_vreg) = builder_new_vreg(b)
+	b = emit_move(b_ret_slot, ret_vreg, mir_opnd_imm(0))
+	var (b_err_slot, func_err_vreg) = builder_new_vreg(b)
+	b = emit_move(b_err_slot, func_err_vreg, mir_opnd_imm(0))
+
+	var (b_return, return_id) = builder_add_block(b)
+	b = b_return
+	var (b_error_return, error_return_id) = builder_add_block(b)
+	b = b_error_return
+	var normal_ensure_id = 0 - 1
+	var error_ensure_id = 0 - 1
+	var func_revert_id = 0 - 1
+	if (ensure_node as i64) != 0 do
+		var (b_ne, ne_id) = builder_add_block(b)
+		b = b_ne
+		normal_ensure_id = ne_id
+		var (b_ee, ee_id) = builder_add_block(b)
+		b = b_ee
+		error_ensure_id = ee_id
+	end
+	if (revert_node as i64) != 0 do
+		var (b_fr, fr_id) = builder_add_block(b)
+		b = b_fr
+		func_revert_id = fr_id
+	end
+
+	saved_func_return = g_func_return_block
+	saved_func_ensure = g_func_normal_ensure_block
+	saved_func_ret = g_func_ret_vreg
+	saved_cleanup = g_in_func_cleanup
+	saved_try_revert = g_try_revert_block
+	saved_try_retry = g_try_retry_block
+	saved_try_err = g_try_err_vreg
+	saved_try_parent_err = g_try_parent_err_vreg
+	g_func_return_block = return_id
+	g_func_normal_ensure_block = normal_ensure_id
+	g_func_ret_vreg = ret_vreg
+	g_in_func_cleanup = 0
+	g_try_retry_block = 0 - 1
+	g_try_err_vreg = func_err_vreg
+	g_try_parent_err_vreg = 0 - 1
+	if func_revert_id >= 0 do
+		g_try_revert_block = func_revert_id
+	eif error_ensure_id >= 0 do
+		g_try_revert_block = error_ensure_id
+	else
+		g_try_revert_block = error_return_id
+	end
+
+	if (body_node as i64) != 0 do b = lower_stmt(b, body_node) end
+	if not builder_current_block_terminated(b) do
+		if normal_ensure_id >= 0 do b = emit_jump(b, normal_ensure_id) else b = emit_jump(b, return_id) end
+	end
+
+	# A handled throw runs function revert first, then normal ensure.
+	if func_revert_id >= 0 do
+		b = builder_set_current_block(b, func_revert_id)
+		g_in_func_cleanup = 1
+		if error_ensure_id >= 0 do g_try_revert_block = error_ensure_id else g_try_revert_block = error_return_id end
+		b = lower_stmt(b, revert_node)
+		if not builder_current_block_terminated(b) do
+			if normal_ensure_id >= 0 do b = emit_jump(b, normal_ensure_id) else b = emit_jump(b, return_id) end
+		end
+	end
+
+	if normal_ensure_id >= 0 do
+		b = builder_set_current_block(b, normal_ensure_id)
+		g_in_func_cleanup = 1
+		g_try_revert_block = 0 - 1
+		b = lower_stmt(b, ensure_node)
+		if not builder_current_block_terminated(b) do b = emit_jump(b, return_id) end
+
+		# Unhandled throw still executes ensure, then propagates the original erx.
+		b = builder_set_current_block(b, error_ensure_id)
+		b = lower_stmt(b, ensure_node)
+		if not builder_current_block_terminated(b) do
+			b = emit_jump(b, error_return_id)
+		end
+	end
+
+	b = builder_set_current_block(b, return_id)
+	b = emit_intrinsic(b, MIR_INTR_ERX, mir_opnd_none(), mir_opnd_imm(0))
+	ins_ret = mir_instr_new(MirOp.Return, mir_opnd_none(), mir_opnd_vreg(ret_vreg), mir_opnd_none())
+	b = builder_add_instr(b, ins_ret)
+
+	b = builder_set_current_block(b, error_return_id)
+	if fat_cstr_eq(fname, "main") == 1 do
+		b = emit_intrinsic(b, MIR_INTR_THROW, mir_opnd_none(), mir_opnd_vreg(func_err_vreg))
+	else
+		b = emit_intrinsic(b, MIR_INTR_ERX, mir_opnd_none(), mir_opnd_vreg(func_err_vreg))
+		err_ret = mir_instr_new(MirOp.Return, mir_opnd_none(), mir_opnd_imm(0), mir_opnd_none())
+		b = builder_add_instr(b, err_ret)
+	end
+
+	g_func_return_block = saved_func_return
+	g_func_normal_ensure_block = saved_func_ensure
+	g_func_ret_vreg = saved_func_ret
+	g_in_func_cleanup = saved_cleanup
+	g_try_revert_block = saved_try_revert
+	g_try_retry_block = saved_try_retry
+	g_try_err_vreg = saved_try_err
+	g_try_parent_err_vreg = saved_try_parent_err
 	f = builder_func(b)
     vc = native_read_i64(b as i64, 8)
     native_write_i64(f as i64, 16, vc)
