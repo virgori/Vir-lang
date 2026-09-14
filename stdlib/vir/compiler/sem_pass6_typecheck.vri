@@ -450,6 +450,9 @@ func pass6_types_compatible(declared: i64, actual: TypeKind):
         out 1
     end
     # Fat-pointer ABI: many `string` / entity handles are i64 at runtime.
+    if declared == TypeKind.Int as i64 and actual == TypeKind.String do
+        out 1
+    end
     if declared == TypeKind.String as i64 and pass6_is_integer_like(actual) == 1 do
         out 1
     end
@@ -469,6 +472,38 @@ func pass6_ufcs_types_compatible(declared: i64, actual: TypeKind):
     if actual == TypeKind.Bool & pass6_is_integer_like(declared as TypeKind) == 1 do out 1 end
     if declared == TypeKind.Array as i64 & actual == TypeKind.Entity do out 1 end
     if declared == TypeKind.Entity as i64 & actual == TypeKind.Array do out 1 end
+    out 0
+end.
+
+# Ordinary Vir calls retain the compiler's pointer-sized compatibility rules,
+# but bool is not silently accepted for a declared numeric parameter (or the
+# reverse).  This keeps annotated `in` parameters meaningful without breaking
+# self-hosted code that represents strings/entities/addresses as `int`.
+func pass6_param_types_compatible(declared: i64, actual: TypeKind):
+    if declared == TypeKind.Int as i64 and actual == TypeKind.Bool do out 0 end
+    if declared == TypeKind.Bool as i64 and actual == TypeKind.Int do out 0 end
+    # The self-hosted runtime ABI passes fat-string handles through `int`.
+    if declared == TypeKind.Int as i64 and actual == TypeKind.String do out 1 end
+    out pass6_types_compatible(declared, actual)
+end.
+
+func pass6_call_arg_types_compatible(symbols: SymbolTable, scopes: ScopeTree, declared: i64, actual: TypeKind, arg: AstNode):
+    if pass6_param_types_compatible(declared, actual) == 1 do out 1 end
+    # An unannotated local still carries the legacy integer storage kind.  Its
+    # expression-derived bool value is valid for a bool parameter; only an
+    # explicit annotation or literal makes this a strict int/bool mismatch.
+    if arg.node_type == AstType.Identifier do
+        sid = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), arg.name)
+        if sid != -1 do
+            sym = pass6_symbol_at(symbols, sid)
+            if sym.ast_id == 0 do
+                out pass6_types_compatible(declared, actual)
+            else
+                decl = sym.ast_id as AstNode
+                if fat_str_len(decl.name2) == 0 do out pass6_types_compatible(declared, actual) end
+            end
+        end
+    end
     out 0
 end.
 
@@ -1428,6 +1463,11 @@ func pass6_check_method_call(symbols: SymbolTable, scopes: ScopeTree, diag: Diag
                     end
                     ai = ai + 1
                 end
+                if has_this == 1 do
+                    pass6_check_method_mut_args(symbols, scopes, diag, found_method, node, 0, 0, 1 + nargs)
+                else
+                    pass6_check_method_mut_args(symbols, scopes, diag, found_method, node, 1, 0, nargs)
+                end
                 node.builtin_id = 201
                 # Keep only the parser-owned receiver type across the semantic
                 # arena boundary. AST-to-MIR rebuilds the qualified method name
@@ -1570,6 +1610,7 @@ func pass6_check_method_call(symbols: SymbolTable, scopes: ScopeTree, diag: Diag
                     end
                     ai2 = ai2 + 1
                 end
+                pass6_check_method_mut_args(symbols, scopes, diag, fn_ast, node, 0, 0, total_args)
             end
             node.builtin_id = 203
             node.name2 = mname
@@ -1580,6 +1621,110 @@ func pass6_check_method_call(symbols: SymbolTable, scopes: ScopeTree, diag: Diag
     # Priority 4: No candidate found
     report_error(diag, 3021, node.line, 0)
     out 0
+end.
+
+func pass6_lvalue_root_name(expr: AstNode):
+    if (expr as i64) == 0 do out fat_str_new("") end
+    if expr.node_type == AstType.Identifier or expr.node_type == AstType.IndexAccess do
+        out expr.name
+    end
+    if expr.node_type == AstType.FieldAccess or expr.node_type == AstType.ExprIndex do
+        if vec_len_rt(expr.children) > 0 do
+            out pass6_lvalue_root_name(vec_get_rt(expr.children, 0) as AstNode)
+        end
+    end
+    out fat_str_new("")
+end.
+
+func pass6_index_paths_may_overlap(left: AstNode, right: AstNode, left_start: int, right_start: int):
+    let left_count = vec_len_rt(left.children) - left_start
+    let right_count = vec_len_rt(right.children) - right_start
+    if left_count != right_count do out 1 end
+    var ii = 0
+    when ii < left_count loop
+        li = vec_get_rt(left.children, left_start + ii) as AstNode
+        ri = vec_get_rt(right.children, right_start + ii) as AstNode
+        if li.node_type == AstType.LiteralInt and ri.node_type == AstType.LiteralInt do
+            if li.int_val != ri.int_val do out 0 end
+        else
+            # Dynamic indices may evaluate to the same element.
+            out 1
+        end
+        ii = ii + 1
+    end
+    out 1
+end.
+
+func pass6_lvalues_may_overlap(left: AstNode, right: AstNode):
+    let left_root = pass6_lvalue_root_name(left)
+    let right_root = pass6_lvalue_root_name(right)
+    if fat_str_len(left_root) == 0 or fat_str_len(right_root) == 0 do out 0 end
+    if fat_str_eq(left_root, right_root) == 0 do out 0 end
+    if left.node_type == AstType.FieldAccess and right.node_type == AstType.FieldAccess do
+        if fat_str_eq(left.name, right.name) == 0 do out 0 end
+        if vec_len_rt(left.children) > 0 and vec_len_rt(right.children) > 0 do
+            out pass6_lvalues_may_overlap(vec_get_rt(left.children, 0) as AstNode, vec_get_rt(right.children, 0) as AstNode)
+        end
+        out 1
+    end
+    if left.node_type == AstType.IndexAccess and right.node_type == AstType.IndexAccess do
+        out pass6_index_paths_may_overlap(left, right, 0, 0)
+    end
+    if left.node_type == AstType.ExprIndex and right.node_type == AstType.ExprIndex do
+        if vec_len_rt(left.children) == 0 or vec_len_rt(right.children) == 0 do out 1 end
+        if not pass6_lvalues_may_overlap(vec_get_rt(left.children, 0) as AstNode, vec_get_rt(right.children, 0) as AstNode) do out 0 end
+        out pass6_index_paths_may_overlap(left, right, 1, 1)
+    end
+    # A whole object and one of its fields/elements overlap conservatively.
+    out 1
+end.
+
+func pass6_check_method_mut_args(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, fn_ast: AstNode, call_node: AstNode, arg_start: int, param_start: int, count: int):
+    var seen = vec_new_rt()
+    var ai = 0
+    when ai < count loop
+        param_def = vec_get_rt(fn_ast.children, param_start + ai) as AstNode
+        arg_expr = vec_get_rt(call_node.children, arg_start + ai) as AstNode
+        let is_ref_p = param_def.node_type == AstType.RefParam or param_def.int_val == 1
+        let is_out_p = param_def.node_type == AstType.OutParam or param_def.int_val == 2
+        if is_ref_p or is_out_p do
+            let is_lval = arg_expr.node_type == AstType.Identifier or arg_expr.node_type == AstType.FieldAccess or arg_expr.node_type == AstType.IndexAccess or arg_expr.node_type == AstType.ExprIndex
+            if not is_lval do
+                report_error(diag, 3048, call_node.line, 0)
+            else
+                var si = 0
+                var overlaps = false
+                when si < vec_len_rt(seen) loop
+                    if pass6_lvalues_may_overlap(vec_get_rt(seen, si) as AstNode, arg_expr) do overlaps = true end
+                    si = si + 1
+                end
+                if overlaps do
+                    report_error(diag, 5003, call_node.line, 0)
+                else
+                    seen = vec_push_rt(seen, arg_expr as i64)
+                end
+
+                root_name = pass6_lvalue_root_name(arg_expr)
+                sym_idx = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), root_name)
+                if sym_idx != -1 do
+                    sym = pass6_symbol_at(symbols, sym_idx)
+                    if sym.kind == SymbolKind.Const or not sym.is_mutable do
+                        report_error(diag, 3003, call_node.line, 0)
+                    end
+                    if is_ref_p and sym.ast_id != 0 do
+                        decl = sym.ast_id as AstNode
+                        if decl.node_type == AstType.VarDecl and vec_len_rt(decl.children) == 0 and pass6_name_in_vec(g_pass6_assigned_vars, root_name) == 0 do
+                            report_error(diag, 3049, call_node.line, 0)
+                        end
+                    end
+                end
+                if is_out_p and arg_expr.node_type == AstType.Identifier and pass6_name_in_vec(g_pass6_assigned_vars, arg_expr.name) == 0 do
+                    g_pass6_assigned_vars = vec_push_rt(g_pass6_assigned_vars, arg_expr.name as i64)
+                end
+            end
+        end
+        ai = ai + 1
+    end
 end.
 
 func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode):
@@ -2010,6 +2155,20 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                 is_out_p = param_def.node_type == AstType.OutParam or param_def.int_val == 2
                 is_mut_p = is_ref_p or is_out_p
 
+                # Parameter annotations constrain all modes, including ordinary
+                # in/value parameters.
+                if fat_str_len(param_def.name2) > 0 do
+                    expected_ty = pass6_resolve_ffi_type(param_def.name2)
+                    actual_ty = pass6_infer_type(symbols, scopes, arg_expr)
+                    if expected_ty != TypeKind.Void and actual_ty != TypeKind.Void do
+                        if is_mut_p and expected_ty != actual_ty do
+                            report_error(diag, 3007, node.line, 0)
+                        eif not is_mut_p and pass6_call_arg_types_compatible(symbols, scopes, expected_ty as i64, actual_ty, arg_expr) == 0 do
+                            report_error(diag, 3007, node.line, 0)
+                        end
+                    end
+                end
+
                 if is_mut_p do
                     # 1. Lvalue check (temporary / literal check) -> E3048
                     is_lval = arg_expr.node_type == AstType.Identifier or arg_expr.node_type == AstType.FieldAccess or arg_expr.node_type == AstType.IndexAccess or arg_expr.node_type == AstType.ExprIndex
@@ -2017,22 +2176,14 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                         report_error(diag, 3048, node.line, 0)
                     end
 
-                    # 2. Type mismatch -> E3007
-                    if fat_str_len(param_def.name2) > 0 do
-                        expected_ty = pass6_resolve_ffi_type(param_def.name2)
-                        actual_ty = pass6_infer_type(symbols, scopes, arg_expr)
-                        if expected_ty != TypeKind.Void and actual_ty != TypeKind.Void and expected_ty != actual_ty do
-                            report_error(diag, 3007, node.line, 0)
-                        end
-                    end
-
-                    # 3. Identifier checks: mutability, uninitialized, aliasing
-                    if arg_expr.node_type == AstType.Identifier do
-                        # Check aliasing (two mutable references to same variable) -> E5003
+                    # 2. All mutable lvalues: overlapping aliases, root
+                    # mutability, and initialized-before-ref.
+                    if is_lval do
                         var was_seen = false
                         var si = 0
                         when si < vec_len_rt(mut_args_seen) loop
-                            if fat_str_eq(vec_get_rt(mut_args_seen, si) as string, arg_expr.name) == 1 do
+                            prev_arg = vec_get_rt(mut_args_seen, si) as AstNode
+                            if pass6_lvalues_may_overlap(prev_arg, arg_expr) do
                                 was_seen = true
                             end
                             si = si + 1
@@ -2040,18 +2191,20 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                         if was_seen do
                             report_error(diag, 5003, node.line, 0)
                         else
-                            mut_args_seen = vec_push_rt(mut_args_seen, arg_expr.name)
+                            mut_args_seen = vec_push_rt(mut_args_seen, arg_expr as i64)
                         end
 
-                        # Lookup symbol
-                        arg_sym_idx = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), arg_expr.name)
+                        root_name = pass6_lvalue_root_name(arg_expr)
+                        # Lookup the owner/root symbol.  Field and index lvalues
+                        # inherit writability and initialization from this root.
+                        arg_sym_idx = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), root_name)
                         if arg_sym_idx == -1 do
                             syms_vec_find = native_read_i64(symbols as i64, 0)
                             var si = vec_len_rt(syms_vec_find) - 1
                             when si >= 0 loop
                                 s_sym = vec_get_rt(syms_vec_find, si)
                                 s_name_ptr = native_read_i64(s_sym as i64, 8)
-                                if fat_str_eq(s_name_ptr as string, arg_expr.name) == 1 do
+                                if fat_str_eq(s_name_ptr as string, root_name) == 1 do
                                     arg_sym_idx = si
                                     si = -1
                                 else
@@ -2089,6 +2242,8 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                                         when as_i < vec_len_rt(g_pass6_assigned_vars) loop
                                             if fat_str_eq(vec_get_rt(g_pass6_assigned_vars, as_i) as string, arg_expr.name) == 1 do
                                                 was_assigned = true
+                                            eif fat_str_eq(vec_get_rt(g_pass6_assigned_vars, as_i) as string, root_name) == 1 do
+                                                was_assigned = true
                                             end
                                             as_i = as_i + 1
                                         end
@@ -2097,6 +2252,13 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                                         end
                                     end
                                 end
+                            end
+                        end
+                        # A successful normal return initializes an identifier
+                        # passed to an out parameter for following calls.
+                        if is_out_p and arg_expr.node_type == AstType.Identifier do
+                            if pass6_name_in_vec(g_pass6_assigned_vars, arg_expr.name) == 0 do
+                                g_pass6_assigned_vars = vec_push_rt(g_pass6_assigned_vars, arg_expr.name as i64)
                             end
                         end
                     end
@@ -2319,8 +2481,11 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
             if sid != -1 do
                 psym = pass6_symbol_at(symbols, sid)
                 native_write_i64(psym as i64, 32, param as i64)
+                param_kind = pass6_resolve_ffi_type(param.name2)
                 if fat_str_len(param.name2) > 0 and is_tensor_type_str(param.name2) do
                     native_write_i64(psym as i64, 16, TypeKind.Tensor as i64)
+                eif param_kind != TypeKind.Void do
+                    native_write_i64(psym as i64, 16, param_kind as i64)
                 eif psym.type_id == 0 do
                     native_write_i64(psym as i64, 16, TypeKind.Int as i64)
                 end
