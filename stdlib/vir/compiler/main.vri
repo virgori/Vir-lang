@@ -930,7 +930,8 @@ const G_INC_MAX = 512
 const G_PREPROCESS_MAX = 2048
 var g_inc_tab = 0
 var g_inc_base = 0;   # C-string directory of the main source file
-var g_inc_err = 0;    # 1 = cannot read, 3 = import symbol/export missing
+var g_inc_err = 0;    # 1 = cannot read/parse/resolve, 3 = import symbol/export missing
+var g_inc_diag_code = 0
 var g_inc_last_dir = 0
 var g_imp_mod = 0
 var g_imp_syms = 0
@@ -948,36 +949,104 @@ func g_inc_init:
     end
     native_write_i64(g_inc_tab, 0, 0)
     g_inc_err = 0
+    g_inc_diag_code = 0
     g_inc_resolved_path = 0
     g_inc_cur_parent_file = 0
     g_inc_cur_parent_line = 0
 end.
 
+func inc_set_error(code: int):
+    g_inc_diag_code = code
+    if code == 2113 do
+        g_inc_err = 3
+    else
+        g_inc_err = 1
+    end
+end.
+
+func inc_print_error_prefix(code: int, area: string):
+    out 0
+end.
+
 func g_inc_norm_key(name: string):
-    # Canonicalize a module key: drop directory prefix and a trailing ".vri"
-    # so `include "dir/foo.vri"` and `import ... from foo` map to the same key.
-    let d = native_read_i64(name, 0)
-    var ln = native_read_i64(name, 8)
-    # `and` is eager in the C-VM. Keep the length guard in a separate
-    # branch so short names never evaluate a negative byte offset.
-    if ln >= 4 do
-        if native_read_u8(d, ln - 4) == 46 and native_read_u8(d, ln - 3) == 118 and native_read_u8(d, ln - 2) == 114 and native_read_u8(d, ln - 1) == 105 do
-            ln = ln - 4
+    # Include/import identity must describe the resolved source unit, not just
+    # its basename.  Basename keys make foo/resolver.vri hide bar/resolver.vri.
+    out name
+end.
+
+func path_normalize_fat(path: string):
+    data = native_read_i64(path, 0)
+    n = native_read_i64(path, 8)
+    out_buf = vir_alloc(n + 2)
+    seg_starts = vir_alloc((n + 2) * 8)
+    seg_lens = vir_alloc((n + 2) * 8)
+    seg_count = 0
+    out_len = 0
+    absolute = 0
+    if n > 0 do
+        if native_read_u8(data, 0) == 47 do
+            absolute = 1
+            native_write_u8(out_buf, 0, 47)
+            out_len = 1
         end
     end
-    var start = 0
-    var i = 0
-    when i < ln loop
-        let ch = native_read_u8(d, i)
-        if ch == 47 or ch == 46 do
-            start = i + 1
+    i = 0
+    when i < n loop
+        when i < n and native_read_u8(data, i) == 47 loop
+            i = i + 1
         end
-        i = i + 1
+        s = i
+        when i < n and native_read_u8(data, i) != 47 loop
+            i = i + 1
+        end
+        l = i - s
+        if l == 0 do
+            skip
+        eif l == 1 and native_read_u8(data, s) == 46 do
+            skip
+        eif l == 2 and native_read_u8(data, s) == 46 and native_read_u8(data, s + 1) == 46 do
+            if seg_count > 0 do
+                seg_count = seg_count - 1
+                out_len = native_read_i64(seg_starts, seg_count * 8)
+                if out_len > 1 and native_read_u8(out_buf, out_len - 1) == 47 do
+                    out_len = out_len - 1
+                end
+            else
+                if absolute == 0 do
+                    if out_len > 0 and native_read_u8(out_buf, out_len - 1) != 47 do
+                        native_write_u8(out_buf, out_len, 47)
+                        out_len = out_len + 1
+                    end
+                    native_write_i64(seg_starts, seg_count * 8, out_len)
+                    native_write_i64(seg_lens, seg_count * 8, 2)
+                    native_write_u8(out_buf, out_len, 46)
+                    native_write_u8(out_buf, out_len + 1, 46)
+                    out_len = out_len + 2
+                    seg_count = seg_count + 1
+                end
+            end
+        else
+            if out_len > 0 and native_read_u8(out_buf, out_len - 1) != 47 do
+                native_write_u8(out_buf, out_len, 47)
+                out_len = out_len + 1
+            end
+            native_write_i64(seg_starts, seg_count * 8, out_len)
+            native_write_i64(seg_lens, seg_count * 8, l)
+            j = 0
+            when j < l loop
+                native_write_u8(out_buf, out_len + j, native_read_u8(data, s + j))
+                j = j + 1
+            end
+            out_len = out_len + l
+            seg_count = seg_count + 1
+        end
     end
-    if ln - start <= 0 do
-        out name
+    if out_len == 0 do
+        native_write_u8(out_buf, 0, 46)
+        out_len = 1
     end
-    out text_fat_from_range(d, start, ln - start)
+    native_write_u8(out_buf, out_len, 0)
+    out str_from_cstr(out_buf)
 end.
 
 func g_inc_has(name: string):
@@ -1134,7 +1203,8 @@ func try_read_file(path_fat: string):
     if raw == 0 do
         out 0
     end
-    g_inc_resolved_path = cstr
+    let norm_path = path_normalize_fat(path_fat)
+    g_inc_resolved_path = native_read_i64(norm_path, 0)
     out str_from_cstr(raw)
 end.
 
@@ -1861,52 +1931,57 @@ func expand_includes_text(source: string):
             out source
         end
         if text_line_has_double_colon(source, at) == 1 do
-            print_str("virc: invalid token '::'; use '.' for qualified names\n")
-            g_inc_err = 1
+            print_str("virc: error [E2103] Source Resolution: ")
+            print_str("invalid token '::'; use '.' for qualified names\n")
+            inc_set_error(2103)
             out source
         end
         let iname = text_parse_include_name(source, at)
         if iname == 0 do
-            print_str("virc: include error: failed to parse include statement name\n")
-            g_inc_err = 1
+            print_str("virc: error [E2101] Source Resolution: ")
+            print_str("failed to parse include statement name\n")
+            inc_set_error(2101)
             out source
         end
-        if g_inc_has(iname) == 1 do
+        g_inc_resolved_path = 0
+        var body = read_include_source(iname)
+        if body == 0 do
+            inc_locate_marker_before(source, at)
+            print_str("virc: error [E2102] Source Resolution: ")
+            print_str("included source not found: '")
+            print_str(native_read_i64(iname as i64, 0))
+            print_str("' requested at ")
+            print_str(g_inc_cur_parent_file)
+            print_str(":")
+            print_int(g_inc_cur_parent_line)
+            print_str("\n")
+            inc_set_error(2102)
+            out source
+        end
+        var inc_key = g_inc_resolved_path
+        if inc_key == 0 do
+            inc_key = native_read_i64(iname as i64, 0)
+        end
+        let inc_key_fat = str_from_cstr(inc_key)
+        if g_inc_has(inc_key_fat) == 1 do
             let end_at = text_skip_include_stmt(source, at)
-            let dup_str = inc_make_dup_comment(native_read_i64(iname as i64, 0))
+            let dup_str = inc_make_dup_comment(inc_key)
             source = text_splice_at(source, at, end_at, dup_str)
         else
-            g_inc_mark(iname)
-            g_inc_resolved_path = 0
-            var body = read_include_source(iname)
-            if body == 0 do
-                inc_locate_marker_before(source, at)
-                print_str("virc: include fail: module not found: '")
-                print_str(native_read_i64(iname as i64, 0))
-                print_str("' requested at ")
-                print_str(g_inc_cur_parent_file)
-                print_str(":")
-                print_int(g_inc_cur_parent_line)
-                print_str("\n")
-                g_inc_err = 1
-                out source
-            end
+            g_inc_mark(inc_key_fat)
             body = text_ascii_sanitize(body)
             let end_at = text_skip_include_stmt(source, at)
             inc_locate_marker_before(source, at)
             let p_file = g_inc_cur_parent_file
             let p_line = g_inc_cur_parent_line
-            var r_path = g_inc_resolved_path
-            if r_path == 0 do
-                r_path = native_read_i64(iname as i64, 0)
-            end
-            let wrapped_body = inc_wrap_source(body, r_path, p_file, p_line + 1)
+            let wrapped_body = inc_wrap_source(body, inc_key, p_file, p_line + 1)
             source = text_splice_at(source, at, end_at, wrapped_body)
         end
     end
     if guard >= G_PREPROCESS_MAX do
-        print_str("virc: include fail: G_PREPROCESS_MAX loop limit reached\n")
-        g_inc_err = 1
+        print_str("virc: error [E2104] Source Resolution: ")
+        print_str("include recursion/expansion limit reached\n")
+        inc_set_error(2104)
     end
     out source
 end.
@@ -2009,6 +2084,9 @@ func text_has_export(body: string, fname: string):
                     sym_len = j - sym_start
                     if sym_len > 0 and text_eq_ident(data, sym_start, sym_len, fname) == 1 do
                         out 1
+                    end
+                    if sym_len <= 0 do
+                        j = j + 1
                     end
                 end
             end
@@ -2422,6 +2500,9 @@ func text_build_import_body(mod_body: string, alias_only: int):
         end
         out mod_body
     end
+    if alias_only == 0 and text_find_include(mod_body) >= 0 do
+        out mod_body
+    end
     if alias_only == 1 and g_imp_aliases == 0 do
         out 0
     end
@@ -2506,13 +2587,15 @@ func expand_imports_text(source: string):
             out source
         end
         if text_line_has_double_colon(source, at) == 1 do
-            print_str("virc: invalid token '::'; use '.' for qualified names\n")
-            g_inc_err = 1
+            print_str("virc: error [E2103] Module Resolution: ")
+            print_str("invalid token '::'; use '.' for qualified names\n")
+            inc_set_error(2103)
             out source
         end
         kind = text_parse_import_at(source, at)
         if kind == 0 or g_imp_mod == 0 do
-            print_str("virc: import error: failed to parse import statement at offset: ")
+            print_str("virc: error [E2111] Module Resolution: ")
+            print_str("failed to parse import statement at offset: ")
             print_int(at)
             print_str("\nSnippet: '")
             sdata = native_read_i64(source, 0)
@@ -2526,18 +2609,30 @@ func expand_imports_text(source: string):
                 print_str(native_read_i64(snip, 0))
             end
             print_str("'\n")
-            g_inc_err = 1
+            inc_set_error(2111)
             out source
         end
         end_at = text_skip_import_stmt(source, at)
-        # Already pulled in via include — the exported names are already in scope,
-        # so we only need to splice rename shims for any aliased imports (import … as X).
-        if g_inc_has(g_imp_mod) == 1 do
+        g_inc_resolved_path = 0
+        body = read_include_source(g_imp_mod)
+        if body == 0 do
+            print_str("virc: error [E2112] Module Resolution: ")
+            print_str("module not found: '")
+            print_str(native_read_i64(g_imp_mod, 0))
+            print_str("'\n")
+            inc_set_error(2112)
+            out source
+        end
+        var imp_key = g_inc_resolved_path
+        if imp_key == 0 do
+            imp_key = native_read_i64(g_imp_mod as i64, 0)
+        end
+        let imp_key_fat = str_from_cstr(imp_key)
+        # Already pulled in via include/import — the exported names are already
+        # in scope, so we only need rename shims for aliased imports.
+        if g_inc_has(imp_key_fat) == 1 do
             var shim = 0
-            abody = read_include_source(g_imp_mod)
-            if abody != 0 do
-                shim = text_build_import_body(abody, 1)
-            end
+            shim = text_build_import_body(body, 1)
             if g_inc_err == 3 do
                 g_inc_err = 0
             end
@@ -2548,38 +2643,42 @@ func expand_imports_text(source: string):
             end
             source = text_splice_at(source, at, end_at, shim)
         else
-            body = read_include_source(g_imp_mod)
-            if body == 0 do
-                print_str("virc: import fail: module not found: '")
-                print_str(native_read_i64(g_imp_mod, 0))
-                print_str("'\n")
-                g_inc_err = 1
-                out source
-            end
             piece = text_build_import_body(body, 0)
             if piece == 0 do
+                if g_imp_sym_count > 0 do
+                    if g_inc_err == 0 do
+                        inc_set_error(2113)
+                    end
+                    print_str("virc: error [E2113] Module Resolution: ")
+                    print_str("imported symbol not exported or not found in '")
+                    print_str(native_read_i64(g_imp_mod, 0))
+                    print_str("'\n")
+                    out source
+                end
                 # No export list (stdlib modules): splice whole module once.
                 if g_inc_err == 3 do
                     g_inc_err = 0
-                    g_inc_mark(g_imp_mod)
+                    g_inc_mark(imp_key_fat)
                     piece = body
                 else
                     if g_inc_err == 0 do
-                        g_inc_err = 3
+                        inc_set_error(2113)
                     end
-                    print_str("virc: import warning: symbol not found in '")
+                    print_str("virc: error [E2113] Module Resolution: ")
+                    print_str("imported symbol not exported or not found in '")
                     print_str(native_read_i64(g_imp_mod, 0))
                     print_str("'\n")
                     out source
                 end
             end
-            g_inc_mark(g_imp_mod)
+            g_inc_mark(imp_key_fat)
             source = text_splice_at(source, at, end_at, piece)
         end
     end
     if guard >= G_PREPROCESS_MAX do
-        print_str("virc: import fail: G_PREPROCESS_MAX loop limit reached\n")
-        g_inc_err = 1
+        print_str("virc: error [E2114] Module Resolution: ")
+        print_str("import recursion/expansion limit reached\n")
+        inc_set_error(2114)
     end
     out source
 end.
@@ -2627,6 +2726,11 @@ func compile(source: string, output_path: string):
         print "virc: import symbol not exported"
         out 1
     end
+    if g_inc_err != 0 do
+        print "virc: include cannot read module"
+        out 1
+    end
+    source = expand_includes_text(source)
     if g_inc_err != 0 do
         print "virc: include cannot read module"
         out 1
