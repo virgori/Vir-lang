@@ -57,6 +57,8 @@ run_test_in_group() {
     expected_diag=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC:[[:space:]]*//p' "$test" | head -1)
     local expected_line
     expected_line=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC_LINE:[[:space:]]*//p' "$test" | head -1)
+    local expected_exit
+    expected_exit=$(sed -n 's/^#[[:space:]]*EXPECT_EXIT:[[:space:]]*//p' "$test" | head -1)
     local expected_member
     expected_member=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC_MEMBER:[[:space:]]*//p' "$test" | head -1)
     local expected_receiver
@@ -128,7 +130,14 @@ run_test_in_group() {
 
     # Chuẩn hoá whitespace
     actual=$(echo "$actual" | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba')
-    if [ $rc -ne 0 ]; then
+    if [ -n "$expected_exit" ] && [ "$rc" -ne "$expected_exit" ]; then
+        echo "  [FAIL-RUNTIME] $test (exit code: $rc, expected: $expected_exit)"
+        echo "    Output: $actual"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+        TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+    if [ -z "$expected_exit" ] && [ $rc -ne 0 ]; then
         echo "  [FAIL-RUNTIME] $test (exit code: $rc)"
         echo "    Output: $actual"
         GP_FAIL[$g]=$((GP_FAIL[$g]+1))

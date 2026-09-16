@@ -81,7 +81,10 @@ def expand_file(path: Path, seen_names: set[str], seen_paths: set[Path]) -> str:
     seen_paths.add(path)
     seen_paths.add(canonical)
 
-    display_path = path.relative_to(ROOT).as_posix()
+    try:
+        display_path = path.relative_to(ROOT).as_posix()
+    except ValueError:
+        display_path = path.as_posix()
     output: list[str] = [f"# @vir_source {display_path} 1"]
     for line_no, line in enumerate(path.read_text().splitlines(), start=1):
         match = re.match(r"^include\s+(\S+)", line)
@@ -106,6 +109,8 @@ def main() -> int:
     output = ROOT / "dist/virc-expanded.vri"
     if len(sys.argv) > 1:
         output = Path(sys.argv[1])
+    if len(sys.argv) > 2:
+        source = Path(sys.argv[2])
     text = expand_file(source, set(), set())
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(text)
