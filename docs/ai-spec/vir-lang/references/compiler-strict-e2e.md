@@ -23,6 +23,36 @@ change an operator spelling, or remove a construct merely to make an
 incomplete backend pass.  Such a mismatch is a compiler defect, not a test
 defect.
 
+### 1.1 Syntax diagnostics are fail-fast
+
+Lexical and grammar errors are owned by the lexer/parser boundary.  They must
+be diagnosed before AST construction can yield a program accepted by semantic
+passes.  The compiler must not keep a malformed token sequence as a plausible
+AST node and later report an unrelated name, type, field, or lowering error.
+
+Required behavior:
+
+- The lexer emits one diagnostic for an invalid character, malformed literal,
+  unterminated string/comment, or invalid token boundary, with the source
+  line and column of the first invalid byte.
+- The parser emits a grammar diagnostic for a missing required token,
+  malformed declaration, malformed field list, invalid block closer, or
+  unexpected token.  It identifies the offending token and the expected
+  grammar element.
+- Parser recovery may skip to a defined synchronization point (newline,
+  separator, or matching block boundary) only to find independent errors.  A
+  recovered/error node is never passed to symbol resolution, type checking,
+  MIR lowering, optimization, or code generation.
+- If lexing or parsing produced any error, compilation exits non-zero and
+  produces no executable output artifact.  Semantic analysis is not invoked
+  for that compilation unit.
+- Diagnostics must point to the earliest causal source location.  For
+  example, a malformed `mold Pixel: u16` header must be reported at its header
+  token, not later as a missing `end` in `main` or an unknown field.
+
+This rule is a release gate because delayed syntax failures make compiler
+regressions look like semantic failures and make test triage unreliable.
+
 The required verification path is:
 
 1. Parse the strict `.vri` source without recovery diagnostics.
@@ -274,3 +304,22 @@ output artifact, path-dependent runtime behavior, or expected-output rewrite.
 Any failure is classified as either an unimplemented feature or a regression;
 it may only be classified as a test defect with a demonstrated contradiction
 against this contract or the base Vir v2.0 specification.
+
+### 6.1 Required lexer/parser negative tests
+
+Add a parser-only and a normal compiler-invocation test for each case below.
+Each asserts a non-zero exit, the indicated diagnostic category and source
+location, and confirms that no output binary was created:
+
+- invalid character and malformed numeric/string literal (lexer);
+- missing field width or separator in `mold` (parser);
+- invalid `mold` base type/header token (parser);
+- missing `end.` for a definition and `end` for a statement block (parser);
+- unmatched closing token and an unexpected token after a complete
+  expression (parser);
+- malformed `2^` expression (parser), distinct from the semantic rejection
+  of the grammatically valid `2^-1` negative exponent.
+
+The harness must run these before semantic/type tests.  A negative-syntax test
+that reaches AST semantic diagnostics is a failing test even if compilation
+eventually exits non-zero.
