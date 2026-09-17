@@ -370,6 +370,62 @@ def run_test(
                         stderr=r_stderr,
                         reason=f"Structural test behavioral stdout mismatch: expected '{exp_s}', got '{r_stdout.strip()}'",
                     )
+            if "factorial absent from runtime call graph" in entry.oracle:
+                lowered_funcs = re.findall(r"AST->MIR func\s+\d+\s*:\s*(\w+)", c_all)
+                if "factorial" in lowered_funcs:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target=target,
+                        compile_exit=c_exit,
+                        run_exit=r_exit,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason="Structural gate failed: 'factorial' was lowered to MIR runtime call graph",
+                    )
+                if bin_out.exists():
+                    artifact_bytes = bin_out.read_bytes()
+                    if b"factorial" in artifact_bytes:
+                        return TestResult(
+                            test_id=entry.test_id,
+                            kind=entry.kind,
+                            status="FAIL",
+                            target=target,
+                            compile_exit=c_exit,
+                            run_exit=r_exit,
+                            stdout=r_stdout,
+                            stderr=r_stderr,
+                            reason="Structural gate failed: 'factorial' symbol/string found in runtime binary artifact",
+                        )
+
+            if "no runtime PRECOMP/call" in entry.oracle:
+                lowered_funcs = re.findall(r"AST->MIR func\s+\d+\s*:\s*(\w+)", c_all)
+                for fn in lowered_funcs:
+                    if "precomp" in fn.lower():
+                        return TestResult(
+                            test_id=entry.test_id,
+                            kind=entry.kind,
+                            status="FAIL",
+                            target=target,
+                            compile_exit=c_exit,
+                            run_exit=r_exit,
+                            stdout=r_stdout,
+                            stderr=r_stderr,
+                            reason=f"Structural gate failed: precomp function '{fn}' lowered to MIR runtime call graph",
+                        )
+                if "MIR_INTR_PRECOMP" in c_all or "runtime PRECOMP" in c_all:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target=target,
+                        compile_exit=c_exit,
+                        run_exit=r_exit,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason="Structural gate failed: runtime PRECOMP instruction found in compiler output",
+                    )
 
             if entry.test_id == "TARGET-002":
                 if r_exit != 37:
