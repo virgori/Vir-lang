@@ -1161,6 +1161,7 @@ run_group_17() {
         run_test_in_group 17 "tests/test_adv_026_const_fold.vri"
         run_test_in_group 17 "tests/test_str_len_fold.vri"
         run_test_in_group 17 "tests/vri/test_adv_026_const_fold.vri"
+        run_test_in_group 17 "tests/test_precomp.vri"
     else
         run_test_in_group 17 "tests/test_adv_026_const_fold.vri"
         run_test_in_group 17 "tests/test_str_len_fold.vri"
