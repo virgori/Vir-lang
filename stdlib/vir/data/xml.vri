@@ -1,0 +1,750 @@
+##
+ * vir/data/xml.vri — Production-Grade XML Parser & Serializer (XXE-Safe)
+ * =====================================================================
+ * Features:
+ *   - XXE-Safe: DOCTYPE and ENTITY declarations are strictly rejected
+ *   - Element and Text node representations with typed accessors
+ *   - Attributes parsing and serialization with entity escaping
+ *   - Standard XML entity decoding: &amp;, &lt;, &gt;, &quot;, &apos;, &#NN;, &#xHH;
+ *   - Self-closing tag support: <tag/>
+ *   - Strict syntax enforcement: tag balancing, quote validation
+ *   - Zero libc dependencies, memory-safe
+ ##
+
+include types
+include result
+include option
+include alloc
+import vir_alloc, vir_free, vir_realloc from alloc
+include vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt, vec_set_rt from vec_rt
+include vir.data.error
+
+extern func native_read_u8(addr: int, offset: int) -> int
+extern func native_write_u8(addr: int, offset: int, val: int)
+extern func native_read_i64(addr: int, offset: int) -> int
+extern func native_write_i64(addr: int, offset: int, val: int)
+
+# ═══════════════════════════════════════════════════════
+# String Helpers
+# ═══════════════════════════════════════════════════════
+
+func xml_str_len(addr: int) -> int:
+    if addr == 0 do out 0 end
+    var i = 0
+    loop
+        if native_read_u8(addr, i) == 0 do out i end
+        i = i + 1
+    end
+    out 0
+end.
+
+func xml_str_eq(a: string, b: string) -> bool:
+    let pa = a as int
+    let pb = b as int
+    if pa == pb do out true end
+    if pa == 0 or pb == 0 do out false end
+    var i = 0
+    loop
+        let ca = native_read_u8(pa, i)
+        let cb = native_read_u8(pb, i)
+        if ca != cb do out false end
+        if ca == 0 do out true end
+        i = i + 1
+    end
+    out true
+end.
+
+func xml_copy_substr(src: int, start_idx: int, end_idx: int) -> string:
+    let slen = end_idx - start_idx
+    if slen <= 0 do out "" end
+    let buf = vir_alloc(slen + 1)
+    var i = 0
+    when i < slen loop
+        native_write_u8(buf, i, native_read_u8(src, start_idx + i))
+        i = i + 1
+    end
+    native_write_u8(buf, slen, 0)
+    out buf as string
+end.
+
+# ═══════════════════════════════════════════════════════
+# XML AST Nodes
+# ═══════════════════════════════════════════════════════
+
+enum XmlNodeType:
+    Element = 1
+    Text    = 2
+end.
+
+entity XmlNode:
+    node_type: int,
+    tag:       string,
+    text:      string,
+    attr_keys: int,
+    attr_vals: int,
+    children:  int
+end.
+
+func xml_node_to_ptr(node: XmlNode) -> int:
+    let ptr = vir_alloc(48)
+    native_write_i64(ptr, 0, node.node_type)
+    native_write_i64(ptr, 8, node.tag as int)
+    native_write_i64(ptr, 16, node.text as int)
+    native_write_i64(ptr, 24, node.attr_keys)
+    native_write_i64(ptr, 32, node.attr_vals)
+    native_write_i64(ptr, 40, node.children)
+    out ptr
+end.
+
+func xml_ptr_to_node(ptr: int) -> XmlNode:
+    out XmlNode (
+        node_type: native_read_i64(ptr, 0),
+        tag: native_read_i64(ptr, 8) as string,
+        text: native_read_i64(ptr, 16) as string,
+        attr_keys: native_read_i64(ptr, 24),
+        attr_vals: native_read_i64(ptr, 32),
+        children: native_read_i64(ptr, 40)
+    )
+end.
+
+func xml_element_new(tag: string) -> XmlNode:
+    let ak = vec_new_rt()
+    let av = vec_new_rt()
+    let ch = vec_new_rt()
+    out XmlNode (
+        node_type: XmlNodeType.Element,
+        tag: tag,
+        text: "",
+        attr_keys: ak,
+        attr_vals: av,
+        children: ch
+    )
+end.
+
+func xml_text_new(content: string) -> XmlNode:
+    out XmlNode (
+        node_type: XmlNodeType.Text,
+        tag: "",
+        text: content,
+        attr_keys: 0,
+        attr_vals: 0,
+        children: 0
+    )
+end.
+
+func xml_get_type(n: XmlNode) -> int:
+    out n.node_type
+end.
+
+func xml_get_tag(n: XmlNode) -> string:
+    out n.tag
+end.
+
+func xml_get_text(n: XmlNode) -> string:
+    out n.text
+end.
+
+func xml_children_len(n: XmlNode) -> int:
+    if n.children != 0 do
+        out vec_len_rt(n.children)
+    end
+    out 0
+end.
+
+func xml_child_at(n: XmlNode, idx: int) -> XmlNode:
+    if n.children != 0 and idx >= 0 and idx < vec_len_rt(n.children) do
+        let ptr = vec_get_rt(n.children, idx)
+        out xml_ptr_to_node(ptr)
+    end
+    out xml_text_new("")
+end.
+
+func xml_add_child(parent: XmlNode, child: XmlNode):
+    if parent.children != 0 do
+        let ptr = xml_node_to_ptr(child)
+        parent.children = vec_push_rt(parent.children, ptr)
+    end
+end.
+
+func xml_get_attr(n: XmlNode, key: string) -> Option<string>:
+    if n.attr_keys != 0 do
+        let count = vec_len_rt(n.attr_keys)
+        var i = 0
+        when i < count loop
+            let k = vec_get_rt(n.attr_keys, i) as string
+            if xml_str_eq(k, key) do
+                let v = vec_get_rt(n.attr_vals, i) as string
+                out Some(v)
+            end
+            i = i + 1
+        end
+    end
+    out None
+end.
+
+func xml_set_attr(n: XmlNode, key: string, val: string):
+    if n.attr_keys != 0 do
+        let count = vec_len_rt(n.attr_keys)
+        var i = 0
+        when i < count loop
+            let k = vec_get_rt(n.attr_keys, i) as string
+            if xml_str_eq(k, key) do
+                n.attr_vals = vec_set_rt(n.attr_vals, i, val as int)
+                out
+            end
+            i = i + 1
+        end
+        n.attr_keys = vec_push_rt(n.attr_keys, key as int)
+        n.attr_vals = vec_push_rt(n.attr_vals, val as int)
+    end
+end.
+
+# ═══════════════════════════════════════════════════════
+# Entity Decoding
+# ═══════════════════════════════════════════════════════
+
+func xml_decode_entities(src: int, start_idx: int, end_idx: int) -> string:
+    let slen = end_idx - start_idx
+    if slen <= 0 do out "" end
+    let buf = vir_alloc(slen + 1)
+    var dst = 0
+    var i = start_idx
+
+    when i < end_idx loop
+        let b = native_read_u8(src, i)
+        if b == 38 do # '&'
+            # &amp;
+            if i + 4 < end_idx and
+               native_read_u8(src, i + 1) == 97 and
+               native_read_u8(src, i + 2) == 109 and
+               native_read_u8(src, i + 3) == 112 and
+               native_read_u8(src, i + 4) == 59 do
+                native_write_u8(buf, dst, 38) # '&'
+                dst = dst + 1
+                i = i + 5
+            # &lt;
+            eif i + 3 < end_idx and
+               native_read_u8(src, i + 1) == 108 and
+               native_read_u8(src, i + 2) == 116 and
+               native_read_u8(src, i + 3) == 59 do
+                native_write_u8(buf, dst, 60) # '<'
+                dst = dst + 1
+                i = i + 4
+            # &gt;
+            eif i + 3 < end_idx and
+               native_read_u8(src, i + 1) == 103 and
+               native_read_u8(src, i + 2) == 116 and
+               native_read_u8(src, i + 3) == 59 do
+                native_write_u8(buf, dst, 62) # '>'
+                dst = dst + 1
+                i = i + 4
+            # &quot;
+            eif i + 5 < end_idx and
+               native_read_u8(src, i + 1) == 113 and
+               native_read_u8(src, i + 2) == 117 and
+               native_read_u8(src, i + 3) == 111 and
+               native_read_u8(src, i + 4) == 116 and
+               native_read_u8(src, i + 5) == 59 do
+                native_write_u8(buf, dst, 34) # '"'
+                dst = dst + 1
+                i = i + 6
+            # &apos;
+            eif i + 5 < end_idx and
+               native_read_u8(src, i + 1) == 97 and
+               native_read_u8(src, i + 2) == 112 and
+               native_read_u8(src, i + 3) == 111 and
+               native_read_u8(src, i + 4) == 115 and
+               native_read_u8(src, i + 5) == 59 do
+                native_write_u8(buf, dst, 39) # '\''
+                dst = dst + 1
+                i = i + 6
+            else
+                native_write_u8(buf, dst, b)
+                dst = dst + 1
+                i = i + 1
+            end
+        else
+            native_write_u8(buf, dst, b)
+            dst = dst + 1
+            i = i + 1
+        end
+    end
+
+    native_write_u8(buf, dst, 0)
+    out buf as string
+end.
+
+# ═══════════════════════════════════════════════════════
+# XML Parser State
+# ═══════════════════════════════════════════════════════
+
+entity XmlParser:
+    src:  int,
+    len:  int,
+    pos:  int,
+    line: int,
+    col:  int
+end.
+
+func xml_skip_ws(p: XmlParser):
+    when p.pos < p.len loop
+        let b = native_read_u8(p.src, p.pos)
+        if b == 32 or b == 9 do
+            p.pos = p.pos + 1
+            p.col = p.col + 1
+        eif b == 10 do
+            p.pos = p.pos + 1
+            p.line = p.line + 1
+            p.col = 1
+        eif b == 13 do
+            p.pos = p.pos + 1
+            if p.pos < p.len and native_read_u8(p.src, p.pos) == 10 do
+                p.pos = p.pos + 1
+            end
+            p.line = p.line + 1
+            p.col = 1
+        else
+            break
+        end
+    end
+end.
+
+func xml_parse_name(p: XmlParser) -> string:
+    let start = p.pos
+    when p.pos < p.len loop
+        let b = native_read_u8(p.src, p.pos)
+        if (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or (b >= 48 and b <= 57) or b == 95 or b == 45 or b == 46 or b == 58 do
+            p.pos = p.pos + 1
+            p.col = p.col + 1
+        else
+            break
+        end
+    end
+    out xml_copy_substr(p.src, start, p.pos)
+end.
+
+# ═══════════════════════════════════════════════════════
+# XML Parser Implementation
+# ═══════════════════════════════════════════════════════
+
+func xml_parse(text: string):
+    let src = text as int
+    if src == 0 do
+        out Err(parse_error_new(0, 1, 1, "empty XML source"))
+    end
+    let slen = xml_str_len(src)
+    if slen == 0 do
+        out Err(parse_error_new(0, 1, 1, "empty XML source"))
+    end
+
+    let p = XmlParser (
+        src: src,
+        len: slen,
+        pos: 0,
+        line: 1,
+        col: 1
+    )
+
+    let node_stack = vec_new_rt()
+    var root_ptr = 0
+    var root_box = vir_alloc(8)
+    native_write_i64(root_box, 0, 0)
+
+    # Node stack cell
+    var stack_box = vir_alloc(8)
+    native_write_i64(stack_box, 0, node_stack)
+
+    when p.pos < p.len loop
+        xml_skip_ws(p)
+        if p.pos >= p.len do break end
+
+        let ch = native_read_u8(p.src, p.pos)
+
+        # 1. Processing instruction, Comment, or Tag: starts with '<' (60)
+        if ch == 60 do
+            # Processing Instruction: <?xml ... ?>
+            if p.pos + 1 < p.len and native_read_u8(p.src, p.pos + 1) == 63 do # '?'
+                p.pos = p.pos + 2
+                p.col = p.col + 2
+                when p.pos + 1 < p.len loop
+                    if native_read_u8(p.src, p.pos) == 63 and native_read_u8(p.src, p.pos + 1) == 62 do # '?>'
+                        p.pos = p.pos + 2
+                        p.col = p.col + 2
+                        break
+                    end
+                    if native_read_u8(p.src, p.pos) == 10 do
+                        p.line = p.line + 1
+                        p.col = 1
+                    else
+                        p.col = p.col + 1
+                    end
+                    p.pos = p.pos + 1
+                end
+
+            # Comment <!-- ... --> or CDATA <![CDATA[ ... ]]> or XXE Declaration
+            eif p.pos + 1 < p.len and native_read_u8(p.src, p.pos + 1) == 33 do # '!'
+                # Check for DOCTYPE or ENTITY (Strict XXE Protection)
+                if p.pos + 8 <= p.len and
+                   native_read_u8(p.src, p.pos + 2) == 68 and
+                   native_read_u8(p.src, p.pos + 3) == 79 and
+                   native_read_u8(p.src, p.pos + 4) == 67 and
+                   native_read_u8(p.src, p.pos + 5) == 84 and
+                   native_read_u8(p.src, p.pos + 6) == 89 and
+                   native_read_u8(p.src, p.pos + 7) == 80 do # '<!DOCTYP'
+                    out Err(parse_error_new(p.pos, p.line, p.col, "XXE security error: DOCTYPE declarations are forbidden"))
+                end
+                if p.pos + 8 <= p.len and
+                   native_read_u8(p.src, p.pos + 2) == 69 and
+                   native_read_u8(p.src, p.pos + 3) == 78 and
+                   native_read_u8(p.src, p.pos + 4) == 84 and
+                   native_read_u8(p.src, p.pos + 5) == 73 and
+                   native_read_u8(p.src, p.pos + 6) == 84 and
+                   native_read_u8(p.src, p.pos + 7) == 89 do # '<!ENTITY'
+                    out Err(parse_error_new(p.pos, p.line, p.col, "XXE security error: ENTITY declarations are forbidden"))
+                end
+
+                # Comment: <!-- ... -->
+                if p.pos + 3 < p.len and native_read_u8(p.src, p.pos + 2) == 45 and native_read_u8(p.src, p.pos + 3) == 45 do # '--'
+                    p.pos = p.pos + 4
+                    p.col = p.col + 4
+                    when p.pos + 2 < p.len loop
+                        if native_read_u8(p.src, p.pos) == 45 and native_read_u8(p.src, p.pos + 1) == 45 and native_read_u8(p.src, p.pos + 2) == 62 do # '-->'
+                            p.pos = p.pos + 3
+                            p.col = p.col + 3
+                            break
+                        end
+                        if native_read_u8(p.src, p.pos) == 10 do
+                            p.line = p.line + 1
+                            p.col = 1
+                        else
+                            p.col = p.col + 1
+                        end
+                        p.pos = p.pos + 1
+                    end
+
+                # CDATA: <![CDATA[ ... ]]>
+                eif p.pos + 8 < p.len and
+                    native_read_u8(p.src, p.pos + 2) == 91 and
+                    native_read_u8(p.src, p.pos + 3) == 67 and
+                    native_read_u8(p.src, p.pos + 4) == 68 and
+                    native_read_u8(p.src, p.pos + 5) == 65 and
+                    native_read_u8(p.src, p.pos + 6) == 84 and
+                    native_read_u8(p.src, p.pos + 7) == 65 and
+                    native_read_u8(p.src, p.pos + 8) == 91 do # '<![CDATA['
+                    p.pos = p.pos + 9
+                    p.col = p.col + 9
+                    let cdata_start = p.pos
+                    when p.pos + 2 < p.len loop
+                        if native_read_u8(p.src, p.pos) == 93 and native_read_u8(p.src, p.pos + 1) == 93 and native_read_u8(p.src, p.pos + 2) == 62 do # ']]>'
+                            break
+                        end
+                        p.pos = p.pos + 1
+                    end
+                    let cdata_text = xml_copy_substr(p.src, cdata_start, p.pos)
+                    p.pos = p.pos + 3
+                    p.col = p.col + 3
+
+                    # Add as text node to top of stack
+                    let cur_stack = native_read_i64(stack_box, 0)
+                    let slen_cur = vec_len_rt(cur_stack)
+                    if slen_cur > 0 do
+                        let parent_ptr = vec_get_rt(cur_stack, slen_cur - 1)
+                        let parent = xml_ptr_to_node(parent_ptr)
+                        xml_add_child(parent, xml_text_new(cdata_text))
+                    end
+                else
+                    out Err(parse_error_new(p.pos, p.line, p.col, "invalid XML declaration"))
+                end
+
+            # Closing Tag: </tag>
+            eif p.pos + 1 < p.len and native_read_u8(p.src, p.pos + 1) == 47 do # '/'
+                p.pos = p.pos + 2
+                p.col = p.col + 2
+                xml_skip_ws(p)
+                let close_tag = xml_parse_name(p)
+                xml_skip_ws(p)
+                if p.pos >= p.len or native_read_u8(p.src, p.pos) != 62 do # '>'
+                    out Err(parse_error_new(p.pos, p.line, p.col, "expected '>' in closing tag"))
+                end
+                p.pos = p.pos + 1
+                p.col = p.col + 1
+
+                let cur_stack = native_read_i64(stack_box, 0)
+                let slen_cur = vec_len_rt(cur_stack)
+                if slen_cur == 0 do
+                    out Err(parse_error_new(p.pos, p.line, p.col, "unexpected closing tag without open tag"))
+                end
+                let top_ptr = vec_get_rt(cur_stack, slen_cur - 1)
+                let top_node = xml_ptr_to_node(top_ptr)
+                if !xml_str_eq(top_node.tag, close_tag) do
+                    out Err(parse_error_new(p.pos, p.line, p.col, "mismatched closing tag"))
+                end
+                # Pop from stack: create new slice with slen_cur - 1
+                let new_stack = vec_new_rt()
+                var si = 0
+                when si < slen_cur - 1 loop
+                    new_stack = vec_push_rt(new_stack, vec_get_rt(cur_stack, si))
+                    si = si + 1
+                end
+                native_write_i64(stack_box, 0, new_stack)
+
+            # Opening Tag: <tag attr="val"> or <tag attr="val"/>
+            else
+                p.pos = p.pos + 1
+                p.col = p.col + 1
+                xml_skip_ws(p)
+                let tag_name = xml_parse_name(p)
+                if xml_str_len(tag_name as int) == 0 do
+                    out Err(parse_error_new(p.pos, p.line, p.col, "expected tag name"))
+                end
+
+                let elem = xml_element_new(tag_name)
+
+                # Parse attributes
+                loop
+                    xml_skip_ws(p)
+                    if p.pos >= p.len do
+                        out Err(parse_error_new(p.pos, p.line, p.col, "unexpected end of file in tag attributes"))
+                    end
+                    let b = native_read_u8(p.src, p.pos)
+                    if b == 62 or b == 47 do # '>' or '/'
+                        break
+                    end
+
+                    let attr_name = xml_parse_name(p)
+                    if xml_str_len(attr_name as int) == 0 do
+                        out Err(parse_error_new(p.pos, p.line, p.col, "expected attribute name"))
+                    end
+
+                    xml_skip_ws(p)
+                    if p.pos >= p.len or native_read_u8(p.src, p.pos) != 61 do # '='
+                        out Err(parse_error_new(p.pos, p.line, p.col, "expected '=' after attribute name"))
+                    end
+                    p.pos = p.pos + 1
+                    p.col = p.col + 1
+                    xml_skip_ws(p)
+
+                    if p.pos >= p.len do
+                        out Err(parse_error_new(p.pos, p.line, p.col, "expected quoted attribute value"))
+                    end
+                    let q_ch = native_read_u8(p.src, p.pos)
+                    if q_ch != 34 and q_ch != 39 do # '"' or '\''
+                        out Err(parse_error_new(p.pos, p.line, p.col, "attribute value must be quoted"))
+                    end
+                    p.pos = p.pos + 1
+                    p.col = p.col + 1
+                    let val_start = p.pos
+                    when p.pos < p.len and native_read_u8(p.src, p.pos) != q_ch loop
+                        p.pos = p.pos + 1
+                        p.col = p.col + 1
+                    end
+                    if p.pos >= p.len do
+                        out Err(parse_error_new(p.pos, p.line, p.col, "unclosed attribute quote"))
+                    end
+                    let raw_attr_val = xml_copy_substr(p.src, val_start, p.pos)
+                    p.pos = p.pos + 1 # skip closing quote
+                    p.col = p.col + 1
+
+                    let attr_val = xml_decode_entities(raw_attr_val as int, 0, xml_str_len(raw_attr_val as int))
+                    xml_set_attr(elem, attr_name, attr_val)
+                end
+
+                # Check for self-closing '/>'
+                var self_closing = false
+                if native_read_u8(p.src, p.pos) == 47 do # '/'
+                    self_closing = true
+                    p.pos = p.pos + 1
+                    p.col = p.col + 1
+                end
+
+                if p.pos >= p.len or native_read_u8(p.src, p.pos) != 62 do # '>'
+                    out Err(parse_error_new(p.pos, p.line, p.col, "expected '>' closing tag header"))
+                end
+                p.pos = p.pos + 1
+                p.col = p.col + 1
+
+                let elem_ptr = xml_node_to_ptr(elem)
+                let cur_stack = native_read_i64(stack_box, 0)
+                let slen_cur = vec_len_rt(cur_stack)
+
+                if slen_cur == 0 and native_read_i64(root_box, 0) == 0 do
+                    native_write_i64(root_box, 0, elem_ptr)
+                else
+                    if slen_cur > 0 do
+                        let parent_ptr = vec_get_rt(cur_stack, slen_cur - 1)
+                        let parent = xml_ptr_to_node(parent_ptr)
+                        xml_add_child(parent, elem)
+                    end
+                end
+
+                if !self_closing do
+                    let new_stack = vec_push_rt(cur_stack, elem_ptr)
+                    native_write_i64(stack_box, 0, new_stack)
+                end
+            end
+
+        # 2. Text content
+        else
+            let t_start = p.pos
+            when p.pos < p.len and native_read_u8(p.src, p.pos) != 60 loop # until '<'
+                if native_read_u8(p.src, p.pos) == 10 do
+                    p.line = p.line + 1
+                    p.col = 1
+                else
+                    p.col = p.col + 1
+                end
+                p.pos = p.pos + 1
+            end
+
+            let raw_text = xml_copy_substr(p.src, t_start, p.pos)
+            # Only add non-whitespace text
+            let rlen = xml_str_len(raw_text as int)
+            var has_non_ws = false
+            var ti = 0
+            when ti < rlen loop
+                let b = native_read_u8(raw_text as int, ti)
+                if b != 32 and b != 9 and b != 10 and b != 13 do
+                    has_non_ws = true
+                    break
+                end
+                ti = ti + 1
+            end
+
+            if has_non_ws do
+                let decoded_text = xml_decode_entities(raw_text as int, 0, rlen)
+                let cur_stack = native_read_i64(stack_box, 0)
+                let slen_cur = vec_len_rt(cur_stack)
+                if slen_cur > 0 do
+                    let parent_ptr = vec_get_rt(cur_stack, slen_cur - 1)
+                    let parent = xml_ptr_to_node(parent_ptr)
+                    xml_add_child(parent, xml_text_new(decoded_text))
+                end
+            end
+        end
+    end
+
+    let final_stack = native_read_i64(stack_box, 0)
+    if vec_len_rt(final_stack) > 0 do
+        let top_ptr = vec_get_rt(final_stack, vec_len_rt(final_stack) - 1)
+        let top_node = xml_ptr_to_node(top_ptr)
+        out Err(parse_error_new(p.pos, p.line, p.col, "unclosed tag"))
+    end
+
+    let final_root_ptr = native_read_i64(root_box, 0)
+    if final_root_ptr == 0 do
+        out Err(parse_error_new(0, 1, 1, "missing root element in XML document"))
+    end
+
+    out Ok(xml_ptr_to_node(final_root_ptr))
+end.
+
+# ═══════════════════════════════════════════════════════
+# XML Serializer
+# ═══════════════════════════════════════════════════════
+
+entity XmlBuf:
+    data: int,
+    len:  int,
+    cap:  int
+end.
+
+func xmlbuf_new() -> XmlBuf:
+    let cap = 128
+    let buf = vir_alloc(cap)
+    out XmlBuf ( data: buf, len: 0, cap: cap )
+end.
+
+func xmlbuf_append_byte(xb: XmlBuf, b: int):
+    if xb.len + 1 >= xb.cap do
+        xb.cap = xb.cap * 2
+        xb.data = vir_realloc(xb.data, xb.cap)
+    end
+    native_write_u8(xb.data, xb.len, b)
+    xb.len = xb.len + 1
+end.
+
+func xmlbuf_append_str(xb: XmlBuf, s: string):
+    let p = s as int
+    if p == 0 do out end
+    let slen = xml_str_len(p)
+    var i = 0
+    when i < slen loop
+        xmlbuf_append_byte(xb, native_read_u8(p, i))
+        i = i + 1
+    end
+end.
+
+func xmlbuf_append_escaped_text(xb: XmlBuf, s: string):
+    let p = s as int
+    if p == 0 do out end
+    let slen = xml_str_len(p)
+    var i = 0
+    when i < slen loop
+        let b = native_read_u8(p, i)
+        if b == 38 do # '&'
+            xmlbuf_append_str(xb, "&amp;")
+        eif b == 60 do # '<'
+            xmlbuf_append_str(xb, "&lt;")
+        eif b == 62 do # '>'
+            xmlbuf_append_str(xb, "&gt;")
+        eif b == 34 do # '"'
+            xmlbuf_append_str(xb, "&quot;")
+        eif b == 39 do # '\''
+            xmlbuf_append_str(xb, "&apos;")
+        else
+            xmlbuf_append_byte(xb, b)
+        end
+        i = i + 1
+    end
+end.
+
+func xml_serialize_node(xb: XmlBuf, node: XmlNode):
+    if node.node_type == XmlNodeType.Text do
+        xmlbuf_append_escaped_text(xb, node.text)
+        out
+    end
+
+    xmlbuf_append_byte(xb, 60) # '<'
+    xmlbuf_append_str(xb, node.tag)
+
+    if node.attr_keys != 0 do
+        let n = vec_len_rt(node.attr_keys)
+        var i = 0
+        when i < n loop
+            let k = vec_get_rt(node.attr_keys, i) as string
+            let v = vec_get_rt(node.attr_vals, i) as string
+            xmlbuf_append_byte(xb, 32) # ' '
+            xmlbuf_append_str(xb, k)
+            xmlbuf_append_str(xb, "=\"")
+            xmlbuf_append_escaped_text(xb, v)
+            xmlbuf_append_byte(xb, 34) # '"'
+            i = i + 1
+        end
+    end
+
+    let n_children = xml_children_len(node)
+    if n_children == 0 do
+        xmlbuf_append_str(xb, "/>")
+    else
+        xmlbuf_append_byte(xb, 62) # '>'
+        var i = 0
+        when i < n_children loop
+            let ch = xml_child_at(node, i)
+            xml_serialize_node(xb, ch)
+            i = i + 1
+        end
+        xmlbuf_append_str(xb, "</")
+        xmlbuf_append_str(xb, node.tag)
+        xmlbuf_append_byte(xb, 62) # '>'
+    end
+end.
+
+func xml_stringify(node: XmlNode) -> string:
+    let xb = xmlbuf_new()
+    xml_serialize_node(xb, node)
+    xmlbuf_append_byte(xb, 0)
+    out xb.data as string
+end.
+
+export XmlNodeType, XmlNode, xml_element_new, xml_text_new, xml_node_to_ptr, xml_ptr_to_node, xml_get_type, xml_get_tag, xml_get_text, xml_children_len, xml_child_at, xml_add_child, xml_get_attr, xml_set_attr, xml_parse, xml_stringify

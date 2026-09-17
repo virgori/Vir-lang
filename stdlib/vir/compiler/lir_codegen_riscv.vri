@@ -1,0 +1,310 @@
+##
+ * vir/compiler/lir_codegen_riscv.vri — RISC-V 64-bit Machine Code Generator (Pure Vir)
+ * ====================================================================================
+ * Emits pure RV64GC machine code for Linux RISC-V 64 from LIR.
+ *
+ * ABI: RISC-V psABI (RV64)
+ *   Arguments: a0..a7 (x10..x17)
+ *   Return:    a0..a1 (x10..x11)
+ *   Saved:     s0..s11 (x8..x9, x18..x27), sp (x2), ra (x1)
+ *   Temporaries: t0..t6 (x5..x7, x28..x31)
+ *   Syscalls:  a7 (syscall number), a0..a5 (args), ecall
+ ##
+module vir.compiler.lir_codegen_riscv
+
+include types
+include vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt,
+       bvec_new, bvec_push, bvec_get, bvec_set, bvec_len from vec_rt
+include string_rt
+import native_read_i64, native_write_i64, native_read_u8, native_write_u8,
+       fat_str_len, fat_str_eq, fat_str_new, fat_cstr_eq from string_rt
+include compiler.lir
+import LirType, LirOp, LirOperandType, LirOperand, LirInstr, LirBlock, LirFunc,
+       lir_func_id, lir_func_name, lir_func_blocks, lir_func_strings, lir_func_stack_size,
+       lir_block_id, lir_block_instrs,
+       lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_aux,
+       lir_opnd_type, lir_opnd_vreg, lir_opnd_imm_val from compiler.lir
+include compiler.codegen
+import TargetArch, CodeBuf, codebuf_new, codebuf_emit_u32, codebuf_emit_byte,
+       codebuf_offset, codebuf_patch_u32 from compiler.codegen
+
+# ═══════════════════════════════════════════════════════
+# RISC-V Register Numbers
+# ═══════════════════════════════════════════════════════
+const RV_ZERO: int = 0
+const RV_RA:   int = 1
+const RV_SP:   int = 2
+const RV_GP:   int = 3
+const RV_TP:   int = 4
+const RV_T0:   int = 5
+const RV_T1:   int = 6
+const RV_T2:   int = 7
+const RV_S0:   int = 8
+const RV_S1:   int = 9
+const RV_A0:   int = 10
+const RV_A1:   int = 11
+const RV_A2:   int = 12
+const RV_A3:   int = 13
+const RV_A4:   int = 14
+const RV_A5:   int = 15
+const RV_A6:   int = 16
+const RV_A7:   int = 17
+const RV_T3:   int = 28
+const RV_T4:   int = 29
+const RV_T5:   int = 30
+const RV_T6:   int = 31
+
+# ═══════════════════════════════════════════════════════
+# Instruction Encoders
+# ═══════════════════════════════════════════════════════
+
+func rv_encode_r(opcode: int, funct3: int, funct7: int, rd: int, rs1: int, rs2: int):
+    let op = opcode bit_and 0x7F
+    let f3 = (funct3 bit_and 0x7) shl 12
+    let f7 = (funct7 bit_and 0x7F) shl 25
+    let d = (rd bit_and 0x1F) shl 7
+    let s1 = (rs1 bit_and 0x1F) shl 15
+    let s2 = (rs2 bit_and 0x1F) shl 20
+    out f7 bit_or s2 bit_or s1 bit_or f3 bit_or d bit_or op
+end.
+
+func rv_encode_i(opcode: int, funct3: int, rd: int, rs1: int, imm: int):
+    let op = opcode bit_and 0x7F
+    let f3 = (funct3 bit_and 0x7) shl 12
+    let d = (rd bit_and 0x1F) shl 7
+    let s1 = (rs1 bit_and 0x1F) shl 15
+    let im = (imm bit_and 0xFFF) shl 20
+    out im bit_or s1 bit_or f3 bit_or d bit_or op
+end.
+
+func rv_encode_s(opcode: int, funct3: int, rs1: int, rs2: int, imm: int):
+    let op = opcode bit_and 0x7F
+    let f3 = (funct3 bit_and 0x7) shl 12
+    let imm4_0 = (imm bit_and 0x1F) shl 7
+    let s1 = (rs1 bit_and 0x1F) shl 15
+    let s2 = (rs2 bit_and 0x1F) shl 20
+    let imm11_5 = ((imm shr 5) bit_and 0x7F) shl 25
+    out imm11_5 bit_or s2 bit_or s1 bit_or f3 bit_or imm4_0 bit_or op
+end.
+
+func rv_encode_u(opcode: int, rd: int, imm20: int):
+    let op = opcode bit_and 0x7F
+    let d = (rd bit_and 0x1F) shl 7
+    let im = (imm20 bit_and 0xFFFFF) shl 12
+    out im bit_or d bit_or op
+end.
+
+func rv_encode_j(opcode: int, rd: int, imm: int):
+    let op = opcode bit_and 0x7F
+    let d = (rd bit_and 0x1F) shl 7
+    let i20 = ((imm shr 20) bit_and 1) shl 31
+    let i10_1 = ((imm shr 1) bit_and 0x3FF) shl 21
+    let i11 = ((imm shr 11) bit_and 1) shl 20
+    let i19_12 = ((imm shr 12) bit_and 0xFF) shl 12
+    out i20 bit_or i10_1 bit_or i11 bit_or i19_12 bit_or d bit_or op
+end.
+
+# Instructions
+func rv_add(rd: int, rs1: int, rs2: int):  out rv_encode_r(0x33, 0, 0, rd, rs1, rs2) end.
+func rv_sub(rd: int, rs1: int, rs2: int):  out rv_encode_r(0x33, 0, 0x20, rd, rs1, rs2) end.
+func rv_mul(rd: int, rs1: int, rs2: int):  out rv_encode_r(0x33, 0, 1, rd, rs1, rs2) end.
+func rv_div(rd: int, rs1: int, rs2: int):  out rv_encode_r(0x33, 4, 1, rd, rs1, rs2) end.
+func rv_rem(rd: int, rs1: int, rs2: int):  out rv_encode_r(0x33, 6, 1, rd, rs1, rs2) end.
+func rv_and(rd: int, rs1: int, rs2: int):  out rv_encode_r(0x33, 7, 0, rd, rs1, rs2) end.
+func rv_or(rd: int, rs1: int, rs2: int):   out rv_encode_r(0x33, 6, 0, rd, rs1, rs2) end.
+func rv_xor(rd: int, rs1: int, rs2: int):  out rv_encode_r(0x33, 4, 0, rd, rs1, rs2) end.
+
+func rv_addi(rd: int, rs1: int, imm: int): out rv_encode_i(0x13, 0, rd, rs1, imm) end.
+func rv_andi(rd: int, rs1: int, imm: int): out rv_encode_i(0x13, 7, rd, rs1, imm) end.
+func rv_ori(rd: int, rs1: int, imm: int):  out rv_encode_i(0x13, 6, rd, rs1, imm) end.
+func rv_xori(rd: int, rs1: int, imm: int): out rv_encode_i(0x13, 4, rd, rs1, imm) end.
+
+func rv_ld(rd: int, rs1: int, off: int):   out rv_encode_i(0x03, 3, rd, rs1, off) end.
+func rv_lw(rd: int, rs1: int, off: int):   out rv_encode_i(0x03, 2, rd, rs1, off) end.
+func rv_lbu(rd: int, rs1: int, off: int):  out rv_encode_i(0x03, 4, rd, rs1, off) end.
+
+func rv_sd(rs2: int, rs1: int, off: int):  out rv_encode_s(0x23, 3, rs1, rs2, off) end.
+func rv_sw(rs2: int, rs1: int, off: int):  out rv_encode_s(0x23, 2, rs1, rs2, off) end.
+func rv_sb(rs2: int, rs1: int, off: int):  out rv_encode_s(0x23, 0, rs1, rs2, off) end.
+
+func rv_lui(rd: int, imm20: int):          out rv_encode_u(0x37, rd, imm20) end.
+func rv_auipc(rd: int, imm20: int):        out rv_encode_u(0x17, rd, imm20) end.
+func rv_jal(rd: int, imm: int):            out rv_encode_j(0x6F, rd, imm) end.
+func rv_jalr(rd: int, rs1: int, imm: int): out rv_encode_i(0x67, 0, rd, rs1, imm) end.
+func rv_ret():                             out rv_encode_i(0x67, 0, 0, 1, 0) end.
+func rv_ecall():                           out 0x00000073 end.
+
+func rv_emit_li(cb: CodeBuf, rd: int, val: int):
+    if val >= (0 - 2048) and val <= 2047 do
+        cb = codebuf_emit_u32(cb, rv_addi(rd, RV_ZERO, val))
+        out cb
+    end
+    let hi20 = ((val + 0x800) shr 12) bit_and 0xFFFFF
+    let lo12 = val bit_and 0xFFF
+    cb = codebuf_emit_u32(cb, rv_lui(rd, hi20))
+    cb = codebuf_emit_u32(cb, rv_addi(rd, rd, lo12))
+    out cb
+end.
+
+func rv_find_func_index(lir_funcs: i64, name: string):
+    let n = vec_len_rt(lir_funcs)
+    var i = 0
+    when i < n loop
+        let lf = vec_get_rt(lir_funcs, i)
+        if lf != 0 do
+            let fn_name = native_read_i64(lf as i64, 8) as string
+            if (fn_name as i64) != 0 and fat_str_eq(fn_name, name) == 1 do
+                out i
+            end
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+# ═══════════════════════════════════════════════════════
+# Module Emitter
+# ═══════════════════════════════════════════════════════
+
+func emit_lir_module_riscv64(lir_funcs: i64):
+    var cb = codebuf_new(TargetArch.RISCV64)
+    let n_funcs = vec_len_rt(lir_funcs)
+    var func_offs = vec_new_rt()
+
+    # Frame size for local variables (512 bytes)
+    let frame_size = 512
+
+    var fi = 0
+    when fi < n_funcs loop
+        func_offs = vec_push_rt(func_offs, codebuf_offset(cb) as i64)
+        let lf = vec_get_rt(lir_funcs, fi)
+
+        # ── Prologue ──
+        # sd ra, -8(sp)
+        cb = codebuf_emit_u32(cb, rv_sd(RV_RA, RV_SP, 0 - 8))
+        # sd s0, -16(sp)
+        cb = codebuf_emit_u32(cb, rv_sd(RV_S0, RV_SP, 0 - 16))
+        # addi s0, sp, 0
+        cb = codebuf_emit_u32(cb, rv_addi(RV_S0, RV_SP, 0))
+        # addi sp, sp, -frame_size
+        cb = codebuf_emit_u32(cb, rv_addi(RV_SP, RV_SP, 0 - frame_size))
+
+        let blocks = lir_func_blocks(lf)
+        let nb = vec_len_rt(blocks)
+        var bi = 0
+        when bi < nb loop
+            let blk = vec_get_rt(blocks, bi)
+            let instrs = lir_block_instrs(blk)
+            let ni = vec_len_rt(instrs)
+            var ii = 0
+            when ii < ni loop
+                let ins = vec_get_rt(instrs, ii)
+                let op = lir_instr_op(ins)
+                let dst = lir_instr_dst(ins)
+                let s1 = lir_instr_src1(ins)
+                let s2 = lir_instr_src2(ins)
+
+                if op == LirOp.Mov as int do
+                    if lir_opnd_type(s1) == LirOperandType.Imm as int do
+                        cb = rv_emit_li(cb, RV_T0, lir_opnd_imm_val(s1))
+                    eif lir_opnd_type(s1) == LirOperandType.VRegInt as int do
+                        let s1_off = 0 - (32 + (lir_opnd_vreg(s1) * 8))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T0, RV_S0, s1_off))
+                    end
+                    let d_off = 0 - (32 + (lir_opnd_vreg(dst) * 8))
+                    cb = codebuf_emit_u32(cb, rv_sd(RV_T0, RV_S0, d_off))
+
+                eif op == LirOp.Add as int or op == LirOp.Sub as int or op == LirOp.Mul as int or op == LirOp.Div as int do
+                    # Load src1 -> t0
+                    if lir_opnd_type(s1) == LirOperandType.Imm as int do
+                        cb = rv_emit_li(cb, RV_T0, lir_opnd_imm_val(s1))
+                    else
+                        let s1_off = 0 - (32 + (lir_opnd_vreg(s1) * 8))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T0, RV_S0, s1_off))
+                    end
+                    # Load src2 -> t1
+                    if lir_opnd_type(s2) == LirOperandType.Imm as int do
+                        cb = rv_emit_li(cb, RV_T1, lir_opnd_imm_val(s2))
+                    else
+                        let s2_off = 0 - (32 + (lir_opnd_vreg(s2) * 8))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T1, RV_S0, s2_off))
+                    end
+
+                    if op == LirOp.Add as int do
+                        cb = codebuf_emit_u32(cb, rv_add(RV_T2, RV_T0, RV_T1))
+                    eif op == LirOp.Sub as int do
+                        cb = codebuf_emit_u32(cb, rv_sub(RV_T2, RV_T0, RV_T1))
+                    eif op == LirOp.Mul as int do
+                        cb = codebuf_emit_u32(cb, rv_mul(RV_T2, RV_T0, RV_T1))
+                    eif op == LirOp.Div as int do
+                        cb = codebuf_emit_u32(cb, rv_div(RV_T2, RV_T0, RV_T1))
+                    end
+                    let d_off = 0 - (32 + (lir_opnd_vreg(dst) * 8))
+                    cb = codebuf_emit_u32(cb, rv_sd(RV_T2, RV_S0, d_off))
+
+                eif op == LirOp.SetArg as int do
+                    let arg_idx = lir_opnd_imm_val(s1)
+                    if arg_idx >= 0 and arg_idx < 8 do
+                        let arg_reg = RV_A0 + arg_idx
+                        if lir_opnd_type(s2) == LirOperandType.Imm as int do
+                            cb = rv_emit_li(cb, arg_reg, lir_opnd_imm_val(s2))
+                        else
+                            let s2_off = 0 - (32 + (lir_opnd_vreg(s2) * 8))
+                            cb = codebuf_emit_u32(cb, rv_ld(arg_reg, RV_S0, s2_off))
+                        end
+                    end
+
+                eif op == LirOp.Ret as int do
+                    if lir_opnd_type(s1) == LirOperandType.Imm as int do
+                        cb = rv_emit_li(cb, RV_A0, lir_opnd_imm_val(s1))
+                    eif lir_opnd_type(s1) == LirOperandType.VRegInt as int do
+                        let s1_off = 0 - (32 + (lir_opnd_vreg(s1) * 8))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_A0, RV_S0, s1_off))
+                    end
+                    # Epilogue
+                    cb = codebuf_emit_u32(cb, rv_addi(RV_SP, RV_SP, frame_size))
+                    cb = codebuf_emit_u32(cb, rv_ld(RV_S0, RV_SP, 0 - 16))
+                    cb = codebuf_emit_u32(cb, rv_ld(RV_RA, RV_SP, 0 - 8))
+                    cb = codebuf_emit_u32(cb, rv_ret())
+                end
+
+                ii = ii + 1
+            end
+            bi = bi + 1
+        end
+
+        # Fallthrough epilogue if no Ret instruction
+        cb = codebuf_emit_u32(cb, rv_addi(RV_SP, RV_SP, frame_size))
+        cb = codebuf_emit_u32(cb, rv_ld(RV_S0, RV_SP, 0 - 16))
+        cb = codebuf_emit_u32(cb, rv_ld(RV_RA, RV_SP, 0 - 8))
+        cb = codebuf_emit_u32(cb, rv_ret())
+
+        fi = fi + 1
+    end
+
+    # ── Entry point (_start) ──
+    cb.start_offset = codebuf_offset(cb)
+    # addi s0, zero, 0
+    cb = codebuf_emit_u32(cb, rv_addi(RV_S0, RV_ZERO, 0))
+
+    # Call main
+    let main_name = fat_str_new("main")
+    let main_idx = rv_find_func_index(lir_funcs, main_name)
+    if main_idx >= 0 do
+        let main_off = vec_get_rt(func_offs, main_idx) as int
+        let curr_off = codebuf_offset(cb)
+        let rel = main_off - curr_off
+        cb = codebuf_emit_u32(cb, rv_jal(RV_RA, rel))
+    end
+
+    # Exit with code in a0: sys_exit = 93
+    # addi a7, zero, 93
+    cb = codebuf_emit_u32(cb, rv_addi(RV_A7, RV_ZERO, 93))
+    # ecall
+    cb = codebuf_emit_u32(cb, rv_ecall())
+
+    out cb
+end.
+
+export emit_lir_module_riscv64

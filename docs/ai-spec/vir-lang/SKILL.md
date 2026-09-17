@@ -35,6 +35,13 @@ When writing Vir code:
 7. Do not modify the language spec (paths above) unless the user explicitly
    requested a spec change.
 
+## Scalar power
+
+`^` is right-associative. For integer operands, a non-negative exponent
+returns an integer; a negative exponent is valid and returns a binary64
+`float` reciprocal (`2^-3 == 0.125`). Incomplete forms such as `2^` and `2^-`
+are syntax errors.
+
 ## References
 
 - syntax.md — lexical and syntax rules

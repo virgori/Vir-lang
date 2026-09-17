@@ -91,6 +91,9 @@ none
 ## Operators (high-signal)
 
 - Arithmetic: `+` `-` `*` `/` `^` ; remainder is **`mod`** (not `%` — `%` is percent)
+- Power `^` is right-associative. With integer operands, a non-negative
+  exponent returns `int`; a negative exponent is valid and returns the
+  binary64 reciprocal as `float` (`2^-3 == 0.125`).
 - Compare: `==` `!=` `>` `<` `>=` `<=` ; nil-safe `?=` `?=/=`
 - Logic: `&` `||` `!`
 - Bitwise keywords: `and` `or` `xor` `shl` `shr`

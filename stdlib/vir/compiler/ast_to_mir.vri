@@ -211,6 +211,8 @@ var g_scoped_field_is_nested: i64 = 0
 var g_var_type_hash: i64 = 0
 var g_var_type_names: i64 = 0
 var g_var_type_values: i64 = 0
+var g_dict_var_hash: i64 = 0
+var g_dict_var_names: i64 = 0
 
 var g_current_entity_name: i64 = 0
 
@@ -234,6 +236,23 @@ func get_var_type(var_name: string):
         if idx >= 0 do
             out vec_get_rt(g_var_type_values, idx) as string
         end
+    end
+    out 0
+end.
+
+func mark_dict_var(var_name: string):
+    if g_dict_var_hash != 0 and var_name != 0 do
+        if hash_table_lookup(g_dict_var_hash, g_dict_var_names, var_name) < 0 do
+            idx = vec_len_rt(g_dict_var_names)
+            g_dict_var_names = vec_push_rt(g_dict_var_names, var_name as i64)
+            hash_table_insert(g_dict_var_hash, g_dict_var_names, var_name, idx)
+        end
+    end
+end.
+
+func is_known_dict_var(var_name: string):
+    if g_dict_var_hash != 0 and var_name != 0 do
+        if hash_table_lookup(g_dict_var_hash, g_dict_var_names, var_name) >= 0 do out 1 end
     end
     out 0
 end.
@@ -388,14 +407,25 @@ func infer_expr_type_name(node: AstNode):
     if nt == AstType.LiteralNone do out fat_str_new("none") end
     if nt == AstType.EnumConstruct do out ast_node_name2(node) end
     if nt == AstType.LiteralStr or nt == AstType.InterpExpr do out fat_str_new("string") end
+    if nt == AstType.CastExpr do out ast_node_name(node) end
     if nt == AstType.Identifier do
         vt = get_var_type(ast_node_name(node))
         if vt != 0 do out vt end
         out fat_str_new("")
     end
+    if nt == AstType.Call do
+        callee_name = resolve_callee_alias(ast_node_name(node))
+        callee_ast = find_func_ast(callee_name)
+        if (callee_ast as i64) != 0 do
+            ret_t = ast_node_name2(callee_ast)
+            if ret_t != 0 and fat_str_len(ret_t) > 0 do out ret_t end
+        end
+        out fat_str_new("")
+    end
     if nt == AstType.Compare do out fat_str_new("bool") end
     if nt == AstType.BinOp and ast_node_child_count(node) >= 2 do
         op = ast_node_op_of(node)
+        if op == OpType.PowOp and ast_node_int_val(node) == 1 do out fat_str_new("float") end
         if op == OpType.Eq or op == OpType.Ne or op == OpType.Gt or op == OpType.Lt or op == OpType.Ge or op == OpType.Le or op == OpType.SafeEq or op == OpType.SafeNe or op == OpType.Land or op == OpType.Lor do
             out fat_str_new("bool")
         end
@@ -676,6 +706,8 @@ func set_global_prog_ast(ast: AstNode):
     g_var_type_names = vec_new_rt()
     g_var_type_values = vec_new_rt()
     g_var_type_hash = hash_table_new()
+    g_dict_var_names = vec_new_rt()
+    g_dict_var_hash = hash_table_new()
 
     g_current_entity_name = 0
 
@@ -2526,6 +2558,9 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 			if fat_cstr_eq(bin_lt, "float") == 1 or fat_cstr_eq(bin_rt, "float") == 1 do
 				mir_instr_set_type(ins, MirType.F64 as i64)
 			end
+			if mop_i == 28 and ast_node_int_val(expr) == 1 do
+				mir_instr_set_type(ins, MirType.F64 as i64)
+			end
 			if mop_i == 29 or mop_i == 30 do
 				# Semantic pass 6 guarantees known rank-2 operands.  Zero is an
 				# invalid sentinel, never a guessed 2x2 shape.
@@ -3059,7 +3094,9 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 		if bv >= 0 do
 			base = mir_opnd_vreg(bv)
 		end
-		vtype = get_var_type(base_name)
+		if is_known_dict_var(base_name) == 0 do
+			vtype = get_var_type(base_name)
+		end
 		start_idx = 0
 		num_idx = nch
 	else
@@ -3112,7 +3149,7 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 	end
 
 	if base.op_type != MirOperandType.None do
-		if expr_type == AstType.IndexAccess and is_dict_type_name(vtype) == 1 do
+		if expr_type == AstType.IndexAccess and is_known_dict_var(ast_node_name(expr)) == 1 do
 			out lower_dict_index(b_mut, base, flat_opnd, dict_key_is_string(ast_node_child(expr, 0)))
 		end
 		var (b4, dst) = builder_new_vreg(b_mut)
@@ -3226,15 +3263,30 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
  out expr_result(b2, mir_opnd_vreg(dst))
  end
 
-    # 12. CastExpr — identity Move (+ CAST marker for typed backends)
+    # 12. CastExpr — preserve source/destination numeric categories in kind.
  if expr_type == AstType.CastExpr do
  nch = ast_node_child_count(expr)
  if nch > 0 do
- var b2 = lower_expr(b, ast_node_child(expr, 0))
+ var cast_child = ast_node_child(expr, 0)
+ var b2 = lower_expr(b, cast_child)
  var child_opnd = g_lower_expr_result_opnd as MirOperand
  var (b3, dst) = builder_new_vreg(b2)
- b3 = emit_move(b3, dst, child_opnd)
- b3 = emit_intrinsic(b3, MIR_INTR_CAST, mir_opnd_vreg(dst), mir_opnd_vreg(dst))
+ var cast_src_name = infer_expr_type_name(cast_child)
+ var cast_dst_name = ast_node_name(expr)
+ var cast_src_cat = 1
+ var cast_dst_cat = 1
+ var cast_dst_bits = 64
+ var cast_mir_type = MirType.Int64 as i64
+ if fat_cstr_eq(cast_src_name, "float") == 1 or fat_cstr_eq(cast_src_name, "f64") == 1 do cast_src_cat = 2 end
+ if fat_cstr_eq(cast_dst_name, "float") == 1 or fat_cstr_eq(cast_dst_name, "f64") == 1 do
+     cast_dst_cat = 2
+     cast_mir_type = MirType.F64 as i64
+ end
+ if fat_cstr_eq(cast_dst_name, "i8") == 1 do cast_dst_bits = 8; cast_mir_type = MirType.Int8 as i64 end
+ if fat_cstr_eq(cast_dst_name, "i16") == 1 do cast_dst_bits = 16; cast_mir_type = MirType.Int16 as i64 end
+ if fat_cstr_eq(cast_dst_name, "i32") == 1 do cast_dst_bits = 32; cast_mir_type = MirType.Int32 as i64 end
+ var cast_kind = MIR_INTR_CAST + (cast_src_cat shl 8) + (cast_dst_cat shl 16) + (cast_dst_bits shl 24)
+ b3 = emit_intrinsic_typed(b3, cast_kind, mir_opnd_vreg(dst), child_opnd, cast_mir_type)
  out expr_result(b3, mir_opnd_vreg(dst))
  end
  end
@@ -3306,7 +3358,11 @@ func lower_dict_literal(b: MirBuilder, expr: AstNode):
 	n = ast_node_child_count(expr) / 2
 	cap = n + 8
 	if cap < 8 do cap = 8 end
-	b_mut = emit_set_arg(b, 0, mir_opnd_imm(16 + cap * 16))
+	if cap > 256 do cap = 256 end
+	# Reserve backing storage once so growth can keep the dictionary pointer
+	# stable; the header still exposes the smaller logical capacity.
+	var reserved_cap = 256
+	b_mut = emit_set_arg(b, 0, mir_opnd_imm(16 + reserved_cap * 16))
 	var (b_base, base) = builder_new_vreg(b_mut)
 	b_base = emit_intrinsic(b_base, MIR_INTR_BUILTIN, mir_opnd_vreg(base), mir_opnd_imm(3))
 	b_mut = b_base
@@ -3394,10 +3450,14 @@ func lower_dict_store(b: MirBuilder, base: MirOperand, key: MirOperand, val: Mir
 	var (b4, step_id) = builder_add_block(b3)
 	var (b5, append_check_id) = builder_add_block(b4)
 	var (b6, append_id) = builder_add_block(b5)
-	var (b7, end_id) = builder_add_block(b6)
-	b7 = emit_jump(b7, cond_id)
-	b7 = builder_set_current_block(b7, cond_id)
-	var (b_cmp, cmp_v) = builder_new_vreg(b7)
+	var (b7, grow_id) = builder_add_block(b6)
+	var (b8, grow_body_id) = builder_add_block(b7)
+	var (b9, capacity_error_id) = builder_add_block(b8)
+	var (b10, append_body_id) = builder_add_block(b9)
+	var (b11, end_id) = builder_add_block(b10)
+	b11 = emit_jump(b11, cond_id)
+	b11 = builder_set_current_block(b11, cond_id)
+	var (b_cmp, cmp_v) = builder_new_vreg(b11)
 	b_cmp = builder_add_instr(b_cmp, mir_instr_new(MirOp.CmpLt, mir_opnd_vreg(cmp_v), mir_opnd_vreg(i_v), mir_opnd_vreg(len_v)))
 	b_cmp = emit_jump_if_not(b_cmp, mir_opnd_vreg(cmp_v), append_check_id, body_id)
 	b_cmp = builder_set_current_block(b_cmp, body_id)
@@ -3431,8 +3491,18 @@ func lower_dict_store(b: MirBuilder, base: MirOperand, key: MirOperand, val: Mir
 	b_nf = builder_set_current_block(b_nf, append_id)
 	var (b_room, room_v) = builder_new_vreg(b_nf)
 	b_room = builder_add_instr(b_room, mir_instr_new(MirOp.CmpLt, mir_opnd_vreg(room_v), mir_opnd_vreg(len_v), mir_opnd_vreg(cap_v)))
-	var (b_append_body, append_body_id) = builder_add_block(b_room)
-	b_room = emit_jump_if_not(b_room, mir_opnd_vreg(room_v), end_id, append_body_id)
+	b_room = emit_jump_if_not(b_room, mir_opnd_vreg(room_v), grow_id, append_body_id)
+	b_room = builder_set_current_block(b_room, grow_id)
+	var (b_can_grow, can_grow_v) = builder_new_vreg(b_room)
+	b_can_grow = builder_add_instr(b_can_grow, mir_instr_new(MirOp.CmpLt, mir_opnd_vreg(can_grow_v), mir_opnd_vreg(cap_v), mir_opnd_imm(256)))
+	b_can_grow = emit_jump_if_not(b_can_grow, mir_opnd_vreg(can_grow_v), capacity_error_id, grow_body_id)
+	b_can_grow = builder_set_current_block(b_can_grow, grow_body_id)
+	var b_grow = emit_store(b_can_grow, mir_opnd_vreg(cap_addr), mir_opnd_imm(256))
+	b_room = emit_jump(b_grow, append_body_id)
+	b_room = builder_set_current_block(b_room, capacity_error_id)
+	b_room = emit_set_arg(b_room, 0, mir_opnd_imm(70))
+	b_room = emit_intrinsic(b_room, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(18))
+	b_room = emit_jump(b_room, end_id)
 	b_room = builder_set_current_block(b_room, append_body_id)
 	var (b_aoff, append_off) = builder_new_vreg(b_room)
 	b_aoff = builder_add_instr(b_aoff, mir_instr_new(MirOp.Mul, mir_opnd_vreg(append_off), mir_opnd_vreg(len_v), mir_opnd_imm(16)))
@@ -3636,6 +3706,27 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 			expr = ast_node_child(stmt, 0)
 			var b2 = lower_expr(b, expr)
 			var val_opnd = g_lower_expr_result_opnd as MirOperand
+			# Typed declarations perform the numeric coercion promised by the
+			# source type instead of merely relabelling the source bit-pattern.
+			var declared_t = ast_node_name2(stmt)
+			var source_t = infer_expr_type_name(expr)
+			if declared_t != 0 and fat_str_len(declared_t) > 0 do
+				var source_is_float = fat_cstr_eq(source_t, "float") == 1 or fat_cstr_eq(source_t, "f64") == 1
+				var target_is_float = fat_cstr_eq(declared_t, "float") == 1 or fat_cstr_eq(declared_t, "f64") == 1
+				var source_is_int = fat_cstr_eq(source_t, "int") == 1 or fat_cstr_eq(source_t, "i64") == 1
+				var target_is_int = fat_cstr_eq(declared_t, "int") == 1 or fat_cstr_eq(declared_t, "i64") == 1
+				if (source_is_int and target_is_float) or (source_is_float and target_is_int) do
+					var (b_cast, cast_v) = builder_new_vreg(b2)
+					var cast_src_cat = 1
+					var cast_dst_cat = 1
+					var cast_typ = MirType.Int64 as i64
+					if source_is_float do cast_src_cat = 2 end
+					if target_is_float do cast_dst_cat = 2; cast_typ = MirType.F64 as i64 end
+					var cast_kind = MIR_INTR_CAST + (cast_src_cat shl 8) + (cast_dst_cat shl 16)
+					b2 = emit_intrinsic_typed(b_cast, cast_kind, mir_opnd_vreg(cast_v), val_opnd, cast_typ)
+					val_opnd = mir_opnd_vreg(cast_v)
+				end
+			end
 			var (b3, v) = builder_new_vreg(b2)
 			ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), val_opnd, mir_opnd_none())
 			b3 = builder_add_instr(b3, ins)
@@ -3748,6 +3839,9 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 			if var_t != 0 and fat_str_len(var_t) > 0 do
 				set_var_type(ast_node_name(stmt), var_t)
 			end
+			if ast_node_type_of(expr) == AstType.DictLiteral or is_dict_type_name(var_t) == 1 do
+				mark_dict_var(ast_node_name(stmt))
+			end
 			out b3
 		end
 		decl_name = ast_node_name(stmt)
@@ -3804,6 +3898,7 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 			end
 			if expr_nt == AstType.DictLiteral do
 				set_var_type(target_name, fat_str_new("dict"))
+				mark_dict_var(target_name)
 			end
 			if expr_nt == AstType.BinOp and (ast_node_op_of(expr) == OpType.MatMulOp or ast_node_op_of(expr) == OpType.FmaOp) do
 				left_n = ast_node_child(expr, 0)
@@ -3855,6 +3950,27 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		end
 		var b2 = lower_expr(b, expr)
 		var val_opnd = g_lower_expr_result_opnd as MirOperand
+		# Preserve the established type of an assignment target. A numeric
+		# assignment changes representation just like an explicit `as` cast.
+		var assign_target_t = get_var_type(target_name)
+		var assign_source_t = infer_expr_type_name(expr)
+		if assign_target_t != 0 and fat_str_len(assign_target_t) > 0 do
+			var assign_source_float = fat_cstr_eq(assign_source_t, "float") == 1 or fat_cstr_eq(assign_source_t, "f64") == 1
+			var assign_target_float = fat_cstr_eq(assign_target_t, "float") == 1 or fat_cstr_eq(assign_target_t, "f64") == 1
+			var assign_source_int = fat_cstr_eq(assign_source_t, "int") == 1 or fat_cstr_eq(assign_source_t, "i64") == 1
+			var assign_target_int = fat_cstr_eq(assign_target_t, "int") == 1 or fat_cstr_eq(assign_target_t, "i64") == 1
+			if (assign_source_int and assign_target_float) or (assign_source_float and assign_target_int) do
+				var (b_assign_cast, assign_cast_v) = builder_new_vreg(b2)
+				var assign_src_cat = 1
+				var assign_dst_cat = 1
+				var assign_cast_typ = MirType.Int64 as i64
+				if assign_source_float do assign_src_cat = 2 end
+				if assign_target_float do assign_dst_cat = 2; assign_cast_typ = MirType.F64 as i64 end
+				var assign_cast_kind = MIR_INTR_CAST + (assign_src_cat shl 8) + (assign_dst_cat shl 16)
+				b2 = emit_intrinsic_typed(b_assign_cast, assign_cast_kind, mir_opnd_vreg(assign_cast_v), val_opnd, assign_cast_typ)
+				val_opnd = mir_opnd_vreg(assign_cast_v)
+			end
+		end
 		if g_func_ref_param_hash != 0 do
 			ref_idx = hash_table_lookup(g_func_ref_param_hash, g_func_ref_param_names, target_name)
 			if ref_idx >= 0 do
@@ -3884,7 +4000,9 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		if child_count >= 2 do
 			vname = ast_node_name(stmt)
 			bv = get_var_vreg(b, vname)
-			vtype = get_var_type(vname)
+			var is_dict_container = is_known_dict_var(vname)
+			var vtype = fat_str_new("")
+			if is_dict_container == 0 do vtype = get_var_type(vname) end
 			val_expr = ast_node_child(stmt, child_count - 1)
 			if is_tensor_type_str(vtype) and parse_tensor_elem_code(vtype) == 1 do
 				var is_flt_val = false
@@ -3949,8 +4067,12 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 			end
 			var b3 = lower_expr(b_cur, val_expr)
 			var val = g_lower_expr_result_opnd as MirOperand
+			# `lower_expr` is a deep call under register pressure. Reload the
+			# declared container type instead of relying on a caller-held fat
+			# string surviving the call sequence.
+			if is_dict_container == 0 do vtype = get_var_type(vname) end
 			if bv >= 0 do
-				if is_dict_type_name(vtype) == 1 do
+				if is_dict_container == 1 do
 					out lower_dict_store(b3, mir_opnd_vreg(bv), flat_opnd, val, dict_key_is_string(ast_node_child(stmt, 0)))
 				end
 				b3 = emit_set_arg(b3, 0, flat_opnd)
@@ -4535,6 +4657,7 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		var isolate_names = vec_new_rt()
 		var isolate_targets = vec_new_rt()
 		var isolate_working = vec_new_rt()
+		var isolate_revert_values = vec_new_rt()
 		var timeout_immediate = false
 		when ci < nch loop
 			ch = ast_node_child(stmt, ci)
@@ -4632,6 +4755,14 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		if (try_body as i64) != (0 - 1) do
 			b = lower_stmt(b, try_body)
 		end
+		# Capture the last value visible in the attempt before the normal-only
+		# commit path rewires the variable map back to the original target.
+		var iso_capture_i = 0
+		when iso_capture_i < vec_len_rt(isolate_names) loop
+			iso_capture_name = vec_get_rt(isolate_names, iso_capture_i) as string
+			isolate_revert_values = vec_push_rt(isolate_revert_values, get_var_vreg(b, iso_capture_name))
+			iso_capture_i = iso_capture_i + 1
+		end
 		var iso_commit_i = 0
 		when iso_commit_i < vec_len_rt(isolate_targets) loop
 			iso_commit_name = vec_get_rt(isolate_names, iso_commit_i) as string
@@ -4649,11 +4780,16 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		g_try_revert_block = saved_block
 		g_try_parent_err_vreg = saved_err
 		b = builder_set_current_block(b, revert_id)
+		# Keep the attempt's working values visible in `revert`. The snapshot is
+		# restored at try_entry only when `resume retry` branches back there;
+		# normal handler exit / resume revert discards the snapshot.
 		var iso_revert_i = 0
-		when iso_revert_i < vec_len_rt(isolate_targets) loop
+		when iso_revert_i < vec_len_rt(isolate_names) loop
 			iso_revert_name = vec_get_rt(isolate_names, iso_revert_i) as string
-			iso_revert_target = vec_get_rt(isolate_targets, iso_revert_i)
-			b = set_var_vreg(b, iso_revert_name, iso_revert_target)
+			iso_revert_vreg = vec_get_rt(isolate_revert_values, iso_revert_i)
+			if iso_revert_vreg >= 0 do
+				b = set_var_vreg(b, iso_revert_name, iso_revert_vreg)
+			end
 			iso_revert_i = iso_revert_i + 1
 		end
 		if (revert_body as i64) != (0 - 1) do

@@ -79,12 +79,29 @@ of the selected integer type.
 side: `2^3` is canonical and must have exactly the same meaning as `2 ^ 3`.
 It is right-associative: `2^3^2` means `2^(3^2)` and produces `512`.
 
-For integer operands, the exponent must be a non-negative integer.  `x^0` is
-`1`, including when `x` is zero.  Integer overflow follows the language's
-chosen fixed-width wrapping policy; it must not silently become a float,
-pointer, or an uninitialised register.  A negative integer exponent must be
-rejected during semantic checking until a distinct floating-power contract is
-specified.
+For an integer base and integer exponent, the exponent controls the result
+category:
+
+- `x^n` with `n >= 0` produces an integer.  `x^0` is `1`, including when `x`
+  is zero.  Integer overflow follows the language's chosen fixed-width
+  wrapping policy; it must not silently become a float, pointer, or an
+  uninitialised register.
+- `x^n` with `n < 0` produces a `float` and is numerically equivalent to
+  `1.0 / (x^abs(n))`.  The magnitude is evaluated in the floating domain; an
+  overflowing intermediate integer power must not corrupt the result.
+  Negative bases preserve the sign implied by exponent parity, so
+  `(-2)^-3 == -0.125` and `(-2)^-2 == 0.25`.
+- A negative exponent may be written directly (`2^-3`), parenthesized
+  (`2^(-3)`), supplied by a constant, or produced by a constant expression.
+  These forms have identical type and value semantics.
+- `0` raised to a negative exponent follows IEEE-754 division-by-zero
+  behavior and produces positive infinity.  Implementations must handle the
+  full signed exponent range without overflowing while computing its
+  magnitude, including the minimum signed integer exponent.
+
+The result category is determined from the checked exponent, not from source
+spacing.  A grammatically incomplete form such as `2^` or `2^-` remains a
+parser error and is distinct from a valid negative exponent.
 
 `**` remains tensor matrix multiplication only; it must never be used as an
 alternative spelling for scalar power.
@@ -107,9 +124,25 @@ end.
 # EXPECT_END
 ```
 
-Also retain a compile-fail test for `2^-1`, with a stable diagnostic that
-identifies an invalid negative integer exponent.  The test must not execute a
-native binary after the diagnostic.
+Also retain native E2E coverage for negative exponents:
+
+```vir
+# tests/strict_v2/power_negative_e2e.vri
+func main:
+    if 2^-1 != 0.5 do out 1 end
+    if 2^(-3) != 0.125 do out 2 end
+    if (-2)^-3 != -0.125 do out 3 end
+    print 1
+end.
+# EXPECT_START
+# 1
+# EXPECT_END
+```
+
+`power_negative_const_e2e.vri` must additionally cover a negative `const`
+exponent and a negative constant expression.  Parser-negative tests must cover
+`2^`, `^2`, `2^^3`, and `2^-`; none of those malformed forms may reach
+semantic analysis or native execution.
 
 ## 3. Float and integer conversion
 
@@ -317,8 +350,8 @@ location, and confirms that no output binary was created:
 - missing `end.` for a definition and `end` for a statement block (parser);
 - unmatched closing token and an unexpected token after a complete
   expression (parser);
-- malformed `2^` expression (parser), distinct from the semantic rejection
-  of the grammatically valid `2^-1` negative exponent.
+- malformed `2^`, `^2`, `2^^3`, and `2^-` expressions (parser), distinct
+  from the grammatically valid and executable `2^-1` negative exponent.
 
 The harness must run these before semantic/type tests.  A negative-syntax test
 that reaches AST semantic diagnostics is a failing test even if compilation

@@ -1,0 +1,522 @@
+##
+ * vir/net/url.vri — RFC 3986 Compliant URL & URI Parser, Serializer, and Encoder
+ * ==============================================================================
+ * Features:
+ *   - RFC 3986 percent-encoding & percent-decoding
+ *   - Structured URL representation: scheme, host, port, path, query, fragment
+ *   - Typed accessors for compiler ABI safety
+ *   - URL stringification with default port suppression (80 for http, 443 for https)
+ *   - Query string key-value extraction & decoding
+ *   - Strict syntax checking via Result<Url, ParseError>
+ *   - Pure Vir, zero libc dependencies
+ ##
+
+include types
+include result
+include option
+include alloc
+import vir_alloc, vir_free, vir_realloc from alloc
+include vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt
+include vir.data.error
+
+extern func native_read_u8(addr: int, offset: int) -> int
+extern func native_write_u8(addr: int, offset: int, val: int)
+extern func native_read_i64(addr: int, offset: int) -> int
+extern func native_write_i64(addr: int, offset: int, val: int)
+
+# ═══════════════════════════════════════════════════════
+# String Helpers
+# ═══════════════════════════════════════════════════════
+
+func url_str_len(addr: int) -> int:
+    if addr == 0 do out 0 end
+    var i = 0
+    loop
+        if native_read_u8(addr, i) == 0 do out i end
+        i = i + 1
+    end
+    out 0
+end.
+
+func url_str_eq(a: string, b: string) -> bool:
+    let pa = a as int
+    let pb = b as int
+    if pa == pb do out true end
+    if pa == 0 or pb == 0 do out false end
+    var i = 0
+    loop
+        let ca = native_read_u8(pa, i)
+        let cb = native_read_u8(pb, i)
+        if ca != cb do out false end
+        if ca == 0 do out true end
+        i = i + 1
+    end
+    out true
+end.
+
+func url_copy_substr(src: int, start_idx: int, end_idx: int) -> string:
+    let slen = end_idx - start_idx
+    if slen <= 0 do out "" end
+    let buf = vir_alloc(slen + 1)
+    var i = 0
+    when i < slen loop
+        native_write_u8(buf, i, native_read_u8(src, start_idx + i))
+        i = i + 1
+    end
+    native_write_u8(buf, slen, 0)
+    out buf as string
+end.
+
+func url_hex_val(ch: int) -> int:
+    if ch >= 48 and ch <= 57 do out ch - 48 end # '0'..'9'
+    if ch >= 65 and ch <= 70 do out ch - 65 + 10 end # 'A'..'F'
+    if ch >= 97 and ch <= 102 do out ch - 97 + 10 end # 'a'..'f'
+    out 0 - 1
+end.
+
+func url_hex_char(v: int) -> int:
+    if v < 10 do out 48 + v end
+    out 65 + (v - 10)
+end.
+
+# ═══════════════════════════════════════════════════════
+# Percent-Encoding & Decoding (RFC 3986)
+# ═══════════════════════════════════════════════════════
+
+func is_unreserved(ch: int) -> bool:
+    # A-Z, a-z, 0-9, '-', '_', '.', '~'
+    if (ch >= 65 and ch <= 90) or (ch >= 97 and ch <= 122) or (ch >= 48 and ch <= 57) do
+        out true
+    end
+    if ch == 45 or ch == 95 or ch == 46 or ch == 126 do
+        out true
+    end
+    out false
+end.
+
+func url_encode(s: string) -> string:
+    let p = s as int
+    if p == 0 do out "" end
+    let slen = url_str_len(p)
+    if slen == 0 do out "" end
+
+    let cap = slen * 3 + 1
+    let buf = vir_alloc(cap)
+    var dst = 0
+    var i = 0
+
+    when i < slen loop
+        let b = native_read_u8(p, i)
+        if is_unreserved(b) do
+            native_write_u8(buf, dst, b)
+            dst = dst + 1
+        else
+            native_write_u8(buf, dst, 37) # '%'
+            native_write_u8(buf, dst + 1, url_hex_char((b shr 4) bit_and 15))
+            native_write_u8(buf, dst + 2, url_hex_char(b bit_and 15))
+            dst = dst + 3
+        end
+        i = i + 1
+    end
+
+    native_write_u8(buf, dst, 0)
+    out buf as string
+end.
+
+func url_decode_form_mode(s: string, form_mode: bool) -> Result<string, ParseError>:
+    let p = s as int
+    if p == 0 do out Ok("") end
+    let slen = url_str_len(p)
+    if slen == 0 do out Ok("") end
+
+    let buf = vir_alloc(slen + 1)
+    var dst = 0
+    var i = 0
+
+    when i < slen loop
+        let b = native_read_u8(p, i)
+        if b == 37 do # '%'
+            if i + 2 >= slen do
+                out Err(parse_error_new(i, 1, i + 1, "truncated percent-encoded sequence"))
+            end
+            let h1 = url_hex_val(native_read_u8(p, i + 1))
+            let h2 = url_hex_val(native_read_u8(p, i + 2))
+            if h1 < 0 or h2 < 0 do
+                out Err(parse_error_new(i, 1, i + 1, "invalid hex digit in percent-encoded sequence"))
+            end
+            let decoded_byte = (h1 shl 4) bit_or h2
+            native_write_u8(buf, dst, decoded_byte)
+            dst = dst + 1
+            i = i + 3
+        else
+            if form_mode and b == 43 do # '+' -> space in form mode
+                native_write_u8(buf, dst, 32)
+            else
+                native_write_u8(buf, dst, b)
+            end
+            dst = dst + 1
+            i = i + 1
+        end
+    end
+
+    native_write_u8(buf, dst, 0)
+    out Ok(buf as string)
+end.
+
+func url_decode(s: string) -> Result<string, ParseError>:
+    out url_decode_form_mode(s, false)
+end.
+
+func url_decode_form(s: string) -> Result<string, ParseError>:
+    out url_decode_form_mode(s, true)
+end.
+
+# ═══════════════════════════════════════════════════════
+# URL Structure & Accessors
+# ═══════════════════════════════════════════════════════
+
+entity Url:
+    scheme:   string,
+    host:     string,
+    port_num: int,
+    path:     string,
+    query:    string,
+    fragment: string
+end.
+
+func url_get_scheme(u: Url) -> string:
+    out u.scheme
+end.
+
+func url_get_host(u: Url) -> string:
+    out u.host
+end.
+
+func url_get_port(u: Url) -> int:
+    out u.port_num
+end.
+
+func url_get_path(u: Url) -> string:
+    out u.path
+end.
+
+func url_get_query(u: Url) -> string:
+    out u.query
+end.
+
+func url_get_fragment(u: Url) -> string:
+    out u.fragment
+end.
+
+func url_new(scheme: string, host: string, port_num: int, path: string, query: string, fragment: string) -> Url:
+    out Url (
+        scheme: scheme,
+        host: host,
+        port_num: port_num,
+        path: path,
+        query: query,
+        fragment: fragment
+    )
+end.
+
+# ═══════════════════════════════════════════════════════
+# URL Parser (RFC 3986)
+# ═══════════════════════════════════════════════════════
+
+func url_parse(raw_url: string):
+    let p = raw_url as int
+    if p == 0 do
+        out Ok(url_new("", "", 0, "", "", ""))
+    end
+    let slen = url_str_len(p)
+    if slen == 0 do
+        out Ok(url_new("", "", 0, "", "", ""))
+    end
+
+    var pos = 0
+    var scheme = ""
+    var host = ""
+    var port_num = 0
+    var path = ""
+    var query = ""
+    var fragment = ""
+
+    # 1. Check for scheme: alpha *( alpha | digit | "+" | "-" | "." ) ":"
+    var scan = 0
+    var colon_pos = 0 - 1
+    when scan < slen loop
+        let b = native_read_u8(p, scan)
+        if b == 58 do # ':'
+            colon_pos = scan
+            break
+        eif b == 47 or b == 63 or b == 35 do # '/', '?', '#'
+            break
+        end
+        scan = scan + 1
+    end
+
+    if colon_pos > 0 do
+        # Valid scheme must start with alpha
+        let first_b = native_read_u8(p, 0)
+        if (first_b >= 65 and first_b <= 90) or (first_b >= 97 and first_b <= 122) do
+            scheme = url_copy_substr(p, 0, colon_pos)
+            pos = colon_pos + 1
+        end
+    end
+
+    # 2. Check for authority: "//"
+    if pos + 1 < slen and native_read_u8(p, pos) == 47 and native_read_u8(p, pos + 1) == 47 do
+        pos = pos + 2
+        let auth_start = pos
+        # Authority ends at '/', '?', '#', or end of string
+        var auth_end = pos
+        when auth_end < slen loop
+            let b = native_read_u8(p, auth_end)
+            if b == 47 or b == 63 or b == 35 do break end
+            auth_end = auth_end + 1
+        end
+        pos = auth_end
+
+        # Authority: [userinfo@]host[:port]
+        # Skip userinfo if present
+        var host_start = auth_start
+        var at_pos = 0 - 1
+        var ai = auth_start
+        when ai < auth_end loop
+            if native_read_u8(p, ai) == 64 do # '@'
+                at_pos = ai
+                break
+            end
+            ai = ai + 1
+        end
+        if at_pos >= 0 do
+            host_start = at_pos + 1
+        end
+
+        # Find port separator ':' after host
+        var host_end = auth_end
+        var port_colon = 0 - 1
+        var hi = host_start
+        when hi < auth_end loop
+            if native_read_u8(p, hi) == 58 do # ':'
+                port_colon = hi
+                break
+            end
+            hi = hi + 1
+        end
+
+        if port_colon >= 0 do
+            host = url_copy_substr(p, host_start, port_colon)
+            # Parse port
+            var pi = port_colon + 1
+            var port_val = 0
+            when pi < auth_end loop
+                let b = native_read_u8(p, pi)
+                if b >= 48 and b <= 57 do
+                    port_val = port_val * 10 + (b - 48)
+                else
+                    out Err(parse_error_new(pi, 1, pi + 1, "invalid port in URL"))
+                end
+                pi = pi + 1
+            end
+            port_num = port_val
+        else
+            host = url_copy_substr(p, host_start, auth_end)
+            if url_str_eq(scheme, "http") do
+                port_num = 80
+            eif url_str_eq(scheme, "https") do
+                port_num = 443
+            end
+        end
+    end
+
+    # 3. Path: up to '?' or '#' or end of string
+    let path_start = pos
+    var path_end = pos
+    when path_end < slen loop
+        let b = native_read_u8(p, path_end)
+        if b == 63 or b == 35 do break end
+        path_end = path_end + 1
+    end
+    path = url_copy_substr(p, path_start, path_end)
+    pos = path_end
+
+    # 4. Query: starts with '?'
+    if pos < slen and native_read_u8(p, pos) == 63 do # '?'
+        pos = pos + 1
+        let q_start = pos
+        var q_end = pos
+        when q_end < slen loop
+            let b = native_read_u8(p, q_end)
+            if b == 35 do break end # '#'
+            q_end = q_end + 1
+        end
+        query = url_copy_substr(p, q_start, q_end)
+        pos = q_end
+    end
+
+    # 5. Fragment: starts with '#'
+    if pos < slen and native_read_u8(p, pos) == 35 do # '#'
+        pos = pos + 1
+        fragment = url_copy_substr(p, pos, slen)
+    end
+
+    out Ok(url_new(scheme, host, port_num, path, query, fragment))
+end.
+
+# ═══════════════════════════════════════════════════════
+# URL Serializer
+# ═══════════════════════════════════════════════════════
+
+entity UrlBuf:
+    data: int,
+    len: int,
+    cap: int
+end.
+
+func ub_new() -> UrlBuf:
+    let cap = 128
+    let buf = vir_alloc(cap)
+    out UrlBuf ( data: buf, len: 0, cap: cap )
+end.
+
+func ub_append_byte(ub: UrlBuf, b: int):
+    if ub.len + 1 >= ub.cap do
+        ub.cap = ub.cap * 2
+        ub.data = vir_realloc(ub.data, ub.cap)
+    end
+    native_write_u8(ub.data, ub.len, b)
+    ub.len = ub.len + 1
+end.
+
+func ub_append_str(ub: UrlBuf, s: string):
+    let p = s as int
+    if p == 0 do out end
+    let slen = url_str_len(p)
+    var i = 0
+    when i < slen loop
+        ub_append_byte(ub, native_read_u8(p, i))
+        i = i + 1
+    end
+end.
+
+func ub_append_int(ub: UrlBuf, n: int):
+    if n == 0 do
+        ub_append_byte(ub, 48)
+        out
+    end
+    var tmp = n
+    var digits = 0
+    var buf = vir_alloc(20)
+    when tmp > 0 loop
+        native_write_u8(buf, digits, 48 + (tmp mod 10))
+        tmp = tmp / 10
+        digits = digits + 1
+    end
+    var i = digits - 1
+    when i >= 0 loop
+        ub_append_byte(ub, native_read_u8(buf, i))
+        i = i - 1
+    end
+end.
+
+func url_stringify(u: Url) -> string:
+    let ub = ub_new()
+
+    if url_str_len(u.scheme as int) > 0 do
+        ub_append_str(ub, u.scheme)
+        ub_append_str(ub, "://")
+    end
+
+    if url_str_len(u.host as int) > 0 do
+        ub_append_str(ub, u.host)
+        # Append port if not default
+        var show_port = false
+        if u.port_num > 0 do
+            if url_str_eq(u.scheme, "http") and u.port_num != 80 do
+                show_port = true
+            eif url_str_eq(u.scheme, "https") and u.port_num != 443 do
+                show_port = true
+            eif !url_str_eq(u.scheme, "http") and !url_str_eq(u.scheme, "https") do
+                show_port = true
+            end
+        end
+        if show_port do
+            ub_append_byte(ub, 58) # ':'
+            ub_append_int(ub, u.port_num)
+        end
+    end
+
+    if url_str_len(u.path as int) > 0 do
+        ub_append_str(ub, u.path)
+    end
+
+    if url_str_len(u.query as int) > 0 do
+        ub_append_byte(ub, 63) # '?'
+        ub_append_str(ub, u.query)
+    end
+
+    if url_str_len(u.fragment as int) > 0 do
+        ub_append_byte(ub, 35) # '#'
+        ub_append_str(ub, u.fragment)
+    end
+
+    ub_append_byte(ub, 0)
+    out ub.data as string
+end.
+
+# ═══════════════════════════════════════════════════════
+# Query Parameter Extraction
+# ═══════════════════════════════════════════════════════
+
+func url_query_get(query: string, key: string) -> Option<string>:
+    let qp = query as int
+    if qp == 0 do out None end
+    let qlen = url_str_len(qp)
+    if qlen == 0 do out None end
+
+    var pos = 0
+    when pos < qlen loop
+        # Find next '&' or end
+        var pair_end = pos
+        when pair_end < qlen loop
+            if native_read_u8(qp, pair_end) == 38 do break end # '&'
+            pair_end = pair_end + 1
+        end
+
+        # Find '=' within [pos, pair_end)
+        var eq_pos = 0 - 1
+        var si = pos
+        when si < pair_end loop
+            if native_read_u8(qp, si) == 61 do # '='
+                eq_pos = si
+                break
+            end
+            si = si + 1
+        end
+
+        if eq_pos >= 0 do
+            let k = url_copy_substr(qp, pos, eq_pos)
+            if url_str_eq(k, key) do
+                let raw_v = url_copy_substr(qp, eq_pos + 1, pair_end)
+                let r_dec = url_decode_form(raw_v)
+                case r_dec
+                    Ok(val): out Some(val)
+                    Err(_): out Some(raw_v)
+                end
+            end
+        else
+            let k = url_copy_substr(qp, pos, pair_end)
+            if url_str_eq(k, key) do
+                out Some("")
+            end
+        end
+
+        pos = pair_end + 1
+    end
+
+    out None
+end.
+
+export Url, url_new, url_parse, url_stringify, url_encode, url_decode, url_decode_form, url_query_get, url_get_scheme, url_get_host, url_get_port, url_get_path, url_get_query, url_get_fragment
