@@ -1,0 +1,493 @@
+##
+ * vir/data/csv.vri — Strict RFC 4180 CSV Parser & Serializer (Pure Vir, Zero Libc)
+ * ==============================================================================
+ * Features:
+ *   - Full RFC 4180 state machine parser
+ *   - Supports CRLF and LF record separators
+ *   - Proper quoted field parsing with embedded commas, newlines, and "" escapes
+ *   - Rejection of invalid CSV: unclosed quotes, stray characters after quotes
+ *   - Configurable delimiter (comma, tab, semicolon)
+ *   - Two-way serializer with automatic quote escaping
+ ##
+
+include types
+include option
+include result
+include alloc
+import vir_alloc, vir_free, vir_realloc from alloc
+include vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt
+include vir.data.error
+
+extern func native_read_u8(addr: int, offset: int) -> int
+extern func native_write_u8(addr: int, offset: int, val: int)
+extern func native_read_i64(addr: int, offset: int) -> int
+extern func native_write_i64(addr: int, offset: int, val: int)
+
+# ═══════════════════════════════════════════════════════
+# Document & Row Types
+# ═══════════════════════════════════════════════════════
+
+entity CsvRow:
+    fields: int
+end.
+
+entity CsvDocument:
+    rows: int
+end.
+
+func csv_row_new() -> CsvRow:
+    let f = vec_new_rt()
+    out CsvRow ( fields: f )
+end.
+
+func csv_doc_new() -> CsvDocument:
+    let r = vec_new_rt()
+    out CsvDocument ( rows: r )
+end.
+
+func csv_row_add_field(row: CsvRow, field: string):
+    if row.fields != 0 do
+        row.fields = vec_push_rt(row.fields, field as int)
+    end
+end.
+
+func csv_row_len(row: CsvRow) -> int:
+    if row.fields != 0 do
+        out vec_len_rt(row.fields)
+    end
+    out 0
+end.
+
+func csv_row_get(row: CsvRow, idx: int) -> string:
+    if row.fields != 0 do
+        if idx >= 0 and idx < vec_len_rt(row.fields) do
+            let p = vec_get_rt(row.fields, idx)
+            out p as string
+        end
+    end
+    out ""
+end.
+
+func csv_doc_add_row(doc: CsvDocument, row: CsvRow):
+    if doc.rows != 0 do
+        let ptr = vir_alloc(8)
+        native_write_i64(ptr, 0, row.fields)
+        doc.rows = vec_push_rt(doc.rows, ptr)
+    end
+end.
+
+func csv_doc_rows_len(doc: CsvDocument) -> int:
+    if doc.rows != 0 do
+        out vec_len_rt(doc.rows)
+    end
+    out 0
+end.
+
+func csv_doc_get_row(doc: CsvDocument, idx: int) -> CsvRow:
+    if doc.rows != 0 do
+        if idx >= 0 and idx < vec_len_rt(doc.rows) do
+            let ptr = vec_get_rt(doc.rows, idx)
+            let f = native_read_i64(ptr, 0)
+            out CsvRow ( fields: f )
+        end
+    end
+    out csv_row_new()
+end.
+
+# Helper: string length
+func csv_str_len(p: int) -> int:
+    if p == 0 do out 0 end
+    var i = 0
+    when native_read_u8(p, i) != 0 loop
+        i = i + 1
+    end
+    out i
+end.
+
+# ═══════════════════════════════════════════════════════
+# RFC 4180 State Machine Parser
+# ═══════════════════════════════════════════════════════
+
+# States:
+# 0: START_FIELD
+# 1: IN_UNQUOTED
+# 2: IN_QUOTED
+# 3: AFTER_QUOTE
+
+func csv_parse_with_delimiter(text: string, delim: int):
+    let src = text as int
+    if src == 0 do
+        out Ok(csv_doc_new())
+    end
+    let slen = csv_str_len(src)
+    if slen == 0 do
+        out Ok(csv_doc_new())
+    end
+
+    let doc = csv_doc_new()
+    var cur_row = csv_row_new()
+
+    var fbuf_cap = 64
+    var fbuf = vir_alloc(fbuf_cap)
+    var fbuf_len = 0
+
+    var state = 0
+    var pos = 0
+    var line = 1
+    var col = 1
+    var field_start_line = 1
+    var field_start_col = 1
+
+    when pos < slen loop
+        let ch = native_read_u8(src, pos)
+
+        # STATE 0: START_FIELD
+        if state == 0 do
+            field_start_line = line
+            field_start_col = col
+            if ch == 34 do # quote "
+                state = 2 # enter IN_QUOTED
+                pos = pos + 1
+                col = col + 1
+            eif ch == delim do
+                # Empty field
+                native_write_u8(fbuf, 0, 0)
+                csv_row_add_field(cur_row, fbuf as string)
+                fbuf_cap = 64
+                fbuf = vir_alloc(fbuf_cap)
+                fbuf_len = 0
+                pos = pos + 1
+                col = col + 1
+            eif ch == 13 do # CR
+                pos = pos + 1
+                if pos < slen and native_read_u8(src, pos) == 10 do
+                    pos = pos + 1
+                end
+                # Push empty field and end row
+                native_write_u8(fbuf, 0, 0)
+                csv_row_add_field(cur_row, fbuf as string)
+                fbuf_cap = 64
+                fbuf = vir_alloc(fbuf_cap)
+                fbuf_len = 0
+                csv_doc_add_row(doc, cur_row)
+                cur_row = csv_row_new()
+                line = line + 1
+                col = 1
+            eif ch == 10 do # LF
+                pos = pos + 1
+                native_write_u8(fbuf, 0, 0)
+                csv_row_add_field(cur_row, fbuf as string)
+                fbuf_cap = 64
+                fbuf = vir_alloc(fbuf_cap)
+                fbuf_len = 0
+                csv_doc_add_row(doc, cur_row)
+                cur_row = csv_row_new()
+                line = line + 1
+                col = 1
+            else
+                if fbuf_len + 1 >= fbuf_cap do
+                    fbuf_cap = fbuf_cap * 2
+                    fbuf = vir_realloc(fbuf, fbuf_cap)
+                end
+                native_write_u8(fbuf, fbuf_len, ch)
+                fbuf_len = fbuf_len + 1
+                state = 1 # enter IN_UNQUOTED
+                pos = pos + 1
+                col = col + 1
+            end
+
+        # STATE 1: IN_UNQUOTED
+        eif state == 1 do
+            if ch == delim do
+                native_write_u8(fbuf, fbuf_len, 0)
+                csv_row_add_field(cur_row, fbuf as string)
+                fbuf_cap = 64
+                fbuf = vir_alloc(fbuf_cap)
+                fbuf_len = 0
+                state = 0
+                pos = pos + 1
+                col = col + 1
+            eif ch == 13 do # CR
+                pos = pos + 1
+                if pos < slen and native_read_u8(src, pos) == 10 do
+                    pos = pos + 1
+                end
+                native_write_u8(fbuf, fbuf_len, 0)
+                csv_row_add_field(cur_row, fbuf as string)
+                fbuf_cap = 64
+                fbuf = vir_alloc(fbuf_cap)
+                fbuf_len = 0
+                csv_doc_add_row(doc, cur_row)
+                cur_row = csv_row_new()
+                state = 0
+                line = line + 1
+                col = 1
+            eif ch == 10 do # LF
+                pos = pos + 1
+                native_write_u8(fbuf, fbuf_len, 0)
+                csv_row_add_field(cur_row, fbuf as string)
+                fbuf_cap = 64
+                fbuf = vir_alloc(fbuf_cap)
+                fbuf_len = 0
+                csv_doc_add_row(doc, cur_row)
+                cur_row = csv_row_new()
+                state = 0
+                line = line + 1
+                col = 1
+            eif ch == 34 do # Stray quote in unquoted field -> RFC 4180 violation
+                out Err(parse_error_new(pos, line, col, "unescaped quote in unquoted field"))
+            else
+                if fbuf_len + 1 >= fbuf_cap do
+                    fbuf_cap = fbuf_cap * 2
+                    fbuf = vir_realloc(fbuf, fbuf_cap)
+                end
+                native_write_u8(fbuf, fbuf_len, ch)
+                fbuf_len = fbuf_len + 1
+                pos = pos + 1
+                col = col + 1
+            end
+
+        # STATE 2: IN_QUOTED
+        eif state == 2 do
+            if ch == 34 do # quote
+                state = 3 # transition to AFTER_QUOTE
+                pos = pos + 1
+                col = col + 1
+            else
+                if fbuf_len + 1 >= fbuf_cap do
+                    fbuf_cap = fbuf_cap * 2
+                    fbuf = vir_realloc(fbuf, fbuf_cap)
+                end
+                native_write_u8(fbuf, fbuf_len, ch)
+                fbuf_len = fbuf_len + 1
+                pos = pos + 1
+                if ch == 10 do
+                    line = line + 1
+                    col = 1
+                else
+                    col = col + 1
+                end
+            end
+
+        # STATE 3: AFTER_QUOTE
+        eif state == 3 do
+            if ch == 34 do # escaped quote ""
+                if fbuf_len + 1 >= fbuf_cap do
+                    fbuf_cap = fbuf_cap * 2
+                    fbuf = vir_realloc(fbuf, fbuf_cap)
+                end
+                native_write_u8(fbuf, fbuf_len, 34)
+                fbuf_len = fbuf_len + 1
+                state = 2 # back to IN_QUOTED
+                pos = pos + 1
+                col = col + 1
+            eif ch == delim do
+                native_write_u8(fbuf, fbuf_len, 0)
+                csv_row_add_field(cur_row, fbuf as string)
+                fbuf_cap = 64
+                fbuf = vir_alloc(fbuf_cap)
+                fbuf_len = 0
+                state = 0
+                pos = pos + 1
+                col = col + 1
+            eif ch == 13 do # CR
+                pos = pos + 1
+                if pos < slen and native_read_u8(src, pos) == 10 do
+                    pos = pos + 1
+                end
+                native_write_u8(fbuf, fbuf_len, 0)
+                csv_row_add_field(cur_row, fbuf as string)
+                fbuf_cap = 64
+                fbuf = vir_alloc(fbuf_cap)
+                fbuf_len = 0
+                csv_doc_add_row(doc, cur_row)
+                cur_row = csv_row_new()
+                state = 0
+                line = line + 1
+                col = 1
+            eif ch == 10 do # LF
+                pos = pos + 1
+                native_write_u8(fbuf, fbuf_len, 0)
+                csv_row_add_field(cur_row, fbuf as string)
+                fbuf_cap = 64
+                fbuf = vir_alloc(fbuf_cap)
+                fbuf_len = 0
+                csv_doc_add_row(doc, cur_row)
+                cur_row = csv_row_new()
+                state = 0
+                line = line + 1
+                col = 1
+            else
+                out Err(parse_error_new(pos, line, col, "character after closing quote before delimiter"))
+            end
+        end
+    end
+
+    # Handle end of file
+    if state == 2 do
+        out Err(parse_error_new(pos, field_start_line, field_start_col, "unterminated quoted field"))
+    end
+
+    if state == 1 or state == 3 or fbuf_len > 0 do
+        native_write_u8(fbuf, fbuf_len, 0)
+        csv_row_add_field(cur_row, fbuf as string)
+        csv_doc_add_row(doc, cur_row)
+    eif csv_row_len(cur_row) > 0 do
+        csv_doc_add_row(doc, cur_row)
+    end
+
+    out Ok(doc)
+end.
+
+func csv_parse(text: string):
+    out csv_parse_with_delimiter(text, 44) # 44 is comma ","
+end.
+
+# ═══════════════════════════════════════════════════════
+# CSV Serializer
+# ═══════════════════════════════════════════════════════
+
+entity CsvBuf:
+    data: int
+    len: int
+    cap: int
+end.
+
+func cb_new() -> CsvBuf:
+    let cap = 128
+    let buf = vir_alloc(cap)
+    out CsvBuf ( data: buf, len: 0, cap: cap )
+end.
+
+func cb_push_byte(cb: CsvBuf, b: int):
+    if cb.len + 1 >= cb.cap do
+        cb.cap = cb.cap * 2
+        cb.data = vir_realloc(cb.data, cb.cap)
+    end
+    native_write_u8(cb.data, cb.len, b)
+    cb.len = cb.len + 1
+end.
+
+func cb_push_field(cb: CsvBuf, field_str: string, delim: int):
+    let ptr = field_str as int
+    if ptr == 0 do out end
+    let flen = csv_str_len(ptr)
+
+    # Check if escaping is required: contains delim, quote ("), CR, or LF
+    var needs_quote = 0
+    var i = 0
+    when i < flen loop
+        let ch = native_read_u8(ptr, i)
+        if ch == delim or ch == 34 or ch == 13 or ch == 10 do
+            needs_quote = 1
+        end
+        i = i + 1
+    end
+
+    if needs_quote == 1 do
+        cb_push_byte(cb, 34) # opening quote
+        i = 0
+        when i < flen loop
+            let ch = native_read_u8(ptr, i)
+            if ch == 34 do
+                cb_push_byte(cb, 34)
+                cb_push_byte(cb, 34)
+            else
+                cb_push_byte(cb, ch)
+            end
+            i = i + 1
+        end
+        cb_push_byte(cb, 34) # closing quote
+    else
+        i = 0
+        when i < flen loop
+            cb_push_byte(cb, native_read_u8(ptr, i))
+            i = i + 1
+        end
+    end
+end.
+
+func csv_stringify_with_delimiter(doc: CsvDocument, delim: int) -> string:
+    let cb = cb_new()
+    let r_count = csv_doc_rows_len(doc)
+    var row_idx = 0
+    when row_idx < r_count loop
+        let row = csv_doc_get_row(doc, row_idx)
+        let f_count = csv_row_len(row)
+        var col_idx = 0
+        when col_idx < f_count loop
+            let field = csv_row_get(row, col_idx)
+            cb_push_field(cb, field, delim)
+            if col_idx + 1 < f_count do
+                cb_push_byte(cb, delim)
+            end
+            col_idx = col_idx + 1
+        end
+        # RFC 4180 specifies CRLF (\r\n) line breaks
+        cb_push_byte(cb, 13)
+        cb_push_byte(cb, 10)
+        row_idx = row_idx + 1
+    end
+    cb_push_byte(cb, 0)
+    out cb.data as string
+end.
+
+func csv_stringify(doc: CsvDocument) -> string:
+    out csv_stringify_with_delimiter(doc, 44) # comma
+end.
+
+entity CsvNamespace:
+    method read(s):
+        out csv_parse_with_delimiter(s as string, 44)
+    end.
+    method read_delim(s, delim: int):
+        out csv_parse_with_delimiter(s as string, delim)
+    end.
+    method write(doc: CsvDocument) -> string:
+        out csv_stringify_with_delimiter(doc, 44)
+    end.
+    method write_delim(doc: CsvDocument, delim: int) -> string:
+        out csv_stringify_with_delimiter(doc, delim)
+    end.
+    method doc() -> CsvDocument:
+        out csv_doc_new()
+    end.
+    method row() -> CsvRow:
+        out csv_row_new()
+    end.
+    method count(doc: CsvDocument) -> int:
+        out csv_doc_rows_len(doc)
+    end.
+    method size(doc: CsvDocument) -> int:
+        out csv_doc_rows_len(doc)
+    end.
+    method at(doc: CsvDocument, idx: int) -> CsvRow:
+        out csv_doc_get_row(doc, idx)
+    end.
+    method get(doc: CsvDocument, idx: int) -> CsvRow:
+        out csv_doc_get_row(doc, idx)
+    end.
+    method add(doc: CsvDocument, r: CsvRow):
+        csv_doc_add_row(doc, r)
+    end.
+    method push(doc: CsvDocument, r: CsvRow):
+        csv_doc_add_row(doc, r)
+    end.
+    method row_count(r: CsvRow) -> int:
+        out csv_row_len(r)
+    end.
+    method row_at(r: CsvRow, idx: int) -> string:
+        out csv_row_get(r, idx)
+    end.
+    method row_add(r: CsvRow, field: string):
+        csv_row_add_field(r, field)
+    end.
+    method row_push(r: CsvRow, field: string):
+        csv_row_add_field(r, field)
+    end.
+end.
+
+var csv: CsvNamespace
+
+export CsvRow, CsvDocument, CsvNamespace, csv

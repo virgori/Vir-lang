@@ -1468,6 +1468,23 @@ skip         # nhảy sang vòng tiếp theo (thay thế 'continue')
 
 > **Lưu ý:** Dùng `mod` cho số dư. `%` là toán tử phần trăm, không thay cho modulo.
 
+**Quy tắc luỹ thừa vô hướng `^`:**
+
+- `^` kết hợp phải: `2^3^2` được hiểu là `2^(3^2)` và cho kết quả `512`.
+- Với cơ số và số mũ nguyên, số mũ không âm cho kết quả nguyên. `x^0` bằng
+  `1`, kể cả `0^0`. Tràn số tuân theo chính sách wrapping của kiểu nguyên đích.
+- Số mũ âm là hợp lệ và cho kết quả `float` binary64, tương đương
+  `1.0 / (x^abs(n))`. Phần trị được tính trong miền số thực để phép luỹ thừa
+  nguyên trung gian bị tràn không làm sai kết quả.
+- Có thể viết trực tiếp (`2^-3`), có ngoặc (`2^(-3)`), dùng hằng số hoặc biểu
+  thức hằng. Cơ số âm giữ dấu theo tính chẵn/lẻ của số mũ:
+  `(-2)^-3 == -0.125`, `(-2)^-2 == 0.25`.
+- `0` với số mũ âm tạo dương vô cực theo quy tắc chia cho 0 của IEEE-754.
+  Compiler phải xử lý toàn bộ miền số mũ nguyên có dấu, kể cả giá trị nhỏ
+  nhất, mà không bị tràn khi lấy độ lớn.
+- Dạng thiếu toán hạng như `2^`, `^2`, `2^^3` hoặc `2^-` là lỗi cú pháp;
+  chúng không được nhầm với một số mũ âm hợp lệ.
+
 ### 10.2 So sánh
 
 | Toán tử | Mô tả | Ưu tiên |
@@ -3808,6 +3825,7 @@ Từ cao đến thấp:
 
 | Tính năng | v1.2 | v2.0 |
 |-----------|------|------|
+| Luỹ thừa mũ âm | Không có contract chuẩn | `x^-n` hợp lệ và trả về `float` binary64 theo nghịch đảo |
 | UFCS | — | `x.func()` ≡ `func(x)` với từ khoá `this` |
 | Entity method | — | Từ khoá `method` bên trong entity cho hàm gắn kết |
 | Packed entity | — | `packed entity` bố trí liên tiếp |

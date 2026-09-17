@@ -1431,6 +1431,26 @@ skip         # skip to next iteration (replaces 'continue')
 
 > **Note:** Use `mod` for remainder. `%` is the percent operator, not a modulo substitute.
 
+**Scalar power `^` rules:**
+
+- `^` is right-associative: `2^3^2` means `2^(3^2)` and produces `512`.
+- With an integer base and exponent, a non-negative exponent produces an
+  integer. `x^0` is `1`, including `0^0`. Overflow follows the destination
+  integer type's wrapping policy.
+- A negative exponent is valid and produces a binary64 `float`, numerically
+  equivalent to `1.0 / (x^abs(n))`. The magnitude is evaluated in the
+  floating domain so an overflowing intermediate integer power cannot corrupt
+  the result.
+- The exponent may be direct (`2^-3`), parenthesized (`2^(-3)`), a constant,
+  or a constant expression. A negative base preserves the sign implied by
+  exponent parity: `(-2)^-3 == -0.125`, `(-2)^-2 == 0.25`.
+- `0` raised to a negative exponent produces positive infinity under IEEE-754
+  division-by-zero behavior. The compiler must handle the full signed exponent
+  range, including the minimum value, without overflowing while taking its
+  magnitude.
+- Missing-operand forms such as `2^`, `^2`, `2^^3`, and `2^-` are syntax
+  errors; they are not confused with a valid negative exponent.
+
 ### 10.2 Comparison
 
 | Operator | Description | Precedence |
@@ -3778,6 +3798,7 @@ From highest to lowest:
 
 | Feature | v1.2 | v2.0 |
 |---------|------|------|
+| Negative exponentiation | No normative contract | `x^-n` is valid and returns a binary64 reciprocal `float` |
 | UFCS | — | `x.func()` ≡ `func(x)` with `this` keyword |
 | Entity method | — | `method` keyword inside entity for bound functions |
 | Packed entity | — | `packed entity` with contiguous layout |

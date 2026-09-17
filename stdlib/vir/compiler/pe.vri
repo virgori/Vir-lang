@@ -1,0 +1,193 @@
+##
+ * vir/compiler/pe.vri — Windows PE32+ Executable Emitter (Pure Vir)
+ * =================================================================
+ * Emits a complete PE32+ (64-bit Portable Executable) for Windows
+ * x86_64 (AMD64) and Windows ARM64. No external linker or SDK needed.
+ *
+ * Produces a valid Windows 64-bit console executable:
+ *   DOS Header → DOS Stub → PE Signature → COFF Header →
+ *   PE32+ Optional Header → Section Header (.text) → Header Padding →
+ *   .text Section Data (Machine Code)
+ ##
+module vir.compiler.pe
+
+include types
+include vec_rt
+import bvec_new, bvec_push, bvec_push_u16_le, bvec_push_u32_le, bvec_push_u64_le,
+    bvec_len, bvec_get, bvec_set, bvec_data_ptr, bvec_free from vec_rt
+include io
+import write_file_bytes from io
+
+# ═══════════════════════════════════════════════════════
+# PE Constants
+# ═══════════════════════════════════════════════════════
+
+const IMAGE_FILE_MACHINE_AMD64: int = 0x8664
+const IMAGE_FILE_MACHINE_ARM64: int = 0xAA64
+
+const PE_FILE_ALIGN: int = 512
+const PE_SEC_ALIGN:  int = 4096
+
+# ═══════════════════════════════════════════════════════
+# PeBuilder Entity
+# ═══════════════════════════════════════════════════════
+
+entity PeBuilder:
+    buf: int,          # bvec byte buffer
+    arch: int,         # 1=x86_64, 0/3=ARM64
+    text_code: int,    # bvec with machine code
+    entry_offset: int  # offset of entry in .text
+end.
+
+func pe_new(arch: int):
+    out PeBuilder(
+        buf: bvec_new(),
+        arch: arch,
+        text_code: bvec_new(),
+        entry_offset: 0
+    )
+end.
+
+func pe_emit(b: PeBuilder):
+    let code_len = bvec_len(b.text_code)
+    var raw_code_size = ((code_len + PE_FILE_ALIGN - 1) / PE_FILE_ALIGN) * PE_FILE_ALIGN
+    if raw_code_size < 512 do
+        raw_code_size = 512
+    end
+
+    var machine_type = IMAGE_FILE_MACHINE_ARM64
+    if b.arch == 1 do
+        machine_type = IMAGE_FILE_MACHINE_AMD64
+    end
+
+    let entry_rva = PE_SEC_ALIGN + b.entry_offset
+    let image_size = PE_SEC_ALIGN + ((raw_code_size + PE_SEC_ALIGN - 1) / PE_SEC_ALIGN) * PE_SEC_ALIGN
+
+    var buf = bvec_new()
+
+    # ── 1. DOS Header (64 bytes: 0x00 .. 0x3F) ──
+    buf = bvec_push(buf, 0x4D) # 'M'
+    buf = bvec_push(buf, 0x5A) # 'Z'
+    var di = 2
+    when di < 0x3C loop
+        buf = bvec_push(buf, 0)
+        di = di + 1
+    end
+    buf = bvec_push_u32_le(buf, 0x80) # e_lfanew = 0x80
+
+    # ── 2. DOS Stub (64 bytes: 0x40 .. 0x7F) ──
+    var si = 0
+    when si < 64 loop
+        buf = bvec_push(buf, 0)
+        si = si + 1
+    end
+
+    # ── 3. PE Signature (4 bytes at 0x80) ──
+    buf = bvec_push_u32_le(buf, 0x00004550) # "PE\0\0"
+
+    # ── 4. COFF File Header (20 bytes at 0x84) ──
+    buf = bvec_push_u16_le(buf, machine_type)       # Machine
+    buf = bvec_push_u16_le(buf, 1)                  # NumberOfSections = 1 (.text)
+    buf = bvec_push_u32_le(buf, 0)                  # TimeDateStamp
+    buf = bvec_push_u32_le(buf, 0)                  # PointerToSymbolTable
+    buf = bvec_push_u32_le(buf, 0)                  # NumberOfSymbols
+    buf = bvec_push_u16_le(buf, 240)                # SizeOfOptionalHeader = 240 (PE32+)
+    buf = bvec_push_u16_le(buf, 0x0022)             # Characteristics: EXECUTABLE | LARGE_ADDRESS_AWARE
+
+    # ── 5. PE32+ Optional Header (240 bytes at 0x98) ──
+    buf = bvec_push_u16_le(buf, 0x020B)             # Magic: PE32+ (64-bit)
+    buf = bvec_push(buf, 1)                         # MajorLinkerVersion
+    buf = bvec_push(buf, 0)                         # MinorLinkerVersion
+    buf = bvec_push_u32_le(buf, raw_code_size)      # SizeOfCode
+    buf = bvec_push_u32_le(buf, 0)                  # SizeOfInitializedData
+    buf = bvec_push_u32_le(buf, 0)                  # SizeOfUninitializedData
+    buf = bvec_push_u32_le(buf, entry_rva)          # AddressOfEntryPoint
+    buf = bvec_push_u32_le(buf, PE_SEC_ALIGN)       # BaseOfCode (RVA = 0x1000)
+
+    # Windows-Specific Fields
+    buf = bvec_push_u64_le(buf, 0x00400000)         # ImageBase = 0x00400000
+    buf = bvec_push_u32_le(buf, PE_SEC_ALIGN)       # SectionAlignment = 4096
+    buf = bvec_push_u32_le(buf, PE_FILE_ALIGN)      # FileAlignment = 512
+    buf = bvec_push_u16_le(buf, 6)                  # MajorOperatingSystemVersion
+    buf = bvec_push_u16_le(buf, 0)                  # MinorOperatingSystemVersion
+    buf = bvec_push_u16_le(buf, 0)                  # MajorImageVersion
+    buf = bvec_push_u16_le(buf, 0)                  # MinorImageVersion
+    buf = bvec_push_u16_le(buf, 6)                  # MajorSubsystemVersion
+    buf = bvec_push_u16_le(buf, 0)                  # MinorSubsystemVersion
+    buf = bvec_push_u32_le(buf, 0)                  # Win32VersionValue
+    buf = bvec_push_u32_le(buf, image_size)         # SizeOfImage
+    buf = bvec_push_u32_le(buf, PE_FILE_ALIGN)      # SizeOfHeaders = 512
+    buf = bvec_push_u32_le(buf, 0)                  # CheckSum
+    buf = bvec_push_u16_le(buf, 3)                  # Subsystem = IMAGE_SUBSYSTEM_WINDOWS_CUI (Console)
+    buf = bvec_push_u16_le(buf, 0x8160)             # DllCharacteristics: DYNAMIC_BASE | NX_COMPAT | TERMINAL_SERVER
+
+    buf = bvec_push_u64_le(buf, 0x100000)           # SizeOfStackReserve = 1MB
+    buf = bvec_push_u64_le(buf, 0x1000)             # SizeOfStackCommit = 4KB
+    buf = bvec_push_u64_le(buf, 0x100000)           # SizeOfHeapReserve = 1MB
+    buf = bvec_push_u64_le(buf, 0x1000)             # SizeOfHeapCommit = 4KB
+    buf = bvec_push_u32_le(buf, 0)                  # LoaderFlags
+    buf = bvec_push_u32_le(buf, 16)                 # NumberOfRvaAndSizes = 16
+
+    # 16 Data Directories (16 * 8 = 128 bytes zeros)
+    var ddi = 0
+    when ddi < 32 loop
+        buf = bvec_push_u32_le(buf, 0)
+        ddi = ddi + 1
+    end
+
+    # ── 6. Section Header .text (40 bytes at 0x188) ──
+    # Name: ".text\0\0\0"
+    buf = bvec_push(buf, 0x2E) # '.'
+    buf = bvec_push(buf, 0x74) # 't'
+    buf = bvec_push(buf, 0x65) # 'e'
+    buf = bvec_push(buf, 0x78) # 'x'
+    buf = bvec_push(buf, 0x74) # 't'
+    buf = bvec_push(buf, 0)
+    buf = bvec_push(buf, 0)
+    buf = bvec_push(buf, 0)
+
+    buf = bvec_push_u32_le(buf, code_len)           # VirtualSize
+    buf = bvec_push_u32_le(buf, PE_SEC_ALIGN)       # VirtualAddress (RVA = 0x1000)
+    buf = bvec_push_u32_le(buf, raw_code_size)      # SizeOfRawData
+    buf = bvec_push_u32_le(buf, PE_FILE_ALIGN)      # PointerToRawData (file offset 512)
+    buf = bvec_push_u32_le(buf, 0)                  # PointerToRelocations
+    buf = bvec_push_u32_le(buf, 0)                  # PointerToLinenumbers
+    buf = bvec_push_u16_le(buf, 0)                  # NumberOfRelocations
+    buf = bvec_push_u16_le(buf, 0)                  # NumberOfLinenumbers
+    buf = bvec_push_u32_le(buf, 0x60000020)         # Characteristics: CODE | EXECUTE | READ
+
+    # ── 7. Header Padding to 512 bytes (offset 0x1B0 .. 0x1FF = 80 bytes) ──
+    var pi = bvec_len(buf)
+    when pi < PE_FILE_ALIGN loop
+        buf = bvec_push(buf, 0)
+        pi = pi + 1
+    end
+
+    # ── 8. Machine Code at offset 512 ──
+    var ci = 0
+    when ci < code_len loop
+        buf = bvec_push(buf, bvec_get(b.text_code, ci))
+        ci = ci + 1
+    end
+
+    # Pad raw code to raw_code_size
+    var cpi = bvec_len(buf)
+    let target_file_size = PE_FILE_ALIGN + raw_code_size
+    when cpi < target_file_size loop
+        buf = bvec_push(buf, 0)
+        cpi = cpi + 1
+    end
+
+    b.buf = buf
+    out b
+end.
+
+func pe_write_to_file(b: PeBuilder, path: int):
+    b = pe_emit(b)
+    let data = bvec_data_ptr(b.buf)
+    let size = bvec_len(b.buf)
+    write_file_bytes(path, data, size, 0o755)
+    out true
+end.
+
+export PeBuilder, pe_new, pe_emit, pe_write_to_file
