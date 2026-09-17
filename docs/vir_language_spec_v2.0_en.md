@@ -648,11 +648,13 @@ end.
 
 | Property | Behavior |
 |----------|----------|
-| Scope | Block-scoped — freed when `end` is reached |
+| Scope | Block-scoped — at `end`, only non-escaping allocations are reclaimed |
 | Nesting | `arena:` blocks can nest; each has its own bump pointer |
 | Default capacity | Compiler-chosen (e.g. 64KB); resizable via `arena(capacity: 256KB):` |
 | Interaction with `try` | `arena:` inside `try:` is freed before local `revert` runs |
 | Stack variables | Unaffected — only heap-allocated objects (entity, string, array, dict) use the sub-arena |
+| Owned-value escape | Move/assignment/`out` automatically promotes to a parent arena or another sufficiently long-lived region |
+| Borrow escape | Forbidden — `&`/`&mut` may not outlive the owner or source arena |
 
 **With explicit capacity:**
 
@@ -663,7 +665,38 @@ arena(capacity: 1MB):
 end
 ```
 
-**Rule:** Any object allocated inside `arena:` must not escape the block. The compiler emits a diagnostic if a reference to an arena-local object is stored in a variable whose lifetime exceeds the block.
+**Unified escape rule:** `arena:` follows the same ownership and lifetime rules
+as `when`, `loop`, `if`, and ordinary scopes. There is no separate `escape`
+keyword.
+
+- An owned value may escape by being moved into an owner with a longer lifetime
+  or by `out`. The source binding becomes invalid immediately after the move.
+- The compiler must place the allocation directly in the nearest arena that
+  outlives every use. If direct placement cannot be selected, promotion must
+  cover the entire owned object graph; shallow-copying a header before resetting
+  its backing storage is invalid.
+- A borrow (`&` or `&mut`) into sub-arena data may not escape. A raw pointer does
+  not extend lifetime, and retaining one after the source arena resets is invalid.
+- At `end`, the compiler resets/reclaims only non-escaping allocations. For
+  nested arenas, a value is promoted to the nearest ancestor arena satisfying
+  its lifetime; if it later escapes the function, §4.8.5 promotion applies again.
+
+```vir
+func build_result() -> [i32]:
+    var result = [0]
+
+    arena:
+        var temporary = [1, 2, 3]
+        result = temporary          # move; allocation belongs to function arena
+    end                             # sub-arena resets; result remains valid
+
+    out result                      # ownership transfers to caller
+end.
+```
+
+Escape does not extend the lifetime of the entire sub-arena: only the owned
+graph reachable from the moved value is promoted; all remaining temporaries are
+still reclaimed in bulk at `end`.
 
 ### 4.7 Allocator API
 

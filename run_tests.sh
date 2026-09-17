@@ -3,7 +3,7 @@
 # Vir Compiler Self-Hosting Test Suite — Categorized by Spec v2.0 (§1 - §31)
 # ==========================================================================
 # Cách sử dụng:
-#   ./run_tests.sh min     # Bộ test cốt lõi nhanh (85 bài / 31 nhóm)
+#   ./run_tests.sh min     # Bộ test cốt lõi nhanh (31 nhóm)
 #   ./run_tests.sh full    # Toàn bộ test suite (> 400 bài không trùng lặp)
 #   ./run_tests.sh <1..31> # Chạy riêng 1 nhóm cụ thể (ví dụ: ./run_tests.sh 26)
 # Mặc định: min
@@ -168,6 +168,46 @@ run_test_in_group() {
         GP_PASS[$g]=$((GP_PASS[$g]+1))
         TOTAL_PASS=$((TOTAL_PASS+1))
     fi
+}
+
+run_contract_suite_in_group() {
+    local g="$1"
+    local label="$2"
+    local manifest="$3"
+    local fixtures="$4"
+    local target="${5:-macos-arm64}"
+    local suite_out
+    local suite_rc
+    local pass_cnt
+    local fail_cnt
+    local blocked_cnt
+
+    suite_out=$(python3 tools/gap_contract_runner.py \
+        --manifest "$manifest" \
+        --fixtures "$fixtures" \
+        --virc "$VIRC" \
+        --target "$target" 2>&1)
+    suite_rc=$?
+
+    echo "$suite_out" | sed 's/^/  /'
+    pass_cnt=$(echo "$suite_out" | sed -n 's/^[[:space:]]*PASS[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' | tail -1)
+    fail_cnt=$(echo "$suite_out" | sed -n 's/^[[:space:]]*FAIL[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' | tail -1)
+    blocked_cnt=$(echo "$suite_out" | sed -n 's/^[[:space:]]*BLOCKED[[:space:]]*:[[:space:]]*\([0-9][0-9]*\)[[:space:]]*$/\1/p' | tail -1)
+
+    if [ -z "$pass_cnt" ] || [ -z "$fail_cnt" ] || [ -z "$blocked_cnt" ]; then
+        echo "  [FAIL-CONTRACT] $label (không đọc được summary của runner)"
+        fail_cnt=1
+        pass_cnt=0
+        blocked_cnt=0
+    elif [ "$suite_rc" -ne 0 ] && [ "$fail_cnt" -eq 0 ]; then
+        echo "  [FAIL-CONTRACT] $label (runner exit code: $suite_rc)"
+        fail_cnt=1
+    fi
+
+    GP_PASS[$g]=$((GP_PASS[$g] + pass_cnt))
+    GP_FAIL[$g]=$((GP_FAIL[$g] + fail_cnt + blocked_cnt))
+    TOTAL_PASS=$((TOTAL_PASS + pass_cnt))
+    TOTAL_FAIL=$((TOTAL_FAIL + fail_cnt + blocked_cnt))
 }
 
 run_ufcs_mc_target() {
@@ -1451,6 +1491,11 @@ run_group_27() {
         run_test_in_group 27 "tests/test_volatile.vri"
         run_test_in_group 27 "tests/vri/test_intrinsics.vri"
     fi
+    run_contract_suite_in_group 27 \
+        "Memory ownership contract" \
+        "tests/memory_contract/manifest.tsv" \
+        "tests/memory_contract" \
+        "${MEMORY_CONTRACT_TARGET:-macos-arm64}"
     local pass_cnt=${GP_PASS[27]}
     local fail_cnt=${GP_FAIL[27]}
     local total_cnt=$((pass_cnt + fail_cnt))
