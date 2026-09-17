@@ -8739,6 +8739,10 @@ func parse_unary(p: Parser):
     # `&mut expr` shared/mut borrow
     if check(p, TokType.BorrowMut) do
         var (p2, t) = advance(p)
+        if check(p2, TokType.Newline) or check(p2, TokType.Semicolon) or check(p2, TokType.Eof) or check(p2, TokType.End) do
+            p2 = parse_error_at(p2, "[E1004] missing borrow target", t.line)
+            out (p2, ast_new(AstType.AddrOf))
+        end
         var (p3, operand) = parse_unary(p2)
         n = ast_new(AstType.AddrOf)
         n.name = fat_str_new("mut")
@@ -8753,12 +8757,20 @@ func parse_unary(p: Parser):
         # `&mut` may also be two tokens if lexer split — accept MutKw
         if check(p2, TokType.MutKw) do
             var (p2b, _) = advance(p2)
+            if check(p2b, TokType.Newline) or check(p2b, TokType.Semicolon) or check(p2b, TokType.Eof) or check(p2b, TokType.End) do
+                p2b = parse_error_at(p2b, "[E1004] missing borrow target", t.line)
+                out (p2b, ast_new(AstType.AddrOf))
+            end
             var (p3, operand) = parse_unary(p2b)
             n = ast_new(AstType.AddrOf)
             n.name = fat_str_new("mut")
             n.line = t.line
             n = ast_add_child(n, operand)
             out (p3, n)
+        end
+        if check(p2, TokType.Newline) or check(p2, TokType.Semicolon) or check(p2, TokType.Eof) or check(p2, TokType.End) do
+            p2 = parse_error_at(p2, "[E1004] missing borrow target", t.line)
+            out (p2, ast_new(AstType.AddrOf))
         end
         var (p3, operand) = parse_unary(p2)
         n = ast_new(AstType.AddrOf)
@@ -11268,13 +11280,21 @@ func parse_statement(p: Parser):
         eif peek_n(p, 1).tok_type == TokType.LParen do
             ai = p.pos + 2
             adepth = 1
+            var has_colon_before_nl = false
             when ai < p.token_count and adepth > 0 loop
                 atok = vec_get_rt(p.tokens, ai).tok_type
-                if atok == TokType.LParen do adepth = adepth + 1 end
-                if atok == TokType.RParen do adepth = adepth - 1 end
-                ai = ai + 1
+                if atok == TokType.Newline or atok == TokType.Eof do
+                    adepth = 0
+                else
+                    if atok == TokType.Colon do
+                        has_colon_before_nl = true
+                    end
+                    if atok == TokType.LParen do adepth = adepth + 1 end
+                    if atok == TokType.RParen do adepth = adepth - 1 end
+                    ai = ai + 1
+                end
             end
-            if adepth == 0 and ai < p.token_count and vec_get_rt(p.tokens, ai).tok_type == TokType.Colon do
+            if (adepth == 0 and ai < p.token_count and vec_get_rt(p.tokens, ai).tok_type == TokType.Colon) or has_colon_before_nl do
                 arena_header = true
             end
         end
@@ -11302,8 +11322,12 @@ func parse_statement(p: Parser):
                 n = ast_add_child(n, cap_expr)
                 p2 = p_expr
             end
-            var (p_rp, _, _) = expect_tok(p2, TokType.RParen, "expected ')' after arena capacity")
-            p2 = p_rp
+            if not check(p2, TokType.RParen) do
+                p2 = parse_error_at(p2, "[E1007] malformed arena capacity: expected ')' after arena capacity", t.line)
+            else
+                var (p_rp, _) = advance(p2)
+                p2 = p_rp
+            end
         end
         var (p3, _) = match_tok(p2, TokType.Colon)
         p3 = skip_newlines(p3)
@@ -12459,6 +12483,7 @@ func type_common(a: TypeKind, b: TypeKind)
 end.
 
 func is_tensor_type_str(name: string) -> bool:
+    if (name as i64) < 4096 do out false end
     let n_len = fat_str_len(name as int)
     if n_len < 6 do out false end
     let c0 = fat_str_byte_at(name as int, 0)
@@ -19066,7 +19091,11 @@ func pass8_str_is_fat(s: string):
     if pass8_is_packed_ascii_word(s as i64) == 1 do
         out 0
     end
-    let n = native_read_i64(s as i64, 0)
+    let data_ptr = native_read_i64(s as i64, 0)
+    if data_ptr < 4096 do
+        out 0
+    end
+    let n = native_read_i64(s as i64, 8)
     if n >= 0 and n < 1048576 do
         out 1
     end
@@ -19451,19 +19480,8 @@ end.
 
 func pass8_check_arena_escape_assign(diag: DiagnosticEngine, lhs: string, rhs: AstNode,
                                      arena_locals: int, pre_arena_names: int, in_arena: int, line: int):
-    if in_arena == 0 do
-        out 0
-    end
-    if pass8_strlen(lhs) == 0 do
-        out 0
-    end
-    if pass8_vec_contains(pre_arena_names, lhs) == 0 do
-        out 0
-    end
-    if pass8_expr_has_arena_local(rhs, arena_locals, in_arena) == 1 do
-        report_error(diag, 5005, line, 0)
-        out 1
-    end
+    # Owned values may escape by being moved or assigned to a longer-lived owner (Spec §4.5–§4.8.5).
+    # Borrow escapes are tracked and rejected by pass8_check_arena_borrow_escape.
     out 0
 end.
 
@@ -19671,7 +19689,7 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         if pass8_strlen(assign_name) > 0 do
             # Cannot mutate variable while shared borrow is active
             if pass8_borrow_count(shared_borrows, assign_name) > 0 do
-                report_error(diag, 5002, pass8_ast_line(node), 0)
+                report_error(diag, 5009, pass8_ast_line(node), 0)
             end
             # Cannot mutate variable while mutable borrow is held by another reference
             if pass8_borrow_count(mut_borrows, assign_name) > 0 do
@@ -19769,6 +19787,16 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
 
     # 5. Function & Method Calls — by-value arguments transfer ownership.
     if pass8_ast_type(node) == AstType.Call or pass8_ast_type(node) == AstType.MethodCall do
+        # arena_reset while live borrow exists → E5010
+        if pass8_ast_type(node) == AstType.Call do
+            let call_name = pass8_ast_name(node)
+            if pass8_cstr_eq(call_name, "arena_reset") == 1 or pass8_cstr_eq(call_name, "arena_free") == 1 do
+                let total_borrows = pass8_box_len(shared_borrows) + pass8_box_len(mut_borrows)
+                if total_borrows > 0 do
+                    report_error(diag, 5010, pass8_ast_line(node), 0)
+                end
+            end
+        end
         let child_count = vec_len_rt(pass8_ast_children(node))
         var i = 0
         when i < child_count loop
@@ -19789,6 +19817,9 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                 if pass8_is_moved(moved_vars, arg_name) == 1 do
                     report_error(diag, 5001, pass8_ast_line(arg), 0)
                 else
+                    if pass8_borrow_count(shared_borrows, arg_name) > 0 or pass8_borrow_count(mut_borrows, arg_name) > 0 do
+                        report_error(diag, 5008, pass8_ast_line(arg), 0)
+                    end
                     let arg_type = pass8_get_var_type(var_types, arg_name)
                     if arg_type == TypeKind.Array do
                         pass8_mark_moved(moved_vars, arg_name)
@@ -19808,18 +19839,11 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         let child_count = vec_len_rt(pass8_ast_children(node))
         if child_count > 0 do
             let val = vec_get_rt(pass8_ast_children(node), 0)
-            # Check local reference escape
+            # Check local reference escape / arena borrow escape
             if pass8_ast_type(val) == AstType.AddrOf do
                 let tgt = pass8_get_addr_target(val)
-                if pass8_strlen(tgt) > 0 and pass8_vec_contains(func_locals, tgt) == 1 do
-                    report_error(diag, 5007, pass8_ast_line(node), 0)
-                end
-            end
-            if pass8_ast_type(val) == AstType.Identifier do
-                let binding = pass8_box_find(bound_borrows, pass8_ast_name(val))
-                if binding != 0 do
-                    let tgt = borrow_binding_target(binding)
-                    if in_arena == 1 and pass8_vec_contains(arena_locals, tgt) == 1 do
+                if pass8_strlen(tgt) > 0 do
+                    if in_arena == 1 or pass8_vec_contains(arena_locals, tgt) == 1 do
                         report_error(diag, 5005, pass8_ast_line(node), 0)
                     end
                     if pass8_vec_contains(func_locals, tgt) == 1 do
@@ -19827,8 +19851,17 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                     end
                 end
             end
-            if in_arena == 1 and pass8_expr_has_arena_local(val, arena_locals, in_arena) == 1 do
-                report_error(diag, 5005, pass8_ast_line(node), 0)
+            if pass8_ast_type(val) == AstType.Identifier do
+                let binding = pass8_box_find(bound_borrows, pass8_ast_name(val))
+                if binding != 0 do
+                    let tgt = borrow_binding_target(binding)
+                    if in_arena == 1 or pass8_vec_contains(arena_locals, tgt) == 1 do
+                        report_error(diag, 5005, pass8_ast_line(node), 0)
+                    end
+                    if pass8_vec_contains(func_locals, tgt) == 1 do
+                        report_error(diag, 5007, pass8_ast_line(node), 0)
+                    end
+                end
             end
             pass8_walk(symbols, scopes, diag, val, moved_vars, shared_borrows, mut_borrows,
                        bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals)
@@ -19908,8 +19941,10 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         let mut_wm = pass8_box_len(mut_borrows)
         let claimed = pass8_walk_children_stmts(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
                                                 bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals)
-        # Release block-scoped borrows
-        pass8_truncate_to(bound_borrows, bound_wm)
+        # Release block-scoped borrows; keep bound_borrows visible inside arena for escape checks
+        if in_arena == 0 do
+            pass8_truncate_to(bound_borrows, bound_wm)
+        end
         pass8_truncate_to(shared_borrows, shared_wm)
         pass8_truncate_to(mut_borrows, mut_wm)
         scope_pop(scopes)
@@ -20519,11 +20554,12 @@ func pass10_code_to_msg(code: int):
     if code == 5002 or code == 8002 do out "Cannot borrow as mutable while shared borrow is active" end
     if code == 5003 do out "Cannot borrow as mutable more than once (aliasing violation)" end
     if code == 5004 do out "Borrow of moved value" end
-    if code == 5005 or code == 8004 do out "Arena-allocated value escapes its block scope" end
+    if code == 5005 or code == 8004 do out "Arena-allocated value or borrow escapes its block scope" end
     if code == 5006 do out "Cannot borrow as shared while mutable borrow is active" end
     if code == 5007 do out "Reference to local variable escapes function scope" end
     if code == 5008 do out "Cannot move value while active borrow exists" end
     if code == 5009 do out "Cannot mutate variable while shared borrow is active" end
+    if code == 5010 do out "Cannot perform arena_reset while live borrow exists" end
 
     # Fallback
     var sb = sb_new()
@@ -20569,6 +20605,9 @@ func pass10_code_to_causes(code: int):
     if code == 5009 do
         out "• Assignment or modification attempted while shared reference (&) is held\n• Violates shared borrow immutability guarantee"
     end
+    if code == 5010 do
+        out "• Calling arena_reset while a live borrow reference is still held\n• Resetting the arena invalidates existing borrows"
+    end
     if code == 4004 do
         out "• 'break' or 'skip' placed outside 'loop' or 'when ... loop'"
     end
@@ -20611,6 +20650,9 @@ func pass10_code_to_actions(code: int):
     end
     if code == 5009 do
         out "• Complete reading through shared reference before mutating the owner"
+    end
+    if code == 5010 do
+        out "• Release or end the live borrow before calling arena_reset"
     end
     if code == 4004 do
         out "• Enclose statement within an active loop construct"
@@ -25503,6 +25545,9 @@ var g_func_normal_ensure_block: i64 = 0 - 1
 var g_func_ret_vreg: i64 = 0 - 1
 var g_in_func_cleanup: i64 = 0
 
+# Stack of active arena mark vregs for break/continue restore.
+var g_arena_mark_stack: i64 = 0   # Vec<i64> — created lazily
+
 var g_entity_hash: i64 = 0
 var g_import_hash: i64 = 0
 var g_field_hash: i64 = 0
@@ -26638,6 +26683,7 @@ func resolve_callee_alias(callee_name: string):
 end.
 
 func is_entity_name(type_name: string):
+    if (type_name as i64) < 4096 do out 0 end
     out lookup_cached_name(g_entity_names, type_name) >= 0
 end.
 
@@ -27288,6 +27334,7 @@ func ast_node_name2(n: AstNode):
 	out native_read_i64(n as i64, 8) as string
 end.
 func ast_node_type_of(n: AstNode):
+	if (n as i64) == 0 do out 0 as AstType end
 	out native_read_i64(n as i64, 16) as AstType
 end.
 func ast_node_op_of(n: AstNode):
@@ -27923,6 +27970,12 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 			ins = mir_instr_new(m_op, mir_opnd_vreg(dst), opnd_l, opnd_r)
 			var bin_lt = infer_expr_type_name(left)
 			var bin_rt = infer_expr_type_name(right)
+			# String concatenation via + must route to str_cat intrinsic
+			if mop_i == 4 and (fat_cstr_eq(bin_lt, "string") == 1 or fat_cstr_eq(bin_rt, "string") == 1) do
+				b5 = emit_set_arg(b5, 0, opnd_l)
+				b5 = emit_set_arg(b5, 1, opnd_r)
+				out expr_result(emit_intrinsic(b5, MIR_INTR_BUILTIN, mir_opnd_vreg(dst), mir_opnd_imm(11)), mir_opnd_vreg(dst))
+			end
 			if fat_cstr_eq(bin_lt, "float") == 1 or fat_cstr_eq(bin_lt, "f64") == 1 or fat_cstr_eq(bin_rt, "float") == 1 or fat_cstr_eq(bin_rt, "f64") == 1 do
 				mir_instr_set_type(ins, MirType.F64 as i64)
 			end
@@ -28453,7 +28506,7 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 	nch = ast_node_child_count(expr)
 	b_mut = b
 	base = mir_opnd_none()
-	var vtype = ""
+	var vtype = fat_str_new("")
 	var start_idx = 0
 	var num_idx = 0
 	if expr_type == AstType.IndexAccess do
@@ -29261,6 +29314,12 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 					set_var_type(target_name, cname)
 				end
 			end
+			if expr_nt == AstType.Identifier do
+				var src_var_t = get_var_type(ast_node_name(expr))
+				if is_entity_name(src_var_t) == 1 do
+					set_var_type(target_name, src_var_t)
+				end
+			end
 			if expr_nt == AstType.QuantizeExpr do
 				set_var_type(target_name, fat_str_new("QuantizedTensor"))
 			end
@@ -29702,6 +29761,16 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		lt = builder_loop_top(b)
 		brk = loop_target_break_block(lt)
 		if brk >= 0 do
+			# Restore any active arena marks in reverse order before jumping out of the loop
+			if g_arena_mark_stack != 0 do
+				var ams_len = vec_len_rt(g_arena_mark_stack)
+				var ams_i = ams_len - 1
+				when ams_i >= 0 loop
+					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+					b = emit_intrinsic(b, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+					ams_i = ams_i - 1
+				end
+			end
 			out emit_jump(b, brk)
 		end
 		out b
@@ -29710,6 +29779,16 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		lt = builder_loop_top(b)
 		cnt = loop_target_continue_block(lt)
 		if cnt >= 0 do
+			# Restore any active arena marks in reverse order before jumping to continue
+			if g_arena_mark_stack != 0 do
+				var ams_len = vec_len_rt(g_arena_mark_stack)
+				var ams_i = ams_len - 1
+				when ams_i >= 0 loop
+					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+					b = emit_intrinsic(b, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+					ams_i = ams_i - 1
+				end
+			end
 			out emit_jump(b, cnt)
 		end
 		out b
@@ -29995,12 +30074,25 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 	if stmt_type == AstType.ArenaBlock do
 		var (b1, mark_vreg) = builder_new_vreg(b)
 		b1 = emit_intrinsic(b1, MIR_INTR_ARENA, mir_opnd_vreg(mark_vreg), mir_opnd_none())
+		# Push mark onto stack so break/continue can emit arena_reset before jumping out
+		if g_arena_mark_stack == 0 do
+			g_arena_mark_stack = vec_new_rt()
+		end
+		vec_push_rt(g_arena_mark_stack, mark_vreg as i64)
 		n_ch = ast_node_child_count(stmt)
 		if n_ch > 0 do
 			body_idx = n_ch - 1
 			b1 = lower_stmt(b1, ast_node_child(stmt, body_idx))
 		end
-		out emit_intrinsic(b1, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mark_vreg))
+		# Pop the mark stack
+		if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+			vec_pop_rt(g_arena_mark_stack)
+		end
+		# Only emit arena restore if the body did not already terminate (e.g. break, continue)
+		if not builder_current_block_terminated(b1) do
+			b1 = emit_intrinsic(b1, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mark_vreg))
+		end
+		out b1
 	end
 
     # 14b. Emit / Select / Try / Resume / Infer / Train
@@ -30381,6 +30473,7 @@ func ast_lower_func(func_id: int, ast_func: AstNode):
 	g_func_ref_param_vregs = vec_new_rt()
 	g_func_ref_param_modes = vec_new_rt()
 	g_func_ref_param_hash = hash_table_new()
+	g_arena_mark_stack = vec_new_rt()
 
 	# Separate the executable body from function-level cleanup clauses.  Cleanup
 	# gets dedicated CFG blocks so early `out` and `throw` cannot bypass it.

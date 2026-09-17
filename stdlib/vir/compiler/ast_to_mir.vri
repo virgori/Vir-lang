@@ -150,6 +150,10 @@ var g_func_normal_ensure_block: i64 = 0 - 1
 var g_func_ret_vreg: i64 = 0 - 1
 var g_in_func_cleanup: i64 = 0
 
+# Stack of active arena mark vregs for break/continue restore.
+# Each entry is the vreg representing the arena watermark for that arena block.
+var g_arena_mark_stack: i64 = 0   # Vec<i64> — created lazily
+
 var g_entity_hash: i64 = 0
 var g_import_hash: i64 = 0
 var g_field_hash: i64 = 0
@@ -1285,6 +1289,7 @@ func resolve_callee_alias(callee_name: string):
 end.
 
 func is_entity_name(type_name: string):
+    if (type_name as i64) < 4096 do out 0 end
     out lookup_cached_name(g_entity_names, type_name) >= 0
 end.
 
@@ -1935,6 +1940,7 @@ func ast_node_name2(n: AstNode):
 	out native_read_i64(n as i64, 8) as string
 end.
 func ast_node_type_of(n: AstNode):
+	if (n as i64) == 0 do out 0 as AstType end
 	out native_read_i64(n as i64, 16) as AstType
 end.
 func ast_node_op_of(n: AstNode):
@@ -2566,10 +2572,17 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 			if mop_i == 28 do m_op = MirOp.Pow end
 			if mop_i == 29 do m_op = MirOp.MatMul end
 			if mop_i == 30 do m_op = MirOp.Fma end
-			if mop_i == 4 do m_op = MirOp.Add end
-			ins = mir_instr_new(m_op, mir_opnd_vreg(dst), opnd_l, opnd_r)
 			var bin_lt = infer_expr_type_name(left)
 			var bin_rt = infer_expr_type_name(right)
+			if mop_i == 4 and (fat_cstr_eq(bin_lt, "string") == 1 or fat_cstr_eq(bin_rt, "string") == 1) do
+				b5 = emit_set_arg(b5, 0, opnd_l)
+				b5 = emit_set_arg(b5, 1, opnd_r)
+				var (b_cat, res_v) = builder_new_vreg(b5)
+				b_cat = emit_intrinsic(b_cat, MIR_INTR_BUILTIN, mir_opnd_vreg(res_v), mir_opnd_imm(11))
+				out expr_result(b_cat, mir_opnd_vreg(res_v))
+			end
+			if mop_i == 4 do m_op = MirOp.Add end
+			ins = mir_instr_new(m_op, mir_opnd_vreg(dst), opnd_l, opnd_r)
 			if fat_cstr_eq(bin_lt, "float") == 1 or fat_cstr_eq(bin_lt, "f64") == 1 or fat_cstr_eq(bin_rt, "float") == 1 or fat_cstr_eq(bin_rt, "f64") == 1 do
 				mir_instr_set_type(ins, MirType.F64 as i64)
 			end
@@ -3100,7 +3113,7 @@ func lower_expr_impl(b: MirBuilder, expr: AstNode):
 	nch = ast_node_child_count(expr)
 	b_mut = b
 	base = mir_opnd_none()
-	var vtype = ""
+	var vtype = fat_str_new("")
 	var start_idx = 0
 	var num_idx = 0
 	if expr_type == AstType.IndexAccess do
@@ -3908,6 +3921,12 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 					set_var_type(target_name, cname)
 				end
 			end
+			if expr_nt == AstType.Identifier do
+				var src_var_t = get_var_type(ast_node_name(expr))
+				if is_entity_name(src_var_t) == 1 do
+					set_var_type(target_name, src_var_t)
+				end
+			end
 			if expr_nt == AstType.QuantizeExpr do
 				set_var_type(target_name, fat_str_new("QuantizedTensor"))
 			end
@@ -4350,6 +4369,16 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		lt = builder_loop_top(b)
 		brk = loop_target_break_block(lt)
 		if brk >= 0 do
+			# Restore any active arena marks in reverse order before jumping out of the loop
+			if g_arena_mark_stack != 0 do
+				var ams_len = vec_len_rt(g_arena_mark_stack)
+				var ams_i = ams_len - 1
+				when ams_i >= 0 loop
+					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+					b = emit_intrinsic(b, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+					ams_i = ams_i - 1
+				end
+			end
 			out emit_jump(b, brk)
 		end
 		out b
@@ -4358,6 +4387,16 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		lt = builder_loop_top(b)
 		cnt = loop_target_continue_block(lt)
 		if cnt >= 0 do
+			# Restore any active arena marks in reverse order before jumping to continue
+			if g_arena_mark_stack != 0 do
+				var ams_len = vec_len_rt(g_arena_mark_stack)
+				var ams_i = ams_len - 1
+				when ams_i >= 0 loop
+					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+					b = emit_intrinsic(b, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+					ams_i = ams_i - 1
+				end
+			end
 			out emit_jump(b, cnt)
 		end
 		out b
@@ -4643,12 +4682,25 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 	if stmt_type == AstType.ArenaBlock do
 		var (b1, mark_vreg) = builder_new_vreg(b)
 		b1 = emit_intrinsic(b1, MIR_INTR_ARENA, mir_opnd_vreg(mark_vreg), mir_opnd_none())
+		# Push mark_vreg onto the arena mark stack so break/continue can restore it
+		if g_arena_mark_stack == 0 do
+			g_arena_mark_stack = vec_new_rt()
+		end
+		g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, mark_vreg)
 		n_ch = ast_node_child_count(stmt)
 		if n_ch > 0 do
 			body_idx = n_ch - 1
 			b1 = lower_stmt(b1, ast_node_child(stmt, body_idx))
 		end
-		out emit_intrinsic(b1, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mark_vreg))
+		# Pop the mark stack
+		if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+			vec_pop_rt(g_arena_mark_stack)
+		end
+		# Only emit arena restore if the body did not already terminate (e.g. break, continue)
+		if not builder_current_block_terminated(b1) do
+			b1 = emit_intrinsic(b1, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mark_vreg))
+		end
+		out b1
 	end
 
     # 14b. Emit / Select / Try / Resume / Infer / Train
@@ -5029,6 +5081,7 @@ func ast_lower_func(func_id: int, ast_func: AstNode):
 	g_func_ref_param_vregs = vec_new_rt()
 	g_func_ref_param_modes = vec_new_rt()
 	g_func_ref_param_hash = hash_table_new()
+	g_arena_mark_stack = vec_new_rt()
 
 	# Separate the executable body from function-level cleanup clauses.  Cleanup
 	# gets dedicated CFG blocks so early `out` and `throw` cannot bypass it.

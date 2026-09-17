@@ -87,6 +87,13 @@ when active loop
 end
 ```
 
+`arena:` uses the same escape rules as ordinary control scopes. Moving an owned
+value into a longer-lived owner, or returning it with `out`, makes the compiler
+promote its complete owned graph to the nearest region with sufficient lifetime.
+The source binding is invalid after the move. Borrows (`&`/`&mut`) may not
+escape, and a raw pointer does not extend lifetime. At `end`, only non-escaping
+allocations are reclaimed; there is no separate `escape` keyword.
+
 ## Agent checklist
 
 - [ ] No `while` / `elif` / `continue` / braces

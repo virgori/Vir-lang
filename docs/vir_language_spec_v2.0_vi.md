@@ -640,11 +640,13 @@ end.
 
 | Thuộc tính | Hành vi |
 |----------|----------|
-| Phạm vi | Block-scoped — giải phóng khi gặp `end` |
+| Phạm vi | Block-scoped — khi gặp `end`, chỉ các cấp phát không escape mới bị thu hồi |
 | Lồng nhau | `arena:` có thể lồng; mỗi khối có bump pointer riêng |
 | Dung lượng mặc định | Compiler chọn (vd. 64KB); tuỳ chỉnh qua `arena(capacity: 256KB):` |
 | Tương tác với `try` | `arena:` trong `try:` được giải phóng trước khi `revert` cục bộ chạy |
 | Biến stack | Không ảnh hưởng — chỉ đối tượng heap (entity, string, array, dict) dùng sub-arena |
+| Escape owned value | Move/assignment/`out` tự động promote tới arena cha hoặc vùng sống đủ lâu |
+| Escape borrow | Cấm — `&`/`&mut` không được sống lâu hơn owner hoặc arena nguồn |
 
 **Với dung lượng tường minh:**
 
@@ -655,7 +657,37 @@ arena(capacity: 1MB):
 end
 ```
 
-**Quy tắc:** Đối tượng cấp phát trong `arena:` không được thoát ra ngoài khối. Compiler phát cảnh báo nếu tham chiếu đến đối tượng arena-local được lưu vào biến có thời gian sống vượt quá khối.
+**Quy tắc escape thống nhất:** `arena:` dùng cùng luật ownership/lifetime như
+`when`, `loop`, `if` và các scope thông thường. Không có keyword `escape` riêng.
+
+- Owned value được phép thoát bằng move vào owner có lifetime dài hơn hoặc bằng
+  `out`. Source binding trở nên không hợp lệ ngay sau move.
+- Compiler phải đặt allocation trực tiếp vào arena gần nhất sống đủ lâu. Nếu
+  không thể quyết định placement trực tiếp, promotion phải bao phủ toàn bộ
+  owned object graph; không được shallow-copy header rồi reset backing storage.
+- Borrow `&`/`&mut` tới dữ liệu của sub-arena không được escape. Raw pointer
+  không kéo dài lifetime và giữ raw pointer sau khi arena nguồn reset là không
+  hợp lệ.
+- Khi gặp `end`, compiler chỉ reset/reclaim các allocation không escape. Với
+  arena lồng nhau, value được promote tới arena tổ tiên gần nhất thỏa lifetime;
+  nếu tiếp tục thoát function thì áp dụng promotion tiếp theo theo §4.8.5.
+
+```vir
+func build_result() -> [i32]:
+    var result = [0]
+
+    arena:
+        var temporary = [1, 2, 3]
+        result = temporary          # move; allocation thuộc arena của function
+    end                             # sub-arena reset; result vẫn hợp lệ
+
+    out result                      # ownership chuyển cho caller
+end.
+```
+
+Escape không biến toàn bộ sub-arena thành sống lâu: chỉ owned graph reachable
+từ value đã move được promote; các allocation tạm còn lại vẫn được thu hồi hàng
+loạt tại `end`.
 
 ### 4.7 Allocator API
 

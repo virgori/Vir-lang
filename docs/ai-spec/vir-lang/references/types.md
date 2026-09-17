@@ -166,8 +166,13 @@ arena(capacity: 256KB):
 end
 ```
 
-- **Quy tắc an toàn (Escape Prevention Rule)**:
-  Đối tượng được cấp phát bên trong `arena:` không được phép thoát (escape) hoặc gán cho các biến có thời gian sống (lifetime) vượt ra ngoài khối `arena:`.
+- **Quy tắc escape thống nhất**:
+  `arena:` tuân theo cùng luật ownership/lifetime như `when`, `loop` và scope
+  thông thường. Owned value có thể move vào owner sống lâu hơn hoặc đi qua
+  `out`; compiler promote toàn bộ owned graph tới arena gần nhất thỏa lifetime.
+  Binding nguồn bị invalid sau move. Borrow `&`/`&mut` không được escape và raw
+  pointer không kéo dài lifetime. Tại `end`, chỉ allocation không escape bị
+  reset/reclaim. Không có keyword `escape` riêng.
 
 - **API Arena cấp thấp (Low-level Arena APIs)**:
   - `arena_alloc(size)`: Cấp phát từ arena hiện tại.

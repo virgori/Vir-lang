@@ -46,6 +46,36 @@ Verify allocation elimination in generated IR or machine code for the exact buil
 
 `sem_pass8_borrow.vri` is the compiler's borrow-analysis pass. Its existence does not establish complete pointer-provenance tracking or universal detection of double-free and use-after-free. Document guarantees only for cases supported and exercised by regression tests, particularly around raw pointers, casts, foreign calls, and explicit allocator operations.
 
+### 2.3. Lexical-scope and sub-arena escape
+
+The language contract applies one ownership/lifetime rule to ordinary control
+scopes (`if`, `when`, `loop`, and `for`) and explicit `arena:` blocks. No
+separate `escape` keyword is required:
+
+- Moving an owned value into an owner that outlives the current scope, or
+  returning it with `out`, is an escape.
+- The compiler assigns the allocation to the nearest enclosing arena or other
+  region that outlives every use. An implementation should select that region
+  before code generation instead of allocating in the child arena and copying
+  later.
+- Promotion covers the complete reachable owned graph. Copying only an array,
+  string, entity, or dictionary header while leaving its backing storage in the
+  child arena is invalid.
+- The source binding is invalid after the move. Borrows (`&` and `&mut`) may not
+  outlive the source owner/arena. Raw pointers do not extend lifetime.
+- Scope exit resets only non-escaping allocations. Escaping one value does not
+  retain the entire child arena.
+
+For nested arenas, promotion targets the nearest ancestor region satisfying the
+required lifetime. A value that later crosses a function or task boundary may
+require a second promotion under the target's ownership and synchronization
+rules.
+
+This is a language/backend requirement, not a claim that every current backend
+already implements complete graph promotion. Until validated by positive,
+negative, nested-graph, early-exit, and mutation tests, incomplete promotion must
+be treated as unsupported rather than implemented with a shallow copy.
+
 ---
 
 ## 3. Runtime Allocator Architecture
@@ -85,6 +115,13 @@ base → [allocated, aligned ranges][remaining capacity] ← base + capacity
 - **`arena_destroy(arena)`** releases the backing mapping. It is independent of the number of objects allocated inside a single arena, but `munmap` has kernel and virtual-memory costs. It is not a constant-cycle operation. A future arena with multiple segments must also account for those segments.
 
 Before reset or destruction, finish all uses of the arena's objects and release any non-memory resources they own. Releasing an arena does not automatically close file descriptors or perform arbitrary per-object cleanup.
+
+For compiler-managed lexical/sub-arenas, escape analysis must place or promote
+escaping owned graphs before the child watermark is restored. Consequently,
+reset invalidates all allocations that remain in that arena, while promoted
+values continue under their destination owner's lifetime. Manually calling
+`arena_reset` on an explicit low-level arena handle does not perform promotion;
+the caller must ensure that no live value or pointer still refers to it.
 
 A request can allocate a 1 KiB input buffer and a 4 KiB parse workspace from the same arena, check both allocation results, use them, and destroy the arena when the request finishes. This expresses the intended lifetime without promising that the entire operation has constant latency.
 

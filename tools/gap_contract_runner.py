@@ -138,6 +138,10 @@ def check_compile_fail_oracle(oracle: str, compile_output: str) -> tuple[bool, s
     m_contains = re.search(r"diagnostic contains (.+)", oracle, re.IGNORECASE)
     if m_contains:
         spec = m_contains.group(1).strip()
+        # Strip semicolon-separated directives (e.g. "; no artifact") — those are
+        # checked separately (artifact existence) and are not keyword search terms.
+        if ";" in spec:
+            spec = spec[: spec.index(";")].strip()
         terms = [t.strip().lower() for t in spec.split(" and ")]
         for term in terms:
             if "/" in term:
@@ -465,8 +469,10 @@ def main() -> int:
 
     print(f"==================================================")
     print(f"  Vir Spec Gap Contract Runner")
-    print(f"  Manifest : {args.manifest.relative_to(ROOT)}")
-    print(f"  Compiler : {args.virc.relative_to(ROOT) if args.virc.is_relative_to(ROOT) else args.virc}")
+    manifest_rel = args.manifest.resolve().relative_to(ROOT) if args.manifest.resolve().is_relative_to(ROOT) else args.manifest
+    virc_rel = args.virc.resolve().relative_to(ROOT) if args.virc.resolve().is_relative_to(ROOT) else args.virc
+    print(f"  Manifest : {manifest_rel}")
+    print(f"  Compiler : {virc_rel}")
     print(f"  Target   : {args.target}")
     print(f"  Total    : {len(entries)} tests")
     print(f"==================================================\n")
