@@ -438,7 +438,7 @@ def main() -> int:
     parser.add_argument("--fixtures", type=Path, default=DEFAULT_FIXTURES_DIR, help="Fixtures directory")
     parser.add_argument("--virc", type=Path, default=ROOT / "bin/virc", help="Path to virc compiler")
     parser.add_argument("--target", type=str, default="macos-arm64", help="Target architecture")
-    parser.add_argument("--save-baseline", type=Path, default=DEFAULT_BASELINE, help="Path to save baseline TSV")
+    parser.add_argument("--save-baseline", type=Path, default=None, help="Path to save baseline TSV")
     parser.add_argument("--filter", type=str, default="", help="Regex filter by test ID")
     parser.add_argument("--group", type=str, default="", help="Filter by group/phase (e.g. Phase1)")
     parser.add_argument("--timeout", type=float, default=5.0, help="Execution timeout in seconds")
