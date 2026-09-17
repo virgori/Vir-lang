@@ -22,14 +22,12 @@ since 2.9.0.
 ## Release artifacts
 
 - `virc-3.2.0-macos-arm64`: promoted, self-hosted Apple Silicon compiler.
-- `virc-3.2.0-linux-arm64`: static Linux AArch64 compiler.
-- `virc-3.2.0-linux-x86_64`: static Linux x86-64 compiler.
-- `virc-3.2.0-linux-riscv64`: static Linux RISC-V 64 compiler.
 
-The release workflow executes a two-level smoke gate for every Linux artifact:
-each compiler must compile the arithmetic smoke program for its own target, and
-the resulting program must execute with the expected output. Non-native Linux
-architectures run under QEMU.
+Linux AArch64, x86-64, and RISC-V 64 compiler artifacts are not shipped in
+3.2.0. Cross-compilation can produce ELF files for those targets, but the
+Linux x86-64 compiler does not yet pass the required self-execution smoke gate.
+Vir does not label cross-target compiler artifacts as supported until the
+compiler and its generated program both execute with the expected output.
 
 The compiler-sized `wasm32-wasi-p1` artifact is not shipped in 3.2.0. The Wasm
 backend rejects control-flow used by the full compiler with
@@ -40,13 +38,6 @@ binary.
 
 - macOS ARM64 SHA-256:
   `3e06dae92c9aabfa08a2389cfbf520919dd32fc1e86a401685c6984c95858109`
-- Linux ARM64 SHA-256:
-  `b63a97448e5045c79118b784c9e6038868c3b2ccd9ec1602f4346f6e18472473`
-- Linux x86-64 SHA-256:
-  `a7c0c1a8ba857fc07c51f0c2ce225299ace9cc7af07f11ce20b4e7202139e0f4`
-- Linux RISC-V 64 SHA-256:
-  `72bb5b044322a9eb1ec0cc51fcc205a0d3af3d04c412a469341f4e357b5f8363`
-
 The macOS binary matches the signed Stage 2/Stage 3 fixed-point hash. The
 read-only filesystem freeze contains its originating Git commit and per-file
 checksums in `MANIFEST.json` and `SHA256SUMS`.
