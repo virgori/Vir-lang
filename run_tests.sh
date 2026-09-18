@@ -69,6 +69,12 @@ run_test_in_group() {
     expected_member=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC_MEMBER:[[:space:]]*//p' "$test" | head -1)
     local expected_receiver
     expected_receiver=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC_RECEIVER:[[:space:]]*//p' "$test" | head -1)
+    local expected_cause
+    expected_cause=$(sed -n 's/^#[[:space:]]*EXPECT_CAUSE:[[:space:]]*//p' "$test" | head -1)
+    local expected_action
+    expected_action=$(sed -n 's/^#[[:space:]]*EXPECT_ACTION:[[:space:]]*//p' "$test" | head -1)
+    local expected_compile_fail
+    expected_compile_fail=$(sed -n 's/^#[[:space:]]*EXPECT_COMPILE_FAIL:[[:space:]]*//p' "$test" | head -1)
 
     # Negative test (compile rejection expected)
     if [[ "$test" == *_rejected.vri ]] || [[ "$test" == *_rejected_*.vri ]] || [[ "$test" == *_negative.vri ]]; then
@@ -87,6 +93,18 @@ run_test_in_group() {
                 fail_reason="kỳ vọng diagnostic member: $expected_member"
             elif [ -n "$expected_receiver" ] && ! grep -Fq "$expected_receiver" <<<"$reject_out"; then
                 fail_reason="kỳ vọng diagnostic receiver: $expected_receiver"
+            elif [ -n "$expected_cause" ] && ! grep -Fq "$expected_cause" <<<"$reject_out"; then
+                fail_reason="kỳ vọng diagnostic cause: $expected_cause"
+            elif [ -n "$expected_action" ] && ! grep -Fq "$expected_action" <<<"$reject_out"; then
+                fail_reason="kỳ vọng diagnostic action: $expected_action"
+            elif [ -n "$expected_compile_fail" ]; then
+                IFS=' ' read -r -a words <<< "$expected_compile_fail"
+                for word in "${words[@]}"; do
+                    if [ "$word" != "and" ] && ! grep -q -i -F "$word" <<< "$reject_out"; then
+                        fail_reason="kỳ vọng nội dung lỗi chứa: $word"
+                        break
+                    fi
+                done
             fi
 
             if [ -n "$fail_reason" ]; then
@@ -467,6 +485,19 @@ run_group_4() {
         run_test_in_group 4 "tests/strict_v2/float_i16_cast_range_trap_e2e.vri"
         run_test_in_group 4 "tests/strict_v2/float_i32_cast_range_trap_e2e.vri"
         run_test_in_group 4 "tests/strict_v2/float_i64_cast_range_trap_e2e.vri"
+        # Generic Monomorphization & Type System (GENERIC-001 -> GENERIC-012)
+        run_test_in_group 4 "tests/spec_gap_contract/generic_identity.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_mismatch_negative.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_two_type_entity.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_specialization_isolation.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_wrong_arity_negative.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_unresolved_type_negative.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_slice_type.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_ref_type.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_func_type.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_nested_bracket_split.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_collision_disambiguation.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_multi_unresolved_negative.vri"
     else
         run_test_in_group 4 "tests/test_adv_001_i64_max.vri"
         run_test_in_group 4 "tests/test_adv_009_bool_chain.vri"
@@ -492,6 +523,19 @@ run_group_4() {
         run_test_in_group 4 "tests/test_float_rw.vri"
         run_test_in_group 4 "tests/vri/test_adv_001_i64_max.vri"
         run_test_in_group 4 "tests/vri/test_adv_009_bool_chain.vri"
+        # Generic Monomorphization & Type System (GENERIC-001 -> GENERIC-012)
+        run_test_in_group 4 "tests/spec_gap_contract/generic_identity.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_mismatch_negative.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_two_type_entity.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_specialization_isolation.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_wrong_arity_negative.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_unresolved_type_negative.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_slice_type.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_ref_type.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_func_type.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_nested_bracket_split.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_collision_disambiguation.vri"
+        run_test_in_group 4 "tests/spec_gap_contract/generic_multi_unresolved_negative.vri"
     fi
     local pass_cnt=${GP_PASS[4]}
     local fail_cnt=${GP_FAIL[4]}
@@ -1162,11 +1206,15 @@ run_group_17() {
         run_test_in_group 17 "tests/test_str_len_fold.vri"
         run_test_in_group 17 "tests/vri/test_adv_026_const_fold.vri"
         run_test_in_group 17 "tests/test_precomp.vri"
+        # Precomp Compile-Time Failure (PRECOMP-007)
+        run_test_in_group 17 "tests/spec_gap_contract/precomp_throw_negative.vri"
     else
         run_test_in_group 17 "tests/test_adv_026_const_fold.vri"
         run_test_in_group 17 "tests/test_str_len_fold.vri"
         run_test_in_group 17 "tests/vri/test_adv_026_const_fold.vri"
         run_test_in_group 17 "tests/test_precomp.vri"
+        # Precomp Compile-Time Failure (PRECOMP-007)
+        run_test_in_group 17 "tests/spec_gap_contract/precomp_throw_negative.vri"
     fi
     local pass_cnt=${GP_PASS[17]}
     local fail_cnt=${GP_FAIL[17]}
@@ -1526,8 +1574,24 @@ run_group_29() {
     echo "──────────────────────────────────────────────────────────────────────────"
     if [ "$MODE" = "min" ]; then
         run_test_in_group 29 "tests/test_kw_valid.vri"
+        # Diagnostic guidance cause & action regression tests
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e3001_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e3002_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e3004_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e5002_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e5003_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e5004_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e5006_rejected.vri"
     else
         run_test_in_group 29 "tests/test_kw_valid.vri"
+        # Diagnostic guidance cause & action regression tests
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e3001_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e3002_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e3004_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e5002_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e5003_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e5004_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e5006_rejected.vri"
     fi
     local pass_cnt=${GP_PASS[29]}
     local fail_cnt=${GP_FAIL[29]}
