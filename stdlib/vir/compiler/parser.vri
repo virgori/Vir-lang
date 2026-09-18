@@ -1318,9 +1318,11 @@ func parse_primary(p: Parser):
         # A generic call or entity literal may place type arguments between
         # the identifier and `(`. Resolve that lookahead before classifying
         # the parenthesized form.
-        var (p_gen, skipped_gen) = try_skip_generic_call_args(p)
+        var (p_gen, skipped_gen, gen_args) = try_parse_generic_call_args(p)
         if skipped_gen do
             p = p_gen
+        else
+            gen_args = fat_str_new("")
         end
 
         # Entity/record literal: IDENT ['<' TypeArgs '>'] '(' field: val, ... ')'
@@ -1330,6 +1332,7 @@ func parse_primary(p: Parser):
             var (p3, _) = advance(p)  # consume '('
             el = ast_new(AstType.EntityLiteral)
             el.name = id_name
+            el.name2 = gen_args
             el.line = id_tok.line
             p3 = skip_newlines(p3);    # skip optional newline/semicolon after '('
             var (p3, _) = match_tok(p3, TokType.Semicolon)
@@ -1357,6 +1360,7 @@ func parse_primary(p: Parser):
                 p3 = skip_newlines(p3)
             end
             var (p8, _, _) = expect_tok(p3, TokType.RParen, "expected ')' after entity literal")
+            el.name2 = gen_args
             out (p8, el)
         end
 
@@ -1402,6 +1406,7 @@ func parse_primary(p: Parser):
             call = ast_new(AstType.Call)
             let this_call_name = id_name
             call.name = this_call_name
+            call.name2 = gen_args
             call.line = id_tok.line
             var (p_lp, _) = advance(p)  # consume '('
             p = skip_newlines(p_lp)
@@ -1454,6 +1459,7 @@ func parse_primary(p: Parser):
             var (p7, _, _) = expect_tok(p, TokType.RParen, "expected ')' after arguments")
             # ast_add_child corrupts soft .name — restore after children.
             call.name = this_call_name
+            call.name2 = gen_args
             out (p7, call)
         end
 
@@ -1655,22 +1661,15 @@ func check_entity_literal(p: Parser):
     end
     out false
 end.
-func try_skip_generic_call_args(p: Parser):
-
-    # If at '<' and span is type-args then '(', move p.pos to that '('; else
-    # leave it unchanged.  This must be index-only lookahead: Parser aggregates
-    # alias in the bootstrap VM, so speculative advance(p) calls mutate the
-    # caller even when this function returns the original value.  A comparison
-    # such as `total < end_pos loop` was therefore scanned all the way to EOF
-    # while looking for a generic-closing `>`.
+func try_parse_generic_call_args(p: Parser):
     if not check(p, TokType.Lt) do
-        out (p, false)
+        out (p, false, fat_str_new(""))
     end
     if p.pos + 1 >= p.token_count do
-        out (p, false)
+        out (p, false, fat_str_new(""))
     end
     if not is_name_token(vec_get_rt(p.tokens, p.pos + 1).tok_type) do
-        out (p, false)
+        out (p, false, fat_str_new(""))
     end
     idx = p.pos
     depth = 1
@@ -1679,14 +1678,26 @@ func try_skip_generic_call_args(p: Parser):
     idx = idx + 1
     steps = 0
     valid = true
+    res = fat_str_new("")
     when depth > 0 and idx < p.token_count and valid loop
-        tt = vec_get_rt(p.tokens, idx).tok_type
+        tk = vec_get_rt(p.tokens, idx)
+        tt = tk.tok_type
         if tt == TokType.Lt do
             depth = depth + 1
         eif tt == TokType.Gt do
             depth = depth - 1
         eif tt == TokType.Cast do
-            depth = depth - 2
+            # '>>' is tokenized as a single Cast token. Treat it as two '>'s:
+            # the first may still be inside the type arg content; the second
+            # closes the next outer bracket level.
+            depth = depth - 1
+            if depth > 0 and valid do
+                res = fat_str_concat(res, fat_str_new(">"))
+            end
+            depth = depth - 1
+            if depth > 0 and valid do
+                res = fat_str_concat(res, fat_str_new(">"))
+            end
         eif tt == TokType.LParen do
             paren_depth = paren_depth + 1
         eif tt == TokType.RParen do
@@ -1716,23 +1727,28 @@ func try_skip_generic_call_args(p: Parser):
             # This is an ordinary comparison/expression, not TypeArgs.
             valid = false
         end
+        if depth > 0 and valid and tt != TokType.Newline and tt != TokType.Cast do
+            res = fat_str_concat(res, tok_lex(tk))
+        end
         idx = idx + 1
         steps = steps + 1
-        # A malformed '<' must never scan an unbounded suffix for a later '>'.
-        # 128 tokens is far beyond normal type-argument lists while keeping
-        # lookahead O(1) with respect to the rest of the source file.
         if steps > 128 do
             valid = false
         end
     end
     if not valid or depth != 0 do
-        out (p, false)
+        out (p, false, fat_str_new(""))
     end
     if idx >= p.token_count or vec_get_rt(p.tokens, idx).tok_type != TokType.LParen do
-        out (p, false)
+        out (p, false, fat_str_new(""))
     end
     p.pos = idx
-    out (p, true)
+    out (p, true, res)
+end.
+
+func try_skip_generic_call_args(p: Parser):
+    var (p2, ok, _) = try_parse_generic_call_args(p)
+    out (p2, ok)
 end.
 # Spec §30 precedence (tight → loose):
 #   postfix . ?. ~mask !! ? | unary ! - ~ & &mut | ^ (right) | ** >< |
@@ -2329,9 +2345,11 @@ func parse_var_decl_single(p: Parser, is_const: bool):
     end
     if matched do
         var (p5, init) = parse_expr(p3)
+        saved_name2 = decl.name2
         decl = ast_add_child(decl, init)
-        # ast_add_child corrupts soft .name — restore for lowering / var map.
+        # ast_add_child corrupts soft .name/.name2 — restore for lowering / var map.
         decl.name = decl_name
+        decl.name2 = saved_name2
         # Skip optional semicolon
         var (p6, _) = match_tok(p5, TokType.Semicolon)
         out (p6, decl)
@@ -2854,6 +2872,40 @@ func skip_generic_list(p: Parser):
     out p
 end.
 
+func parse_generic_param_list(p: Parser):
+    if not check(p, TokType.Lt) do
+        out (p, fat_str_new(""))
+    end
+    depth = 0
+    res = fat_str_new("")
+    first = true
+    when not check(p, TokType.Eof) loop
+        if check(p, TokType.Lt) do
+            depth = depth + 1
+        eif check(p, TokType.Gt) do
+            depth = depth - 1
+        eif check(p, TokType.Cast) do
+            depth = depth - 2
+        end
+        if depth == 1 and not check(p, TokType.Lt) and not check(p, TokType.Comma) and not check(p, TokType.Newline) do
+            tk = peek(p)
+            if is_name_token(tk.tok_type) do
+                if not first do
+                    res = fat_str_concat(res, fat_str_new(","))
+                end
+                res = fat_str_concat(res, tok_lex(tk))
+                first = false
+            end
+        end
+        var (p2, _) = advance(p)
+        p = p2
+        if depth <= 0 do
+            break
+        end
+    end
+    out (p, res)
+end.
+
 # Skip a complete type expression without consuming the surrounding list or
 # declaration delimiter.  This covers references, arrays, nested generics and
 # function types such as `&Map<K,V>` and `func(K, K) -> bool`.
@@ -3036,7 +3088,11 @@ func parse_func_def_mode(p: Parser, signature_only: bool):
     fn_node.line = name_tok.line
 
     # Generic declaration: `func name<T, U>(...)`.
-    p2 = skip_generic_list(p2)
+    var (p_gen, gen_params) = parse_generic_param_list(p2)
+    p2 = p_gen
+    if fat_str_len(gen_params) > 0 do
+        fn_node.builtin_id = gen_params as int
+    end
 
     # Parse parameters (optional parens — `func name` and `func name(...)` both valid)
     var had_parens = false
@@ -3649,7 +3705,8 @@ func parse_entity_def(p: Parser):
     end
 
     # Generic declaration: `entity Name<T, U>`.
-    p2 = skip_generic_list(p2)
+    var (p_gen, gen_params) = parse_generic_param_list(p2)
+    p2 = p_gen
     p2 = skip_newlines(p2)
 
     # Optional base type for register / mold: `register UART_SR: u32`
@@ -3670,6 +3727,9 @@ func parse_entity_def(p: Parser):
     ed.name = name_tok.str_val
     ed.name2 = base_type_name
     ed.line = line
+    if fat_str_len(gen_params) > 0 do
+        ed.builtin_id = gen_params as int
+    end
 
     when not check(p2, TokType.End) and not check(p2, TokType.Eof) loop
         if check(p2, TokType.Method) or check(p2, TokType.Func) do

@@ -8114,9 +8114,11 @@ func parse_primary(p: Parser):
         # A generic call or entity literal may place type arguments between
         # the identifier and `(`. Resolve that lookahead before classifying
         # the parenthesized form.
-        var (p_gen, skipped_gen) = try_skip_generic_call_args(p)
+        var (p_gen, skipped_gen, gen_args) = try_parse_generic_call_args(p)
         if skipped_gen do
             p = p_gen
+        else
+            gen_args = fat_str_new("")
         end
 
         # Entity/record literal: IDENT ['<' TypeArgs '>'] '(' field: val, ... ')'
@@ -8126,6 +8128,7 @@ func parse_primary(p: Parser):
             var (p3, _) = advance(p)  # consume '('
             el = ast_new(AstType.EntityLiteral)
             el.name = id_name
+            el.name2 = gen_args
             el.line = id_tok.line
             p3 = skip_newlines(p3);    # skip optional newline/semicolon after '('
             var (p3, _) = match_tok(p3, TokType.Semicolon)
@@ -8153,6 +8156,7 @@ func parse_primary(p: Parser):
                 p3 = skip_newlines(p3)
             end
             var (p8, _, _) = expect_tok(p3, TokType.RParen, "expected ')' after entity literal")
+            el.name2 = gen_args
             out (p8, el)
         end
 
@@ -8198,6 +8202,7 @@ func parse_primary(p: Parser):
             call = ast_new(AstType.Call)
             let this_call_name = id_name
             call.name = this_call_name
+            call.name2 = gen_args
             call.line = id_tok.line
             var (p_lp, _) = advance(p)  # consume '('
             p = skip_newlines(p_lp)
@@ -8250,6 +8255,7 @@ func parse_primary(p: Parser):
             var (p7, _, _) = expect_tok(p, TokType.RParen, "expected ')' after arguments")
             # ast_add_child corrupts soft .name — restore after children.
             call.name = this_call_name
+            call.name2 = gen_args
             out (p7, call)
         end
 
@@ -8451,22 +8457,15 @@ func check_entity_literal(p: Parser):
     end
     out false
 end.
-func try_skip_generic_call_args(p: Parser):
-
-    # If at '<' and span is type-args then '(', move p.pos to that '('; else
-    # leave it unchanged.  This must be index-only lookahead: Parser aggregates
-    # alias in the bootstrap VM, so speculative advance(p) calls mutate the
-    # caller even when this function returns the original value.  A comparison
-    # such as `total < end_pos loop` was therefore scanned all the way to EOF
-    # while looking for a generic-closing `>`.
+func try_parse_generic_call_args(p: Parser):
     if not check(p, TokType.Lt) do
-        out (p, false)
+        out (p, false, fat_str_new(""))
     end
     if p.pos + 1 >= p.token_count do
-        out (p, false)
+        out (p, false, fat_str_new(""))
     end
     if not is_name_token(vec_get_rt(p.tokens, p.pos + 1).tok_type) do
-        out (p, false)
+        out (p, false, fat_str_new(""))
     end
     idx = p.pos
     depth = 1
@@ -8475,14 +8474,26 @@ func try_skip_generic_call_args(p: Parser):
     idx = idx + 1
     steps = 0
     valid = true
+    res = fat_str_new("")
     when depth > 0 and idx < p.token_count and valid loop
-        tt = vec_get_rt(p.tokens, idx).tok_type
+        tk = vec_get_rt(p.tokens, idx)
+        tt = tk.tok_type
         if tt == TokType.Lt do
             depth = depth + 1
         eif tt == TokType.Gt do
             depth = depth - 1
         eif tt == TokType.Cast do
-            depth = depth - 2
+            # '>>' is tokenized as a single Cast token. Treat it as two '>'s:
+            # the first may still be inside the type arg content; the second
+            # closes the next outer bracket level.
+            depth = depth - 1
+            if depth > 0 and valid do
+                res = fat_str_concat(res, fat_str_new(">"))
+            end
+            depth = depth - 1
+            if depth > 0 and valid do
+                res = fat_str_concat(res, fat_str_new(">"))
+            end
         eif tt == TokType.LParen do
             paren_depth = paren_depth + 1
         eif tt == TokType.RParen do
@@ -8512,23 +8523,28 @@ func try_skip_generic_call_args(p: Parser):
             # This is an ordinary comparison/expression, not TypeArgs.
             valid = false
         end
+        if depth > 0 and valid and tt != TokType.Newline and tt != TokType.Cast do
+            res = fat_str_concat(res, tok_lex(tk))
+        end
         idx = idx + 1
         steps = steps + 1
-        # A malformed '<' must never scan an unbounded suffix for a later '>'.
-        # 128 tokens is far beyond normal type-argument lists while keeping
-        # lookahead O(1) with respect to the rest of the source file.
         if steps > 128 do
             valid = false
         end
     end
     if not valid or depth != 0 do
-        out (p, false)
+        out (p, false, fat_str_new(""))
     end
     if idx >= p.token_count or vec_get_rt(p.tokens, idx).tok_type != TokType.LParen do
-        out (p, false)
+        out (p, false, fat_str_new(""))
     end
     p.pos = idx
-    out (p, true)
+    out (p, true, res)
+end.
+
+func try_skip_generic_call_args(p: Parser):
+    var (p2, ok, _) = try_parse_generic_call_args(p)
+    out (p2, ok)
 end.
 # Spec §30 precedence (tight → loose):
 #   postfix . ?. ~mask !! ? | unary ! - ~ & &mut | ^ (right) | ** >< |
@@ -9125,9 +9141,11 @@ func parse_var_decl_single(p: Parser, is_const: bool):
     end
     if matched do
         var (p5, init) = parse_expr(p3)
+        saved_name2 = decl.name2
         decl = ast_add_child(decl, init)
-        # ast_add_child corrupts soft .name — restore for lowering / var map.
+        # ast_add_child corrupts soft .name/.name2 — restore for lowering / var map.
         decl.name = decl_name
+        decl.name2 = saved_name2
         # Skip optional semicolon
         var (p6, _) = match_tok(p5, TokType.Semicolon)
         out (p6, decl)
@@ -9650,6 +9668,40 @@ func skip_generic_list(p: Parser):
     out p
 end.
 
+func parse_generic_param_list(p: Parser):
+    if not check(p, TokType.Lt) do
+        out (p, fat_str_new(""))
+    end
+    depth = 0
+    res = fat_str_new("")
+    first = true
+    when not check(p, TokType.Eof) loop
+        if check(p, TokType.Lt) do
+            depth = depth + 1
+        eif check(p, TokType.Gt) do
+            depth = depth - 1
+        eif check(p, TokType.Cast) do
+            depth = depth - 2
+        end
+        if depth == 1 and not check(p, TokType.Lt) and not check(p, TokType.Comma) and not check(p, TokType.Newline) do
+            tk = peek(p)
+            if is_name_token(tk.tok_type) do
+                if not first do
+                    res = fat_str_concat(res, fat_str_new(","))
+                end
+                res = fat_str_concat(res, tok_lex(tk))
+                first = false
+            end
+        end
+        var (p2, _) = advance(p)
+        p = p2
+        if depth <= 0 do
+            break
+        end
+    end
+    out (p, res)
+end.
+
 # Skip a complete type expression without consuming the surrounding list or
 # declaration delimiter.  This covers references, arrays, nested generics and
 # function types such as `&Map<K,V>` and `func(K, K) -> bool`.
@@ -9831,7 +9883,11 @@ func parse_func_def_mode(p: Parser, signature_only: bool):
     fn_node.line = name_tok.line
 
     # Generic declaration: `func name<T, U>(...)`.
-    p2 = skip_generic_list(p2)
+    var (p_gen, gen_params) = parse_generic_param_list(p2)
+    p2 = p_gen
+    if fat_str_len(gen_params) > 0 do
+        fn_node.builtin_id = gen_params as int
+    end
 
     # Parse parameters (optional parens — `func name` and `func name(...)` both valid)
     var had_parens = false
@@ -10444,7 +10500,8 @@ func parse_entity_def(p: Parser):
     end
 
     # Generic declaration: `entity Name<T, U>`.
-    p2 = skip_generic_list(p2)
+    var (p_gen, gen_params) = parse_generic_param_list(p2)
+    p2 = p_gen
     p2 = skip_newlines(p2)
 
     # Optional base type for register / mold: `register UART_SR: u32`
@@ -10465,6 +10522,9 @@ func parse_entity_def(p: Parser):
     ed.name = name_tok.str_val
     ed.name2 = base_type_name
     ed.line = line
+    if fat_str_len(gen_params) > 0 do
+        ed.builtin_id = gen_params as int
+    end
 
     when not check(p2, TokType.End) and not check(p2, TokType.Eof) loop
         if check(p2, TokType.Method) or check(p2, TokType.Func) do
@@ -12274,6 +12334,8 @@ end.
 var g_precomp_throw_kind: int = 0
 var g_precomp_throw_val: i64 = 0
 var g_precomp_throw_str: string = ""
+var g_generic_diag_name: string = ""
+var g_disable_specialization: int = 0
 # ═══════════════════════════════════════════════════════
 # AST Arena
 # ═══════════════════════════════════════════════════════
@@ -16273,6 +16335,9 @@ func pass6_get_receiver_entity_name(symbols: SymbolTable, scopes: ScopeTree, rec
         out fat_str_new("")
     end
     if nt == AstType.EntityLiteral do
+        if fat_str_len(recv.name2) > 0 do
+            out fat_str_concat(recv.name, fat_str_concat(fat_str_new("<"), fat_str_concat(recv.name2, fat_str_new(">"))))
+        end
         out recv.name
     end
     if nt == AstType.BuiltinCall & fat_cstr_eq(recv.name, "port") == 1 do
@@ -16466,6 +16531,188 @@ func pass6_extract_second_generic_arg(type_str: string):
         out fat_str_slice(type_str, start, gt - start)
     end
     out fat_str_new("")
+end.
+
+func count_list_items(s: string):
+    slen = fat_str_len(s)
+    if slen <= 0 do out 0 end
+    var count = 1
+    var depth = 0
+    var i = 0
+    when i < slen loop
+        b = fat_str_byte_at(s, i)
+        if b == 60 do depth = depth + 1 end       # '<': enter generic
+        if b == 62 do depth = depth - 1 end       # '>': leave generic
+        if b == 44 and depth == 0 do               # ',': only at top level
+            count = count + 1
+        end
+        i = i + 1
+    end
+    out count
+end.
+
+func get_list_item(s: string, target_idx: int):
+    slen = fat_str_len(s)
+    if slen <= 0 do out fat_str_new("") end
+    var cur_idx = 0
+    var start = 0
+    var depth = 0
+    var i = 0
+    when i <= slen loop
+        var at_split = false
+        if i == slen do
+            at_split = true
+        eif fat_str_byte_at(s, i) == 60 do
+            depth = depth + 1                     # '<': enter generic
+        eif fat_str_byte_at(s, i) == 62 do
+            depth = depth - 1                     # '>': leave generic
+        eif fat_str_byte_at(s, i) == 44 and depth == 0 do
+            at_split = true                       # ',': split only at top level
+        end
+        if at_split do
+            if cur_idx == target_idx do
+                var item_start = start
+                when item_start < i and fat_str_byte_at(s, item_start) == 32 loop
+                    item_start = item_start + 1
+                end
+                var item_end = i
+                when item_end > item_start and fat_str_byte_at(s, item_end - 1) == 32 loop
+                    item_end = item_end - 1
+                end
+                out fat_str_slice(s, item_start, item_end - item_start)
+            end
+            cur_idx = cur_idx + 1
+            start = i + 1
+        end
+        i = i + 1
+    end
+    out fat_str_new("")
+end.
+
+func pass6_extract_generic_args_content(type_str: string):
+    slen = fat_str_len(type_str)
+    var lt = 0 - 1
+    var gt = 0 - 1
+    var depth = 0
+    var i = 0
+    when i < slen loop
+        b = fat_str_byte_at(type_str, i)
+        if b == 60 do                                 # '<'
+            if depth == 0 do lt = i end
+            depth = depth + 1
+        end
+        if b == 62 do                                 # '>'
+            depth = depth - 1
+            if depth == 0 and gt < 0 do gt = i end   # first outermost '>'
+        end
+        i = i + 1
+    end
+    if lt >= 0 and gt > lt do
+        out fat_str_slice(type_str, lt + 1, gt - lt - 1)
+    end
+    out fat_str_new("")
+end.
+
+func pass6_substitute_generic_type(param_names: string, arg_types: string, target_type: string):
+    if fat_str_len(param_names) == 0 or fat_str_len(arg_types) == 0 or fat_str_len(target_type) == 0 do
+        out target_type
+    end
+    p_count = count_list_items(param_names)
+    var i = 0
+    when i < p_count loop
+        p_name = get_list_item(param_names, i)
+        if fat_str_eq(p_name, target_type) == 1 do
+            out get_list_item(arg_types, i)
+        end
+        i = i + 1
+    end
+    # Composite type (e.g. Vec<T>, Map<K,V>): substitute within angle brackets.
+    inner = pass6_extract_generic_args_content(target_type)
+    if fat_str_len(inner) > 0 do
+        lt_pos = 0 - 1
+        var k = 0
+        when k < fat_str_len(target_type) loop
+            if fat_str_byte_at(target_type, k) == 60 do
+                lt_pos = k
+                break
+            end
+            k = k + 1
+        end
+        if lt_pos > 0 do
+            prefix = fat_str_slice(target_type, 0, lt_pos)
+            inner_count = count_list_items(inner)
+            result = fat_str_concat(prefix, fat_str_new("<"))
+            var j = 0
+            when j < inner_count loop
+                if j > 0 do result = fat_str_concat(result, fat_str_new(", ")) end
+                inner_j = get_list_item(inner, j)
+                subst_j = pass6_substitute_generic_type(param_names, arg_types, inner_j)
+                result = fat_str_concat(result, subst_j)
+                j = j + 1
+            end
+            result = fat_str_concat(result, fat_str_new(">"))
+            out result
+        end
+    end
+    out target_type
+end.
+
+func pass6_is_known_type(symbols: SymbolTable, scopes: ScopeTree, ty: string):
+    if fat_str_len(ty) == 0 do out true end
+    if fat_cstr_eq(ty, "int") == 1 or fat_cstr_eq(ty, "i8") == 1 or fat_cstr_eq(ty, "i16") == 1 or fat_cstr_eq(ty, "i32") == 1 or fat_cstr_eq(ty, "i64") == 1 do out true end
+    if fat_cstr_eq(ty, "uint") == 1 or fat_cstr_eq(ty, "u8") == 1 or fat_cstr_eq(ty, "u16") == 1 or fat_cstr_eq(ty, "u32") == 1 or fat_cstr_eq(ty, "u64") == 1 do out true end
+    if fat_cstr_eq(ty, "float") == 1 or fat_cstr_eq(ty, "f32") == 1 or fat_cstr_eq(ty, "f64") == 1 do out true end
+    if fat_cstr_eq(ty, "bool") == 1 or fat_cstr_eq(ty, "string") == 1 or fat_cstr_eq(ty, "ptr") == 1 or fat_cstr_eq(ty, "void") == 1 or fat_cstr_eq(ty, "any") == 1 do out true end
+    if (pass6_find_entity_ast(symbols, scopes, ty) as i64) != 0 do out true end
+    if (pass6_find_enum_ast(symbols, scopes, ty) as i64) != 0 do out true end
+    out false
+end.
+
+func pass6_is_in_generic_params(gen_params: string, ty: string):
+    if fat_str_len(gen_params) == 0 or fat_str_len(ty) == 0 do out false end
+    p_count = count_list_items(gen_params)
+    var i = 0
+    when i < p_count loop
+        if fat_str_eq(get_list_item(gen_params, i), ty) == 1 do
+            out true
+        end
+        i = i + 1
+    end
+    out false
+end.
+
+func pass6_check_generic_func_def(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode):
+    if node.builtin_id == 0 do out 0 end
+    gen_params = node.builtin_id as string
+    if fat_str_len(node.name2) > 0 do
+        if pass6_is_known_type(symbols, scopes, node.name2) == 0 do
+            if pass6_is_in_generic_params(gen_params, node.name2) == 0 do
+                g_generic_diag_name = node.name2
+                report_error(diag, 3086, node.line, 0)
+                out 0
+            end
+        end
+    end
+    child_count = vec_len_rt(node.children)
+    var i = 0
+    when i < child_count loop
+        param = vec_get_rt(node.children, i) as AstNode
+        if param.node_type == AstType.ParamDef or param.node_type == AstType.RefParam do
+            if fat_str_len(param.name2) > 0 do
+                if pass6_is_known_type(symbols, scopes, param.name2) == 0 do
+                    if pass6_is_in_generic_params(gen_params, param.name2) == 0 do
+                        g_generic_diag_name = param.name2
+                        var pline = param.line
+                        if pline <= 0 do pline = node.line end
+                        report_error(diag, 3086, pline, 0)
+                        out 0
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    out 0
 end.
 
 func pass6_check_enum_generic_arg(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, decl_type: string, init_expr: AstNode):
@@ -17104,6 +17351,19 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
 
     if node.node_type == AstType.EntityLiteral do
         pass6_check_packed_literal(symbols, scopes, diag, node)
+        ent_ast = pass6_find_entity_ast(symbols, scopes, node.name)
+        if (ent_ast as i64) != 0 do
+            if ent_ast.builtin_id != 0 do
+                ent_decl_cnt = count_list_items(ent_ast.builtin_id as string)
+                var ent_prov_cnt = 0
+                if fat_str_len(node.name2) > 0 do
+                    ent_prov_cnt = count_list_items(node.name2)
+                end
+                if ent_decl_cnt != ent_prov_cnt do
+                    report_error(diag, 3085, node.line, 0)
+                end
+            end
+        end
     end
 
     if node.node_type == AstType.RegisterDef do
@@ -17558,6 +17818,16 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         end
         call_ast = pass6_find_free_function(node.name)
         if (call_ast as i64) != 0 do
+            if call_ast.builtin_id != 0 do
+                fn_decl_cnt = count_list_items(call_ast.builtin_id as string)
+                var fn_prov_cnt = 0
+                if fat_str_len(node.name2) > 0 do
+                    fn_prov_cnt = count_list_items(node.name2)
+                end
+                if fn_decl_cnt != fn_prov_cnt do
+                    report_error(diag, 3085, node.line, 0)
+                end
+            end
             var fn_params = vec_new_rt()
             var fpi = 0
             when fpi < vec_len_rt(call_ast.children) loop
@@ -17892,6 +18162,9 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
 
     # 5. FuncDef Scope & Local Parameter Registration
     if node.node_type == AstType.FuncDef do
+        if node.builtin_id != 0 do
+            pass6_check_generic_func_def(symbols, scopes, diag, node)
+        end
         g_pass6_assigned_vars = vec_new_rt()
         scope_push(scopes, ScopeKind.Func)
         child_count = vec_len_rt(node.children)
@@ -17999,8 +18272,42 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
             end
         end
         var initializer_type = fat_str_new("")
+        if fat_str_len(node.name2) > 0 do
+            var vd_base = pass6_extract_base_name(node.name2)
+            var vd_ent = pass6_find_entity_ast(symbols, scopes, vd_base)
+            if (vd_ent as i64) != 0 do
+                if vd_ent.builtin_id != 0 do
+                    var vd_gen_args = pass6_extract_generic_args_content(node.name2)
+                    var vd_decl_cnt = count_list_items(vd_ent.builtin_id as string)
+                    var vd_prov_cnt = 0
+                    if fat_str_len(vd_gen_args) > 0 do
+                        vd_prov_cnt = count_list_items(vd_gen_args)
+                    end
+                    if vd_decl_cnt != vd_prov_cnt do
+                        report_error(diag, 3085, node.line, 0)
+                    end
+                end
+            end
+        end
         if child_count > 0 do
             child0 = vec_get_rt(node.children, 0)
+            if child0.node_type == AstType.Call do
+                if fat_str_len(child0.name2) > 0 do
+                    if fat_str_len(node.name2) > 0 do
+                        var call_fn = pass6_find_free_function(child0.name)
+                        if (call_fn as i64) != 0 do
+                            if call_fn.builtin_id != 0 do
+                                var spec_ret = pass6_substitute_generic_type(call_fn.builtin_id as string, child0.name2, call_fn.name2)
+                                if fat_str_len(spec_ret) > 0 do
+                                    if fat_str_eq(spec_ret, node.name2) == 0 do
+                                        report_error(diag, 3084, child0.line, 0)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
             pass6_check_enum_generic_arg(symbols, scopes, diag, node.name2, child0)
             initializer_type = pass6_get_receiver_entity_name(symbols, scopes, child0)
             if child0.node_type == AstType.QuantizeExpr do
@@ -18010,7 +18317,7 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                 initializer_type = fat_str_new("dict")
             end
         end
-        if fat_str_len(initializer_type) > 0 do
+        if fat_str_len(node.name2) == 0 and fat_str_len(initializer_type) > 0 do
             node.name2 = initializer_type
             pass6_set_var_type(node.name, initializer_type)
         eif fat_str_len(node.name2) > 0 do
@@ -18042,12 +18349,46 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
             end
         end
         var initializer_type = fat_str_new("")
+        if fat_str_len(node.name2) > 0 do
+            var cd_base = pass6_extract_base_name(node.name2)
+            var cd_ent = pass6_find_entity_ast(symbols, scopes, cd_base)
+            if (cd_ent as i64) != 0 do
+                if cd_ent.builtin_id != 0 do
+                    var cd_gen_args = pass6_extract_generic_args_content(node.name2)
+                    var cd_decl_cnt = count_list_items(cd_ent.builtin_id as string)
+                    var cd_prov_cnt = 0
+                    if fat_str_len(cd_gen_args) > 0 do
+                        cd_prov_cnt = count_list_items(cd_gen_args)
+                    end
+                    if cd_decl_cnt != cd_prov_cnt do
+                        report_error(diag, 3085, node.line, 0)
+                    end
+                end
+            end
+        end
         if child_count > 0 do
             child0 = vec_get_rt(node.children, 0)
+            if child0.node_type == AstType.Call do
+                if fat_str_len(child0.name2) > 0 do
+                    if fat_str_len(node.name2) > 0 do
+                        var cd_call_fn = pass6_find_free_function(child0.name)
+                        if (cd_call_fn as i64) != 0 do
+                            if cd_call_fn.builtin_id != 0 do
+                                var cd_spec_ret = pass6_substitute_generic_type(cd_call_fn.builtin_id as string, child0.name2, cd_call_fn.name2)
+                                if fat_str_len(cd_spec_ret) > 0 do
+                                    if fat_str_eq(cd_spec_ret, node.name2) == 0 do
+                                        report_error(diag, 3084, child0.line, 0)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
             pass6_check_enum_generic_arg(symbols, scopes, diag, node.name2, child0)
             initializer_type = pass6_get_receiver_entity_name(symbols, scopes, child0)
         end
-        if fat_str_len(initializer_type) > 0 do
+        if fat_str_len(node.name2) == 0 and fat_str_len(initializer_type) > 0 do
             node.name2 = initializer_type
             pass6_set_var_type(node.name, initializer_type)
         eif fat_str_len(node.name2) > 0 do
@@ -20849,395 +21190,8 @@ export pass9_const_fold
 # @vir_source stdlib/vir/compiler/semantic.vri 61
 import pass9_const_fold from compiler.sem_pass9_constfold
 
-# @vir_source stdlib/vir/compiler/sem_pass10_diagnostics.vri 1
-##
- * vir/compiler/sem_pass10_diagnostics.vri
- * ==============================================================
- * Pass 10: Diagnostics Emission.
- * Formats and prints all collected diagnostics, returns error count.
- ##
-
-import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt
-
-import rt_streq, fat_str_eq, fat_str_len, fat_cstr_eq, fat_str_eq, fat_str_len, fat_cstr_eq, rt_strcat, rt_itoa, rt_strlen from string_rt
-
-import DiagnosticEngine, DiagnosticLevel, Diagnostic from context
-
-func pass10_emit_diagnostics(diag: DiagnosticEngine, source_path: string):
-    count = vec_len_rt(diag.diagnostics)
-    if count == 0 do
-        out 0
-    end
-
-    var i = 0
-    when i < count loop
-        d = vec_get_rt(diag.diagnostics, i)
-        pass10_print_one(d, source_path)
-        i = i + 1
-    end
-
-    # Print summary
-    arena:
-        var sb = sb_new()
-        sb = sb_append(sb, "virc: ")
-        sb = sb_append_int(sb, diag.error_count)
-        sb = sb_append(sb, " error(s), ")
-        var warn_count = count - diag.error_count
-        sb = sb_append_int(sb, warn_count)
-        sb = sb_append(sb, " warning(s)")
-        print_ln(sb_to_string(sb))
-        sb_free(sb)
-    end
-
-    out diag.error_count
-end.
-func pass10_code_to_prefix(level: DiagnosticLevel):
-    if level == DiagnosticLevel.Warning do
-        out "W"
-    eif level == DiagnosticLevel.Info do
-        out "I"
-    end
-    out "E"
-end.
-
-func pass10_code_to_result(level: DiagnosticLevel):
-    if level == DiagnosticLevel.Warning do
-        out "WARNING"
-    eif level == DiagnosticLevel.Info do
-        out "INFO"
-    end
-    out "FAILED"
-end.
-
-func pass10_code_to_phase(code: int):
-    if code < 1000 do out "Lexer" end
-    if code < 2000 do out "Parser" end
-    if code >= 2100 and code < 2200 do out "ModuleResolver" end
-    if code < 4000 do out "Semantic" end
-    if code < 5000 do out "ControlFlow" end
-    if code < 6000 or (code >= 8000 and code < 9000) do out "BorrowChecker" end
-    if code >= 7000 and code < 8000 do out "ModuleResolver" end
-    out "Compiler"
-end.
-
-func pass10_code_to_msg(code: int):
-    # Lexer errors (E0xxx)
-    if code == 1 or code == 101 do out "Invalid character in source" end
-    if code == 2 or code == 102 do out "Unterminated string literal" end
-    if code == 3 or code == 103 do out "Invalid numeric literal format" end
-
-    # Parser errors (E1xxx)
-    if code == 1001 do out "Unexpected token in syntax rule" end
-    if code == 1002 do out "Missing block delimiter 'end' or 'end.'" end
-    if code == 1003 do out "Missing colon ':' after condition or signature" end
-    if code == 1004 do out "Invalid expression syntax" end
-    if code == 1005 do out "Unexpected end of file (EOF)" end
-    if code == 1006 do out "Invalid function signature" end
-    if code == 1007 do out "Mismatched parentheses or brackets" end
-
-    # Semantic & Type errors (E2xxx / E3xxx)
-    if code == 2001 do out "Undefined variable in current scope" end
-    if code == 2002 do out "Undefined function or symbol" end
-    if code == 2003 or code == 3001 do out "Type mismatch in expression or operation" end
-    if code == 2004 do out "Duplicate symbol definition in current scope" end
-    if code == 2005 or code == 3012 do out "Invalid assignment target (not an l-value)" end
-    if code == 2101 do out "Malformed include statement" end
-    if code == 2102 do out "Included source not found" end
-    if code == 2103 do out "Invalid module path token" end
-    if code == 2104 do out "Include recursion or expansion limit reached" end
-    if code == 2111 do out "Malformed import statement" end
-    if code == 2112 do out "Imported module not found" end
-    if code == 2113 do out "Imported symbol not exported or not found" end
-    if code == 2114 do out "Import recursion or expansion limit reached" end
-    if code == 3002 do out "Invalid operator for operand type" end
-    if code == 3003 do out "Assignment to immutable variable (declared with 'let')" end
-    if code == 3004 do out "Type mismatch in variable assignment" end
-    if code == 3005 do out "Wrong argument count in function invocation" end
-    if code == 3006 do out "Invalid operand types for and/or/xor/shl/shr" end
-    if code == 3007 do out "Assignment or return value type does not match declared type" end
-    if code == 3008 or code == 1004 do out "Unknown entity field access" end
-    if code == 3009 do out "Operation prohibited in 'infer:' block (e.g. calling .backward())" end
-    if code == 3010 do out "Duplicate field in entity initialization" end
-    if code == 3011 do out "Field type mismatch in entity instantiation" end
-    if code == 3013 do out "Tensor indexing rank mismatch" end
-    if code == 3014 do out "Matrix multiplication dimension mismatch" end
-    if code == 3015 do out "Tensor index must be integer" end
-    if code == 3016 do out "infer/train blocks cannot be nested" end
-    if code == 3017 do out ".backward() is only valid inside a train block" end
-    if code == 3018 do out "quantize input must be a floating-point tensor" end
-    if code == 3019 do out "quantize bits must be a compile-time constant in {4, 8, 16, 32}" end
-    if code == 3020 do out ".backward() receiver must be a floating-point train value with gradient state" end
-    if code == 3021 do out "Unresolved UFCS member: no entity method, callable field, or free function" end
-    if code == 3022 do out "Wrong argument count in UFCS invocation" end
-    if code == 3023 do out "Quantized tensor operations are only supported inside an 'infer:' block" end
-    if code == 3024 do out "Invalid tensor type; expected tensor<T>[S...] with T in {f32, f16, i8, u8, i32} and positive compile-time dimensions" end
-    if code == 3025 do out "Packed entity field missing type annotation" end
-    if code == 3026 do out "Invalid packed entity field type; must be compile-time fixed-size primitive or packed entity" end
-    if code == 3027 do out "Recursive packed entity layout cycle detected" end
-    if code == 3028 do out "Normal entity cannot be embedded inline in packed entity" end
-    if code == 3029 do out "Missing required field in packed entity initialization" end
-    if code == 3030 do out "Integer literal value out of range for packed field type" end
-    if code == 3031 do out "Wrong argument count in enum constructor invocation" end
-    if code == 3032 do out "Non-exhaustive case expression on enum" end
-    if code == 3033 do out "Unknown enum variant in pattern arm" end
-    if code == 3034 do out "Variant does not belong to target enum" end
-    if code == 3035 do out "Duplicate case pattern arm" end
-    if code == 3036 do out "Unreachable pattern arm after wildcard" end
-    if code == 3037 do out "Wrong binder count in enum pattern arm" end
-    if code == 3038 do out "Ambiguous unqualified enum variant; qualify with enum name" end
-    if code == 3039 do out "Duplicate explicit enum variant tag" end
-    if code == 3040 do out "Enum tag value out of range (must be u32: 0..4294967295)" end
-    if code == 3041 do out "Duplicate binder in case pattern arm" end
-    if code == 3042 do out "Incompatible generic argument type for enum constructor" end
-    if code == 3043 do out "Equality comparison '==' is not supported for payload enums; use case pattern matching" end
-    if code == 3044 do out "Parameter keyword 'in' is invalid in parenthesized parameter syntax; default parameters are passed by value (§14.1)" end
-    if code == 3045 do out "Parameter keyword 'out' is invalid in parenthesized parameter syntax; use parameter groups (§14.1)" end
-    if code == 3046 do out "Empty parameter group is not allowed (§14.2)" end
-    if code == 3047 do out "Parameter declaration without a group (§14.2)" end
-    if code == 3048 do out "Cannot pass a temporary value or expression as 'ref' or 'out' parameter (§14)" end
-    if code == 3049 do out "Cannot pass an uninitialized variable to 'ref' parameter (§14)" end
-    if code == 3050 do out "Cannot read 'out' parameter before it has been definitely assigned (§14)" end
-    if code == 3051 do out "'out' parameter is not definitely assigned on all normal return paths (§14)" end
-    if code == 3054 do out "Duplicate parameter name in function definition (§14)" end
-    if code == 3076 do out "Negative integer exponent is invalid for scalar power (§10)" end
-    if code == 3077 do out "Register/mold field width must be positive (§16)" end
-    if code == 3078 do out "Register/mold fields exceed the declared base width (§16)" end
-    if code == 3079 do out "Register/mold field value does not fit its bit width (§16)" end
-    if code == 3080 do out "precomp: I/O is forbidden during compile-time evaluation" end
-    if code == 3081 do out "precomp: division by zero during compile-time evaluation" end
-    if code == 3082 do out "precomp: strings, arrays, and allocations are forbidden during compile-time evaluation" end
-    if code == 3083 do
-        arena:
-            var sb = sb_new()
-            sb = sb_append(sb, "precomp: compile-time failure")
-            if g_precomp_throw_kind == 1 do
-                sb = sb_append(sb, " ")
-                sb = sb_append_int(sb, g_precomp_throw_val)
-            eif g_precomp_throw_kind == 2 do
-                sb = sb_append(sb, " ")
-                sb = sb_append(sb, g_precomp_throw_str)
-            end
-            out sb_to_string(sb)
-        end
-    end
-
-    # Control Flow errors (E4xxx)
-    if code == 4001 do out "Missing return statement on some code paths" end
-    if code == 4002 do out "Unreachable code detected" end
-    if code == 4003 do out "Dead code — condition is always constant" end
-    if code == 4004 do out "Loop control statement 'break' or 'skip' outside loop body" end
-
-    # Borrow Checker errors (E5xxx / E8xxx)
-    if code == 5001 or code == 8001 do out "Use of moved value" end
-    if code == 5002 or code == 8002 do out "Cannot borrow as mutable while shared borrow is active" end
-    if code == 5003 do out "Cannot borrow as mutable more than once (aliasing violation)" end
-    if code == 5004 do out "Borrow of moved value" end
-    if code == 5005 or code == 8004 do out "Arena-allocated value or borrow escapes its block scope" end
-    if code == 5006 do out "Cannot borrow as shared while mutable borrow is active" end
-    if code == 5007 do out "Reference to local variable escapes function scope" end
-    if code == 5008 do out "Cannot move value while active borrow exists" end
-    if code == 5009 do out "Cannot mutate variable while shared borrow is active" end
-    if code == 5010 do out "Cannot perform arena_reset while live borrow exists" end
-
-    # Fallback
-    var sb = sb_new()
-    sb = sb_append(sb, "Compiler diagnostic code ")
-    sb = sb_append_int(sb, code)
-    out sb_to_string(sb)
-end.
-
-func pass10_code_to_causes(code: int):
-    if code == 2001 or code == 1002 do
-        out "• Variable was not declared in current or outer scope\n• Typo in variable identifier name"
-    end
-    if code == 2002 do
-        out "• Function name was misspelled\n• Missing 'import' statement from module"
-    end
-    if code == 3003 do
-        out "• Variable was declared with 'let' (immutable binding)\n• Reassignment is only allowed for 'var' variables"
-    end
-    if code == 3009 do
-        out "• Automatic differentiation (.backward()) was invoked inside 'infer:'\n• 'infer:' disables gradient tape recording for forward inference"
-    end
-    if code == 3021 do
-        out "• Receiver type has no matching method or callable field\n• No visible free function accepts the receiver as its first argument"
-    end
-    if code == 3022 do
-        out "• Explicit argument count does not match the resolved method\n• Free-function UFCS counts the receiver as argument zero"
-    end
-    if code == 3023 do
-        out "• Quantized tensor indexed or used outside 'infer:' block\n• Spec §26.5 requires quantized operations to reside in 'infer:' blocks"
-    end
-    if code == 5001 or code == 8001 do
-        out "• Value ownership was transferred to another variable or function\n• Attempted to read from an invalidated source"
-    end
-    if code == 5005 or code == 8004 do
-        out "• Reference allocated in 'arena:' block assigned to longer-lived variable\n• Pointer would dangle after arena destruction"
-    end
-    if code == 5007 do
-        out "• Reference to stack-allocated local variable was returned from function\n• Stack frame is deallocated upon return, causing dangling pointer"
-    end
-    if code == 5008 do
-        out "• Variable ownership transfer attempted while an active reference (& or &mut) is held\n• Moving would invalidate the memory location referenced by the borrow"
-    end
-    if code == 5009 do
-        out "• Assignment or modification attempted while shared reference (&) is held\n• Violates shared borrow immutability guarantee"
-    end
-    if code == 5010 do
-        out "• Calling arena_reset while a live borrow reference is still held\n• Resetting the arena invalidates existing borrows"
-    end
-    if code == 4004 do
-        out "• 'break' or 'skip' placed outside 'loop' or 'when ... loop'"
-    end
-    if code == 3080 do
-        out "• Attempted to perform input/output inside precomp expression or function\n• precomp only allows pure computations without side effects"
-    end
-    if code == 3081 do
-        out "• Division or modulo by zero in constant/precomp evaluation\n• Evaluated divisor expression resulted in zero"
-    end
-    if code == 3082 do
-        out "• Heap allocations, strings, dynamic arrays, and pointers are not allowed during precomp evaluation\n• Dynamic memory allocation is not permitted at compile time"
-    end
-    if code == 3083 do
-        out "• precomp throw statement executed during compile-time evaluation\n• Compile-time assertion or condition check failed"
-    end
-    out "• Violation of Vir language specification semantic constraints"
-end.
-
-func pass10_code_to_actions(code: int):
-    if code == 2001 or code == 1002 do
-        out "• Declare variable with 'var <name> = <val>' before use\n• Check identifier spelling"
-    end
-    if code == 2002 do
-        out "• Verify function definition exists or add import statement"
-    end
-    if code == 3003 do
-        out "• Change 'let' to 'var' at variable declaration site"
-    end
-    if code == 3009 do
-        out "• Move .backward() call into a 'train:' block"
-    end
-    if code == 3021 do
-        out "• Define the method/callable field/free function or correct its name"
-    end
-    if code == 3022 do
-        out "• Pass exactly the parameters required by the resolved UFCS callee"
-    end
-    if code == 3023 do
-        out "• Move quantized tensor indexing or inference into an 'infer:' block"
-    end
-    if code == 5001 or code == 8001 do
-        out "• Borrow reference with '&' or clone value before move"
-    end
-    if code == 5005 or code == 8004 do
-        out "• Copy data out of arena or expand arena block lifetime"
-    end
-    if code == 5007 do
-        out "• Return value by ownership (move) or allocate in heap/arena"
-    end
-    if code == 5008 do
-        out "• Release or scope-limit the borrow before moving the owner value"
-    end
-    if code == 5009 do
-        out "• Complete reading through shared reference before mutating the owner"
-    end
-    if code == 5010 do
-        out "• Release or end the live borrow before calling arena_reset"
-    end
-    if code == 4004 do
-        out "• Enclose statement within an active loop construct"
-    end
-    if code == 3080 do
-        out "• Remove I/O operations from compile-time functions\n• Move I/O to runtime main or normal functions"
-    end
-    if code == 3081 do
-        out "• Ensure divisor is non-zero in compile-time expressions"
-    end
-    if code == 3082 do
-        out "• Use primitive scalar integers/booleans in precomp evaluation\n• Move string operations and collection initialization to runtime"
-    end
-    if code == 3083 do
-        out "• Review compile-time condition or adjust values to avoid throw"
-    end
-    out "• Review source code against Vir language specification"
-end.
-
-func pass10_print_one(d: Diagnostic, source_path: string):
-    arena:
-        print_ln("═══════════════════════════════════════════════")
-        print_ln("EXECUTION REPORT")
-        print_ln("═══════════════════════════════════════════════")
-        print_ln("")
-
-        var sb = sb_new()
-        sb = sb_append(sb, "Result      : ")
-        sb = sb_append(sb, pass10_code_to_result(d.level))
-        print_ln(sb_to_string(sb))
-        sb_free(sb)
-
-        var sb_code = sb_new()
-        sb_code = sb_append(sb_code, "Code        : [")
-        sb_code = sb_append(sb_code, pass10_code_to_prefix(d.level))
-        if d.message < 1000 do
-            sb_code = sb_append(sb_code, "0")
-        end
-        if d.message < 100 do
-            sb_code = sb_append(sb_code, "0")
-        end
-        if d.message < 10 do
-            sb_code = sb_append(sb_code, "0")
-        end
-        sb_code = sb_append_int(sb_code, d.message)
-        sb_code = sb_append(sb_code, "] ")
-        sb_code = sb_append(sb_code, pass10_code_to_phase(d.message))
-        print_ln(sb_to_string(sb_code))
-        sb_free(sb_code)
-
-        print_ln("Subsystem   : Compiler")
-        print_ln("Stage       : Stage 1 (Vir Native)")
-        print_ln("")
-
-        print_ln("Location")
-        print_ln("───────────────────────────────────────────────")
-        var sb_loc = sb_new()
-        sb_loc = sb_append(sb_loc, "File        : ")
-        sb_loc = sb_append(sb_loc, source_path)
-        print_ln(sb_to_string(sb_loc))
-        sb_free(sb_loc)
-
-        var sb_line = sb_new()
-        sb_line = sb_append(sb_line, "Line        : ")
-        sb_line = sb_append_int(sb_line, d.line)
-        print_ln(sb_to_string(sb_line))
-        sb_free(sb_line)
-
-        if d.col > 0 do
-            var sb_col = sb_new()
-            sb_col = sb_append(sb_col, "Column      : ")
-            sb_col = sb_append_int(sb_col, d.col)
-            print_ln(sb_to_string(sb_col))
-            sb_free(sb_col)
-        end
-        print_ln("")
-
-        print_ln("Analysis")
-        print_ln("───────────────────────────────────────────────")
-        print_ln(pass10_code_to_msg(d.message))
-        print_ln("")
-
-        print_ln("Possible Causes")
-        print_ln("───────────────────────────────────────────────")
-        print_ln(pass10_code_to_causes(d.message))
-        print_ln("")
-
-        print_ln("Action")
-        print_ln("───────────────────────────────────────────────")
-        print_ln(pass10_code_to_actions(d.message))
-        print_ln("")
-
-        print_ln("═══════════════════════════════════════════════")
-    end
-end.
+# Error code registry (pass10): maps codes to messages, phases, causes, actions.
+include error_codes
 
 export pass10_emit_diagnostics
 
@@ -26299,6 +26253,108 @@ func scoped_field_is_callable(entity_name: string, field_name: string):
     out 0
 end.
 
+func extract_base_entity_name(type_str: string):
+    slen = fat_str_len(type_str)
+    if slen <= 0 do out fat_str_new("") end
+    var i = 0
+    when i < slen loop
+        if fat_str_byte_at(type_str, i) == 60 do
+            out fat_str_slice(type_str, 0, i)
+        end
+        i = i + 1
+    end
+    out type_str
+end.
+
+func extract_generic_args_content(type_str: string):
+    slen = fat_str_len(type_str)
+    var lt = 0 - 1
+    var gt = 0 - 1
+    var depth = 0
+    var i = 0
+    when i < slen loop
+        b = fat_str_byte_at(type_str, i)
+        if b == 60 do                                 # '<'
+            if depth == 0 do lt = i end
+            depth = depth + 1
+        end
+        if b == 62 do                                 # '>'
+            depth = depth - 1
+            if depth == 0 and gt < 0 do gt = i end   # first outermost '>'
+        end
+        i = i + 1
+    end
+    if lt >= 0 and gt > lt do
+        out fat_str_slice(type_str, lt + 1, gt - lt - 1)
+    end
+    out fat_str_new("")
+end.
+
+func generic_substitute_type(param_names: string, arg_types: string, target_type: string):
+    if fat_str_len(param_names) == 0 or fat_str_len(arg_types) == 0 or fat_str_len(target_type) == 0 do
+        out target_type
+    end
+    p_count = count_list_items(param_names)
+    var i = 0
+    when i < p_count loop
+        p_name = get_list_item(param_names, i)
+        if fat_str_eq(p_name, target_type) == 1 do
+            out get_list_item(arg_types, i)
+        end
+        i = i + 1
+    end
+    # Composite type (e.g. Vec<T>, Map<K,V>): substitute within angle brackets.
+    inner = extract_generic_args_content(target_type)
+    if fat_str_len(inner) > 0 do
+        lt_pos = 0 - 1
+        var k = 0
+        when k < fat_str_len(target_type) loop
+            if fat_str_byte_at(target_type, k) == 60 do
+                lt_pos = k
+                break
+            end
+            k = k + 1
+        end
+        if lt_pos > 0 do
+            prefix = fat_str_slice(target_type, 0, lt_pos)
+            inner_count = count_list_items(inner)
+            result = fat_str_concat(prefix, fat_str_new("<"))
+            var j = 0
+            when j < inner_count loop
+                if j > 0 do result = fat_str_concat(result, fat_str_new(", ")) end
+                inner_j = get_list_item(inner, j)
+                subst_j = generic_substitute_type(param_names, arg_types, inner_j)
+                result = fat_str_concat(result, subst_j)
+                j = j + 1
+            end
+            result = fat_str_concat(result, fat_str_new(">"))
+            out result
+        end
+    end
+    out target_type
+end.
+
+func get_entity_field_type_by_name(ent_name: string, field_name: string):
+    if g_entity_hash != 0 and ent_name != 0 and field_name != 0 do
+        e_idx = hash_table_lookup(g_entity_hash, g_entity_names, ent_name)
+        if e_idx >= 0 and e_idx < vec_len_rt(g_entity_nodes) do
+            ent_ast = vec_get_rt(g_entity_nodes, e_idx) as AstNode
+            if (ent_ast as i64) != 0 do
+                n_ch = ast_node_child_count(ent_ast)
+                var j = 0
+                when j < n_ch loop
+                    f_child = ast_node_child(ent_ast, j)
+                    if ast_node_type_of(f_child) != AstType.FuncDef and fat_str_eq(ast_node_name(f_child), field_name) == 1 do
+                        out ast_node_name2(f_child)
+                    end
+                    j = j + 1
+                end
+            end
+        end
+    end
+    out fat_str_new("")
+end.
+
 # Lightweight lowering-time type recovery for inferred locals.  The semantic
 # passes already validate compatibility; this table is needed by representation-
 # sensitive lowering such as interpolation and tensor result metadata.
@@ -26324,6 +26380,35 @@ func infer_expr_type_name(node: AstNode):
         if (callee_ast as i64) != 0 do
             ret_t = ast_node_name2(callee_ast)
             if ret_t != 0 and fat_str_len(ret_t) > 0 do out ret_t end
+        end
+        out fat_str_new("")
+    end
+    if nt == AstType.EntityLiteral do
+        let gen_args_lit = ast_node_name2(node)
+        if (gen_args_lit as i64) != 0 and fat_str_len(gen_args_lit) > 0 do
+            out fat_str_concat(ast_node_name(node), fat_str_concat(fat_str_new("<"), fat_str_concat(gen_args_lit, fat_str_new(">"))))
+        end
+        out ast_node_name(node)
+    end
+    if nt == AstType.FieldAccess and ast_node_child_count(node) >= 1 do
+        base_ast = ast_node_child(node, 0)
+        base_t = infer_expr_type_name(base_ast)
+        fname = ast_node_name(node)
+        if fat_str_len(base_t) > 0 do
+            ent_name = extract_base_entity_name(base_t)
+            raw_field_t = get_entity_field_type_by_name(ent_name, fname)
+            if fat_str_len(raw_field_t) > 0 do
+                e_idx = hash_table_lookup(g_entity_hash, g_entity_names, ent_name)
+                if e_idx >= 0 and e_idx < vec_len_rt(g_entity_nodes) do
+                    ent_ast = vec_get_rt(g_entity_nodes, e_idx) as AstNode
+                    if ent_ast.builtin_id != 0 do
+                        ent_params = ent_ast.builtin_id as string
+                        ent_args = extract_generic_args_content(base_t)
+                        out generic_substitute_type(ent_params, ent_args, raw_field_t)
+                    end
+                end
+                out raw_field_t
+            end
         end
         out fat_str_new("")
     end
@@ -26885,6 +26970,14 @@ func get_scoped_field_type(entity_name: string, field_name: string):
         if idx_s >= 0 do
             out vec_get_rt(g_scoped_field_types, idx_s) as string
         end
+        base_name = extract_base_entity_name(entity_name)
+        if fat_str_eq(base_name, entity_name) == 0 do
+            scoped_key2 = fat_str_concat(fat_str_concat(base_name, dot_str), field_name)
+            idx_s2 = hash_table_lookup(g_scoped_field_hash, g_scoped_field_names, scoped_key2)
+            if idx_s2 >= 0 do
+                out vec_get_rt(g_scoped_field_types, idx_s2) as string
+            end
+        end
     end
     out fat_str_new("")
 end.
@@ -26897,6 +26990,14 @@ func get_scoped_field_index(entity_name: string, field_name: string):
         if idx_s >= 0 do
             out vec_get_rt(g_scoped_field_indices, idx_s)
         end
+        base_name = extract_base_entity_name(entity_name)
+        if fat_str_eq(base_name, entity_name) == 0 do
+            scoped_key2 = fat_str_concat(fat_str_concat(base_name, dot_str), field_name)
+            idx_s2 = hash_table_lookup(g_scoped_field_hash, g_scoped_field_names, scoped_key2)
+            if idx_s2 >= 0 do
+                out vec_get_rt(g_scoped_field_indices, idx_s2)
+            end
+        end
     end
     out 0 - 1
 end.
@@ -26908,6 +27009,14 @@ func get_scoped_field_offset(entity_name: string, field_name: string):
         idx_s = hash_table_lookup(g_scoped_field_hash, g_scoped_field_names, scoped_key)
         if idx_s >= 0 and idx_s < vec_len_rt(g_scoped_field_offsets) do
             out vec_get_rt(g_scoped_field_offsets, idx_s)
+        end
+        base_name = extract_base_entity_name(entity_name)
+        if fat_str_eq(base_name, entity_name) == 0 do
+            scoped_key2 = fat_str_concat(fat_str_concat(base_name, dot_str), field_name)
+            idx_s2 = hash_table_lookup(g_scoped_field_hash, g_scoped_field_names, scoped_key2)
+            if idx_s2 >= 0 and idx_s2 < vec_len_rt(g_scoped_field_offsets) do
+                out vec_get_rt(g_scoped_field_offsets, idx_s2)
+            end
         end
     end
     out 0
@@ -27194,7 +27303,12 @@ end.
 
 func is_entity_name(type_name: string):
     if (type_name as i64) < 4096 do out 0 end
-    out lookup_cached_name(g_entity_names, type_name) >= 0
+    if lookup_cached_name(g_entity_names, type_name) >= 0 do out 1 end
+    base_name = extract_base_entity_name(type_name)
+    if fat_str_eq(base_name, type_name) == 0 do
+        out lookup_cached_name(g_entity_names, base_name) >= 0
+    end
+    out 0
 end.
 
 func is_register_field(field_name: string):
@@ -31151,10 +31265,119 @@ func lower_decl_marker(b: MirBuilder, node: AstNode):
 	out emit_intrinsic(b1, MIR_INTR_DECL, mir_opnd_none(), mir_opnd_imm(ast_node_type_of(node) as i64))
 end.
 
+func build_specialized_func_name(callee_name: string, gen_args: string):
+    var res = fat_str_concat(callee_name, fat_str_new("__spec__"))
+    var i = 0
+    var n = fat_str_len(gen_args)
+    when i < n loop
+        b = fat_str_byte_at(gen_args, i)
+        if b == 44 do
+            res = fat_str_concat(res, fat_str_new("_"))
+        eif b == 32 or b == 60 or b == 62 do
+            # skip space, <, >
+        else
+            res = fat_str_concat(res, fat_str_slice(gen_args, i, 1))
+        end
+        i = i + 1
+    end
+    out res
+end.
+
+func clone_ast_with_subst(node: AstNode, gen_params: string, gen_args: string):
+    if (node as i64) == 0 do out 0 as AstNode end
+    let n_ptr = node as i64
+    cnt = native_read_i64(n_ptr, 16) as AstType
+    var c = ast_new(cnt)
+    let c_ptr = c as i64
+    native_write_i64(c_ptr, 0, native_read_i64(n_ptr, 0))
+    n2 = native_read_i64(n_ptr, 8) as string
+    if (n2 as i64) != 0 and fat_str_len(n2) > 0 do
+        subst_n2 = generic_substitute_type(gen_params, gen_args, n2)
+        native_write_i64(c_ptr, 8, subst_n2 as i64)
+    end
+    native_write_i64(c_ptr, 24, native_read_i64(n_ptr, 24))
+    native_write_i64(c_ptr, 32, native_read_i64(n_ptr, 32))
+    native_write_i64(c_ptr, 40, native_read_i64(n_ptr, 40))
+    native_write_i64(c_ptr, 48, native_read_i64(n_ptr, 48))
+    native_write_i64(c_ptr, 56, native_read_i64(n_ptr, 56))
+    n_kids = ast_node_child_count(node)
+    var i = 0
+    when i < n_kids loop
+        kid = ast_node_child(node, i)
+        c = ast_add_child(c, clone_ast_with_subst(kid, gen_params, gen_args))
+        i = i + 1
+    end
+    out c
+end.
+
+func specialize_func_def(orig_fn: AstNode, spec_name: string, gen_params: string, gen_args: string):
+    var spec_fn = ast_new(AstType.FuncDef)
+    let s_ptr = spec_fn as i64
+    let o_ptr = orig_fn as i64
+    native_write_i64(s_ptr, 0, spec_name as i64)
+    orig_ret = native_read_i64(o_ptr, 8) as string
+    if (orig_ret as i64) != 0 and fat_str_len(orig_ret) > 0 do
+        subst_ret = generic_substitute_type(gen_params, gen_args, orig_ret)
+        native_write_i64(s_ptr, 8, subst_ret as i64)
+    end
+    native_write_i64(s_ptr, 24, native_read_i64(o_ptr, 24))
+    native_write_i64(s_ptr, 32, native_read_i64(o_ptr, 32))
+    native_write_i64(s_ptr, 40, native_read_i64(o_ptr, 40))
+    native_write_i64(s_ptr, 48, native_read_i64(o_ptr, 48))
+    native_write_i64(s_ptr, 56, 0)
+    n_kids = ast_node_child_count(orig_fn)
+    var i = 0
+    when i < n_kids loop
+        kid = ast_node_child(orig_fn, i)
+        spec_fn = ast_add_child(spec_fn, clone_ast_with_subst(kid, gen_params, gen_args))
+        i = i + 1
+    end
+    out spec_fn
+end.
+
+func monomorphize_walk(prog: AstNode, node: AstNode):
+    if (node as i64) == 0 do out 0 end
+    nt = ast_node_type_of(node)
+    if nt == AstType.Call do
+        gen_args = ast_node_name2(node)
+        if (gen_args as i64) != 0 and fat_str_len(gen_args) > 0 do
+            callee_name = ast_node_name(node)
+            fn_ast = find_func_ast(callee_name)
+            if (fn_ast as i64) != 0 and fn_ast.builtin_id != 0 do
+                gen_params = fn_ast.builtin_id as string
+                spec_name = build_specialized_func_name(callee_name, gen_args)
+                existing = find_func_ast(spec_name)
+                if (existing as i64) == 0 do
+                    spec_fn = specialize_func_def(fn_ast, spec_name, gen_params, gen_args)
+                    fn_idx = vec_len_rt(g_func_ast_names)
+                    g_func_ast_names = vec_push_rt(g_func_ast_names, spec_name as i64)
+                    g_func_ast_nodes = vec_push_rt(g_func_ast_nodes, spec_fn as i64)
+                    hash_table_insert(g_func_ast_hash, g_func_ast_names, spec_name, fn_idx)
+                    prog = ast_add_child(prog, spec_fn)
+                    monomorphize_walk(prog, spec_fn)
+                end
+                native_write_i64(node as i64, 0, spec_name as i64)
+                native_write_i64(node as i64, 8, fat_str_new("") as i64)
+            end
+        end
+    end
+    n_kids = ast_node_child_count(node)
+    var i = 0
+    when i < n_kids loop
+        kid = ast_node_child(node, i)
+        monomorphize_walk(prog, kid)
+        i = i + 1
+    end
+    out 0
+end.
+
 func ast_lower_program(prog: AstNode):
     set_global_prog_ast(prog)
 	ffi_import_reset()
 	g_mir_scratch_top = 0
+	if g_disable_specialization == 0 do
+		monomorphize_walk(prog, prog)
+	end
 	# Soft/C-VM: keep `var` on the result vec so push reassignments stick.
 	var mir_funcs = vec_new_rt()
 	mir_funcs = vec_push_rt(mir_funcs, ast_build_global_init_func())
@@ -31172,7 +31395,7 @@ func ast_lower_program(prog: AstNode):
 			end
 		end
 		if nt == AstType.FuncDef do
-			if fat_cstr_eq(ast_node_name2(child), "precomp") == 0 do
+			if fat_cstr_eq(ast_node_name2(child), "precomp") == 0 and (g_disable_specialization == 1 or child.builtin_id == 0) do
 				is_func = 1
 			end
 		end
@@ -55041,6 +55264,17 @@ func virc_compile(cfg: CompilerConfig):
             print_ln("virc: import symbol not exported")
             sys_exit(1)
         end
+        source_fat = expand_includes_text(source_fat)
+        if g_inc_err == 1 do
+            print_ln("virc: include expansion failed")
+            sys_exit(1)
+        end
+    else
+        # Pre-expanded file (starts with # @vir_source): still expand any
+        # new 'include' directives added for incremental modularisation.
+        # Import expansion is intentionally skipped — modules are already
+        # inlined and re-loading them would produce duplicate definitions.
+        g_inc_main_file = input_path
         source_fat = expand_includes_text(source_fat)
         if g_inc_err == 1 do
             print_ln("virc: include expansion failed")

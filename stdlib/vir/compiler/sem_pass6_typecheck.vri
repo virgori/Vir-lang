@@ -22,7 +22,7 @@ include scope_tree
 import ScopeTree, ScopeKind, ScopeNode, scope_push, scope_pop, scope_add_symbol, scope_current_id from scope_tree
 
 include context
-import DiagnosticEngine, report_error from context
+import DiagnosticEngine, report_error, g_generic_diag_name from context
 
 include type_table
 import TypeKind, TYPE_VOID, TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_STRING, is_tensor_type_str, tensor_type_is_well_formed, parse_tensor_elem_type, parse_tensor_shape, parse_tensor_rank from type_table
@@ -1043,6 +1043,9 @@ func pass6_get_receiver_entity_name(symbols: SymbolTable, scopes: ScopeTree, rec
         out fat_str_new("")
     end
     if nt == AstType.EntityLiteral do
+        if fat_str_len(recv.name2) > 0 do
+            out fat_str_concat(recv.name, fat_str_concat(fat_str_new("<"), fat_str_concat(recv.name2, fat_str_new(">"))))
+        end
         out recv.name
     end
     if nt == AstType.BuiltinCall & fat_cstr_eq(recv.name, "port") == 1 do
@@ -1236,6 +1239,188 @@ func pass6_extract_second_generic_arg(type_str: string):
         out fat_str_slice(type_str, start, gt - start)
     end
     out fat_str_new("")
+end.
+
+func count_list_items(s: string):
+    slen = fat_str_len(s)
+    if slen <= 0 do out 0 end
+    var count = 1
+    var depth = 0
+    var i = 0
+    when i < slen loop
+        b = fat_str_byte_at(s, i)
+        if b == 60 do depth = depth + 1 end       # '<': enter generic
+        if b == 62 do depth = depth - 1 end       # '>': leave generic
+        if b == 44 and depth == 0 do               # ',': only at top level
+            count = count + 1
+        end
+        i = i + 1
+    end
+    out count
+end.
+
+func get_list_item(s: string, target_idx: int):
+    slen = fat_str_len(s)
+    if slen <= 0 do out fat_str_new("") end
+    var cur_idx = 0
+    var start = 0
+    var depth = 0
+    var i = 0
+    when i <= slen loop
+        var at_split = false
+        if i == slen do
+            at_split = true
+        eif fat_str_byte_at(s, i) == 60 do
+            depth = depth + 1                     # '<': enter generic
+        eif fat_str_byte_at(s, i) == 62 do
+            depth = depth - 1                     # '>': leave generic
+        eif fat_str_byte_at(s, i) == 44 and depth == 0 do
+            at_split = true                       # ',': split only at top level
+        end
+        if at_split do
+            if cur_idx == target_idx do
+                var item_start = start
+                when item_start < i and fat_str_byte_at(s, item_start) == 32 loop
+                    item_start = item_start + 1
+                end
+                var item_end = i
+                when item_end > item_start and fat_str_byte_at(s, item_end - 1) == 32 loop
+                    item_end = item_end - 1
+                end
+                out fat_str_slice(s, item_start, item_end - item_start)
+            end
+            cur_idx = cur_idx + 1
+            start = i + 1
+        end
+        i = i + 1
+    end
+    out fat_str_new("")
+end.
+
+func pass6_extract_generic_args_content(type_str: string):
+    slen = fat_str_len(type_str)
+    var lt = 0 - 1
+    var gt = 0 - 1
+    var depth = 0
+    var i = 0
+    when i < slen loop
+        b = fat_str_byte_at(type_str, i)
+        if b == 60 do                                 # '<'
+            if depth == 0 do lt = i end
+            depth = depth + 1
+        end
+        if b == 62 do                                 # '>'
+            depth = depth - 1
+            if depth == 0 and gt < 0 do gt = i end   # first outermost '>'
+        end
+        i = i + 1
+    end
+    if lt >= 0 and gt > lt do
+        out fat_str_slice(type_str, lt + 1, gt - lt - 1)
+    end
+    out fat_str_new("")
+end.
+
+func pass6_substitute_generic_type(param_names: string, arg_types: string, target_type: string):
+    if fat_str_len(param_names) == 0 or fat_str_len(arg_types) == 0 or fat_str_len(target_type) == 0 do
+        out target_type
+    end
+    p_count = count_list_items(param_names)
+    var i = 0
+    when i < p_count loop
+        p_name = get_list_item(param_names, i)
+        if fat_str_eq(p_name, target_type) == 1 do
+            out get_list_item(arg_types, i)
+        end
+        i = i + 1
+    end
+    # Composite type (e.g. Vec<T>, Map<K,V>): substitute within angle brackets.
+    inner = pass6_extract_generic_args_content(target_type)
+    if fat_str_len(inner) > 0 do
+        lt_pos = 0 - 1
+        var k = 0
+        when k < fat_str_len(target_type) loop
+            if fat_str_byte_at(target_type, k) == 60 do
+                lt_pos = k
+                break
+            end
+            k = k + 1
+        end
+        if lt_pos > 0 do
+            prefix = fat_str_slice(target_type, 0, lt_pos)
+            inner_count = count_list_items(inner)
+            result = fat_str_concat(prefix, fat_str_new("<"))
+            var j = 0
+            when j < inner_count loop
+                if j > 0 do result = fat_str_concat(result, fat_str_new(", ")) end
+                inner_j = get_list_item(inner, j)
+                subst_j = pass6_substitute_generic_type(param_names, arg_types, inner_j)
+                result = fat_str_concat(result, subst_j)
+                j = j + 1
+            end
+            result = fat_str_concat(result, fat_str_new(">"))
+            out result
+        end
+    end
+    out target_type
+end.
+
+func pass6_is_known_type(symbols: SymbolTable, scopes: ScopeTree, ty: string):
+    if fat_str_len(ty) == 0 do out true end
+    if fat_cstr_eq(ty, "int") == 1 or fat_cstr_eq(ty, "i8") == 1 or fat_cstr_eq(ty, "i16") == 1 or fat_cstr_eq(ty, "i32") == 1 or fat_cstr_eq(ty, "i64") == 1 do out true end
+    if fat_cstr_eq(ty, "uint") == 1 or fat_cstr_eq(ty, "u8") == 1 or fat_cstr_eq(ty, "u16") == 1 or fat_cstr_eq(ty, "u32") == 1 or fat_cstr_eq(ty, "u64") == 1 do out true end
+    if fat_cstr_eq(ty, "float") == 1 or fat_cstr_eq(ty, "f32") == 1 or fat_cstr_eq(ty, "f64") == 1 do out true end
+    if fat_cstr_eq(ty, "bool") == 1 or fat_cstr_eq(ty, "string") == 1 or fat_cstr_eq(ty, "ptr") == 1 or fat_cstr_eq(ty, "void") == 1 or fat_cstr_eq(ty, "any") == 1 do out true end
+    if (pass6_find_entity_ast(symbols, scopes, ty) as i64) != 0 do out true end
+    if (pass6_find_enum_ast(symbols, scopes, ty) as i64) != 0 do out true end
+    out false
+end.
+
+func pass6_is_in_generic_params(gen_params: string, ty: string):
+    if fat_str_len(gen_params) == 0 or fat_str_len(ty) == 0 do out false end
+    p_count = count_list_items(gen_params)
+    var i = 0
+    when i < p_count loop
+        if fat_str_eq(get_list_item(gen_params, i), ty) == 1 do
+            out true
+        end
+        i = i + 1
+    end
+    out false
+end.
+
+func pass6_check_generic_func_def(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, node: AstNode):
+    if node.builtin_id == 0 do out 0 end
+    gen_params = node.builtin_id as string
+    if fat_str_len(node.name2) > 0 do
+        if pass6_is_known_type(symbols, scopes, node.name2) == 0 do
+            if pass6_is_in_generic_params(gen_params, node.name2) == 0 do
+                g_generic_diag_name = node.name2
+                report_error(diag, 3086, node.line, 0)
+                out 0
+            end
+        end
+    end
+    child_count = vec_len_rt(node.children)
+    var i = 0
+    when i < child_count loop
+        param = vec_get_rt(node.children, i) as AstNode
+        if param.node_type == AstType.ParamDef or param.node_type == AstType.RefParam do
+            if fat_str_len(param.name2) > 0 do
+                if pass6_is_known_type(symbols, scopes, param.name2) == 0 do
+                    if pass6_is_in_generic_params(gen_params, param.name2) == 0 do
+                        g_generic_diag_name = param.name2
+                        var pline = param.line
+                        if pline <= 0 do pline = node.line end
+                        report_error(diag, 3086, pline, 0)
+                        out 0
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    out 0
 end.
 
 func pass6_check_enum_generic_arg(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine, decl_type: string, init_expr: AstNode):
@@ -1874,6 +2059,19 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
 
     if node.node_type == AstType.EntityLiteral do
         pass6_check_packed_literal(symbols, scopes, diag, node)
+        ent_ast = pass6_find_entity_ast(symbols, scopes, node.name)
+        if (ent_ast as i64) != 0 do
+            if ent_ast.builtin_id != 0 do
+                ent_decl_cnt = count_list_items(ent_ast.builtin_id as string)
+                var ent_prov_cnt = 0
+                if fat_str_len(node.name2) > 0 do
+                    ent_prov_cnt = count_list_items(node.name2)
+                end
+                if ent_decl_cnt != ent_prov_cnt do
+                    report_error(diag, 3085, node.line, 0)
+                end
+            end
+        end
     end
 
     if node.node_type == AstType.RegisterDef do
@@ -2329,6 +2527,16 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         end
         call_ast = pass6_find_free_function(node.name)
         if (call_ast as i64) != 0 do
+            if call_ast.builtin_id != 0 do
+                fn_decl_cnt = count_list_items(call_ast.builtin_id as string)
+                var fn_prov_cnt = 0
+                if fat_str_len(node.name2) > 0 do
+                    fn_prov_cnt = count_list_items(node.name2)
+                end
+                if fn_decl_cnt != fn_prov_cnt do
+                    report_error(diag, 3085, node.line, 0)
+                end
+            end
             var fn_params = vec_new_rt()
             var fpi = 0
             when fpi < vec_len_rt(call_ast.children) loop
@@ -2698,6 +2906,9 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
 
     # 5. FuncDef Scope & Local Parameter Registration
     if node.node_type == AstType.FuncDef do
+        if node.builtin_id != 0 do
+            pass6_check_generic_func_def(symbols, scopes, diag, node)
+        end
         g_pass6_assigned_vars = vec_new_rt()
         scope_push(scopes, ScopeKind.Func)
         child_count = vec_len_rt(node.children)
@@ -2805,8 +3016,42 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
             end
         end
         var initializer_type = fat_str_new("")
+        if fat_str_len(node.name2) > 0 do
+            var vd_base = pass6_extract_base_name(node.name2)
+            var vd_ent = pass6_find_entity_ast(symbols, scopes, vd_base)
+            if (vd_ent as i64) != 0 do
+                if vd_ent.builtin_id != 0 do
+                    var vd_gen_args = pass6_extract_generic_args_content(node.name2)
+                    var vd_decl_cnt = count_list_items(vd_ent.builtin_id as string)
+                    var vd_prov_cnt = 0
+                    if fat_str_len(vd_gen_args) > 0 do
+                        vd_prov_cnt = count_list_items(vd_gen_args)
+                    end
+                    if vd_decl_cnt != vd_prov_cnt do
+                        report_error(diag, 3085, node.line, 0)
+                    end
+                end
+            end
+        end
         if child_count > 0 do
             child0 = vec_get_rt(node.children, 0)
+            if child0.node_type == AstType.Call do
+                if fat_str_len(child0.name2) > 0 do
+                    if fat_str_len(node.name2) > 0 do
+                        var call_fn = pass6_find_free_function(child0.name)
+                        if (call_fn as i64) != 0 do
+                            if call_fn.builtin_id != 0 do
+                                var spec_ret = pass6_substitute_generic_type(call_fn.builtin_id as string, child0.name2, call_fn.name2)
+                                if fat_str_len(spec_ret) > 0 do
+                                    if fat_str_eq(spec_ret, node.name2) == 0 do
+                                        report_error(diag, 3084, child0.line, 0)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
             pass6_check_enum_generic_arg(symbols, scopes, diag, node.name2, child0)
             initializer_type = pass6_get_receiver_entity_name(symbols, scopes, child0)
             if child0.node_type == AstType.QuantizeExpr do
@@ -2816,7 +3061,7 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                 initializer_type = fat_str_new("dict")
             end
         end
-        if fat_str_len(initializer_type) > 0 do
+        if fat_str_len(node.name2) == 0 and fat_str_len(initializer_type) > 0 do
             node.name2 = initializer_type
             pass6_set_var_type(node.name, initializer_type)
         eif fat_str_len(node.name2) > 0 do
@@ -2848,12 +3093,46 @@ func pass6_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
             end
         end
         var initializer_type = fat_str_new("")
+        if fat_str_len(node.name2) > 0 do
+            var cd_base = pass6_extract_base_name(node.name2)
+            var cd_ent = pass6_find_entity_ast(symbols, scopes, cd_base)
+            if (cd_ent as i64) != 0 do
+                if cd_ent.builtin_id != 0 do
+                    var cd_gen_args = pass6_extract_generic_args_content(node.name2)
+                    var cd_decl_cnt = count_list_items(cd_ent.builtin_id as string)
+                    var cd_prov_cnt = 0
+                    if fat_str_len(cd_gen_args) > 0 do
+                        cd_prov_cnt = count_list_items(cd_gen_args)
+                    end
+                    if cd_decl_cnt != cd_prov_cnt do
+                        report_error(diag, 3085, node.line, 0)
+                    end
+                end
+            end
+        end
         if child_count > 0 do
             child0 = vec_get_rt(node.children, 0)
+            if child0.node_type == AstType.Call do
+                if fat_str_len(child0.name2) > 0 do
+                    if fat_str_len(node.name2) > 0 do
+                        var cd_call_fn = pass6_find_free_function(child0.name)
+                        if (cd_call_fn as i64) != 0 do
+                            if cd_call_fn.builtin_id != 0 do
+                                var cd_spec_ret = pass6_substitute_generic_type(cd_call_fn.builtin_id as string, child0.name2, cd_call_fn.name2)
+                                if fat_str_len(cd_spec_ret) > 0 do
+                                    if fat_str_eq(cd_spec_ret, node.name2) == 0 do
+                                        report_error(diag, 3084, child0.line, 0)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
             pass6_check_enum_generic_arg(symbols, scopes, diag, node.name2, child0)
             initializer_type = pass6_get_receiver_entity_name(symbols, scopes, child0)
         end
-        if fat_str_len(initializer_type) > 0 do
+        if fat_str_len(node.name2) == 0 and fat_str_len(initializer_type) > 0 do
             node.name2 = initializer_type
             pass6_set_var_type(node.name, initializer_type)
         eif fat_str_len(node.name2) > 0 do
