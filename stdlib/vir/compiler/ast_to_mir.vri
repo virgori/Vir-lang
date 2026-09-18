@@ -103,9 +103,14 @@ entity LoopTarget:
 end.
 
 func loop_target_new(break_block: i64, continue_block: i64):
-    p = alloc(16)
+    p = alloc(24)
     native_write_i64(p, 0, break_block)
     native_write_i64(p, 8, continue_block)
+    var cur_depth = 0
+    if g_arena_mark_stack != 0 do
+        cur_depth = vec_len_rt(g_arena_mark_stack)
+    end
+    native_write_i64(p, 16, cur_depth)
     out p
 end.
 
@@ -115,6 +120,11 @@ end.
 
 func loop_target_continue_block(lt: LoopTarget):
     out native_read_i64(lt as i64, 8)
+end.
+
+func loop_target_arena_depth(lt: LoopTarget):
+    if (lt as i64) == 0 do out 0 end
+    out native_read_i64(lt as i64, 16)
 end.
 
 entity MirBuilder:
@@ -602,6 +612,15 @@ func infer_expr_type_name(node: AstNode):
     if nt == AstType.LiteralNone do out fat_str_new("none") end
     if nt == AstType.EnumConstruct do out ast_node_name2(node) end
     if nt == AstType.LiteralStr or nt == AstType.InterpExpr do out fat_str_new("string") end
+    if nt == AstType.ArrayLiteral do
+        if ast_node_child_count(node) > 0 do
+            let elem_t = infer_expr_type_name(ast_node_child(node, 0))
+            if fat_str_len(elem_t) > 0 do
+                out fat_str_concat(fat_str_new("["), fat_str_concat(elem_t, fat_str_new("]")))
+            end
+        end
+        out fat_str_new("[int]")
+    end
     if nt == AstType.CastExpr do out ast_node_name(node) end
     if nt == AstType.Identifier do
         vt = get_var_type(ast_node_name(node))
@@ -2217,8 +2236,8 @@ func builtin_id_from_name_uncached(name: string):
     if fat_cstr_eq(name, "len") == 1 do out 1 end
     if fat_cstr_eq(name, "push") == 1 do out 2 end
     if fat_cstr_eq(name, "arr_push") == 1 do out 2 end
-    if fat_cstr_eq(name, "alloc") == 1 or fat_cstr_eq(name, "vir_alloc") == 1 do out 3 end
-    if fat_cstr_eq(name, "dealloc") == 1 or fat_cstr_eq(name, "free") == 1 or fat_cstr_eq(name, "vir_free") == 1 do out 4 end
+    if fat_cstr_eq(name, "alloc") == 1 do out 3 end
+
     if fat_cstr_eq(name, "read_byte") == 1 or fat_cstr_eq(name, "native_read_u8") == 1 or fat_cstr_eq(name, "read_u8") == 1 or fat_cstr_eq(name, "read8") == 1 do out 5 end
     if fat_cstr_eq(name, "write_byte") == 1 or fat_cstr_eq(name, "native_write_u8") == 1 or fat_cstr_eq(name, "write_u8") == 1 or fat_cstr_eq(name, "write8") == 1 do out 6 end
     if fat_cstr_eq(name, "read_word") == 1 or fat_cstr_eq(name, "native_read_i64") == 1 or fat_cstr_eq(name, "read_i64") == 1 or fat_cstr_eq(name, "read64") == 1 do out 7 end
@@ -3956,6 +3975,55 @@ func lower_expr(b: MirBuilder, expr: AstNode):
 	out lower_expr_impl(b, expr)
 end.
 
+func scan_has_local_arena_alloc(node: AstNode):
+    if node == 0 do out 0 end
+    let nt = ast_node_type_of(node)
+    if nt == AstType.ArrayLiteral do out 1 end
+    let nc = ast_node_child_count(node)
+    var i = 0
+    when i < nc loop
+        let ch = ast_node_child(node, i)
+        if scan_has_local_arena_alloc(ch) == 1 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func scan_arena_escaped_var(node: AstNode):
+    if node == 0 do out fat_str_new("") end
+    let nt = ast_node_type_of(node)
+    if nt == AstType.Assign do
+        var target_name = ast_node_name(node)
+        if ast_node_child_count(node) >= 2 do
+            target_name = ast_node_name(ast_node_child(node, 0))
+        end
+        if (target_name as i64) != 0 and fat_str_len(target_name) > 0 do
+            if g_current_func_buckets != 0 do
+                let existing_vr = buckets_get_var(g_current_func_buckets, target_name)
+                if existing_vr >= 0 do
+                    let vt = get_var_type(target_name)
+                    if (vt as i64) != 0 and fat_str_len(vt) > 0 and fat_str_byte_at(vt, 0) == 91 do
+                        out target_name
+                    end
+                end
+            end
+        end
+    end
+    let nc = ast_node_child_count(node)
+    var i = 0
+    when i < nc loop
+        let ch = ast_node_child(node, i)
+        let found = scan_arena_escaped_var(ch)
+        if (found as i64) != 0 and fat_str_len(found) > 0 do
+            out found
+        end
+        i = i + 1
+    end
+    out fat_str_new("")
+end.
+
 func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 	stmt_type = ast_node_type_of(stmt)
 
@@ -4509,13 +4577,38 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		var cond_opnd = g_lower_expr_result_opnd as MirOperand
 		b5 = emit_jump_if_not(b5, cond_opnd, end_id, body_id)
 		b5 = builder_set_current_block(b5, body_id)
-		b5 = lower_stmt(b5, body_block)
-		if not builder_current_block_terminated(b5) do
-			b5 = emit_jump(b5, cond_id)
+
+		let has_arena = scan_has_local_arena_alloc(body_block)
+		let esc_name = scan_arena_escaped_var(body_block)
+		var b_body = b5
+		var iter_mark = 0
+		if has_arena == 1 and fat_str_len(esc_name) == 0 do
+			var (b_mark, imk) = builder_new_vreg(b_body)
+			iter_mark = imk
+			b_body = emit_intrinsic(b_mark, MIR_INTR_ARENA, mir_opnd_vreg(iter_mark), mir_opnd_none())
+			if g_arena_mark_stack == 0 do
+				g_arena_mark_stack = vec_new_rt()
+			end
+			g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, iter_mark as i64)
 		end
-		b5 = builder_pop_loop(b5)
-		b5 = builder_set_current_block(b5, end_id)
-		out b5
+
+		b_body = lower_stmt(b_body, body_block)
+
+		if has_arena == 1 and fat_str_len(esc_name) == 0 do
+			if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+				vec_pop_rt(g_arena_mark_stack)
+			end
+			if not builder_current_block_terminated(b_body) do
+				b_body = emit_intrinsic(b_body, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(iter_mark))
+			end
+		end
+
+		if not builder_current_block_terminated(b_body) do
+			b_body = emit_jump(b_body, cond_id)
+		end
+		b_body = builder_pop_loop(b_body)
+		b_body = builder_set_current_block(b_body, end_id)
+		out b_body
 	end
 
     # 4b. LoopStmt — counted: i in 0..count
@@ -4539,13 +4632,38 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		b8 = builder_add_instr(b8, insc)
 		b8 = emit_jump_if_not(b8, mir_opnd_vreg(cmpv), end_id, body_id)
 		b8 = builder_set_current_block(b8, body_id)
-		b8 = lower_stmt(b8, body_block)
-		if not builder_current_block_terminated(b8) do
-			b8 = emit_jump(b8, step_id)
+
+		let has_arena_loop = scan_has_local_arena_alloc(body_block)
+		let esc_name_loop = scan_arena_escaped_var(body_block)
+		var b_body = b8
+		var iter_mark = 0
+		if has_arena_loop == 1 and fat_str_len(esc_name_loop) == 0 do
+			var (b_mark, imk) = builder_new_vreg(b_body)
+			iter_mark = imk
+			b_body = emit_intrinsic(b_mark, MIR_INTR_ARENA, mir_opnd_vreg(iter_mark), mir_opnd_none())
+			if g_arena_mark_stack == 0 do
+				g_arena_mark_stack = vec_new_rt()
+			end
+			g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, iter_mark as i64)
 		end
-		b8 = builder_set_current_block(b8, step_id)
+
+		b_body = lower_stmt(b_body, body_block)
+
+		if has_arena_loop == 1 and fat_str_len(esc_name_loop) == 0 do
+			if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+				vec_pop_rt(g_arena_mark_stack)
+			end
+			if not builder_current_block_terminated(b_body) do
+				b_body = emit_intrinsic(b_body, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(iter_mark))
+			end
+		end
+
+		if not builder_current_block_terminated(b_body) do
+			b_body = emit_jump(b_body, step_id)
+		end
+		b_body = builder_set_current_block(b_body, step_id)
         # Non-SSA induction: redefine same vreg (SSA rename comes later).
-		var (b9, iv2) = builder_new_vreg(b8)
+		var (b9, iv2) = builder_new_vreg(b_body)
 		ins1 = mir_instr_new(MirOp.Add, mir_opnd_vreg(iv2), mir_opnd_vreg(iv), mir_opnd_imm(1))
 		b9 = builder_add_instr(b9, ins1)
 		insm = mir_instr_new(MirOp.Move, mir_opnd_vreg(iv), mir_opnd_vreg(iv2), mir_opnd_none())
@@ -4632,11 +4750,12 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		lt = builder_loop_top(b)
 		brk = loop_target_break_block(lt)
 		if brk >= 0 do
-			# Restore any active arena marks in reverse order before jumping out of the loop
+			let base_depth = loop_target_arena_depth(lt)
+			# Restore active arena marks down to the loop's outer depth
 			if g_arena_mark_stack != 0 do
 				var ams_len = vec_len_rt(g_arena_mark_stack)
 				var ams_i = ams_len - 1
-				when ams_i >= 0 loop
+				when ams_i >= base_depth loop
 					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
 					b = emit_intrinsic(b, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
 					ams_i = ams_i - 1
@@ -4650,11 +4769,12 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		lt = builder_loop_top(b)
 		cnt = loop_target_continue_block(lt)
 		if cnt >= 0 do
-			# Restore any active arena marks in reverse order before jumping to continue
+			let base_depth = loop_target_arena_depth(lt)
+			# Restore active arena marks down to the loop's outer depth
 			if g_arena_mark_stack != 0 do
 				var ams_len = vec_len_rt(g_arena_mark_stack)
 				var ams_i = ams_len - 1
-				when ams_i >= 0 loop
+				when ams_i >= base_depth loop
 					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
 					b = emit_intrinsic(b, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
 					ams_i = ams_i - 1
@@ -4843,13 +4963,37 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 			b9 = builder_add_instr(b9, insc)
 			b9 = emit_jump_if_not(b9, mir_opnd_vreg(cmpv), end_id, body_id)
 			b9 = builder_set_current_block(b9, body_id)
-			b9 = lower_stmt(b9, body_stmt)
-			if not builder_current_block_terminated(b9) do
-				b9 = emit_jump(b9, step_id)
+			let has_arena_for = scan_has_local_arena_alloc(body_stmt)
+			let esc_name_for = scan_arena_escaped_var(body_stmt)
+			var b_body = b9
+			var iter_mark = 0
+			if has_arena_for == 1 and fat_str_len(esc_name_for) == 0 do
+				var (b_mark, imk) = builder_new_vreg(b_body)
+				iter_mark = imk
+				b_body = emit_intrinsic(b_mark, MIR_INTR_ARENA, mir_opnd_vreg(iter_mark), mir_opnd_none())
+				if g_arena_mark_stack == 0 do
+					g_arena_mark_stack = vec_new_rt()
+				end
+				g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, iter_mark as i64)
 			end
-			b9 = builder_set_current_block(b9, step_id)
-			iv_cur2 = get_var_vreg(b9, ast_node_name(stmt))
-			var (b10, ivn) = builder_new_vreg(b9)
+
+			b_body = lower_stmt(b_body, body_stmt)
+
+			if has_arena_for == 1 and fat_str_len(esc_name_for) == 0 do
+				if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+					vec_pop_rt(g_arena_mark_stack)
+				end
+				if not builder_current_block_terminated(b_body) do
+					b_body = emit_intrinsic(b_body, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(iter_mark))
+				end
+			end
+
+			if not builder_current_block_terminated(b_body) do
+				b_body = emit_jump(b_body, step_id)
+			end
+			b_body = builder_set_current_block(b_body, step_id)
+			iv_cur2 = get_var_vreg(b_body, ast_node_name(stmt))
+			var (b10, ivn) = builder_new_vreg(b_body)
 			ins1 = mir_instr_new(MirOp.Add, mir_opnd_vreg(ivn), mir_opnd_vreg(iv_cur2), mir_opnd_imm(1))
 			b10 = builder_add_instr(b10, ins1)
 			insm = mir_instr_new(MirOp.Move, mir_opnd_vreg(iv_cur2), mir_opnd_vreg(ivn), mir_opnd_none())
@@ -4893,13 +5037,38 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		var cond_opnd = g_lower_expr_result_opnd as MirOperand
 		b5 = emit_jump_if_not(b5, cond_opnd, end_id, body_id)
 		b5 = builder_set_current_block(b5, body_id)
-		b5 = lower_stmt(b5, body_block)
-		if not builder_current_block_terminated(b5) do
-			b5 = emit_jump(b5, cond_id)
+
+		let has_arena_when = scan_has_local_arena_alloc(body_block)
+		let esc_name_when = scan_arena_escaped_var(body_block)
+		var b_body = b5
+		var iter_mark = 0
+		if has_arena_when == 1 and fat_str_len(esc_name_when) == 0 do
+			var (b_mark, imk) = builder_new_vreg(b_body)
+			iter_mark = imk
+			b_body = emit_intrinsic(b_mark, MIR_INTR_ARENA, mir_opnd_vreg(iter_mark), mir_opnd_none())
+			if g_arena_mark_stack == 0 do
+				g_arena_mark_stack = vec_new_rt()
+			end
+			g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, iter_mark as i64)
 		end
-		b5 = builder_pop_loop(b5)
-		b5 = builder_set_current_block(b5, end_id)
-		out b5
+
+		b_body = lower_stmt(b_body, body_block)
+
+		if has_arena_when == 1 and fat_str_len(esc_name_when) == 0 do
+			if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+				vec_pop_rt(g_arena_mark_stack)
+			end
+			if not builder_current_block_terminated(b_body) do
+				b_body = emit_intrinsic(b_body, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(iter_mark))
+			end
+		end
+
+		if not builder_current_block_terminated(b_body) do
+			b_body = emit_jump(b_body, cond_id)
+		end
+		b_body = builder_pop_loop(b_body)
+		b_body = builder_set_current_block(b_body, end_id)
+		out b_body
 	end
 
     # 13. Throw / Cancel / Quiet
@@ -4941,18 +5110,29 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		out b
 	end
 
+
     # 14. ArenaBlock — sub-arena save and restore
 	if stmt_type == AstType.ArenaBlock do
+		n_ch = ast_node_child_count(stmt)
 		var (b1, mark_vreg) = builder_new_vreg(b)
 		b1 = emit_intrinsic(b1, MIR_INTR_ARENA, mir_opnd_vreg(mark_vreg), mir_opnd_none())
+		var has_cap = false
+		var cap_opnd = mir_opnd_none()
+		if n_ch > 1 do
+			has_cap = true
+			var b_cap = lower_expr(b1, ast_node_child(stmt, 0))
+			cap_opnd = g_lower_expr_result_opnd as MirOperand
+			b1 = b_cap
+		end
 		# Push mark_vreg onto the arena mark stack so break/continue can restore it
 		if g_arena_mark_stack == 0 do
 			g_arena_mark_stack = vec_new_rt()
 		end
-		g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, mark_vreg)
-		n_ch = ast_node_child_count(stmt)
+		g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, mark_vreg as i64)
+		var esc_name = fat_str_new("")
 		if n_ch > 0 do
 			body_idx = n_ch - 1
+			esc_name = scan_arena_escaped_var(ast_node_child(stmt, body_idx))
 			b1 = lower_stmt(b1, ast_node_child(stmt, body_idx))
 		end
 		# Pop the mark stack
@@ -4961,6 +5141,29 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		end
 		# Only emit arena restore if the body did not already terminate (e.g. break, continue)
 		if not builder_current_block_terminated(b1) do
+			if has_cap do
+				var (b_chk, cur_bump) = builder_new_vreg(b1)
+				b_chk = emit_intrinsic(b_chk, MIR_INTR_ARENA, mir_opnd_vreg(cur_bump), mir_opnd_none())
+				var (b_sub, used_bytes) = builder_new_vreg(b_chk)
+				b_sub = builder_add_instr(b_sub, mir_instr_new(MirOp.Sub, mir_opnd_vreg(used_bytes), mir_opnd_vreg(cur_bump), mir_opnd_vreg(mark_vreg)))
+				var (b_cmp, is_exceeded) = builder_new_vreg(b_sub)
+				b_cmp = builder_add_instr(b_cmp, mir_instr_new(MirOp.CmpGt, mir_opnd_vreg(is_exceeded), mir_opnd_vreg(used_bytes), cap_opnd))
+				var (b_ok, ok_block) = builder_add_block(b_cmp)
+				var (b_fail, fail_block) = builder_add_block(b_ok)
+				b_fail = emit_jump_if_not(b_fail, mir_opnd_vreg(is_exceeded), ok_block, fail_block)
+				b_fail = builder_set_current_block(b_fail, fail_block)
+				b_fail = emit_set_arg(b_fail, 0, mir_opnd_imm(99))
+				b_fail = emit_intrinsic(b_fail, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(18)) # exit_prog(99)
+				b_fail = emit_jump(b_fail, ok_block)
+				b_fail = builder_set_current_block(b_fail, ok_block)
+				b1 = b_fail
+			end
+			if fat_str_len(esc_name) > 0 do
+				let esc_vr = get_var_vreg(b1, esc_name)
+				if esc_vr >= 0 do
+					b1 = emit_set_arg(b1, 0, mir_opnd_vreg(esc_vr))
+				end
+			end
 			b1 = emit_intrinsic(b1, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mark_vreg))
 		end
 		out b1
