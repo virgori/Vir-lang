@@ -794,6 +794,18 @@ func sys_clock_gettime(clock_id: int, tp: int):
         out syscall2(SYS_CLOCK_GETTIME, clock_id, tp)
     end
 end.
+
+func sys_getrusage(who: int, usage_buf: int):
+    let plat = sys_platform()
+    if plat == Platform.Linux_ARM64 or plat == Platform.Linux_RISCV64 do
+        out syscall2(165, who, usage_buf)
+    eif plat == Platform.Linux_x86_64 do
+        out syscall2(98, who, usage_buf)
+    else
+        out syscall2(0x2000075, who, usage_buf)
+    end
+end.
+
 # ═══════════════════════════════════════════════════════
 # Convenience: Write to stdout / stderr
 # ═══════════════════════════════════════════════════════
@@ -879,20 +891,32 @@ end.
 # @vir_source stdlib/vir/compiler/virc.vri 20
 import sys_exit, sys_write, SYS_EXIT, SYS_WRITE from rt.syscall
 # @vir_source stdlib/vir/compiler/alloc.vri 1
-##
+###
  * vir/rt/alloc.vri — Memory Allocator (Pure Vir, No libc)
  * ========================================================
- * Bump allocator + free-list allocator built on raw mmap syscalls.
+ * Strict Two-Level Segregated Fit (TLSF) O(1) Allocator + Bump Arena.
  * Zero C library. Zero malloc. Zero free. Pure kernel syscalls.
  *
- * Strategy
- *   - Arena (bump) allocator for fast sequential allocation
- *   - Free-list allocator for general-purpose alloc/dealloc
- *   - Page allocator (mmap/munmap) as the backing layer
+ * Strategy:
+ *   - Arena (bump) allocator for fast sequential allocation (lex, parse, IR).
+ *   - Two-Level Segregated Fit (TLSF) O(1) segregated-bin heap allocator.
+ *     * O(1) allocate, O(1) free, O(1) bidirectional coalescing.
+ *     * Constant-time bitmap search (FL/SL bitmaps) via branchless bit-scan (ffs/fls).
+ *     * Intrusive doubly-linked lists inside free block payloads.
+ *     * Boundary tags with prev_size for O(1) bidirectional coalescing.
+ *   - Page allocator (mmap/munmap) as the backing layer.
  *
- * Memory block layout
- *   [size:i64] [flags:i64] [user data...]
- *   ^-- block_ptr         ^-- returned to user (block_ptr + 16)
+ * Memory block layout:
+ *   Allocated block:
+ *     [size_and_flags: i64]  (offset 0)  - bit 0: BLOCK_FREE (0), bit 1: PREV_FREE
+ *     [prev_size: i64]       (offset 8)  - size of physically preceding block
+ *     [user payload...]      (offset 16) - returned to user
+ *
+ *   Free block (minimum 32 bytes):
+ *     [size_and_flags: i64]  (offset 0)  - bit 0: BLOCK_FREE (1), bit 1: PREV_FREE
+ *     [prev_size: i64]       (offset 8)  - size of physically preceding block
+ *     [prev_free: i64]       (offset 16) - intrusive doubly-linked list prev
+ *     [next_free: i64]       (offset 24) - intrusive doubly-linked list next
  ##
 
 module vir.rt.alloc
@@ -907,10 +931,17 @@ import sys_mmap, sys_munmap, sys_platform, Platform, PROT_READ, PROT_WRITE, MAP_
 
 const PAGE_SIZE:        16384;        # 16KB (macOS ARM64)
 const MIN_ARENA_SIZE:   1048576;      # 1MB
-const BLOCK_HEADER:     16;           # 8 bytes size + 8 bytes flags
-const BLOCK_FREE:       0x0
-const BLOCK_USED:       0x1
-const ALIGNMENT:        16;           # 16-byte alignment for ARM64
+const BLOCK_HEADER:     16;           # 8 bytes size_and_flags + 8 bytes prev_size
+const MIN_BLOCK_SIZE:   32;           # 16B header + 16B free list pointers
+const ALIGNMENT:        16;           # 16-byte alignment
+
+const BLOCK_FREE:       0x1;          # bit 0: 1 = block is free, 0 = used
+const PREV_FREE:        0x2;          # bit 1: 1 = preceding block is free, 0 = used
+const FLAG_MASK:        0xF;          # lower 4 bits reserved for flags
+
+const FL_INDEX_COUNT:   28;           # 28 first-level classes (size 32 B to 4 GB)
+const SL_INDEX_COUNT:   16;           # 16 second-level bins per class
+const TOTAL_BINS:       448;          # 28 * 16 = 448 bins
 
 # ═══════════════════════════════════════════════════════
 # Portable Virtual Memory Layer (vm_alloc/vm_free)
@@ -945,39 +976,36 @@ end.
 # ═══════════════════════════════════════════════════════
 
 func page_alloc(size: int):
-
     let ps = rt_page_size()
     # Round up to page boundary
     var pages = (size + ps - 1) / ps
     var actual = pages * ps
 
-    let ptr = vm_alloc(actual, PROT_READ or PROT_WRITE)
+    let ptr = vm_alloc(actual, PROT_READ bit_or PROT_WRITE)
     if ptr < 0 do
         out 0   # allocation failed
     end
     out ptr
 end.
-func page_free(ptr: int, size: int):
 
+func page_free(ptr: int, size: int):
     let ps = rt_page_size()
     var pages = (size + ps - 1) / ps
     var actual = pages * ps
     vm_free(ptr, actual)
 end.
+
 # ═══════════════════════════════════════════════════════
 # Arena Allocator — Fast Bump Allocation
 # ═══════════════════════════════════════════════════════
-# Allocates by bumping a pointer forward.
-# Entire arena freed at once (no individual free).
-# Perfect for compiler phases (lex, parse, IR).
 
 entity Arena:
     base:       int;      # mmap'd base address
     capacity:   int;      # total bytes
     offset:     int      # current bump position
 end.
-func arena_new(size: int):
 
+func arena_new(size: int):
     var actual = size
     if actual < MIN_ARENA_SIZE do
         actual = MIN_ARENA_SIZE
@@ -988,11 +1016,10 @@ func arena_new(size: int):
     end
     out Arena ( base: base, capacity: actual, offset: 0 )
 end.
-func arena_alloc(arena: Arena, size: int):
 
+func arena_alloc(arena: Arena, size: int):
     # Align to ALIGNMENT boundary
     let aligned = (size + ALIGNMENT - 1) & ~(ALIGNMENT - 1)
-
     if arena.offset + aligned > arena.capacity do
         out 0   # out of space
     end
@@ -1001,137 +1028,375 @@ func arena_alloc(arena: Arena, size: int):
     arena.offset = arena.offset + aligned
     out ptr
 end.
-func arena_reset(arena: Arena):
 
+func arena_reset(arena: Arena):
     arena.offset = 0
     out arena
 end.
-func arena_destroy(arena: Arena):
 
+func arena_destroy(arena: Arena):
     if arena.base != 0 do
         page_free(arena.base, arena.capacity)
     end
 end.
+
 # ═══════════════════════════════════════════════════════
-# Free-List Allocator — General Purpose
+# Two-Level Segregated Fit (TLSF) O(1) Heap Allocator
 # ═══════════════════════════════════════════════════════
-# Each block: [size:i64][flags:i64][user data...]
-# Free list is a singly-linked list through free blocks.
-# Coalescing on free to reduce fragmentation.
 
 entity FreeNode:
     size:       int;      # total block size (including header)
     next_ptr:   int      # pointer to next FreeNode, or 0
 end.
+
 entity Heap:
     base:       int;      # mmap'd region base
     capacity:   int;      # total region size
-    free_head:  int;      # pointer to first FreeNode
+    free_head:  int;      # compatibility field (points to base or first block)
     used:       int      # bytes currently allocated
 end.
-# Heap state (module-level singleton)
+
+# Heap singleton
 var g_heap = Heap ( base: 0, capacity: 0, free_head: 0, used: 0 )
+var g_tlsf_ctrl: int = 0
+var g_heap_inspect_count: int = 0
+
+func heap_get_inspect_count() -> int:
+    out g_heap_inspect_count
+end.
+
+func heap_reset_inspect_count():
+    g_heap_inspect_count = 0
+end.
+
+func get_fl_bitmap() -> int:
+    extern func native_read_i64(addr: int, offset: int) -> int
+    out native_read_i64(g_tlsf_ctrl, 0)
+end.
+
+func set_fl_bitmap(val: int):
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    native_write_i64(g_tlsf_ctrl, 0, val)
+end.
+
+func get_sl_bitmap(fl: int) -> int:
+    extern func native_read_i64(addr: int, offset: int) -> int
+    out native_read_i64(g_tlsf_ctrl, 8 + fl * 8)
+end.
+
+func set_sl_bitmap(fl: int, val: int):
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    native_write_i64(g_tlsf_ctrl, 8 + fl * 8, val)
+end.
+
+func get_bin_head(bin_idx: int) -> int:
+    extern func native_read_i64(addr: int, offset: int) -> int
+    out native_read_i64(g_tlsf_ctrl, 256 + bin_idx * 8)
+end.
+
+func set_bin_head(bin_idx: int, val: int):
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    native_write_i64(g_tlsf_ctrl, 256 + bin_idx * 8, val)
+end.
+
+# O(1) Find Last Set bit (MSB, 0..63)
+func tlsf_fls(val: int) -> int:
+    if val <= 0 do
+        out -1
+    end
+    var bit = 0
+    var v = val
+    if (v shr 32) != 0 do
+        bit = bit + 32
+        v = v shr 32
+    end
+    if (v shr 16) != 0 do
+        bit = bit + 16
+        v = v shr 16
+    end
+    if (v shr 8) != 0 do
+        bit = bit + 8
+        v = v shr 8
+    end
+    if (v shr 4) != 0 do
+        bit = bit + 4
+        v = v shr 4
+    end
+    if (v shr 2) != 0 do
+        bit = bit + 2
+        v = v shr 2
+    end
+    if (v shr 1) != 0 do
+        bit = bit + 1
+    end
+    out bit
+end.
+
+# O(1) Find First Set bit (LSB, 0..63)
+func tlsf_ffs(val: int) -> int:
+    if val <= 0 do
+        out -1
+    end
+    let lowest = val bit_and (0 - val)
+    out tlsf_fls(lowest)
+end.
+
+# Map block size to segregated bin index in [0, TOTAL_BINS - 1]
+func tlsf_mapping_bin(size: int) -> int:
+    var s = size
+    if s < MIN_BLOCK_SIZE do
+        s = MIN_BLOCK_SIZE
+    end
+    var fl = tlsf_fls(s)
+    if fl < 5 do
+        fl = 5
+    end
+    if fl > 32 do
+        fl = 32
+    end
+    let fl_idx = fl - 5
+    let sl = (s shr (fl - 4)) bit_and 15
+    out fl_idx * 16 + sl
+end.
+
+# O(1) Search for smallest suitable non-empty bin via bitmaps
+func tlsf_search_suitable_bin(size: int) -> int:
+    var s = size
+    if s < MIN_BLOCK_SIZE do
+        s = MIN_BLOCK_SIZE
+    end
+    var fl = tlsf_fls(s)
+    if fl < 5 do
+        fl = 5
+    end
+    let round_val = (1 shl (fl - 4)) - 1
+    let alloc_size = s + round_val
+
+    var s_fl = tlsf_fls(alloc_size)
+    if s_fl < 5 do
+        s_fl = 5
+    end
+    if s_fl > 32 do
+        s_fl = 32
+    end
+    let fl_idx = s_fl - 5
+    let sl = (alloc_size shr (s_fl - 4)) bit_and 15
+
+    # 1. Look in current fl for sub-bins >= sl
+    g_heap_inspect_count = g_heap_inspect_count + 1
+    let sl_map = get_sl_bitmap(fl_idx) bit_and ((0 - 1) shl sl)
+    if sl_map != 0 do
+        let found_sl = tlsf_ffs(sl_map)
+        out fl_idx * 16 + found_sl
+    end
+
+    # 2. Look in higher fl classes
+    g_heap_inspect_count = g_heap_inspect_count + 1
+    if fl_idx + 1 < FL_INDEX_COUNT do
+        let fl_map = get_fl_bitmap() bit_and ((0 - 1) shl (fl_idx + 1))
+        if fl_map != 0 do
+            let found_fl = tlsf_ffs(fl_map)
+            let found_sl = tlsf_ffs(get_sl_bitmap(found_fl))
+            out found_fl * 16 + found_sl
+        end
+    end
+
+    # 3. First-fit check on exact un-rounded bin head
+    let fl_orig = fl - 5
+    let sl_orig = (s shr (fl - 4)) bit_and 15
+    let exact_bin = fl_orig * 16 + sl_orig
+    let head = get_bin_head(exact_bin)
+    if head != 0 do
+        extern func native_read_i64(addr: int, offset: int) -> int
+        let raw = native_read_i64(head, 0)
+        let bsz = raw bit_and ~(FLAG_MASK)
+        if bsz >= s do
+            out exact_bin
+        end
+    end
+
+    out -1
+end.
+
+# O(1) Prepend block to segregated doubly-linked bin
+func tlsf_insert_block(block: int):
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    let raw = native_read_i64(block, 0)
+    let size = raw bit_and ~(FLAG_MASK)
+    let bin_idx = tlsf_mapping_bin(size)
+    let fl_idx = bin_idx / 16
+    let sl = bin_idx bit_and 15
+
+    let head = get_bin_head(bin_idx)
+    native_write_i64(block, 16, 0);         # block.prev_free = 0
+    native_write_i64(block, 24, head);      # block.next_free = head
+    if head != 0 do
+        native_write_i64(head, 16, block);  # head.prev_free = block
+    end
+    set_bin_head(bin_idx, block)
+
+    let sl_map = get_sl_bitmap(fl_idx) bit_or (1 shl sl)
+    set_sl_bitmap(fl_idx, sl_map)
+    let fl_map = get_fl_bitmap() bit_or (1 shl fl_idx)
+    set_fl_bitmap(fl_map)
+end.
+
+# O(1) Unlink block from segregated doubly-linked bin
+func tlsf_remove_block(block: int):
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    let raw = native_read_i64(block, 0)
+    let size = raw bit_and ~(FLAG_MASK)
+    let bin_idx = tlsf_mapping_bin(size)
+    let fl_idx = bin_idx / 16
+    let sl = bin_idx bit_and 15
+
+    let prev = native_read_i64(block, 16)
+    let next = native_read_i64(block, 24)
+
+    if prev != 0 do
+        native_write_i64(prev, 24, next)
+    else
+        set_bin_head(bin_idx, next)
+    end
+    if next != 0 do
+        native_write_i64(next, 16, prev)
+    end
+
+    native_write_i64(block, 16, 0)
+    native_write_i64(block, 24, 0)
+
+    if get_bin_head(bin_idx) == 0 do
+        let sl_map = get_sl_bitmap(fl_idx) bit_and ~(1 shl sl)
+        set_sl_bitmap(fl_idx, sl_map)
+        if sl_map == 0 do
+            let fl_map = get_fl_bitmap() bit_and ~(1 shl fl_idx)
+            set_fl_bitmap(fl_map)
+        end
+    end
+end.
 
 func heap_init(size: int):
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    if g_tlsf_ctrl == 0 do
+        g_tlsf_ctrl = page_alloc(16384)
+        if g_tlsf_ctrl == 0 do
+            out false
+        end
+    end
+
+    # Zero control memory
+    var zi = 0
+    when zi < 4096 loop
+        native_write_i64(g_tlsf_ctrl, zi, 0)
+        zi = zi + 8
+    end
 
     var actual = size
     if actual < MIN_ARENA_SIZE do
         actual = MIN_ARENA_SIZE
     end
+    let ps = rt_page_size()
+    actual = ((actual + ps - 1) / ps) * ps
+
     let base = page_alloc(actual)
     if base == 0 do
         out false
     end
 
-    # Initialize entire region as one big free block
-    extern func native_write_i64(addr: int, offset: int, val: int)
-    native_write_i64(base, 0, actual);       # size
-    native_write_i64(base, 8, 0);            # next = null (byte offset)
+    let usable_size = actual - BLOCK_HEADER
+    let sentinel = base + usable_size
+
+    native_write_i64(base, 0, usable_size bit_or BLOCK_FREE)
+    native_write_i64(base, 8, 0)
+
+    native_write_i64(sentinel, 0, PREV_FREE)
+    native_write_i64(sentinel, 8, usable_size)
+
+    tlsf_insert_block(base)
 
     g_heap = Heap ( base: base, capacity: actual, free_head: base, used: 0 )
     out true
 end.
+
 func heap_alloc(size: int):
+    if g_tlsf_ctrl == 0 do
+        heap_init(MIN_ARENA_SIZE * 4)
+    end
 
     var needed = size + BLOCK_HEADER
-    # Align
-    needed = (needed + ALIGNMENT - 1) & ~(ALIGNMENT - 1)
+    needed = (needed + ALIGNMENT - 1) bit_and ~(ALIGNMENT - 1)
+    if needed < MIN_BLOCK_SIZE do
+        needed = MIN_BLOCK_SIZE
+    end
 
     extern func native_read_i64(addr: int, offset: int) -> int
     extern func native_write_i64(addr: int, offset: int, val: int)
 
-    # First-fit search through free list
-    var prev_ptr = 0
-    var cur = g_heap.free_head
+    var bin_idx = tlsf_search_suitable_bin(needed)
+    if bin_idx < 0 do
+        var grow = needed + MIN_ARENA_SIZE
+        let ps = rt_page_size()
+        grow = ((grow + ps - 1) / ps) * ps
 
-    when cur != 0 loop
-        let block_size = native_read_i64(cur, 0)
-        let next = native_read_i64(cur, 8)
-
-        if block_size >= needed do
-            # Found a fit! Split if remainder is big enough
-            let remainder = block_size - needed
-
-            if remainder >= (BLOCK_HEADER + ALIGNMENT) do
-                # Split: shrink this block, create new free block after
-                native_write_i64(cur, 0, needed);    # resize current
-                let new_free = cur + needed
-                native_write_i64(new_free, 0, remainder);   # size
-                native_write_i64(new_free, 8, next);         # next
-
-                # Patch prev or head to point to new_free
-                if prev_ptr == 0 do
-                    g_heap.free_head = new_free
-                else
-                    native_write_i64(prev_ptr, 8, new_free)
-                end
-            else
-                # Use whole block
-                needed = block_size
-                if prev_ptr == 0 do
-                    g_heap.free_head = next
-                else
-                    native_write_i64(prev_ptr, 8, next)
-                end
-            end
-
-            # Mark as used
-            native_write_i64(cur, 0, needed)
-            native_write_i64(cur, 8, BLOCK_USED)
-            g_heap.used = g_heap.used + needed
-
-            out cur + BLOCK_HEADER   # return user pointer
+        let new_region = page_alloc(grow)
+        if new_region == 0 do
+            out 0
         end
 
-        prev_ptr = cur
-        cur = next
+        let new_usable = grow - BLOCK_HEADER
+        let new_sentinel = new_region + new_usable
+
+        native_write_i64(new_region, 0, new_usable bit_or BLOCK_FREE)
+        native_write_i64(new_region, 8, 0)
+        native_write_i64(new_sentinel, 0, PREV_FREE)
+        native_write_i64(new_sentinel, 8, new_usable)
+
+        tlsf_insert_block(new_region)
+        g_heap.capacity = g_heap.capacity + grow
+
+        bin_idx = tlsf_search_suitable_bin(needed)
+        if bin_idx < 0 do
+            out 0
+        end
     end
 
-    # No fit found — grow heap
-    var grow = needed
-    if grow < MIN_ARENA_SIZE do
-        grow = MIN_ARENA_SIZE
-    end
-    let new_region = page_alloc(grow)
-    if new_region == 0 do
-        out 0   # OOM
-    end
+    let block = get_bin_head(bin_idx)
+    tlsf_remove_block(block)
 
-    # Set up new region as allocated block + remainder as free
-    native_write_i64(new_region, 0, needed)
-    native_write_i64(new_region, 8, BLOCK_USED)
+    let raw = native_read_i64(block, 0)
+    let block_size = raw bit_and ~(FLAG_MASK)
+    let prev_flags = raw bit_and PREV_FREE
 
-    let remainder = grow - needed
-    if remainder >= (BLOCK_HEADER + ALIGNMENT) do
-        let new_free = new_region + needed
-        native_write_i64(new_free, 0, remainder)
-        native_write_i64(new_free, 8, g_heap.free_head)
-        g_heap.free_head = new_free
+    let remainder = block_size - needed
+    if remainder >= MIN_BLOCK_SIZE do
+        native_write_i64(block, 0, needed bit_or prev_flags)
+        let rem_block = block + needed
+        native_write_i64(rem_block, 0, remainder bit_or BLOCK_FREE)
+        native_write_i64(rem_block, 8, needed)
+
+        let next_block = rem_block + remainder
+        let next_raw = native_read_i64(next_block, 0)
+        native_write_i64(next_block, 0, next_raw bit_or PREV_FREE)
+        native_write_i64(next_block, 8, remainder)
+
+        tlsf_insert_block(rem_block)
+    else
+        needed = block_size
+        native_write_i64(block, 0, needed bit_or prev_flags)
+
+        let next_block = block + needed
+        let next_raw = native_read_i64(next_block, 0)
+        native_write_i64(next_block, 0, next_raw bit_and ~(PREV_FREE))
+        native_write_i64(next_block, 8, needed)
     end
 
     g_heap.used = g_heap.used + needed
-    g_heap.capacity = g_heap.capacity + grow
-    out new_region + BLOCK_HEADER
+    out block + BLOCK_HEADER
 end.
 
 func heap_free(p: int):
@@ -1143,26 +1408,46 @@ func heap_free(p: int):
     extern func native_write_i64(addr: int, offset: int, val: int)
 
     let block = p - BLOCK_HEADER
-    var block_size = native_read_i64(block, 0)
+    let raw = native_read_i64(block, 0)
+    let original_size = raw bit_and ~(FLAG_MASK)
+    var block_size = original_size
+    let prev_is_free = (raw bit_and PREV_FREE) != 0
+    var merged_block = block
 
-    # Coalescing: merge with immediate next free block if contiguous
-    let next_block = block + block_size
-    if next_block == g_heap.free_head do
-        let next_size = native_read_i64(next_block, 0)
-        let next_next = native_read_i64(next_block, 8)
-        block_size = block_size + next_size
-        native_write_i64(block, 0, block_size)
-        native_write_i64(block, 8, next_next)
-        g_heap.free_head = block
-        g_heap.used = g_heap.used - block_size
-        out 0
+    # 1. O(1) Left coalescing via prev_size boundary tag
+    if prev_is_free do
+        let prev_size = native_read_i64(block, 8)
+        let left_block = block - prev_size
+        tlsf_remove_block(left_block)
+        block_size = block_size + prev_size
+        merged_block = left_block
     end
 
-    # Mark as free, add to free list head
-    native_write_i64(block, 0, block_size)
-    native_write_i64(block, 8, g_heap.free_head)
-    g_heap.free_head = block
-    g_heap.used = g_heap.used - block_size
+    # 2. O(1) Right coalescing via physical offset
+    let right_block = block + original_size
+    let right_raw = native_read_i64(right_block, 0)
+    if (right_raw bit_and BLOCK_FREE) != 0 do
+        let right_size = right_raw bit_and ~(FLAG_MASK)
+        tlsf_remove_block(right_block)
+        block_size = block_size + right_size
+    end
+
+    # 3. Write merged block header (inherit left PREV_FREE)
+    let left_raw = native_read_i64(merged_block, 0)
+    let left_prev_flag = left_raw bit_and PREV_FREE
+    native_write_i64(merged_block, 0, block_size bit_or BLOCK_FREE bit_or left_prev_flag)
+
+    # 4. Update the block after the merged block
+    let after_merged = merged_block + block_size
+    let after_raw = native_read_i64(after_merged, 0)
+    native_write_i64(after_merged, 0, after_raw bit_or PREV_FREE)
+    native_write_i64(after_merged, 8, block_size)
+
+    # 5. Reinsert merged block into segregated bin
+    tlsf_insert_block(merged_block)
+
+    # 6. Correct accounting: deduct only the block being freed
+    g_heap.used = g_heap.used - original_size
     out 0
 end.
 
@@ -1175,11 +1460,52 @@ func heap_realloc(p: int, new_size: int):
     extern func native_write_i64(addr: int, offset: int, val: int)
 
     let block = p - BLOCK_HEADER
-    let old_size = native_read_i64(block, 0) - BLOCK_HEADER
+    let raw = native_read_i64(block, 0)
+    let old_block_size = raw bit_and ~(FLAG_MASK)
+    let old_payload_size = old_block_size - BLOCK_HEADER
 
     # In-place shrink / reuse: no reallocation or copy needed!
-    if new_size <= old_size do
+    if new_size <= old_payload_size do
         out p
+    end
+
+    # Check if we can expand in-place into adjacent right free block
+    var needed = new_size + BLOCK_HEADER
+    needed = (needed + ALIGNMENT - 1) bit_and ~(ALIGNMENT - 1)
+    if needed < MIN_BLOCK_SIZE do
+        needed = MIN_BLOCK_SIZE
+    end
+
+    let right_block = block + old_block_size
+    let right_raw = native_read_i64(right_block, 0)
+    if (right_raw bit_and BLOCK_FREE) != 0 do
+        let right_size = right_raw bit_and ~(FLAG_MASK)
+        let combined_size = old_block_size + right_size
+        if combined_size >= needed do
+            tlsf_remove_block(right_block)
+            let remainder = combined_size - needed
+            let prev_flags = raw bit_and PREV_FREE
+            if remainder >= MIN_BLOCK_SIZE do
+                native_write_i64(block, 0, needed bit_or prev_flags)
+                let rem_block = block + needed
+                native_write_i64(rem_block, 0, remainder bit_or BLOCK_FREE)
+                native_write_i64(rem_block, 8, needed)
+                let next_block = rem_block + remainder
+                let next_raw = native_read_i64(next_block, 0)
+                native_write_i64(next_block, 0, next_raw bit_or PREV_FREE)
+                native_write_i64(next_block, 8, remainder)
+                tlsf_insert_block(rem_block)
+                g_heap.used = g_heap.used + (needed - old_block_size)
+            else
+                native_write_i64(block, 0, combined_size bit_or prev_flags)
+                let next_block = block + combined_size
+                let next_raw = native_read_i64(next_block, 0)
+                native_write_i64(next_block, 0, next_raw bit_and ~(PREV_FREE))
+                native_write_i64(next_block, 8, combined_size)
+                g_heap.used = g_heap.used + (combined_size - old_block_size)
+            end
+            out p
+        end
     end
 
     # Allocate new, copy words, free old
@@ -1188,7 +1514,7 @@ func heap_realloc(p: int, new_size: int):
         out 0
     end
 
-    var copy_len = old_size
+    var copy_len = old_payload_size
     if new_size < copy_len do
         copy_len = new_size
     end
@@ -1210,8 +1536,61 @@ func heap_realloc(p: int, new_size: int):
     out new_ptr
 end.
 
+func heap_verify() -> int:
+    if g_tlsf_ctrl == 0 do
+        out 1
+    end
+    extern func native_read_i64(addr: int, offset: int) -> int
+
+    let fl_map = get_fl_bitmap()
+    var fl = 0
+    when fl < FL_INDEX_COUNT loop
+        let sl_map = get_sl_bitmap(fl)
+        let fl_bit = (fl_map bit_and (1 shl fl)) != 0
+        if sl_map != 0 and fl_bit == false do
+            out 0
+        end
+        if sl_map == 0 and fl_bit == true do
+            out 0
+        end
+
+        var sl = 0
+        when sl < SL_INDEX_COUNT loop
+            let bin_idx = fl * SL_INDEX_COUNT + sl
+            let head = get_bin_head(bin_idx)
+            let sl_bit = (sl_map bit_and (1 shl sl)) != 0
+
+            if head != 0 and sl_bit == false do
+                out 0
+            end
+            if head == 0 and sl_bit == true do
+                out 0
+            end
+
+            var cur = head
+            var prev = 0
+            when cur != 0 loop
+                let raw = native_read_i64(cur, 0)
+                if (raw bit_and BLOCK_FREE) == 0 do
+                    out 0
+                end
+                let p = native_read_i64(cur, 16)
+                if p != prev do
+                    out 0
+                end
+                prev = cur
+                cur = native_read_i64(cur, 24)
+            end
+
+            sl = sl + 1
+        end
+        fl = fl + 1
+    end
+    out 1
+end.
+
 # ═══════════════════════════════════════════════════════
-# Global Allocator API (FFI heap — C-VM lowers vir_alloc/vir_free to Q_HEAP_ALLOC/Q_FREE)
+# Global Allocator API (FFI heap — lowered to vir_alloc/vir_free)
 # ═══════════════════════════════════════════════════════
 
 var g_initialized = false
@@ -1236,8 +1615,33 @@ func vir_realloc(p: int, new_size: int):
     out heap_realloc(p, new_size)
 end.
 
+func alloc(size: int):
+    out vir_alloc(size)
+end.
+
+func free(p: int):
+    vir_free(p)
+end.
+
+func realloc(p: int, new_size: int):
+    out vir_realloc(p, new_size)
+end.
+
+func alloc_zeroed(size: int):
+    let p = vir_alloc(size)
+    if p != 0 do
+        var i = 0
+        extern func native_write_u8(addr: int, offset: int, val: int)
+        when i < size loop
+            native_write_u8(p, i, 0)
+            i = i + 1
+        end
+    end
+    out p
+end.
+
 # @vir_source stdlib/vir/compiler/virc.vri 22
-import vir_alloc, vir_free, vir_realloc, heap_init from rt.alloc
+import vir_alloc, vir_free, vir_realloc, heap_init, heap_verify from rt.alloc
 # @vir_source stdlib/vir/compiler/string_rt.vri 1
 ##
  * vir/rt/string_rt.vri — String Runtime (Pure Vir, No libc)
@@ -26019,9 +26423,14 @@ entity LoopTarget:
 end.
 
 func loop_target_new(break_block: i64, continue_block: i64):
-    p = alloc(16)
+    p = alloc(24)
     native_write_i64(p, 0, break_block)
     native_write_i64(p, 8, continue_block)
+    var cur_depth = 0
+    if g_arena_mark_stack != 0 do
+        cur_depth = vec_len_rt(g_arena_mark_stack)
+    end
+    native_write_i64(p, 16, cur_depth)
     out p
 end.
 
@@ -26031,6 +26440,11 @@ end.
 
 func loop_target_continue_block(lt: LoopTarget):
     out native_read_i64(lt as i64, 8)
+end.
+
+func loop_target_arena_depth(lt: LoopTarget):
+    if (lt as i64) == 0 do out 0 end
+    out native_read_i64(lt as i64, 16)
 end.
 
 entity MirBuilder:
@@ -26448,6 +26862,15 @@ func infer_expr_type_name(node: AstNode):
     if nt == AstType.LiteralNone do out fat_str_new("none") end
     if nt == AstType.EnumConstruct do out ast_node_name2(node) end
     if nt == AstType.LiteralStr or nt == AstType.InterpExpr do out fat_str_new("string") end
+    if nt == AstType.ArrayLiteral do
+        if ast_node_child_count(node) > 0 do
+            let elem_t = infer_expr_type_name(ast_node_child(node, 0))
+            if fat_str_len(elem_t) > 0 do
+                out fat_str_concat(fat_str_new("["), fat_str_concat(elem_t, fat_str_new("]")))
+            end
+        end
+        out fat_str_new("[int]")
+    end
     if nt == AstType.CastExpr do out ast_node_name(node) end
     if nt == AstType.Identifier do
         vt = get_var_type(ast_node_name(node))
@@ -28063,8 +28486,8 @@ func builtin_id_from_name_uncached(name: string):
     if fat_cstr_eq(name, "len") == 1 do out 1 end
     if fat_cstr_eq(name, "push") == 1 do out 2 end
     if fat_cstr_eq(name, "arr_push") == 1 do out 2 end
-    if fat_cstr_eq(name, "alloc") == 1 or fat_cstr_eq(name, "vir_alloc") == 1 do out 3 end
-    if fat_cstr_eq(name, "dealloc") == 1 or fat_cstr_eq(name, "free") == 1 or fat_cstr_eq(name, "vir_free") == 1 do out 4 end
+    if fat_cstr_eq(name, "alloc") == 1 do out 3 end
+
     if fat_cstr_eq(name, "read_byte") == 1 or fat_cstr_eq(name, "native_read_u8") == 1 or fat_cstr_eq(name, "read_u8") == 1 or fat_cstr_eq(name, "read8") == 1 do out 5 end
     if fat_cstr_eq(name, "write_byte") == 1 or fat_cstr_eq(name, "native_write_u8") == 1 or fat_cstr_eq(name, "write_u8") == 1 or fat_cstr_eq(name, "write8") == 1 do out 6 end
     if fat_cstr_eq(name, "read_word") == 1 or fat_cstr_eq(name, "native_read_i64") == 1 or fat_cstr_eq(name, "read_i64") == 1 or fat_cstr_eq(name, "read64") == 1 do out 7 end
@@ -29801,6 +30224,55 @@ func lower_expr(b: MirBuilder, expr: AstNode):
 	out lower_expr_impl(b, expr)
 end.
 
+func scan_has_local_arena_alloc(node: AstNode):
+    if node == 0 do out 0 end
+    let nt = ast_node_type_of(node)
+    if nt == AstType.ArrayLiteral do out 1 end
+    let nc = ast_node_child_count(node)
+    var i = 0
+    when i < nc loop
+        let ch = ast_node_child(node, i)
+        if scan_has_local_arena_alloc(ch) == 1 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func scan_arena_escaped_var(node: AstNode):
+    if node == 0 do out fat_str_new("") end
+    let nt = ast_node_type_of(node)
+    if nt == AstType.Assign do
+        var target_name = ast_node_name(node)
+        if ast_node_child_count(node) >= 2 do
+            target_name = ast_node_name(ast_node_child(node, 0))
+        end
+        if (target_name as i64) != 0 and fat_str_len(target_name) > 0 do
+            if g_current_func_buckets != 0 do
+                let existing_vr = buckets_get_var(g_current_func_buckets, target_name)
+                if existing_vr >= 0 do
+                    let vt = get_var_type(target_name)
+                    if (vt as i64) != 0 and fat_str_len(vt) > 0 and fat_str_byte_at(vt, 0) == 91 do
+                        out target_name
+                    end
+                end
+            end
+        end
+    end
+    let nc = ast_node_child_count(node)
+    var i = 0
+    when i < nc loop
+        let ch = ast_node_child(node, i)
+        let found = scan_arena_escaped_var(ch)
+        if (found as i64) != 0 and fat_str_len(found) > 0 do
+            out found
+        end
+        i = i + 1
+    end
+    out fat_str_new("")
+end.
+
 func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 	stmt_type = ast_node_type_of(stmt)
 
@@ -30349,13 +30821,38 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		var cond_opnd = g_lower_expr_result_opnd as MirOperand
 		b5 = emit_jump_if_not(b5, cond_opnd, end_id, body_id)
 		b5 = builder_set_current_block(b5, body_id)
-		b5 = lower_stmt(b5, body_block)
-		if not builder_current_block_terminated(b5) do
-			b5 = emit_jump(b5, cond_id)
+
+		let has_arena = scan_has_local_arena_alloc(body_block)
+		let esc_name = scan_arena_escaped_var(body_block)
+		var b_body = b5
+		var iter_mark = 0
+		if has_arena == 1 and fat_str_len(esc_name) == 0 do
+			var (b_mark, imk) = builder_new_vreg(b_body)
+			iter_mark = imk
+			b_body = emit_intrinsic(b_mark, MIR_INTR_ARENA, mir_opnd_vreg(iter_mark), mir_opnd_none())
+			if g_arena_mark_stack == 0 do
+				g_arena_mark_stack = vec_new_rt()
+			end
+			g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, iter_mark as i64)
 		end
-		b5 = builder_pop_loop(b5)
-		b5 = builder_set_current_block(b5, end_id)
-		out b5
+
+		b_body = lower_stmt(b_body, body_block)
+
+		if has_arena == 1 and fat_str_len(esc_name) == 0 do
+			if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+				vec_pop_rt(g_arena_mark_stack)
+			end
+			if not builder_current_block_terminated(b_body) do
+				b_body = emit_intrinsic(b_body, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(iter_mark))
+			end
+		end
+
+		if not builder_current_block_terminated(b_body) do
+			b_body = emit_jump(b_body, cond_id)
+		end
+		b_body = builder_pop_loop(b_body)
+		b_body = builder_set_current_block(b_body, end_id)
+		out b_body
 	end
 
     # 4b. LoopStmt — counted: i in 0..count
@@ -30379,13 +30876,38 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		b8 = builder_add_instr(b8, insc)
 		b8 = emit_jump_if_not(b8, mir_opnd_vreg(cmpv), end_id, body_id)
 		b8 = builder_set_current_block(b8, body_id)
-		b8 = lower_stmt(b8, body_block)
-		if not builder_current_block_terminated(b8) do
-			b8 = emit_jump(b8, step_id)
+
+		let has_arena_loop = scan_has_local_arena_alloc(body_block)
+		let esc_name_loop = scan_arena_escaped_var(body_block)
+		var b_body = b8
+		var iter_mark = 0
+		if has_arena_loop == 1 and fat_str_len(esc_name_loop) == 0 do
+			var (b_mark, imk) = builder_new_vreg(b_body)
+			iter_mark = imk
+			b_body = emit_intrinsic(b_mark, MIR_INTR_ARENA, mir_opnd_vreg(iter_mark), mir_opnd_none())
+			if g_arena_mark_stack == 0 do
+				g_arena_mark_stack = vec_new_rt()
+			end
+			g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, iter_mark as i64)
 		end
-		b8 = builder_set_current_block(b8, step_id)
+
+		b_body = lower_stmt(b_body, body_block)
+
+		if has_arena_loop == 1 and fat_str_len(esc_name_loop) == 0 do
+			if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+				vec_pop_rt(g_arena_mark_stack)
+			end
+			if not builder_current_block_terminated(b_body) do
+				b_body = emit_intrinsic(b_body, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(iter_mark))
+			end
+		end
+
+		if not builder_current_block_terminated(b_body) do
+			b_body = emit_jump(b_body, step_id)
+		end
+		b_body = builder_set_current_block(b_body, step_id)
         # Non-SSA induction: redefine same vreg (SSA rename comes later).
-		var (b9, iv2) = builder_new_vreg(b8)
+		var (b9, iv2) = builder_new_vreg(b_body)
 		ins1 = mir_instr_new(MirOp.Add, mir_opnd_vreg(iv2), mir_opnd_vreg(iv), mir_opnd_imm(1))
 		b9 = builder_add_instr(b9, ins1)
 		insm = mir_instr_new(MirOp.Move, mir_opnd_vreg(iv), mir_opnd_vreg(iv2), mir_opnd_none())
@@ -30472,11 +30994,12 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		lt = builder_loop_top(b)
 		brk = loop_target_break_block(lt)
 		if brk >= 0 do
-			# Restore any active arena marks in reverse order before jumping out of the loop
+			let base_depth = loop_target_arena_depth(lt)
+			# Restore active arena marks down to the loop's outer depth
 			if g_arena_mark_stack != 0 do
 				var ams_len = vec_len_rt(g_arena_mark_stack)
 				var ams_i = ams_len - 1
-				when ams_i >= 0 loop
+				when ams_i >= base_depth loop
 					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
 					b = emit_intrinsic(b, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
 					ams_i = ams_i - 1
@@ -30490,11 +31013,12 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		lt = builder_loop_top(b)
 		cnt = loop_target_continue_block(lt)
 		if cnt >= 0 do
-			# Restore any active arena marks in reverse order before jumping to continue
+			let base_depth = loop_target_arena_depth(lt)
+			# Restore active arena marks down to the loop's outer depth
 			if g_arena_mark_stack != 0 do
 				var ams_len = vec_len_rt(g_arena_mark_stack)
 				var ams_i = ams_len - 1
-				when ams_i >= 0 loop
+				when ams_i >= base_depth loop
 					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
 					b = emit_intrinsic(b, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
 					ams_i = ams_i - 1
@@ -30683,13 +31207,37 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 			b9 = builder_add_instr(b9, insc)
 			b9 = emit_jump_if_not(b9, mir_opnd_vreg(cmpv), end_id, body_id)
 			b9 = builder_set_current_block(b9, body_id)
-			b9 = lower_stmt(b9, body_stmt)
-			if not builder_current_block_terminated(b9) do
-				b9 = emit_jump(b9, step_id)
+			let has_arena_for = scan_has_local_arena_alloc(body_stmt)
+			let esc_name_for = scan_arena_escaped_var(body_stmt)
+			var b_body = b9
+			var iter_mark = 0
+			if has_arena_for == 1 and fat_str_len(esc_name_for) == 0 do
+				var (b_mark, imk) = builder_new_vreg(b_body)
+				iter_mark = imk
+				b_body = emit_intrinsic(b_mark, MIR_INTR_ARENA, mir_opnd_vreg(iter_mark), mir_opnd_none())
+				if g_arena_mark_stack == 0 do
+					g_arena_mark_stack = vec_new_rt()
+				end
+				g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, iter_mark as i64)
 			end
-			b9 = builder_set_current_block(b9, step_id)
-			iv_cur2 = get_var_vreg(b9, ast_node_name(stmt))
-			var (b10, ivn) = builder_new_vreg(b9)
+
+			b_body = lower_stmt(b_body, body_stmt)
+
+			if has_arena_for == 1 and fat_str_len(esc_name_for) == 0 do
+				if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+					vec_pop_rt(g_arena_mark_stack)
+				end
+				if not builder_current_block_terminated(b_body) do
+					b_body = emit_intrinsic(b_body, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(iter_mark))
+				end
+			end
+
+			if not builder_current_block_terminated(b_body) do
+				b_body = emit_jump(b_body, step_id)
+			end
+			b_body = builder_set_current_block(b_body, step_id)
+			iv_cur2 = get_var_vreg(b_body, ast_node_name(stmt))
+			var (b10, ivn) = builder_new_vreg(b_body)
 			ins1 = mir_instr_new(MirOp.Add, mir_opnd_vreg(ivn), mir_opnd_vreg(iv_cur2), mir_opnd_imm(1))
 			b10 = builder_add_instr(b10, ins1)
 			insm = mir_instr_new(MirOp.Move, mir_opnd_vreg(iv_cur2), mir_opnd_vreg(ivn), mir_opnd_none())
@@ -30733,13 +31281,38 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		var cond_opnd = g_lower_expr_result_opnd as MirOperand
 		b5 = emit_jump_if_not(b5, cond_opnd, end_id, body_id)
 		b5 = builder_set_current_block(b5, body_id)
-		b5 = lower_stmt(b5, body_block)
-		if not builder_current_block_terminated(b5) do
-			b5 = emit_jump(b5, cond_id)
+
+		let has_arena_when = scan_has_local_arena_alloc(body_block)
+		let esc_name_when = scan_arena_escaped_var(body_block)
+		var b_body = b5
+		var iter_mark = 0
+		if has_arena_when == 1 and fat_str_len(esc_name_when) == 0 do
+			var (b_mark, imk) = builder_new_vreg(b_body)
+			iter_mark = imk
+			b_body = emit_intrinsic(b_mark, MIR_INTR_ARENA, mir_opnd_vreg(iter_mark), mir_opnd_none())
+			if g_arena_mark_stack == 0 do
+				g_arena_mark_stack = vec_new_rt()
+			end
+			g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, iter_mark as i64)
 		end
-		b5 = builder_pop_loop(b5)
-		b5 = builder_set_current_block(b5, end_id)
-		out b5
+
+		b_body = lower_stmt(b_body, body_block)
+
+		if has_arena_when == 1 and fat_str_len(esc_name_when) == 0 do
+			if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+				vec_pop_rt(g_arena_mark_stack)
+			end
+			if not builder_current_block_terminated(b_body) do
+				b_body = emit_intrinsic(b_body, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(iter_mark))
+			end
+		end
+
+		if not builder_current_block_terminated(b_body) do
+			b_body = emit_jump(b_body, cond_id)
+		end
+		b_body = builder_pop_loop(b_body)
+		b_body = builder_set_current_block(b_body, end_id)
+		out b_body
 	end
 
     # 13. Throw / Cancel / Quiet
@@ -30783,16 +31356,26 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 
     # 14. ArenaBlock — sub-arena save and restore
 	if stmt_type == AstType.ArenaBlock do
+		n_ch = ast_node_child_count(stmt)
 		var (b1, mark_vreg) = builder_new_vreg(b)
 		b1 = emit_intrinsic(b1, MIR_INTR_ARENA, mir_opnd_vreg(mark_vreg), mir_opnd_none())
-		# Push mark onto stack so break/continue can emit arena_reset before jumping out
+		var has_cap = false
+		var cap_opnd = mir_opnd_none()
+		if n_ch > 1 do
+			has_cap = true
+			var b_cap = lower_expr(b1, ast_node_child(stmt, 0))
+			cap_opnd = g_lower_expr_result_opnd as MirOperand
+			b1 = b_cap
+		end
+		# Push mark_vreg onto the arena mark stack so break/continue can restore it
 		if g_arena_mark_stack == 0 do
 			g_arena_mark_stack = vec_new_rt()
 		end
-		vec_push_rt(g_arena_mark_stack, mark_vreg as i64)
-		n_ch = ast_node_child_count(stmt)
+		g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, mark_vreg as i64)
+		var esc_name = fat_str_new("")
 		if n_ch > 0 do
 			body_idx = n_ch - 1
+			esc_name = scan_arena_escaped_var(ast_node_child(stmt, body_idx))
 			b1 = lower_stmt(b1, ast_node_child(stmt, body_idx))
 		end
 		# Pop the mark stack
@@ -30801,6 +31384,29 @@ func lower_stmt_impl(b: MirBuilder, stmt: AstNode):
 		end
 		# Only emit arena restore if the body did not already terminate (e.g. break, continue)
 		if not builder_current_block_terminated(b1) do
+			if has_cap do
+				var (b_chk, cur_bump) = builder_new_vreg(b1)
+				b_chk = emit_intrinsic(b_chk, MIR_INTR_ARENA, mir_opnd_vreg(cur_bump), mir_opnd_none())
+				var (b_sub, used_bytes) = builder_new_vreg(b_chk)
+				b_sub = builder_add_instr(b_sub, mir_instr_new(MirOp.Sub, mir_opnd_vreg(used_bytes), mir_opnd_vreg(cur_bump), mir_opnd_vreg(mark_vreg)))
+				var (b_cmp, is_exceeded) = builder_new_vreg(b_sub)
+				b_cmp = builder_add_instr(b_cmp, mir_instr_new(MirOp.CmpGt, mir_opnd_vreg(is_exceeded), mir_opnd_vreg(used_bytes), cap_opnd))
+				var (b_ok, ok_block) = builder_add_block(b_cmp)
+				var (b_fail, fail_block) = builder_add_block(b_ok)
+				b_fail = emit_jump_if_not(b_fail, mir_opnd_vreg(is_exceeded), ok_block, fail_block)
+				b_fail = builder_set_current_block(b_fail, fail_block)
+				b_fail = emit_set_arg(b_fail, 0, mir_opnd_imm(99))
+				b_fail = emit_intrinsic(b_fail, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(18)) # exit_prog(99)
+				b_fail = emit_jump(b_fail, ok_block)
+				b_fail = builder_set_current_block(b_fail, ok_block)
+				b1 = b_fail
+			end
+			if fat_str_len(esc_name) > 0 do
+				let esc_vr = get_var_vreg(b1, esc_name)
+				if esc_vr >= 0 do
+					b1 = emit_set_arg(b1, 0, mir_opnd_vreg(esc_vr))
+				end
+			end
 			b1 = emit_intrinsic(b1, MIR_INTR_ARENA, mir_opnd_none(), mir_opnd_vreg(mark_vreg))
 		end
 		out b1
@@ -37494,8 +38100,8 @@ func lir_intr_is_payload(kind: i64):
 end.
 
 func lir_stub_for_builtin_id(bid: i64):
-    if bid == 3 or bid == 35 or bid == 49 or bid == 50 do out LIR_RT_ALLOC end
-    if bid == 4 do out LIR_RT_NOP end
+    if bid == 3 or bid == 49 or bid == 50 do out LIR_RT_ALLOC end
+
     if bid == 18 do out LIR_RT_EXIT_PROG end
     if bid == 22 do out LIR_RT_PRINT_STR end
     if bid == 9 do out LIR_RT_STR_LEN end
@@ -37550,8 +38156,8 @@ func lir_stub_for_callee_name(cname: string):
     if fat_cstr_eq(cname, "write_word") or fat_cstr_eq(cname, "native_write_i64") or fat_cstr_eq(cname, "write_i64") or fat_cstr_eq(cname, "write64") or rt_streq(cname as int, "write_word") or rt_streq(cname as int, "native_write_i64") or rt_streq(cname as int, "write_i64") or rt_streq(cname as int, "write64") do out LIR_RT_NATIVE_WRITE_I64 end
     if fat_cstr_eq(cname, "get_arg") or fat_cstr_eq(cname, "rt_argv") or fat_cstr_eq(cname, "rt_get_arg") or rt_streq(cname as int, "get_arg") or rt_streq(cname as int, "rt_argv") or rt_streq(cname as int, "rt_get_arg") do out LIR_RT_GET_ARG end
     if fat_cstr_eq(cname, "arg_count") or fat_cstr_eq(cname, "rt_argc") or rt_streq(cname as int, "arg_count") or rt_streq(cname as int, "rt_argc") do out LIR_RT_ARG_COUNT end
-    if fat_cstr_eq(cname, "alloc") or fat_cstr_eq(cname, "vir_alloc") or rt_streq(cname as int, "alloc") or rt_streq(cname as int, "vir_alloc") do out LIR_RT_ALLOC end
-    if fat_cstr_eq(cname, "free") or fat_cstr_eq(cname, "vir_free") or fat_cstr_eq(cname, "dealloc") or rt_streq(cname as int, "free") or rt_streq(cname as int, "vir_free") or rt_streq(cname as int, "dealloc") do out LIR_RT_NOP end
+    if fat_cstr_eq(cname, "alloc") or rt_streq(cname as int, "alloc") do out LIR_RT_ALLOC end
+
     if fat_cstr_eq(cname, "print_str") or rt_streq(cname as int, "print_str") do out LIR_RT_PRINT_STR end
     if fat_cstr_eq(cname, "str_len") or rt_streq(cname as int, "str_len") do out LIR_RT_STR_LEN end
     if fat_cstr_eq(cname, "str_cat") or fat_cstr_eq(cname, "str_concat") or fat_cstr_eq(cname, "strcat") or rt_streq(cname as int, "str_cat") or rt_streq(cname as int, "str_concat") or rt_streq(cname as int, "strcat") do out LIR_RT_STR_CAT end
@@ -38260,13 +38866,47 @@ func emit_lir_intrinsic(cb: CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assigned_
         out arm64_nop(cb)
     end
     if kind == MIR_INTR_ARENA do
-        if rd >= 0 do
+        if rd >= 0 and rs1 < 0 do
             cb = arm64_ldr_uoff(cb, rd as int, 28, 0)
             out cb
         end
         if rs1 >= 0 do
-            cb = arm64_str_uoff(cb, rs1 as int, 28, 0)
-            out cb
+            if vec_len_rt(recent_setargs) >= 1 and vec_get_rt(recent_setargs, 0) != 0 do
+                s0 = vec_get_rt(recent_setargs, 0)
+                vec_set_rt(recent_setargs, 0, 0)
+                var (cb_esc, r_esc) = lir_load_opnd_to_reg(cb, s0, assigned_phys, 12)
+                cb = cb_esc
+                cb = arm64_cmp_rr(cb, r_esc as int, rs1 as int)
+                let no_esc_fixup = codebuf_offset(cb) as int
+                cb = arm64_blt_imm19(cb, 0)
+
+                cb = arm64_ldr_uoff(cb, 9, r_esc as int, 0)
+                cb = arm64_lsl_imm(cb, 10, 9, 3)
+                cb = arm64_add_imm(cb, 10, 10, 31)
+                cb = arm64_movz_imm64(cb, 11, 4)
+                cb = arm64_lsr_rrr(cb, 10, 10, 11)
+                cb = arm64_lsl_imm(cb, 10, 10, 4)
+
+                cb = arm64_add_rrr(cb, 13, r_esc as int, 10)
+                cb = arm64_str_uoff(cb, 13, 28, 0)
+
+                let skip_normal_fixup = codebuf_offset(cb) as int
+                cb = arm64_b_imm26(cb, 0)
+
+                let normal_restore = codebuf_offset(cb) as int
+                let imm_ne = ((normal_restore - no_esc_fixup) shr 2) and 0x7FFFF
+                cb = codebuf_patch_u32(cb, no_esc_fixup, (0x5400000B or (imm_ne shl 5)) as int)
+
+                cb = arm64_str_uoff(cb, rs1 as int, 28, 0)
+
+                let end_fixup = codebuf_offset(cb) as int
+                let imm_sn = ((end_fixup - skip_normal_fixup) shr 2) and 0x3FFFFFF
+                cb = codebuf_patch_u32(cb, skip_normal_fixup, (0x14000000 or imm_sn) as int)
+                out cb
+            else
+                cb = arm64_str_uoff(cb, rs1 as int, 28, 0)
+                out cb
+            end
         end
         out arm64_nop(cb)
     end
@@ -42671,7 +43311,8 @@ func x86_stub_for_builtin_id(bid: i64):
     if bid == 11 do out LIR_RT_STR_CAT end
     if bid == 19 do out LIR_RT_INT_TO_STR end
     if bid == 1000 do out LIR_RT_BOOL_TO_STR end
-    if bid == 3 or bid == 35 or bid == 49 or bid == 50 do out LIR_RT_ALLOC end
+    if bid == 3 or bid == 49 or bid == 50 do out LIR_RT_ALLOC end
+
     if bid == 5 do out LIR_RT_NATIVE_READ_U8 end
     if bid == 6 do out LIR_RT_NATIVE_WRITE_U8 end
     if bid == 7 or bid == 46 do out LIR_RT_NATIVE_READ_I64 end
@@ -43210,8 +43851,8 @@ func x86_stub_for_callee_name(cname: string):
     if fat_cstr_eq(cname, "write_word") or fat_cstr_eq(cname, "native_write_i64") or fat_cstr_eq(cname, "write_i64") or fat_cstr_eq(cname, "write64") or rt_streq(cname as int, "write_word") or rt_streq(cname as int, "native_write_i64") or rt_streq(cname as int, "write_i64") or rt_streq(cname as int, "write64") do out LIR_RT_NATIVE_WRITE_I64 end
     if fat_cstr_eq(cname, "get_arg") or fat_cstr_eq(cname, "rt_argv") or fat_cstr_eq(cname, "rt_get_arg") or rt_streq(cname as int, "get_arg") or rt_streq(cname as int, "rt_argv") or rt_streq(cname as int, "rt_get_arg") do out LIR_RT_GET_ARG end
     if fat_cstr_eq(cname, "arg_count") or fat_cstr_eq(cname, "rt_argc") or rt_streq(cname as int, "arg_count") or rt_streq(cname as int, "rt_argc") do out LIR_RT_ARG_COUNT end
-    if fat_cstr_eq(cname, "alloc") or fat_cstr_eq(cname, "vir_alloc") or rt_streq(cname as int, "alloc") or rt_streq(cname as int, "vir_alloc") do out LIR_RT_ALLOC end
-    if fat_cstr_eq(cname, "free") or fat_cstr_eq(cname, "vir_free") or fat_cstr_eq(cname, "dealloc") or rt_streq(cname as int, "free") or rt_streq(cname as int, "vir_free") or rt_streq(cname as int, "dealloc") do out LIR_RT_NOP end
+    if fat_cstr_eq(cname, "alloc") or rt_streq(cname as int, "alloc") do out LIR_RT_ALLOC end
+
     if fat_cstr_eq(cname, "print_str") or rt_streq(cname as int, "print_str") do out LIR_RT_PRINT_STR end
     if fat_cstr_eq(cname, "vir_get_platform") or fat_cstr_eq(cname, "sys_platform") or rt_streq(cname as int, "vir_get_platform") or rt_streq(cname as int, "sys_platform") do out LIR_RT_PLATFORM end
     if fat_cstr_eq(cname, "exit") or fat_cstr_eq(cname, "exit_prog") or fat_cstr_eq(cname, "sys_exit") or rt_streq(cname as int, "exit") or rt_streq(cname as int, "exit_prog") or rt_streq(cname as int, "sys_exit") do out LIR_RT_EXIT_PROG end
