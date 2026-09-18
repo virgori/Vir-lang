@@ -427,6 +427,57 @@ def run_test(
                         reason="Structural gate failed: runtime PRECOMP instruction found in compiler output",
                     )
 
+            if entry.test_id == "MEM-STRUCT-001":
+                if not bin_out.exists():
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target=target,
+                        compile_exit=c_exit,
+                        run_exit=r_exit,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason="Structural gate failed: binary artifact not found",
+                    )
+                disasm_out = ""
+                try:
+                    if target.startswith("macos"):
+                        proc = subprocess.run(["otool", "-tv", str(bin_out)], capture_output=True, text=True, timeout=10)
+                        disasm_out = proc.stdout
+                    else:
+                        proc = subprocess.run(["objdump", "-d", str(bin_out)], capture_output=True, text=True, timeout=10)
+                        disasm_out = proc.stdout
+                except Exception as e:
+                    disasm_out = ""
+
+                has_branch = bool(re.search(r"\b(bl|call|jal)\b", disasm_out))
+                if not has_branch:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target=target,
+                        compile_exit=c_exit,
+                        run_exit=r_exit,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason="Structural gate failed: no call/branch instruction found in disassembled binary",
+                    )
+                lowered_funcs = re.findall(r"AST->MIR func\s+\d+\s*:\s*(\w+)", c_all)
+                if not ("heap_free" in lowered_funcs or "vir_free" in lowered_funcs or "free" in lowered_funcs):
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target=target,
+                        compile_exit=c_exit,
+                        run_exit=r_exit,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason="Structural gate failed: heap_free / vir_free not present in compiler MIR functions",
+                    )
+
             if entry.test_id == "TARGET-002":
                 if r_exit != 37:
                     return TestResult(
