@@ -919,29 +919,60 @@ import sys_exit, sys_write, SYS_EXIT, SYS_WRITE from rt.syscall
  *     [next_free: i64]       (offset 24) - intrusive doubly-linked list next
  ##
 
+##
+ * vir/rt/alloc.vri — Memory Allocator (Pure Vir, No libc)
+ * ========================================================
+ * Strict Two-Level Segregated Fit (TLSF) O(1) Allocator + Bump Arena.
+ * Zero C library. Zero malloc. Zero free. Pure kernel syscalls.
+ *
+ * Strategy:
+ *   - Arena (bump) allocator for fast sequential allocation (lex, parse, IR).
+ *   - Two-Level Segregated Fit (TLSF) O(1) segregated-bin heap allocator.
+ *     * O(1) allocate, O(1) free, O(1) bidirectional coalescing.
+ *     * Constant-time bitmap search (FL/SL bitmaps) via branchless bit-scan (ffs/fls).
+ *     * Intrusive doubly-linked lists inside free block payloads.
+ *     * Boundary tags with prev_size for O(1) bidirectional coalescing.
+ *   - Page allocator (mmap/munmap) as the backing layer.
+ *
+ * Memory block layout:
+ *   Allocated block:
+ *     [size_and_flags: i64]  (offset 0)  - bit 0: BLOCK_FREE (0), bit 1: PREV_FREE
+ *     [prev_size: i64]       (offset 8)  - size of physically preceding block
+ *     [user payload...]      (offset 16) - returned to user
+ *
+ *   Free block (minimum 32 bytes):
+ *     [size_and_flags: i64]  (offset 0)  - bit 0: BLOCK_FREE (1), bit 1: PREV_FREE
+ *     [prev_size: i64]       (offset 8)  - size of physically preceding block
+ *     [prev_free: i64]       (offset 16) - intrusive doubly-linked list prev
+ *     [next_free: i64]       (offset 24) - intrusive doubly-linked list next
+ ##
+
 module vir.rt.alloc
 
-
-# @vir_source stdlib/vir/compiler/alloc.vri 21
-import sys_mmap, sys_munmap, sys_platform, Platform, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS from syscall
+import sys_mmap, sys_munmap, sys_platform, sys_exit, Platform, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS from syscall
 
 # ═══════════════════════════════════════════════════════
 # Constants
 # ═══════════════════════════════════════════════════════
 
-const PAGE_SIZE:        16384;        # 16KB (macOS ARM64)
-const MIN_ARENA_SIZE:   1048576;      # 1MB
-const BLOCK_HEADER:     16;           # 8 bytes size_and_flags + 8 bytes prev_size
-const MIN_BLOCK_SIZE:   32;           # 16B header + 16B free list pointers
-const ALIGNMENT:        16;           # 16-byte alignment
+const PAGE_SIZE:             16384;        # 16KB (macOS ARM64)
+const MIN_ARENA_SIZE:        1048576;      # 1MB
+const BLOCK_HEADER:          16;           # 8 bytes size_and_flags + 8 bytes prev_size
+const MIN_BLOCK_SIZE:        32;           # 16B header + 16B free list pointers
+const ALIGNMENT:             16;           # 16-byte alignment
 
-const BLOCK_FREE:       0x1;          # bit 0: 1 = block is free, 0 = used
-const PREV_FREE:        0x2;          # bit 1: 1 = preceding block is free, 0 = used
-const FLAG_MASK:        0xF;          # lower 4 bits reserved for flags
+const BLOCK_FREE:            0x1;          # bit 0: 1 = block is free, 0 = used
+const PREV_FREE:             0x2;          # bit 1: 1 = preceding block is free, 0 = used
+const BLOCK_DIRECT_MAP:      0x4;          # bit 2: 1 = direct-mapped via page_alloc (>8MB)
+const FLAG_MASK:             0xF;          # lower 4 bits reserved for flags
 
-const FL_INDEX_COUNT:   28;           # 28 first-level classes (size 32 B to 4 GB)
-const SL_INDEX_COUNT:   16;           # 16 second-level bins per class
-const TOTAL_BINS:       448;          # 28 * 16 = 448 bins
+const LARGE_ALLOC_THRESHOLD: 8388608;      # 8MB: requests above threshold use direct mapping
+const MAX_ALLOC_SIZE:        1073741824;   # 1GB: maximum permissible allocation (prevents overflow)
+
+const FL_INDEX_COUNT:        28;           # 28 first-level classes (size 32 B to 4 GB)
+const SL_INDEX_COUNT:        16;           # 16 second-level bins per class
+const TOTAL_BINS:            448;          # 28 * 16 = 448 bins
+const HEAP_THREAD_SAFE:      false;        # native allocator is single-threaded / non-concurrent
 
 # ═══════════════════════════════════════════════════════
 # Portable Virtual Memory Layer (vm_alloc/vm_free)
@@ -1053,13 +1084,18 @@ entity Heap:
     base:       int;      # mmap'd region base
     capacity:   int;      # total region size
     free_head:  int;      # compatibility field (points to base or first block)
-    used:       int      # bytes currently allocated
+    used:       int;      # bytes currently allocated
+    peak_used:  int       # peak bytes allocated
 end.
 
 # Heap singleton
-var g_heap = Heap ( base: 0, capacity: 0, free_head: 0, used: 0 )
+var g_heap = Heap ( base: 0, capacity: 0, free_head: 0, used: 0, peak_used: 0 )
 var g_tlsf_ctrl: int = 0
 var g_heap_inspect_count: int = 0
+
+func heap_is_thread_safe() -> bool:
+    out HEAP_THREAD_SAFE
+end.
 
 func heap_get_inspect_count() -> int:
     out g_heap_inspect_count
@@ -1324,8 +1360,38 @@ func heap_init(size: int):
 end.
 
 func heap_alloc(size: int):
+    # 1. Validation: reject non-positive or oversized allocations
+    if size <= 0 do
+        out 0
+    end
+    if size > MAX_ALLOC_SIZE do
+        out 0
+    end
+
     if g_tlsf_ctrl == 0 do
         heap_init(MIN_ARENA_SIZE * 4)
+    end
+
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    # Check for direct-mapped large allocation (> 8MB)
+    if size > LARGE_ALLOC_THRESHOLD do
+        let ps = rt_page_size()
+        var total_req = size + BLOCK_HEADER
+        var pages = (total_req + ps - 1) / ps
+        var actual = pages * ps
+        let ptr = vm_alloc(actual, PROT_READ bit_or PROT_WRITE)
+        if ptr <= 0 do
+            out 0
+        end
+        native_write_i64(ptr, 0, actual bit_or BLOCK_DIRECT_MAP)
+        native_write_i64(ptr, 8, actual)
+        g_heap.used = g_heap.used + actual
+        if g_heap.used > g_heap.peak_used do
+            g_heap.peak_used = g_heap.used
+        end
+        out ptr + BLOCK_HEADER
     end
 
     var needed = size + BLOCK_HEADER
@@ -1333,9 +1399,9 @@ func heap_alloc(size: int):
     if needed < MIN_BLOCK_SIZE do
         needed = MIN_BLOCK_SIZE
     end
-
-    extern func native_read_i64(addr: int, offset: int) -> int
-    extern func native_write_i64(addr: int, offset: int, val: int)
+    if needed <= 0 or needed > MAX_ALLOC_SIZE do
+        out 0
+    end
 
     var bin_idx = tlsf_search_suitable_bin(needed)
     if bin_idx < 0 do
@@ -1396,6 +1462,9 @@ func heap_alloc(size: int):
     end
 
     g_heap.used = g_heap.used + needed
+    if g_heap.used > g_heap.peak_used do
+        g_heap.peak_used = g_heap.used
+    end
     out block + BLOCK_HEADER
 end.
 
@@ -1406,15 +1475,52 @@ func heap_free(p: int):
 
     extern func native_read_i64(addr: int, offset: int) -> int
     extern func native_write_i64(addr: int, offset: int, val: int)
+    extern func sys_exit(code: int)
+
+    # Validate alignment: payload pointer must be 16-byte aligned
+    if (p bit_and (ALIGNMENT - 1)) != 0 do
+        sys_exit(134)
+        out 0
+    end
 
     let block = p - BLOCK_HEADER
     let raw = native_read_i64(block, 0)
+
+    # Check for direct-mapped block
+    if (raw bit_and BLOCK_DIRECT_MAP) != 0 do
+        let map_size = raw bit_and ~(FLAG_MASK)
+        if map_size <= 0 or (raw bit_and BLOCK_FREE) != 0 do
+            sys_exit(134)
+            out 0
+        end
+        native_write_i64(block, 0, map_size bit_or BLOCK_FREE)
+        let ps = rt_page_size()
+        var pages = (map_size + ps - 1) / ps
+        var actual = pages * ps
+        vm_free(block, actual)
+        g_heap.used = g_heap.used - map_size
+        out 0
+    end
+
+    # Hardened double-free check: if already free, trap immediately with SIGABRT (134)
+    if (raw bit_and BLOCK_FREE) != 0 do
+        sys_exit(134)
+        out 0
+    end
+
     let original_size = raw bit_and ~(FLAG_MASK)
+    # Hardened block size validation: must be at least MIN_BLOCK_SIZE and 16-byte aligned
+    if original_size < MIN_BLOCK_SIZE or (original_size bit_and (ALIGNMENT - 1)) != 0 do
+        sys_exit(134)
+        out 0
+    end
+
     var block_size = original_size
     let prev_is_free = (raw bit_and PREV_FREE) != 0
     var merged_block = block
 
     # 1. O(1) Left coalescing via prev_size boundary tag
+    g_heap_inspect_count = g_heap_inspect_count + 1
     if prev_is_free do
         let prev_size = native_read_i64(block, 8)
         let left_block = block - prev_size
@@ -1424,6 +1530,7 @@ func heap_free(p: int):
     end
 
     # 2. O(1) Right coalescing via physical offset
+    g_heap_inspect_count = g_heap_inspect_count + 1
     let right_block = block + original_size
     let right_raw = native_read_i64(right_block, 0)
     if (right_raw bit_and BLOCK_FREE) != 0 do
@@ -1455,27 +1562,97 @@ func heap_realloc(p: int, new_size: int):
     if p == 0 do
         out heap_alloc(new_size)
     end
+    if new_size <= 0 do
+        heap_free(p)
+        out 0
+    end
+    if new_size > MAX_ALLOC_SIZE do
+        out 0
+    end
 
     extern func native_read_i64(addr: int, offset: int) -> int
     extern func native_write_i64(addr: int, offset: int, val: int)
 
     let block = p - BLOCK_HEADER
     let raw = native_read_i64(block, 0)
+
+    # Handle direct-mapped block realloc
+    if (raw bit_and BLOCK_DIRECT_MAP) != 0 do
+        let old_map_size = raw bit_and ~(FLAG_MASK)
+        let old_payload = old_map_size - BLOCK_HEADER
+        let new_ptr = heap_alloc(new_size)
+        if new_ptr == 0 do
+            out 0
+        end
+        var clen = old_payload
+        if new_size < clen do
+            clen = new_size
+        end
+        var ci = 0
+        when ci + 8 <= clen loop
+            let word = native_read_i64(p, ci)
+            native_write_i64(new_ptr, ci, word)
+            ci = ci + 8
+        end
+        when ci < clen loop
+            extern func native_read_u8(addr: int, offset: int) -> int
+            extern func native_write_u8(addr: int, offset: int, val: int)
+            let byte_val = native_read_u8(p, ci)
+            native_write_u8(new_ptr, ci, byte_val)
+            ci = ci + 1
+        end
+        heap_free(p)
+        out new_ptr
+    end
+
     let old_block_size = raw bit_and ~(FLAG_MASK)
     let old_payload_size = old_block_size - BLOCK_HEADER
 
-    # In-place shrink / reuse: no reallocation or copy needed!
-    if new_size <= old_payload_size do
-        out p
-    end
-
-    # Check if we can expand in-place into adjacent right free block
     var needed = new_size + BLOCK_HEADER
     needed = (needed + ALIGNMENT - 1) bit_and ~(ALIGNMENT - 1)
     if needed < MIN_BLOCK_SIZE do
         needed = MIN_BLOCK_SIZE
     end
 
+    # In-place shrink / split tail
+    if needed < old_block_size do
+        let remainder = old_block_size - needed
+        if remainder >= MIN_BLOCK_SIZE do
+            let prev_flags = raw bit_and PREV_FREE
+            native_write_i64(block, 0, needed bit_or prev_flags)
+
+            let rem_block = block + needed
+            native_write_i64(rem_block, 0, remainder bit_or BLOCK_FREE)
+            native_write_i64(rem_block, 8, needed)
+
+            let next_block = rem_block + remainder
+            let next_raw = native_read_i64(next_block, 0)
+            if (next_raw bit_and BLOCK_FREE) != 0 do
+                let next_sz = next_raw bit_and ~(FLAG_MASK)
+                tlsf_remove_block(next_block)
+                let combined_rem = remainder + next_sz
+                native_write_i64(rem_block, 0, combined_rem bit_or BLOCK_FREE)
+                let after_next = rem_block + combined_rem
+                let after_raw = native_read_i64(after_next, 0)
+                native_write_i64(after_next, 0, after_raw bit_or PREV_FREE)
+                native_write_i64(after_next, 8, combined_rem)
+                tlsf_insert_block(rem_block)
+            else
+                native_write_i64(next_block, 0, next_raw bit_or PREV_FREE)
+                native_write_i64(next_block, 8, remainder)
+                tlsf_insert_block(rem_block)
+            end
+
+            g_heap.used = g_heap.used - remainder
+        end
+        out p
+    end
+
+    if needed == old_block_size do
+        out p
+    end
+
+    # Check if we can expand in-place into adjacent right free block
     let right_block = block + old_block_size
     let right_raw = native_read_i64(right_block, 0)
     if (right_raw bit_and BLOCK_FREE) != 0 do
@@ -1508,7 +1685,7 @@ func heap_realloc(p: int, new_size: int):
         end
     end
 
-    # Allocate new, copy words, free old
+    # Allocate new, copy words, free old (failure preservation: if heap_alloc returns 0, old block is untouched)
     let new_ptr = heap_alloc(new_size)
     if new_ptr == 0 do
         out 0
@@ -1542,6 +1719,7 @@ func heap_verify() -> int:
     end
     extern func native_read_i64(addr: int, offset: int) -> int
 
+    # 1. Check Bitmap <-> Bin consistency and free block list integrity
     let fl_map = get_fl_bitmap()
     var fl = 0
     when fl < FL_INDEX_COUNT loop
@@ -1569,6 +1747,7 @@ func heap_verify() -> int:
 
             var cur = head
             var prev = 0
+            var cycle_guard = 0
             when cur != 0 loop
                 let raw = native_read_i64(cur, 0)
                 if (raw bit_and BLOCK_FREE) == 0 do
@@ -1578,14 +1757,71 @@ func heap_verify() -> int:
                 if p != prev do
                     out 0
                 end
+                let bsz = raw bit_and ~(FLAG_MASK)
+                if bsz < MIN_BLOCK_SIZE or (bsz bit_and 0xF) != 0 do
+                    out 0
+                end
+                let mapped_bin = tlsf_mapping_bin(bsz)
+                if mapped_bin != bin_idx do
+                    out 0
+                end
+
                 prev = cur
                 cur = native_read_i64(cur, 24)
+                cycle_guard = cycle_guard + 1
+                if cycle_guard > 500000 do
+                    out 0
+                end
             end
 
             sl = sl + 1
         end
         fl = fl + 1
     end
+
+    # 2. Physical heap walk: boundary tag reciprocity and sentinel integrity
+    if g_heap.base != 0 do
+        var cur = g_heap.base
+        var seg_limit = g_heap.base + g_heap.capacity
+        var prev_sz = 0
+        var prev_was_free = 0
+        var walk_guard = 0
+        when cur < seg_limit loop
+            let raw = native_read_i64(cur, 0)
+            let cur_sz = raw bit_and ~(FLAG_MASK)
+            let cur_prev_free = (raw bit_and PREV_FREE) != 0
+
+            if prev_sz > 0 do
+                if cur_prev_free != (prev_was_free != 0) do
+                    out 0
+                end
+                let rec_prev_sz = native_read_i64(cur, 8)
+                if rec_prev_sz != prev_sz do
+                    out 0
+                end
+            end
+
+            if cur_sz == 0 do
+                cur = seg_limit
+            else
+                if cur_sz < MIN_BLOCK_SIZE or (cur_sz bit_and 0xF) != 0 do
+                    out 0
+                end
+                if cur + cur_sz > seg_limit do
+                    out 0
+                end
+                prev_sz = cur_sz
+                prev_was_free = raw bit_and BLOCK_FREE
+                cur = cur + cur_sz
+            end
+
+            walk_guard = walk_guard + 1
+            if walk_guard > 500000 do
+                out 0
+            end
+        end
+    end
+
     out 1
 end.
 
@@ -1639,7 +1875,6 @@ func alloc_zeroed(size: int):
     end
     out p
 end.
-
 # @vir_source stdlib/vir/compiler/virc.vri 22
 import vir_alloc, vir_free, vir_realloc, heap_init, heap_verify from rt.alloc
 # @vir_source stdlib/vir/compiler/string_rt.vri 1
@@ -2648,7 +2883,6 @@ import vir_alloc, vir_free, vir_realloc, page_alloc from alloc
 
 extern func native_read_i64(addr: int, offset: int) -> int
 extern func native_write_i64(addr: int, offset: int, val: int)
-extern func native_mem_copy(dst: int, src: int, len: int)
 
 # ═══════════════════════════════════════════════════════
 # Vec operations (i64 element array)
@@ -2696,7 +2930,7 @@ func vec_push_rt(v: int, val: int):
         let new_bytes = HEADER_SIZE + new_cap * ELEM_SIZE
         # Transfer the new allocation straight out of the growth branch.
         # Returning after the branch auto-drops a branch-local owner first.
-        let grown_data = page_alloc(new_bytes) + HEADER_SIZE
+        let grown_data = vir_alloc(new_bytes) + HEADER_SIZE
         if base != 0 and old_bytes > 0 do
             var ci = 0
             when ci + 8 <= old_bytes loop
@@ -2749,7 +2983,9 @@ func vec_clear_rt(v: int):
     native_write_i64(v - 8, 0, 0)
 end.
 func vec_free_rt(v: int):
-    # vir_free(v - HEADER_SIZE)
+    if v > 0 do
+        vir_free(v - HEADER_SIZE)
+    end
 end.
 func vec_copy_rt(v: int):
 
@@ -2817,7 +3053,7 @@ func bvec_push(v: int, byte: int):
         let base = v - HEADER_SIZE
         let old_bytes = HEADER_SIZE + cap
         let new_bytes = HEADER_SIZE + new_cap
-        let new_base = page_alloc(new_bytes)
+        let new_base = vir_alloc(new_bytes)
         if base != 0 and old_bytes > 0 do
             var ci = 0
             when ci + 8 <= old_bytes loop
@@ -2838,6 +3074,53 @@ func bvec_push(v: int, byte: int):
 
     native_write_u8(v, len, byte & 0xFF)
     native_write_i64(v - 8, 0, len + 1)
+    out v
+end.
+
+func bvec_append_bytes(v: int, src_data: int, count: int):
+    if count <= 0 do out v end
+    let cur_len = bvec_len(v)
+    let needed = cur_len + count
+    var cap = native_read_i64(v - 16, 0)
+    if needed > cap do
+        var new_cap = cap * 2
+        when new_cap < needed loop
+            new_cap = new_cap * 2
+        end
+        let base = v - HEADER_SIZE
+        let old_bytes = HEADER_SIZE + cap
+        let new_bytes = HEADER_SIZE + new_cap
+        let new_base = vir_alloc(new_bytes)
+        if base != 0 and old_bytes > 0 do
+            var ci = 0
+            when ci + 8 <= old_bytes loop
+                let word = native_read_i64(base, ci)
+                let _w = native_write_i64(new_base, ci, word)
+                ci = ci + 8
+            end
+            when ci < old_bytes loop
+                let bval = native_read_u8(base, ci)
+                let _b = native_write_u8(new_base, ci, bval)
+                ci = ci + 1
+            end
+        end
+        let new_data = new_base + HEADER_SIZE
+        native_write_i64(new_base, 0, new_cap)
+        v = new_data
+    end
+    var bi = 0
+    let dst_ptr = v + cur_len
+    when bi + 8 <= count loop
+        let word = native_read_i64(src_data, bi)
+        let _w = native_write_i64(dst_ptr, bi, word)
+        bi = bi + 8
+    end
+    when bi < count loop
+        let bval = native_read_u8(src_data, bi)
+        let _b = native_write_u8(dst_ptr, bi, bval)
+        bi = bi + 1
+    end
+    native_write_i64(v - 8, 0, needed)
     out v
 end.
 func bvec_push_u16_le(v: int, val: int):
@@ -2886,7 +3169,9 @@ func bvec_data_ptr(v: int):
     out v   # data pointer is v itself
 end.
 func bvec_free(v: int):
-    # vir_free(v - HEADER_SIZE)
+    if v > 0 do
+        vir_free(v - HEADER_SIZE)
+    end
 end.
 
 # @vir_source stdlib/vir/compiler/virc.vri 33
@@ -3507,6 +3792,10 @@ func macho_rotr32(value: int, shift: int) -> int:
     out ((word shr shift) bit_or (word shl (32 - shift))) bit_and 0xFFFFFFFF
 end.
 
+func macho_shr32(value: int, shift: int) -> int:
+    out (value bit_and 0xFFFFFFFF) shr shift
+end.
+
 func macho_sha256_compress(state: i64, block: i64, block_start: int):
     var words = vir_alloc(64 * 8)
     var i = 0
@@ -3523,8 +3812,8 @@ func macho_sha256_compress(state: i64, block: i64, block_start: int):
     when i < 64 loop
         let w15 = native_read_i64(words, (i - 15) * 8)
         let w2 = native_read_i64(words, (i - 2) * 8)
-        let s0 = macho_rotr32(w15, 7) bit_xor macho_rotr32(w15, 18) bit_xor ((w15 bit_and 0xFFFFFFFF) shr 3)
-        let s1 = macho_rotr32(w2, 17) bit_xor macho_rotr32(w2, 19) bit_xor ((w2 bit_and 0xFFFFFFFF) shr 10)
+        let s0 = macho_rotr32(w15, 7) bit_xor macho_rotr32(w15, 18) bit_xor macho_shr32(w15, 3)
+        let s1 = macho_rotr32(w2, 17) bit_xor macho_rotr32(w2, 19) bit_xor macho_shr32(w2, 10)
         let next = (native_read_i64(words, (i - 16) * 8) + s0 + native_read_i64(words, (i - 7) * 8) + s1) bit_and 0xFFFFFFFF
         native_write_i64(words, i * 8, next)
         i = i + 1
@@ -3564,6 +3853,7 @@ func macho_sha256_compress(state: i64, block: i64, block_start: int):
     native_write_i64(state, 40, (native_read_i64(state, 40) + f) bit_and 0xFFFFFFFF)
     native_write_i64(state, 48, (native_read_i64(state, 48) + g) bit_and 0xFFFFFFFF)
     native_write_i64(state, 56, (native_read_i64(state, 56) + h) bit_and 0xFFFFFFFF)
+    vir_free(words)
 end.
 
 func macho_sha256_range(buf: i64, start: int, count: int) -> i64:
@@ -3596,6 +3886,7 @@ func macho_sha256_range(buf: i64, start: int, count: int) -> i64:
         macho_sha256_compress(state, padded, off)
         off = off + 64
     end
+    bvec_free(padded)
 
     var digest = bvec_new()
     i = 0
@@ -3603,6 +3894,7 @@ func macho_sha256_range(buf: i64, start: int, count: int) -> i64:
         digest = macho_bvec_push_u32_be(digest, native_read_i64(state, i * 8))
         i = i + 1
     end
+    vir_free(state)
     out digest
 end.
 
@@ -3699,6 +3991,7 @@ func macho_emit_adhoc_signature(b: MachOBuilder) -> MachOBuilder:
             b.buf = bvec_push(b.buf, bvec_get(digest, di))
             di = di + 1
         end
+        bvec_free(digest)
         slot = slot + 1
     end
     out b
@@ -4048,11 +4341,7 @@ func macho_emit(b: MachOBuilder, entry_off_param: i64):
         current = current + 1
     end
 
-    var i = 0
-    when i < code_size loop
-        b.buf = bvec_push(b.buf, bvec_get(b.text_code, i))
-        i = i + 1
-    end
+    b.buf = bvec_append_bytes(b.buf, bvec_data_ptr(b.text_code), code_size)
 
     current = bvec_len(b.buf)
     when current < text_segment_size loop
@@ -21926,7 +22215,6 @@ func mir_opnd_new(op_type: i64, vreg: i64, imm: i64, block_id: i64):
 end.
 
 func mir_instr_new(op: i64, dst: i64, src1: i64, src2: i64):
-    p = alloc(40)
     p = alloc(48)
     native_write_i64(p, 0, op)
     native_write_i64(p, 8, dst)
@@ -23038,6 +23326,11 @@ const MIR_COLD_BLOCK_MARKER: i64 = 100
 const MIR_ARC_RETAIN: i64 = 201
 const MIR_ARC_RELEASE: i64 = 202
 const MIR_ARC_TRIAL: i64 = 203
+const MIR_INLINE_CALLER_BUDGET: i64 = 300
+const MIR_INLINE_VISIT_SLOTS: i64 = 64
+const MIR_INLINE_VISIT_MASK: i64 = 63
+var g_inline_visit: i64 = 0
+var g_inline_pass_epoch: i64 = 0
 
 func mir_opt_set_program(program: i64):
     g_mir_opt_program = program
@@ -23236,6 +23529,7 @@ func mir_opt_copy_propagation(blocks: i64):
         end
         i = i + 1
     end
+    vec_free_rt(def_counts)
     out blocks
 end.
 
@@ -23261,6 +23555,7 @@ func mir_opt_constant_propagation(blocks: i64):
         end
         i = i + 1
     end
+    vec_free_rt(def_counts)
     out blocks
 end.
 
@@ -23509,38 +23804,37 @@ func mir_opt_dce(blocks: i64):
         end
     end
 
-    # Single sweep: rebuild blocks omitting Nop instructions
+    # Single sweep: in-place compact instructions omitting Nop
     bi = 0
     when bi < n_blocks loop
         b = vec_get_rt(blocks, bi)
         instrs = mir_block_head(b)
         if instrs >= 0 do
             n_instrs = vec_len_rt(instrs)
-            new_instrs = vec_new_rt()
+            var write_idx = 0
             var j = 0
+            var has_nop = 0
             when j < n_instrs loop
                 ins = vec_get_rt(instrs, j)
                 if mir_instr_op(ins) != MirOp.Nop as i64 do
-                    new_instrs = vec_push_rt(new_instrs, ins)
+                    if write_idx != j do
+                        vec_set_rt(instrs, write_idx, ins)
+                    end
+                    write_idx = write_idx + 1
+                else
+                    has_nop = 1
                 end
                 j = j + 1
             end
-            b_new = mir_block_new(
-                mir_block_id(b),
-                mir_block_phis(b),
-                new_instrs,
-                mir_block_tail(b),
-                mir_block_successors(b),
-                mir_block_preds(b),
-                mir_block_idom(b),
-                mir_block_dom_children(b),
-                mir_block_df(b),
-                mir_block_next_block(b)
-            )
-            vec_set_rt(blocks, bi, b_new)
+            if has_nop == 1 do
+                native_write_i64(instrs - 8, 0, write_idx)
+            end
         end
         bi = bi + 1
     end
+    vec_free_rt(uses)
+    vec_free_rt(def_ins_tab)
+    vec_free_rt(worklist)
     out blocks
 end.
 
@@ -23768,6 +24062,7 @@ func mir_opt_licm(blocks: i64):
         end
         hdr_idx = hdr_idx + 1
     end
+    vec_free_rt(def_counts)
     out blocks
 end.
 
@@ -23968,7 +24263,15 @@ func mir_trampoline_target(blocks: i64, block_id: i64):
         end
         i = i + 1
     end
-    if meaningful == 1 do out target end
+    if meaningful == 1 do
+        t_idx = mir_find_block_index(blocks, target)
+        if t_idx >= 0 do
+            tb = vec_get_rt(blocks, t_idx)
+            t_phis = mir_block_phis(tb)
+            if t_phis >= 0 and vec_len_rt(t_phis) > 0 do out 0 - 1 end
+        end
+        out target
+    end
     out 0 - 1
 end.
 
@@ -24134,7 +24437,6 @@ func mir_opt_sccp(blocks: i64):
                         end
                     else
                         if not mir_opnd_is_same(rs1, mir_instr_src1(ins2)) or not mir_opnd_is_same(rs2, mir_instr_src2(ins2)) do
-                            vec_set_rt(instrs2, ii, mir_instr_new(op2, dst2, rs1, rs2))
                             new_ins2 = mir_instr_new(op2, dst2, rs1, rs2)
                             mir_instr_set_aux(new_ins2, mir_instr_aux(ins2))
                             mir_instr_set_type(new_ins2, mir_instr_type(ins2))
@@ -24144,7 +24446,6 @@ func mir_opt_sccp(blocks: i64):
                     end
                 else
                     if not mir_opnd_is_same(rs1, mir_instr_src1(ins2)) or not mir_opnd_is_same(rs2, mir_instr_src2(ins2)) do
-                        vec_set_rt(instrs2, ii, mir_instr_new(op2, dst2, rs1, rs2))
                         new_ins2 = mir_instr_new(op2, dst2, rs1, rs2)
                         mir_instr_set_aux(new_ins2, mir_instr_aux(ins2))
                         mir_instr_set_type(new_ins2, mir_instr_type(ins2))
@@ -24157,6 +24458,8 @@ func mir_opt_sccp(blocks: i64):
         end
         bi = bi + 1
     end
+    vec_free_rt(states)
+    vec_free_rt(values)
     out blocks
 end.
 
@@ -24561,7 +24864,7 @@ func mir_opt_sweep_dead_phis(blocks: i64):
 end.
 
 func mir_terminates_control(op: i64):
-    out mir_is_control_terminator(op)
+    out op == MirOp.Jump or op == MirOp.Return
 end.
 
 func mir_opt_cfg_simplification(blocks: i64):
@@ -25480,40 +25783,8 @@ end.
  * PRE — hoist partially-redundant pure exprs into dominating predecessor.
  ##
 func mir_opt_pre(blocks: i64):
-    n_blocks = vec_len_rt(blocks)
-    var b_idx = 0
-    when b_idx < n_blocks loop
-        b = vec_get_rt(blocks, b_idx)
-        succs = mir_block_successors(b)
-        if succs >= 0 and vec_len_rt(succs) == 1 do
-            succ_id = vec_get_rt(succs, 0)
-            succ_idx = mir_find_block_index(blocks, succ_id)
-            if succ_idx >= 0 do
-                hdr_instrs = mir_block_head(b)
-                succ_instrs = mir_block_head(vec_get_rt(blocks, succ_idx))
-                if hdr_instrs >= 0 and succ_instrs >= 0 do
-                    var si = 0
-                    when si < vec_len_rt(succ_instrs) and si < 4 loop
-                        sins = vec_get_rt(succ_instrs, si)
-                        sop = mir_instr_op(sins)
-                        if mir_gvn_candidate(sop) do
-                            ss1 = mir_instr_src1(sins)
-                            ss2 = mir_instr_src2(sins)
-                            if mir_opnd_type(ss1) != MirOperandType.VReg or count_vreg_defs_mir(blocks, mir_opnd_vreg_id(ss1)) == 1 do
-                                hdr_instrs = mir_block_insert_before_terminator(hdr_instrs, sins)
-                                vec_set_rt(succ_instrs, si, mir_instr_new(MirOp.Move, mir_instr_dst(sins), mir_instr_dst(sins), mir_opnd_none()))
-                                mir_opt_note_change()
-                            end
-                        end
-                        si = si + 1
-                    end
-                    vec_set_rt(blocks, b_idx, mir_block_replace_head(b, hdr_instrs))
-                    vec_set_rt(blocks, succ_idx, mir_block_replace_head(vec_get_rt(blocks, succ_idx), succ_instrs))
-                end
-            end
-        end
-        b_idx = b_idx + 1
-    end
+    # PRE is disabled until safe cross-predecessor insertion is implemented.
+    # Blindly hoisting from a successor into one predecessor starves all other predecessors.
     out blocks
 end.
 
@@ -25547,11 +25818,52 @@ func mir_opt_slp(blocks: i64):
                     end
                 end
                 i = i + 1
-            end
+             end
         end
         b_idx = b_idx + 1
     end
     out blocks
+end.
+
+func mir_inline_name_hash(name: string):
+    var name_ptr = name as i64
+    if name_ptr == 0 do out 0 end
+    var data_ptr = native_read_i64(name_ptr, 0)
+    var len = native_read_i64(name_ptr, 8)
+    if data_ptr == 0 or len <= 0 do out 0 end
+    var h = 2166136261
+    var limit = len
+    if limit > 64 do limit = 64 end
+    var i = 0
+    when i < limit loop
+        var b = native_read_u8(data_ptr, i)
+        h = (h ^ b) * 16777619
+        i = i + 1
+    end
+    out (h & MIR_INLINE_VISIT_MASK)
+end.
+
+func mir_inline_visit_begin():
+    g_inline_pass_epoch = g_inline_pass_epoch + 1
+    if g_inline_visit == 0 do
+        g_inline_visit = vec_new_rt()
+        var s = 0
+        when s < MIR_INLINE_VISIT_SLOTS loop
+            g_inline_visit = vec_push_rt(g_inline_visit, 0)
+            s = s + 1
+        end
+    end
+end.
+
+func mir_inline_visit_check_mark(callee_name: string):
+    slot = mir_inline_name_hash(callee_name)
+    stored = vec_get_rt(g_inline_visit, slot)
+    key = (g_inline_pass_epoch * 4294967296) + slot
+    if stored == key do
+        out 1
+    end
+    vec_set_rt(g_inline_visit, slot, key)
+    out 0
 end.
 
 func mir_opt_try_inline_at(blocks: i64, b_idx: i64, call_idx: i64):
@@ -25565,20 +25877,26 @@ func mir_opt_try_inline_at(blocks: i64, b_idx: i64, call_idx: i64):
     if mir_opnd_type(mir_instr_src2(call_ins)) != MirOperandType.Imm do out blocks end
     pool_id = mir_opnd_imm_val(mir_instr_src2(call_ins))
     callee_name = mir_strings_get(mir_func_strings(caller), pool_id)
+    # Epoch check FIRST — O(1). Skips all expensive lookups for repeated call sites.
+    if mir_inline_visit_check_mark(callee_name) != 0 do out blocks end
     callee = mir_program_find_func(g_mir_opt_program, callee_name)
     if callee == 0 do out blocks end
     callee_blocks = mir_func_blocks(callee)
+    if vec_len_rt(callee_blocks) != 1 do out blocks end
     if mir_count_all_instrs(callee_blocks) > MIR_INLINE_MAX_INSTRS do out blocks end
     if mir_blocks_contain_call(callee_blocks) do out blocks end
+    if mir_count_all_instrs(blocks) > MIR_INLINE_CALLER_BUDGET do out blocks end
+
     nargs = mir_opnd_imm_val(mir_instr_src1(call_ins))
     arg_vals = mir_opt_collect_call_args(instrs, call_idx, nargs)
+
     param_vregs = mir_callee_param_vregs(callee_blocks)
     vreg_base = mir_func_next_vreg(caller)
     new_instrs = vec_new_rt()
     var ii = 0
     when ii < call_idx loop
         ins = vec_get_rt(instrs, ii)
-        if mir_instr_op(ins) != MirOp.SetArg do
+        if ii < (call_idx - nargs) or mir_instr_op(ins) != MirOp.SetArg do
             new_instrs = vec_push_rt(new_instrs, ins)
         end
         ii = ii + 1
@@ -25626,6 +25944,7 @@ end.
  * Inlining — leaf direct calls when program context is set.
  ##
 func mir_opt_inlining(blocks: i64):
+    mir_inline_visit_begin()
     n_blocks = vec_len_rt(blocks)
     var b_idx = 0
     when b_idx < n_blocks loop
@@ -25644,6 +25963,7 @@ func mir_opt_inlining(blocks: i64):
     end
     out blocks
 end.
+
 
 ##
  * Shrink-wrap — annotate call-free blocks for minimal prologue/epilogue.
@@ -25721,6 +26041,7 @@ end.
  ##
 func mir_opt_dae(blocks: i64):
     n_blocks = vec_len_rt(blocks)
+    last_slot = vec_new_rt()
     var b_idx = 0
     when b_idx < n_blocks loop
         instrs = mir_block_head(vec_get_rt(blocks, b_idx))
@@ -25729,7 +26050,7 @@ func mir_opt_dae(blocks: i64):
             when i < vec_len_rt(instrs) loop
                 if mir_instr_op(vec_get_rt(instrs, i)) == MirOp.Call do
                     nargs = mir_opnd_imm_val(mir_instr_src1(vec_get_rt(instrs, i)))
-                    last_slot = vec_new_rt()
+                    vec_clear_rt(last_slot)
                     var ci = i - 1
                     when ci >= 0 loop
                         ins = vec_get_rt(instrs, ci)
@@ -25738,12 +26059,12 @@ func mir_opt_dae(blocks: i64):
                         else
                             slot = mir_opnd_imm_val(mir_instr_src1(ins))
                             if slot >= nargs do
-                                vec_set_rt(instrs, ci, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                native_write_i64(ins as i64, 0, MirOp.Nop as i64)
                                 mir_opt_note_change()
                             else
                                 if slot < vec_len_rt(last_slot) do
                                     if vec_get_rt(last_slot, slot) == 1 do
-                                        vec_set_rt(instrs, ci, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                        native_write_i64(ins as i64, 0, MirOp.Nop as i64)
                                         mir_opt_note_change()
                                     end
                                 end
@@ -25763,6 +26084,7 @@ func mir_opt_dae(blocks: i64):
         end
         b_idx = b_idx + 1
     end
+    vec_free_rt(last_slot)
     out blocks
 end.
 
@@ -25800,79 +26122,6 @@ end.
  * Escape analysis — non-escaping allocs → arena fastpath marker.
  ##
 func mir_opt_escape_analysis_and_arena_promotion(blocks: i64):
-    n_vregs = max_vreg_mir(blocks)
-    escaped = vec_new_rt()
-    var vi = 0
-    when vi < n_vregs loop
-        escaped = vec_push_rt(escaped, 0)
-        vi = vi + 1
-    end
-    n_blocks = vec_len_rt(blocks)
-    var b_idx = 0
-    when b_idx < n_blocks loop
-        instrs = mir_block_head(vec_get_rt(blocks, b_idx))
-        if instrs >= 0 do
-            var i = 0
-            when i < vec_len_rt(instrs) loop
-                ins = vec_get_rt(instrs, i)
-                op = mir_instr_op(ins)
-                if op == MirOp.Call or op == MirOp.Return or op == MirOp.Store do
-                    s1 = mir_instr_src1(ins)
-                    s2 = mir_instr_src2(ins)
-                    if mir_opnd_type(s1) == MirOperandType.VReg do
-                        v = mir_opnd_vreg_id(s1)
-                        if v >= 0 and v < n_vregs do vec_set_rt(escaped, v, 1) end
-                    end
-                    if mir_opnd_type(s2) == MirOperandType.VReg do
-                        v2 = mir_opnd_vreg_id(s2)
-                        if v2 >= 0 and v2 < n_vregs do vec_set_rt(escaped, v2, 1) end
-                    end
-                end
-                if op == MirOp.Intrinsic do
-                    s2k = mir_instr_src2(ins)
-                    if mir_opnd_type(s2k) == MirOperandType.Imm and mir_opnd_imm_val(s2k) == MIR_INTR_ADDR_OF do
-                        s1k = mir_instr_src1(ins)
-                        if mir_opnd_type(s1k) == MirOperandType.VReg do
-                            v3 = mir_opnd_vreg_id(s1k)
-                            if v3 >= 0 and v3 < n_vregs do vec_set_rt(escaped, v3, 1) end
-                        end
-                    end
-                end
-                i = i + 1
-            end
-        end
-        b_idx = b_idx + 1
-    end
-    b_idx = 0
-    when b_idx < n_blocks loop
-        instrs2 = mir_block_head(vec_get_rt(blocks, b_idx))
-        if instrs2 >= 0 do
-            var j = 0
-            when j < vec_len_rt(instrs2) loop
-                ins2 = vec_get_rt(instrs2, j)
-                if mir_instr_op(ins2) == MirOp.Intrinsic do
-                    s2b = mir_instr_src2(ins2)
-                    if mir_opnd_type(s2b) == MirOperandType.Imm and mir_opnd_imm_val(s2b) == MIR_INTR_BUILTIN do
-                        s1b = mir_instr_src1(ins2)
-                        bid = mir_opnd_imm_val(s1b)
-                        if bid == 3 or bid == 49 or bid == 50 do
-                            dst = mir_instr_dst(ins2)
-                            if mir_opnd_type(dst) == MirOperandType.VReg do
-                                dv = mir_opnd_vreg_id(dst)
-                                if dv >= 0 and dv < n_vregs and vec_get_rt(escaped, dv) == 0 do
-                                    vec_set_rt(instrs2, j, mir_instr_new(MirOp.Intrinsic, dst, mir_opnd_imm(MIR_BCE_MARKER), mir_opnd_imm(MIR_INTR_ARENA)))
-                                    mir_opt_note_change()
-                                end
-                            end
-                        end
-                    end
-                end
-                j = j + 1
-            end
-            vec_set_rt(blocks, b_idx, mir_block_replace_head(vec_get_rt(blocks, b_idx), instrs2))
-        end
-        b_idx = b_idx + 1
-    end
     out blocks
 end.
 
@@ -25967,70 +26216,105 @@ func mir_opt_arc_insert_retain_release(blocks: i64, escaped: i64):
         b = vec_get_rt(blocks, b_idx)
         instrs = mir_block_head(b)
         if instrs >= 0 do
+            n_ins = vec_len_rt(instrs)
+            var needs_insert = 0
             var i = 0
-            when i < vec_len_rt(instrs) loop
+            when i < n_ins loop
                 ins = vec_get_rt(instrs, i)
-                if mir_is_heap_alloc_builtin(ins) do
+                if mir_instr_op(ins) == MirOp.Return do
+                    rv = mir_instr_src1(ins)
+                    if mir_opnd_type(rv) == MirOperandType.VReg do
+                        dv2 = mir_opnd_vreg_id(rv)
+                        if dv2 >= 0 and dv2 < n_vregs and vec_get_rt(escaped, dv2) == 1 do
+                            has_release = 0
+                            if i > 0 do
+                                prev = vec_get_rt(instrs, i - 1)
+                                if mir_is_arc_patch(prev, MIR_ARC_RELEASE) and mir_arc_marker_vreg(prev) == dv2 do
+                                    has_release = 1
+                                end
+                            end
+                            if has_release == 0 do
+                                needs_insert = 1
+                            end
+                        end
+                    end
+                eif mir_is_heap_alloc_builtin(ins) do
                     dst = mir_instr_dst(ins)
                     if mir_opnd_type(dst) == MirOperandType.VReg do
                         dv = mir_opnd_vreg_id(dst)
                         if dv >= 0 and dv < n_vregs and vec_get_rt(escaped, dv) == 1 do
                             has_retain = 0
-                            if (i + 1) < vec_len_rt(instrs) do
+                            if (i + 1) < n_ins do
                                 nxt = vec_get_rt(instrs, i + 1)
                                 if mir_is_arc_patch(nxt, MIR_ARC_RETAIN) and mir_arc_marker_vreg(nxt) == dv do
                                     has_retain = 1
                                 end
                             end
                             if has_retain == 0 do
-                                retain = mir_instr_new(MirOp.Intrinsic, dst, mir_opnd_imm(MIR_ARC_RETAIN), mir_opnd_imm(MIR_INTR_PATCH_POINT))
-                                trial = mir_instr_new(MirOp.Intrinsic, dst, mir_opnd_imm(MIR_ARC_TRIAL), mir_opnd_imm(MIR_INTR_PATCH_POINT))
-                                new_instrs = vec_new_rt()
-                                var k = 0
-                                when k <= i loop
-                                    new_instrs = vec_push_rt(new_instrs, vec_get_rt(instrs, k))
-                                    k = k + 1
-                                end
-                                new_instrs = vec_push_rt(new_instrs, retain)
-                                new_instrs = vec_push_rt(new_instrs, trial)
-                                k = i + 1
-                                when k < vec_len_rt(instrs) loop
-                                    new_instrs = vec_push_rt(new_instrs, vec_get_rt(instrs, k))
-                                    k = k + 1
-                                end
-                                instrs = new_instrs
-                                mir_opt_note_change()
+                                needs_insert = 1
                             end
-                        end
-                    end
-                end
-                if mir_instr_op(ins) == MirOp.Return do
-                    rv = mir_instr_src1(ins)
-                    if mir_opnd_type(rv) == MirOperandType.VReg do
-                        dv2 = mir_opnd_vreg_id(rv)
-                        if dv2 >= 0 and dv2 < n_vregs and vec_get_rt(escaped, dv2) == 1 do
-                            rel = mir_instr_new(MirOp.Intrinsic, mir_opnd_vreg(dv2), mir_opnd_imm(MIR_ARC_RELEASE), mir_opnd_imm(MIR_INTR_PATCH_POINT))
-                            new_instrs2 = vec_new_rt()
-                            var k2 = 0
-                            when k2 < i loop
-                                new_instrs2 = vec_push_rt(new_instrs2, vec_get_rt(instrs, k2))
-                                k2 = k2 + 1
-                            end
-                            new_instrs2 = vec_push_rt(new_instrs2, rel)
-                            new_instrs2 = vec_push_rt(new_instrs2, ins)
-                            k2 = i + 1
-                            when k2 < vec_len_rt(instrs) loop
-                                new_instrs2 = vec_push_rt(new_instrs2, vec_get_rt(instrs, k2))
-                                k2 = k2 + 1
-                            end
-                            instrs = new_instrs2
-                            mir_opt_note_change()
                         end
                     end
                 end
                 i = i + 1
             end
-            vec_set_rt(blocks, b_idx, mir_block_replace_head(b, instrs))
+
+            if needs_insert == 1 do
+                new_instrs = vec_new_rt()
+                i = 0
+                when i < n_ins loop
+                    ins = vec_get_rt(instrs, i)
+                    if mir_instr_op(ins) == MirOp.Return do
+                        rv = mir_instr_src1(ins)
+                        if mir_opnd_type(rv) == MirOperandType.VReg do
+                            dv2 = mir_opnd_vreg_id(rv)
+                            if dv2 >= 0 and dv2 < n_vregs and vec_get_rt(escaped, dv2) == 1 do
+                                has_release = 0
+                                cur_len = vec_len_rt(new_instrs)
+                                if cur_len > 0 do
+                                    prev = vec_get_rt(new_instrs, cur_len - 1)
+                                    if mir_is_arc_patch(prev, MIR_ARC_RELEASE) and mir_arc_marker_vreg(prev) == dv2 do
+                                        has_release = 1
+                                    end
+                                end
+                                if has_release == 0 do
+                                    rel = mir_instr_new(MirOp.Intrinsic, mir_opnd_vreg(dv2), mir_opnd_imm(MIR_ARC_RELEASE), mir_opnd_imm(MIR_INTR_PATCH_POINT))
+                                    new_instrs = vec_push_rt(new_instrs, rel)
+                                end
+                            end
+                        end
+                    end
+
+                    new_instrs = vec_push_rt(new_instrs, ins)
+
+                    if mir_is_heap_alloc_builtin(ins) do
+                        dst = mir_instr_dst(ins)
+                        if mir_opnd_type(dst) == MirOperandType.VReg do
+                            dv = mir_opnd_vreg_id(dst)
+                            if dv >= 0 and dv < n_vregs and vec_get_rt(escaped, dv) == 1 do
+                                has_retain = 0
+                                if (i + 1) < n_ins do
+                                    nxt = vec_get_rt(instrs, i + 1)
+                                    if mir_is_arc_patch(nxt, MIR_ARC_RETAIN) and mir_arc_marker_vreg(nxt) == dv do
+                                        has_retain = 1
+                                    end
+                                end
+                                if has_retain == 0 do
+                                    retain = mir_instr_new(MirOp.Intrinsic, dst, mir_opnd_imm(MIR_ARC_RETAIN), mir_opnd_imm(MIR_INTR_PATCH_POINT))
+                                    trial = mir_instr_new(MirOp.Intrinsic, dst, mir_opnd_imm(MIR_ARC_TRIAL), mir_opnd_imm(MIR_INTR_PATCH_POINT))
+                                    new_instrs = vec_push_rt(new_instrs, retain)
+                                    new_instrs = vec_push_rt(new_instrs, trial)
+                                end
+                            end
+                        end
+                    end
+
+                    i = i + 1
+                end
+                vec_free_rt(instrs)
+                vec_set_rt(blocks, b_idx, mir_block_replace_head(b, new_instrs))
+                mir_opt_note_change()
+            end
         end
         b_idx = b_idx + 1
     end
@@ -26053,16 +26337,19 @@ func mir_opt_arc_trial_delete_pairs(blocks: i64, escaped: i64):
                 eif mir_is_arc_patch(ins, MIR_ARC_RELEASE) do
                     rv = mir_arc_marker_vreg(ins)
                     if rv == pending_v and pending_v >= 0 do
-                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                        native_write_i64(ins as i64, 0, MirOp.Nop as i64)
+                        native_write_i64(ins as i64, 8, mir_opnd_none() as i64)
                         var j = i - 1
                         when j >= 0 loop
                             prev = vec_get_rt(instrs, j)
                             if mir_is_arc_patch(prev, MIR_ARC_RETAIN) and mir_arc_marker_vreg(prev) == rv do
-                                vec_set_rt(instrs, j, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                native_write_i64(prev as i64, 0, MirOp.Nop as i64)
+                                native_write_i64(prev as i64, 8, mir_opnd_none() as i64)
                                 j = 0 - 1
                             else
                                 if mir_is_arc_patch(prev, MIR_ARC_TRIAL) and mir_arc_marker_vreg(prev) == rv do
-                                    vec_set_rt(instrs, j, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                    native_write_i64(prev as i64, 0, MirOp.Nop as i64)
+                                    native_write_i64(prev as i64, 8, mir_opnd_none() as i64)
                                 end
                                 j = j - 1
                             end
@@ -26096,7 +26383,8 @@ func mir_opt_arc_trial_delete_pairs(blocks: i64, escaped: i64):
                 if mir_is_arc_patch(ins2, MIR_ARC_RETAIN) or mir_is_arc_patch(ins2, MIR_ARC_RELEASE) or mir_is_arc_patch(ins2, MIR_ARC_TRIAL) do
                     vv = mir_arc_marker_vreg(ins2)
                     if vv >= 0 and vv < n_vregs and vec_get_rt(escaped, vv) == 0 do
-                        vec_set_rt(instrs, i2, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                        native_write_i64(ins2 as i64, 0, MirOp.Nop as i64)
+                        native_write_i64(ins2 as i64, 8, mir_opnd_none() as i64)
                         mir_opt_note_change()
                     end
                 end
@@ -26113,14 +26401,16 @@ func mir_opt_arc_trial_deletion(blocks: i64):
     escaped = mir_opt_build_escaped_vregs(blocks)
     blocks = mir_opt_arc_insert_retain_release(blocks, escaped)
     blocks = mir_opt_arc_trial_delete_pairs(blocks, escaped)
+    vec_free_rt(escaped)
     out blocks
 end.
 
 ##
- * IPO cascade — re-run key passes after inlining hooks.
+ * IPO cascade — fold constants and eliminate dead code after the preceding
+ * inlining round. Does NOT re-invoke mir_opt_inlining() — that was already
+ * called by mir_opt_run_spec_round and would cause O(n²) IR growth.
  ##
 func mir_opt_ipo_inline_cascade(blocks: i64):
-    blocks = mir_opt_inlining(blocks)
     blocks = mir_opt_sccp(blocks)
     blocks = mir_opt_sroa(blocks)
     blocks = mir_opt_dae(blocks)
@@ -34467,6 +34757,9 @@ func lir_compute_liveness(func_obj: LirFunc):
         end
     end
 
+    if block_starts > 0 do vec_free_rt(block_starts) end
+    if calls > 0 do vec_free_rt(calls) end
+
     out intervals
 end.
 
@@ -34523,7 +34816,7 @@ func intervals_overlap(i1: LiveInterval, i2: LiveInterval):
     if s2 == 0 - 1 do out false end
     e1 = native_read_i64(i1 as i64, 16)
     e2 = native_read_i64(i2 as i64, 16)
-    out s1 <= e2 & s2 <= e1
+    out s1 < e2 & s2 < e1
 end.
 
 func ig_num_nodes(ig: InterferenceGraph):
@@ -34663,7 +34956,7 @@ func build_interference_graph(intervals: i64):
             let v = vec_get_rt(active, aj)
             let iv_v = vec_get_rt(intervals, v)
             let start_v = native_read_i64(iv_v as i64, 8)
-            if start_v > end_u do
+            if start_v >= end_u do
                 should_cont = false
             else
                 # Record in Adjacency Lists
@@ -34694,6 +34987,7 @@ func build_interference_graph(intervals: i64):
         ai = ai + 1
     end
 
+    vec_free_rt(active)
     out ig_new(n_nodes, bit_matrix, degrees, adj_lists)
 end.
 
@@ -34764,6 +35058,7 @@ func build_interference_graph_def_live_out(func_obj: LirFunc, intervals: i64):
         bi = bi + 1
     end
 
+    ig_free(base_ig)
     out ig_new(n_nodes, bit_matrix, degrees, adj_lists)
 end.
 
@@ -34779,8 +35074,27 @@ func get_edge(ig: InterferenceGraph, u: i64, v: i64):
     out (word shr bit_idx) and 1
 end.
 
+func ig_free(ig: i64):
+    if ig <= 0 do out end
+    let mat = ig_matrix(ig as InterferenceGraph)
+    if mat > 0 do vec_free_rt(mat) end
+    let deg = ig_degrees(ig as InterferenceGraph)
+    if deg > 0 do vec_free_rt(deg) end
+    let adjs = ig_adj_lists(ig as InterferenceGraph)
+    if adjs > 0 do
+        let n = vec_len_rt(adjs)
+        var i = 0
+        when i < n loop
+            let lst = vec_get_rt(adjs, i)
+            if lst > 0 do vec_free_rt(lst) end
+            i = i + 1
+        end
+        vec_free_rt(adjs)
+    end
+end.
+
 export InterferenceGraph, build_interference_graph, build_interference_graph_def_live_out
-export get_edge, ig_num_nodes, ig_degrees, ig_adj_lists, intervals_overlap, ig_add_edge
+export get_edge, ig_num_nodes, ig_degrees, ig_adj_lists, intervals_overlap, ig_add_edge, ig_free
 
 # @vir_source stdlib/vir/compiler/virc.vri 68
 # @vir_source stdlib/vir/compiler/lir_verifier.vri 1
@@ -35066,11 +35380,11 @@ func lir_allocate_registers_color(func_obj: LirFunc, intervals: i64):
 
     degrees_vec = ig_degrees(ig)
     curr_degrees = vec_new_rt()
-    move_partner = vec_new_rt()
+    move_affinities = vec_new_rt()
     i = 0
     when i < n_nodes loop
         curr_degrees = vec_push_rt(curr_degrees, vec_get_rt(degrees_vec, i))
-        move_partner = vec_push_rt(move_partner, 0 - 1)
+        move_affinities = vec_push_rt(move_affinities, vec_new_rt())
         i = i + 1
     end
 
@@ -35089,12 +35403,35 @@ func lir_allocate_registers_color(func_obj: LirFunc, intervals: i64):
                 d_opnd = native_read_i64(ins_m as i64, 16)
                 s_opnd = native_read_i64(ins_m as i64, 24)
                 if d_opnd != 0 and s_opnd != 0 do
-                    if native_read_i64(d_opnd, 0) == 1 and native_read_i64(s_opnd, 0) == 1 do
+                    let dt = native_read_i64(d_opnd, 0)
+                    let st = native_read_i64(s_opnd, 0)
+                    if (dt == 1 or dt == 2) and (st == 1 or st == 2) do
                         u_v = native_read_i64(d_opnd, 8)
                         v_v = native_read_i64(s_opnd, 8)
-                        if u_v >= 0 and u_v < n_nodes and v_v >= 0 and v_v < n_nodes do
-                            vec_set_rt(move_partner, u_v, v_v)
-                            vec_set_rt(move_partner, v_v, u_v)
+                        if u_v >= 0 and u_v < n_nodes and v_v >= 0 and v_v < n_nodes and u_v != v_v do
+                            aff_u = vec_get_rt(move_affinities, u_v)
+                            var has_v = 0
+                            var ai_u = 0
+                            let n_u = vec_len_rt(aff_u)
+                            when ai_u < n_u loop
+                                if vec_get_rt(aff_u, ai_u) == v_v do has_v = 1 end
+                                ai_u = ai_u + 1
+                            end
+                            if has_v == 0 do
+                                vec_set_rt(move_affinities, u_v, vec_push_rt(aff_u, v_v))
+                            end
+
+                            aff_v = vec_get_rt(move_affinities, v_v)
+                            var has_u = 0
+                            var ai_v = 0
+                            let n_v = vec_len_rt(aff_v)
+                            when ai_v < n_v loop
+                                if vec_get_rt(aff_v, ai_v) == u_v do has_u = 1 end
+                                ai_v = ai_v + 1
+                            end
+                            if has_u == 0 do
+                                vec_set_rt(move_affinities, v_v, vec_push_rt(aff_v, u_v))
+                            end
                         end
                     end
                 end
@@ -35315,15 +35652,21 @@ func lir_allocate_registers_color(func_obj: LirFunc, intervals: i64):
         scan_bi = scan_bi + 1
     end
     var spill_count = 0
+    used_colors = vec_new_rt()
+    var c_init = 0
+    when c_init < K loop
+        used_colors = vec_push_rt(used_colors, 0)
+        c_init = c_init + 1
+    end
+
     top = vec_len_rt(stack) - 1
     when top >= 0 loop
         u = vec_get_rt(stack, top)
         top = top - 1
 
-        used_colors = vec_new_rt()
         c = 0
         when c < K loop
-            used_colors = vec_push_rt(used_colors, 0)
+            vec_set_rt(used_colors, c, 0)
             c = c + 1
         end
 
@@ -35340,16 +35683,22 @@ func lir_allocate_registers_color(func_obj: LirFunc, intervals: i64):
             ni = ni + 1
         end
         color = -1
-        # Biased coloring: prefer color of move partner if available
+        # Biased coloring: prefer color of any move partner if available
         if u >= 0 and u < n_nodes do
-            partner = vec_get_rt(move_partner, u)
-            if partner >= 0 and partner < n_nodes do
-                partner_color = vec_get_rt(assigned_phys, partner)
-                if partner_color >= 0 and partner_color < K do
-                    if vec_get_rt(used_colors, partner_color) == 0 do
-                        color = partner_color
+            aff_u = vec_get_rt(move_affinities, u)
+            let n_aff = vec_len_rt(aff_u)
+            var ai = 0
+            when ai < n_aff and color == -1 loop
+                partner = vec_get_rt(aff_u, ai)
+                if partner >= 0 and partner < n_nodes do
+                    partner_color = vec_get_rt(assigned_phys, partner)
+                    if partner_color >= 0 and partner_color < K do
+                        if vec_get_rt(used_colors, partner_color) == 0 do
+                            color = partner_color
+                        end
                     end
                 end
+                ai = ai + 1
             end
         end
         # Fallback to first available color
@@ -35375,6 +35724,21 @@ func lir_allocate_registers_color(func_obj: LirFunc, intervals: i64):
             spill_count = spill_count + 1
         end
     end
+    vec_free_rt(used_colors)
+    vec_free_rt(stack)
+    vec_free_rt(simplify_wl)
+    vec_free_rt(removed)
+    vec_free_rt(curr_degrees)
+    vec_free_rt(vreg_weight)
+    let n_ma = vec_len_rt(move_affinities)
+    var mai = 0
+    when mai < n_ma loop
+        let m_lst = vec_get_rt(move_affinities, mai)
+        if m_lst > 0 do vec_free_rt(m_lst) end
+        mai = mai + 1
+    end
+    vec_free_rt(move_affinities)
+    vec_free_rt(block_depths)
 
     ##
      * George–Appel Conservative Move Coalescing.
@@ -35426,6 +35790,7 @@ func lir_allocate_registers_color(func_obj: LirFunc, intervals: i64):
         native_read_i64(func_obj as i64, 32)
     )
     lir_verify_func(res_func, ig, assigned_phys, assigned_stack, is_leaf as i64, intervals)
+    ig_free(ig)
     out (res_func, assigned_phys, assigned_stack)
 end.
 
@@ -35555,10 +35920,35 @@ func lir_lower_func(m_func: MirFunc, m_blocks: i64):
                 l_op = lower_mir_op(m_op)
                 m_typ = mir_instr_type(m_ins)
                 l_typ = lower_mir_type(m_typ)
+                var l_dst = lower_mir_opnd(mir_instr_dst(m_ins)) as i64
+                if l_op == (LirOp.Nop as i64) or l_op == (LirOp.Jmp as i64) or l_op == (LirOp.JmpCond as i64) or l_op == (LirOp.Ret as i64) or l_op == (LirOp.Push as i64) or l_op == (LirOp.Store as i64) or l_op == (LirOp.SetArg as i64) do
+                    l_dst = lir_opnd_none() as i64
+                end
+                if l_op == (LirOp.Intrinsic as i64) do
+                    aux_kind = lower_mir_aux(m_ins)
+                    if aux_kind == MIR_INTR_NOP_MARKER or aux_kind == MIR_INTR_DECL or aux_kind == MIR_INTR_QUIET or aux_kind == MIR_INTR_CHECK_CPU or aux_kind == MIR_INTR_PATCH_POINT or aux_kind == MIR_INTR_PRECOMP or aux_kind == MIR_INTR_EXPOSE or aux_kind == MIR_INTR_ASYNC or aux_kind == MIR_INTR_ATOMIC_VAR or aux_kind == MIR_INTR_TIMEOUT or aux_kind == MIR_INTR_ISOLATE or aux_kind == MIR_INTR_PTR or aux_kind == MIR_INTR_AWAIT_PASS or aux_kind == MIR_INTR_ENSURE or aux_kind == MIR_INTR_REVERT or aux_kind == MIR_INTR_ENUM or aux_kind == MIR_INTR_ERROR or aux_kind == MIR_INTR_EXIST or aux_kind == MIR_INTR_REACTIVE or aux_kind == MIR_INTR_MORPH or aux_kind == MIR_INTR_TRY or aux_kind == MIR_INTR_RESUME or aux_kind == MIR_INTR_EMIT or aux_kind == MIR_INTR_INDEX_STORE or aux_kind == MIR_INTR_FIELD_STORE or aux_kind == MIR_INTR_THROW or aux_kind == MIR_INTR_PRINT or aux_kind == MIR_INTR_PRINT_STR or aux_kind == MIR_INTR_PRINT_FLOAT or aux_kind == MIR_INTR_PRINT_BOOL or aux_kind == MIR_INTR_TRAIN or aux_kind == MIR_INTR_INFER do
+                        l_dst = lir_opnd_none() as i64
+                    end
+                    if aux_kind == MIR_INTR_ARENA do
+                        m_s1 = mir_instr_src1(m_ins)
+                        if mir_opnd_type(m_s1) != MirOperandType.None do
+                            l_dst = lir_opnd_none() as i64
+                        end
+                    end
+                    if aux_kind == MIR_INTR_BUILTIN do
+                        m_s1 = mir_instr_src1(m_ins)
+                        if mir_opnd_type(m_s1) == MirOperandType.Imm do
+                            bid = mir_opnd_imm_val(m_s1)
+                            if bid == 6 or bid == 8 or bid == 47 or bid == 32 or bid == 51 or bid == 18 do
+                                l_dst = lir_opnd_none() as i64
+                            end
+                        end
+                    end
+                end
                 l_ins = lir_instr_new(
                     l_op as i64,
                     l_typ,
-                    lower_mir_opnd(mir_instr_dst(m_ins)) as i64,
+                    l_dst,
                     lower_mir_opnd(mir_instr_src1(m_ins)) as i64,
                     lower_mir_opnd(mir_instr_src2(m_ins)) as i64,
                     lower_mir_aux(m_ins)
@@ -35595,21 +35985,24 @@ func lir_lower_func(m_func: MirFunc, m_blocks: i64):
                     val = vec_get_rt(inc_values, k)
 
                     if mir_opnd_type(val) != MirOperandType.None do
-                        pred_lb = vec_get_rt(blocks, pred_id)
-                        mov_ins = lir_instr_new(
-                            LirOp.Mov as i64,
-                            LirType.Int64 as i64,
-                            lir_opnd_vreg_int(mir_phi_dst(phi)) as i64,
-                            lower_mir_opnd(val) as i64,
-                            lir_opnd_none() as i64,
-                            0
-                        )
-                        p_instrs = insert_before_terminator(lir_block_instrs(pred_lb), mov_ins)
-                        pred_lb_new = lir_block_new(
-                            lir_block_id(pred_lb),
-                            p_instrs
-                        )
-                        vec_set_rt(blocks, pred_id, pred_lb_new)
+                        let is_phi_self_move = (mir_opnd_type(val) == MirOperandType.VReg) and (mir_opnd_vreg_id(val) == mir_phi_dst(phi))
+                        if not is_phi_self_move do
+                            pred_lb = vec_get_rt(blocks, pred_id)
+                            mov_ins = lir_instr_new(
+                                LirOp.Mov as i64,
+                                LirType.Int64 as i64,
+                                lir_opnd_vreg_int(mir_phi_dst(phi)) as i64,
+                                lower_mir_opnd(val) as i64,
+                                lir_opnd_none() as i64,
+                                0
+                            )
+                            p_instrs = insert_before_terminator(lir_block_instrs(pred_lb), mov_ins)
+                            pred_lb_new = lir_block_new(
+                                lir_block_id(pred_lb),
+                                p_instrs
+                            )
+                            vec_set_rt(blocks, pred_id, pred_lb_new)
+                        end
                     end
                     k = k + 1
                 end
@@ -37188,16 +37581,275 @@ import TargetArch, get_codegen_target from target
  * Not part of the architecture-neutral MIR pipeline.
  ##
 
-import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt, vec_free_rt from vec_rt
 import mir_opt_arm64_instruction_selection_and_scheduling,
        mir_opt_arm64_addressing_modes_and_register_induction,
        mir_opt_neon_simd_vector_lowering,
        mir_opt_shrink_wrapping,
        mir_opt_hot_cold_layout_partitioning from mir_opt
-import LirOp, LirFunc, lir_func_id, lir_func_name, lir_func_blocks, lir_func_stack_size, lir_func_strings,
-       lir_block_id, lir_block_instrs, lir_instr_op, lir_instr_new, lir_block_new, lir_func_new from lir
+import LirOp, LirPhysReg, LirFunc, lir_func_id, lir_func_name, lir_func_blocks, lir_func_stack_size, lir_func_strings,
+       lir_block_id, lir_block_instrs, lir_instr_op, lir_instr_new, lir_block_new, lir_func_new,
+       lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_aux, lir_instr_typ,
+       lir_opnd_type, lir_opnd_phys_reg_val, lir_opnd_imm_val, lir_opnd_phys_reg,
+       lir_opnd_label_id, lir_opnd_stack_offset, lir_opnd_none from lir
 
 const LIR_SHRINK_WRAP_AUX: i64 = 88
+
+func lir_is_alu_op(op: i64):
+    if op == (LirOp.Add as i64) or op == (LirOp.Sub as i64) or op == (LirOp.Mul as i64) or op == (LirOp.Div as i64) or op == (LirOp.Rem as i64) do
+        out 1
+    end
+    if op == (LirOp.And as i64) or op == (LirOp.Or as i64) or op == (LirOp.Xor as i64) or op == (LirOp.Shl as i64) or op == (LirOp.Shr as i64) do
+        out 1
+    end
+    if op == (LirOp.Not as i64) or op == (LirOp.Pow as i64) or op == (LirOp.Load as i64) or op == (LirOp.Fma as i64) do
+        out 1
+    end
+    out 0
+end.
+
+func lir_ins_reads_phys(ins: i64, reg: i64):
+    let s1 = lir_instr_src1(ins)
+    if s1 != 0 and lir_opnd_type(s1) == 3 and lir_opnd_phys_reg_val(s1) == reg do
+        out 1
+    end
+    let s2 = lir_instr_src2(ins)
+    if s2 != 0 and lir_opnd_type(s2) == 3 and lir_opnd_phys_reg_val(s2) == reg do
+        out 1
+    end
+    out 0
+end.
+
+func lir_ins_writes_phys(ins: i64, reg: i64):
+    let dst = lir_instr_dst(ins)
+    if dst != 0 and lir_opnd_type(dst) == 3 and lir_opnd_phys_reg_val(dst) == reg do
+        out 1
+    end
+    out 0
+end.
+
+func lir_replace_phys_reg_in_ins(ins: i64, old_reg: i64, new_reg: i64):
+    let op = lir_instr_op(ins)
+    let typ = lir_instr_typ(ins)
+    var dst = lir_instr_dst(ins)
+    var s1 = lir_instr_src1(ins)
+    var s2 = lir_instr_src2(ins)
+    let aux = lir_instr_aux(ins)
+    if s1 != 0 and lir_opnd_type(s1) == 3 and lir_opnd_phys_reg_val(s1) == old_reg do
+        s1 = lir_opnd_phys_reg(new_reg as LirPhysReg) as i64
+    end
+    if s2 != 0 and lir_opnd_type(s2) == 3 and lir_opnd_phys_reg_val(s2) == old_reg do
+        s2 = lir_opnd_phys_reg(new_reg as LirPhysReg) as i64
+    end
+    out lir_instr_new(op, typ, dst, s1, s2, aux)
+end.
+
+func opt_post_ra_clean_block(instrs: i64):
+    if instrs <= 0 do out instrs end
+    let n_ins = vec_len_rt(instrs)
+    if n_ins <= 0 do out instrs end
+
+    var alias = vec_new_rt()
+    var r_init = 0
+    when r_init < 32 loop
+        alias = vec_push_rt(alias, 0 - 1)
+        r_init = r_init + 1
+    end
+
+    var ii = 0
+    when ii < n_ins loop
+        ins = vec_get_rt(instrs, ii)
+        op = lir_instr_op(ins)
+        if op == (LirOp.Nop as i64) do
+            # ignore
+        eif op == (LirOp.Mov as i64) do
+            dst = lir_instr_dst(ins)
+            src1 = lir_instr_src1(ins)
+            var is_redundant = 0
+            if dst != 0 and src1 != 0 do
+                dt = lir_opnd_type(dst)
+                st = lir_opnd_type(src1)
+                if dt == 3 and st == 3 do # PhysReg
+                    rd = lir_opnd_phys_reg_val(dst)
+                    rs = lir_opnd_phys_reg_val(src1)
+                    if rd == rs do
+                        is_redundant = 1
+                    eif rd >= 0 and rd < 32 and rs >= 0 and rs < 32 do
+                        alias_d = vec_get_rt(alias, rd)
+                        alias_s = vec_get_rt(alias, rs)
+                        if alias_d == rs do
+                            is_redundant = 1
+                        eif alias_s == rd do
+                            is_redundant = 1
+                        eif alias_d >= 0 and alias_s >= 0 and alias_d == alias_s do
+                            is_redundant = 1
+                        end
+                    end
+
+                eif dt == 4 and st == 4 do # StackMem
+                    off_d = lir_opnd_stack_offset(dst)
+                    off_s = lir_opnd_stack_offset(src1)
+                    if off_d == off_s do
+                        is_redundant = 1
+                    end
+                end
+            end
+
+            if is_redundant == 1 do
+                vec_set_rt(instrs, ii, lir_instr_new(LirOp.Nop as i64, 0, lir_opnd_none() as i64, lir_opnd_none() as i64, lir_opnd_none() as i64, 0))
+            else
+                if dst != 0 and lir_opnd_type(dst) == 3 do
+                    rd = lir_opnd_phys_reg_val(dst)
+                    if rd >= 0 and rd < 32 do
+                        var xi = 0
+                        when xi < 32 loop
+                            if vec_get_rt(alias, xi) == rd do
+                                vec_set_rt(alias, xi, 0 - 1)
+                            end
+                            xi = xi + 1
+                        end
+                        if src1 != 0 and lir_opnd_type(src1) == 3 do
+                            rs = lir_opnd_phys_reg_val(src1)
+                            if rs >= 0 and rs < 32 do
+                                var s_root = rs
+                                if vec_get_rt(alias, rs) >= 0 do
+                                    s_root = vec_get_rt(alias, rs)
+                                end
+                                vec_set_rt(alias, rd, s_root)
+                            else
+                                vec_set_rt(alias, rd, 0 - 1)
+                            end
+                        else
+                            vec_set_rt(alias, rd, 0 - 1)
+                        end
+                    end
+                end
+            end
+        eif op == (LirOp.Ret as i64) do
+            let r_s1 = lir_instr_src1(ins)
+            if r_s1 != 0 and lir_opnd_type(r_s1) == 3 do
+                let r_reg = lir_opnd_phys_reg_val(r_s1)
+                if r_reg > 0 and r_reg < 32 do
+                    var rk = ii - 1
+                    var stop_ret_back = 0
+                    when rk >= 0 and stop_ret_back == 0 loop
+                        let r_prev = vec_get_rt(instrs, rk)
+                        let rp_op = lir_instr_op(r_prev)
+                        if rp_op != (LirOp.Nop as i64) do
+                            if rp_op == (LirOp.Call as i64) or rp_op == (LirOp.Ret as i64) or rp_op == (LirOp.Jmp as i64) or rp_op == (LirOp.JmpCond as i64) do
+                                stop_ret_back = 1
+                            eif lir_ins_writes_phys(r_prev, r_reg) == 1 do
+                                if lir_is_alu_op(rp_op) == 1 or rp_op == (LirOp.Mov as i64) do
+                                    if rp_op == (LirOp.Mov as i64) and lir_ins_reads_phys(r_prev, 0) == 1 do
+                                        vec_set_rt(instrs, rk, lir_instr_new(LirOp.Nop as i64, 0, lir_opnd_none() as i64, lir_opnd_none() as i64, lir_opnd_none() as i64, 0))
+                                    else
+                                        let new_p = lir_instr_new(rp_op, lir_instr_typ(r_prev), lir_opnd_phys_reg(0 as LirPhysReg), lir_instr_src1(r_prev), lir_instr_src2(r_prev), lir_instr_aux(r_prev))
+                                        vec_set_rt(instrs, rk, new_p)
+                                    end
+                                    let new_ret2 = lir_instr_new(LirOp.Ret as i64, lir_instr_typ(ins), lir_opnd_none() as i64, lir_opnd_phys_reg(0 as LirPhysReg), lir_opnd_none() as i64, lir_instr_aux(ins))
+                                    vec_set_rt(instrs, ii, new_ret2)
+                                end
+                                stop_ret_back = 1
+                            eif lir_ins_reads_phys(r_prev, 0) == 1 or lir_ins_writes_phys(r_prev, 0) == 1 do
+                                stop_ret_back = 1
+                            eif lir_ins_reads_phys(r_prev, r_reg) == 1 do
+                                stop_ret_back = 1
+                            end
+                        end
+                        rk = rk - 1
+                    end
+                end
+            end
+        else
+            if op == (LirOp.Call as i64) or op == (LirOp.MatMul as i64) or op == (LirOp.Fma as i64) do
+                var c = 0
+                when c < 19 loop
+                    vec_set_rt(alias, c, 0 - 1)
+                    c = c + 1
+                end
+                var xi = 0
+                when xi < 32 loop
+                    let a_val = vec_get_rt(alias, xi)
+                    if a_val >= 0 and a_val < 19 do
+                        vec_set_rt(alias, xi, 0 - 1)
+                    end
+                    xi = xi + 1
+                end
+            eif op == (LirOp.Intrinsic as i64) do
+                let aux = lir_instr_aux(ins)
+                if aux != 100 and aux != 103 and aux != 104 and aux != 105 do
+                    var c = 0
+                    when c < 19 loop
+                        vec_set_rt(alias, c, 0 - 1)
+                        c = c + 1
+                    end
+                    var xi = 0
+                    when xi < 32 loop
+                        let a_val = vec_get_rt(alias, xi)
+                        if a_val >= 0 and a_val < 19 do
+                            vec_set_rt(alias, xi, 0 - 1)
+                        end
+                        xi = xi + 1
+                    end
+                end
+            end
+
+            # SetArg writes to physical argument register X0..X7
+            if op == (LirOp.SetArg as i64) do
+                var ai = lir_instr_aux(ins)
+                let s1 = lir_instr_src1(ins)
+                if s1 != 0 and lir_opnd_type(s1) == 5 do
+                    ai = lir_opnd_imm_val(s1)
+                end
+                if ai >= 0 and ai < 8 do
+                    var xi = 0
+                    when xi < 32 loop
+                        if vec_get_rt(alias, xi) == ai do
+                            vec_set_rt(alias, xi, 0 - 1)
+                        end
+                        xi = xi + 1
+                    end
+                    vec_set_rt(alias, ai, 0 - 1)
+                end
+            end
+
+            # Any instruction defining a physical destination register writes to rd
+            dst = lir_instr_dst(ins)
+            if dst != 0 and lir_opnd_type(dst) == 3 do
+                rd = lir_opnd_phys_reg_val(dst)
+                if rd >= 0 and rd < 32 do
+                    var xi = 0
+                    when xi < 32 loop
+                        if vec_get_rt(alias, xi) == rd do
+                            vec_set_rt(alias, xi, 0 - 1)
+                        end
+                        xi = xi + 1
+                    end
+                    vec_set_rt(alias, rd, 0 - 1)
+                end
+            end
+        end
+        ii = ii + 1
+    end
+    vec_free_rt(alias)
+
+    # Compact unneeded Nops (keeping shrink wrap aux marker)
+    new_instrs = vec_new_rt()
+    ii = 0
+    when ii < n_ins loop
+        ins = vec_get_rt(instrs, ii)
+        op = lir_instr_op(ins)
+        if op == (LirOp.Nop as i64) do
+            if lir_instr_aux(ins) == LIR_SHRINK_WRAP_AUX do
+                new_instrs = vec_push_rt(new_instrs, ins)
+            end
+        else
+            new_instrs = vec_push_rt(new_instrs, ins)
+        end
+        ii = ii + 1
+    end
+    out new_instrs
+end.
 
 # MIR-stage ISA prep (strength patterns that become ARM64 MADD/LSL later)
 func opt_arm64_run_mir_passes(blocks: i64):
@@ -37207,33 +37859,272 @@ func opt_arm64_run_mir_passes(blocks: i64):
     out blocks
 end.
 
-# LIR-stage: shrink-wrap — mark call-free blocks for minimal save/restore
+# LIR-stage: reachable block pruning, single-predecessor block merging,
+# shrink-wrap marking, and post-RA redundant move cleanup
 func opt_arm64_run_lir_passes(lf: i64):
     if lf == 0 do out 0 end
-    blocks = lir_func_blocks(lf)
+    var blocks = lir_func_blocks(lf)
     if blocks <= 0 do out lf end
-    n_blocks = vec_len_rt(blocks)
+    let n_blocks = vec_len_rt(blocks)
+    if n_blocks <= 0 do out lf end
+
+    # Compute max_bid and bid_to_idx
+    var max_bid = 0
     var bi = 0
     when bi < n_blocks loop
-        lb = vec_get_rt(blocks, bi)
-        instrs = lir_block_instrs(lb)
-        if instrs >= 0 do
-            var has_call = 0
+        let b = vec_get_rt(blocks, bi)
+        let bid = lir_block_id(b)
+        if bid > max_bid do max_bid = bid end
+        bi = bi + 1
+    end
+
+    var bid_to_idx = vec_new_rt()
+    var init_k = 0
+    when init_k <= max_bid loop
+        bid_to_idx = vec_push_rt(bid_to_idx, 0 - 1)
+        init_k = init_k + 1
+    end
+    bi = 0
+    when bi < n_blocks loop
+        let b = vec_get_rt(blocks, bi)
+        let bid = lir_block_id(b)
+        if bid >= 0 and bid <= max_bid do
+            vec_set_rt(bid_to_idx, bid, bi)
+        end
+        bi = bi + 1
+    end
+
+    # ── Phase 1: Reachability Analysis with Fallthroughs ──
+    var reachable = vec_new_rt()
+    bi = 0
+    when bi < n_blocks loop
+        reachable = vec_push_rt(reachable, 0)
+        bi = bi + 1
+    end
+    vec_set_rt(reachable, 0, 1)
+
+    var wl = vec_new_rt()
+    wl = vec_push_rt(wl, 0)
+    var wl_head = 0
+    when wl_head < vec_len_rt(wl) loop
+        let cur_idx = vec_get_rt(wl, wl_head)
+        wl_head = wl_head + 1
+        let cur_b = vec_get_rt(blocks, cur_idx)
+        let binstrs = lir_block_instrs(cur_b)
+        let n_ins = vec_len_rt(binstrs)
+        if n_ins == 0 do
+            # Empty block falls through to cur_idx + 1
+            if cur_idx + 1 < n_blocks and vec_get_rt(reachable, cur_idx + 1) == 0 do
+                vec_set_rt(reachable, cur_idx + 1, 1)
+                wl = vec_push_rt(wl, cur_idx + 1)
+            end
+        else
+            var can_fallthrough = 1
             var ii = 0
-            when ii < vec_len_rt(instrs) loop
-                op = lir_instr_op(vec_get_rt(instrs, ii))
-                if op == LirOp.Call or op == LirOp.Intrinsic do has_call = 1 end
+            when ii < n_ins loop
+                let ins = vec_get_rt(binstrs, ii)
+                let op = lir_instr_op(ins)
+                if op == (LirOp.Ret as i64) do
+                    can_fallthrough = 0
+                eif op == (LirOp.Jmp as i64) do
+                    can_fallthrough = 0
+                    let s1 = lir_instr_src1(ins)
+                    var tgt = 0 - 1
+                    if s1 > 4096 do
+                        let st = lir_opnd_type(s1)
+                        if st == 6 do tgt = lir_opnd_label_id(s1) end
+                        if st == 5 do tgt = lir_opnd_imm_val(s1) end
+                    end
+                    if tgt >= 0 and tgt <= max_bid do
+                        let t_idx = vec_get_rt(bid_to_idx, tgt)
+                        if t_idx >= 0 and vec_get_rt(reachable, t_idx) == 0 do
+                            vec_set_rt(reachable, t_idx, 1)
+                            wl = vec_push_rt(wl, t_idx)
+                        end
+                    end
+                eif op == (LirOp.JmpCond as i64) do
+                    let s2 = lir_instr_src2(ins)
+                    var tgt = 0 - 1
+                    if s2 > 4096 do
+                        let st = lir_opnd_type(s2)
+                        if st == 6 do tgt = lir_opnd_label_id(s2) end
+                        if st == 5 do tgt = lir_opnd_imm_val(s2) end
+                    end
+                    if tgt >= 0 and tgt <= max_bid do
+                        let t_idx = vec_get_rt(bid_to_idx, tgt)
+                        if t_idx >= 0 and vec_get_rt(reachable, t_idx) == 0 do
+                            vec_set_rt(reachable, t_idx, 1)
+                            wl = vec_push_rt(wl, t_idx)
+                        end
+                    end
+                end
                 ii = ii + 1
             end
-            if has_call == 0 do
-                marker = lir_instr_new(LirOp.Nop, 0, 0, 0, 0, LIR_SHRINK_WRAP_AUX)
-                instrs = vec_push_rt(instrs, marker)
-                vec_set_rt(blocks, bi, lir_block_new(lir_block_id(lb), instrs))
+            if can_fallthrough == 1 and cur_idx + 1 < n_blocks do
+                if vec_get_rt(reachable, cur_idx + 1) == 0 do
+                    vec_set_rt(reachable, cur_idx + 1, 1)
+                    wl = vec_push_rt(wl, cur_idx + 1)
+                end
+            end
+        end
+    end
+    vec_free_rt(wl)
+
+    # Empty instructions of unreachable blocks
+    bi = 0
+    when bi < n_blocks loop
+        if vec_get_rt(reachable, bi) == 0 do
+            let ub = vec_get_rt(blocks, bi)
+            vec_set_rt(blocks, bi, lir_block_new(lir_block_id(ub), vec_new_rt()))
+        end
+        bi = bi + 1
+    end
+    vec_free_rt(reachable)
+
+    # ── Phase 2: Straight-Line Adjacent Block Merging ──
+    # Compute true predecessor counts including fallthroughs and all branch types
+    var pred_counts = vec_new_rt()
+    bi = 0
+    when bi < n_blocks loop
+        pred_counts = vec_push_rt(pred_counts, 0)
+        bi = bi + 1
+    end
+
+    bi = 0
+    when bi < n_blocks loop
+        let b = vec_get_rt(blocks, bi)
+        let binstrs = lir_block_instrs(b)
+        let n_ins = vec_len_rt(binstrs)
+        if n_ins == 0 do
+            if bi + 1 < n_blocks do
+                vec_set_rt(pred_counts, bi + 1, vec_get_rt(pred_counts, bi + 1) + 1)
+            end
+        else
+            var can_ft = 1
+            var ii = 0
+            when ii < n_ins loop
+                let ins = vec_get_rt(binstrs, ii)
+                let op = lir_instr_op(ins)
+                if op == (LirOp.Ret as i64) do
+                    can_ft = 0
+                eif op == (LirOp.Jmp as i64) do
+                    can_ft = 0
+                    let s1 = lir_instr_src1(ins)
+                    var tgt = 0 - 1
+                    if s1 > 4096 do
+                        let st = lir_opnd_type(s1)
+                        if st == 6 do tgt = lir_opnd_label_id(s1) end
+                        if st == 5 do tgt = lir_opnd_imm_val(s1) end
+                    end
+                    if tgt >= 0 and tgt <= max_bid do
+                        let t_idx = vec_get_rt(bid_to_idx, tgt)
+                        if t_idx >= 0 do
+                            vec_set_rt(pred_counts, t_idx, vec_get_rt(pred_counts, t_idx) + 1)
+                        end
+                    end
+                eif op == (LirOp.JmpCond as i64) do
+                    let s2 = lir_instr_src2(ins)
+                    var tgt = 0 - 1
+                    if s2 > 4096 do
+                        let st = lir_opnd_type(s2)
+                        if st == 6 do tgt = lir_opnd_label_id(s2) end
+                        if st == 5 do tgt = lir_opnd_imm_val(s2) end
+                    end
+                    if tgt >= 0 and tgt <= max_bid do
+                        let t_idx = vec_get_rt(bid_to_idx, tgt)
+                        if t_idx >= 0 do
+                            vec_set_rt(pred_counts, t_idx, vec_get_rt(pred_counts, t_idx) + 1)
+                        end
+                    end
+                end
+                ii = ii + 1
+            end
+            if can_ft == 1 and bi + 1 < n_blocks do
+                vec_set_rt(pred_counts, bi + 1, vec_get_rt(pred_counts, bi + 1) + 1)
             end
         end
         bi = bi + 1
     end
-    out lir_func_new(lir_func_id(lf), lir_func_name(lf), blocks, lir_func_stack_size(lf), lir_func_strings(lf))
+
+    bi = 0
+    when bi < n_blocks - 1 loop
+        let b = vec_get_rt(blocks, bi)
+        let binstrs = lir_block_instrs(b)
+        let n_ins = vec_len_rt(binstrs)
+        if n_ins > 0 do
+            let last_ins = vec_get_rt(binstrs, n_ins - 1)
+            if lir_instr_op(last_ins) == (LirOp.Jmp as i64) do
+                let s1 = lir_instr_src1(last_ins)
+                var tgt = 0 - 1
+                if s1 > 4096 do
+                    let st = lir_opnd_type(s1)
+                    if st == 6 do tgt = lir_opnd_label_id(s1) end
+                    if st == 5 do tgt = lir_opnd_imm_val(s1) end
+                end
+                if tgt >= 0 and tgt <= max_bid do
+                    let t_idx = vec_get_rt(bid_to_idx, tgt)
+                    if t_idx == bi + 1 and vec_get_rt(pred_counts, t_idx) == 1 do
+                        let tb = vec_get_rt(blocks, t_idx)
+                        let tb_instrs = lir_block_instrs(tb)
+                        if vec_len_rt(tb_instrs) > 0 do
+                            var comb = vec_new_rt()
+                            var ci = 0
+                            when ci < n_ins - 1 loop
+                                comb = vec_push_rt(comb, vec_get_rt(binstrs, ci))
+                                ci = ci + 1
+                            end
+                            var ti = 0
+                            let tn = vec_len_rt(tb_instrs)
+                            when ti < tn loop
+                                comb = vec_push_rt(comb, vec_get_rt(tb_instrs, ti))
+                                ti = ti + 1
+                            end
+                            vec_set_rt(blocks, bi, lir_block_new(lir_block_id(b), comb))
+                            vec_set_rt(blocks, t_idx, lir_block_new(lir_block_id(tb), vec_new_rt()))
+                            vec_set_rt(pred_counts, t_idx, 0)
+                        end
+                    end
+                end
+            end
+        end
+        bi = bi + 1
+    end
+    vec_free_rt(bid_to_idx)
+    vec_free_rt(pred_counts)
+
+    # ── Phase 3: Post-RA Clean & Shrink Wrap Marker (preserving every block) ──
+    bi = 0
+    when bi < n_blocks loop
+        let b = vec_get_rt(blocks, bi)
+        var binstrs = lir_block_instrs(b)
+        let n_ins = vec_len_rt(binstrs)
+        if n_ins > 0 do
+            binstrs = opt_post_ra_clean_block(binstrs)
+            var has_call = 0
+            var ii = 0
+            let cur_n = vec_len_rt(binstrs)
+            when ii < cur_n loop
+                let op = lir_instr_op(vec_get_rt(binstrs, ii))
+                if op == (LirOp.Call as i64) or op == (LirOp.MatMul as i64) or op == (LirOp.Fma as i64) do
+                    has_call = 1
+                eif op == (LirOp.Intrinsic as i64) do
+                    let iaux = lir_instr_aux(vec_get_rt(binstrs, ii))
+                    if iaux != 100 do # Not MIR_INTR_PARAM
+                        has_call = 1
+                    end
+                end
+                ii = ii + 1
+            end
+            if has_call == 0 do
+                let marker = lir_instr_new(LirOp.Nop as i64, 0, 0, 0, 0, LIR_SHRINK_WRAP_AUX)
+                binstrs = vec_push_rt(binstrs, marker)
+            end
+            vec_set_rt(blocks, bi, lir_block_new(lir_block_id(b), binstrs))
+        end
+        bi = bi + 1
+    end
+
+    out lf
 end.
 
 # Codegen-stage SIMD lowering (NEON)
@@ -37429,7 +38320,10 @@ func opt_backend_run_lir_pre(lf: i64, arch: int):
 end.
 
 # Post-RA LIR hook: completely independent optimizations per target
-func opt_backend_run_lir_post(lf: i64, arch: int):
+func opt_backend_run_lir_post(lf: i64, arch: int, opt_level: int):
+    if opt_level < 1 do
+        out lf
+    end
     if arch == TargetArch.ARM64 or arch == 2 or arch == 0 do
         out opt_arm64_run_lir_post(lf)
     end
@@ -37612,10 +38506,13 @@ func compile_pipeline(source_path: string, ast: AstNode, verbose: int):
             let intervals = lir_compute_liveness(lf)
             var (colored_lf, phys_map, stack_map) = lir_allocate_registers_color(lf, intervals)
             lf2 = colored_lf
+            if phys_map > 0 do vec_free_rt(phys_map) end
+            if stack_map > 0 do vec_free_rt(stack_map) end
+            if intervals > 0 do vec_free_rt(intervals) end
         end
 
         # Post-RA LIR hook: completely independent optimizations per target
-        lf2 = opt_backend_run_lir_post(lf2, target_arch)
+        lf2 = opt_backend_run_lir_post(lf2, target_arch, opt_level)
         vec_set_rt(lir_funcs, i, lf2)
         i = i + 1
     end
@@ -37788,7 +38685,7 @@ func robust_src_reg(cb: CodeBuf, opnd: i64, assigned_phys: i64, scratch: i64):
     if r >= 0 do
         out r
     end
-    if native_read_i64(opnd, 0) == 4 or native_read_i64(opnd, 0) == 5 do
+    if native_read_i64(opnd, 0) == 4 do
         out resolve_or_imm_reg(cb, opnd as LirOperand, assigned_phys, scratch)
     end
     out r
@@ -38097,6 +38994,45 @@ func lir_intr_is_payload(kind: i64):
         out 1
     end
     out 0
+end.
+
+func lir_instr_has_def(ins: LirInstr):
+    if (ins as i64) == 0 do out 0 end
+    ins_i = ins as i64
+    dst = native_read_i64(ins_i, 16)
+    if dst == 0 do out 0 end
+    if native_read_i64(dst, 0) == 0 do out 0 end
+    op = native_read_i64(ins_i, 0)
+    if op == (LirOp.Nop as i64) or op == (LirOp.Jmp as i64) or op == (LirOp.JmpCond as i64) or op == (LirOp.Ret as i64) or op == (LirOp.Push as i64) or op == (LirOp.Store as i64) or op == (LirOp.SetArg as i64) or op == (LirOp.TailCall as i64) do
+        out 0
+    end
+    if op == (LirOp.Intrinsic as i64) do
+        kind = native_read_i64(ins_i, 40)
+        if lir_intr_is_marker(kind) == 1 do
+            out 0
+        end
+        if kind == MIR_INTR_GLOBAL_STORE or kind == MIR_INTR_INDEX_STORE or kind == MIR_INTR_FIELD_STORE or kind == MIR_INTR_THROW or kind == MIR_INTR_PRINT or kind == MIR_INTR_PRINT_STR or kind == MIR_INTR_PRINT_FLOAT or kind == MIR_INTR_PRINT_BOOL or kind == MIR_INTR_TRAIN or kind == MIR_INTR_INFER do
+            out 0
+        end
+        if kind == MIR_INTR_ARENA do
+            s1 = native_read_i64(ins_i, 24)
+            if s1 != 0 and native_read_i64(s1, 0) != 0 do
+                out 0
+            end
+            out 1
+        end
+        if kind == MIR_INTR_BUILTIN do
+            s1 = native_read_i64(ins_i, 24)
+            if s1 != 0 and native_read_i64(s1, 0) == 5 do
+                bid = native_read_i64(s1, 32)
+                if bid == 6 or bid == 8 or bid == 47 or bid == 32 or bid == 51 or bid == 18 do
+                    out 0
+                end
+            end
+        end
+        out 1
+    end
+    out 1
 end.
 
 func lir_stub_for_builtin_id(bid: i64):
@@ -41288,10 +42224,10 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
     var last_cmp_pred = 0 - 1
     var last_cmp_dst = 0
     recent_setargs = vec_new_cap_rt(8)
-    vec_push_rt(recent_setargs, 0)
-    vec_push_rt(recent_setargs, 0)
-    vec_push_rt(recent_setargs, 0)
-    vec_push_rt(recent_setargs, 0)
+    recent_setargs = vec_push_rt(recent_setargs, 0)
+    recent_setargs = vec_push_rt(recent_setargs, 0)
+    recent_setargs = vec_push_rt(recent_setargs, 0)
+    recent_setargs = vec_push_rt(recent_setargs, 0)
     reg_const_val = vec_new_cap_rt(32)
     reg_shl_src = vec_new_cap_rt(32)
     reg_shl_amt = vec_new_cap_rt(32)
@@ -41299,11 +42235,11 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
     reg_shr_amt = vec_new_cap_rt(32)
     var rci = 0
     when rci < 32 loop
-        vec_push_rt(reg_const_val, 0 - 1)
-        vec_push_rt(reg_shl_src, 0 - 1)
-        vec_push_rt(reg_shl_amt, 0)
-        vec_push_rt(reg_shr_src, 0 - 1)
-        vec_push_rt(reg_shr_amt, 0)
+        reg_const_val = vec_push_rt(reg_const_val, 0 - 1)
+        reg_shl_src = vec_push_rt(reg_shl_src, 0 - 1)
+        reg_shl_amt = vec_push_rt(reg_shl_amt, 0)
+        reg_shr_src = vec_push_rt(reg_shr_src, 0 - 1)
+        reg_shr_amt = vec_push_rt(reg_shr_amt, 0)
         rci = rci + 1
     end
     when bi < n_blocks loop
@@ -41335,6 +42271,9 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
             rd_spill = lir_opnd_spill_off(ins_dst)
             if rd_spill < 0 do
                 rd = SCRD
+            end
+            if lir_instr_has_def(ins) == 0 do
+                rd_spill = 0
             end
             # Spilled sources: reload into scratch so every consumer sees a reg.
             # Use X14/X15 (not X9/X10) to avoid the temps used by INDEX/FIELD
@@ -41654,32 +42593,8 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
             eif op == LirOp.Or do
                 a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
-                is_ror = 0
-                if a >= 0 and a < 32 and breg >= 0 and breg < 32 and rd >= 0 do
-                    shl_src_a = vec_get_rt(reg_shl_src, a)
-                    shr_src_b = vec_get_rt(reg_shr_src, breg)
-                    shl_amt_a = vec_get_rt(reg_shl_amt, a)
-                    shr_amt_b = vec_get_rt(reg_shr_amt, breg)
-                    if shl_src_a >= 0 and shl_src_a == shr_src_b and (shl_amt_a + shr_amt_b == 32) do
-                        shift = 32 - shl_amt_a
-                        cb = arm64_ror_imm32(cb, rd as int, shl_src_a as int, shift as int)
-                        is_ror = 1
-                    else
-                        shr_src_a = vec_get_rt(reg_shr_src, a)
-                        shl_src_b = vec_get_rt(reg_shl_src, breg)
-                        shr_amt_a = vec_get_rt(reg_shr_amt, a)
-                        shl_amt_b = vec_get_rt(reg_shl_amt, breg)
-                        if shr_src_a >= 0 and shr_src_a == shl_src_b and (shr_amt_a + shl_amt_b == 32) do
-                            shift = 32 - shl_amt_b
-                            cb = arm64_ror_imm32(cb, rd as int, shr_src_a as int, shift as int)
-                            is_ror = 1
-                        end
-                    end
-                end
-                if is_ror == 0 do
-                    if rd >= 0 and a >= 0 and breg >= 0 do
-                        cb = arm64_orr_rrr(cb, rd as int, a as int, breg as int)
-                    end
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_orr_rrr(cb, rd as int, a as int, breg as int)
                 end
                 if rd >= 0 and rd < 32 do
                     vec_set_rt(reg_const_val, rd, 0 - 1)
@@ -41690,19 +42605,8 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
             eif op == LirOp.Xor do
                 a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
-                is_eor_lsr = 0
-                if rd >= 0 and a >= 0 and breg >= 0 and breg < 32 do
-                    shr_src_b = vec_get_rt(reg_shr_src, breg)
-                    shr_amt_b = vec_get_rt(reg_shr_amt, breg)
-                    if shr_src_b >= 0 and shr_amt_b > 0 and shr_amt_b < 64 do
-                        cb = arm64_eor_lsr64(cb, rd as int, a as int, shr_src_b as int, shr_amt_b as int)
-                        is_eor_lsr = 1
-                    end
-                end
-                if is_eor_lsr == 0 do
-                    if rd >= 0 and a >= 0 and breg >= 0 do
-                        cb = arm64_eor_rrr(cb, rd as int, a as int, breg as int)
-                    end
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_eor_rrr(cb, rd as int, a as int, breg as int)
                 end
                 if rd >= 0 and rd < 32 do
                     vec_set_rt(reg_const_val, rd, 0 - 1)
@@ -41927,6 +42831,7 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
                             is_fused = 1
                             last_cmp_pred = ins_aux
                             last_cmp_dst = ins_dst
+                            rd_spill = 0
                         end
                     end
                 end
@@ -41975,16 +42880,24 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
                 end
                 last_cmp_pred = 0 - 1
             eif op == LirOp.Store do
-                if rs1 >= 0 and rs2 >= 0 do
+                var r_addr = rs1
+                if r_addr < 0 and (ins_src1 as i64) != 0 do
+                    r_addr = resolve_or_imm_reg(cb, ins_src1 as LirOperand, assigned_phys, 14)
+                end
+                var r_val = rs2
+                if r_val < 0 and (ins_src2 as i64) != 0 do
+                    r_val = resolve_or_imm_reg(cb, ins_src2 as LirOperand, assigned_phys, 15)
+                end
+                if r_addr >= 0 and r_val >= 0 do
                     store_aux = native_read_i64(ins as i64, 40)
                     if store_aux == 1 or store_aux == (0 - 1) do
-                        cb = codebuf_emit_u32(cb, 0x39000000 or ((rs2 as int and 0x1F) shl 5) or (rs1 as int and 0x1F))
+                        cb = codebuf_emit_u32(cb, 0x39000000 or ((r_val as int and 0x1F) shl 5) or (r_addr as int and 0x1F))
                     eif store_aux == 2 or store_aux == (0 - 2) do
-                        cb = codebuf_emit_u32(cb, 0x79000000 or ((rs2 as int and 0x1F) shl 5) or (rs1 as int and 0x1F))
+                        cb = codebuf_emit_u32(cb, 0x79000000 or ((r_val as int and 0x1F) shl 5) or (r_addr as int and 0x1F))
                     eif store_aux == 4 or store_aux == (0 - 4) do
-                        cb = codebuf_emit_u32(cb, 0xB9000000 or ((rs2 as int and 0x1F) shl 5) or (rs1 as int and 0x1F))
+                        cb = codebuf_emit_u32(cb, 0xB9000000 or ((r_val as int and 0x1F) shl 5) or (r_addr as int and 0x1F))
                     else
-                        cb = codebuf_emit_u32(cb, 0xF9000000 or ((rs2 as int and 0x1F) shl 5) or (rs1 as int and 0x1F))
+                        cb = codebuf_emit_u32(cb, 0xF9000000 or ((r_val as int and 0x1F) shl 5) or (r_addr as int and 0x1F))
                     end
                 end
                 last_cmp_pred = 0 - 1
@@ -42081,14 +42994,16 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
                 if last_cmp_pred >= 0 and lir_opnd_matches(last_cmp_dst, ins_src1) == 1 do
                     # Fused Cmp + JmpCond: flags already in NZCV, branch directly to condition!
                     if tgt >= 0 do
-                        at = codebuf_offset(cb) as i64
                         is_ifnot = 0
                         if ins_aux == LIR_JMP_IFNOT do
                             is_ifnot = 1
                         end
                         cond = arm64_cond_code(last_cmp_pred, is_ifnot)
-                        cb = codebuf_emit_u32(cb, 0x54000000)
-                        fixups = vec_push_rt(fixups, lir_fixup_new(at, tgt, 10 + cond))
+                        inv_cond = (cond xor 1) and 0xF
+                        cb = codebuf_emit_u32(cb, 0x54000040 or (inv_cond as int))
+                        at = codebuf_offset(cb) as i64
+                        cb = arm64_b_imm26(cb, 0)
+                        fixups = vec_push_rt(fixups, lir_fixup_new(at, tgt, 0))
                     end
                     last_cmp_pred = 0 - 1
                 else
@@ -42097,17 +43012,16 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
                         cb = codebuf_emit_u32(cb, 0xF100001F or ((a as int and 0x1F) shl 5))
                     end
                     if tgt >= 0 do
-                        at = codebuf_offset(cb) as i64
-                        kind = 2
-                        if ins_aux == LIR_JMP_IFNOT do
-                            kind = 1
-                        end
-                        if kind == 1 do
-                            cb = arm64_beq_imm19(cb, 0)
+                        var inv_c = 0
+                        if ins_aux != LIR_JMP_IFNOT do
+                            inv_c = 0
                         else
-                            cb = arm64_bne_imm19(cb, 0)
+                            inv_c = 1
                         end
-                        fixups = vec_push_rt(fixups, lir_fixup_new(at, tgt, kind))
+                        cb = codebuf_emit_u32(cb, 0x54000040 or inv_c)
+                        at = codebuf_offset(cb) as i64
+                        cb = arm64_b_imm26(cb, 0)
+                        fixups = vec_push_rt(fixups, lir_fixup_new(at, tgt, 0))
                     end
                     last_cmp_pred = 0 - 1
                 end
@@ -42133,7 +43047,7 @@ func emit_lir_arm64_into(cb: CodeBuf, func_obj: LirFunc, assigned_phys: i64, lir
                 cb = arm64_ret(cb)
                 last_cmp_pred = 0 - 1
             end
-            if rd_spill < 0 do
+            if rd_spill < 0 and lir_instr_has_def(ins) == 1 do
                 cb = emit_spill_store(cb, ins_dst, SCRD)
             end
             ii = ii + 1
@@ -49148,6 +50062,7 @@ func lir_func_to_mc_arm64(func_obj: LirFunc, assigned_phys: i64):
     var last_cmp_cond = 0 - 1
     var pending_stack_args = vec_new_rt()
     var pending_arg0_imm = 0 - 1
+    var last_op = 0 - 1
 
     when bi < n_blocks loop
         let b = vec_get_rt(blocks, bi)
@@ -49165,6 +50080,9 @@ func lir_func_to_mc_arm64(func_obj: LirFunc, assigned_phys: i64):
         when ii < n_ins loop
             let ins = vec_get_rt(binstrs, ii)
             let op = lir_instr_op(ins)
+            if op != (LirOp.Nop as i64) do
+                last_op = op
+            end
             let d = lir_instr_dst(ins)
             let s1 = lir_instr_src1(ins)
             let s2 = lir_instr_src2(ins)
@@ -49885,30 +50803,32 @@ func lir_func_to_mc_arm64(func_obj: LirFunc, assigned_phys: i64):
         bi = bi + 1
     end
 
-    # Fall-through epilogue
-    let op_ret = mc_opnd_reg(0)
-    let op_imm0 = mc_opnd_imm(0)
-    mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_MOVZ, op_ret, op_imm0, op_n0, op_n1, 0) as i64)
-    let op_sp = mc_opnd_reg(31)
-    let op_fp = mc_opnd_reg(29)
-    let op_lr = mc_opnd_reg(30)
-    mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_sp, op_fp, op_n0, op_n1, 0) as i64)
-    let op_64 = mc_opnd_imm(64)
-    mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_SUB_IMM, op_sp, op_sp, op_64, op_n0, 0) as i64)
-    let op_x20 = mc_opnd_reg(20)
-    let op_x21 = mc_opnd_reg(21)
-    let op_x22 = mc_opnd_reg(22)
-    let op_x23 = mc_opnd_reg(23)
-    let op_x24 = mc_opnd_reg(24)
-    let op_x25 = mc_opnd_reg(25)
-    let op_x26 = mc_opnd_reg(26)
-    let op_x27 = mc_opnd_reg(27)
-    mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x26, op_x27, op_n0, op_n1, 0) as i64)
-    mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x24, op_x25, op_n0, op_n1, 0) as i64)
-    mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x22, op_x23, op_n0, op_n1, 0) as i64)
-    mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x20, op_x21, op_n0, op_n1, 0) as i64)
-    mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_fp, op_lr, op_n0, op_n1, 0) as i64)
-    mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+    # Fall-through epilogue (suppressed if last instruction was already Ret)
+    if last_op != (LirOp.Ret as i64) do
+        let op_ret = mc_opnd_reg(0)
+        let op_imm0 = mc_opnd_imm(0)
+        mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_MOVZ, op_ret, op_imm0, op_n0, op_n1, 0) as i64)
+        let op_sp = mc_opnd_reg(31)
+        let op_fp = mc_opnd_reg(29)
+        let op_lr = mc_opnd_reg(30)
+        mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_MOV_RR, op_sp, op_fp, op_n0, op_n1, 0) as i64)
+        let op_64 = mc_opnd_imm(64)
+        mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_SUB_IMM, op_sp, op_sp, op_64, op_n0, 0) as i64)
+        let op_x20 = mc_opnd_reg(20)
+        let op_x21 = mc_opnd_reg(21)
+        let op_x22 = mc_opnd_reg(22)
+        let op_x23 = mc_opnd_reg(23)
+        let op_x24 = mc_opnd_reg(24)
+        let op_x25 = mc_opnd_reg(25)
+        let op_x26 = mc_opnd_reg(26)
+        let op_x27 = mc_opnd_reg(27)
+        mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x26, op_x27, op_n0, op_n1, 0) as i64)
+        mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x24, op_x25, op_n0, op_n1, 0) as i64)
+        mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x22, op_x23, op_n0, op_n1, 0) as i64)
+        mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_x20, op_x21, op_n0, op_n1, 0) as i64)
+        mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_LDP_POST, op_fp, op_lr, op_n0, op_n1, 0) as i64)
+        mc_emit_inst(insts_slot, mc_inst_new(MCOpcode.ARM64_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+    end
 
     out native_read_i64(insts_slot, 0)
 end.
@@ -49973,6 +50893,7 @@ func lir_func_to_mc_x86_64(func_obj: LirFunc, assigned_phys: i64):
     var last_cmp_cond = 0 - 1
     var pending_stack_args = vec_new_rt()
     var pending_arg0_imm = 0 - 1
+    var last_op = 0 - 1
 
     when bi < n_blocks loop
         let b = vec_get_rt(blocks, bi)
@@ -49988,6 +50909,9 @@ func lir_func_to_mc_x86_64(func_obj: LirFunc, assigned_phys: i64):
         when ii < n_ins loop
             let ins = vec_get_rt(binstrs, ii)
             let op = lir_instr_op(ins)
+            if op != (LirOp.Nop as i64) do
+                last_op = op
+            end
             let d = lir_instr_dst(ins)
             let s1 = lir_instr_src1(ins)
             let s2 = lir_instr_src2(ins)
@@ -50742,26 +51666,28 @@ func lir_func_to_mc_x86_64(func_obj: LirFunc, assigned_phys: i64):
         bi = bi + 1
     end
 
-    # Fall-through epilogue
-    let op_rax = mc_opnd_reg(0)
-    let op_imm0 = mc_opnd_imm(0)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_rax, op_imm0, op_n0, op_n1, 0) as i64)
-    let op_rsp = mc_opnd_reg(4)
-    let op_rbp = mc_opnd_reg(5)
-    let op_rbx = mc_opnd_reg(3)
-    let op_r12 = mc_opnd_reg(12)
-    let op_r13 = mc_opnd_reg(13)
-    let op_r14 = mc_opnd_reg(14)
-    let op_32 = mc_opnd_imm(32)
+    # Fall-through epilogue (suppressed if last instruction was already Ret)
+    if last_op != (LirOp.Ret as i64) do
+        let op_rax = mc_opnd_reg(0)
+        let op_imm0 = mc_opnd_imm(0)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RI, op_rax, op_imm0, op_n0, op_n1, 0) as i64)
+        let op_rsp = mc_opnd_reg(4)
+        let op_rbp = mc_opnd_reg(5)
+        let op_rbx = mc_opnd_reg(3)
+        let op_r12 = mc_opnd_reg(12)
+        let op_r13 = mc_opnd_reg(13)
+        let op_r14 = mc_opnd_reg(14)
+        let op_32 = mc_opnd_imm(32)
 
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_rsp, op_rbp, op_n0, op_n1, 0) as i64)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_SUB_RSP_IMM, op_32, op_n0, op_n0, op_n1, 0) as i64)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r14, op_n0, op_n0, op_n1, 0) as i64)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r13, op_n0, op_n0, op_n1, 0) as i64)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r12, op_n0, op_n0, op_n1, 0) as i64)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_rbx, op_n0, op_n0, op_n1, 0) as i64)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_rbp, op_n0, op_n0, op_n1, 0) as i64)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_MOV_RR, op_rsp, op_rbp, op_n0, op_n1, 0) as i64)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_SUB_RSP_IMM, op_32, op_n0, op_n0, op_n1, 0) as i64)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r14, op_n0, op_n0, op_n1, 0) as i64)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r13, op_n0, op_n0, op_n1, 0) as i64)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_r12, op_n0, op_n0, op_n1, 0) as i64)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_rbx, op_n0, op_n0, op_n1, 0) as i64)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_POP_R, op_rbp, op_n0, op_n0, op_n1, 0) as i64)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.X86_64_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
+    end
 
     out insts
 end.
@@ -50856,6 +51782,7 @@ func lir_func_to_mc_riscv64(func_obj: LirFunc, assigned_phys: i64):
     var last_cmp_rs2 = 0 - 1
     var pending_stack_args = vec_new_rt()
     var pending_arg0_imm = 0 - 1
+    var last_op = 0 - 1
 
     when bi < n_blocks loop
         let b = vec_get_rt(blocks, bi)
@@ -50871,6 +51798,9 @@ func lir_func_to_mc_riscv64(func_obj: LirFunc, assigned_phys: i64):
         when ii < n_ins loop
             let ins = vec_get_rt(binstrs, ii)
             let op = lir_instr_op(ins)
+            if op != (LirOp.Nop as i64) do
+                last_op = op
+            end
             let d = lir_instr_dst(ins)
             let s1 = lir_instr_src1(ins)
             let s2 = lir_instr_src2(ins)
@@ -51788,26 +52718,28 @@ func lir_func_to_mc_riscv64(func_obj: LirFunc, assigned_phys: i64):
         bi = bi + 1
     end
 
-    # Fall-through epilogue
-    let op_a0 = mc_opnd_reg(10)
-    let op_imm0 = mc_opnd_imm(0)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_a0, op_imm0, op_n0, op_n1, 0) as i64)
-    let op_sp = mc_opnd_reg(2)
-    let op_ra = mc_opnd_reg(1)
-    let op_s0 = mc_opnd_reg(8)
-    let op_off_ra = mc_opnd_imm(0)
-    let op_off_s0 = mc_opnd_imm(8)
-    var si_ld_ft = 0
-    when si_ld_ft < 8 loop
-        let op_sr = mc_opnd_reg(18 + si_ld_ft)
-        let off_sr = mc_opnd_imm(16 + (si_ld_ft * 8))
-        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_sr, op_sp, off_sr, op_n0, 0) as i64)
-        si_ld_ft = si_ld_ft + 1
+    # Fall-through epilogue (suppressed if last instruction was already Ret)
+    if last_op != (LirOp.Ret as i64) do
+        let op_a0 = mc_opnd_reg(10)
+        let op_imm0 = mc_opnd_imm(0)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LI, op_a0, op_imm0, op_n0, op_n1, 0) as i64)
+        let op_sp = mc_opnd_reg(2)
+        let op_ra = mc_opnd_reg(1)
+        let op_s0 = mc_opnd_reg(8)
+        let op_off_ra = mc_opnd_imm(0)
+        let op_off_s0 = mc_opnd_imm(8)
+        var si_ld_ft = 0
+        when si_ld_ft < 8 loop
+            let op_sr = mc_opnd_reg(18 + si_ld_ft)
+            let off_sr = mc_opnd_imm(16 + (si_ld_ft * 8))
+            insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_sr, op_sp, off_sr, op_n0, 0) as i64)
+            si_ld_ft = si_ld_ft + 1
+        end
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_ra, op_sp, op_off_ra, op_n0, 0) as i64)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_s0, op_sp, op_off_s0, op_n0, 0) as i64)
+        insts = emit_riscv_stack_adjust(insts, op_sp, total_ssz, op_n0)
+        insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
     end
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_ra, op_sp, op_off_ra, op_n0, 0) as i64)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_LD, op_s0, op_sp, op_off_s0, op_n0, 0) as i64)
-    insts = emit_riscv_stack_adjust(insts, op_sp, total_ssz, op_n0)
-    insts = vec_push_rt(insts, mc_inst_new(MCOpcode.RISCV_RET, op_n0, op_n0, op_n0, op_n1, 0) as i64)
 
     out insts
 end.
