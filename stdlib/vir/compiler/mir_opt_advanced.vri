@@ -369,40 +369,8 @@ end.
  * PRE — hoist partially-redundant pure exprs into dominating predecessor.
  ##
 func mir_opt_pre(blocks: i64):
-    n_blocks = vec_len_rt(blocks)
-    var b_idx = 0
-    when b_idx < n_blocks loop
-        b = vec_get_rt(blocks, b_idx)
-        succs = mir_block_successors(b)
-        if succs >= 0 and vec_len_rt(succs) == 1 do
-            succ_id = vec_get_rt(succs, 0)
-            succ_idx = mir_find_block_index(blocks, succ_id)
-            if succ_idx >= 0 do
-                hdr_instrs = mir_block_head(b)
-                succ_instrs = mir_block_head(vec_get_rt(blocks, succ_idx))
-                if hdr_instrs >= 0 and succ_instrs >= 0 do
-                    var si = 0
-                    when si < vec_len_rt(succ_instrs) and si < 4 loop
-                        sins = vec_get_rt(succ_instrs, si)
-                        sop = mir_instr_op(sins)
-                        if mir_gvn_candidate(sop) do
-                            ss1 = mir_instr_src1(sins)
-                            ss2 = mir_instr_src2(sins)
-                            if mir_opnd_type(ss1) != MirOperandType.VReg or count_vreg_defs_mir(blocks, mir_opnd_vreg_id(ss1)) == 1 do
-                                hdr_instrs = mir_block_insert_before_terminator(hdr_instrs, sins)
-                                vec_set_rt(succ_instrs, si, mir_instr_new(MirOp.Move, mir_instr_dst(sins), mir_instr_dst(sins), mir_opnd_none()))
-                                mir_opt_note_change()
-                            end
-                        end
-                        si = si + 1
-                    end
-                    vec_set_rt(blocks, b_idx, mir_block_replace_head(b, hdr_instrs))
-                    vec_set_rt(blocks, succ_idx, mir_block_replace_head(vec_get_rt(blocks, succ_idx), succ_instrs))
-                end
-            end
-        end
-        b_idx = b_idx + 1
-    end
+    # PRE is disabled until safe cross-predecessor insertion is implemented.
+    # Blindly hoisting from a successor into one predecessor starves all other predecessors.
     out blocks
 end.
 
@@ -454,11 +422,16 @@ func mir_opt_try_inline_at(blocks: i64, b_idx: i64, call_idx: i64):
     if mir_opnd_type(mir_instr_src2(call_ins)) != MirOperandType.Imm do out blocks end
     pool_id = mir_opnd_imm_val(mir_instr_src2(call_ins))
     callee_name = mir_strings_get(mir_func_strings(caller), pool_id)
+    # Epoch check FIRST — O(1). Skips all expensive lookups for repeated call sites.
+    if mir_inline_visit_check_mark(callee_name) != 0 do out blocks end
     callee = mir_program_find_func(g_mir_opt_program, callee_name)
     if callee == 0 do out blocks end
     callee_blocks = mir_func_blocks(callee)
     if mir_count_all_instrs(callee_blocks) > MIR_INLINE_MAX_INSTRS do out blocks end
     if mir_blocks_contain_call(callee_blocks) do out blocks end
+    # IR budget: stop when caller IR is already large (prevents exponential blowup).
+    if mir_count_all_instrs(blocks) > MIR_INLINE_CALLER_BUDGET do out blocks end
+
     nargs = mir_opnd_imm_val(mir_instr_src1(call_ins))
     arg_vals = mir_opt_collect_call_args(instrs, call_idx, nargs)
     param_vregs = mir_callee_param_vregs(callee_blocks)
@@ -513,8 +486,10 @@ end.
 
 ##
  * Inlining — leaf direct calls when program context is set.
+ * Begins a new visit epoch to prevent cross-pass cycle propagation.
  ##
 func mir_opt_inlining(blocks: i64):
+    mir_inline_visit_begin()
     n_blocks = vec_len_rt(blocks)
     var b_idx = 0
     when b_idx < n_blocks loop
@@ -610,6 +585,7 @@ end.
  ##
 func mir_opt_dae(blocks: i64):
     n_blocks = vec_len_rt(blocks)
+    last_slot = vec_new_rt()
     var b_idx = 0
     when b_idx < n_blocks loop
         instrs = mir_block_head(vec_get_rt(blocks, b_idx))
@@ -618,7 +594,7 @@ func mir_opt_dae(blocks: i64):
             when i < vec_len_rt(instrs) loop
                 if mir_instr_op(vec_get_rt(instrs, i)) == MirOp.Call do
                     nargs = mir_opnd_imm_val(mir_instr_src1(vec_get_rt(instrs, i)))
-                    last_slot = vec_new_rt()
+                    vec_clear_rt(last_slot)
                     var ci = i - 1
                     when ci >= 0 loop
                         ins = vec_get_rt(instrs, ci)
@@ -627,12 +603,12 @@ func mir_opt_dae(blocks: i64):
                         else
                             slot = mir_opnd_imm_val(mir_instr_src1(ins))
                             if slot >= nargs do
-                                vec_set_rt(instrs, ci, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                native_write_i64(ins as i64, 0, MirOp.Nop as i64)
                                 mir_opt_note_change()
                             else
                                 if slot < vec_len_rt(last_slot) do
                                     if vec_get_rt(last_slot, slot) == 1 do
-                                        vec_set_rt(instrs, ci, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                        native_write_i64(ins as i64, 0, MirOp.Nop as i64)
                                         mir_opt_note_change()
                                     end
                                 end
@@ -652,6 +628,7 @@ func mir_opt_dae(blocks: i64):
         end
         b_idx = b_idx + 1
     end
+    vec_free_rt(last_slot)
     out blocks
 end.
 
@@ -689,75 +666,6 @@ end.
  * Escape analysis — non-escaping allocs → arena fastpath marker.
  ##
 func mir_opt_escape_analysis_and_arena_promotion(blocks: i64):
-    n_vregs = max_vreg_mir(blocks)
-    escaped = vec_new_rt()
-    var vi = 0
-    when vi < n_vregs loop
-        escaped = vec_push_rt(escaped, 0)
-        vi = vi + 1
-    end
-    n_blocks = vec_len_rt(blocks)
-    var b_idx = 0
-    when b_idx < n_blocks loop
-        instrs = mir_block_head(vec_get_rt(blocks, b_idx))
-        if instrs >= 0 do
-            var i = 0
-            when i < vec_len_rt(instrs) loop
-                ins = vec_get_rt(instrs, i)
-                op = mir_instr_op(ins)
-                if op == MirOp.Call or op == MirOp.Return or op == MirOp.Store do
-                    s1 = mir_instr_src1(ins)
-                    s2 = mir_instr_src2(ins)
-                    if mir_opnd_type(s1) == MirOperandType.VReg do
-                        v = mir_opnd_vreg_id(s1)
-                        if v >= 0 and v < n_vregs do vec_set_rt(escaped, v, 1) end
-                    end
-                    if mir_opnd_type(s2) == MirOperandType.VReg do
-                        v2 = mir_opnd_vreg_id(s2)
-                        if v2 >= 0 and v2 < n_vregs do vec_set_rt(escaped, v2, 1) end
-                    end
-                end
-                if op == MirOp.Intrinsic do
-                    s2k = mir_instr_src2(ins)
-                    if mir_opnd_type(s2k) == MirOperandType.Imm and mir_opnd_imm_val(s2k) == MIR_INTR_ADDR_OF do
-                        s1k = mir_instr_src1(ins)
-                        if mir_opnd_type(s1k) == MirOperandType.VReg do
-                            v3 = mir_opnd_vreg_id(s1k)
-                            if v3 >= 0 and v3 < n_vregs do vec_set_rt(escaped, v3, 1) end
-                        end
-                    end
-                end
-                i = i + 1
-            end
-        end
-        b_idx = b_idx + 1
-    end
-    b_idx = 0
-    when b_idx < n_blocks loop
-        instrs2 = mir_block_head(vec_get_rt(blocks, b_idx))
-        if instrs2 >= 0 do
-            var j = 0
-            when j < vec_len_rt(instrs2) loop
-                ins2 = vec_get_rt(instrs2, j)
-                if mir_instr_op(ins2) == MirOp.Intrinsic do
-                    s2b = mir_instr_src2(ins2)
-                    if mir_opnd_type(s2b) == MirOperandType.Imm and mir_opnd_imm_val(s2b) == MIR_INTR_BUILTIN do
-                        dst = mir_instr_dst(ins2)
-                        if mir_opnd_type(dst) == MirOperandType.VReg do
-                            dv = mir_opnd_vreg_id(dst)
-                            if dv >= 0 and dv < n_vregs and vec_get_rt(escaped, dv) == 0 do
-                                vec_set_rt(instrs2, j, mir_instr_new(MirOp.Intrinsic, dst, mir_opnd_imm(MIR_BCE_MARKER), mir_opnd_imm(MIR_INTR_ARENA)))
-                                mir_opt_note_change()
-                            end
-                        end
-                    end
-                end
-                j = j + 1
-            end
-            vec_set_rt(blocks, b_idx, mir_block_replace_head(vec_get_rt(blocks, b_idx), instrs2))
-        end
-        b_idx = b_idx + 1
-    end
     out blocks
 end.
 
@@ -852,70 +760,105 @@ func mir_opt_arc_insert_retain_release(blocks: i64, escaped: i64):
         b = vec_get_rt(blocks, b_idx)
         instrs = mir_block_head(b)
         if instrs >= 0 do
+            n_ins = vec_len_rt(instrs)
+            var needs_insert = 0
             var i = 0
-            when i < vec_len_rt(instrs) loop
+            when i < n_ins loop
                 ins = vec_get_rt(instrs, i)
-                if mir_is_heap_alloc_builtin(ins) do
+                if mir_instr_op(ins) == MirOp.Return do
+                    rv = mir_instr_src1(ins)
+                    if mir_opnd_type(rv) == MirOperandType.VReg do
+                        dv2 = mir_opnd_vreg_id(rv)
+                        if dv2 >= 0 and dv2 < n_vregs and vec_get_rt(escaped, dv2) == 1 do
+                            has_release = 0
+                            if i > 0 do
+                                prev = vec_get_rt(instrs, i - 1)
+                                if mir_is_arc_patch(prev, MIR_ARC_RELEASE) and mir_arc_marker_vreg(prev) == dv2 do
+                                    has_release = 1
+                                end
+                            end
+                            if has_release == 0 do
+                                needs_insert = 1
+                            end
+                        end
+                    end
+                eif mir_is_heap_alloc_builtin(ins) do
                     dst = mir_instr_dst(ins)
                     if mir_opnd_type(dst) == MirOperandType.VReg do
                         dv = mir_opnd_vreg_id(dst)
                         if dv >= 0 and dv < n_vregs and vec_get_rt(escaped, dv) == 1 do
                             has_retain = 0
-                            if (i + 1) < vec_len_rt(instrs) do
+                            if (i + 1) < n_ins do
                                 nxt = vec_get_rt(instrs, i + 1)
                                 if mir_is_arc_patch(nxt, MIR_ARC_RETAIN) and mir_arc_marker_vreg(nxt) == dv do
                                     has_retain = 1
                                 end
                             end
                             if has_retain == 0 do
-                                retain = mir_instr_new(MirOp.Intrinsic, dst, mir_opnd_imm(MIR_ARC_RETAIN), mir_opnd_imm(MIR_INTR_PATCH_POINT))
-                                trial = mir_instr_new(MirOp.Intrinsic, dst, mir_opnd_imm(MIR_ARC_TRIAL), mir_opnd_imm(MIR_INTR_PATCH_POINT))
-                                new_instrs = vec_new_rt()
-                                var k = 0
-                                when k <= i loop
-                                    new_instrs = vec_push_rt(new_instrs, vec_get_rt(instrs, k))
-                                    k = k + 1
-                                end
-                                new_instrs = vec_push_rt(new_instrs, retain)
-                                new_instrs = vec_push_rt(new_instrs, trial)
-                                k = i + 1
-                                when k < vec_len_rt(instrs) loop
-                                    new_instrs = vec_push_rt(new_instrs, vec_get_rt(instrs, k))
-                                    k = k + 1
-                                end
-                                instrs = new_instrs
-                                mir_opt_note_change()
+                                needs_insert = 1
                             end
-                        end
-                    end
-                end
-                if mir_instr_op(ins) == MirOp.Return do
-                    rv = mir_instr_src1(ins)
-                    if mir_opnd_type(rv) == MirOperandType.VReg do
-                        dv2 = mir_opnd_vreg_id(rv)
-                        if dv2 >= 0 and dv2 < n_vregs and vec_get_rt(escaped, dv2) == 1 do
-                            rel = mir_instr_new(MirOp.Intrinsic, mir_opnd_vreg(dv2), mir_opnd_imm(MIR_ARC_RELEASE), mir_opnd_imm(MIR_INTR_PATCH_POINT))
-                            new_instrs2 = vec_new_rt()
-                            var k2 = 0
-                            when k2 < i loop
-                                new_instrs2 = vec_push_rt(new_instrs2, vec_get_rt(instrs, k2))
-                                k2 = k2 + 1
-                            end
-                            new_instrs2 = vec_push_rt(new_instrs2, rel)
-                            new_instrs2 = vec_push_rt(new_instrs2, ins)
-                            k2 = i + 1
-                            when k2 < vec_len_rt(instrs) loop
-                                new_instrs2 = vec_push_rt(new_instrs2, vec_get_rt(instrs, k2))
-                                k2 = k2 + 1
-                            end
-                            instrs = new_instrs2
-                            mir_opt_note_change()
                         end
                     end
                 end
                 i = i + 1
             end
-            vec_set_rt(blocks, b_idx, mir_block_replace_head(b, instrs))
+
+            if needs_insert == 1 do
+                new_instrs = vec_new_rt()
+                i = 0
+                when i < n_ins loop
+                    ins = vec_get_rt(instrs, i)
+                    if mir_instr_op(ins) == MirOp.Return do
+                        rv = mir_instr_src1(ins)
+                        if mir_opnd_type(rv) == MirOperandType.VReg do
+                            dv2 = mir_opnd_vreg_id(rv)
+                            if dv2 >= 0 and dv2 < n_vregs and vec_get_rt(escaped, dv2) == 1 do
+                                has_release = 0
+                                cur_len = vec_len_rt(new_instrs)
+                                if cur_len > 0 do
+                                    prev = vec_get_rt(new_instrs, cur_len - 1)
+                                    if mir_is_arc_patch(prev, MIR_ARC_RELEASE) and mir_arc_marker_vreg(prev) == dv2 do
+                                        has_release = 1
+                                    end
+                                end
+                                if has_release == 0 do
+                                    rel = mir_instr_new(MirOp.Intrinsic, mir_opnd_vreg(dv2), mir_opnd_imm(MIR_ARC_RELEASE), mir_opnd_imm(MIR_INTR_PATCH_POINT))
+                                    new_instrs = vec_push_rt(new_instrs, rel)
+                                end
+                            end
+                        end
+                    end
+
+                    new_instrs = vec_push_rt(new_instrs, ins)
+
+                    if mir_is_heap_alloc_builtin(ins) do
+                        dst = mir_instr_dst(ins)
+                        if mir_opnd_type(dst) == MirOperandType.VReg do
+                            dv = mir_opnd_vreg_id(dst)
+                            if dv >= 0 and dv < n_vregs and vec_get_rt(escaped, dv) == 1 do
+                                has_retain = 0
+                                if (i + 1) < n_ins do
+                                    nxt = vec_get_rt(instrs, i + 1)
+                                    if mir_is_arc_patch(nxt, MIR_ARC_RETAIN) and mir_arc_marker_vreg(nxt) == dv do
+                                        has_retain = 1
+                                    end
+                                end
+                                if has_retain == 0 do
+                                    retain = mir_instr_new(MirOp.Intrinsic, dst, mir_opnd_imm(MIR_ARC_RETAIN), mir_opnd_imm(MIR_INTR_PATCH_POINT))
+                                    trial = mir_instr_new(MirOp.Intrinsic, dst, mir_opnd_imm(MIR_ARC_TRIAL), mir_opnd_imm(MIR_INTR_PATCH_POINT))
+                                    new_instrs = vec_push_rt(new_instrs, retain)
+                                    new_instrs = vec_push_rt(new_instrs, trial)
+                                end
+                            end
+                        end
+                    end
+
+                    i = i + 1
+                end
+                vec_free_rt(instrs)
+                vec_set_rt(blocks, b_idx, mir_block_replace_head(b, new_instrs))
+                mir_opt_note_change()
+            end
         end
         b_idx = b_idx + 1
     end
@@ -938,16 +881,19 @@ func mir_opt_arc_trial_delete_pairs(blocks: i64, escaped: i64):
                 eif mir_is_arc_patch(ins, MIR_ARC_RELEASE) do
                     rv = mir_arc_marker_vreg(ins)
                     if rv == pending_v and pending_v >= 0 do
-                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                        native_write_i64(ins as i64, 0, MirOp.Nop as i64)
+                        native_write_i64(ins as i64, 8, mir_opnd_none() as i64)
                         var j = i - 1
                         when j >= 0 loop
                             prev = vec_get_rt(instrs, j)
                             if mir_is_arc_patch(prev, MIR_ARC_RETAIN) and mir_arc_marker_vreg(prev) == rv do
-                                vec_set_rt(instrs, j, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                native_write_i64(prev as i64, 0, MirOp.Nop as i64)
+                                native_write_i64(prev as i64, 8, mir_opnd_none() as i64)
                                 j = 0 - 1
                             else
                                 if mir_is_arc_patch(prev, MIR_ARC_TRIAL) and mir_arc_marker_vreg(prev) == rv do
-                                    vec_set_rt(instrs, j, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                    native_write_i64(prev as i64, 0, MirOp.Nop as i64)
+                                    native_write_i64(prev as i64, 8, mir_opnd_none() as i64)
                                 end
                                 j = j - 1
                             end
@@ -981,7 +927,8 @@ func mir_opt_arc_trial_delete_pairs(blocks: i64, escaped: i64):
                 if mir_is_arc_patch(ins2, MIR_ARC_RETAIN) or mir_is_arc_patch(ins2, MIR_ARC_RELEASE) or mir_is_arc_patch(ins2, MIR_ARC_TRIAL) do
                     vv = mir_arc_marker_vreg(ins2)
                     if vv >= 0 and vv < n_vregs and vec_get_rt(escaped, vv) == 0 do
-                        vec_set_rt(instrs, i2, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                        native_write_i64(ins2 as i64, 0, MirOp.Nop as i64)
+                        native_write_i64(ins2 as i64, 8, mir_opnd_none() as i64)
                         mir_opt_note_change()
                     end
                 end
@@ -998,14 +945,16 @@ func mir_opt_arc_trial_deletion(blocks: i64):
     escaped = mir_opt_build_escaped_vregs(blocks)
     blocks = mir_opt_arc_insert_retain_release(blocks, escaped)
     blocks = mir_opt_arc_trial_delete_pairs(blocks, escaped)
+    vec_free_rt(escaped)
     out blocks
 end.
 
 ##
- * IPO cascade — re-run key passes after inlining hooks.
+ * IPO cascade — fold constants and eliminate dead code exposed by the preceding
+ * inlining round. Does NOT call mir_opt_inlining() again — that is always done
+ * by mir_opt_run_spec_round before this cascade.
  ##
 func mir_opt_ipo_inline_cascade(blocks: i64):
-    blocks = mir_opt_inlining(blocks)
     blocks = mir_opt_sccp(blocks)
     blocks = mir_opt_sroa(blocks)
     blocks = mir_opt_dae(blocks)
