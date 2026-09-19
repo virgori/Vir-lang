@@ -30,25 +30,30 @@ module vir.rt.alloc
 
 include types
 include rt.syscall
-import sys_mmap, sys_munmap, sys_platform, Platform, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS from rt.syscall
+import sys_mmap, sys_munmap, sys_platform, sys_exit, Platform, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS from rt.syscall
 
 # ═══════════════════════════════════════════════════════
 # Constants
 # ═══════════════════════════════════════════════════════
 
-const PAGE_SIZE:        16384;        # 16KB (macOS ARM64)
-const MIN_ARENA_SIZE:   1048576;      # 1MB
-const BLOCK_HEADER:     16;           # 8 bytes size_and_flags + 8 bytes prev_size
-const MIN_BLOCK_SIZE:   32;           # 16B header + 16B free list pointers
-const ALIGNMENT:        16;           # 16-byte alignment
+const PAGE_SIZE:             16384;        # 16KB (macOS ARM64)
+const MIN_ARENA_SIZE:        1048576;      # 1MB
+const BLOCK_HEADER:          16;           # 8 bytes size_and_flags + 8 bytes prev_size
+const MIN_BLOCK_SIZE:        32;           # 16B header + 16B free list pointers
+const ALIGNMENT:             16;           # 16-byte alignment
 
-const BLOCK_FREE:       0x1;          # bit 0: 1 = block is free, 0 = used
-const PREV_FREE:        0x2;          # bit 1: 1 = preceding block is free, 0 = used
-const FLAG_MASK:        0xF;          # lower 4 bits reserved for flags
+const BLOCK_FREE:            0x1;          # bit 0: 1 = block is free, 0 = used
+const PREV_FREE:             0x2;          # bit 1: 1 = preceding block is free, 0 = used
+const BLOCK_DIRECT_MAP:      0x4;          # bit 2: 1 = direct-mapped via page_alloc (>8MB)
+const FLAG_MASK:             0xF;          # lower 4 bits reserved for flags
 
-const FL_INDEX_COUNT:   28;           # 28 first-level classes (size 32 B to 4 GB)
-const SL_INDEX_COUNT:   16;           # 16 second-level bins per class
-const TOTAL_BINS:       448;          # 28 * 16 = 448 bins
+const LARGE_ALLOC_THRESHOLD: 8388608;      # 8MB: requests above threshold use direct mapping
+const MAX_ALLOC_SIZE:        1073741824;   # 1GB: maximum permissible allocation (prevents overflow)
+
+const FL_INDEX_COUNT:        28;           # 28 first-level classes (size 32 B to 4 GB)
+const SL_INDEX_COUNT:        16;           # 16 second-level bins per class
+const TOTAL_BINS:            448;          # 28 * 16 = 448 bins
+const HEAP_THREAD_SAFE:      false;        # native allocator is single-threaded / non-concurrent
 
 # ═══════════════════════════════════════════════════════
 # Portable Virtual Memory Layer (vm_alloc/vm_free)
@@ -160,13 +165,18 @@ entity Heap:
     base:       int;      # mmap'd region base
     capacity:   int;      # total region size
     free_head:  int;      # compatibility field (points to base or first block)
-    used:       int      # bytes currently allocated
+    used:       int;      # bytes currently allocated
+    peak_used:  int       # peak bytes allocated
 end.
 
 # Heap singleton
-var g_heap = Heap ( base: 0, capacity: 0, free_head: 0, used: 0 )
+var g_heap = Heap ( base: 0, capacity: 0, free_head: 0, used: 0, peak_used: 0 )
 var g_tlsf_ctrl: int = 0
 var g_heap_inspect_count: int = 0
+
+func heap_is_thread_safe() -> bool:
+    out HEAP_THREAD_SAFE
+end.
 
 func heap_get_inspect_count() -> int:
     out g_heap_inspect_count
@@ -431,8 +441,38 @@ func heap_init(size: int):
 end.
 
 func heap_alloc(size: int):
+    # 1. Validation: reject non-positive or oversized allocations
+    if size <= 0 do
+        out 0
+    end
+    if size > MAX_ALLOC_SIZE do
+        out 0
+    end
+
     if g_tlsf_ctrl == 0 do
         heap_init(MIN_ARENA_SIZE * 4)
+    end
+
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    # Check for direct-mapped large allocation (> 8MB)
+    if size > LARGE_ALLOC_THRESHOLD do
+        let ps = rt_page_size()
+        var total_req = size + BLOCK_HEADER
+        var pages = (total_req + ps - 1) / ps
+        var actual = pages * ps
+        let ptr = vm_alloc(actual, PROT_READ bit_or PROT_WRITE)
+        if ptr <= 0 do
+            out 0
+        end
+        native_write_i64(ptr, 0, actual bit_or BLOCK_DIRECT_MAP)
+        native_write_i64(ptr, 8, actual)
+        g_heap.used = g_heap.used + actual
+        if g_heap.used > g_heap.peak_used do
+            g_heap.peak_used = g_heap.used
+        end
+        out ptr + BLOCK_HEADER
     end
 
     var needed = size + BLOCK_HEADER
@@ -440,9 +480,9 @@ func heap_alloc(size: int):
     if needed < MIN_BLOCK_SIZE do
         needed = MIN_BLOCK_SIZE
     end
-
-    extern func native_read_i64(addr: int, offset: int) -> int
-    extern func native_write_i64(addr: int, offset: int, val: int)
+    if needed <= 0 or needed > MAX_ALLOC_SIZE do
+        out 0
+    end
 
     var bin_idx = tlsf_search_suitable_bin(needed)
     if bin_idx < 0 do
@@ -503,6 +543,9 @@ func heap_alloc(size: int):
     end
 
     g_heap.used = g_heap.used + needed
+    if g_heap.used > g_heap.peak_used do
+        g_heap.peak_used = g_heap.used
+    end
     out block + BLOCK_HEADER
 end.
 
@@ -513,15 +556,52 @@ func heap_free(p: int):
 
     extern func native_read_i64(addr: int, offset: int) -> int
     extern func native_write_i64(addr: int, offset: int, val: int)
+    extern func sys_exit(code: int)
+
+    # Validate alignment: payload pointer must be 16-byte aligned
+    if (p bit_and (ALIGNMENT - 1)) != 0 do
+        sys_exit(134)
+        out 0
+    end
 
     let block = p - BLOCK_HEADER
     let raw = native_read_i64(block, 0)
+
+    # Check for direct-mapped block
+    if (raw bit_and BLOCK_DIRECT_MAP) != 0 do
+        let map_size = raw bit_and ~(FLAG_MASK)
+        if map_size <= 0 or (raw bit_and BLOCK_FREE) != 0 do
+            sys_exit(134)
+            out 0
+        end
+        native_write_i64(block, 0, map_size bit_or BLOCK_FREE)
+        let ps = rt_page_size()
+        var pages = (map_size + ps - 1) / ps
+        var actual = pages * ps
+        vm_free(block, actual)
+        g_heap.used = g_heap.used - map_size
+        out 0
+    end
+
+    # Hardened double-free check: if already free, trap immediately with SIGABRT (134)
+    if (raw bit_and BLOCK_FREE) != 0 do
+        sys_exit(134)
+        out 0
+    end
+
     let original_size = raw bit_and ~(FLAG_MASK)
+    # Hardened block size validation: must be at least MIN_BLOCK_SIZE and 16-byte aligned
+    if original_size < MIN_BLOCK_SIZE or (original_size bit_and (ALIGNMENT - 1)) != 0 do
+        sys_exit(134)
+        out 0
+    end
+
     var block_size = original_size
     let prev_is_free = (raw bit_and PREV_FREE) != 0
     var merged_block = block
 
     # 1. O(1) Left coalescing via prev_size boundary tag
+    g_heap_inspect_count = g_heap_inspect_count + 1
     if prev_is_free do
         let prev_size = native_read_i64(block, 8)
         let left_block = block - prev_size
@@ -531,6 +611,7 @@ func heap_free(p: int):
     end
 
     # 2. O(1) Right coalescing via physical offset
+    g_heap_inspect_count = g_heap_inspect_count + 1
     let right_block = block + original_size
     let right_raw = native_read_i64(right_block, 0)
     if (right_raw bit_and BLOCK_FREE) != 0 do
@@ -562,27 +643,97 @@ func heap_realloc(p: int, new_size: int):
     if p == 0 do
         out heap_alloc(new_size)
     end
+    if new_size <= 0 do
+        heap_free(p)
+        out 0
+    end
+    if new_size > MAX_ALLOC_SIZE do
+        out 0
+    end
 
     extern func native_read_i64(addr: int, offset: int) -> int
     extern func native_write_i64(addr: int, offset: int, val: int)
 
     let block = p - BLOCK_HEADER
     let raw = native_read_i64(block, 0)
+
+    # Handle direct-mapped block realloc
+    if (raw bit_and BLOCK_DIRECT_MAP) != 0 do
+        let old_map_size = raw bit_and ~(FLAG_MASK)
+        let old_payload = old_map_size - BLOCK_HEADER
+        let new_ptr = heap_alloc(new_size)
+        if new_ptr == 0 do
+            out 0
+        end
+        var clen = old_payload
+        if new_size < clen do
+            clen = new_size
+        end
+        var ci = 0
+        when ci + 8 <= clen loop
+            let word = native_read_i64(p, ci)
+            native_write_i64(new_ptr, ci, word)
+            ci = ci + 8
+        end
+        when ci < clen loop
+            extern func native_read_u8(addr: int, offset: int) -> int
+            extern func native_write_u8(addr: int, offset: int, val: int)
+            let byte_val = native_read_u8(p, ci)
+            native_write_u8(new_ptr, ci, byte_val)
+            ci = ci + 1
+        end
+        heap_free(p)
+        out new_ptr
+    end
+
     let old_block_size = raw bit_and ~(FLAG_MASK)
     let old_payload_size = old_block_size - BLOCK_HEADER
 
-    # In-place shrink / reuse: no reallocation or copy needed!
-    if new_size <= old_payload_size do
-        out p
-    end
-
-    # Check if we can expand in-place into adjacent right free block
     var needed = new_size + BLOCK_HEADER
     needed = (needed + ALIGNMENT - 1) bit_and ~(ALIGNMENT - 1)
     if needed < MIN_BLOCK_SIZE do
         needed = MIN_BLOCK_SIZE
     end
 
+    # In-place shrink / split tail
+    if needed < old_block_size do
+        let remainder = old_block_size - needed
+        if remainder >= MIN_BLOCK_SIZE do
+            let prev_flags = raw bit_and PREV_FREE
+            native_write_i64(block, 0, needed bit_or prev_flags)
+
+            let rem_block = block + needed
+            native_write_i64(rem_block, 0, remainder bit_or BLOCK_FREE)
+            native_write_i64(rem_block, 8, needed)
+
+            let next_block = rem_block + remainder
+            let next_raw = native_read_i64(next_block, 0)
+            if (next_raw bit_and BLOCK_FREE) != 0 do
+                let next_sz = next_raw bit_and ~(FLAG_MASK)
+                tlsf_remove_block(next_block)
+                let combined_rem = remainder + next_sz
+                native_write_i64(rem_block, 0, combined_rem bit_or BLOCK_FREE)
+                let after_next = rem_block + combined_rem
+                let after_raw = native_read_i64(after_next, 0)
+                native_write_i64(after_next, 0, after_raw bit_or PREV_FREE)
+                native_write_i64(after_next, 8, combined_rem)
+                tlsf_insert_block(rem_block)
+            else
+                native_write_i64(next_block, 0, next_raw bit_or PREV_FREE)
+                native_write_i64(next_block, 8, remainder)
+                tlsf_insert_block(rem_block)
+            end
+
+            g_heap.used = g_heap.used - remainder
+        end
+        out p
+    end
+
+    if needed == old_block_size do
+        out p
+    end
+
+    # Check if we can expand in-place into adjacent right free block
     let right_block = block + old_block_size
     let right_raw = native_read_i64(right_block, 0)
     if (right_raw bit_and BLOCK_FREE) != 0 do
@@ -615,7 +766,7 @@ func heap_realloc(p: int, new_size: int):
         end
     end
 
-    # Allocate new, copy words, free old
+    # Allocate new, copy words, free old (failure preservation: if heap_alloc returns 0, old block is untouched)
     let new_ptr = heap_alloc(new_size)
     if new_ptr == 0 do
         out 0
@@ -649,6 +800,7 @@ func heap_verify() -> int:
     end
     extern func native_read_i64(addr: int, offset: int) -> int
 
+    # 1. Check Bitmap <-> Bin consistency and free block list integrity
     let fl_map = get_fl_bitmap()
     var fl = 0
     when fl < FL_INDEX_COUNT loop
@@ -676,6 +828,7 @@ func heap_verify() -> int:
 
             var cur = head
             var prev = 0
+            var cycle_guard = 0
             when cur != 0 loop
                 let raw = native_read_i64(cur, 0)
                 if (raw bit_and BLOCK_FREE) == 0 do
@@ -685,14 +838,71 @@ func heap_verify() -> int:
                 if p != prev do
                     out 0
                 end
+                let bsz = raw bit_and ~(FLAG_MASK)
+                if bsz < MIN_BLOCK_SIZE or (bsz bit_and 0xF) != 0 do
+                    out 0
+                end
+                let mapped_bin = tlsf_mapping_bin(bsz)
+                if mapped_bin != bin_idx do
+                    out 0
+                end
+
                 prev = cur
                 cur = native_read_i64(cur, 24)
+                cycle_guard = cycle_guard + 1
+                if cycle_guard > 500000 do
+                    out 0
+                end
             end
 
             sl = sl + 1
         end
         fl = fl + 1
     end
+
+    # 2. Physical heap walk: boundary tag reciprocity and sentinel integrity
+    if g_heap.base != 0 do
+        var cur = g_heap.base
+        var seg_limit = g_heap.base + g_heap.capacity
+        var prev_sz = 0
+        var prev_was_free = 0
+        var walk_guard = 0
+        when cur < seg_limit loop
+            let raw = native_read_i64(cur, 0)
+            let cur_sz = raw bit_and ~(FLAG_MASK)
+            let cur_prev_free = (raw bit_and PREV_FREE) != 0
+
+            if prev_sz > 0 do
+                if cur_prev_free != (prev_was_free != 0) do
+                    out 0
+                end
+                let rec_prev_sz = native_read_i64(cur, 8)
+                if rec_prev_sz != prev_sz do
+                    out 0
+                end
+            end
+
+            if cur_sz == 0 do
+                cur = seg_limit
+            else
+                if cur_sz < MIN_BLOCK_SIZE or (cur_sz bit_and 0xF) != 0 do
+                    out 0
+                end
+                if cur + cur_sz > seg_limit do
+                    out 0
+                end
+                prev_sz = cur_sz
+                prev_was_free = raw bit_and BLOCK_FREE
+                cur = cur + cur_sz
+            end
+
+            walk_guard = walk_guard + 1
+            if walk_guard > 500000 do
+                out 0
+            end
+        end
+    end
+
     out 1
 end.
 
