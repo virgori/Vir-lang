@@ -165,9 +165,11 @@ def check_compile_fail_oracle(oracle: str, compile_output: str) -> tuple[bool, s
 def run_test(
     entry: TestEntry,
     virc_bin: Path,
-    target: str,
-    fixtures_dir: Path,
+    target: str = "",
+    fixtures_dir: Path = DEFAULT_FIXTURES_DIR,
     timeout: float = 5.0,
+    compile_timeout: float = 30.0,
+    opt_level: str = "",
 ) -> TestResult:
     if entry.kind == "blocked_contract":
         return TestResult(
@@ -203,8 +205,10 @@ def run_test(
         compile_cmd = [str(virc_bin), str(fixture_path), "-o", str(bin_out)]
         if target:
             compile_cmd.extend(["--target", target])
+        if opt_level:
+            compile_cmd.append(opt_level)
 
-        c_exit, c_stdout, c_stderr = run_command(compile_cmd, cwd=ROOT, timeout=10.0)
+        c_exit, c_stdout, c_stderr = run_command(compile_cmd, cwd=ROOT, timeout=compile_timeout)
         c_all = c_stdout + "\n" + c_stderr
 
         # ── Kind: compile_fail ──
@@ -291,6 +295,22 @@ def run_test(
                     stderr=r_stderr,
                     reason="Execution succeeded with exit 0, expected trap/run failure",
                 )
+            m = re.search(r"exit\s+(-?\d+)", entry.oracle)
+            if m:
+                expected_code = int(m.group(1))
+                code_matched = (r_exit == expected_code) or (expected_code > 128 and r_exit == -(expected_code - 128)) or (expected_code < 0 and r_exit == 128 + abs(expected_code))
+                if not code_matched:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target=target,
+                        compile_exit=c_exit,
+                        run_exit=r_exit,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason=f"Execution exit code {r_exit} does not match expected {expected_code}",
+                    )
             return TestResult(
                 test_id=entry.test_id,
                 kind=entry.kind,
@@ -440,32 +460,30 @@ def run_test(
                         stderr=r_stderr,
                         reason="Structural gate failed: binary artifact not found",
                     )
-                disasm_out = ""
-                try:
-                    if target.startswith("macos"):
-                        proc = subprocess.run(["otool", "-tv", str(bin_out)], capture_output=True, text=True, timeout=10)
-                        disasm_out = proc.stdout
-                    else:
-                        proc = subprocess.run(["objdump", "-d", str(bin_out)], capture_output=True, text=True, timeout=10)
-                        disasm_out = proc.stdout
-                except Exception as e:
-                    disasm_out = ""
-
-                has_branch = bool(re.search(r"\b(bl|call|jal)\b", disasm_out))
-                if not has_branch:
+                # Compile to assembly with -S to verify physical call instruction in main
+                s_out = tmp_path / "struct.s"
+                s_cmd = [str(virc_bin), str(fixture_path), "-S", "-o", str(s_out)]
+                if target:
+                    s_cmd.extend(["--target", target])
+                if opt_level:
+                    s_cmd.append(opt_level)
+                s_exit, s_stdout, s_stderr = run_command(s_cmd, cwd=ROOT, timeout=10.0)
+                if s_exit != 0 or not s_out.exists():
                     return TestResult(
                         test_id=entry.test_id,
                         kind=entry.kind,
                         status="FAIL",
                         target=target,
-                        compile_exit=c_exit,
-                        run_exit=r_exit,
-                        stdout=r_stdout,
-                        stderr=r_stderr,
-                        reason="Structural gate failed: no call/branch instruction found in disassembled binary",
+                        compile_exit=s_exit,
+                        run_exit=None,
+                        stdout=s_stdout,
+                        stderr=s_stderr,
+                        reason="Structural gate failed: unable to emit assembly with -S",
                     )
-                lowered_funcs = re.findall(r"AST->MIR func\s+\d+\s*:\s*(\w+)", c_all)
-                if not ("heap_free" in lowered_funcs or "vir_free" in lowered_funcs or "free" in lowered_funcs):
+                s_content = s_out.read_text()
+                # Locate main function body in assembly
+                m_main = re.search(r"(?:_main|main):\s*\n(.*?)(?:\n\s*(?:_|\.)[a-zA-Z0-9_]+:|\Z)", s_content, re.DOTALL)
+                if not m_main:
                     return TestResult(
                         test_id=entry.test_id,
                         kind=entry.kind,
@@ -475,7 +493,22 @@ def run_test(
                         run_exit=r_exit,
                         stdout=r_stdout,
                         stderr=r_stderr,
-                        reason="Structural gate failed: heap_free / vir_free not present in compiler MIR functions",
+                        reason="Structural gate failed: main function not found in assembly",
+                    )
+                main_body = m_main.group(1)
+                # Verify that main contains an actual non-NOP call/branch targeting vir_free or heap_free
+                has_free_call = bool(re.search(r"\b(bl|call|jal)\s+[_]?(vir_free|heap_free)\b", main_body))
+                if not has_free_call:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target=target,
+                        compile_exit=c_exit,
+                        run_exit=r_exit,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason="Structural gate failed: main does not contain a concrete branch/call instruction to vir_free/heap_free",
                     )
 
             if entry.test_id == "TARGET-002":
@@ -553,6 +586,8 @@ def main() -> int:
     parser.add_argument("--filter", type=str, default="", help="Regex filter by test ID")
     parser.add_argument("--group", type=str, default="", help="Filter by group/phase (e.g. Phase1)")
     parser.add_argument("--timeout", type=float, default=5.0, help="Execution timeout in seconds")
+    parser.add_argument("--compile-timeout", type=float, default=30.0, help="Compilation timeout in seconds (default 30; use 60+ for -O2/-O3)")
+    parser.add_argument("--opt-level", type=str, default="", help="Optimization level flag (-O0, -O1, -O2, -O3)")
     parser.add_argument("--verbose", "-v", action="store_true", help="Print details for every test")
     args = parser.parse_args()
 
@@ -581,6 +616,8 @@ def main() -> int:
     print(f"  Manifest : {manifest_rel}")
     print(f"  Compiler : {virc_rel}")
     print(f"  Target   : {args.target}")
+    if args.opt_level:
+        print(f"  OptLevel : {args.opt_level}")
     print(f"  Total    : {len(entries)} tests")
     print(f"==================================================\n")
 
@@ -596,6 +633,8 @@ def main() -> int:
             target=args.target,
             fixtures_dir=args.fixtures,
             timeout=args.timeout,
+            compile_timeout=args.compile_timeout,
+            opt_level=args.opt_level,
         )
         results.append(res)
 
