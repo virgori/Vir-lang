@@ -2,7 +2,7 @@ import os
 import sys
 import subprocess
 
-VIRC = sys.argv[1] if len(sys.argv) > 1 else "scratch/stage3/virc"
+VIRC = sys.argv[1] if len(sys.argv) > 1 else "bin/virc"
 TEST_DIR = "tests/opt_mov"
 SCRATCH = "scratch/opt_mov_bins"
 os.makedirs(SCRATCH, exist_ok=True)
