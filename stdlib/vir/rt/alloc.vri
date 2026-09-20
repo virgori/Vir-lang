@@ -53,7 +53,19 @@ const MAX_ALLOC_SIZE:        1073741824;   # 1GB: maximum permissible allocation
 const FL_INDEX_COUNT:        28;           # 28 first-level classes (size 32 B to 4 GB)
 const SL_INDEX_COUNT:        16;           # 16 second-level bins per class
 const TOTAL_BINS:            448;          # 28 * 16 = 448 bins
-const HEAP_THREAD_SAFE:      false;        # native allocator is single-threaded / non-concurrent
+# THREAD SAFETY CONTRACT (Phase 2):
+# The Vir native heap allocator is deliberately single-threaded.
+# Design rationale:
+#   - The arena/bump allocator (X28/s11) is per-thread by convention: each thread
+#     uses its own stack-relative arena frame, so arena alloc/reset needs no lock.
+#   - The global TLSF heap (g_tlsf_ctrl) is shared state without atomics/locks.
+#     Concurrent heap_alloc/heap_free from multiple threads causes data races.
+# Contract for callers:
+#   Option A (recommended): use arena: blocks exclusively — no heap sharing needed.
+#   Option B: wrap heap_alloc/heap_free with a platform mutex if sharing is required.
+#   Option C: use per-thread arenas with one TLSF heap per thread (planned Phase 3).
+# Future: a lock-free allocator using CAS on bin heads is planned for Phase 3.
+const HEAP_THREAD_SAFE: false;
 
 # ═══════════════════════════════════════════════════════
 # Portable Virtual Memory Layer (vm_alloc/vm_free)
@@ -292,6 +304,90 @@ func tlsf_direct_count() -> int:
     out native_read_i64(g_tlsf_ctrl, 36616)
 end.
 
+# Direct-map hash table: 512 slots at g_tlsf_ctrl[44816]
+# Slot format: [base: i64, array_idx: i64] — 16 bytes per slot
+# Empty slot: base == 0
+const DM_HASH_BASE: int = 44816
+const DM_HASH_SIZE: int = 512
+
+func tlsf_dm_hash_slot(base: int) -> int:
+    out (base shr 20) bit_and (DM_HASH_SIZE - 1)
+end.
+
+func tlsf_direct_hash_find(base: int) -> int:
+    if g_tlsf_ctrl == 0 do out 0 - 1 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    var slot = tlsf_dm_hash_slot(base)
+    var probes = 0
+    when probes < DM_HASH_SIZE loop
+        let off = DM_HASH_BASE + slot * 16
+        let stored_base = native_read_i64(g_tlsf_ctrl, off)
+        if stored_base == 0 do out 0 - 1 end           # empty slot: not found
+        if stored_base == base do
+            out native_read_i64(g_tlsf_ctrl, off + 8)  # return array index
+        end
+        slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+        probes = probes + 1
+    end
+    out 0 - 1
+end.
+
+func tlsf_direct_hash_insert(base: int, arr_idx: int):
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    var slot = tlsf_dm_hash_slot(base)
+    var probes = 0
+    when probes < DM_HASH_SIZE loop
+        let off = DM_HASH_BASE + slot * 16
+        let stored_base = native_read_i64(g_tlsf_ctrl, off)
+        if stored_base == 0 or stored_base == base do
+            native_write_i64(g_tlsf_ctrl, off, base)
+            native_write_i64(g_tlsf_ctrl, off + 8, arr_idx)
+            out 0
+        end
+        slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+        probes = probes + 1
+    end
+    # Hash table full: fall back (shouldn't happen with load < 0.5)
+end.
+
+func tlsf_direct_hash_remove(base: int):
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    var slot = tlsf_dm_hash_slot(base)
+    var probes = 0
+    when probes < DM_HASH_SIZE loop
+        let off = DM_HASH_BASE + slot * 16
+        let stored_base = native_read_i64(g_tlsf_ctrl, off)
+        if stored_base == 0 do out 0 end  # not found
+        if stored_base == base do
+            # Open-addressed tables cannot leave an empty hole in a probe
+            # cluster: find() would stop before later collided entries.
+            # Remove the slot, then reinsert the remainder of the cluster.
+            native_write_i64(g_tlsf_ctrl, off, 0)
+            native_write_i64(g_tlsf_ctrl, off + 8, 0)
+            var next_slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+            var rehashed = 0
+            when rehashed < DM_HASH_SIZE - 1 loop
+                let next_off = DM_HASH_BASE + next_slot * 16
+                let next_base = native_read_i64(g_tlsf_ctrl, next_off)
+                if next_base == 0 do out 0 end
+                let next_idx = native_read_i64(g_tlsf_ctrl, next_off + 8)
+                native_write_i64(g_tlsf_ctrl, next_off, 0)
+                native_write_i64(g_tlsf_ctrl, next_off + 8, 0)
+                tlsf_direct_hash_insert(next_base, next_idx)
+                next_slot = (next_slot + 1) bit_and (DM_HASH_SIZE - 1)
+                rehashed = rehashed + 1
+            end
+            out 0
+        end
+        slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+        probes = probes + 1
+    end
+end.
+
 func tlsf_direct_add(base: int, size: int):
     if g_tlsf_ctrl == 0 do out 0 end
     extern func native_read_i64(addr: int, offset: int) -> int
@@ -302,6 +398,7 @@ func tlsf_direct_add(base: int, size: int):
         native_write_i64(g_tlsf_ctrl, off, base)
         native_write_i64(g_tlsf_ctrl, off + 8, size)
         native_write_i64(g_tlsf_ctrl, 36616, cnt + 1)
+        tlsf_direct_hash_insert(base, cnt)
     else
         extern func sys_exit(code: int)
         sys_exit(134)
@@ -309,18 +406,8 @@ func tlsf_direct_add(base: int, size: int):
 end.
 
 func tlsf_direct_find(base: int) -> int:
-    if g_tlsf_ctrl == 0 do out 0 - 1 end
-    extern func native_read_i64(addr: int, offset: int) -> int
-    let cnt = native_read_i64(g_tlsf_ctrl, 36616)
-    var i = 0
-    when i < cnt loop
-        let off = 36624 + i * 16
-        if native_read_i64(g_tlsf_ctrl, off) == base do
-            out i
-        end
-        i = i + 1
-    end
-    out 0 - 1
+    # O(1) hash lookup — replaces former O(n) linear scan
+    out tlsf_direct_hash_find(base)
 end.
 
 func tlsf_direct_remove(base: int):
@@ -334,11 +421,14 @@ func tlsf_direct_remove(base: int):
         if idx != last_idx do
             let last_off = 36624 + last_idx * 16
             let cur_off = 36624 + idx * 16
-            native_write_i64(g_tlsf_ctrl, cur_off, native_read_i64(g_tlsf_ctrl, last_off))
+            let last_base = native_read_i64(g_tlsf_ctrl, last_off)
+            native_write_i64(g_tlsf_ctrl, cur_off, last_base)
             native_write_i64(g_tlsf_ctrl, cur_off + 8, native_read_i64(g_tlsf_ctrl, last_off + 8))
+            tlsf_direct_hash_insert(last_base, idx)
         end
         native_write_i64(g_tlsf_ctrl, 36616, last_idx)
     end
+    tlsf_direct_hash_remove(base)
 end.
 
 # O(1) Find Last Set bit (MSB, 0..63)
@@ -1213,8 +1303,13 @@ func rt_promote_graph(p: int, arena_base: int, arena_top: int) -> int:
         out native_read_i64(hdr, 0)
     end
 
-    var size = native_read_i64(hdr, 0)
-    if size < 16 or size > 67108864 or (size bit_and 15) != 0 do
+    let total_size = native_read_i64(hdr, 0)
+    var size = 0
+    if total_size >= 16 and total_size <= 67108864 and (total_size bit_and 15) == 0 do
+        # Arena headers record header + aligned payload. vir_alloc() expects
+        # payload bytes, so never copy the 16-byte header as object data.
+        size = total_size - 16
+    else
         let n_elem = native_read_i64(p, 0)
         if n_elem >= 0 and n_elem < 8388608 do
             size = 16 + n_elem * 8

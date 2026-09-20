@@ -152,12 +152,17 @@ The native runtime (`stdlib/vir/rt/alloc.vri`) implements a segregated Two-Level
 - **Exact accounting and integrity verifier**:
   - `g_heap.used` tracks strictly live payload bytes, decremented only by the payload of the freed block without double-counting previously merged neighbors.
   - `heap_verify() -> int` validates internal consistency: bitmap-to-bin correspondence, doubly-linked list symmetry, neighbor boundary tag reciprocity, and allocation flag sanity.
-- **Real `free()` lowering across all backends**:
-  - Builtins `free` and `vir_free` lower directly to `heap_free()` across ARM64, x86_64, RISC-V, and native execution paths. Silent `LIR_RT_NOP` stubs are eliminated.
+- **Backend lowering status**:
+  - ARM64 and x86-64 lower `free`/`vir_free` to the native heap runtime.
+  - Wasm uses its separate linear-memory slab/free-list implementation.
+  - The direct RISC-V executable emitter rejects calls and arena/heap memory
+    intrinsics with `E-RISCV-UNSUPPORTED`; it must not emit a no-op that appears
+    to implement release or promotion.
 - **Empirical verification**:
   - Storage reuse: `tests/memory_contract/heap_alloc_free_reuse.vri` (exact pointer identity on sequential allocation and release).
   - Bounded kernel RSS: `tests/memory_contract/heap_bounded_rss_reuse.vri` (10,000 iterations $\times 4\text{ KB}$ with OS kernel measurement via `sys_getrusage`, asserting $\Delta\text{RSS} \le 128\text{ KB}$ and `heap_verify() == 1`).
-  - Adversarial complexity contract: `tests/memory_contract/heap_complexity_adversarial.vri` (250 fragmented free nodes with worst-case search steps $\le 4$).
+  - Adversarial TLSF-bin complexity contract: `tests/memory_contract/heap_complexity_adversarial.vri` (fragmented small allocations with worst-case bin inspection steps $\le 8$).
+  - Direct-map collision deletion: `tests/memory_contract/direct_hash_collision_delete.vri` inserts colliding keys, removes the cluster head, and verifies that later entries remain reachable.
   - Structural disassembly verification: `tools/gap_contract_runner.py` disassembles binaries via `otool -tv` / `objdump -d` asserting branch instructions (`bl vir_free` / `heap_free`).
 
 ### 3.4. Size-class slab pools
@@ -240,7 +245,9 @@ The memory management implementation is verified against the comprehensive `test
 
 | Category | Test Fixture | Contract / Invariant Verified | Result |
 | :--- | :--- | :--- | :--- |
-| **Heap $O(1)$ Complexity** | `MEM-HEAP-003` | Worst-case search inspection steps $\le 4$ on adversarial heap with 250 fragmented free nodes | **PASS** (1) |
+| **TLSF Bin Complexity** | `MEM-HEAP-003` | Bounded bin inspection on fragmented small-block allocation | **PASS** (1) |
+| **Direct-Map Collision Deletion** | `MEM-HEAP-007` | Removing a collided hash-cluster head preserves lookup of subsequent entries | **PASS** (1) |
+| **Wasm Slab Reuse** | `MEM-WASM-001` | A released linear-memory size-class slot is reused by the next equal-size allocation | **PASS** (1) |
 | **Kernel RSS Reuse** | `MEM-HEAP-002` | 10,000 iterations $\times 4\text{ KB}$ allocations with OS kernel RSS check (`sys_getrusage`), $\Delta\text{RSS} \le 128\text{ KB}$ | **PASS** (10000) |
 | **Storage Reuse** | `MEM-HEAP-001` | Sequential allocate-free-allocate returns identical virtual address pointer | **PASS** (1) |
 | **Disassembly Structural** | `MEM-STRUCT-001` | Machine code disassembled via `otool -tv` / `objdump -d` asserts concrete branch `bl vir_free` / `heap_free` | **PASS** (1) |
@@ -248,26 +255,43 @@ The memory management implementation is verified against the comprehensive `test
 | **Loop Escape Preservation**| `MEM-LOOP-002` | Accumulator escaping outer loop scope is preserved without clobbering | **PASS** (10000) |
 | **Arena Capacity Trapping** | `MEM-CAP-001` | Runtime watermark check aborts process with exit status `99` when allocation exceeds capacity | **PASS** (exit 99) |
 | **Arena Capacity Pass** | `MEM-CAP-002` | Executing within capacity limit completes normally with exit status `0` | **PASS** (exit 0) |
-| **Owned Graph Promotion** | `MEM-ESC-001..003`| Escape across nested arenas preserves deep graph backing memory across multiple scopes | **PASS** (100%) |
-| **Borrow Invalidation** | `MEM-BORROW-001..003`| Compile-time rejection with stable diagnostic when borrowing across arena resets | **PASS** (100%) |
+| **Deep Graph Promotion** | `MEM-DEEP-001..004`| Native macOS ARM64 execution of recursive graph promotion and early-exit paths | **PASS** (100%) |
+| **Owned Graph Promotion** | `MEM-ESC-001..010`| Escape across nested arenas preserves deep graph backing memory across multiple scopes | **PASS** (100%) |
+| **Borrow Invalidation** | `MEM-BOR-001..010` | Compile-time rejection with stable diagnostic when borrowing across arena resets | **PASS** (100%) |
+| **CFG Escape Propagation** | `MEM-CFG-001..003` | CFG-wide phi equivalence propagation prevents premature sub-arena reset | **PASS** (100%) |
+| **Cleanup & Reset Invariants**| `MEM-CLEAN-001..005`| Arena unwinding across normal exit, break, skip, out, throw, and ensure | **PASS** (100%) |
 
 **Summary Gate Verification:**
-- Memory Contract Suite (`tools/gap_contract_runner.py`): **46 / 46 PASS (100%)**
-- Compiler Group 27 Integration Suite (`./run_tests.sh 27`): **52 / 52 PASS (100%)**
-- Compiler Min Suite (`./run_tests.sh min`): **271 / 271 PASS (100%)**
+- Memory Contract Suite (`tools/gap_contract_runner.py`):
+  - `-O0`: **51 / 51 PASS (100%)**
+  - `-O1`: **51 / 51 PASS (100%)**
+  - `-O2`: **51 / 51 PASS (100%)**
+  - `-O3`: **51 / 51 PASS (100%)**
+  - Total across all 4 opt levels: **204 / 204 PASS (100%)**
+- Compiler Group 27 Integration Suite (`./run_tests.sh 27`): **57 / 57 PASS (100%)**
+- Compiler Full Min Suite (`./run_tests.sh min`): **276 / 276 PASS (100%)**
+
+The Wasm row establishes slab reuse only; the remaining native results do not
+establish equivalent Wasm or RISC-V behavior.
+Wasm rejects `MIR_MEM_PROMOTE` with `E-WASM-UNSUPPORTED` until it has a
+persistent parent-region allocator and recursive graph copier. The direct
+RISC-V emitter likewise rejects calls and memory intrinsics rather than
+silently emitting no-ops. Backend support must be reported separately from the
+native contract suite.
 
 ### 6.2. Bit-for-Bit Self-Host Bootstrap Convergence
 
-Self-host fixed-point convergence is verified across 3 bootstrap generations (Stage 1 $\to$ Stage 2 $\to$ Stage 3) compiled with canonical target naming:
+Self-host fixed-point convergence is verified by compiling the unchanged source
+with one repaired self-host generation and then recompiling it with the result.
+The two final executables are bit-for-bit identical: 17,269,807 bytes with
+SHA-256 `00a32bcfe690c3af95b80bf4aecceedb6d2f3a0886747c1f49e54d105e1f0948`.
 
-- **Stage 2 Binary**: Compiled from source by Stage 1 compiler (`scratch/stage2/virc`).
-- **Stage 3 Binary**: Compiled from source by Stage 2 compiler (`scratch/stage3/virc`).
 - **Bit-for-Bit Comparison**:
   ```shell
-  cmp scratch/stage2/virc scratch/stage3/virc
-  # Exit code: 0 (0 byte differences across all 17,745,871 bytes)
+  cmp scratch/virc_phase2_repair_s4 scratch/virc_phase2_repair_s5
+  # Exit code: 0 (0 byte differences)
   ```
 - **Cryptographic Hash (SHA-256)**:
-  - Stage 2 SHA-256: `24cab86b6f721d5a6bc965d7056e69970b834934310db52b0a87a76b6ed51245`
-  - Stage 3 SHA-256: `24cab86b6f721d5a6bc965d7056e69970b834934310db52b0a87a76b6ed51245`
-- **Installed Compiler**: `bin/virc` is synchronized to the converged Stage 3 binary.
+  - Final generation 1: `00a32bcfe690c3af95b80bf4aecceedb6d2f3a0886747c1f49e54d105e1f0948`
+  - Final generation 2: `00a32bcfe690c3af95b80bf4aecceedb6d2f3a0886747c1f49e54d105e1f0948`
+- **Installed Compiler**: `bin/virc` is synchronized to the second converged generation.

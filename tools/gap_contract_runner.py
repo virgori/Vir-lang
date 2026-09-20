@@ -8,6 +8,7 @@ Supports kinds:
   - compile_fail: compiler returns non-zero, diagnostic oracle match, no artifact
   - run_fail: compile succeeds, run traps/exits non-zero via error path
   - structural: runtime/behavioral gate + MIR/symbol/structural oracle check
+  - wasm_run: compile to WASI, execute with Node.js, and inspect linear memory
   - blocked_contract: unconditionally reports BLOCKED (never PASS)
 """
 
@@ -202,9 +203,10 @@ def run_test(
         tmp_path = Path(tmpdir)
         bin_out = tmp_path / "test_artifact"
 
+        compile_target = "wasm32-wasi-p1" if entry.kind == "wasm_run" else target
         compile_cmd = [str(virc_bin), str(fixture_path), "-o", str(bin_out)]
-        if target:
-            compile_cmd.extend(["--target", target])
+        if compile_target:
+            compile_cmd.extend(["--target", compile_target])
         if opt_level:
             compile_cmd.append(opt_level)
 
@@ -275,6 +277,51 @@ def run_test(
                 stdout=c_stdout,
                 stderr=c_stderr,
                 reason="Compilation succeeded but artifact does not exist",
+            )
+
+        if entry.kind == "wasm_run":
+            if shutil.which("node") is None:
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="BLOCKED",
+                    target=compile_target,
+                    compile_exit=c_exit,
+                    run_exit=None,
+                    stdout="",
+                    stderr="",
+                    reason="Node.js is required for Wasm validation",
+                )
+            node_script = r"""
+const fs = require("fs");
+const { WASI } = require("wasi");
+const wasi = new WASI({ version: "preview1", args: [], env: {} });
+WebAssembly.instantiate(fs.readFileSync(process.argv[1]), {
+  wasi_snapshot_preview1: wasi.wasiImport
+}).then(({ instance }) => {
+  instance.exports._start();
+  const view = new DataView(instance.exports.memory.buffer);
+  console.log(`${view.getBigInt64(60000, true)}ok`);
+}).catch((error) => {
+  console.error(error);
+  process.exit(1);
+});
+"""
+            r_exit, r_stdout, r_stderr = run_command(
+                ["node", "--no-warnings", "--experimental-wasi-unstable-preview1", "-e", node_script, str(bin_out)],
+                cwd=ROOT,
+                timeout=timeout,
+            )
+            return TestResult(
+                test_id=entry.test_id,
+                kind=entry.kind,
+                status="PASS" if r_exit == 0 and r_stdout.strip() == "0ok" else "FAIL",
+                target=compile_target,
+                compile_exit=c_exit,
+                run_exit=r_exit,
+                stdout=r_stdout,
+                stderr=r_stderr,
+                reason="Wasm slab reused the released size-class slot" if r_exit == 0 and r_stdout.strip() == "0ok" else "Wasm slab reuse validation/execution failed",
             )
 
         # Run artifact

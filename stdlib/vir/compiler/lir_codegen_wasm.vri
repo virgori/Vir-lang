@@ -20,7 +20,7 @@ import LirType, LirOp, LirOperandType, lir_func_blocks, lir_func_strings, lir_bl
        lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_aux,
        lir_instr_typ, lir_opnd_type, lir_opnd_vreg, lir_opnd_imm_val from compiler.lir
 include compiler.mir
-import MIR_INTR_STR_LIT, MIR_INTR_PRINT_STR, MIR_INTR_BUILTIN, MIR_INTR_PERCENT, MIR_INTR_LOAD_ADDR, MIR_INTR_ERX, MIR_MEM_MARK, MIR_MEM_RESET, MIR_MEM_PROMOTE, MIR_MEM_DROP from compiler.mir
+import MIR_INTR_STR_LIT, MIR_INTR_PRINT_STR, MIR_INTR_BUILTIN, MIR_INTR_PERCENT, MIR_INTR_LOAD_ADDR, MIR_INTR_ERX, MIR_INTR_CAST, MIR_INTR_PATCH_POINT, MIR_MEM_MARK, MIR_MEM_RESET, MIR_MEM_PROMOTE, MIR_MEM_DROP from compiler.mir
 include compiler.ffi_imports
 import ffi_import_find, ffi_import_used_count, ffi_import_used_at,
        ffi_import_name, ffi_import_source, ffi_source_is_os,
@@ -39,6 +39,8 @@ const W_I32_CONST: int = 0x41
 const W_I64_CONST: int = 0x42
 const W_I32_ADD: int = 0x6a
 const W_I32_SUB: int = 0x6b
+const W_I32_MUL: int = 0x6c
+const W_I32_OR: int = 0x72
 const W_I32_GE_U: int = 0x4f
 const W_I32_EQZ: int = 0x45
 const W_I32_LOAD: int = 0x28
@@ -335,7 +337,10 @@ func wasm_lir_validate_supported(mainf: int):
                 end
             eif op == LirOp.Intrinsic as int do
                 kind = lir_instr_aux(ins)
-                supported = kind == MIR_INTR_STR_LIT or kind == MIR_INTR_PRINT_STR or kind == MIR_INTR_PERCENT or kind == MIR_INTR_LOAD_ADDR or kind == MIR_INTR_ERX or kind == MIR_MEM_MARK or kind == MIR_MEM_RESET or kind == MIR_MEM_PROMOTE or kind == MIR_MEM_DROP
+                supported = kind == MIR_INTR_STR_LIT or kind == MIR_INTR_PRINT_STR or kind == MIR_INTR_PERCENT or kind == MIR_INTR_LOAD_ADDR or kind == MIR_INTR_ERX or kind == MIR_INTR_PATCH_POINT or kind == MIR_MEM_MARK or kind == MIR_MEM_RESET or kind == MIR_MEM_DROP
+                if (kind and 0xFF) == MIR_INTR_CAST do
+                    supported = lir_instr_typ(ins) != LirType.F64 as int & lir_opnd_type(lir_instr_src1(ins)) != LirOperandType.VRegFloat as int
+                end
                 if kind == MIR_INTR_BUILTIN do
                     bid = lir_opnd_imm_val(lir_instr_src1(ins))
                     supported = bid == 11 or bid == 19 or bid == 1000 or bid == 3 or bid == 4 or bid == 5 or bid == 6 or bid == 7 or bid == 8 or bid == 22 or bid == 18 or bid == 1 or bid == 9
@@ -381,7 +386,8 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
         when bi < sl loop data = bvec_push(data, native_read_u8(sp, bi)); bi = bi + 1 end
         data = bvec_push(data, 0); off = off + sl + 1; si = si + 1
     end
-    heap = off + 16
+    var freelists_base = off + 16
+    heap = freelists_base + 32
     code = bvec_new(); maxr = 0; args_base = 128
     blocks = lir_func_blocks(mainf)
     var bi = 0
@@ -468,6 +474,12 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                     print_op = src1
                     if lir_opnd_type(print_op) == LirOperandType.None as int do print_op = src2 end
                     code = w_opnd(code, print_op); code = w_call(code, 1 + n_ffi)
+                eif (kind and 0xFF) == MIR_INTR_CAST do
+                    if lir_instr_typ(ins) == LirType.F64 as int || lir_opnd_type(src1) == LirOperandType.VRegFloat as int do
+                        wasm_lir_unsupported(LirOp.Intrinsic as int, kind)
+                    end
+                    code = w_opnd(code, src1)
+                    code = w_local_set(code, lir_opnd_vreg(dst))
                 eif kind == MIR_INTR_BUILTIN do
                     bid = lir_opnd_imm_val(src1)
                     if bid == 11 do
@@ -477,7 +489,6 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                     eif bid == 1000 do
                         code = w_local_get(code, args_base); code = w_call(code, 4 + n_ffi); code = w_local_set(code, lir_opnd_vreg(dst))
                     eif bid == 3 do
-                        # Check if requested size is 0: if size == 0, return current bump without advancing
                         code = w_local_get(code, args_base)
                         code = bvec_push(code, W_I64_EQZ)
                         code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
@@ -486,13 +497,54 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                         code = w_local_set(code, lir_opnd_vreg(dst))
                         code = bvec_push(code, W_ELSE)
 
-                        # old_bump = global.get 0
-                        # total_size = ((size + 7) & ~7) + 8
+                        code = bvec_push(code, W_BLOCK); code = bvec_push(code, W_VOID)
+
+                        # sc = 29 - clz((size - 1) | 7)
+                        code = w_i32_const(code, 29)
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 1); code = bvec_push(code, W_I32_SUB)
+                        code = w_i32_const(code, 7); code = bvec_push(code, W_I32_OR)
+                        code = bvec_push(code, 0x67) # W_I32_CLZ
+                        code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 1)
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, 0x48) # W_I32_LT_S
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        code = w_i32_const(code, freelists_base)
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 4); code = bvec_push(code, W_I32_MUL)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 2)
+
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 3)
+
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_EQZ)
+                        code = bvec_push(code, 0x45) # W_I32_EQZ (which is just 'not', so head != 0)
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        # i32.store(addr, i32.load(head))
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        code = w_local_get(code, args_base + 3)
+                        code = w_local_set(code, lir_opnd_vreg(dst))
+                        code = bvec_push(code, W_BR); code = w_u(code, 2) # break to end of W_BLOCK
+
+                        code = bvec_push(code, W_END)
+                        code = bvec_push(code, W_END)
+
+                        # bump alloc fallback
                         code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
                         code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
                         code = w_i32_const(code, 7); code = bvec_push(code, W_I32_ADD)
                         code = w_i32_const(code, 0 - 8); code = bvec_push(code, 0x71)
-                        code = bvec_push(code, W_I32_ADD)
                         code = w_i32_const(code, 8); code = bvec_push(code, W_I32_ADD)
                         code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
 
@@ -506,24 +558,73 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                         code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
                         code = bvec_push(code, W_I32_ADD)
                         code = bvec_push(code, W_GLOBAL_SET); code = w_u(code, 0)
-                        code = bvec_push(code, W_END)
+
+                        code = bvec_push(code, W_END) # W_BLOCK
+                        code = bvec_push(code, W_END) # W_ELSE
                     eif bid == 4 do
                         code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
                         code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
                         code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
                         code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
-                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
-                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 1) # hdr_addr
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
                         code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 2) # blk_size
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
                         code = bvec_push(code, W_I32_ADD)
                         code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
                         code = bvec_push(code, W_I32_EQ)
                         code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
-                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
-                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
                         code = bvec_push(code, W_GLOBAL_SET); code = w_u(code, 0)
-                        code = bvec_push(code, W_END)
-                        code = bvec_push(code, W_END)
+
+                        code = bvec_push(code, W_ELSE)
+
+                        # user_size = blk_size - 8
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+
+                        # sc = 29 - clz((user_size - 1) | 7)
+                        code = w_i32_const(code, 1); code = bvec_push(code, W_I32_SUB)
+                        code = w_i32_const(code, 7); code = bvec_push(code, W_I32_OR)
+                        code = bvec_push(code, 0x67) # W_I32_CLZ
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 3)
+                        code = w_i32_const(code, 29)
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 3) # sc
+
+                        # if sc < 8
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, 0x48) # W_I32_LT_S
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        # addr = freelists_base + sc * 4
+                        code = w_i32_const(code, freelists_base)
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 4); code = bvec_push(code, W_I32_MUL)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 4) # addr
+
+                        # i32.store(ptr, i32.load(addr))
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 4); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        # i32.store(addr, ptr)
+                        code = w_local_get(code, args_base + 4); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        code = bvec_push(code, W_END) # sc < 8 IF
+                        code = bvec_push(code, W_END) # LIFO IF
+                        code = bvec_push(code, W_END) # ptr != 0 IF
                     eif bid == 5 do
                         code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
                         code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
@@ -598,10 +699,10 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                         code = bvec_push(code, W_END)
                     end
                 eif kind == MIR_MEM_PROMOTE do
-                    if lir_opnd_type(dst) == (LirOperandType.VRegInt as int) and lir_opnd_type(src1) == (LirOperandType.VRegInt as int) do
-                        code = w_local_get(code, lir_opnd_vreg(src1))
-                        code = w_local_set(code, lir_opnd_vreg(dst))
-                    end
+                    # Validation rejects this path until the Wasm backend has
+                    # a persistent parent-region allocator and recursive graph
+                    # copier. Never emit a shallow-copy promotion.
+                    wasm_lir_unsupported(LirOp.Intrinsic as int, MIR_MEM_PROMOTE)
                 end
             end
             if op == LirOp.Ret as int do code_done = 1 end
