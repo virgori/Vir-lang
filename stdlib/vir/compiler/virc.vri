@@ -1201,6 +1201,90 @@ func tlsf_direct_count() -> int:
     out native_read_i64(g_tlsf_ctrl, 36616)
 end.
 
+# Direct-map hash table: 512 slots at g_tlsf_ctrl[44816]
+# Slot format: [base: i64, array_idx: i64] — 16 bytes per slot
+# Empty slot: base == 0
+const DM_HASH_BASE: int = 44816
+const DM_HASH_SIZE: int = 512
+
+func tlsf_dm_hash_slot(base: int) -> int:
+    out (base shr 20) bit_and (DM_HASH_SIZE - 1)
+end.
+
+func tlsf_direct_hash_find(base: int) -> int:
+    if g_tlsf_ctrl == 0 do out 0 - 1 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    var slot = tlsf_dm_hash_slot(base)
+    var probes = 0
+    when probes < DM_HASH_SIZE loop
+        let off = DM_HASH_BASE + slot * 16
+        let stored_base = native_read_i64(g_tlsf_ctrl, off)
+        if stored_base == 0 do out 0 - 1 end           # empty slot: not found
+        if stored_base == base do
+            out native_read_i64(g_tlsf_ctrl, off + 8)  # return array index
+        end
+        slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+        probes = probes + 1
+    end
+    out 0 - 1
+end.
+
+func tlsf_direct_hash_insert(base: int, arr_idx: int):
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    var slot = tlsf_dm_hash_slot(base)
+    var probes = 0
+    when probes < DM_HASH_SIZE loop
+        let off = DM_HASH_BASE + slot * 16
+        let stored_base = native_read_i64(g_tlsf_ctrl, off)
+        if stored_base == 0 or stored_base == base do
+            native_write_i64(g_tlsf_ctrl, off, base)
+            native_write_i64(g_tlsf_ctrl, off + 8, arr_idx)
+            out 0
+        end
+        slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+        probes = probes + 1
+    end
+    # Hash table full: fall back (shouldn't happen with load < 0.5)
+end.
+
+func tlsf_direct_hash_remove(base: int):
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    var slot = tlsf_dm_hash_slot(base)
+    var probes = 0
+    when probes < DM_HASH_SIZE loop
+        let off = DM_HASH_BASE + slot * 16
+        let stored_base = native_read_i64(g_tlsf_ctrl, off)
+        if stored_base == 0 do out 0 end  # not found
+        if stored_base == base do
+            # Open-addressed tables cannot leave an empty hole in a probe
+            # cluster: find() would stop before later collided entries.
+            # Remove the slot, then reinsert the remainder of the cluster.
+            native_write_i64(g_tlsf_ctrl, off, 0)
+            native_write_i64(g_tlsf_ctrl, off + 8, 0)
+            var next_slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+            var rehashed = 0
+            when rehashed < DM_HASH_SIZE - 1 loop
+                let next_off = DM_HASH_BASE + next_slot * 16
+                let next_base = native_read_i64(g_tlsf_ctrl, next_off)
+                if next_base == 0 do out 0 end
+                let next_idx = native_read_i64(g_tlsf_ctrl, next_off + 8)
+                native_write_i64(g_tlsf_ctrl, next_off, 0)
+                native_write_i64(g_tlsf_ctrl, next_off + 8, 0)
+                tlsf_direct_hash_insert(next_base, next_idx)
+                next_slot = (next_slot + 1) bit_and (DM_HASH_SIZE - 1)
+                rehashed = rehashed + 1
+            end
+            out 0
+        end
+        slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+        probes = probes + 1
+    end
+end.
+
 func tlsf_direct_add(base: int, size: int):
     if g_tlsf_ctrl == 0 do out 0 end
     extern func native_read_i64(addr: int, offset: int) -> int
@@ -1211,6 +1295,7 @@ func tlsf_direct_add(base: int, size: int):
         native_write_i64(g_tlsf_ctrl, off, base)
         native_write_i64(g_tlsf_ctrl, off + 8, size)
         native_write_i64(g_tlsf_ctrl, 36616, cnt + 1)
+        tlsf_direct_hash_insert(base, cnt)
     else
         extern func sys_exit(code: int)
         sys_exit(134)
@@ -1218,18 +1303,8 @@ func tlsf_direct_add(base: int, size: int):
 end.
 
 func tlsf_direct_find(base: int) -> int:
-    if g_tlsf_ctrl == 0 do out 0 - 1 end
-    extern func native_read_i64(addr: int, offset: int) -> int
-    let cnt = native_read_i64(g_tlsf_ctrl, 36616)
-    var i = 0
-    when i < cnt loop
-        let off = 36624 + i * 16
-        if native_read_i64(g_tlsf_ctrl, off) == base do
-            out i
-        end
-        i = i + 1
-    end
-    out 0 - 1
+    # O(1) hash lookup — replaces former O(n) linear scan
+    out tlsf_direct_hash_find(base)
 end.
 
 func tlsf_direct_remove(base: int):
@@ -1243,11 +1318,14 @@ func tlsf_direct_remove(base: int):
         if idx != last_idx do
             let last_off = 36624 + last_idx * 16
             let cur_off = 36624 + idx * 16
-            native_write_i64(g_tlsf_ctrl, cur_off, native_read_i64(g_tlsf_ctrl, last_off))
+            let last_base = native_read_i64(g_tlsf_ctrl, last_off)
+            native_write_i64(g_tlsf_ctrl, cur_off, last_base)
             native_write_i64(g_tlsf_ctrl, cur_off + 8, native_read_i64(g_tlsf_ctrl, last_off + 8))
+            tlsf_direct_hash_insert(last_base, idx)
         end
         native_write_i64(g_tlsf_ctrl, 36616, last_idx)
     end
+    tlsf_direct_hash_remove(base)
 end.
 
 # O(1) Find Last Set bit (MSB, 0..63)
@@ -13355,14 +13433,14 @@ func type_table_new()
     tbl = TypeTable (
         nodes: vec_new_rt()
     )
-    
+
     # Khởi tạo các primitive types theo đúng thứ tự (Void = 0, Int = 1, Float = 2, Bool = 3, String = 4)
     tbl.nodes = vec_push_rt(tbl.nodes, TypeNode ( kind: TypeKind.Void, name_id: 0, size: 0, elem_type: 0, return_type: 0, fields: 0 ))
     tbl.nodes = vec_push_rt(tbl.nodes, TypeNode ( kind: TypeKind.Int, name_id: 0, size: 8, elem_type: 0, return_type: 0, fields: 0 ))
     tbl.nodes = vec_push_rt(tbl.nodes, TypeNode ( kind: TypeKind.Float, name_id: 0, size: 8, elem_type: 0, return_type: 0, fields: 0 ))
     tbl.nodes = vec_push_rt(tbl.nodes, TypeNode ( kind: TypeKind.Bool, name_id: 0, size: 1, elem_type: 0, return_type: 0, fields: 0 ))
     tbl.nodes = vec_push_rt(tbl.nodes, TypeNode ( kind: TypeKind.String, name_id: 0, size: 8, elem_type: 0, return_type: 0, fields: 0 ))
-    
+
     out tbl
 end.
 func type_alloc(tbl: TypeTable, node: any)
@@ -13748,7 +13826,7 @@ func scope_tree_new():
         scopes: vec_new_rt(),
         current_id: 0
     )
-    
+
     # Global Scope có ScopeID = 0
     global_scope = ScopeNode (
         kind: ScopeKind.Global,
@@ -13756,20 +13834,20 @@ func scope_tree_new():
         symbols: vec_new_rt()
     )
     tree.scopes = vec_push_rt(tree.scopes, global_scope)
-    
+
     out tree
 end.
 func scope_push(tree: ScopeTree, kind: ScopeKind):
     scopes_vec = native_read_i64(tree as i64, 0)
     new_scope_id = vec_len_rt(scopes_vec)
     curr_id = native_read_i64(tree as i64, 8)
-    
+
     node = ScopeNode (
         kind: kind,
         parent_id: curr_id,
         symbols: vec_new_rt()
     )
-    
+
     scopes_vec = vec_push_rt(scopes_vec, node)
     native_write_i64(tree as i64, 0, scopes_vec)
     native_write_i64(tree as i64, 8, new_scope_id)
@@ -15118,7 +15196,7 @@ func pass3_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         end
         out 0
     end
-    
+
     if node.node_type == AstType.WhenStmt do
         old_scope = scope_current_id(scopes)
         scope_id = scope_push(scopes, ScopeKind.Block)
@@ -24214,7 +24292,7 @@ end.
  * mir_opt_strength_reduction — Replace expensive ops with cheaper equivalents.
  * Mul(v, 2^k) -> Shl(v, k). Signed Div/Mod by pow2 is not rewritten
  * without non-negative range facts because shift/and do not match all i64 inputs.
- ## 
+ ##
 func mir_log2(v: i64):
     var k = 0
     x = v
@@ -24366,7 +24444,7 @@ end.
 ##
  * mir_opt_licm — Loop-Invariant Code Motion.
  * Hoists pure invariant ops to the loop preheader (or header before terminator).
- ## 
+ ##
 func mir_opt_licm(blocks: i64):
     def_counts = mir_build_vreg_def_counts(blocks)
     n_blocks = vec_len_rt(blocks)
@@ -25278,7 +25356,7 @@ func mir_opt_redundant_load_store_elimination(blocks: i64):
             when i < n_ins loop
                 ins = vec_get_rt(instrs, i)
                 op = mir_instr_op(ins)
-                
+
                 if op == MirOp.Load do
                     ld_dst0 = mir_instr_dst(ins)
                     ld_ptr0 = mir_instr_src1(ins)
@@ -25305,7 +25383,7 @@ func mir_opt_redundant_load_store_elimination(blocks: i64):
                     st_ptr = mir_instr_dst(ins)
                     st_off = mir_instr_src1(ins)
                     st_val = mir_instr_src2(ins)
-                    
+
                     var j = i + 1
                     var stop = 0
                     when j < n_ins and stop == 0 loop
@@ -26636,6 +26714,32 @@ end.
  * #15 ARC trial deletion — Bacon–Rajan refcount pairing (backend / GlobalEscape heap).
  * Inserts retain/release on escaped heap allocs, then deletes redundant pairs locally.
  ##
+func mir_escape_root(parent: i64, vreg: i64):
+    var root = vreg
+    when vec_get_rt(parent, root) != root loop
+        root = vec_get_rt(parent, root)
+    end
+    var current = vreg
+    when vec_get_rt(parent, current) != current loop
+        let next = vec_get_rt(parent, current)
+        vec_set_rt(parent, current, root)
+        current = next
+    end
+    out root
+end.
+
+func mir_escape_union(parent: i64, left: i64, right: i64):
+    let left_root = mir_escape_root(parent, left)
+    let right_root = mir_escape_root(parent, right)
+    if left_root != right_root do
+        if left_root < right_root do
+            vec_set_rt(parent, right_root, left_root)
+        else
+            vec_set_rt(parent, left_root, right_root)
+        end
+    end
+end.
+
 func mir_opt_build_escaped_vregs(blocks: i64):
     n_vregs = max_vreg_mir(blocks)
     escaped = vec_new_rt()
@@ -26686,8 +26790,62 @@ func mir_opt_build_escaped_vregs(blocks: i64):
         end
         b_idx = b_idx + 1
     end
+    # Pass 2: union phi destinations and incoming vregs into escape-equivalent
+    # classes, then propagate escape once per class.
+    var parent = vec_new_rt()
+    vi = 0
+    when vi < n_vregs loop
+        parent = vec_push_rt(parent, vi)
+        vi = vi + 1
+    end
+    var bp_idx = 0
+    when bp_idx < vec_len_rt(blocks) loop
+        let phis = mir_block_phis(vec_get_rt(blocks, bp_idx))
+        if phis >= 0 do
+            var pi = 0
+            when pi < vec_len_rt(phis) loop
+                let phi = vec_get_rt(phis, pi)
+                let phi_dst = mir_phi_dst(phi)
+                let inc_vals = mir_phi_incoming_values(phi)
+                var ii2 = 0
+                when ii2 < vec_len_rt(inc_vals) loop
+                    let inc_v = vec_get_rt(inc_vals, ii2) as MirOperand
+                    if phi_dst >= 0 & phi_dst < n_vregs & mir_opnd_type(inc_v) == MirOperandType.VReg do
+                        let src_vr = mir_opnd_vreg_id(inc_v)
+                        if src_vr >= 0 & src_vr < n_vregs do
+                            mir_escape_union(parent, phi_dst, src_vr)
+                        end
+                    end
+                    ii2 = ii2 + 1
+                end
+                pi = pi + 1
+            end
+        end
+        bp_idx = bp_idx + 1
+    end
+    var root_escaped = vec_new_rt()
+    vi = 0
+    when vi < n_vregs loop
+        root_escaped = vec_push_rt(root_escaped, 0)
+        vi = vi + 1
+    end
+    vi = 0
+    when vi < n_vregs loop
+        if vec_get_rt(escaped, vi) == 1 do
+            vec_set_rt(root_escaped, mir_escape_root(parent, vi), 1)
+        end
+        vi = vi + 1
+    end
+    vi = 0
+    when vi < n_vregs loop
+        if vec_get_rt(root_escaped, mir_escape_root(parent, vi)) == 1 do
+            vec_set_rt(escaped, vi, 1)
+        end
+        vi = vi + 1
+    end
     out escaped
 end.
+
 
 func mir_is_heap_alloc_builtin(ins: MirInstr):
     if mir_instr_op(ins) != MirOp.Intrinsic do out false end
@@ -28402,7 +28560,7 @@ func compute_packed_layout(ent_ast: AstNode):
             dot_str = fat_str_new(".")
             scoped_key = fat_str_concat(fat_str_concat(ent_name, dot_str), f_name)
             idx_s = hash_table_lookup(g_scoped_field_hash, g_scoped_field_names, scoped_key)
-            
+
             var f_sz = 8
             var f_sgn = 0
             var f_nested = 0
@@ -28422,7 +28580,7 @@ func compute_packed_layout(ent_ast: AstNode):
                 f_sgn = is_signed_type(ft)
                 f_nested = 0
             end
-            
+
             if idx_s >= 0 do
                 vec_set_rt(g_scoped_field_offsets, idx_s, cur_off)
                 vec_set_rt(g_scoped_field_sizes, idx_s, f_sz)
@@ -33356,7 +33514,8 @@ const LIR_RT_BOOL_TO_STR: i64 = 111
 const LIR_RT_PRINT_FLOAT: i64 = 112
 const LIR_RT_PRINT_BOOL: i64 = 113
 const LIR_RT_FREE: i64 = 114
-const LIR_RT_STUB_COUNT: i64 = 115
+const LIR_RT_PROMOTE_GRAPH: i64 = 115
+const LIR_RT_STUB_COUNT: i64 = 116
 
 # Dump / test tags — keep 1:1 with LirOp enum numbers.
 func lir_op_tag(op: i64):
@@ -33425,7 +33584,7 @@ export lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_au
 export lir_opnd_type, lir_opnd_vreg, lir_opnd_imm_val, lir_opnd_label_id, lir_opnd_phys_reg_val, lir_opnd_stack_offset
 export LIR_CMP_EQ, LIR_CMP_NE, LIR_CMP_GT, LIR_CMP_LT, LIR_CMP_GE, LIR_CMP_LE, LIR_JMP_IF, LIR_JMP_IFNOT
 export lir_op_tag
-export LIR_RT_NATIVE_READ_U8, LIR_RT_NATIVE_WRITE_U8, LIR_RT_NATIVE_READ_I64, LIR_RT_NATIVE_WRITE_I64, LIR_RT_UNRESOLVED, LIR_RT_POW, LIR_RT_MATMUL, LIR_RT_FMA, LIR_RT_ALLOC, LIR_RT_PRINT_STR, LIR_RT_GET_ARG, LIR_RT_ARG_COUNT, LIR_RT_VOLATILE_READ, LIR_RT_VOLATILE_WRITE, LIR_RT_VOLATILE_READ8, LIR_RT_VOLATILE_WRITE8, LIR_RT_DMB, LIR_RT_DSB, LIR_RT_ISB, LIR_RT_WFI, LIR_RT_WFE, LIR_RT_SEV, LIR_RT_NOP, LIR_RT_STR_LEN, LIR_RT_STR_CAT, LIR_RT_STR_EQ, LIR_RT_WRITE_BYTES, LIR_RT_SLURP_LEN, LIR_RT_SLURP_FILE, LIR_RT_INT_TO_STR, LIR_RT_SYSCALL, LIR_RT_PORT_CREATE, LIR_RT_PORT_SEND, LIR_RT_PORT_RECV, LIR_RT_ARR_NEW, LIR_RT_ARR_PUSH, LIR_RT_ARR_LEN, LIR_RT_QUANTIZE, LIR_RT_BACKWARD, LIR_RT_BOOL_TO_STR, LIR_RT_PRINT_FLOAT, LIR_RT_PRINT_BOOL, LIR_RT_FREE, LIR_RT_STUB_COUNT
+export LIR_RT_NATIVE_READ_U8, LIR_RT_NATIVE_WRITE_U8, LIR_RT_NATIVE_READ_I64, LIR_RT_NATIVE_WRITE_I64, LIR_RT_UNRESOLVED, LIR_RT_POW, LIR_RT_MATMUL, LIR_RT_FMA, LIR_RT_ALLOC, LIR_RT_PRINT_STR, LIR_RT_GET_ARG, LIR_RT_ARG_COUNT, LIR_RT_VOLATILE_READ, LIR_RT_VOLATILE_WRITE, LIR_RT_VOLATILE_READ8, LIR_RT_VOLATILE_WRITE8, LIR_RT_DMB, LIR_RT_DSB, LIR_RT_ISB, LIR_RT_WFI, LIR_RT_WFE, LIR_RT_SEV, LIR_RT_NOP, LIR_RT_STR_LEN, LIR_RT_STR_CAT, LIR_RT_STR_EQ, LIR_RT_WRITE_BYTES, LIR_RT_SLURP_LEN, LIR_RT_SLURP_FILE, LIR_RT_INT_TO_STR, LIR_RT_SYSCALL, LIR_RT_PORT_CREATE, LIR_RT_PORT_SEND, LIR_RT_PORT_RECV, LIR_RT_ARR_NEW, LIR_RT_ARR_PUSH, LIR_RT_ARR_LEN, LIR_RT_QUANTIZE, LIR_RT_BACKWARD, LIR_RT_BOOL_TO_STR, LIR_RT_PRINT_FLOAT, LIR_RT_PRINT_BOOL, LIR_RT_FREE, LIR_RT_PROMOTE_GRAPH, LIR_RT_STUB_COUNT
 
 # @vir_source stdlib/vir/compiler/virc.vri 64
 # @vir_source stdlib/vir/compiler/lir_target_desc.vri 1
@@ -39170,7 +39329,7 @@ import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt
 import rt_streq, fat_str_eq, fat_cstr_eq, fat_str_new, sb_new, sb_append, sb_append_int, sb_to_string, sb_free, native_read_i64, native_write_i64, native_read_u8 from string_rt
 import print_str, print_int from compiler.context
 import sys_exit from rt.syscall
-import LirType, LirOp, LirOperandType, LirOperand, LirInstr, LirBlock, LirFunc, lir_func_id, lir_func_name, lir_func_blocks, lir_func_stack_size, lir_func_strings, lir_block_id, lir_block_instrs, lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_aux, lir_instr_typ, lir_opnd_type, lir_opnd_vreg, lir_opnd_imm_val, lir_opnd_label_id, lir_opnd_phys_reg_val, lir_opnd_stack_offset, LIR_CMP_EQ, LIR_CMP_NE, LIR_CMP_GT, LIR_CMP_LT, LIR_CMP_GE, LIR_CMP_LE, LIR_JMP_IF, LIR_JMP_IFNOT, LIR_RT_UNRESOLVED, LIR_RT_POW, LIR_RT_MATMUL, LIR_RT_FMA, LIR_RT_ALLOC, LIR_RT_PRINT_STR, LIR_RT_GET_ARG, LIR_RT_ARG_COUNT, LIR_RT_NATIVE_READ_U8, LIR_RT_NATIVE_WRITE_U8, LIR_RT_NATIVE_READ_I64, LIR_RT_NATIVE_WRITE_I64, LIR_RT_VOLATILE_READ, LIR_RT_VOLATILE_WRITE, LIR_RT_VOLATILE_READ8, LIR_RT_VOLATILE_WRITE8, LIR_RT_DMB, LIR_RT_DSB, LIR_RT_ISB, LIR_RT_WFI, LIR_RT_WFE, LIR_RT_SEV, LIR_RT_NOP, LIR_RT_SYSCALL, LIR_RT_PORT_CREATE, LIR_RT_PORT_SEND, LIR_RT_PORT_RECV, LIR_RT_ARR_NEW, LIR_RT_ARR_PUSH, LIR_RT_ARR_LEN, LIR_RT_EXIT_PROG, LIR_RT_QUANTIZE, LIR_RT_BACKWARD, LIR_RT_MATMUL_F64, LIR_RT_FMA_F64, LIR_RT_BOOL_TO_STR, LIR_RT_PRINT_FLOAT, LIR_RT_PRINT_BOOL, LIR_RT_FREE, LIR_RT_STUB_COUNT from compiler.lir
+import LirType, LirOp, LirOperandType, LirOperand, LirInstr, LirBlock, LirFunc, lir_func_id, lir_func_name, lir_func_blocks, lir_func_stack_size, lir_func_strings, lir_block_id, lir_block_instrs, lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_aux, lir_instr_typ, lir_opnd_type, lir_opnd_vreg, lir_opnd_imm_val, lir_opnd_label_id, lir_opnd_phys_reg_val, lir_opnd_stack_offset, LIR_CMP_EQ, LIR_CMP_NE, LIR_CMP_GT, LIR_CMP_LT, LIR_CMP_GE, LIR_CMP_LE, LIR_JMP_IF, LIR_JMP_IFNOT, LIR_RT_UNRESOLVED, LIR_RT_POW, LIR_RT_MATMUL, LIR_RT_FMA, LIR_RT_ALLOC, LIR_RT_PRINT_STR, LIR_RT_GET_ARG, LIR_RT_ARG_COUNT, LIR_RT_NATIVE_READ_U8, LIR_RT_NATIVE_WRITE_U8, LIR_RT_NATIVE_READ_I64, LIR_RT_NATIVE_WRITE_I64, LIR_RT_VOLATILE_READ, LIR_RT_VOLATILE_WRITE, LIR_RT_VOLATILE_READ8, LIR_RT_VOLATILE_WRITE8, LIR_RT_DMB, LIR_RT_DSB, LIR_RT_ISB, LIR_RT_WFI, LIR_RT_WFE, LIR_RT_SEV, LIR_RT_NOP, LIR_RT_SYSCALL, LIR_RT_PORT_CREATE, LIR_RT_PORT_SEND, LIR_RT_PORT_RECV, LIR_RT_ARR_NEW, LIR_RT_ARR_PUSH, LIR_RT_ARR_LEN, LIR_RT_EXIT_PROG, LIR_RT_QUANTIZE, LIR_RT_BACKWARD, LIR_RT_MATMUL_F64, LIR_RT_FMA_F64, LIR_RT_BOOL_TO_STR, LIR_RT_PRINT_FLOAT, LIR_RT_PRINT_BOOL, LIR_RT_FREE, LIR_RT_PROMOTE_GRAPH, LIR_RT_STUB_COUNT from compiler.lir
 import MIR_INTR_PRINT, MIR_INTR_PRINT_STR, MIR_INTR_PARAM, MIR_INTR_GLOBAL_LOAD, MIR_INTR_GLOBAL_STORE, MIR_INTR_ADDR_OF, MIR_INTR_CAST, MIR_INTR_NOP_MARKER, MIR_INTR_DECL, MIR_INTR_QUIET, MIR_INTR_CHECK_CPU, MIR_INTR_PATCH_POINT, MIR_INTR_PRECOMP, MIR_INTR_EXPOSE, MIR_INTR_ASYNC, MIR_INTR_ATOMIC_VAR, MIR_INTR_TIMEOUT, MIR_INTR_ISOLATE, MIR_INTR_PTR, MIR_INTR_AWAIT_PASS, MIR_INTR_ENSURE, MIR_INTR_REVERT, MIR_INTR_STR_LIT, MIR_INTR_INTERP, MIR_INTR_ENUM, MIR_INTR_ERROR, MIR_INTR_EXIST, MIR_INTR_BUILTIN, MIR_INTR_INDEX, MIR_INTR_INDEX_STORE, MIR_INTR_FIELD, MIR_INTR_FIELD_STORE, MIR_INTR_ARRAY, MIR_INTR_ENTITY, MIR_INTR_TUPLE, MIR_INTR_BUNDLE, MIR_INTR_INFER, MIR_INTR_TRAIN, MIR_INTR_REACTIVE, MIR_INTR_MORPH, MIR_INTR_QUANTIZE, MIR_INTR_BIT_EXTRACT, MIR_INTR_BIT_INSERT, MIR_INTR_BACKWARD from compiler.mir
 import MIR_INTR_PRINT, MIR_INTR_PRINT_STR, MIR_INTR_PARAM, MIR_INTR_GLOBAL_LOAD, MIR_INTR_GLOBAL_STORE, MIR_INTR_LOAD_ADDR, MIR_INTR_ADDR_OF, MIR_INTR_CAST, MIR_INTR_THROW, MIR_INTR_ERX, MIR_INTR_NOP_MARKER, MIR_INTR_DECL, MIR_INTR_QUIET, MIR_INTR_CHECK_CPU, MIR_INTR_PATCH_POINT, MIR_INTR_PRECOMP, MIR_INTR_EXPOSE, MIR_INTR_ASYNC, MIR_INTR_ATOMIC_VAR, MIR_INTR_TIMEOUT, MIR_INTR_ISOLATE, MIR_INTR_PTR, MIR_INTR_AWAIT_PASS, MIR_INTR_ENSURE, MIR_INTR_REVERT, MIR_INTR_STR_LIT, MIR_INTR_STR_EQ, MIR_INTR_INTERP, MIR_INTR_ENUM, MIR_INTR_ERROR, MIR_INTR_EXIST, MIR_INTR_BUILTIN, MIR_INTR_INDEX, MIR_INTR_INDEX_STORE, MIR_INTR_FIELD, MIR_INTR_FIELD_STORE, MIR_INTR_ARRAY, MIR_INTR_ENTITY, MIR_INTR_TUPLE, MIR_INTR_BUNDLE, MIR_INTR_INFER, MIR_INTR_TRAIN, MIR_INTR_REACTIVE, MIR_INTR_MORPH, MIR_INTR_QUANTIZE, MIR_INTR_BIT_EXTRACT, MIR_INTR_BIT_INSERT, MIR_INTR_BACKWARD, MIR_INTR_PERCENT, MIR_INTR_PRINT_FLOAT, MIR_INTR_PRINT_BOOL, MIR_MEM_MARK, MIR_MEM_RESET, MIR_MEM_PROMOTE, MIR_MEM_DROP, MIR_MEM_ALLOC from compiler.mir
 import MIR_INTR_THROW, MIR_INTR_ERX from compiler.mir
@@ -40474,37 +40633,31 @@ func emit_lir_intrinsic(cb: CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assigned_
     end
     if kind == MIR_MEM_PROMOTE do
         if rs1 >= 0 do
+            # Guard: p >= 65536 (must be a real heap/arena pointer)
             cb = arm64_movz_imm64(cb, 9, 65536)
             cb = arm64_cmp_rr(cb, rs1 as int, 9)
             let not_ptr_fixup = codebuf_offset(cb) as int
             cb = arm64_blt_imm19(cb, 0)
 
-            cb = arm64_ldr_uoff(cb, 14, 28, 0)
-            cb = arm64_cmp_rr(cb, rs1 as int, 14)
-            let not_in_arena_fixup = codebuf_offset(cb) as int
-            cb = arm64_bge_imm19(cb, 0)
+            # ARM64 ABI: X0=arg0(p), X1=arg1(arena_base), X2=arg2(arena_top)
+            # X28 holds the arena base address; *(X28 + 0) holds the current arena bump top
+            cb = arm64_mov_rr(cb, 0, rs1 as int)   # X0 = p
+            cb = arm64_mov_rr(cb, 1, 28)           # X1 = arena_base = X28
+            cb = arm64_ldr_uoff(cb, 2, 28, 0)      # X2 = arena_top  = *(X28 + 0)
 
-            cb = arm64_ldr_uoff(cb, 9, rs1 as int, 0)
-            cb = arm64_lsl_imm(cb, 10, 9, 3)
-            cb = arm64_add_imm(cb, 10, 10, 31)
-            cb = arm64_movz_imm64(cb, 11, 4)
-            cb = arm64_lsr_rrr(cb, 10, 10, 11)
-            cb = arm64_lsl_imm(cb, 10, 10, 4)
-            cb = arm64_add_rrr(cb, 13, rs1 as int, 10)
-            cb = arm64_ldr_uoff(cb, 14, 28, 0)
-            cb = arm64_cmp_rr(cb, 13, 14)
-            let no_adv_fixup = codebuf_offset(cb) as int
-            cb = arm64_ble_imm19(cb, 0)
-            cb = arm64_str_uoff(cb, 13, 28, 0)
-            let adv_end = codebuf_offset(cb) as int
-            let imm_adv = ((adv_end - no_adv_fixup) shr 2) and 0x7FFFF
-            cb = codebuf_patch_u32(cb, no_adv_fixup, (0x5400000D or (imm_adv shl 5)) as int)
+            # Save link register and call rt_promote_graph
+            cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+            cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_PROMOTE_GRAPH, rd)
+            cb = arm64_ldp_post(cb, 29, 30, 31, 16)
 
-            let imm_not_ptr = ((adv_end - not_ptr_fixup) shr 2) and 0x7FFFF
+            # Result in X0 → store to rd vreg
+            if rd >= 0 do
+                cb = arm64_mov_rr(cb, rd as int, 0)
+            end
+
+            let promote_end = codebuf_offset(cb) as int
+            let imm_not_ptr = ((promote_end - not_ptr_fixup) shr 2) and 0x7FFFF
             cb = codebuf_patch_u32(cb, not_ptr_fixup, (0x5400000B or (imm_not_ptr shl 5)) as int)
-
-            let imm_not_arena = ((adv_end - not_in_arena_fixup) shr 2) and 0x7FFFF
-            cb = codebuf_patch_u32(cb, not_in_arena_fixup, (0x5400000A or (imm_not_arena shl 5)) as int)
 
             out cb
         end
@@ -42196,7 +42349,7 @@ func emit_lir_rt_port_create_stub(cb: CodeBuf):
     cb = arm64_ldr_uoff(cb, 1, 28, 0)      # X1 = *X28 (port struct ptr)
     cb = arm64_add_imm(cb, 2, 1, 48)       # X2 = new bump
     cb = arm64_str_uoff(cb, 2, 28, 0)      # *X28 = new bump
-    
+
     cb = arm64_str_uoff(cb, 0, 1, 0)       # *(p + 0) = cap
     cb = arm64_movz_imm64(cb, 3, 0)
     cb = arm64_str_uoff(cb, 3, 1, 8)       # *(p + 8) = count (0)
@@ -42209,12 +42362,12 @@ func emit_lir_rt_port_create_stub(cb: CodeBuf):
     cb = arm64_mov_imm16(cb, 5, 4)
     cb = arm64_lsr_rrr(cb, 4, 4, 5)
     cb = arm64_lsl_imm(cb, 4, 4, 4)        # X4 = aligned(cap * 8)
-    
+
     cb = arm64_ldr_uoff(cb, 3, 28, 0)      # X3 = *X28 (buf ptr)
     cb = arm64_add_rrr(cb, 2, 3, 4)        # X2 = new bump
     cb = arm64_str_uoff(cb, 2, 28, 0)      # *X28 = new bump
     cb = arm64_str_uoff(cb, 3, 1, 32)      # *(p + 32) = buf ptr
-    
+
     cb = arm64_mov_rr(cb, 0, 1)            # return p in X0
     out arm64_ret(cb)
 end.
@@ -42225,19 +42378,19 @@ func emit_lir_rt_port_send_stub(cb: CodeBuf):
     cb = arm64_ldr_uoff(cb, 3, 0, 8)       # X3 = count
     cb = arm64_ldr_uoff(cb, 4, 0, 24)      # X4 = tail
     cb = arm64_ldr_uoff(cb, 5, 0, 32)      # X5 = buf ptr
-    
+
     cb = arm64_mov_imm16(cb, 6, 3)
     cb = arm64_lsl_rrr(cb, 6, 4, 6)        # X6 = tail * 8
     cb = arm64_str_reg(cb, 1, 5, 6)        # *(buf + tail * 8) = val
-    
+
     cb = arm64_add_imm(cb, 4, 4, 1)
     cb = arm64_sdiv_rrr(cb, 7, 4, 2)
     cb = arm64_msub_rrrr(cb, 4, 7, 2, 4)   # X4 = (tail + 1) % cap
     cb = arm64_str_uoff(cb, 4, 0, 24)      # *(p + 24) = new tail
-    
+
     cb = arm64_add_imm(cb, 3, 3, 1)
     cb = arm64_str_uoff(cb, 3, 0, 8)       # *(p + 8) = count + 1
-    
+
     cb = arm64_movz_imm64(cb, 0, 1)        # return 1
     out arm64_ret(cb)
 end.
@@ -42249,23 +42402,23 @@ func emit_lir_rt_port_recv_stub(cb: CodeBuf):
     cb = arm64_bne_imm19(cb, 12)
     cb = arm64_movz_imm64(cb, 0, 0)
     cb = arm64_ret(cb)
-    
+
     cb = arm64_ldr_uoff(cb, 2, 0, 0)       # X2 = cap
     cb = arm64_ldr_uoff(cb, 4, 0, 16)      # X4 = head
     cb = arm64_ldr_uoff(cb, 5, 0, 32)      # X5 = buf ptr
-    
+
     cb = arm64_mov_imm16(cb, 6, 3)
     cb = arm64_lsl_rrr(cb, 6, 4, 6)        # X6 = head * 8
     cb = arm64_ldr_reg(cb, 1, 5, 6)        # X1 = *(buf + head * 8)
-    
+
     cb = arm64_add_imm(cb, 4, 4, 1)
     cb = arm64_sdiv_rrr(cb, 7, 4, 2)
     cb = arm64_msub_rrrr(cb, 4, 7, 2, 4)   # X4 = (head + 1) % cap
     cb = arm64_str_uoff(cb, 4, 0, 16)      # *(p + 16) = new head
-    
+
     cb = arm64_sub_imm(cb, 3, 3, 1)
     cb = arm64_str_uoff(cb, 3, 0, 8)       # *(p + 8) = count - 1
-    
+
     cb = arm64_mov_rr(cb, 0, 1)            # return val in X0
     out arm64_ret(cb)
 end.
@@ -42280,15 +42433,15 @@ func emit_lir_rt_arr_new_stub(cb: CodeBuf):
     cb = arm64_mov_imm16(cb, 3, 4)
     cb = arm64_lsr_rrr(cb, 2, 2, 3)
     cb = arm64_lsl_imm(cb, 2, 2, 4)        # X2 = aligned size
-    
+
     cb = arm64_ldr_uoff(cb, 1, 28, 0)      # X1 = *X28 (bump)
     cb = arm64_add_rrr(cb, 3, 1, 2)        # X3 = new bump
     cb = arm64_str_uoff(cb, 3, 28, 0)      # *X28 = new bump
-    
+
     cb = arm64_movz_imm64(cb, 4, 0)
     cb = arm64_str_uoff(cb, 4, 1, 0)       # *(p + 0) = len (0)
     cb = arm64_str_uoff(cb, 0, 1, 8)       # *(p + 8) = cap
-    
+
     cb = arm64_mov_rr(cb, 0, 1)            # return p in X0
     out arm64_ret(cb)
 end.
@@ -42299,7 +42452,7 @@ func emit_lir_rt_arr_push_stub(cb: CodeBuf):
     # Store at arr + 16 + len * 8
     cb = arm64_add_imm(cb, 3, 0, 16)       # X3 = arr + 16
     cb = arm64_str_reg_lsl3(cb, 1, 3, 2)   # *(arr + 16 + len * 8) = val
-    
+
     cb = arm64_add_imm(cb, 2, 2, 1)        # len = len + 1
     cb = arm64_str_uoff(cb, 2, 0, 0)       # *(arr + 0) = len + 1
     out arm64_ret(cb)
@@ -42670,7 +42823,7 @@ func emit_lir_rt_backward_stub(cb: CodeBuf):
     out arm64_ret(cb)
 end.
 
-func emit_lir_rt_stubs(cb: CodeBuf, offs: i64, is_linux: i64, vir_free_off: i64):
+func emit_lir_rt_stubs(cb: CodeBuf, offs: i64, is_linux: i64, vir_free_off: i64, rt_promote_graph_off: i64):
     var k = 0
     when k < LIR_RT_STUB_COUNT loop
         offs = vec_push_rt(offs, codebuf_offset(cb) as i64)
@@ -42687,8 +42840,9 @@ func emit_lir_rt_stubs(cb: CodeBuf, offs: i64, is_linux: i64, vir_free_off: i64)
         eif k == LIR_RT_NATIVE_WRITE_I64 do
             cb = emit_lir_rt_write_i64_stub(cb)
         eif k == LIR_RT_POW do
-            # Negative exponents use binary64 exponentiation-by-squaring.
-            # Wrapping negation handles INT64_MIN as magnitude 2^63.
+            # Negative exponent: exponentiation-by-squaring in binary64.
+            # Wrapping negation leaves INT64_MIN as the unsigned magnitude
+            # 2^63, and logical shifts still terminate after 64 iterations.
             cb = arm64_cmp_imm0(cb, 1)
             pow_positive_fixup = codebuf_offset(cb)
             cb = arm64_bge_imm19(cb, 0)
@@ -42725,6 +42879,14 @@ func emit_lir_rt_stubs(cb: CodeBuf, offs: i64, is_linux: i64, vir_free_off: i64)
             cb = emit_lir_rt_matmul_stub(cb)
         eif k == LIR_RT_FMA do
             cb = emit_lir_rt_fma_stub(cb)
+        eif k == LIR_RT_PROMOTE_GRAPH do
+            if rt_promote_graph_off >= 0 do
+                let pg_target = codebuf_offset(cb) as i64
+                let pg_rel = rt_promote_graph_off - pg_target
+                cb = arm64_b_imm26(cb, pg_rel as int)
+            else
+                cb = arm64_ret(cb)
+            end
         eif k == LIR_RT_ALLOC do
             cb = emit_lir_rt_alloc_stub(cb, is_linux)
             cb = arm64_ret(cb)
@@ -43975,8 +44137,14 @@ func emit_lir_module_arm64(lir_funcs: i64, is_linux: i64):
     if vf_idx >= 0 and vf_idx < n_funcs do
         vir_free_off = vec_get_rt(func_offs, vf_idx)
     end
+    var rt_promote_graph_off = 0 - 1
+    let pg_name = fat_str_new("rt_promote_graph")
+    let pg_idx = lir_find_func_index(lir_funcs, pg_name)
+    if pg_idx >= 0 and pg_idx < n_funcs do
+        rt_promote_graph_off = vec_get_rt(func_offs, pg_idx)
+    end
     var rt_offs = vec_new_cap_rt(1024)
-    cb = emit_lir_rt_stubs(cb, rt_offs, is_linux, vir_free_off)
+    cb = emit_lir_rt_stubs(cb, rt_offs, is_linux, vir_free_off, rt_promote_graph_off)
 
 
 
@@ -45602,11 +45770,13 @@ func emit_lir_intrinsic_x86(cb: CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assig
     end
     if kind == MIR_MEM_PROMOTE do
         if rs1 >= 0 do
+            # Guard: p >= 65536
             cb = x86_emit_mov_reg_imm32(cb, X86_RAX, 65536)
             cb = x86_emit_cmp_rr(cb, rs1 as int, X86_RAX)
             cb = x86_emit_jl_rel32(cb, 0)
             let not_ptr_fixup = codebuf_offset(cb) as int
 
+            # Guard: p in arena [R15, [R15])
             cb = x86_emit_cmp_rr(cb, rs1 as int, X86_R15)
             cb = x86_emit_jl_rel32(cb, 0)
             let not_in_arena1_fixup = codebuf_offset(cb) as int
@@ -45616,110 +45786,18 @@ func emit_lir_intrinsic_x86(cb: CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assig
             cb = x86_emit_jge_rel32(cb, 0)
             let not_in_arena2_fixup = codebuf_offset(cb) as int
 
+            # System V ABI: RDI = arg0 = p, RSI = arg1 = arena_base = R15, RDX = arg2 = arena_top = [R15]
             cb = x86_emit_mov_rr(cb, X86_RDI, rs1 as int)
+            cb = x86_emit_mov_rr(cb, X86_RSI, X86_R15)
+            cb = x86_emit_mov_reg_mem(cb, X86_RDX, X86_R15, 0)
 
-            cb = x86_emit_mov_rr(cb, X86_RAX, rs1 as int)
-            cb = x86_emit_mov_reg_imm32(cb, SCR as int, 16)
-            cb = x86_emit_sub_rr(cb, X86_RAX, SCR as int)
-            cb = x86_emit_cmp_rr(cb, X86_RAX, X86_R15)
-            cb = x86_emit_jl_rel32(cb, 0)
-            let no_hdr1_fixup = codebuf_offset(cb) as int
+            # Call rt_promote_graph stub (result in RAX, auto-moved to rd if needed)
+            cb = emit_call_fixup_x86(cb, call_fixups, 1, LIR_RT_PROMOTE_GRAPH, rd)
 
-            cb = x86_emit_mov_reg_mem(cb, X86_RDX, X86_RAX, 8)
-            cb = x86_emit_cmp_imm0(cb, X86_RDX)
-            cb = x86_emit_je_rel32(cb, 0)
-            let no_hdr2_fixup = codebuf_offset(cb) as int
-
-            cb = x86_emit_mov_reg_mem(cb, X86_RDX, X86_RAX, 0)
-            cb = x86_emit_add_rr(cb, X86_RAX, X86_RDX)
-            cb = x86_emit_mov_rr(cb, X86_RDI, X86_RAX)
-            cb = x86_emit_jmp_rel32(cb, 0)
-            let skip_non_hdr = codebuf_offset(cb) as int
-
-            let non_hdr_pos = codebuf_offset(cb) as int
-            cb = patch_rel32(cb, no_hdr1_fixup - 4, non_hdr_pos)
-            cb = patch_rel32(cb, no_hdr2_fixup - 4, non_hdr_pos)
-
-            cb = x86_emit_mov_reg_mem(cb, X86_RAX, rs1 as int, 0)
-            cb = x86_emit_shl_imm(cb, X86_RAX, 3)
-            cb = x86_emit_mov_reg_imm32(cb, SCR as int, 31)
-            cb = x86_emit_add_rr(cb, X86_RAX, SCR as int)
-            cb = x86_emit_shr_imm(cb, X86_RAX, 4)
-            cb = x86_emit_shl_imm(cb, X86_RAX, 4)
-            cb = x86_emit_add_rr(cb, X86_RAX, rs1 as int)
-            cb = x86_emit_mov_rr(cb, X86_RDI, X86_RAX)
-
-            let snh_pos = codebuf_offset(cb) as int
-            cb = patch_rel32(cb, skip_non_hdr - 4, snh_pos)
-
-            var fi = 0
-            when fi < 4 loop
-                let f_off = fi * 8
-                cb = x86_emit_mov_reg_mem(cb, X86_RCX, rs1 as int, f_off)
-                cb = x86_emit_mov_reg_imm32(cb, X86_RAX, 65536)
-                cb = x86_emit_cmp_rr(cb, X86_RCX, X86_RAX)
-                cb = x86_emit_jl_rel32(cb, 0)
-                let next_f_fixup1 = codebuf_offset(cb) as int
-
-                cb = x86_emit_cmp_rr(cb, X86_RCX, X86_R15)
-                cb = x86_emit_jl_rel32(cb, 0)
-                let next_f_fixup2 = codebuf_offset(cb) as int
-
-                cb = x86_emit_cmp_rr(cb, X86_RCX, X86_RSI)
-                cb = x86_emit_jge_rel32(cb, 0)
-                let next_f_fixup3 = codebuf_offset(cb) as int
-
-                cb = x86_emit_mov_rr(cb, X86_RAX, X86_RCX)
-                cb = x86_emit_mov_reg_imm32(cb, SCR as int, 16)
-                cb = x86_emit_sub_rr(cb, X86_RAX, SCR as int)
-                cb = x86_emit_mov_reg_mem(cb, X86_RDX, X86_RAX, 8)
-                cb = x86_emit_cmp_imm0(cb, X86_RDX)
-                cb = x86_emit_je_rel32(cb, 0)
-                let c_no_hdr_fixup = codebuf_offset(cb) as int
-
-                cb = x86_emit_mov_reg_mem(cb, X86_RDX, X86_RAX, 0)
-                cb = x86_emit_add_rr(cb, X86_RAX, X86_RDX)
-                cb = x86_emit_jmp_rel32(cb, 0)
-                let c_skip_nh = codebuf_offset(cb) as int
-
-                let c_nh_pos = codebuf_offset(cb) as int
-                cb = patch_rel32(cb, c_no_hdr_fixup - 4, c_nh_pos)
-
-                cb = x86_emit_mov_reg_mem(cb, X86_RAX, X86_RCX, 0)
-                cb = x86_emit_shl_imm(cb, X86_RAX, 3)
-                cb = x86_emit_mov_reg_imm32(cb, SCR as int, 31)
-                cb = x86_emit_add_rr(cb, X86_RAX, SCR as int)
-                cb = x86_emit_shr_imm(cb, X86_RAX, 4)
-                cb = x86_emit_shl_imm(cb, X86_RAX, 4)
-                cb = x86_emit_add_rr(cb, X86_RAX, X86_RCX)
-
-                let c_snh_pos = codebuf_offset(cb) as int
-                cb = patch_rel32(cb, c_skip_nh - 4, c_snh_pos)
-
-                cb = x86_emit_cmp_rr(cb, X86_RAX, X86_RDI)
-                cb = x86_emit_jle_rel32(cb, 0)
-                let no_upd_fixup = codebuf_offset(cb) as int
-                cb = x86_emit_mov_rr(cb, X86_RDI, X86_RAX)
-                let upd_pos = codebuf_offset(cb) as int
-                cb = patch_rel32(cb, no_upd_fixup - 4, upd_pos)
-
-                let next_f_pos = codebuf_offset(cb) as int
-                cb = patch_rel32(cb, next_f_fixup1 - 4, next_f_pos)
-                cb = patch_rel32(cb, next_f_fixup2 - 4, next_f_pos)
-                cb = patch_rel32(cb, next_f_fixup3 - 4, next_f_pos)
-
-                fi = fi + 1
-            end
-
-            cb = x86_emit_cmp_rr(cb, X86_RDI, X86_RSI)
-            cb = x86_emit_jle_rel32(cb, 0)
-            let no_adv_fixup = codebuf_offset(cb) as int
-            cb = x86_emit_mov_mem_reg(cb, X86_R15, 0, X86_RDI)
-            let adv_end = codebuf_offset(cb) as int
-            cb = patch_rel32(cb, no_adv_fixup - 4, adv_end)
-            cb = patch_rel32(cb, not_ptr_fixup - 4, adv_end)
-            cb = patch_rel32(cb, not_in_arena1_fixup - 4, adv_end)
-            cb = patch_rel32(cb, not_in_arena2_fixup - 4, adv_end)
+            let promote_end = codebuf_offset(cb) as int
+            cb = patch_rel32(cb, not_ptr_fixup - 4, promote_end)
+            cb = patch_rel32(cb, not_in_arena1_fixup - 4, promote_end)
+            cb = patch_rel32(cb, not_in_arena2_fixup - 4, promote_end)
             out cb
         end
         out x86_emit_nop(cb)
@@ -46785,7 +46863,7 @@ func emit_lir_rt_quantize_stub_x86(cb: CodeBuf):
     out x86_emit_ret(cb)
 end.
 
-func emit_lir_rt_stubs_x86(cb: CodeBuf, offs: i64, vir_free_off: i64):
+func emit_lir_rt_stubs_x86(cb: CodeBuf, offs: i64, vir_free_off: i64, rt_promote_graph_off: i64):
     var k = 0
     when k < LIR_RT_STUB_COUNT loop
         offs = vec_push_rt(offs, codebuf_offset(cb) as i64)
@@ -46850,6 +46928,14 @@ func emit_lir_rt_stubs_x86(cb: CodeBuf, offs: i64, vir_free_off: i64):
             cb = x86_emit_ret(cb)
             cb = patch_rel32(cb, eq_false_fixup - 4, eq_false)
             cb = patch_rel32(cb, eq_true_fixup - 4, eq_true)
+        eif k == LIR_RT_PROMOTE_GRAPH do
+            if rt_promote_graph_off >= 0 do
+                cb = x86_emit_jmp_rel32(cb, 0)
+                let jmp_site = codebuf_offset(cb) as int
+                cb = patch_rel32(cb, jmp_site - 4, rt_promote_graph_off as int)
+            else
+                cb = x86_emit_ret(cb)
+            end
         eif k == LIR_RT_ALLOC do
             # RDI = requested size, R15 = pointer to bump_curr
             cb = x86_emit_cmp_imm0(cb, X86_RDI)
@@ -47527,8 +47613,14 @@ func emit_lir_module_x86_64(lir_funcs: i64):
     if vf_idx >= 0 and vf_idx < n_funcs do
         vir_free_off = vec_get_rt(func_offs, vf_idx)
     end
+    var rt_promote_graph_off = 0 - 1
+    let pg_name = fat_str_new("rt_promote_graph")
+    let pg_idx = lir_find_func_index(lir_funcs, pg_name)
+    if pg_idx >= 0 and pg_idx < n_funcs do
+        rt_promote_graph_off = vec_get_rt(func_offs, pg_idx)
+    end
     rt_offs = vec_new_cap_rt_x86(1024)
-    cb = emit_lir_rt_stubs_x86(cb, rt_offs, vir_free_off)
+    cb = emit_lir_rt_stubs_x86(cb, rt_offs, vir_free_off, rt_promote_graph_off)
 
     call_fixups = native_read_i64(call_fixups_box, 0)
     nf = vec_len_rt(call_fixups)
@@ -47686,6 +47778,7 @@ const RV_T3:   int = 28
 const RV_T4:   int = 29
 const RV_T5:   int = 30
 const RV_T6:   int = 31
+const RV_S11:  int = 27
 
 func rv_encode_r(opcode: int, funct3: int, funct7: int, rd: int, rs1: int, rs2: int):
     let op = opcode bit_and 0x7F
@@ -47775,7 +47868,54 @@ func rv_find_func_index(lir_funcs: i64, name: string):
     out 0 - 1
 end.
 
+func riscv_lir_unsupported(op: int, detail: int):
+    print_str("virc: error [E-RISCV-UNSUPPORTED]: linux-riscv64 backend cannot lower LIR op ")
+    print_int(op)
+    if detail >= 0 do
+        print_str(" (detail ")
+        print_int(detail)
+        print_str(")")
+    end
+    print_newline()
+    sys_exit(1)
+end.
+
+func riscv_lir_validate_memory_supported(lir_funcs: i64):
+    var fi = 0
+    when fi < vec_len_rt(lir_funcs) loop
+        let blocks = lir_func_blocks(vec_get_rt(lir_funcs, fi))
+        var bi = 0
+        when bi < vec_len_rt(blocks) loop
+            let instrs = lir_block_instrs(vec_get_rt(blocks, bi))
+            var ii = 0
+            when ii < vec_len_rt(instrs) loop
+                let ins = vec_get_rt(instrs, ii)
+                let op = lir_instr_op(ins)
+                if op == LirOp.Call as int do
+                    riscv_lir_unsupported(op, lir_instr_aux(ins))
+                end
+                if op == LirOp.Intrinsic as int do
+                    let kind = lir_instr_aux(ins)
+                    if kind == MIR_MEM_MARK or kind == MIR_MEM_RESET or kind == MIR_MEM_PROMOTE or kind == MIR_MEM_DROP do
+                        riscv_lir_unsupported(op, kind)
+                    end
+                    if kind == MIR_INTR_BUILTIN do
+                        let builtin_id = lir_opnd_imm_val(lir_instr_src1(ins))
+                        if builtin_id == 3 or builtin_id == 4 do
+                            riscv_lir_unsupported(op, builtin_id)
+                        end
+                    end
+                end
+                ii = ii + 1
+            end
+            bi = bi + 1
+        end
+        fi = fi + 1
+    end
+end.
+
 func emit_lir_module_riscv64(lir_funcs: i64):
+    riscv_lir_validate_memory_supported(lir_funcs)
     var cb = codebuf_new(TargetArch.RISCV64)
     let n_funcs = vec_len_rt(lir_funcs)
     var func_offs = vec_new_rt()
@@ -47790,6 +47930,7 @@ func emit_lir_module_riscv64(lir_funcs: i64):
         cb = codebuf_emit_u32(cb, rv_sd(RV_S0, RV_SP, 0 - 16))
         cb = codebuf_emit_u32(cb, rv_addi(RV_S0, RV_SP, 0))
         cb = codebuf_emit_u32(cb, rv_addi(RV_SP, RV_SP, 0 - frame_size))
+        cb = codebuf_emit_u32(cb, rv_addi(RV_S11, RV_ZERO, 0))
 
         let blocks = lir_func_blocks(lf)
         let nb = vec_len_rt(blocks)
@@ -47865,6 +48006,81 @@ func emit_lir_module_riscv64(lir_funcs: i64):
                     cb = codebuf_emit_u32(cb, rv_ld(RV_S0, RV_SP, 0 - 16))
                     cb = codebuf_emit_u32(cb, rv_ld(RV_RA, RV_SP, 0 - 8))
                     cb = codebuf_emit_u32(cb, rv_ret())
+                eif op == LirOp.Intrinsic as int do
+                    let bid = lir_opnd_imm_val(s1)
+                    let dst_vreg = lir_opnd_vreg(dst)
+                    let d_off = 0 - (32 + (dst_vreg * 8))
+
+                    # --- MIR_MEM_MARK ---
+                    if bid == 71 do
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T0, RV_S11, 0))
+                        cb = codebuf_emit_u32(cb, rv_sd(RV_T0, RV_S0, d_off))
+
+                    # --- MIR_MEM_RESET ---
+                    eif bid == 72 do
+                        let s1_vreg = lir_opnd_vreg(s1)
+                        let s1_off = 0 - (32 + (s1_vreg * 8))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T0, RV_S0, s1_off))
+                        cb = codebuf_emit_u32(cb, rv_sd(RV_T0, RV_S11, 0))
+
+                    # --- MIR_MEM_DROP ---
+                    eif bid == 74 do
+                        let s1_vreg2 = lir_opnd_vreg(s1)
+                        let s1_off2 = 0 - (32 + (s1_vreg2 * 8))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T0, RV_S0, s1_off2))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_T2, RV_T0, 0 - 16))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T3, RV_T2, 0))
+                        cb = codebuf_emit_u32(cb, rv_add(RV_T4, RV_T2, RV_T3))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T5, RV_S11, 0))
+                        let bne_enc = 0x00030463 or ((RV_T4 shl 15) as int) or ((RV_T5 shl 20) as int)
+                        cb = codebuf_emit_u32(cb, bne_enc)
+                        cb = codebuf_emit_u32(cb, rv_sd(RV_T2, RV_S11, 0))
+
+                    # --- MIR_MEM_PROMOTE ---
+                    eif bid == 73 do
+                        let s1_vreg3 = lir_opnd_vreg(s1)
+                        let s1_off3 = 0 - (32 + (s1_vreg3 * 8))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T0, RV_S0, s1_off3))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T1, RV_S11, 0))
+                        if dst_vreg >= 0 do
+                            cb = codebuf_emit_u32(cb, rv_sd(RV_T0, RV_S0, d_off))
+                        end
+
+                    # --- alloc (bid == 3) ---
+                    eif bid == 3 do
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_T0, RV_ZERO, 0))
+                        cb = codebuf_emit_u32(cb, rv_ld(RV_T1, RV_S11, 0))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_T2, RV_T1, 16))
+                        cb = codebuf_emit_u32(cb, rv_sd(RV_T1, RV_T1, 0))
+                        cb = codebuf_emit_u32(cb, rv_sd(RV_T2, RV_S11, 0))
+                        if dst_vreg >= 0 do
+                            cb = codebuf_emit_u32(cb, rv_sd(RV_T1, RV_S0, d_off))
+                        end
+
+                    # --- free (bid == 4) ---
+                    eif bid == 4 do
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_ZERO, RV_ZERO, 0))
+
+                    end
+                eif op == LirOp.Call as int do
+                    cb = codebuf_emit_u32(cb, rv_addi(RV_ZERO, RV_ZERO, 0))
+                eif op == LirOp.Load as int do
+                    let s1_vreg4 = lir_opnd_vreg(s1)
+                    let s1_off4 = 0 - (32 + (s1_vreg4 * 8))
+                    cb = codebuf_emit_u32(cb, rv_ld(RV_T0, RV_S0, s1_off4))
+                    cb = codebuf_emit_u32(cb, rv_ld(RV_T1, RV_T0, 0))
+                    if lir_opnd_type(dst) == LirOperandType.VRegInt as int do
+                        let d2_off = 0 - (32 + (lir_opnd_vreg(dst) * 8))
+                        cb = codebuf_emit_u32(cb, rv_sd(RV_T1, RV_S0, d2_off))
+                    end
+                eif op == LirOp.Store as int do
+                    let s2_vreg = lir_opnd_vreg(s2)
+                    let s2_off = 0 - (32 + (s2_vreg * 8))
+                    let s1_vreg5 = lir_opnd_vreg(s1)
+                    let s1_off5 = 0 - (32 + (s1_vreg5 * 8))
+                    cb = codebuf_emit_u32(cb, rv_ld(RV_T0, RV_S0, s1_off5))
+                    cb = codebuf_emit_u32(cb, rv_ld(RV_T1, RV_S0, s2_off))
+                    cb = codebuf_emit_u32(cb, rv_sd(RV_T1, RV_T0, 0))
                 end
 
                 ii = ii + 1
@@ -47938,6 +48154,8 @@ const W_I32_CONST: int = 0x41
 const W_I64_CONST: int = 0x42
 const W_I32_ADD: int = 0x6a
 const W_I32_SUB: int = 0x6b
+const W_I32_MUL: int = 0x6c
+const W_I32_OR: int = 0x72
 const W_I32_GE_U: int = 0x4f
 const W_I32_EQZ: int = 0x45
 const W_I32_LOAD: int = 0x28
@@ -48234,7 +48452,10 @@ func wasm_lir_validate_supported(mainf: int):
                 end
             eif op == LirOp.Intrinsic as int do
                 kind = lir_instr_aux(ins)
-                supported = kind == MIR_INTR_STR_LIT or kind == MIR_INTR_PRINT_STR or kind == MIR_INTR_PERCENT or kind == MIR_INTR_LOAD_ADDR or kind == MIR_INTR_ERX or kind == MIR_MEM_MARK or kind == MIR_MEM_RESET or kind == MIR_MEM_PROMOTE or kind == MIR_MEM_DROP
+                supported = kind == MIR_INTR_STR_LIT or kind == MIR_INTR_PRINT_STR or kind == MIR_INTR_PERCENT or kind == MIR_INTR_LOAD_ADDR or kind == MIR_INTR_ERX or kind == MIR_INTR_PATCH_POINT or kind == MIR_MEM_MARK or kind == MIR_MEM_RESET or kind == MIR_MEM_DROP
+                if (kind and 0xFF) == MIR_INTR_CAST do
+                    supported = lir_instr_typ(ins) != LirType.F64 as int & lir_opnd_type(lir_instr_src1(ins)) != LirOperandType.VRegFloat as int
+                end
                 if kind == MIR_INTR_BUILTIN do
                     bid = lir_opnd_imm_val(lir_instr_src1(ins))
                     supported = bid == 11 or bid == 19 or bid == 1000 or bid == 3 or bid == 4 or bid == 5 or bid == 6 or bid == 7 or bid == 8 or bid == 22 or bid == 18 or bid == 1 or bid == 9
@@ -48280,7 +48501,8 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
         when bi < sl loop data = bvec_push(data, native_read_u8(sp, bi)); bi = bi + 1 end
         data = bvec_push(data, 0); off = off + sl + 1; si = si + 1
     end
-    heap = off + 16
+    var freelists_base = off + 16
+    heap = freelists_base + 32
     code = bvec_new(); maxr = 0; args_base = 128
     blocks = lir_func_blocks(mainf)
     var bi = 0
@@ -48367,6 +48589,12 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                     print_op = src1
                     if lir_opnd_type(print_op) == LirOperandType.None as int do print_op = src2 end
                     code = w_opnd(code, print_op); code = w_call(code, 1 + n_ffi)
+                eif (kind and 0xFF) == MIR_INTR_CAST do
+                    if lir_instr_typ(ins) == LirType.F64 as int || lir_opnd_type(src1) == LirOperandType.VRegFloat as int do
+                        wasm_lir_unsupported(LirOp.Intrinsic as int, kind)
+                    end
+                    code = w_opnd(code, src1)
+                    code = w_local_set(code, lir_opnd_vreg(dst))
                 eif kind == MIR_INTR_BUILTIN do
                     bid = lir_opnd_imm_val(src1)
                     if bid == 11 do
@@ -48376,7 +48604,6 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                     eif bid == 1000 do
                         code = w_local_get(code, args_base); code = w_call(code, 4 + n_ffi); code = w_local_set(code, lir_opnd_vreg(dst))
                     eif bid == 3 do
-                        # Check if requested size is 0: if size == 0, return current bump without advancing
                         code = w_local_get(code, args_base)
                         code = bvec_push(code, W_I64_EQZ)
                         code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
@@ -48385,13 +48612,54 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                         code = w_local_set(code, lir_opnd_vreg(dst))
                         code = bvec_push(code, W_ELSE)
 
-                        # old_bump = global.get 0
-                        # total_size = ((size + 7) & ~7) + 8
+                        code = bvec_push(code, W_BLOCK); code = bvec_push(code, W_VOID)
+
+                        # sc = 29 - clz((size - 1) | 7)
+                        code = w_i32_const(code, 29)
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 1); code = bvec_push(code, W_I32_SUB)
+                        code = w_i32_const(code, 7); code = bvec_push(code, W_I32_OR)
+                        code = bvec_push(code, 0x67) # W_I32_CLZ
+                        code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 1)
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, 0x48) # W_I32_LT_S
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        code = w_i32_const(code, freelists_base)
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 4); code = bvec_push(code, W_I32_MUL)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 2)
+
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 3)
+
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_EQZ)
+                        code = bvec_push(code, 0x45) # W_I32_EQZ (which is just 'not', so head != 0)
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        # i32.store(addr, i32.load(head))
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        code = w_local_get(code, args_base + 3)
+                        code = w_local_set(code, lir_opnd_vreg(dst))
+                        code = bvec_push(code, W_BR); code = w_u(code, 2) # break to end of W_BLOCK
+
+                        code = bvec_push(code, W_END)
+                        code = bvec_push(code, W_END)
+
+                        # bump alloc fallback
                         code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
                         code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
                         code = w_i32_const(code, 7); code = bvec_push(code, W_I32_ADD)
                         code = w_i32_const(code, 0 - 8); code = bvec_push(code, 0x71)
-                        code = bvec_push(code, W_I32_ADD)
                         code = w_i32_const(code, 8); code = bvec_push(code, W_I32_ADD)
                         code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
 
@@ -48405,24 +48673,73 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                         code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
                         code = bvec_push(code, W_I32_ADD)
                         code = bvec_push(code, W_GLOBAL_SET); code = w_u(code, 0)
-                        code = bvec_push(code, W_END)
+
+                        code = bvec_push(code, W_END) # W_BLOCK
+                        code = bvec_push(code, W_END) # W_ELSE
                     eif bid == 4 do
                         code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
                         code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
                         code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
                         code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
-                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
-                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 1) # hdr_addr
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
                         code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 2) # blk_size
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
                         code = bvec_push(code, W_I32_ADD)
                         code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
                         code = bvec_push(code, W_I32_EQ)
                         code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
-                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
-                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
                         code = bvec_push(code, W_GLOBAL_SET); code = w_u(code, 0)
-                        code = bvec_push(code, W_END)
-                        code = bvec_push(code, W_END)
+
+                        code = bvec_push(code, W_ELSE)
+
+                        # user_size = blk_size - 8
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+
+                        # sc = 29 - clz((user_size - 1) | 7)
+                        code = w_i32_const(code, 1); code = bvec_push(code, W_I32_SUB)
+                        code = w_i32_const(code, 7); code = bvec_push(code, W_I32_OR)
+                        code = bvec_push(code, 0x67) # W_I32_CLZ
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 3)
+                        code = w_i32_const(code, 29)
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 3) # sc
+
+                        # if sc < 8
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, 0x48) # W_I32_LT_S
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        # addr = freelists_base + sc * 4
+                        code = w_i32_const(code, freelists_base)
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 4); code = bvec_push(code, W_I32_MUL)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 4) # addr
+
+                        # i32.store(ptr, i32.load(addr))
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 4); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        # i32.store(addr, ptr)
+                        code = w_local_get(code, args_base + 4); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        code = bvec_push(code, W_END) # sc < 8 IF
+                        code = bvec_push(code, W_END) # LIFO IF
+                        code = bvec_push(code, W_END) # ptr != 0 IF
                     eif bid == 5 do
                         code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
                         code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
@@ -48497,10 +48814,10 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                         code = bvec_push(code, W_END)
                     end
                 eif kind == MIR_MEM_PROMOTE do
-                    if lir_opnd_type(dst) == (LirOperandType.VRegInt as int) and lir_opnd_type(src1) == (LirOperandType.VRegInt as int) do
-                        code = w_local_get(code, lir_opnd_vreg(src1))
-                        code = w_local_set(code, lir_opnd_vreg(dst))
-                    end
+                    # Validation rejects this path until the Wasm backend has
+                    # a persistent parent-region allocator and recursive graph
+                    # copier. Never emit a shallow-copy promotion.
+                    wasm_lir_unsupported(LirOp.Intrinsic as int, MIR_MEM_PROMOTE)
                 end
             end
             if op == LirOp.Ret as int do code_done = 1 end
