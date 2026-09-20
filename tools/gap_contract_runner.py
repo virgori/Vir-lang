@@ -209,6 +209,15 @@ def run_test(
             compile_cmd.extend(["--target", compile_target])
         if opt_level:
             compile_cmd.append(opt_level)
+        m_flags = re.search(r"#\s*VIRC_FLAGS:\s*([^\n]+)", fixture_path.read_text(encoding="utf-8", errors="replace"))
+        if m_flags:
+            compile_cmd.extend(m_flags.group(1).strip().split())
+        elif "missing_reset" in entry.fixture:
+            compile_cmd.append("--mutate-mir=missing_reset")
+        elif "duplicate_reset" in entry.fixture:
+            compile_cmd.append("--mutate-mir=duplicate_reset")
+        elif "misordered_reset" in entry.fixture:
+            compile_cmd.append("--mutate-mir=misordered_reset")
 
         c_exit, c_stdout, c_stderr = run_command(compile_cmd, cwd=ROOT, timeout=compile_timeout)
         c_all = c_stdout + "\n" + c_stderr
