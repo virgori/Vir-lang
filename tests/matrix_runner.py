@@ -480,8 +480,9 @@ def main():
         json.dump(results, f, indent=2)
     print(f"Saved JSON report to {report_path}")
 
-    # Return exit code 0 if all runnable tests passed and others are properly blocked
-    sys.exit(0 if fail_cnt == 0 else 1)
+    # A partial matrix is useful evidence, but must never turn the full
+    # multi-target release gate green. Every advertised target must run.
+    sys.exit(0 if pass_cnt == len(results) else 1)
 
 if __name__ == "__main__":
     main()
