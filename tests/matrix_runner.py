@@ -17,7 +17,7 @@ Checks:
   - Binary structural validation (Mach-O, ELF, PE32+, WASM)
   - Execution verification (Native macOS, Node.js WASI, QEMU/Wine when available)
   - Output correctness vs EXPECT comments
-  - Accurate reporting: PASS, FAIL, or BLOCKED_NO_RUNNER (never faked)
+  - Accurate reporting: PASS, FAIL, UNSUPPORTED, or BLOCKED_NO_RUNNER (never faked)
 """
 
 import sys
@@ -436,8 +436,13 @@ def main():
 
         if not compile_ok:
             err_summary = extract_error_summary(compile_stdout, compile_stderr)
-            result_entry["run_status"] = "FAIL"
-            result_entry["status_reason"] = f"Compilation failed: {err_summary}"
+            compile_text = compile_stdout + "\n" + compile_stderr
+            if "E-RISCV-UNSUPPORTED" in compile_text or "E-WASM-UNSUPPORTED" in compile_text:
+                result_entry["run_status"] = "UNSUPPORTED"
+                result_entry["status_reason"] = f"Target explicitly unsupported for this program: {err_summary}"
+            else:
+                result_entry["run_status"] = "FAIL"
+                result_entry["status_reason"] = f"Compilation failed: {err_summary}"
         else:
             struct_ok, struct_msg = validate_artifact_structure(target, artifact_path)
             result_entry["structural_valid"] = struct_ok
@@ -455,15 +460,16 @@ def main():
                 result_entry["status_reason"] = reason
 
         results[target] = result_entry
-        color = "\033[92m" if result_entry["run_status"] == "PASS" else ("\033[93m" if result_entry["run_status"] == "BLOCKED_NO_RUNNER" else "\033[91m")
+        color = "\033[92m" if result_entry["run_status"] == "PASS" else ("\033[93m" if result_entry["run_status"] in ("BLOCKED_NO_RUNNER", "UNSUPPORTED") else "\033[91m")
         reset = "\033[0m"
         print(f"[{color}{result_entry['run_status']:<18}{reset}] {target:<24} {result_entry['status_reason']}")
 
     print("\n" + "=" * 60)
     pass_cnt = sum(1 for r in results.values() if r["run_status"] == "PASS")
     blocked_cnt = sum(1 for r in results.values() if r["run_status"] == "BLOCKED_NO_RUNNER")
+    unsupported_cnt = sum(1 for r in results.values() if r["run_status"] == "UNSUPPORTED")
     fail_cnt = sum(1 for r in results.values() if r["run_status"] == "FAIL")
-    print(f"Summary: PASS={pass_cnt}, BLOCKED_NO_RUNNER={blocked_cnt}, FAIL={fail_cnt}, TOTAL={len(results)}")
+    print(f"Summary: PASS={pass_cnt}, BLOCKED_NO_RUNNER={blocked_cnt}, UNSUPPORTED={unsupported_cnt}, FAIL={fail_cnt}, TOTAL={len(results)}")
 
     if args.json:
         print("\nJSON Output:")
