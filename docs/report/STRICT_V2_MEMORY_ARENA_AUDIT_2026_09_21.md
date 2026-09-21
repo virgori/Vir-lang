@@ -50,6 +50,9 @@ The JSON evidence is `/private/tmp/vir_arena_matrix_final/matrix_report.json`.
   matrix runner labels these **UNSUPPORTED**, not PASS. The separate WASM
   allocator slab fixture in the contract suite passes, but that does not
   establish general WASM arena support.
+- The runner exits nonzero for this 2/8 partial matrix, even though no
+  unexpected compiler/runtime failure occurred; incomplete target proof must
+  not become a green release gate.
 
 ## Performance/RSS sample
 
