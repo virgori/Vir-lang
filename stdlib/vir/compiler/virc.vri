@@ -13290,7 +13290,10 @@ entity Diagnostic:
         message: i64; # InternID
     line: i64,
         col: i64,
-        extra: string
+        extra: string,
+        secondary_line: i64,
+        secondary_col: i64,
+        secondary_note: string
 end.
 entity DiagnosticEngine:
     diagnostics: i64; # vec of Diagnostic
@@ -13311,7 +13314,10 @@ func report_error_info(engine: DiagnosticEngine, message_id: i64, line: i64, col
         message: message_id,
         line: line,
         col: col,
-        extra: extra
+        extra: extra,
+        secondary_line: 0,
+        secondary_col: 0,
+        secondary_note: ""
     )
     diags = native_read_i64(engine as i64, 0)
     diags = vec_push_rt(diags, d)
@@ -13319,13 +13325,26 @@ func report_error_info(engine: DiagnosticEngine, message_id: i64, line: i64, col
     errs = native_read_i64(engine as i64, 8)
     native_write_i64(engine as i64, 8, errs + 1)
 end.
+func report_error_related(engine: DiagnosticEngine, message_id: i64, line: i64, col: i64,
+                          extra: string, secondary_line: i64, secondary_col: i64, secondary_note: string):
+    var related_line = secondary_line
+    if related_line <= 0 do
+        related_line = line
+    end
+    # Negative legacy column is a bootstrap-stable carrier for the secondary
+    # line.  Newer diagnostic printers decode it as a related location.
+    report_error_info(engine, message_id, line, 0 - related_line, extra)
+end.
 func report_warning(engine: DiagnosticEngine, message_id: i64, line: i64, col: i64)
     d = Diagnostic(
         level: DiagnosticLevel.Warning,
         message: message_id,
         line: line,
         col: col,
-        extra: ""
+        extra: "",
+        secondary_line: 0,
+        secondary_col: 0,
+        secondary_note: ""
     )
     diags = native_read_i64(engine as i64, 0)
     diags = vec_push_rt(diags, d)
@@ -20853,14 +20872,35 @@ func pass8_is_moved(moved_vars: int, name: string):
 end.
 
 func pass8_mark_moved(moved_vars: int, name: string):
+    out pass8_mark_moved_at(moved_vars, name, 0)
+end.
+
+func pass8_mark_moved_at(moved_vars: int, name: string, line: int):
     if pass8_strlen(name) == 0 do
         out 0
     end
     if pass8_is_moved(moved_vars, name) == 0 do
-        let moved_item = var_item_new(name, 0)
+        let moved_item = var_item_new(name, line)
         pass8_box_push(moved_vars, moved_item as i64)
     end
     out 0
+end.
+
+func pass8_moved_line(moved_vars: int, name: string):
+    let item = pass8_box_find(moved_vars, name)
+    if item == 0 do out 0 end
+    out var_item_val(item)
+end.
+
+func pass8_borrow_line(borrows: int, name: string):
+    let item = pass8_box_find(borrows, name)
+    if item == 0 do out 0 end
+    out var_item_val(item)
+end.
+
+func pass8_first_borrow_line(borrows: int):
+    if pass8_box_len(borrows) == 0 do out 0 end
+    out var_item_val(pass8_box_get(borrows, 0))
 end.
 
 func pass8_unmark_moved(moved_vars: int, name: string):
@@ -20911,7 +20951,7 @@ func pass8_merge_moved(moved_vars: int, snapshot: int):
         let item = pass8_box_get(snapshot, i)
         let name = var_item_name(item)
         if pass8_strlen(name) > 0 do
-            pass8_mark_moved(moved_vars, name)
+            pass8_mark_moved_at(moved_vars, name, var_item_val(item))
         end
         i = i + 1
     end
@@ -21204,18 +21244,21 @@ func pass8_handle_addr_of(symbols: SymbolTable, scopes: ScopeTree, diag: Diagnos
     end
     if is_mut == 1 do
         if pass8_borrow_count(shared_borrows, tgt) > 0 do
-            report_error(diag, 5002, pass8_ast_line(node), 0)
+            report_error_related(diag, 5002, pass8_ast_line(node), 0, tgt,
+                                 pass8_borrow_line(shared_borrows, tgt), 0, "Shared borrow started here")
         end
         if pass8_borrow_count(mut_borrows, tgt) > 0 do
-            report_error(diag, 5003, pass8_ast_line(node), 0)
+            report_error_related(diag, 5003, pass8_ast_line(node), 0, tgt,
+                                 pass8_borrow_line(mut_borrows, tgt), 0, "Mutable borrow started here")
         end
-        let mut_item = var_item_new(tgt, 0)
+        let mut_item = var_item_new(tgt, pass8_ast_line(node))
         pass8_box_push(mut_borrows, mut_item as i64)
     else
         if pass8_borrow_count(mut_borrows, tgt) > 0 do
-            report_error(diag, 5006, pass8_ast_line(node), 0)
+            report_error_related(diag, 5006, pass8_ast_line(node), 0, tgt,
+                                 pass8_borrow_line(mut_borrows, tgt), 0, "Mutable borrow started here")
         end
-        let shared_item = var_item_new(tgt, 0)
+        let shared_item = var_item_new(tgt, pass8_ast_line(node))
         pass8_box_push(shared_borrows, shared_item as i64)
     end
     out tgt
@@ -21248,10 +21291,14 @@ func pass8_process_binding_rhs(symbols: SymbolTable, scopes: ScopeTree, diag: Di
         if pass8_ast_type(rhs) == AstType.Identifier do
             let rhs_name = pass8_ast_name(rhs)
             if pass8_is_moved(moved_vars, rhs_name) == 1 do
-                report_error_info(diag, 5001, pass8_ast_line(rhs), 0, rhs_name)
+                report_error_related(diag, 5001, pass8_ast_line(rhs), 0, rhs_name,
+                                     pass8_moved_line(moved_vars, rhs_name), 0, "Value was moved here")
             else
                 if pass8_borrow_count(shared_borrows, rhs_name) > 0 or pass8_borrow_count(mut_borrows, rhs_name) > 0 do
-                    report_error(diag, 5008, pass8_ast_line(rhs), 0)
+                    var borrow_line = pass8_borrow_line(shared_borrows, rhs_name)
+                    if borrow_line == 0 do borrow_line = pass8_borrow_line(mut_borrows, rhs_name) end
+                    report_error_related(diag, 5008, pass8_ast_line(rhs), 0, rhs_name,
+                                         borrow_line, 0, "Borrow started here")
                 end
                 let rhs_type = pass8_get_var_type(var_types, rhs_name)
                 if type_is_move(rhs_type) do
@@ -21262,7 +21309,7 @@ func pass8_process_binding_rhs(symbols: SymbolTable, scopes: ScopeTree, diag: Di
                         end
                     end
                     if rhs_is_param == 0 do
-                        pass8_mark_moved(moved_vars, rhs_name)
+                        pass8_mark_moved_at(moved_vars, rhs_name, pass8_ast_line(rhs))
                     end
                 end
             end
@@ -21405,7 +21452,8 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
     if pass8_ast_type(node) == AstType.Identifier do
         if pass8_strlen(pass8_ast_name(node)) > 0 do
             if pass8_is_moved(moved_vars, pass8_ast_name(node)) == 1 do
-                report_error_info(diag, 5001, pass8_ast_line(node), 0, pass8_ast_name(node))
+                report_error_related(diag, 5001, pass8_ast_line(node), 0, pass8_ast_name(node),
+                                     pass8_moved_line(moved_vars, pass8_ast_name(node)), 0, "Value was moved here")
             end
         end
     end
@@ -21415,7 +21463,8 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         let base_name = pass8_ast_name(node)
         if pass8_strlen(base_name) > 0 do
             if pass8_is_moved(moved_vars, base_name) == 1 do
-                report_error_info(diag, 5001, pass8_ast_line(node), 0, base_name)
+                report_error_related(diag, 5001, pass8_ast_line(node), 0, base_name,
+                                     pass8_moved_line(moved_vars, base_name), 0, "Value was moved here")
             end
         end
     end
@@ -21458,11 +21507,13 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         if pass8_strlen(assign_name) > 0 do
             # Cannot mutate variable while shared borrow is active
             if pass8_borrow_count(shared_borrows, assign_name) > 0 do
-                report_error(diag, 5009, pass8_ast_line(node), 0)
+                report_error_related(diag, 5009, pass8_ast_line(node), 0, assign_name,
+                                     pass8_borrow_line(shared_borrows, assign_name), 0, "Shared borrow started here")
             end
             # Cannot mutate variable while mutable borrow is held by another reference
             if pass8_borrow_count(mut_borrows, assign_name) > 0 do
-                report_error(diag, 5003, pass8_ast_line(node), 0)
+                report_error_related(diag, 5003, pass8_ast_line(node), 0, assign_name,
+                                     pass8_borrow_line(mut_borrows, assign_name), 0, "Mutable borrow started here")
             end
         end
 
@@ -21559,7 +21610,10 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
         let call_name = pass8_ast_name(node)
         if pass8_cstr_eq(call_name, "arena_reset") == 1 or pass8_cstr_eq(call_name, "arena_free") == 1 do
             if pass8_box_len(shared_borrows) > 0 or pass8_box_len(mut_borrows) > 0 or pass8_box_len(bound_borrows) > 0 do
-                report_error(diag, 5010, pass8_ast_line(node), 0)
+                var borrow_line = pass8_first_borrow_line(shared_borrows)
+                if borrow_line == 0 do borrow_line = pass8_first_borrow_line(mut_borrows) end
+                report_error_related(diag, 5010, pass8_ast_line(node), 0, call_name,
+                                     borrow_line, 0, "Live borrow started here")
             end
         end
         let callee_fn = pass8_find_func(call_name)
@@ -21581,10 +21635,14 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                 # visitor so a repeated call argument produces one E5001.
                 let arg_name = pass8_ast_name(arg)
                 if pass8_is_moved(moved_vars, arg_name) == 1 do
-                    report_error_info(diag, 5001, pass8_ast_line(arg), 0, arg_name)
+                    report_error_related(diag, 5001, pass8_ast_line(arg), 0, arg_name,
+                                         pass8_moved_line(moved_vars, arg_name), 0, "Value was moved here")
                 else
                     if pass8_borrow_count(shared_borrows, arg_name) > 0 or pass8_borrow_count(mut_borrows, arg_name) > 0 do
-                        report_error(diag, 5008, pass8_ast_line(arg), 0)
+                        var borrow_line = pass8_borrow_line(shared_borrows, arg_name)
+                        if borrow_line == 0 do borrow_line = pass8_borrow_line(mut_borrows, arg_name) end
+                        report_error_related(diag, 5008, pass8_ast_line(arg), 0, arg_name,
+                                             borrow_line, 0, "Borrow started here")
                     end
                     var param_idx = i
                     if pass8_ast_type(node) == AstType.MethodCall do
@@ -21618,7 +21676,7 @@ func pass8_walk(symbols: SymbolTable, scopes: ScopeTree, diag: DiagnosticEngine,
                             end
                         end
                         if should_move == 1 do
-                            pass8_mark_moved(moved_vars, arg_name)
+                            pass8_mark_moved_at(moved_vars, arg_name, pass8_ast_line(arg))
                         end
                     end
                 end
@@ -27009,7 +27067,35 @@ func mir_block_dominates(blocks: i64, n_blocks: int, dom_b: int, target_b: int) 
     out true
 end.
 
+# Stable detail for the most recent verifier failure. The pipeline prints this
+# before aborting, so malformed MIR reports the violated invariant and origin
+# instead of collapsing every failure into a bare E6001.
+var g_mir_verify_reason: string = ""
+var g_mir_verify_block: int = -1
+var g_mir_verify_instr: int = -1
+var g_mir_verify_origin: i64 = -1
+
+func mir_verify_fail(reason: string, block_idx: int, instr_idx: int, origin: i64) -> bool:
+    g_mir_verify_reason = reason
+    g_mir_verify_block = block_idx
+    g_mir_verify_instr = instr_idx
+    g_mir_verify_origin = origin
+    out false
+end.
+
+func mir_verify_error_reason() -> string: out g_mir_verify_reason end.
+func mir_verify_error_block() -> int: out g_mir_verify_block end.
+func mir_verify_error_instr() -> int: out g_mir_verify_instr end.
+func mir_verify_error_origin() -> i64: out g_mir_verify_origin end.
+
+# Mandatory ownership metadata verifier. Run before and after the optimizer so
+# an allocation cannot silently lose its stable identity while being cloned or
+# rewritten across CFG/SSA transformations.
 func mir_verify_memory_contract(blocks: i64) -> bool:
+    g_mir_verify_reason = ""
+    g_mir_verify_block = -1
+    g_mir_verify_instr = -1
+    g_mir_verify_origin = -1
     let n_blocks = vec_len_rt(blocks)
     if n_blocks == 0 do out true end
 
@@ -27080,16 +27166,16 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                             let ik = mir_opnd_imm_val(kind)
                             if ik == MIR_INTR_BUILTIN and mir_opnd_type(detail) == MirOperandType.Imm and mir_opnd_imm_val(detail) == 3 do
                                 let dst = mir_instr_dst(ins)
-                                if mir_opnd_type(dst) != MirOperandType.VReg do out false end
+                                if mir_opnd_type(dst) != MirOperandType.VReg do out mir_verify_fail("allocation destination is not a vreg", b_idx, i, mir_instr_src_origin(ins)) end
                                 let alloc_vreg = mir_opnd_vreg_id(dst)
                                 let align = mir_instr_align(ins)
                                 let region = mir_instr_region(ins)
-                                if mir_instr_provenance(ins) != 1 do out false end
-                                if mir_instr_owner_id(ins) != alloc_vreg or mir_instr_alloc_id(ins) != alloc_vreg do out false end
-                                if mir_instr_parent_rel(ins) != 0 do out false end
-                                if mir_instr_size(ins) < 0 or align < 8 or (align bit_and (align - 1)) != 0 do out false end
-                                if region < 0 do out false end
-                                if region == 0 and mir_instr_epoch(ins) != 0 do out false end
+                                if mir_instr_provenance(ins) != 1 do out mir_verify_fail("allocation provenance is invalid", b_idx, i, mir_instr_src_origin(ins)) end
+                                if mir_instr_owner_id(ins) != alloc_vreg or mir_instr_alloc_id(ins) != alloc_vreg do out mir_verify_fail("allocation owner identity is inconsistent", b_idx, i, mir_instr_src_origin(ins)) end
+                                if mir_instr_parent_rel(ins) != 0 do out mir_verify_fail("allocation parent relation is invalid", b_idx, i, mir_instr_src_origin(ins)) end
+                                if mir_instr_size(ins) < 0 or align < 8 or (align bit_and (align - 1)) != 0 do out mir_verify_fail("allocation size or alignment is invalid", b_idx, i, mir_instr_src_origin(ins)) end
+                                if region < 0 do out mir_verify_fail("allocation region is negative", b_idx, i, mir_instr_src_origin(ins)) end
+                                if region == 0 and mir_instr_epoch(ins) != 0 do out mir_verify_fail("root allocation has a nonzero arena epoch", b_idx, i, mir_instr_src_origin(ins)) end
                                 if region > 0 do
                                     let ep = mir_instr_epoch(ins)
                                     if ep > 0 do
@@ -27099,13 +27185,13 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                                         alloc_ins_indices = vec_push_rt(alloc_ins_indices, i as i64)
                                     end
                                 end
-                                if mir_instr_src_origin(ins) < 0 do out false end
+                                if mir_instr_src_origin(ins) < 0 do out mir_verify_fail("allocation is missing source origin", b_idx, i, mir_instr_src_origin(ins)) end
                             end
                             if ik == MIR_MEM_MARK do
                                 let dst = mir_instr_dst(ins)
-                                if mir_opnd_type(dst) != MirOperandType.VReg do out false end
+                                if mir_opnd_type(dst) != MirOperandType.VReg do out mir_verify_fail("arena mark destination is not a vreg", b_idx, i, mir_instr_src_origin(ins)) end
                                 let m_reg = mir_instr_region(ins)
-                                if m_reg < 0 do out false end
+                                if m_reg < 0 do out mir_verify_fail("arena mark region is negative", b_idx, i, mir_instr_src_origin(ins)) end
                                 let m_vr = mir_opnd_vreg_id(dst)
                                 mark_vregs = vec_push_rt(mark_vregs, m_vr as i64)
                                 mark_regions = vec_push_rt(mark_regions, m_reg as i64)
@@ -27115,9 +27201,9 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                                 mark_count = mark_count + 1
                             end
                             if ik == MIR_MEM_RESET do
-                                if mir_opnd_type(detail) != MirOperandType.VReg do out false end
+                                if mir_opnd_type(detail) != MirOperandType.VReg do out mir_verify_fail("arena reset mark is not a vreg", b_idx, i, mir_instr_src_origin(ins)) end
                                 let r_reg = mir_instr_region(ins)
-                                if r_reg < 0 do out false end
+                                if r_reg < 0 do out mir_verify_fail("arena reset region is negative", b_idx, i, mir_instr_src_origin(ins)) end
                                 let r_vr = mir_opnd_vreg_id(detail)
                                 var matched_idx = -1
                                 var mi = 0
@@ -27128,9 +27214,9 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                                     end
                                     mi = mi + 1
                                 end
-                                if matched_idx < 0 do out false end
+                                if matched_idx < 0 do out mir_verify_fail("arena reset has no matching mark", b_idx, i, mir_instr_src_origin(ins)) end
                                 let exp_reg = vec_get_rt(mark_regions, matched_idx)
-                                if exp_reg > 0 and r_reg > 0 and exp_reg != (r_reg as i64) do out false end
+                                if exp_reg > 0 and r_reg > 0 and exp_reg != (r_reg as i64) do out mir_verify_fail("arena reset region does not match its mark", b_idx, i, mir_instr_src_origin(ins)) end
                                 let old_rc = vec_get_rt(mark_resets, matched_idx)
                                 vec_set_rt(mark_resets, matched_idx, (old_rc + 1) as i64)
                                 reset_count = reset_count + 1
@@ -27139,14 +27225,14 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                                 reset_ins_indices = vec_push_rt(reset_ins_indices, i as i64)
                             end
                             if ik == MIR_MEM_DROP do
-                                if mir_opnd_type(detail) != MirOperandType.VReg do out false end
-                                if mir_instr_region(ins) < 0 do out false end
+                                if mir_opnd_type(detail) != MirOperandType.VReg do out mir_verify_fail("memory drop owner is not a vreg", b_idx, i, mir_instr_src_origin(ins)) end
+                                if mir_instr_region(ins) < 0 do out mir_verify_fail("memory drop region is negative", b_idx, i, mir_instr_src_origin(ins)) end
                             end
                             if ik == MIR_MEM_PROMOTE do
                                 let dst = mir_instr_dst(ins)
-                                if mir_opnd_type(dst) != MirOperandType.VReg and mir_opnd_type(dst) != MirOperandType.None do out false end
-                                if mir_opnd_type(detail) != MirOperandType.VReg and mir_opnd_type(detail) != MirOperandType.Imm do out false end
-                                if mir_instr_region(ins) < 0 do out false end
+                                if mir_opnd_type(dst) != MirOperandType.VReg and mir_opnd_type(dst) != MirOperandType.None do out mir_verify_fail("promotion destination is malformed", b_idx, i, mir_instr_src_origin(ins)) end
+                                if mir_opnd_type(detail) != MirOperandType.VReg and mir_opnd_type(detail) != MirOperandType.Imm do out mir_verify_fail("promotion source is malformed", b_idx, i, mir_instr_src_origin(ins)) end
+                                if mir_instr_region(ins) < 0 do out mir_verify_fail("promotion region is negative", b_idx, i, mir_instr_src_origin(ins)) end
                             end
                         end
                     end
@@ -27158,9 +27244,9 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
     end
 
     if mark_count > 0 and reset_count == 0 do
-        if vec_len_rt(arena_epochs) > 0 do out false end
+        if vec_len_rt(arena_epochs) > 0 do out mir_verify_fail("arena allocation is missing reset", -1, -1, -1) end
     end
-    if reset_count > 0 and mark_count == 0 do out false end
+    if reset_count > 0 and mark_count == 0 do out mir_verify_fail("arena reset exists without any mark", -1, -1, -1) end
 
     # 3. Dominance and Exactly-Once verification for every mark
     var m = 0
@@ -27196,9 +27282,9 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                     let B_a = vec_get_rt(alloc_b_indices, a) as int
                     let I_a = vec_get_rt(alloc_ins_indices, a) as int
                     if B_a != B_m do
-                        if mir_block_dominates(blocks, n_blocks, B_m, B_a) == false do out false end
+                        if mir_block_dominates(blocks, n_blocks, B_m, B_a) == false do out mir_verify_fail("arena mark does not dominate allocation", B_a, I_a, -1) end
                     else
-                        if I_m >= I_a do out false end
+                        if I_m >= I_a do out mir_verify_fail("arena allocation precedes its mark", B_a, I_a, -1) end
                     end
                 end
                 a = a + 1
@@ -27212,9 +27298,9 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                     let B_r = vec_get_rt(reset_b_indices, r) as int
                     let I_r = vec_get_rt(reset_ins_indices, r) as int
                     if B_r != B_m do
-                        if mir_block_dominates(blocks, n_blocks, B_m, B_r) == false do out false end
+                        if mir_block_dominates(blocks, n_blocks, B_m, B_r) == false do out mir_verify_fail("arena mark does not dominate reset", B_r, I_r, -1) end
                     else
-                        if I_m >= I_r do out false end
+                        if I_m >= I_r do out mir_verify_fail("arena reset precedes its mark", B_r, I_r, -1) end
                     end
                 end
                 r = r + 1
@@ -27247,7 +27333,7 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                         let ins = vec_get_rt(instrs, ii)
                         if mir_instr_op(ins) == MirOp.Return do
                             has_ret = true
-                            if curr_st != 0 do out false end
+                            if curr_st != 0 do out mir_verify_fail("function exits with an active arena mark", b, ii, mir_instr_src_origin(ins)) end
                         end
                         if mir_instr_op(ins) == MirOp.Intrinsic do
                             let kind = mir_instr_src2(ins)
@@ -27255,16 +27341,16 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                             if mir_opnd_type(kind) == MirOperandType.Imm do
                                 let ik = mir_opnd_imm_val(kind)
                                 if ik == MIR_MEM_MARK and mir_opnd_type(mir_instr_dst(ins)) == MirOperandType.VReg and mir_opnd_vreg_id(mir_instr_dst(ins)) == V_m do
-                                    if curr_st != 0 do out false end
+                                    if curr_st != 0 do out mir_verify_fail("arena mark is activated twice", b, ii, mir_instr_src_origin(ins)) end
                                     curr_st = 1
                                 end
                                 if ik == MIR_INTR_BUILTIN and mir_opnd_type(detail) == MirOperandType.Imm and mir_opnd_imm_val(detail) == 3 do
                                     if mir_instr_epoch(ins) == V_m do
-                                        if curr_st != 1 do out false end
+                                        if curr_st != 1 do out mir_verify_fail("arena allocation occurs outside its active mark", b, ii, mir_instr_src_origin(ins)) end
                                     end
                                 end
                                 if ik == MIR_MEM_RESET and mir_opnd_type(detail) == MirOperandType.VReg and mir_opnd_vreg_id(detail) == V_m do
-                                    if curr_st != 1 do out false end
+                                    if curr_st != 1 do out mir_verify_fail("arena reset occurs while mark is inactive", b, ii, mir_instr_src_origin(ins)) end
                                     curr_st = 0
                                 end
                             end
@@ -27280,7 +27366,7 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                 end
 
                 if n_succs == 0 or has_ret == true do
-                    if curr_st != 0 do out false end
+                    if curr_st != 0 do out mir_verify_fail("control-flow exit is missing arena reset", b, -1, -1) end
                 end
 
                 if succs >= 0 and has_ret == false do
@@ -27294,7 +27380,7 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
                                 df_worklist = vec_push_rt(df_worklist, succ_b as i64)
                             else
                                 if prev_st != curr_st do
-                                    out false
+                                    out mir_verify_fail("arena active state disagrees at CFG merge", succ_b, -1, -1)
                                 end
                             end
                         end
@@ -27321,7 +27407,7 @@ func mir_verify_memory_contract(blocks: i64) -> bool:
             end
             k = k + 1
         end
-        if ep_matched == false do out false end
+        if ep_matched == false do out mir_verify_fail("allocation epoch has no matching arena mark", -1, -1, -1) end
         ei = ei + 1
     end
 
@@ -27985,7 +28071,7 @@ func mir_opt_loop_unroll(blocks: i64):
 end.
 
 
-export mir_opt_set_program, mir_opt_set_current_func, mir_verify_memory_contract, mir_opt_constant_folding, mir_opt_constant_propagation, mir_opt_copy_propagation, mir_opt_cse, mir_opt_dce, mir_opt_bce, mir_opt_strength_reduction, mir_opt_loop_unroll, mir_opt_licm, mir_opt_ivsr, mir_opt_symbolic_loop_collapse, mir_opt_gvn, mir_opt_pre, mir_opt_slp, mir_opt_inlining, mir_opt_shrink_wrapping, mir_opt_jump_threading, mir_opt_sroa, mir_opt_sccp, mir_opt_dae, mir_opt_devirtualization, mir_opt_escape_analysis_and_arena_promotion, mir_opt_ipo_inline_cascade, mir_opt_loop_tiling_fusion_interchange, mir_opt_loop_idiom_recognizer, mir_opt_hot_cold_layout_partitioning, mir_opt_redundant_load_store_elimination, mir_opt_arm64_instruction_selection_and_scheduling, mir_opt_neon_simd_vector_lowering, mir_opt_zero_cost_abi_and_semantics_tuning, mir_opt_inline_bump_arena_fastpath, mir_opt_arm64_addressing_modes_and_register_induction, mir_opt_algebraic_simplification, mir_opt_branch_folding, mir_opt_phi_simplification, mir_opt_sweep_dead_phis, mir_opt_cfg_simplification, mir_opt_arc_trial_deletion, mir_opt_reset_counters, mir_opt_get_last_changes, mir_opt_get_total_changes
+export mir_opt_set_program, mir_opt_set_current_func, mir_verify_memory_contract, mir_verify_error_reason, mir_verify_error_block, mir_verify_error_instr, mir_verify_error_origin, mir_opt_constant_folding, mir_opt_constant_propagation, mir_opt_copy_propagation, mir_opt_cse, mir_opt_dce, mir_opt_bce, mir_opt_strength_reduction, mir_opt_loop_unroll, mir_opt_licm, mir_opt_ivsr, mir_opt_symbolic_loop_collapse, mir_opt_gvn, mir_opt_pre, mir_opt_slp, mir_opt_inlining, mir_opt_shrink_wrapping, mir_opt_jump_threading, mir_opt_sroa, mir_opt_sccp, mir_opt_dae, mir_opt_devirtualization, mir_opt_escape_analysis_and_arena_promotion, mir_opt_ipo_inline_cascade, mir_opt_loop_tiling_fusion_interchange, mir_opt_loop_idiom_recognizer, mir_opt_hot_cold_layout_partitioning, mir_opt_redundant_load_store_elimination, mir_opt_arm64_instruction_selection_and_scheduling, mir_opt_neon_simd_vector_lowering, mir_opt_zero_cost_abi_and_semantics_tuning, mir_opt_inline_bump_arena_fastpath, mir_opt_arm64_addressing_modes_and_register_induction, mir_opt_algebraic_simplification, mir_opt_branch_folding, mir_opt_phi_simplification, mir_opt_sweep_dead_phis, mir_opt_cfg_simplification, mir_opt_arc_trial_deletion, mir_opt_reset_counters, mir_opt_get_last_changes, mir_opt_get_total_changes
 
 # @vir_source stdlib/vir/compiler/virc.vri 60
 # @vir_source stdlib/vir/compiler/ast_to_mir.vri 1
@@ -38959,6 +39045,20 @@ import mir_opt_reset_counters,
 
 var g_mir_opt_level: int = 1
 
+func mir_opt_report_verify_failure(stage: string):
+    print_str("virc: error [E6001]: MIR memory contract verification failed; stage=")
+    print_str(stage)
+    print_str("; invariant=")
+    print_str(mir_verify_error_reason())
+    print_str("; block=")
+    print_int(mir_verify_error_block())
+    print_str("; instruction=")
+    print_int(mir_verify_error_instr())
+    print_str("; source_origin=")
+    print_int(mir_verify_error_origin())
+    print_str("\n")
+end.
+
 func set_mir_opt_level(level: int):
     if level < 0 do
         g_mir_opt_level = 0
@@ -38985,7 +39085,7 @@ end.
 func mir_opt_run_spec_round(blocks: i64, level: int):
     if mir_verify_memory_contract(blocks) == false do
         extern func sys_exit(code: int)
-        print_str("virc: error [E6001]: MIR memory contract verification failed in spec round\n")
+        mir_opt_report_verify_failure("spec round pre")
         sys_exit(1)
     end
     # 1. Constant folding & propagation
@@ -39083,7 +39183,7 @@ func mir_opt_run_spec_round(blocks: i64, level: int):
     end
     if mir_verify_memory_contract(blocks) == false do
         extern func sys_exit(code: int)
-        print_str("virc: error [E6001]: MIR memory contract verification failed after round\n")
+        mir_opt_report_verify_failure("spec round post")
         sys_exit(1)
     end
     out blocks
@@ -39100,14 +39200,14 @@ func mir_opt_run_spec_pipeline(blocks: i64, opt_level: int):
     if level == 0 do
         if mir_verify_memory_contract(blocks) == false do
             extern func sys_exit(code: int)
-            print_str("virc: error [E6001]: MIR memory contract verification failed at O0 pre\n")
+            mir_opt_report_verify_failure("O0 pre")
             sys_exit(1)
         end
         blocks = mir_opt_constant_folding(blocks)
         blocks = mir_opt_dce(blocks)
         if mir_verify_memory_contract(blocks) == false do
             extern func sys_exit(code: int)
-            print_str("virc: error [E6001]: MIR memory contract verification failed at O0 post\n")
+            mir_opt_report_verify_failure("O0 post")
             sys_exit(1)
         end
         out blocks
@@ -39944,6 +40044,20 @@ var g_use_hir_pipeline: int = 0
 var g_mir_full_opt: int = 0
 var g_mir_opt_level: int = 1
 
+func pipeline_report_mir_verify_failure(stage: string):
+    print_str("virc: error [E6001]: MIR memory contract verification failed; stage=")
+    print_str(stage)
+    print_str("; invariant=")
+    print_str(mir_verify_error_reason())
+    print_str("; block=")
+    print_int(mir_verify_error_block())
+    print_str("; instruction=")
+    print_int(mir_verify_error_instr())
+    print_str("; source_origin=")
+    print_int(mir_verify_error_origin())
+    print_str("\n")
+end.
+
 func set_pipeline_hir_mode(mode: int):
     g_use_hir_pipeline = mode
 end.
@@ -40127,7 +40241,7 @@ func compile_pipeline(source_path: string, ast: AstNode, verbose: int):
         end
         if mir_verify_memory_contract(blocks4) == false do
             extern func sys_exit(code: int)
-            print_str("virc: error [E6001]: MIR memory contract verification failed before optimizer\n")
+            pipeline_report_mir_verify_failure("before optimizer")
             sys_exit(1)
         end
         mir_opt_set_current_func(mf2)
@@ -40143,7 +40257,7 @@ func compile_pipeline(source_path: string, ast: AstNode, verbose: int):
         end
         if mir_verify_memory_contract(blocks5) == false do
             extern func sys_exit(code: int)
-            print_str("virc: error [E6001]: MIR memory contract verification failed after optimizer\n")
+            pipeline_report_mir_verify_failure("after optimizer")
             sys_exit(1)
         end
         mf_new = mir_func_new(
