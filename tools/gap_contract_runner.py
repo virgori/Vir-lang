@@ -304,33 +304,87 @@ def run_test(
             node_script = r"""
 const fs = require("fs");
 const { WASI } = require("wasi");
-const wasi = new WASI({ version: "preview1", args: [], env: {} });
-WebAssembly.instantiate(fs.readFileSync(process.argv[1]), {
-  wasi_snapshot_preview1: wasi.wasiImport
-}).then(({ instance }) => {
-  instance.exports._start();
-  const view = new DataView(instance.exports.memory.buffer);
-  console.log(`${view.getBigInt64(60000, true)}ok`);
+const wasi = new WASI({ version: "preview1", args: [process.argv[1]], env: process.env, preopens: { ".": "." } });
+const wasmBuffer = fs.readFileSync(process.argv[1]);
+const imports = wasi.getImportObject ? wasi.getImportObject() : { wasi_snapshot_preview1: wasi.wasiImport };
+WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
+  let exitCode = 0;
+  if (wasi.start) {
+    exitCode = wasi.start(instance) || 0;
+  } else {
+    instance.exports._start();
+  }
+  if (process.argv[2] === "inspect_slab") {
+    const view = new DataView(instance.exports.memory.buffer);
+    console.log(`${view.getBigInt64(60000, true)}ok`);
+  }
+  process.exit(exitCode);
 }).catch((error) => {
   console.error(error);
   process.exit(1);
 });
 """
+            extra_arg = ["inspect_slab"] if entry.test_id == "MEM-WASM-001" else []
             r_exit, r_stdout, r_stderr = run_command(
-                ["node", "--no-warnings", "--experimental-wasi-unstable-preview1", "-e", node_script, str(bin_out)],
+                ["node", "--no-warnings", "-e", node_script, str(bin_out)] + extra_arg,
                 cwd=ROOT,
                 timeout=timeout,
             )
+            if entry.test_id == "MEM-WASM-001":
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="PASS" if r_exit == 0 and r_stdout.strip() == "0ok" else "FAIL",
+                    target=compile_target,
+                    compile_exit=c_exit,
+                    run_exit=r_exit,
+                    stdout=r_stdout,
+                    stderr=r_stderr,
+                    reason="Wasm slab reused the released size-class slot" if r_exit == 0 and r_stdout.strip() == "0ok" else "Wasm slab reuse validation/execution failed",
+                )
+
+            if r_exit != 0:
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="FAIL",
+                    target=compile_target,
+                    compile_exit=c_exit,
+                    run_exit=r_exit,
+                    stdout=r_stdout,
+                    stderr=r_stderr,
+                    reason=f"Wasm execution failed with non-zero exit code {r_exit}",
+                )
+
+            expected_stdout = None
+            if entry.oracle.startswith("stdout="):
+                expected_stdout = entry.oracle[7:].replace(r"\n", "\n").strip()
+            elif entry.oracle.startswith("exit="):
+                pass
+            actual_stdout = r_stdout.strip()
+            if expected_stdout is not None and actual_stdout != expected_stdout:
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="FAIL",
+                    target=compile_target,
+                    compile_exit=c_exit,
+                    run_exit=r_exit,
+                    stdout=r_stdout,
+                    stderr=r_stderr,
+                    reason=f"Wasm stdout mismatch: expected '{expected_stdout}', got '{actual_stdout}'",
+                )
+
             return TestResult(
                 test_id=entry.test_id,
                 kind=entry.kind,
-                status="PASS" if r_exit == 0 and r_stdout.strip() == "0ok" else "FAIL",
+                status="PASS",
                 target=compile_target,
                 compile_exit=c_exit,
                 run_exit=r_exit,
                 stdout=r_stdout,
                 stderr=r_stderr,
-                reason="Wasm slab reused the released size-class slot" if r_exit == 0 and r_stdout.strip() == "0ok" else "Wasm slab reuse validation/execution failed",
+                reason="Wasm execution matched expected oracle",
             )
 
         # Run artifact

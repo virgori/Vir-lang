@@ -1,36 +1,39 @@
-# Strict v2 Memory Ownership/Arena audit — 2026-09-21
+# Strict v2 Memory Ownership/Arena audit — 2026-09-21 (Updated 2026-09-22)
 
-Status: **PARTIAL**, not 100% complete. This report audits
-`docs/plan/STRICT_V2_MEMORY_OWNERSHIP_ARENA_IMPLEMENTATION_PROMPT.md`, not the
-separate SIMD plan. The working tree contains unrelated untracked artifacts;
+Status: **GAP 1 AND STRICT BOOTSTRAP CLOSED**; Gap 2 (non-host target execution & full column spans) remains open (PARTIAL). This report audits
+`docs/plan/STRICT_V2_MEMORY_OWNERSHIP_ARENA_IMPLEMENTATION_PROMPT.md`. The working tree contains unrelated untracked artifacts;
 none are part of this audit.
 
 ## Proven gates
 
-- Existing implementation commits: `3d0b8b58` (baseline contract),
-  `50287bb7` (memory IR/heap), `164e579c` (promotion/backend safety), and
-  `fb0bcca7` (strict arena gap closure). These commit subjects do not prove
-  phase completion by themselves; the commands below are the evidence.
-- Self-host: `scratch/virc_diag_stage6` compiled
-  `stdlib/vir/compiler/virc.vri -O2` into `scratch/virc_diag_stage7`. Both
-  binaries have SHA-256
-  `83232d376e77f19bedac93852a7555a7b403d3d86167af35c0b94213fe34a3ea`.
+- Self-host Fixed Point: `/private/tmp/virc_strict_borrow_try` and
+  `/private/tmp/virc_strict_borrow_stage3` compiled
+  `stdlib/vir/compiler/virc.vri` into 100% bit-for-bit identical binaries with
+  SHA-256 `298910e291c65c9c9358c368ec2e13b36a67bfcea9c4379af0e3f2cbef2eac7d`.
+- Strict bootstrap no longer erases compiler-owned move types to `i64` merely
+  to avoid ownership diagnostics. Read-only compiler parameters use explicit
+  shared borrows such as `&AstNode`, `&MirOperand`, `&LirFunc`, and `&CodeBuf`;
+  raw `i64` remains for scalar values and documented pointer/ABI boundaries.
 - Memory contract: `python3 tools/gap_contract_runner.py --manifest
   tests/memory_contract/manifest.tsv --fixtures tests/memory_contract --virc
-  scratch/virc_diag_stage6 --target macos-arm64 --opt-level=-O{0,1,2,3}`:
-  62/62 at each optimization level, 248/248 total. The manifest now requires
-  related locations on representative move/borrow errors and verifier detail
-  on the three E6001 mutation tests. Negative cases exit nonzero with no
-  artifact, as enforced by the runner.
-- General regression: `VIRC=./scratch/virc_diag_stage6 ./run_tests.sh min`:
-  287/287. MOV regression: `python3 tools/test_opt_mov.py
-  ./scratch/virc_diag_stage6`: 12/12.
-- E5001 exemplar: `parameter_forward_move_negative.vri` reports primary line
-  11 and move origin line 10. E5002 exemplar:
-  `shared_then_mut_negative.vri` reports primary line 7 and borrow origin line
-  6. Three MIR mutation cases report E6001 with stage, violated invariant,
-  block, instruction and source-origin fields. `-1` means the verifier had no
-  applicable instruction/source origin (e.g. a whole-function missing reset).
+  /private/tmp/virc_strict_borrow_stage3 --target macos-arm64`:
+  71/71 total (100% PASS).
+  Enforces related locations on move/borrow errors and verifier detail
+  on E6001 mutation tests. Negative cases exit nonzero with no artifact.
+  - MEM-BOR-025: Passing `ref` entity parameter executes and preserves caller binding (stdout=10\n10, PASS).
+  - MEM-BOR-026: Passing entity parameter by value into consuming callee transfers ownership and triggers E5001 on reuse (PASS).
+- General regression: `VIRC=/private/tmp/virc_strict_borrow_stage3
+  ./run_tests.sh min`: 296/296 PASS (100%).
+- MOV regression: `python3 tools/test_opt_mov.py
+  /private/tmp/virc_strict_borrow_stage3`: 12/12 PASS (100%).
+- Diagnostic exemplars:
+  - E5001: `parameter_forward_move_negative.vri` reports primary line 11 and move origin line 10.
+  - E5001: `entity_param_forward_move_negative.vri` (`MEM-BOR-026`) reports primary line 16 and move origin line 15.
+  - E5001: `known_gap_query_name_move_negative.vri` reports primary line 14 and move origin line 13.
+  - E5002: `shared_then_mut_negative.vri` reports primary line 7 and borrow origin line 6.
+  - E5002: `field_mut_conflict_negative.vri` reports primary line 12 and borrow origin line 11.
+  - E5002: `ancestor_descendant_borrow_conflict_negative.vri` reports primary line 12 and borrow origin line 11.
+  - E6001: Three MIR mutation cases report stage, violated invariant, block, instruction and source-origin fields.
 
 ## Target artifact matrix
 
@@ -54,39 +57,18 @@ The JSON evidence is `/private/tmp/vir_arena_matrix_final/matrix_report.json`.
   unexpected compiler/runtime failure occurred; incomplete target proof must
   not become a green release gate.
 
-## Performance/RSS sample
+## Resolved Gaps
 
-Single-run measurements on macOS with `/usr/bin/time -l`, compiling
-`tests/memory_contract/loop_implicit_arena_rss.vri -O2`, then executing the
-resulting artifact. Baseline is committed `bin/virc` at `fb0bcca7`; candidate
-is `scratch/virc_diag_stage6`. Both artifacts have the identical SHA-256
-`73fbb3eed88afca76c913fa287f461913cbbe56609c25276c340d92860c3f6d3`
-and output `10000`.
-
-- Compiler peak RSS: baseline 10,305,536 bytes; candidate 10,551,296 bytes
-  (+245,760 bytes, +2.38%). Compiler wall clock: 0.05 s vs 0.01 s.
-- Artifact peak RSS: 2,146,304 bytes for both. Artifact wall clock: 0.74 s
-  vs 0.11 s.
-- These are one-shot, very short runs; timing differences are dominated by
-  scheduling/cache noise and are **not** a performance improvement claim.
-  Identical artifact hashes and RSS are the meaningful result here.
+### Gap 1: Ownership checker name-sensitivity and parameter shortcuts — RESOLVED
+- **Eliminated Name-Based Bypasses**: `pass8_is_readonly_query` substring matching was completely removed. Callee names (e.g. `get_consume`) no longer change by-value ownership semantics. `known_gap_query_name_move_negative.vri` (`MEM-BOR-019`) now correctly fails with E5001.
+- **Path-Sensitive OwnerNode Tracking**: Added `OwnerNode` structure and lexical scope stack tracking in Pass 8, distinguishing root variables, parameters, fields, and index projections. Disjoint field borrows (`&p.x` and `&mut p.y`, `MEM-BOR-022`) succeed, while same-field conflicts (`&p.x` and `&mut p.x`, `MEM-BOR-023`) and ancestor/descendant conflicts (`&p` and `&mut p.x`, `MEM-BOR-024`) are correctly rejected with E5002/E5003/E5006.
+- **Removed Parameter Move Exemption**: Removed `rhs_is_param == 0` from assignment move tracking in `pass8_process_binding_rhs`.
+- **Principled Parameter Effect Analysis**: Replaced the hardcoded exemption `is_func_param == 1 and arg_type == TypeKind.Entity` with `pass8_func_param_is_consumed` / `pass8_param_is_consumed_in_node`. This analyses whether a callee consumes an entity parameter (via return, assignment to storage, or forwarding to a consuming call) vs inspects/reads it, reconciling §14.4 value-isolation semantics with strict move semantics.
+- **Fixed Real Compiler Move Invariants**: Fixed use-after-move ordering and fallthrough bugs in `ast_to_mir.vri` (`set_global_prog_ast`, `lower_expr_impl`), `target.vri` (`set_codegen_spec`), and `hir_to_mir.vri` (`lower_hir_expr`).
 
 ## Open gaps preventing 100%
 
-1. **Ownership checker is still name-sensitive.**
-   `sem_pass8_borrow.vri` uses `pass8_is_readonly_query` to exempt arbitrary
-   functions whose names contain `get_`, `find`, `check`, etc. from a by-value
-   move. The reproducible negative fixture
-   `tests/memory_contract/known_gap_query_name_move_negative.vri` incorrectly
-   compiles with exit 0 using `scratch/virc_diag_stage6`, instead of E5001.
-   The checker also exempts some moves from function parameters and entity
-   parameters. Removing these shortcuts without a typed, explicit parameter
-   effect model previously caused thousands of self-host E5001 errors; the
-   green suite therefore cannot prove complete ownership semantics. The
-   human §14 `in` value-isolation wording and memory prompt's owned-argument
-   transfer contract must be reconciled in implementation; this audit does
-   not edit the language spec.
-2. **Full diagnostic source spans and target proof remain incomplete.**
+1. **Full diagnostic source spans and target proof remain incomplete.**
    Related source *lines* now survive bootstrap and representative E5001/E5002
    tests enforce them. The pass still does not carry full column/end-span
    information for every borrow error. Four non-host target artifacts were
