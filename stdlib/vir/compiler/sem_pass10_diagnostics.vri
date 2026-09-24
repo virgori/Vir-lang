@@ -11,20 +11,448 @@ import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt
 include string_rt
 import rt_streq, fat_str_eq, fat_str_len, fat_str_byte_at, fat_cstr_eq, rt_strcat, rt_itoa, rt_strlen, sb_append_char from string_rt
 
+include rt.alloc
+import vir_alloc, alloc from rt.alloc
+
 include context
 import DiagnosticEngine, DiagnosticLevel, Diagnostic from context
 
-func pass10_emit_diagnostics(diag: &DiagnosticEngine, source_path: &string):
+include source_manager
+import g_active_source_manager, sm_get_file_path, sm_get_span from source_manager
+
+include rt.syscall
+import sys_getrusage, sys_platform, Platform from rt.syscall
+
+extern func syscall2(num: int, a1: int, a2: int) -> int
+extern func syscall3(num: int, a1: int, a2: int, a3: int) -> int
+extern func _NSGetEnviron() -> int
+
+var g_color_mode: int = 0
+var g_time_buf_start: int = 0
+var g_compile_timer_printed: int = 0
+var g_diag_json: int = 0
+var g_phase_timings: int = 0
+var g_phase_read_us: int = 0
+var g_phase_preprocess_us: int = 0
+var g_phase_lex_us: int = 0
+var g_phase_parse_us: int = 0
+var g_phase_semantic_us: int = 0
+var g_phase_semantic_start_us: int = 0
+var g_phase_lower_us: int = 0
+var g_phase_codegen_us: int = 0
+var g_phase_link_us: int = 0
+
+func virc_timer_init():
+    if g_time_buf_start == 0 do
+        g_time_buf_start = vir_alloc(16)
+        let plat = sys_platform()
+        var clk = 1; # Linux CLOCK_MONOTONIC
+        if plat == Platform.MacOS_ARM64 or plat == Platform.MacOS_x86_64 do
+            clk = 6; # macOS CLOCK_MONOTONIC
+        end
+        sys_clock_gettime(clk, g_time_buf_start)
+    end
+end.
+
+func virc_elapsed_us():
+    let buf = vir_alloc(16)
+    let plat = sys_platform()
+    var clk = 1
+    if plat == Platform.MacOS_ARM64 or plat == Platform.MacOS_x86_64 do
+        clk = 6
+    end
+    sys_clock_gettime(clk, buf)
+    let sec = native_read_i64(buf, 0)
+    let nsec = native_read_i64(buf, 8)
+    var s_sec = 0
+    var s_nsec = 0
+    if g_time_buf_start != 0 do
+        s_sec = native_read_i64(g_time_buf_start, 0)
+        s_nsec = native_read_i64(g_time_buf_start, 8)
+    end
+    var d_sec = sec - s_sec
+    var d_nsec = nsec - s_nsec
+    if d_nsec < 0 do
+        d_sec = d_sec - 1
+        d_nsec = d_nsec + 1000000000
+    end
+    var total = d_sec * 1000000 + (d_nsec / 1000)
+    if total < 0 do total = 0 end
+    out total
+end.
+
+func virc_print_phase_timings():
+    if g_phase_timings == 0 do out 0 end
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "Phase timings (ms): read=")
+        sb = sb_append_int(sb, g_phase_read_us / 1000)
+        sb = sb_append(sb, " preprocess=")
+        sb = sb_append_int(sb, g_phase_preprocess_us / 1000)
+        sb = sb_append(sb, " lex=")
+        sb = sb_append_int(sb, g_phase_lex_us / 1000)
+        sb = sb_append(sb, " parse=")
+        sb = sb_append_int(sb, g_phase_parse_us / 1000)
+        sb = sb_append(sb, " semantic=")
+        sb = sb_append_int(sb, g_phase_semantic_us / 1000)
+        sb = sb_append(sb, " lower=")
+        sb = sb_append_int(sb, g_phase_lower_us / 1000)
+        sb = sb_append(sb, " codegen=")
+        sb = sb_append_int(sb, g_phase_codegen_us / 1000)
+        sb = sb_append(sb, " link=")
+        sb = sb_append_int(sb, g_phase_link_us / 1000)
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+    out 0
+end.
+
+func virc_print_compile_time():
+    if g_compile_timer_printed == 1 do out 0 end
+    if g_diag_json == 1 do
+        var diag = diagnostic_engine_new()
+        pass10_emit_json(diag)
+        out 0
+    end
+    g_compile_timer_printed = 1
+    let total_us = virc_elapsed_us()
+    var ms = total_us / 1000
+    var frac = (total_us mod 1000) / 10
+    if ms == 0 and frac == 0 do
+        frac = 10
+    end
+    virc_print_phase_timings()
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "Compile time: ")
+        sb = sb_append_int(sb, ms)
+        sb = sb_append(sb, ".")
+        if frac < 10 do
+            sb = sb_append(sb, "0")
+        end
+        sb = sb_append_int(sb, frac)
+        sb = sb_append(sb, " ms")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+    out 0
+end.
+
+func pass10_json_escape_cstr(sb: StringBuilder, s: int):
+    if s == 0 do out sb end
+    let slen = rt_strlen(s)
+    var i = 0
+    when i < slen loop
+        let b = native_read_u8(s, i)
+        if b == 34 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 34)
+        eif b == 92 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 92)
+        eif b == 10 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 110)
+        eif b == 13 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 114)
+        eif b == 9 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 116)
+        else
+            sb = sb_append_char(sb, b)
+        end
+        i = i + 1
+    end
+    out sb
+end.
+
+func pass10_json_escape_str(sb: StringBuilder, s: string):
+    if (s as i64) == 0 do out sb end
+    let cstr = s as i64
+    out pass10_json_escape_cstr(sb, cstr)
+end.
+
+func pass10_emit_json_one(sb: StringBuilder, d: Diagnostic):
+    let level = native_read_i64(d as i64, 0)
+    let code = native_read_i64(d as i64, 8)
+    let d_span_id = native_read_i64(d as i64, 72)
+    var line = native_read_i64(d as i64, 16)
+    var col = native_read_i64(d as i64, 24)
+    var end_line = line
+    var end_col = col + 1
+    var file_path = native_read_i64(d as i64, 80)
+    if d_span_id > 0 and g_active_source_manager != 0 do
+        let sp = sm_get_span(g_active_source_manager, d_span_id)
+        if sp != 0 do
+            line = native_read_i64(sp, 8)
+            col = native_read_i64(sp, 16)
+            end_line = native_read_i64(sp, 24)
+            end_col = native_read_i64(sp, 32)
+            let sp_fid = native_read_i64(sp, 0)
+            file_path = sm_get_file_path(g_active_source_manager, sp_fid)
+        end
+    end
+    let extra = native_read_i64(d as i64, 32) as string
+    let sec_line = native_read_i64(d as i64, 40)
+    var sec_col = native_read_i64(d as i64, 48)
+    let sec_note = native_read_i64(d as i64, 56) as string
+    if col <= 0 do col = 1 end
+    if end_col <= col do end_col = col + 1 end
+    if sec_col <= 0 and sec_line > 0 do sec_col = 1 end
+    if file_path == 0 and g_active_source_manager != 0 do
+        file_path = sm_get_file_path(g_active_source_manager, 0)
+    end
+    sb = sb_append(sb, "{\"code\":\"")
+    sb = sb_append(sb, pass10_code_to_prefix(level))
+    if code < 1000 do sb = sb_append(sb, "0") end
+    if code < 100 do sb = sb_append(sb, "0") end
+    if code < 10 do sb = sb_append(sb, "0") end
+    sb = sb_append_int(sb, code)
+    sb = sb_append(sb, "\",\"severity\":\"")
+    if level == DiagnosticLevel.Warning do
+        sb = sb_append(sb, "warning")
+    else
+        sb = sb_append(sb, "error")
+    end
+    sb = sb_append(sb, "\",\"message\":\"")
+    let msg_str = pass10_code_to_msg(code, extra)
+    sb = pass10_json_escape_str(sb, msg_str)
+    sb = sb_append(sb, "\",\"primary_span\":{\"file\":\"")
+    sb = pass10_json_escape_cstr(sb, file_path)
+    sb = sb_append(sb, "\",\"start_line\":")
+    sb = sb_append_int(sb, line)
+    sb = sb_append(sb, ",\"start_column\":")
+    sb = sb_append_int(sb, col)
+    sb = sb_append(sb, ",\"end_line\":")
+    sb = sb_append_int(sb, end_line)
+    sb = sb_append(sb, ",\"end_column\":")
+    sb = sb_append_int(sb, end_col)
+    sb = sb_append(sb, "},\"related_locations\":")
+    var sec_file_path = native_read_i64(d as i64, 96)
+    if sec_file_path == 0 and g_active_source_manager != 0 do
+        let sec_fid = native_read_i64(d as i64, 88)
+        if sec_fid > 0 do
+            sec_file_path = sm_get_file_path(g_active_source_manager, sec_fid)
+        end
+    end
+    if sec_file_path == 0 do
+        sec_file_path = file_path
+    end
+    if sec_line > 0 do
+        sb = sb_append(sb, "[{\"file\":\"")
+        sb = pass10_json_escape_cstr(sb, sec_file_path)
+        sb = sb_append(sb, "\",\"line\":")
+        sb = sb_append_int(sb, sec_line)
+        sb = sb_append(sb, ",\"column\":")
+        sb = sb_append_int(sb, sec_col)
+        sb = sb_append(sb, ",\"message\":\"")
+        if (sec_note as i64) != 0 and fat_str_len(sec_note) > 0 do
+            sb = pass10_json_escape_str(sb, sec_note)
+        else
+            sb = sb_append(sb, "related location")
+        end
+        sb = sb_append(sb, "\"}]")
+    else
+        sb = sb_append(sb, "[]")
+    end
+    sb = sb_append(sb, "}")
+    out sb
+end.
+
+func pass10_emit_json(diag: &DiagnosticEngine):
+    let elapsed_ms = virc_elapsed_us() / 1000
+    let count = vec_len_rt(diag.diagnostics)
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "{\"schema_version\":1,")
+        if count <= 0 do
+            sb = sb_append(sb, "\"success\":true,\"diagnostics\":[],\"error_count\":0,\"warning_count\":0,\"compile_time_ms\":")
+            sb = sb_append_int(sb, elapsed_ms)
+            sb = sb_append(sb, "}")
+            print_ln(sb_to_string(sb))
+            sb_free(sb)
+            g_compile_timer_printed = 1
+            out 0
+        end
+
+        if diag.error_count == 0 do
+            sb = sb_append(sb, "\"success\":true,")
+        else
+            sb = sb_append(sb, "\"success\":false,")
+        end
+
+        let d0 = vec_get_rt(diag.diagnostics, 0)
+        let level0 = native_read_i64(d0 as i64, 0)
+        let code0 = native_read_i64(d0 as i64, 8)
+        let d_span_id0 = native_read_i64(d0 as i64, 72)
+        var line0 = native_read_i64(d0 as i64, 16)
+        var col0 = native_read_i64(d0 as i64, 24)
+        var end_line0 = line0
+        var end_col0 = col0 + 1
+        var file_path0 = native_read_i64(d0 as i64, 80)
+        if d_span_id0 > 0 and g_active_source_manager != 0 do
+            let sp0 = sm_get_span(g_active_source_manager, d_span_id0)
+            if sp0 != 0 do
+                line0 = native_read_i64(sp0, 8)
+                col0 = native_read_i64(sp0, 16)
+                end_line0 = native_read_i64(sp0, 24)
+                end_col0 = native_read_i64(sp0, 32)
+                let sp_fid0 = native_read_i64(sp0, 0)
+                file_path0 = sm_get_file_path(g_active_source_manager, sp_fid0)
+            end
+        end
+        let extra0 = native_read_i64(d0 as i64, 32) as string
+        if col0 <= 0 do col0 = 1 end
+        if end_col0 <= col0 do end_col0 = col0 + 1 end
+        if file_path0 == 0 and g_active_source_manager != 0 do
+            file_path0 = sm_get_file_path(g_active_source_manager, 0)
+        end
+        sb = sb_append(sb, "\"code\":\"")
+        sb = sb_append(sb, pass10_code_to_prefix(level0))
+        if code0 < 1000 do sb = sb_append(sb, "0") end
+        if code0 < 100 do sb = sb_append(sb, "0") end
+        if code0 < 10 do sb = sb_append(sb, "0") end
+        sb = sb_append_int(sb, code0)
+        sb = sb_append(sb, "\",\"severity\":\"")
+        if level0 == DiagnosticLevel.Warning do
+            sb = sb_append(sb, "warning")
+        else
+            sb = sb_append(sb, "error")
+        end
+        sb = sb_append(sb, "\",\"message\":\"")
+        let msg0 = pass10_code_to_msg(code0, extra0)
+        sb = pass10_json_escape_str(sb, msg0)
+        sb = sb_append(sb, "\",\"primary_span\":{\"file\":\"")
+        sb = pass10_json_escape_cstr(sb, file_path0)
+        sb = sb_append(sb, "\",\"start_line\":")
+        sb = sb_append_int(sb, line0)
+        sb = sb_append(sb, ",\"start_column\":")
+        sb = sb_append_int(sb, col0)
+        sb = sb_append(sb, ",\"end_line\":")
+        sb = sb_append_int(sb, end_line0)
+        sb = sb_append(sb, ",\"end_column\":")
+        sb = sb_append_int(sb, end_col0)
+        sb = sb_append(sb, "},\"related_locations\":")
+        var sec_file_path0 = native_read_i64(d0 as i64, 96)
+        if sec_file_path0 == 0 and g_active_source_manager != 0 do
+            let sec_fid0 = native_read_i64(d0 as i64, 88)
+            if sec_fid0 > 0 do
+                sec_file_path0 = sm_get_file_path(g_active_source_manager, sec_fid0)
+            end
+        end
+        if sec_file_path0 == 0 do
+            sec_file_path0 = file_path0
+        end
+        let sec_line0 = native_read_i64(d0 as i64, 40)
+        var sec_col0 = native_read_i64(d0 as i64, 48)
+        let sec_note0 = native_read_i64(d0 as i64, 56) as string
+        if sec_col0 <= 0 and sec_line0 > 0 do sec_col0 = 1 end
+        if sec_line0 > 0 do
+            sb = sb_append(sb, "[{\"file\":\"")
+            sb = pass10_json_escape_cstr(sb, sec_file_path0)
+            sb = sb_append(sb, "\",\"line\":")
+            sb = sb_append_int(sb, sec_line0)
+            sb = sb_append(sb, ",\"column\":")
+            sb = sb_append_int(sb, sec_col0)
+            sb = sb_append(sb, ",\"message\":\"")
+            if (sec_note0 as i64) != 0 and fat_str_len(sec_note0) > 0 do
+                sb = pass10_json_escape_str(sb, sec_note0)
+            else
+                sb = sb_append(sb, "related location")
+            end
+            sb = sb_append(sb, "\"}]")
+        else
+            sb = sb_append(sb, "[]")
+        end
+        sb = sb_append(sb, ",\"diagnostics\":[")
+
+        var idx = 0
+        when idx < count loop
+            if idx > 0 do
+                sb = sb_append(sb, ",")
+            end
+            let cur_d = vec_get_rt(diag.diagnostics, idx)
+            sb = pass10_emit_json_one(sb, cur_d)
+            idx = idx + 1
+        end
+
+        sb = sb_append(sb, "],\"error_count\":")
+        sb = sb_append_int(sb, diag.error_count)
+        sb = sb_append(sb, ",\"warning_count\":")
+        sb = sb_append_int(sb, count - diag.error_count)
+        sb = sb_append(sb, ",\"compile_time_ms\":")
+        sb = sb_append_int(sb, elapsed_ms)
+        sb = sb_append(sb, "}")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+    g_compile_timer_printed = 1
+    out diag.error_count
+end.
+
+func virc_isatty(fd: int):
+    var buf = vir_alloc(16)
+    var rc = syscall3(0x2000036, fd, 0x40487413, buf)
+    if rc == 0 do out 1 end
+    out 0
+end.
+
+func virc_has_no_color():
+    let env_ptr_ptr = _NSGetEnviron()
+    if env_ptr_ptr == 0 do out 0 end
+    let env_ptr = native_read_i64(env_ptr_ptr, 0)
+    if env_ptr == 0 do out 0 end
+    var idx = 0
+    when true loop
+        let entry = native_read_i64(env_ptr, idx * 8)
+        if entry == 0 do out 0 end
+        if native_read_u8(entry, 0) == 78 and native_read_u8(entry, 1) == 79 and native_read_u8(entry, 2) == 95 and native_read_u8(entry, 3) == 67 and native_read_u8(entry, 4) == 79 and native_read_u8(entry, 5) == 76 and native_read_u8(entry, 6) == 79 and native_read_u8(entry, 7) == 82 and native_read_u8(entry, 8) == 61 do
+            out 1
+        end
+        idx = idx + 1
+    end
+    out 0
+end.
+
+func virc_should_color():
+    if g_color_mode == 1 do out 1 end
+    if g_color_mode == 2 do out 0 end
+    if virc_has_no_color() == 1 do out 0 end
+    if virc_isatty(1) == 1 do out 1 end
+    out 0
+end.
+
+func pass10_emit_diagnostics(diag: &DiagnosticEngine):
     count = vec_len_rt(diag.diagnostics)
     if count == 0 do
         out 0
     end
 
-    var i = 0
-    when i < count loop
-        d = vec_get_rt(diag.diagnostics, i)
-        pass10_print_one(d, source_path)
-        i = i + 1
+    if g_phase_timings == 1 and g_phase_semantic_start_us > 0 do
+        g_phase_semantic_us = virc_elapsed_us() - g_phase_semantic_start_us
+    end
+    if g_diag_json == 1 do
+        out pass10_emit_json(diag)
+    end
+
+    let use_color = virc_should_color()
+
+    if count <= 2 do
+        var i = 0
+        when i < count loop
+            d = vec_get_rt(diag.diagnostics, i)
+            pass10_print_one_detailed(d, use_color)
+            i = i + 1
+        end
+    else
+        var i = 0
+        when i < count loop
+            d = vec_get_rt(diag.diagnostics, i)
+            pass10_print_one_compact(d, use_color)
+            i = i + 1
+        end
+        print_ln("")
     end
 
     # Print summary
@@ -40,9 +468,11 @@ func pass10_emit_diagnostics(diag: &DiagnosticEngine, source_path: &string):
         sb_free(sb)
     end
 
+    virc_print_compile_time()
+
     out diag.error_count
 end.
-func pass10_code_to_prefix(level: i64Level):
+func pass10_code_to_prefix(level: int):
     if level == DiagnosticLevel.Warning do
         out "W"
     eif level == DiagnosticLevel.Info do
@@ -51,7 +481,7 @@ func pass10_code_to_prefix(level: i64Level):
     out "E"
 end.
 
-func pass10_code_to_result(level: i64Level):
+func pass10_code_to_result(level: int):
     if level == DiagnosticLevel.Warning do
         out "WARNING"
     eif level == DiagnosticLevel.Info do
@@ -73,12 +503,24 @@ end.
 
 func pass10_code_to_msg(code: int, extra: string):
     # Lexer errors (E0xxx)
-    if code == 1 or code == 101 do out "Invalid character in source" end
-    if code == 2 or code == 102 do out "Unterminated string literal" end
-    if code == 3 or code == 103 do out "Invalid numeric literal format" end
+    if code == 1 or code == 101 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do out extra end
+        out "Invalid character in source"
+    end
+    if code == 2 or code == 102 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do out extra end
+        out "Unterminated string literal"
+    end
+    if code == 3 or code == 103 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do out extra end
+        out "Invalid numeric literal format"
+    end
 
     # Parser errors (E1xxx)
-    if code == 1001 do out "Unexpected token in syntax rule" end
+    if code == 1001 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do out extra end
+        out "Unexpected token in syntax rule"
+    end
     if code == 1002 do out "Missing block delimiter 'end' or 'end.'" end
     if code == 1003 do out "Missing colon ':' after condition or signature" end
     if code == 1004 do out "Invalid expression syntax" end
@@ -92,14 +534,70 @@ func pass10_code_to_msg(code: int, extra: string):
     if code == 2003 or code == 3001 do out "Type mismatch in expression or operation" end
     if code == 2004 do out "Duplicate symbol definition in current scope" end
     if code == 2005 or code == 3012 do out "Invalid assignment target (not an l-value)" end
-    if code == 2101 do out "Malformed include statement" end
-    if code == 2102 do out "Included source not found" end
-    if code == 2103 do out "Invalid module path token" end
-    if code == 2104 do out "Include recursion or expansion limit reached" end
-    if code == 2111 do out "Malformed import statement" end
-    if code == 2112 do out "Imported module not found" end
-    if code == 2113 do out "Imported symbol not exported or not found" end
-    if code == 2114 do out "Import recursion or expansion limit reached" end
+    if code == 2101 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "failed to parse include statement name: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "failed to parse include statement name"
+    end
+    if code == 2102 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "included source not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "included source not found"
+    end
+    if code == 2103 do out "invalid token '::'; use '.' for qualified names" end
+    if code == 2104 do out "maximum include depth exceeded" end
+    if code == 2111 do out "empty or invalid module name in import" end
+    if code == 2112 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "imported module not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "imported module not found"
+    end
+    if code == 2113 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "imported symbol not exported: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "imported symbol not exported"
+    end
+    if code == 2114 do out "maximum import depth exceeded" end
+    if code == 2201 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "invalid UTF-8 in '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "invalid UTF-8 in source encoding"
+    end
     if code == 3002 do out "Invalid operator for operand type" end
     if code == 3003 do out "Assignment to immutable variable (declared with 'let')" end
     if code == 3004 do out "Type mismatch in variable assignment" end
@@ -423,17 +921,57 @@ func pass10_code_to_actions(code: int):
     out "• Review source code against Vir language specification"
 end.
 
-func pass10_print_one(d: Diagnostic, source_path: string):
-    # Cache the aggregate before the first call.  Native bootstrap calls may
-    # clobber entity wrapper locals, while these scalar fields stay stable.
+func pass10_color_red(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1;31m")
+    out sb
+end.
+
+func pass10_color_yellow(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1;33m")
+    out sb
+end.
+
+func pass10_color_bold(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1m")
+    out sb
+end.
+
+func pass10_color_reset(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[0m")
+    out sb
+end.
+
+func pass10_print_one_detailed(d: Diagnostic, use_color: int):
     let d_level = native_read_i64(d as i64, 0)
     let d_message = native_read_i64(d as i64, 8)
-    let d_line = native_read_i64(d as i64, 16)
-    let d_col = native_read_i64(d as i64, 24)
+    let d_span_id = native_read_i64(d as i64, 72)
+    var d_line = native_read_i64(d as i64, 16)
+    var d_col = native_read_i64(d as i64, 24)
     let d_extra = native_read_i64(d as i64, 32) as string
     let d_secondary_line = native_read_i64(d as i64, 40)
     let d_secondary_col = native_read_i64(d as i64, 48)
     let d_secondary_note = native_read_i64(d as i64, 56) as string
+    var actual_file = native_read_i64(d as i64, 80)
+    if d_span_id > 0 and g_active_source_manager != 0 do
+        let sp = sm_get_span(g_active_source_manager, d_span_id)
+        if sp != 0 do
+            d_line = native_read_i64(sp, 8)
+            d_col = native_read_i64(sp, 16)
+            let sp_fid = native_read_i64(sp, 0)
+            actual_file = sm_get_file_path(g_active_source_manager, sp_fid)
+        end
+    end
+
+    if actual_file == 0 or rt_strlen(actual_file) == 0 do
+        if g_active_source_manager != 0 do
+            actual_file = sm_get_file_path(g_active_source_manager, 0)
+        end
+    end
+
     arena:
         print_ln("═══════════════════════════════════════════════")
         print_ln("EXECUTION REPORT")
@@ -442,12 +980,29 @@ func pass10_print_one(d: Diagnostic, source_path: string):
 
         var sb = sb_new()
         sb = sb_append(sb, "Result      : ")
+        if use_color == 1 do
+            if d_level == DiagnosticLevel.Warning do
+                sb = pass10_color_yellow(sb)
+            else
+                sb = pass10_color_red(sb)
+            end
+        end
         sb = sb_append(sb, pass10_code_to_result(d_level))
+        if use_color == 1 do
+            sb = pass10_color_reset(sb)
+        end
         print_ln(sb_to_string(sb))
         sb_free(sb)
 
         var sb_code = sb_new()
         sb_code = sb_append(sb_code, "Code        : [")
+        if use_color == 1 do
+            if d_level == DiagnosticLevel.Warning do
+                sb_code = pass10_color_yellow(sb_code)
+            else
+                sb_code = pass10_color_red(sb_code)
+            end
+        end
         sb_code = sb_append(sb_code, pass10_code_to_prefix(d_level))
         if d_message < 1000 do
             sb_code = sb_append(sb_code, "0")
@@ -459,6 +1014,9 @@ func pass10_print_one(d: Diagnostic, source_path: string):
             sb_code = sb_append(sb_code, "0")
         end
         sb_code = sb_append_int(sb_code, d_message)
+        if use_color == 1 do
+            sb_code = pass10_color_reset(sb_code)
+        end
         sb_code = sb_append(sb_code, "] ")
         sb_code = sb_append(sb_code, pass10_code_to_phase(d_message))
         print_ln(sb_to_string(sb_code))
@@ -472,7 +1030,7 @@ func pass10_print_one(d: Diagnostic, source_path: string):
         print_ln("───────────────────────────────────────────────")
         var sb_loc = sb_new()
         sb_loc = sb_append(sb_loc, "File        : ")
-        sb_loc = sb_append(sb_loc, source_path)
+        sb_loc = sb_append(sb_loc, actual_file)
         print_ln(sb_to_string(sb_loc))
         sb_free(sb_loc)
 
@@ -518,6 +1076,15 @@ func pass10_print_one(d: Diagnostic, source_path: string):
         print_ln("Analysis")
         print_ln("───────────────────────────────────────────────")
         print_ln(pass10_code_to_msg(d_message, d_extra))
+        if d_message == 2102 or d_message == 2112 do
+            var sb_req = sb_new()
+            sb_req = sb_append(sb_req, "requested at ")
+            sb_req = sb_append(sb_req, actual_file)
+            sb_req = sb_append(sb_req, ":")
+            sb_req = sb_append_int(sb_req, d_line)
+            print_ln(sb_to_string(sb_req))
+            sb_free(sb_req)
+        end
         print_ln("")
 
         print_ln("Possible Causes")
@@ -534,4 +1101,78 @@ func pass10_print_one(d: Diagnostic, source_path: string):
     end
 end.
 
-export pass10_emit_diagnostics
+func pass10_print_one_compact(d: Diagnostic, use_color: int):
+    let d_level = native_read_i64(d as i64, 0)
+    let d_message = native_read_i64(d as i64, 8)
+    let d_span_id = native_read_i64(d as i64, 72)
+    var d_line = native_read_i64(d as i64, 16)
+    var d_col = native_read_i64(d as i64, 24)
+    let d_extra = native_read_i64(d as i64, 32) as string
+    var actual_file = native_read_i64(d as i64, 80)
+    if d_span_id > 0 and g_active_source_manager != 0 do
+        let sp = sm_get_span(g_active_source_manager, d_span_id)
+        if sp != 0 do
+            d_line = native_read_i64(sp, 8)
+            d_col = native_read_i64(sp, 16)
+            let sp_fid = native_read_i64(sp, 0)
+            actual_file = sm_get_file_path(g_active_source_manager, sp_fid)
+        end
+    end
+
+    if actual_file == 0 or rt_strlen(actual_file) == 0 do
+        if g_active_source_manager != 0 do
+            actual_file = sm_get_file_path(g_active_source_manager, 0)
+        end
+    end
+
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "[")
+        if use_color == 1 do sb = pass10_color_bold(sb) end
+        sb = sb_append(sb, actual_file)
+        sb = sb_append(sb, ":")
+        sb = sb_append_int(sb, d_line)
+        sb = sb_append(sb, ":")
+        if d_col > 0 do
+            sb = sb_append_int(sb, d_col)
+        else
+            sb = sb_append_int(sb, 1)
+        end
+        if use_color == 1 do sb = pass10_color_reset(sb) end
+        sb = sb_append(sb, "] [")
+        if use_color == 1 do
+            if d_level == DiagnosticLevel.Warning do
+                sb = pass10_color_yellow(sb)
+            else
+                sb = pass10_color_red(sb)
+            end
+        end
+        sb = sb_append(sb, pass10_code_to_prefix(d_level))
+        if d_message < 1000 do sb = sb_append(sb, "0") end
+        if d_message < 100 do sb = sb_append(sb, "0") end
+        if d_message < 10 do sb = sb_append(sb, "0") end
+        sb = sb_append_int(sb, d_message)
+        if use_color == 1 do sb = pass10_color_reset(sb) end
+        sb = sb_append(sb, "] ")
+        sb = sb_append(sb, pass10_code_to_msg(d_message, d_extra))
+        if d_message == 2102 or d_message == 2112 do
+            sb = sb_append(sb, " requested at ")
+            sb = sb_append(sb, actual_file)
+            sb = sb_append(sb, ":")
+            sb = sb_append_int(sb, d_line)
+        end
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+end.
+
+func pass10_print_one(d: Diagnostic):
+    pass10_print_one_detailed(d, 0)
+end.
+
+export pass10_emit_diagnostics, pass10_print_one, pass10_emit_json,
+       virc_timer_init, virc_elapsed_us, virc_print_compile_time, virc_print_phase_timings,
+       g_color_mode, g_diag_json, g_phase_timings, g_time_buf_start, g_compile_timer_printed,
+       g_phase_read_us, g_phase_preprocess_us, g_phase_lex_us, g_phase_parse_us,
+       g_phase_semantic_us, g_phase_semantic_start_us, g_phase_lower_us,
+       g_phase_codegen_us, g_phase_link_us
