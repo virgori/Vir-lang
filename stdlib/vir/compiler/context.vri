@@ -47,6 +47,11 @@ func get_interned_string(interner: StringInterner, id: i64)
     strs = native_read_i64(interner as i64, 0)
     out vec_get_rt(strs, id)
 end.
+include source_manager
+import SourceFile, SourceMapSegment, SourceSpan, SourceManager, g_active_source_manager,
+       sm_new, sm_register_file, sm_get_file_path, sm_add_segment, sm_find_segment,
+       sm_file_from_line, sm_line_from_expanded, sm_add_span, sm_get_span, sm_build_from_source from source_manager
+
 # ═══════════════════════════════════════════════════════
 # Diagnostic Engine
 # ═══════════════════════════════════════════════════════
@@ -58,13 +63,18 @@ enum DiagnosticLevel:
 end.
 entity Diagnostic:
     level: DiagnosticLevel,
-        message: i64; # InternID
+    message: i64; # InternID
     line: i64,
-        col: i64,
-        extra: string,
-        secondary_line: i64,
-        secondary_col: i64,
-        secondary_note: string
+    col: i64,
+    extra: string,
+    secondary_line: i64,
+    secondary_col: i64,
+    secondary_note: string,
+    file_id: i64,
+    span_id: i64,
+    file_path: string,
+    secondary_file_id: i64,
+    secondary_file_path: string
 end.
 entity DiagnosticEngine:
     diagnostics: i64; # vec of Diagnostic
@@ -76,19 +86,54 @@ func diagnostic_engine_new()
         error_count: 0
     )
 end.
-func report_error(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64)
-    report_error_info(engine, message_id, line, col, "")
-end.
-func report_error_info(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64, extra: string)
+func report_error_loc_related(engine: &DiagnosticEngine, message_id: i64, file_id: i64, line: i64, col: i64, extra: string, secondary_line: i64, secondary_col: i64, secondary_note: string):
+    var cur_file = 0
+    var cur_fid = file_id
+    var cur_line = line
+    if g_active_source_manager != 0 do
+        if cur_fid == 0 and cur_line > 0 do
+            cur_fid = sm_file_from_line(g_active_source_manager, cur_line)
+            cur_line = sm_line_from_expanded(g_active_source_manager, cur_line)
+        end
+        # Always resolve the display path so the renderer never needs source_path.
+        cur_file = sm_get_file_path(g_active_source_manager, cur_fid)
+        if cur_file == 0 do
+            cur_file = sm_get_file_path(g_active_source_manager, 0)
+        end
+    end
+    var source_col = col
+    if source_col <= 0 do source_col = 1 end
+    var source_span = 0
+    if g_active_source_manager != 0 do
+        source_span = sm_add_span(g_active_source_manager, cur_fid, cur_line, source_col, cur_line, source_col + 1)
+    end
+    var sec_line = secondary_line
+    var sec_col = secondary_col
+    var sec_fid = 0
+    var sec_file = 0
+    if g_active_source_manager != 0 and sec_line > 0 do
+        sec_fid = sm_file_from_line(g_active_source_manager, sec_line)
+        sec_line = sm_line_from_expanded(g_active_source_manager, sec_line)
+        sec_file = sm_get_file_path(g_active_source_manager, sec_fid)
+    end
+    if sec_file == 0 do
+        sec_file = cur_file
+    end
+    if sec_col <= 0 and sec_line > 0 do sec_col = 1 end
     d = Diagnostic(
         level: DiagnosticLevel.Error,
         message: message_id,
-        line: line,
-        col: col,
+        line: cur_line,
+        col: source_col,
         extra: extra,
-        secondary_line: 0,
-        secondary_col: 0,
-        secondary_note: ""
+        secondary_line: sec_line,
+        secondary_col: sec_col,
+        secondary_note: secondary_note,
+        file_id: cur_fid,
+        span_id: source_span,
+        file_path: cur_file,
+        secondary_file_id: sec_fid,
+        secondary_file_path: sec_file
     )
     diags = native_read_i64(engine as i64, 0)
     diags = vec_push_rt(diags, d)
@@ -96,30 +141,65 @@ func report_error_info(engine: &DiagnosticEngine, message_id: i64, line: i64, co
     errs = native_read_i64(engine as i64, 8)
     native_write_i64(engine as i64, 8, errs + 1)
 end.
+func report_error_loc(engine: &DiagnosticEngine, message_id: i64, file_id: i64, line: i64, col: i64, extra: string):
+    report_error_loc_related(engine, message_id, file_id, line, col, extra, 0, 0, "")
+end.
+func report_error(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64):
+    report_error_info(engine, message_id, line, col, "")
+end.
+func report_error_info(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64, extra: string):
+    report_error_loc(engine, message_id, 0, line, col, extra)
+end.
 func report_error_related(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64,
                           extra: string, secondary_line: i64, secondary_col: i64, secondary_note: string):
     var related_line = secondary_line
     if related_line <= 0 do
         related_line = line
     end
-    # Negative legacy column is a bootstrap-stable carrier for the secondary
-    # line.  Newer diagnostic printers decode it as a related location.
-    report_error_info(engine, message_id, line, 0 - related_line, extra)
+    report_error_loc_related(engine, message_id, 0, line, col, extra, related_line, secondary_col, secondary_note)
 end.
-func report_warning(engine: DiagnosticEngine, message_id: i64, line: i64, col: i64)
+func report_warning_loc(engine: &DiagnosticEngine, message_id: i64, file_id: i64, line: i64, col: i64, extra: string):
+    var cur_file = 0
+    var cur_fid = file_id
+    var cur_line = line
+    if g_active_source_manager != 0 do
+        if cur_fid == 0 and cur_line > 0 do
+            cur_fid = sm_file_from_line(g_active_source_manager, cur_line)
+            cur_line = sm_line_from_expanded(g_active_source_manager, cur_line)
+        end
+        # Always resolve the display path so the renderer never needs source_path.
+        cur_file = sm_get_file_path(g_active_source_manager, cur_fid)
+        if cur_file == 0 do
+            cur_file = sm_get_file_path(g_active_source_manager, 0)
+        end
+    end
+    var source_col = col
+    if source_col <= 0 do source_col = 1 end
+    var source_span = 0
+    if g_active_source_manager != 0 do
+        source_span = sm_add_span(g_active_source_manager, cur_fid, cur_line, source_col, cur_line, source_col + 1)
+    end
     d = Diagnostic(
         level: DiagnosticLevel.Warning,
         message: message_id,
-        line: line,
-        col: col,
-        extra: "",
+        line: cur_line,
+        col: source_col,
+        extra: extra,
         secondary_line: 0,
         secondary_col: 0,
-        secondary_note: ""
+        secondary_note: "",
+        file_id: cur_fid,
+        span_id: source_span,
+        file_path: cur_file,
+        secondary_file_id: 0,
+        secondary_file_path: 0
     )
     diags = native_read_i64(engine as i64, 0)
     diags = vec_push_rt(diags, d)
     native_write_i64(engine as i64, 0, diags)
+end.
+func report_warning(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64):
+    report_warning_loc(engine, message_id, 0, line, col, "")
 end.
 func has_errors(engine: DiagnosticEngine)
     errs = native_read_i64(engine as i64, 8)

@@ -1558,8 +1558,20 @@ run_group_28() {
     echo "──────────────────────────────────────────────────────────────────────────"
     if [ "$MODE" = "min" ]; then
         run_test_in_group 28 "tests/virgex_date.vri"
+        run_test_in_group 28 "tests/virgex_email.vri"
+        run_test_in_group 28 "tests/virgex_phone.vri"
+        run_test_in_group 28 "tests/strict_v2/test_pattern_virgex_regex_equiv.vri"
+        run_test_in_group 28 "tests/strict_v2/test_virgex_lexer_parser.vri"
+        run_test_in_group 28 "tests/strict_v2/test_virgex_e2e_compiler.vri"
+        run_test_in_group 28 "tests/strict_v2/test_virgex_multilingual_integration.vri"
     else
         run_test_in_group 28 "tests/virgex_date.vri"
+        run_test_in_group 28 "tests/virgex_email.vri"
+        run_test_in_group 28 "tests/virgex_phone.vri"
+        run_test_in_group 28 "tests/strict_v2/test_pattern_virgex_regex_equiv.vri"
+        run_test_in_group 28 "tests/strict_v2/test_virgex_lexer_parser.vri"
+        run_test_in_group 28 "tests/strict_v2/test_virgex_e2e_compiler.vri"
+        run_test_in_group 28 "tests/strict_v2/test_virgex_multilingual_integration.vri"
     fi
     local pass_cnt=${GP_PASS[28]}
     local fail_cnt=${GP_FAIL[28]}

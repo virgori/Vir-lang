@@ -155,7 +155,6 @@ end.
 func parse_float(s: string) -> int:
     out 0
 end.
-
 # @vir_source stdlib/vir/compiler/syscall.vri 18
 
 # ═══════════════════════════════════════════════════════
@@ -839,8 +838,8 @@ func read_file_raw(path: int):
 
     # Allocate buffer via mmap
     let buf = sys_mmap(0, end_pos + 1,
-                       PROT_READ or PROT_WRITE,
-                       MAP_PRIVATE or map_anon, -1, 0)
+                       PROT_READ bit_or PROT_WRITE,
+                       MAP_PRIVATE bit_or map_anon, -1, 0)
     if buf < 0 do
         sys_close(fd)
         out 0
@@ -870,7 +869,7 @@ func write_file_raw:
         data: int
         len: int
         mode: int
-    let fd = sys_open(path, O_WRONLY or O_CREAT or O_TRUNC, mode)
+    let fd = sys_open(path, VIR_O_WRONLY bit_or VIR_O_CREAT bit_or VIR_O_TRUNC, mode)
     if fd < 0 do
         out -1
     end
@@ -887,38 +886,9 @@ func write_file_raw:
     sys_close(fd)
     out 0
 end.
-
 # @vir_source stdlib/vir/compiler/virc.vri 20
 import sys_exit, sys_write, SYS_EXIT, SYS_WRITE from rt.syscall
 # @vir_source stdlib/vir/compiler/alloc.vri 1
-###
- * vir/rt/alloc.vri — Memory Allocator (Pure Vir, No libc)
- * ========================================================
- * Strict Two-Level Segregated Fit (TLSF) O(1) Allocator + Bump Arena.
- * Zero C library. Zero malloc. Zero free. Pure kernel syscalls.
- *
- * Strategy:
- *   - Arena (bump) allocator for fast sequential allocation (lex, parse, IR).
- *   - Two-Level Segregated Fit (TLSF) O(1) segregated-bin heap allocator.
- *     * O(1) allocate, O(1) free, O(1) bidirectional coalescing.
- *     * Constant-time bitmap search (FL/SL bitmaps) via branchless bit-scan (ffs/fls).
- *     * Intrusive doubly-linked lists inside free block payloads.
- *     * Boundary tags with prev_size for O(1) bidirectional coalescing.
- *   - Page allocator (mmap/munmap) as the backing layer.
- *
- * Memory block layout:
- *   Allocated block:
- *     [size_and_flags: i64]  (offset 0)  - bit 0: BLOCK_FREE (0), bit 1: PREV_FREE
- *     [prev_size: i64]       (offset 8)  - size of physically preceding block
- *     [user payload...]      (offset 16) - returned to user
- *
- *   Free block (minimum 32 bytes):
- *     [size_and_flags: i64]  (offset 0)  - bit 0: BLOCK_FREE (1), bit 1: PREV_FREE
- *     [prev_size: i64]       (offset 8)  - size of physically preceding block
- *     [prev_free: i64]       (offset 16) - intrusive doubly-linked list prev
- *     [next_free: i64]       (offset 24) - intrusive doubly-linked list next
- ##
-
 ##
  * vir/rt/alloc.vri — Memory Allocator (Pure Vir, No libc)
  * ========================================================
@@ -972,7 +942,19 @@ const MAX_ALLOC_SIZE:        1073741824;   # 1GB: maximum permissible allocation
 const FL_INDEX_COUNT:        28;           # 28 first-level classes (size 32 B to 4 GB)
 const SL_INDEX_COUNT:        16;           # 16 second-level bins per class
 const TOTAL_BINS:            448;          # 28 * 16 = 448 bins
-const HEAP_THREAD_SAFE:      false;        # native allocator is single-threaded / non-concurrent
+# THREAD SAFETY CONTRACT (Phase 2):
+# The Vir native heap allocator is deliberately single-threaded.
+# Design rationale:
+#   - The arena/bump allocator (X28/s11) is per-thread by convention: each thread
+#     uses its own stack-relative arena frame, so arena alloc/reset needs no lock.
+#   - The global TLSF heap (g_tlsf_ctrl) is shared state without atomics/locks.
+#     Concurrent heap_alloc/heap_free from multiple threads causes data races.
+# Contract for callers:
+#   Option A (recommended): use arena: blocks exclusively — no heap sharing needed.
+#   Option B: wrap heap_alloc/heap_free with a platform mutex if sharing is required.
+#   Option C: use per-thread arenas with one TLSF heap per thread (planned Phase 3).
+# Future: a lock-free allocator using CAS on bin heads is planned for Phase 3.
+const HEAP_THREAD_SAFE: false;
 
 # ═══════════════════════════════════════════════════════
 # Portable Virtual Memory Layer (vm_alloc/vm_free)
@@ -1147,6 +1129,10 @@ func tlsf_seg_add(base: int, size: int):
     extern func native_write_i64(addr: int, offset: int, val: int)
     let cnt = native_read_i64(g_tlsf_ctrl, 3840)
     if cnt < 2048 do
+        # Keep the segment registry ordered by address. Segment creation is a
+        # cold path, so paying for insertion here lets heap_free validate a
+        # pointer with a bounded binary search instead of scanning every
+        # segment on the hot path.
         var pos = cnt
         when pos > 0 and native_read_i64(g_tlsf_ctrl, 3848 + (pos - 1) * 16) > base loop
             let prev_off = 3848 + (pos - 1) * 16
@@ -1161,7 +1147,7 @@ func tlsf_seg_add(base: int, size: int):
         native_write_i64(g_tlsf_ctrl, 3840, cnt + 1)
     else
         extern func sys_exit(code: int)
-        sys_exit(140)
+        sys_exit(134)
     end
 end.
 
@@ -1172,13 +1158,19 @@ func tlsf_seg_find(block: int) -> int:
     when lo < hi loop
         let mid = lo + (hi - lo) / 2
         let base = tlsf_seg_base(mid)
-        if block < base do hi = mid else lo = mid + 1 end
+        if block < base do
+            hi = mid
+        else
+            lo = mid + 1
+        end
     end
     let idx = lo - 1
     if idx >= 0 do
         let base = tlsf_seg_base(idx)
         let size = tlsf_seg_size(idx)
-        if block >= base and block + MIN_BLOCK_SIZE <= base + size do out idx end
+        if block >= base and block + MIN_BLOCK_SIZE <= base + size do
+            out idx
+        end
     end
     out 0 - 1
 end.
@@ -1555,11 +1547,7 @@ func heap_init(size: int):
 end.
 
 func heap_alloc(size: int):
-    # 1. Validation: reject non-positive or oversized allocations
-    if size <= 0 do
-        out 0
-    end
-    if size > MAX_ALLOC_SIZE do
+    if size <= 0 or size > MAX_ALLOC_SIZE do
         out 0
     end
 
@@ -1601,13 +1589,7 @@ func heap_alloc(size: int):
 
     var bin_idx = tlsf_search_suitable_bin(needed)
     if bin_idx < 0 do
-        var grow = needed + MIN_ARENA_SIZE * 4
-        if grow < g_heap.capacity / 4 do
-            grow = g_heap.capacity / 4
-        end
-        if grow > 67108864 do
-            grow = 67108864
-        end
+        var grow = needed + MIN_ARENA_SIZE
         let ps = rt_page_size()
         grow = ((grow + ps - 1) / ps) * ps
 
@@ -1688,7 +1670,8 @@ func heap_free(p: int):
 
     let block = p - BLOCK_HEADER
 
-    # Ordered registry lookup avoids a linear scan on the free hot path.
+    # Prove pointer validity before dereferencing. The ordered segment registry
+    # makes this O(log segment_count), never a linear scan through every arena.
     var is_valid = 0
     var is_direct = 0
     if tlsf_seg_find(block) >= 0 do
@@ -1732,7 +1715,16 @@ func heap_free(p: int):
 
     let original_size = raw bit_and ~(FLAG_MASK)
     # Hardened block size validation: must be at least MIN_BLOCK_SIZE and 16-byte aligned
-    if original_size < MIN_BLOCK_SIZE or (original_size bit_and (ALIGNMENT - 1)) != 0 do
+    if original_size < MIN_BLOCK_SIZE or original_size > MAX_ALLOC_SIZE or (original_size bit_and (ALIGNMENT - 1)) != 0 do
+        sys_exit(134)
+        out 0
+    end
+
+    # Boundary tag reciprocity: next block must have prev_size == original_size and PREV_FREE == 0
+    let next_b = block + original_size
+    let next_raw = native_read_i64(next_b, 0)
+    let next_prev = native_read_i64(next_b, 8)
+    if next_prev != original_size or (next_raw bit_and PREV_FREE) != 0 do
         sys_exit(134)
         out 0
     end
@@ -2180,6 +2172,72 @@ func alloc_zeroed(size: int):
     end
     out p
 end.
+
+# ═══════════════════════════════════════════════════════
+# Deep Graph Promotion Runtime (MIR_MEM_PROMOTE)
+# ═══════════════════════════════════════════════════════
+
+func rt_promote_graph(p: int, arena_base: int, arena_top: int) -> int:
+    if p < 65536 do out p end
+    if arena_base <= 0 or arena_top <= arena_base do out p end
+    if p < arena_base or p >= arena_top do out p end
+
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    let hdr = p - 16
+    let mark_flag = native_read_i64(hdr, 8)
+    # Check if already promoted (cycle / alias handling)
+    if mark_flag == 0 - 1 do
+        out native_read_i64(hdr, 0)
+    end
+
+    let total_size = native_read_i64(hdr, 0)
+    var size = 0
+    if total_size >= 16 and total_size <= 67108864 and (total_size bit_and 15) == 0 do
+        # Arena headers record header + aligned payload. vir_alloc() expects
+        # payload bytes, so never copy the 16-byte header as object data.
+        size = total_size - 16
+    else
+        let n_elem = native_read_i64(p, 0)
+        if n_elem >= 0 and n_elem < 8388608 do
+            size = 16 + n_elem * 8
+            size = (size + 15) bit_and (0 - 16)
+        else
+            size = 32
+        end
+    end
+
+    let new_p = vir_alloc(size)
+    if new_p == 0 do
+        extern func sys_exit(code: int)
+        sys_exit(1)
+    end
+
+    # Copy payload
+    var off = 0
+    when off < size loop
+        native_write_i64(new_p, off, native_read_i64(p, off))
+        off = off + 8
+    end
+
+    # Mark original object as forwarded: hdr[8] = -1, hdr[0] = new_p
+    native_write_i64(hdr, 8, 0 - 1)
+    native_write_i64(hdr, 0, new_p)
+
+    # Recursively traverse and promote child pointers
+    off = 0
+    when off < size loop
+        let child = native_read_i64(new_p, off)
+        if child >= 65536 and child >= arena_base and child < arena_top do
+            let prom_child = rt_promote_graph(child, arena_base, arena_top)
+            native_write_i64(new_p, off, prom_child)
+        end
+        off = off + 8
+    end
+
+    out new_p
+end.
 # @vir_source stdlib/vir/compiler/virc.vri 22
 import vir_alloc, vir_free, vir_realloc, heap_init, heap_verify from rt.alloc
 # @vir_source stdlib/vir/compiler/string_rt.vri 1
@@ -2197,9 +2255,8 @@ import vir_alloc, vir_free, vir_realloc, heap_init, heap_verify from rt.alloc
 
 module vir.rt.string_rt
 
-
 # @vir_source stdlib/vir/compiler/string_rt.vri 17
-import vir_alloc, vir_free, vir_realloc, page_alloc from alloc
+import vir_alloc, vir_free, vir_realloc from rt.alloc
 
 # ═══════════════════════════════════════════════════════
 # Low-level byte access (compiler intrinsics)
@@ -2825,7 +2882,6 @@ func sb_free(sb: StringBuilder):
     # The self-host runtime is arena-backed; individual frees are no-ops.
     out 0
 end.
-
 # @vir_source stdlib/vir/compiler/virc.vri 24
 import rt_strlen, rt_strcmp, rt_streq, rt_strcat, rt_strdup,
        rt_itoa, rt_atoi, StringBuilder, sb_new, sb_append,
@@ -2847,8 +2903,7 @@ module vir.rt.io
 import sys_read, sys_write, sys_open, sys_close, sys_lseek,
     sys_fstat, STDIN_FD, STDOUT_FD, STDERR_FD,
     O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND from syscall
-import vir_alloc, vir_free, vir_realloc, page_alloc from alloc
-
+import vir_alloc, vir_free, vir_realloc from alloc
 # @vir_source stdlib/vir/compiler/io.vri 21
 import rt_strlen, rt_itoa, sb_new, sb_append, sb_append_char,
     sb_append_int, sb_to_string, sb_free, StringBuilder from string_rt
@@ -3090,12 +3145,12 @@ func read_file_str(path: int):
     let sz = sys_lseek(fd, 0, 2)
     sys_lseek(fd, 0, 0)
     if sz <= 0 do
-        var cap = 65536
-        var content = vir_alloc(cap)
-        var total = 0
-        var reading = 1
+        var cap: int = 65536
+        var f_buf: int = vir_alloc(cap)
+        var total: int = 0
+        var reading: int = 1
         when reading == 1 loop
-            let n = sys_read(fd, content + total, cap - total - 1)
+            let n = sys_read(fd, f_buf + total, cap - total - 1)
             if n == -4 do
                 skip
             end
@@ -3106,22 +3161,22 @@ func read_file_str(path: int):
             total = total + n
             if total + 1 >= cap do
                 cap = cap * 2
-                content = vir_realloc(content, cap)
+                f_buf = vir_realloc(f_buf, cap)
             end
         end
-        native_write_u8(content, total, 0)
+        native_write_u8(f_buf, total, 0)
         sys_close(fd)
-        out content
+        out f_buf
     end
-    let content = vir_alloc(sz + 1)
-    var total = 0
-    var reading = 1
+    let f_buf: int = vir_alloc(sz + 1)
+    var total: int = 0
+    var reading: int = 1
     when total < sz and reading == 1 loop
-        var to_read = sz - total
+        var to_read: int = sz - total
         if to_read > 65536 do
             to_read = 65536
         end
-        let n = sys_read(fd, content + total, to_read)
+        let n = sys_read(fd, f_buf + total, to_read)
         if n == -4 do
             skip
         end
@@ -3131,9 +3186,9 @@ func read_file_str(path: int):
         end
         total = total + n
     end
-    native_write_u8(content, total, 0)
+    native_write_u8(f_buf, total, 0)
     sys_close(fd)
-    out content
+    out f_buf
 end.
 # ═══════════════════════════════════════════════════════
 # Convenience: Write string to file by path
@@ -3166,7 +3221,6 @@ func write_file_bytes:
     sys_close(f.fd)
     out true
 end.
-
 # @vir_source stdlib/vir/compiler/virc.vri 29
 import print_str, print_int, print_ln, print_newline, eprint_ln,
         file_open_read, file_read_all, file_close,
@@ -3478,7 +3532,6 @@ func bvec_free(v: int):
         vir_free(v - HEADER_SIZE)
     end
 end.
-
 # @vir_source stdlib/vir/compiler/virc.vri 33
 import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt,
        vec_free_rt, bvec_new, bvec_push, bvec_push_u32_le,
@@ -3548,7 +3601,6 @@ end.
 
 # Syscall intrinsics (compiled to SVC / SYSCALL instructions)
 # syscall0..6 → mov args to regs, mov sysnum to x16/x8/rax, svc/syscall
-
 # @vir_source stdlib/vir/compiler/virc.vri 38
 import rt_argc, rt_argv from rt.start
 # Note: vir.str.string removed — compiler modules use stdlib/vir/string.vri shim instead
@@ -3570,15 +3622,13 @@ import rt_argc, rt_argv from rt.start
  ##
 module vir.compiler.macho
 
-
 # @vir_source stdlib/vir/compiler/macho.vri 17
+import vir_alloc, vir_free from alloc
 import bvec_new, bvec_push, bvec_push_u16_le, bvec_push_u32_le, bvec_push_u64_le,
-    bvec_len, bvec_get, bvec_set, bvec_patch_u32_le, bvec_data_ptr, bvec_free,
-    vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt
-
+    bvec_len, bvec_get, bvec_set, bvec_patch_u32_le, bvec_data_ptr, bvec_free, bvec_append_bytes,
 # @vir_source stdlib/vir/compiler/macho.vri 21
+    vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt
 import write_file_bytes from io
-import rt_strlen, fat_str_new, fat_str_eq, fat_str_len, fat_str_byte_at from string_rt
 # @vir_source stdlib/vir/compiler/ffi_imports.vri 1
 ##
  * vir/compiler/ffi_imports.vri — target-neutral external symbol registry
@@ -3736,9 +3786,12 @@ export ffi_import_reset, ffi_import_register, ffi_import_find, ffi_import_count,
        ffi_import_used_count, ffi_import_used_at,
        ffi_arm64_stubs_reset, ffi_arm64_stub_add, ffi_arm64_stub_offset,
        MACHO_FFI_CODE_OFFSET
-
 # @vir_source stdlib/vir/compiler/macho.vri 25
+import rt_strlen, fat_str_new, fat_str_eq, fat_str_len, fat_str_byte_at from string_rt
 import ffi_import_used_count, ffi_import_used_at, ffi_import_name, ffi_import_source, ffi_source_is_os, ffi_arm64_stub_offset from compiler.ffi_imports
+
+extern func native_read_i64(addr: int, offset: int) -> int
+extern func native_write_i64(addr: int, offset: int, val: int)
 
 # ═══════════════════════════════════════════════════════
 # Mach-O Constants
@@ -4684,7 +4737,6 @@ func macho_write_to_file(b: MachOBuilder, path: i64):
     write_file_bytes(path, data, size, 493)
     out true
 end.
-
 # @vir_source stdlib/vir/compiler/virc.vri 44
 import MachOBuilder, macho_new, macho_write_to_file from compiler.macho
 # @vir_source stdlib/vir/compiler/elf.vri 1
@@ -5125,15 +5177,37 @@ func elf_write_to_file(b: ElfBuilder, path: int):
     write_file_bytes(path, data, size, 0o755)
     out true
 end.
+# @vir_source stdlib/vir/compiler/pe.vri 1
+##
+ * vir/compiler/pe.vri — Windows PE32+ Executable Emitter (Pure Vir)
+ * =================================================================
+ * Emits a complete PE32+ (64-bit Portable Executable) for Windows
+ * x86_64 (AMD64) and Windows ARM64. No external linker or SDK needed.
+ *
+ * Produces a valid Windows 64-bit console executable:
+ *   DOS Header → DOS Stub → PE Signature → COFF Header →
+ *   PE32+ Optional Header → Section Header (.text) → Header Padding →
+ *   .text Section Data (Machine Code)
+ ##
+module vir.compiler.pe
+
+import bvec_new, bvec_push, bvec_push_u16_le, bvec_push_u32_le, bvec_push_u64_le,
+    bvec_len, bvec_get, bvec_set, bvec_data_ptr, bvec_free from vec_rt
+import write_file_bytes from io
 
 # ═══════════════════════════════════════════════════════
-# PE32+ (64-bit Windows Executable) Emitter
+# PE Constants
 # ═══════════════════════════════════════════════════════
 
 const IMAGE_FILE_MACHINE_AMD64: int = 0x8664
 const IMAGE_FILE_MACHINE_ARM64: int = 0xAA64
+
 const PE_FILE_ALIGN: int = 512
 const PE_SEC_ALIGN:  int = 4096
+
+# ═══════════════════════════════════════════════════════
+# PeBuilder Entity
+# ═══════════════════════════════════════════════════════
 
 entity PeBuilder:
     buf: int,          # bvec byte buffer
@@ -5293,8 +5367,10 @@ func pe_write_to_file(b: PeBuilder, path: int):
     out true
 end.
 
+export PeBuilder, pe_new, pe_emit, pe_write_to_file
 # @vir_source stdlib/vir/compiler/virc.vri 46
 import ElfBuilder, elf_new, elf_write_to_file from rt.elf
+import PeBuilder, pe_new, pe_write_to_file from compiler.pe
 
 # ── Compiler modules (self-hosting, pure Vir) ──
 # @vir_source stdlib/vir/compiler/lexer.vri 1
@@ -5337,7 +5413,6 @@ end.
 func is_none(opt: Option):
     out !is_some(opt)
 end.
-
 # @vir_source stdlib/vir/compiler/result_prelude.vri 6
 
 enum Result:
@@ -5355,7 +5430,6 @@ end.
 func is_err(r: Result):
     out !is_ok(r)
 end.
-
 # @vir_source stdlib/vir/compiler/lexer.vri 16
 import Result, Ok, Err from result
 import fat_str_new, fat_str_concat, fat_str_len, fat_str_byte_at, fat_str_eq, fat_str_eq_span, fat_str_slice,
@@ -5465,6 +5539,7 @@ func vec_set:
 end.
 # @vir_source stdlib/vir/compiler/lexer.vri 24
 import Vec, vec_new, vec_push, vec_len, vec_get, vec_reserve from vec
+import g_active_source_manager, sm_file_from_line, sm_line_from_expanded from source_manager
 
 # ═══════════════════════════════════════════════════════
 # Token Types (v1.2 Standard)
@@ -6933,7 +7008,32 @@ func lex_interpolated_string(ref lex: Lexer):
                         lex = l_n
                         paren_depth = paren_depth - 1
                         lex.tokens = vec_push(lex.tokens, token_new(TokType.RParen, lex.line, lex.col))
-                    eif c_in == 34 or c_in == 39 do
+                    eif c_in == 10 do # newline
+                        paren_depth = 0
+                    eif c_in == 34 do
+                        var scan_p = lex.pos + 1
+                        var has_inner_closing = 0
+                        when scan_p < lex.source_len loop
+                            let sc = native_read_u8(g_lexer_source_data, scan_p)
+                            if sc == 10 or sc == 0 do
+                                scan_p = lex.source_len
+                            eif sc == 92 do
+                                scan_p = scan_p + 2
+                            eif sc == 34 do
+                                has_inner_closing = 1
+                                scan_p = lex.source_len
+                            else
+                                scan_p = scan_p + 1
+                            end
+                        end
+                        if has_inner_closing == 1 do
+                            var (l_n, s_tok) = lex_string(lex)
+                            lex = l_n
+                            lex.tokens = vec_push(lex.tokens, s_tok)
+                        else
+                            paren_depth = 0
+                        end
+                    eif c_in == 39 do
                         var (l_n, s_tok) = lex_string(lex)
                         lex = l_n
                         lex.tokens = vec_push(lex.tokens, s_tok)
@@ -7275,9 +7375,9 @@ func tokenize(ref lex: Lexer):
         # `::` is not a Vir token. Reject it explicitly so users get one
         # stable diagnostic instead of two cascading ':' parse errors.
         if c == 58 and c2 == 58 do
-            err_str = g_lexer_err_double_colon as string
+            err_str = "invalid token '::'; use '.' for qualified names"
             lex.error_msg = err_str
-            g_lexer_error = g_lexer_err_double_colon
+            g_lexer_error = err_str as i64
             tok = token_new(TokType.Error, lex.line, lex.col)
             tok.str_val = err_str
             tok.int_val = 112
@@ -8010,14 +8110,14 @@ end.
 
 entity AstNode:
     name:           string,
-        name2:          string,
-        node_type:      AstType,
-        op:             OpType,
-        line:           int,
-        int_val:        int,
-        float_val:      float,
-        builtin_id:     int,
-        children:       int
+    name2:          string,
+    node_type:      AstType,
+    op:             OpType,
+    line:           int,
+    int_val:        int,
+    float_val:      float,
+    builtin_id:     int,
+    children:       int
 end.
 
 # Bump-pointer AST arena: one slab for child vecs + node handle log (reset per parse).
@@ -8511,10 +8611,7 @@ func parse_error(ref p: Parser, msg: string):
 
     if rt_strlen(p.error_msg) == 0 do
         t = peek(p)
-        p.error_msg = rt_strcat(
-            rt_strcat(rt_strcat("line ", rt_itoa(t.line)), rt_strcat(": ", msg)),
-            ""
-        )
+        p.error_msg = msg
         if check(p, TokType.Eof) do
             p.error_msg = rt_strcat(p.error_msg, " (at EOF)")
         else
@@ -9881,6 +9978,7 @@ func parse_unary(ref p: Parser):
                 mc_name = tok_lex(field_tok)
                 mc.name = mc_name
                 mc.line = field_tok.line
+                mc.int_val = field_tok.col
                 mc = ast_add_child(mc, left)
                 var (p5, _) = advance(p4)
                 p5 = skip_newlines(p5)
@@ -9910,6 +10008,7 @@ func parse_unary(ref p: Parser):
                 fa_name = tok_lex(field_tok)
                 fa.name = fa_name
                 fa.line = field_tok.line
+                fa.int_val = field_tok.col
                 fa = ast_add_child(fa, left)
                 fa.name = fa_name
                 left = fa
@@ -13189,13 +13288,13 @@ func parse_program(ref p: Parser):
             p = p_adv
         eif p2.error_line > 0 do
             # Error recovery: log error and advance at least 1 token to guarantee progress
-            if p2.error_msg != 0 do
+            if g_diag_json == 0 and p2.error_msg != 0 do
                 print_ln(p2.error_msg)
             end
             if p.error_line == 0 do
                 p.error_line = p2.error_line
+                p.error_msg = p2.error_msg
             end
-            p.error_msg = ""
             var (p_adv, _) = advance(p)
             p = p_adv
             when not check(p, TokType.Eof) and not check(p, TokType.Func) and not check(p, TokType.Enum) and not check(p, TokType.Entity) and not check(p, TokType.Const) and not check(p, TokType.Var) and not check(p, TokType.Extern) and not check(p, TokType.Import) loop
@@ -13240,6 +13339,291 @@ import Parser, AstNode, AstType, parser_new, parse_program from compiler.parser
  * Trả về error_count. Nếu > 0, pipeline PHẢI dừng trước codegen.
  ##
 
+# @vir_source stdlib/vir/compiler/source_manager.vri 1
+##
+ * vir/compiler/source_manager.vri — Source Origin & Source Manager
+ * ==============================================================
+ * Single source of truth for physical and logical source locations,
+ * mapping preprocessed / expanded text back to pre-include origins.
+ ##
+
+import fat_str_new, fat_str_len, fat_str_byte_at, fat_str_eq, str_from_cstr from rt.string_rt
+import vir_alloc from rt.alloc
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from rt.vec_rt
+
+extern func native_read_u8(addr: int, offset: int) -> int
+extern func native_write_u8(addr: int, offset: int, val: int)
+extern func native_read_i64(addr: int, offset: int) -> int
+extern func native_write_i64(addr: int, offset: int, val: int)
+
+entity SourceFile:
+    file_id:        int,
+    display_path:   string,
+    canonical_path: string,
+    src_content:    int,
+    line_count:     int
+end.
+
+entity SourceMapSegment:
+    expanded_start_line: int,
+    expanded_end_line:   int,
+    original_file_id:    int,
+    original_start_line: int
+end.
+
+entity SourceSpan:
+    file_id:       int,
+    start_line:    int,
+    start_col:     int,
+    end_line:      int,
+    end_col:       int
+end.
+
+entity SourceManager:
+    files:         int,
+    segments:      int,
+    spans:         int
+end.
+
+var g_active_source_manager: i64 = 0
+
+func sm_new():
+    let sm = vir_alloc(24)
+    var spans = vec_new_rt()
+    spans = vec_push_rt(spans, 0); # span id 0 is invalid
+    native_write_i64(sm, 0, vec_new_rt())
+    native_write_i64(sm, 8, vec_new_rt())
+    native_write_i64(sm, 16, spans)
+    out sm
+end.
+
+func sm_register_file(sm: i64, display_path: string, canonical_path: string):
+    if sm == 0 do out 0 end
+    let files = native_read_i64(sm, 0)
+    let n = vec_len_rt(files)
+    var i = 0
+    when i < n loop
+        let f = vec_get_rt(files, i)
+        let cur_disp = native_read_i64(f, 8) as string
+        if fat_str_eq(cur_disp, display_path) == 1 do
+            out i
+        end
+        i = i + 1
+    end
+    let f_obj = vir_alloc(40)
+    native_write_i64(f_obj, 0, n)
+    native_write_i64(f_obj, 8, display_path as i64)
+    native_write_i64(f_obj, 16, canonical_path as i64)
+    native_write_i64(f_obj, 24, 0)
+    native_write_i64(f_obj, 32, 0)
+    let new_files = vec_push_rt(files, f_obj)
+    native_write_i64(sm, 0, new_files)
+    out n
+end.
+
+func sm_get_file_path(sm: i64, file_id: int):
+    if sm == 0 do out 0 end
+    let files = native_read_i64(sm, 0)
+    let n = vec_len_rt(files)
+    if file_id < 0 or file_id >= n do
+        out 0
+    end
+    let f = vec_get_rt(files, file_id)
+    let fat = native_read_i64(f, 8)
+    if fat == 0 do out 0 end
+    out native_read_i64(fat, 0)
+end.
+
+func sm_add_segment(sm: i64, exp_start: int, exp_end: int, orig_fid: int, orig_start: int):
+    if sm == 0 do out 0 end
+    let segs = native_read_i64(sm, 8)
+    let seg = vir_alloc(32)
+    native_write_i64(seg, 0, exp_start)
+    native_write_i64(seg, 8, exp_end)
+    native_write_i64(seg, 16, orig_fid)
+    native_write_i64(seg, 24, orig_start)
+    let new_segs = vec_push_rt(segs, seg)
+    native_write_i64(sm, 8, new_segs)
+    out 0
+end.
+
+func sm_find_segment(sm: i64, exp_line: int):
+    if sm == 0 do out 0 - 1 end
+    let segs = native_read_i64(sm, 8)
+    let count = vec_len_rt(segs)
+    if count <= 0 do out 0 - 1 end
+    var low = 0
+    var high = count - 1
+    var best = 0 - 1
+    when low <= high loop
+        let mid = (low + high) / 2
+        let seg = vec_get_rt(segs, mid)
+        let s_start = native_read_i64(seg, 0)
+        let s_end = native_read_i64(seg, 8)
+        if exp_line >= s_start and exp_line <= s_end do
+            out mid
+        eif exp_line < s_start do
+            high = mid - 1
+        else
+            best = mid
+            low = mid + 1
+        end
+    end
+    out best
+end.
+
+func sm_file_from_line(sm: i64, exp_line: int):
+    let s_idx = sm_find_segment(sm, exp_line)
+    if s_idx < 0 do out 0 end
+    let segs = native_read_i64(sm, 8)
+    let seg = vec_get_rt(segs, s_idx)
+    out native_read_i64(seg, 16)
+end.
+
+func sm_line_from_expanded(sm: i64, exp_line: int):
+    let s_idx = sm_find_segment(sm, exp_line)
+    if s_idx < 0 do out exp_line end
+    let segs = native_read_i64(sm, 8)
+    let seg = vec_get_rt(segs, s_idx)
+    let s_start = native_read_i64(seg, 0)
+    let orig_start = native_read_i64(seg, 24)
+    out orig_start + (exp_line - s_start)
+end.
+
+func sm_add_span(sm: i64, fid: int, s_line: int, s_col: int, e_line: int, e_col: int):
+    if sm == 0 do out 0 end
+    let spans = native_read_i64(sm, 16)
+    let n = vec_len_rt(spans)
+    let sp = vir_alloc(40)
+    native_write_i64(sp, 0, fid)
+    native_write_i64(sp, 8, s_line)
+    native_write_i64(sp, 16, s_col)
+    native_write_i64(sp, 24, e_line)
+    native_write_i64(sp, 32, e_col)
+    let new_spans = vec_push_rt(spans, sp)
+    native_write_i64(sm, 16, new_spans)
+    out n
+end.
+
+func sm_get_span(sm: i64, span_id: int):
+    if sm == 0 or span_id <= 0 do out 0 end
+    let spans = native_read_i64(sm, 16)
+    let n = vec_len_rt(spans)
+    if span_id >= n do out 0 end
+    out vec_get_rt(spans, span_id)
+end.
+
+func sm_build_from_source(sm: i64, source: string, main_file: int):
+    if sm == 0 do out 0 end
+    let data = native_read_i64(source as i64, 0)
+    let n = native_read_i64(source as i64, 8)
+    if n <= 0 do out 0 end
+
+    let main_fat = str_from_cstr(main_file)
+    let main_fid = sm_register_file(sm, main_fat, main_fat)
+
+    var cur_fid = main_fid
+    var cur_orig_start = 1
+    var cur_exp_start = 1
+    var pos = 0
+    var cur_line = 1
+    var has_markers = 0
+
+    when pos < n loop
+        let line_start = pos
+        when pos < n and native_read_u8(data, pos) != 10 loop
+            pos = pos + 1
+        end
+        let line_end = pos
+
+        var is_marker = 0
+        if line_end - line_start >= 15 do
+            if native_read_u8(data, line_start) == 35 and native_read_u8(data, line_start + 1) == 32 and native_read_u8(data, line_start + 2) == 64 and native_read_u8(data, line_start + 3) == 118 and native_read_u8(data, line_start + 4) == 105 and native_read_u8(data, line_start + 5) == 114 and native_read_u8(data, line_start + 6) == 95 and native_read_u8(data, line_start + 7) == 115 and native_read_u8(data, line_start + 8) == 111 and native_read_u8(data, line_start + 9) == 117 and native_read_u8(data, line_start + 10) == 114 and native_read_u8(data, line_start + 11) == 99 and native_read_u8(data, line_start + 12) == 101 and native_read_u8(data, line_start + 13) == 32 do
+                is_marker = 1
+            end
+        end
+
+        if is_marker == 1 do
+            has_markers = 1
+            if cur_exp_start <= cur_line - 1 do
+                sm_add_segment(sm, cur_exp_start, cur_line - 1, cur_fid, cur_orig_start)
+            end
+
+            var p_start = line_start + 14
+            when p_start < line_end and native_read_u8(data, p_start) == 32 loop
+                p_start = p_start + 1
+            end
+
+            var p_end = p_start
+            var orig_line = 1
+            if p_start < line_end and native_read_u8(data, p_start) == 34 do
+                p_start = p_start + 1
+                p_end = p_start
+                when p_end < line_end and native_read_u8(data, p_end) != 34 loop
+                    p_end = p_end + 1
+                end
+                var l_pos = p_end + 1
+                when l_pos < line_end and native_read_u8(data, l_pos) == 32 loop
+                    l_pos = l_pos + 1
+                end
+                orig_line = 0
+                when l_pos < line_end loop
+                    let c = native_read_u8(data, l_pos)
+                    if c >= 48 and c <= 57 do
+                        orig_line = orig_line * 10 + c - 48
+                    end
+                    l_pos = l_pos + 1
+                end
+            else
+                var last_sp = line_end - 1
+                when last_sp > p_start and native_read_u8(data, last_sp) != 32 loop
+                    last_sp = last_sp - 1
+                end
+                p_end = last_sp
+                orig_line = 0
+                var l_pos = last_sp + 1
+                when l_pos < line_end loop
+                    let c = native_read_u8(data, l_pos)
+                    if c >= 48 and c <= 57 do
+                        orig_line = orig_line * 10 + c - 48
+                    end
+                    l_pos = l_pos + 1
+                end
+            end
+
+            if orig_line <= 0 do orig_line = 1 end
+            let path_len = p_end - p_start
+            let path_buf = vir_alloc(path_len + 1)
+            var pi = 0
+            when pi < path_len loop
+                native_write_u8(path_buf, pi, native_read_u8(data, p_start + pi))
+                pi = pi + 1
+            end
+            native_write_u8(path_buf, path_len, 0)
+            let path_fat = str_from_cstr(path_buf)
+            cur_fid = sm_register_file(sm, path_fat, path_fat)
+            cur_orig_start = orig_line
+            cur_exp_start = cur_line + 1
+        end
+
+        if pos < n and native_read_u8(data, pos) == 10 do
+            pos = pos + 1
+        end
+        cur_line = cur_line + 1
+    end
+
+    if cur_exp_start <= cur_line do
+        sm_add_segment(sm, cur_exp_start, cur_line, cur_fid, cur_orig_start)
+    end
+    if has_markers == 0 do
+        sm_add_segment(sm, 1, cur_line, main_fid, 1)
+    end
+    out 0
+end.
+
+export SourceFile, SourceMapSegment, SourceSpan, SourceManager, g_active_source_manager,
+       sm_new, sm_register_file, sm_get_file_path, sm_add_segment, sm_find_segment,
+       sm_file_from_line, sm_line_from_expanded, sm_add_span, sm_get_span, sm_build_from_source
 # @vir_source stdlib/vir/compiler/context.vri 1
 ##
  * vir/compiler/context.vri — Compiler Context & Core Infrastructure
@@ -13286,6 +13670,10 @@ func get_interned_string(interner: StringInterner, id: i64)
     strs = native_read_i64(interner as i64, 0)
     out vec_get_rt(strs, id)
 end.
+import SourceFile, SourceMapSegment, SourceSpan, SourceManager, g_active_source_manager,
+       sm_new, sm_register_file, sm_get_file_path, sm_add_segment, sm_find_segment,
+       sm_file_from_line, sm_line_from_expanded, sm_add_span, sm_get_span, sm_build_from_source from source_manager
+
 # ═══════════════════════════════════════════════════════
 # Diagnostic Engine
 # ═══════════════════════════════════════════════════════
@@ -13297,13 +13685,18 @@ enum DiagnosticLevel:
 end.
 entity Diagnostic:
     level: DiagnosticLevel,
-        message: i64; # InternID
+    message: i64; # InternID
     line: i64,
-        col: i64,
-        extra: string,
-        secondary_line: i64,
-        secondary_col: i64,
-        secondary_note: string
+    col: i64,
+    extra: string,
+    secondary_line: i64,
+    secondary_col: i64,
+    secondary_note: string,
+    file_id: i64,
+    span_id: i64,
+    file_path: string,
+    secondary_file_id: i64,
+    secondary_file_path: string
 end.
 entity DiagnosticEngine:
     diagnostics: i64; # vec of Diagnostic
@@ -13315,19 +13708,54 @@ func diagnostic_engine_new()
         error_count: 0
     )
 end.
-func report_error(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64)
-    report_error_info(engine, message_id, line, col, "")
-end.
-func report_error_info(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64, extra: string)
+func report_error_loc_related(engine: &DiagnosticEngine, message_id: i64, file_id: i64, line: i64, col: i64, extra: string, secondary_line: i64, secondary_col: i64, secondary_note: string):
+    var cur_file = 0
+    var cur_fid = file_id
+    var cur_line = line
+    if g_active_source_manager != 0 do
+        if cur_fid == 0 and cur_line > 0 do
+            cur_fid = sm_file_from_line(g_active_source_manager, cur_line)
+            cur_line = sm_line_from_expanded(g_active_source_manager, cur_line)
+        end
+        # Always resolve the display path so the renderer never needs source_path.
+        cur_file = sm_get_file_path(g_active_source_manager, cur_fid)
+        if cur_file == 0 do
+            cur_file = sm_get_file_path(g_active_source_manager, 0)
+        end
+    end
+    var source_col = col
+    if source_col <= 0 do source_col = 1 end
+    var source_span = 0
+    if g_active_source_manager != 0 do
+        source_span = sm_add_span(g_active_source_manager, cur_fid, cur_line, source_col, cur_line, source_col + 1)
+    end
+    var sec_line = secondary_line
+    var sec_col = secondary_col
+    var sec_fid = 0
+    var sec_file = 0
+    if g_active_source_manager != 0 and sec_line > 0 do
+        sec_fid = sm_file_from_line(g_active_source_manager, sec_line)
+        sec_line = sm_line_from_expanded(g_active_source_manager, sec_line)
+        sec_file = sm_get_file_path(g_active_source_manager, sec_fid)
+    end
+    if sec_file == 0 do
+        sec_file = cur_file
+    end
+    if sec_col <= 0 and sec_line > 0 do sec_col = 1 end
     d = Diagnostic(
         level: DiagnosticLevel.Error,
         message: message_id,
-        line: line,
-        col: col,
+        line: cur_line,
+        col: source_col,
         extra: extra,
-        secondary_line: 0,
-        secondary_col: 0,
-        secondary_note: ""
+        secondary_line: sec_line,
+        secondary_col: sec_col,
+        secondary_note: secondary_note,
+        file_id: cur_fid,
+        span_id: source_span,
+        file_path: cur_file,
+        secondary_file_id: sec_fid,
+        secondary_file_path: sec_file
     )
     diags = native_read_i64(engine as i64, 0)
     diags = vec_push_rt(diags, d)
@@ -13335,30 +13763,65 @@ func report_error_info(engine: &DiagnosticEngine, message_id: i64, line: i64, co
     errs = native_read_i64(engine as i64, 8)
     native_write_i64(engine as i64, 8, errs + 1)
 end.
+func report_error_loc(engine: &DiagnosticEngine, message_id: i64, file_id: i64, line: i64, col: i64, extra: string):
+    report_error_loc_related(engine, message_id, file_id, line, col, extra, 0, 0, "")
+end.
+func report_error(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64):
+    report_error_info(engine, message_id, line, col, "")
+end.
+func report_error_info(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64, extra: string):
+    report_error_loc(engine, message_id, 0, line, col, extra)
+end.
 func report_error_related(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64,
                           extra: string, secondary_line: i64, secondary_col: i64, secondary_note: string):
     var related_line = secondary_line
     if related_line <= 0 do
         related_line = line
     end
-    # Negative legacy column is a bootstrap-stable carrier for the secondary
-    # line.  Newer diagnostic printers decode it as a related location.
-    report_error_info(engine, message_id, line, 0 - related_line, extra)
+    report_error_loc_related(engine, message_id, 0, line, col, extra, related_line, secondary_col, secondary_note)
 end.
-func report_warning(engine: DiagnosticEngine, message_id: i64, line: i64, col: i64)
+func report_warning_loc(engine: &DiagnosticEngine, message_id: i64, file_id: i64, line: i64, col: i64, extra: string):
+    var cur_file = 0
+    var cur_fid = file_id
+    var cur_line = line
+    if g_active_source_manager != 0 do
+        if cur_fid == 0 and cur_line > 0 do
+            cur_fid = sm_file_from_line(g_active_source_manager, cur_line)
+            cur_line = sm_line_from_expanded(g_active_source_manager, cur_line)
+        end
+        # Always resolve the display path so the renderer never needs source_path.
+        cur_file = sm_get_file_path(g_active_source_manager, cur_fid)
+        if cur_file == 0 do
+            cur_file = sm_get_file_path(g_active_source_manager, 0)
+        end
+    end
+    var source_col = col
+    if source_col <= 0 do source_col = 1 end
+    var source_span = 0
+    if g_active_source_manager != 0 do
+        source_span = sm_add_span(g_active_source_manager, cur_fid, cur_line, source_col, cur_line, source_col + 1)
+    end
     d = Diagnostic(
         level: DiagnosticLevel.Warning,
         message: message_id,
-        line: line,
-        col: col,
-        extra: "",
+        line: cur_line,
+        col: source_col,
+        extra: extra,
         secondary_line: 0,
         secondary_col: 0,
-        secondary_note: ""
+        secondary_note: "",
+        file_id: cur_fid,
+        span_id: source_span,
+        file_path: cur_file,
+        secondary_file_id: 0,
+        secondary_file_path: 0
     )
     diags = native_read_i64(engine as i64, 0)
     diags = vec_push_rt(diags, d)
     native_write_i64(engine as i64, 0, diags)
+end.
+func report_warning(engine: &DiagnosticEngine, message_id: i64, line: i64, col: i64):
+    report_warning_loc(engine, message_id, 0, line, col, "")
 end.
 func has_errors(engine: DiagnosticEngine)
     errs = native_read_i64(engine as i64, 8)
@@ -13371,6 +13834,35 @@ var g_precomp_throw_str: string = ""
 var g_disable_specialization: int = 0
 # ═══════════════════════════════════════════════════════
 # AST Arena
+# ═══════════════════════════════════════════════════════
+
+entity ASTArena:
+    nodes: i64 # vec of AstNode (or ANY)
+end.
+func ast_arena_new()
+    arena = ASTArena(
+        nodes: vec_new_rt()
+    )
+    arena.nodes = vec_push_rt(arena.nodes, 0); # index 0 is null/invalid node
+    out arena
+end.
+func ast_arena_alloc(arena: ASTArena, node: any)
+    nodes = native_read_i64(arena as i64, 0)
+    id = vec_len_rt(nodes)
+    nodes = vec_push_rt(nodes, node)
+    native_write_i64(arena as i64, 0, nodes)
+    out id
+end.
+func ast_arena_get(arena: ASTArena, id: i64)
+    nodes = native_read_i64(arena as i64, 0)
+    out vec_get_rt(nodes, id)
+end.
+func ast_arena_set(arena: ASTArena, id: i64, node: any)
+    nodes = native_read_i64(arena as i64, 0)
+    vec_set_rt(nodes, id, node)
+end.
+# ═══════════════════════════════════════════════════════
+# CompilerContext
 # ═══════════════════════════════════════════════════════
 
 # @vir_source stdlib/vir/compiler/type_table.vri 1
@@ -13705,8 +14197,6 @@ func tensor_elem_byte_size(type_str: string) -> int:
 end.
 
 export TypeKind, TypeNode, TypeTable, TYPE_VOID, TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_STRING, type_table_new, type_alloc, type_get, type_is_numeric, type_is_integer, type_is_copy, type_is_move, type_can_binop, type_common, type_is_tensor, tensor_type_rank, tensor_type_shape, tensor_type_elem_type, tensor_type_dim, tensor_type_stride, tensor_type_numel, tensor_type_new, is_tensor_type_str, parse_tensor_elem_code, tensor_type_is_well_formed, parse_tensor_elem_type, parse_tensor_shape, parse_tensor_rank, parse_tensor_stride, parse_tensor_numel, tensor_elem_byte_size
-
-# @vir_source stdlib/vir/compiler/context.vri 137
 # @vir_source stdlib/vir/compiler/symbol_table.vri 1
 ##
  * vir/compiler/symbol_table.vri
@@ -13791,7 +14281,6 @@ func symbol_lookup(ref tbl: SymbolTable, ref tree: ScopeTree, start_scope_id: i6
     end
     out -1 # Not found
 end.
-# @vir_source stdlib/vir/compiler/context.vri 138
 # @vir_source stdlib/vir/compiler/scope_tree.vri 1
 ##
  * vir/compiler/scope_tree.vri
@@ -13879,33 +14368,7 @@ func scope_get_parent(ref tree: ScopeTree, scope_id: i64):
     node = vec_get_rt(scopes_vec, scope_id)
     out native_read_i64(node as i64, 8)
 end.
-# @vir_source stdlib/vir/compiler/context.vri 139
-func ast_arena_new()
-    arena = ASTArena(
-        nodes: vec_new_rt()
-    )
-    arena.nodes = vec_push_rt(arena.nodes, 0); # index 0 is null/invalid node
-    out arena
-end.
-func ast_arena_alloc(arena: ASTArena, node: any)
-    nodes = native_read_i64(arena as i64, 0)
-    id = vec_len_rt(nodes)
-    nodes = vec_push_rt(nodes, node)
-    native_write_i64(arena as i64, 0, nodes)
-    out id
-end.
-func ast_arena_get(arena: ASTArena, id: i64)
-    nodes = native_read_i64(arena as i64, 0)
-    out vec_get_rt(nodes, id)
-end.
-func ast_arena_set(arena: ASTArena, id: i64, node: any)
-    nodes = native_read_i64(arena as i64, 0)
-    vec_set_rt(nodes, id, node)
-end.
-# ═══════════════════════════════════════════════════════
-# CompilerContext
-# ═══════════════════════════════════════════════════════
-
+# @vir_source stdlib/vir/compiler/context.vri 249
 
 entity CompilerContext:
     interner: StringInterner,
@@ -14120,7 +14583,7 @@ func pass2_is_type_name(name: &string):
     out false
 end.
 
-func pass2_hash_name(name: i64):
+func pass2_hash_name(name: &string):
     n = fat_str_len(name as string)
     h = n * 17
     var i = 0
@@ -14640,7 +15103,7 @@ func pass2_register(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &Diag
     pass2_index_symbol(curr_scope, name, sym_id)
     out sym_id
 end.
-func pass2_lookup_name_in_scope(ref symbols: SymbolTable, ref scopes: ScopeTree, scope_id: int, name: i64):
+func pass2_lookup_name_in_scope(ref symbols: SymbolTable, ref scopes: ScopeTree, scope_id: int, name: &string):
     if fat_str_len(name as string) == 0 do
         out -1
     end
@@ -14719,7 +15182,7 @@ func pass3_resolve_import_alias(name: string):
     out name
 end.
 
-func pass3_name_bucket(name: i64):
+func pass3_name_bucket(name: &string):
     n = fat_str_len(name)
     if n <= 0 do
         out 0
@@ -14772,7 +15235,7 @@ func pass3_build_global_index(ref symbols: SymbolTable, ref scopes: ScopeTree):
     end
 end.
 
-func pass3_lookup_global(ref symbols: SymbolTable, ref scopes: ScopeTree, name: i64):
+func pass3_lookup_global(ref symbols: SymbolTable, ref scopes: ScopeTree, name: &string):
     if fat_str_len(name) == 0 do
         out -1
     end
@@ -15810,7 +16273,7 @@ import TypeKind, TYPE_VOID, TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_STRING from ty
 const PASS5_BUCKETS: int = 256
 var g_pass5_global_buckets: i64 = 0
 
-func pass5_hash_name(name: i64):
+func pass5_hash_name(name: &string):
     n = fat_str_len(name)
     if n <= 0 do
         out 0
@@ -16322,7 +16785,7 @@ func pass5_lookup_scope_linear(ref symbols: SymbolTable, ref scopes: ScopeTree, 
     out -1
 end.
 
-func pass5_lookup(ref symbols: SymbolTable, ref scopes: ScopeTree, start_scope: int, name: i64):
+func pass5_lookup(ref symbols: SymbolTable, ref scopes: ScopeTree, start_scope: int, name: &string):
     if fat_str_len(name) == 0 do
         out -1
     end
@@ -16366,7 +16829,7 @@ import SymbolTable, SymbolKind, SymbolNode, symbol_alloc from symbol_table
 
 import ScopeTree, ScopeKind, ScopeNode, scope_push, scope_pop, scope_add_symbol, scope_current_id from scope_tree
 
-import DiagnosticEngine, report_error, report_error_info from context
+import DiagnosticEngine, report_error, report_error_info, report_error_loc from context
 
 import TypeKind, TYPE_VOID, TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_STRING, is_tensor_type_str, tensor_type_is_well_formed, parse_tensor_elem_type, parse_tensor_shape, parse_tensor_rank from type_table
 
@@ -16390,7 +16853,7 @@ var g_pass6_quantized_tensor_type: i64 = fat_str_new("QuantizedTensor") as i64
 var g_pass6_assigned_vars: i64 = 0
 
 
-func pass6_hash_name(name: i64):
+func pass6_hash_name(name: &string):
     n = fat_str_len(name)
     if n <= 0 do
         out 0
@@ -16538,7 +17001,7 @@ end.
 # Evaluate integer constant syntax used where semantics depend on sign.  Const
 # identifiers are followed through their declaration AST; mutable variables are
 # deliberately not folded because their runtime value may change.
-func pass6_eval_const_int(ref symbols: SymbolTable, ref scopes: ScopeTree, node: i64, depth: int):
+func pass6_eval_const_int(ref symbols: SymbolTable, ref scopes: ScopeTree, node: &AstNode, depth: int):
     if node as i64 == 0 or depth > 32 do out (0, 0) end
     if node.node_type == AstType.LiteralInt do out (1, node.int_val) end
     if node.node_type == AstType.Identifier do
@@ -16970,7 +17433,7 @@ func pass6_collect_entities(node: &AstNode):
     out 0
 end.
 
-func pass6_find_entity_ast(ref symbols: SymbolTable, ref scopes: ScopeTree, entity_name: i64):
+func pass6_find_entity_ast(ref symbols: SymbolTable, ref scopes: ScopeTree, entity_name: &string):
     if fat_str_len(entity_name) == 0 do out 0 as AstNode end
     if g_pass6_entity_names != 0 do
         n_ents = vec_len_rt(g_pass6_entity_names)
@@ -17218,7 +17681,7 @@ func pass6_get_var_type(name: string):
     out fat_str_new("")
 end.
 
-func pass6_dict_key_expr_type(ref symbols: SymbolTable, ref scopes: ScopeTree, node: i64):
+func pass6_dict_key_expr_type(ref symbols: SymbolTable, ref scopes: ScopeTree, node: &AstNode):
     if node == 0 do out TypeKind.Void end
     if node.node_type == AstType.Identifier and fat_cstr_eq(pass6_get_var_type(node.name), "string") == 1 do
         out TypeKind.String
@@ -17226,7 +17689,7 @@ func pass6_dict_key_expr_type(ref symbols: SymbolTable, ref scopes: ScopeTree, n
     out pass6_infer_type(symbols, scopes, node)
 end.
 
-func pass6_dict_literal_key_type(ref symbols: SymbolTable, ref scopes: ScopeTree, lit: i64):
+func pass6_dict_literal_key_type(ref symbols: SymbolTable, ref scopes: ScopeTree, lit: &AstNode):
     if lit == 0 or lit.node_type != AstType.DictLiteral or vec_len_rt(lit.children) < 2 do
         out TypeKind.Void
     end
@@ -17488,7 +17951,7 @@ func pass6_get_receiver_entity_name(ref symbols: SymbolTable, ref scopes: ScopeT
     out fat_str_new("")
 end.
 
-func pass6_extract_base_name(type_str: i64):
+func pass6_extract_base_name(type_str: &string):
     slen = fat_str_len(type_str)
     if slen <= 0 do out fat_str_new("") end
     var i = 0
@@ -17501,7 +17964,7 @@ func pass6_extract_base_name(type_str: i64):
     out type_str
 end.
 
-func pass6_find_enum_ast(ref symbols: SymbolTable, ref scopes: ScopeTree, name: i64):
+func pass6_find_enum_ast(ref symbols: SymbolTable, ref scopes: ScopeTree, name: &string):
     base_name = pass6_extract_base_name(name)
     if fat_str_len(base_name) == 0 do out 0 as AstNode end
     sid = pass6_lookup_chain(symbols, scopes, 0, base_name)
@@ -17528,7 +17991,7 @@ func pass6_enum_is_tagged(enum_ast: &AstNode):
     out false
 end.
 
-func pass6_extract_first_generic_arg(type_str: i64):
+func pass6_extract_first_generic_arg(type_str: &string):
     slen = fat_str_len(type_str)
     var lt = 0 - 1
     var i = 0
@@ -17563,7 +18026,7 @@ func pass6_extract_first_generic_arg(type_str: i64):
     out fat_str_new("")
 end.
 
-func pass6_extract_second_generic_arg(type_str: i64):
+func pass6_extract_second_generic_arg(type_str: &string):
     slen = fat_str_len(type_str)
     var comma = 0 - 1
     var gt = 0 - 1
@@ -17584,7 +18047,7 @@ func pass6_extract_second_generic_arg(type_str: i64):
     out fat_str_new("")
 end.
 
-func count_list_items(s: i64):
+func count_list_items(s: &string):
     slen = fat_str_len(s)
     if slen <= 0 do out 0 end
     var count = 1
@@ -18072,7 +18535,9 @@ end.
 func pass6_check_method_call(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode):
     child_count = vec_len_rt(node.children)
     if child_count <= 0 do
-        report_error(diag, 3021, node.line, 0)
+        var call_col = node.int_val
+        if call_col <= 0 do call_col = 1 end
+        report_error_loc(diag, 3021, 0, node.line, call_col, "")
         out 0
     end
     var ci = 0
@@ -18303,7 +18768,9 @@ func pass6_check_method_call(ref symbols: SymbolTable, ref scopes: ScopeTree, di
     end
 
     # Priority 4: No candidate found
-    report_error(diag, 3021, node.line, 0)
+    var call_col = node.int_val
+    if call_col <= 0 do call_col = 1 end
+    report_error_loc(diag, 3021, 0, node.line, call_col, "")
     out 0
 end.
 
@@ -19721,7 +20188,7 @@ func pass7_analyze_cfa(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &D
     pass7_walk(symbols, scopes, diag, node, 0, 0)
 end.
 
-func pass7_collect_decl_names(node: i64, include_try: int):
+func pass7_collect_decl_names(node: &AstNode, include_try: int):
     if (node as i64) == 0 do out 0 end
     if node.node_type == AstType.TryStmt and include_try == 0 do out 0 end
     if node.node_type == AstType.VarDecl or node.node_type == AstType.ConstDecl do
@@ -22016,7 +22483,7 @@ import DiagnosticEngine, report_warning, report_error from context
 
 import vir_alloc from alloc
 
-func pass9_is_known_const(const_map_box: int, name: i64):
+func pass9_is_known_const(const_map_box: int, name: &string):
     let const_map = native_read_i64(const_map_box, 0)
     let count = vec_len_rt(const_map)
     var i = 0
@@ -22777,19 +23244,444 @@ import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt
 
 import rt_streq, fat_str_eq, fat_str_len, fat_str_byte_at, fat_cstr_eq, rt_strcat, rt_itoa, rt_strlen, sb_append_char from string_rt
 
+import vir_alloc, alloc from rt.alloc
+
 import DiagnosticEngine, DiagnosticLevel, Diagnostic from context
 
-func pass10_emit_diagnostics(diag: i64, source_path: i64):
+import g_active_source_manager, sm_get_file_path, sm_get_span from source_manager
+
+import sys_getrusage, sys_platform, Platform from rt.syscall
+
+extern func syscall2(num: int, a1: int, a2: int) -> int
+extern func syscall3(num: int, a1: int, a2: int, a3: int) -> int
+extern func _NSGetEnviron() -> int
+
+var g_color_mode: int = 0
+var g_time_buf_start: int = 0
+var g_compile_timer_printed: int = 0
+var g_diag_json: int = 0
+var g_phase_timings: int = 0
+var g_phase_read_us: int = 0
+var g_phase_preprocess_us: int = 0
+var g_phase_lex_us: int = 0
+var g_phase_parse_us: int = 0
+var g_phase_semantic_us: int = 0
+var g_phase_semantic_start_us: int = 0
+var g_phase_lower_us: int = 0
+var g_phase_codegen_us: int = 0
+var g_phase_link_us: int = 0
+
+func virc_timer_init():
+    if g_time_buf_start == 0 do
+        g_time_buf_start = vir_alloc(16)
+        let plat = sys_platform()
+        var clk = 1; # Linux CLOCK_MONOTONIC
+        if plat == Platform.MacOS_ARM64 or plat == Platform.MacOS_x86_64 do
+            clk = 6; # macOS CLOCK_MONOTONIC
+        end
+        sys_clock_gettime(clk, g_time_buf_start)
+    end
+end.
+
+func virc_elapsed_us():
+    let buf = vir_alloc(16)
+    let plat = sys_platform()
+    var clk = 1
+    if plat == Platform.MacOS_ARM64 or plat == Platform.MacOS_x86_64 do
+        clk = 6
+    end
+    sys_clock_gettime(clk, buf)
+    let sec = native_read_i64(buf, 0)
+    let nsec = native_read_i64(buf, 8)
+    var s_sec = 0
+    var s_nsec = 0
+    if g_time_buf_start != 0 do
+        s_sec = native_read_i64(g_time_buf_start, 0)
+        s_nsec = native_read_i64(g_time_buf_start, 8)
+    end
+    var d_sec = sec - s_sec
+    var d_nsec = nsec - s_nsec
+    if d_nsec < 0 do
+        d_sec = d_sec - 1
+        d_nsec = d_nsec + 1000000000
+    end
+    var total = d_sec * 1000000 + (d_nsec / 1000)
+    if total < 0 do total = 0 end
+    out total
+end.
+
+func virc_print_phase_timings():
+    if g_phase_timings == 0 do out 0 end
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "Phase timings (ms): read=")
+        sb = sb_append_int(sb, g_phase_read_us / 1000)
+        sb = sb_append(sb, " preprocess=")
+        sb = sb_append_int(sb, g_phase_preprocess_us / 1000)
+        sb = sb_append(sb, " lex=")
+        sb = sb_append_int(sb, g_phase_lex_us / 1000)
+        sb = sb_append(sb, " parse=")
+        sb = sb_append_int(sb, g_phase_parse_us / 1000)
+        sb = sb_append(sb, " semantic=")
+        sb = sb_append_int(sb, g_phase_semantic_us / 1000)
+        sb = sb_append(sb, " lower=")
+        sb = sb_append_int(sb, g_phase_lower_us / 1000)
+        sb = sb_append(sb, " codegen=")
+        sb = sb_append_int(sb, g_phase_codegen_us / 1000)
+        sb = sb_append(sb, " link=")
+        sb = sb_append_int(sb, g_phase_link_us / 1000)
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+    out 0
+end.
+
+func virc_print_compile_time():
+    if g_compile_timer_printed == 1 do out 0 end
+    if g_diag_json == 1 do
+        var diag = diagnostic_engine_new()
+        pass10_emit_json(diag)
+        out 0
+    end
+    g_compile_timer_printed = 1
+    let total_us = virc_elapsed_us()
+    var ms = total_us / 1000
+    var frac = (total_us mod 1000) / 10
+    if ms == 0 and frac == 0 do
+        frac = 10
+    end
+    virc_print_phase_timings()
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "Compile time: ")
+        sb = sb_append_int(sb, ms)
+        sb = sb_append(sb, ".")
+        if frac < 10 do
+            sb = sb_append(sb, "0")
+        end
+        sb = sb_append_int(sb, frac)
+        sb = sb_append(sb, " ms")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+    out 0
+end.
+
+func pass10_json_escape_cstr(sb: StringBuilder, s: int):
+    if s == 0 do out sb end
+    let slen = rt_strlen(s)
+    var i = 0
+    when i < slen loop
+        let b = native_read_u8(s, i)
+        if b == 34 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 34)
+        eif b == 92 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 92)
+        eif b == 10 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 110)
+        eif b == 13 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 114)
+        eif b == 9 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 116)
+        else
+            sb = sb_append_char(sb, b)
+        end
+        i = i + 1
+    end
+    out sb
+end.
+
+func pass10_json_escape_str(sb: StringBuilder, s: string):
+    if (s as i64) == 0 do out sb end
+    let cstr = s as i64
+    out pass10_json_escape_cstr(sb, cstr)
+end.
+
+func pass10_emit_json_one(sb: StringBuilder, d: Diagnostic):
+    let level = native_read_i64(d as i64, 0)
+    let code = native_read_i64(d as i64, 8)
+    let d_span_id = native_read_i64(d as i64, 72)
+    var line = native_read_i64(d as i64, 16)
+    var col = native_read_i64(d as i64, 24)
+    var end_line = line
+    var end_col = col + 1
+    var file_path = native_read_i64(d as i64, 80)
+    if d_span_id > 0 and g_active_source_manager != 0 do
+        let sp = sm_get_span(g_active_source_manager, d_span_id)
+        if sp != 0 do
+            line = native_read_i64(sp, 8)
+            col = native_read_i64(sp, 16)
+            end_line = native_read_i64(sp, 24)
+            end_col = native_read_i64(sp, 32)
+            let sp_fid = native_read_i64(sp, 0)
+            file_path = sm_get_file_path(g_active_source_manager, sp_fid)
+        end
+    end
+    let extra = native_read_i64(d as i64, 32) as string
+    let sec_line = native_read_i64(d as i64, 40)
+    var sec_col = native_read_i64(d as i64, 48)
+    let sec_note = native_read_i64(d as i64, 56) as string
+    if col <= 0 do col = 1 end
+    if end_col <= col do end_col = col + 1 end
+    if sec_col <= 0 and sec_line > 0 do sec_col = 1 end
+    if file_path == 0 and g_active_source_manager != 0 do
+        file_path = sm_get_file_path(g_active_source_manager, 0)
+    end
+    sb = sb_append(sb, "{\"code\":\"")
+    sb = sb_append(sb, pass10_code_to_prefix(level))
+    if code < 1000 do sb = sb_append(sb, "0") end
+    if code < 100 do sb = sb_append(sb, "0") end
+    if code < 10 do sb = sb_append(sb, "0") end
+    sb = sb_append_int(sb, code)
+    sb = sb_append(sb, "\",\"severity\":\"")
+    if level == DiagnosticLevel.Warning do
+        sb = sb_append(sb, "warning")
+    else
+        sb = sb_append(sb, "error")
+    end
+    sb = sb_append(sb, "\",\"message\":\"")
+    let msg_str = pass10_code_to_msg(code, extra)
+    sb = pass10_json_escape_str(sb, msg_str)
+    sb = sb_append(sb, "\",\"primary_span\":{\"file\":\"")
+    sb = pass10_json_escape_cstr(sb, file_path)
+    sb = sb_append(sb, "\",\"start_line\":")
+    sb = sb_append_int(sb, line)
+    sb = sb_append(sb, ",\"start_column\":")
+    sb = sb_append_int(sb, col)
+    sb = sb_append(sb, ",\"end_line\":")
+    sb = sb_append_int(sb, end_line)
+    sb = sb_append(sb, ",\"end_column\":")
+    sb = sb_append_int(sb, end_col)
+    sb = sb_append(sb, "},\"related_locations\":")
+    var sec_file_path = native_read_i64(d as i64, 96)
+    if sec_file_path == 0 and g_active_source_manager != 0 do
+        let sec_fid = native_read_i64(d as i64, 88)
+        if sec_fid > 0 do
+            sec_file_path = sm_get_file_path(g_active_source_manager, sec_fid)
+        end
+    end
+    if sec_file_path == 0 do
+        sec_file_path = file_path
+    end
+    if sec_line > 0 do
+        sb = sb_append(sb, "[{\"file\":\"")
+        sb = pass10_json_escape_cstr(sb, sec_file_path)
+        sb = sb_append(sb, "\",\"line\":")
+        sb = sb_append_int(sb, sec_line)
+        sb = sb_append(sb, ",\"column\":")
+        sb = sb_append_int(sb, sec_col)
+        sb = sb_append(sb, ",\"message\":\"")
+        if (sec_note as i64) != 0 and fat_str_len(sec_note) > 0 do
+            sb = pass10_json_escape_str(sb, sec_note)
+        else
+            sb = sb_append(sb, "related location")
+        end
+        sb = sb_append(sb, "\"}]")
+    else
+        sb = sb_append(sb, "[]")
+    end
+    sb = sb_append(sb, "}")
+    out sb
+end.
+
+func pass10_emit_json(diag: &DiagnosticEngine):
+    let elapsed_ms = virc_elapsed_us() / 1000
+    let count = vec_len_rt(diag.diagnostics)
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "{\"schema_version\":1,")
+        if count <= 0 do
+            sb = sb_append(sb, "\"success\":true,\"diagnostics\":[],\"error_count\":0,\"warning_count\":0,\"compile_time_ms\":")
+            sb = sb_append_int(sb, elapsed_ms)
+            sb = sb_append(sb, "}")
+            print_ln(sb_to_string(sb))
+            sb_free(sb)
+            g_compile_timer_printed = 1
+            out 0
+        end
+
+        if diag.error_count == 0 do
+            sb = sb_append(sb, "\"success\":true,")
+        else
+            sb = sb_append(sb, "\"success\":false,")
+        end
+
+        let d0 = vec_get_rt(diag.diagnostics, 0)
+        let level0 = native_read_i64(d0 as i64, 0)
+        let code0 = native_read_i64(d0 as i64, 8)
+        let d_span_id0 = native_read_i64(d0 as i64, 72)
+        var line0 = native_read_i64(d0 as i64, 16)
+        var col0 = native_read_i64(d0 as i64, 24)
+        var end_line0 = line0
+        var end_col0 = col0 + 1
+        var file_path0 = native_read_i64(d0 as i64, 80)
+        if d_span_id0 > 0 and g_active_source_manager != 0 do
+            let sp0 = sm_get_span(g_active_source_manager, d_span_id0)
+            if sp0 != 0 do
+                line0 = native_read_i64(sp0, 8)
+                col0 = native_read_i64(sp0, 16)
+                end_line0 = native_read_i64(sp0, 24)
+                end_col0 = native_read_i64(sp0, 32)
+                let sp_fid0 = native_read_i64(sp0, 0)
+                file_path0 = sm_get_file_path(g_active_source_manager, sp_fid0)
+            end
+        end
+        let extra0 = native_read_i64(d0 as i64, 32) as string
+        if col0 <= 0 do col0 = 1 end
+        if end_col0 <= col0 do end_col0 = col0 + 1 end
+        if file_path0 == 0 and g_active_source_manager != 0 do
+            file_path0 = sm_get_file_path(g_active_source_manager, 0)
+        end
+        sb = sb_append(sb, "\"code\":\"")
+        sb = sb_append(sb, pass10_code_to_prefix(level0))
+        if code0 < 1000 do sb = sb_append(sb, "0") end
+        if code0 < 100 do sb = sb_append(sb, "0") end
+        if code0 < 10 do sb = sb_append(sb, "0") end
+        sb = sb_append_int(sb, code0)
+        sb = sb_append(sb, "\",\"severity\":\"")
+        if level0 == DiagnosticLevel.Warning do
+            sb = sb_append(sb, "warning")
+        else
+            sb = sb_append(sb, "error")
+        end
+        sb = sb_append(sb, "\",\"message\":\"")
+        let msg0 = pass10_code_to_msg(code0, extra0)
+        sb = pass10_json_escape_str(sb, msg0)
+        sb = sb_append(sb, "\",\"primary_span\":{\"file\":\"")
+        sb = pass10_json_escape_cstr(sb, file_path0)
+        sb = sb_append(sb, "\",\"start_line\":")
+        sb = sb_append_int(sb, line0)
+        sb = sb_append(sb, ",\"start_column\":")
+        sb = sb_append_int(sb, col0)
+        sb = sb_append(sb, ",\"end_line\":")
+        sb = sb_append_int(sb, end_line0)
+        sb = sb_append(sb, ",\"end_column\":")
+        sb = sb_append_int(sb, end_col0)
+        sb = sb_append(sb, "},\"related_locations\":")
+        var sec_file_path0 = native_read_i64(d0 as i64, 96)
+        if sec_file_path0 == 0 and g_active_source_manager != 0 do
+            let sec_fid0 = native_read_i64(d0 as i64, 88)
+            if sec_fid0 > 0 do
+                sec_file_path0 = sm_get_file_path(g_active_source_manager, sec_fid0)
+            end
+        end
+        if sec_file_path0 == 0 do
+            sec_file_path0 = file_path0
+        end
+        let sec_line0 = native_read_i64(d0 as i64, 40)
+        var sec_col0 = native_read_i64(d0 as i64, 48)
+        let sec_note0 = native_read_i64(d0 as i64, 56) as string
+        if sec_col0 <= 0 and sec_line0 > 0 do sec_col0 = 1 end
+        if sec_line0 > 0 do
+            sb = sb_append(sb, "[{\"file\":\"")
+            sb = pass10_json_escape_cstr(sb, sec_file_path0)
+            sb = sb_append(sb, "\",\"line\":")
+            sb = sb_append_int(sb, sec_line0)
+            sb = sb_append(sb, ",\"column\":")
+            sb = sb_append_int(sb, sec_col0)
+            sb = sb_append(sb, ",\"message\":\"")
+            if (sec_note0 as i64) != 0 and fat_str_len(sec_note0) > 0 do
+                sb = pass10_json_escape_str(sb, sec_note0)
+            else
+                sb = sb_append(sb, "related location")
+            end
+            sb = sb_append(sb, "\"}]")
+        else
+            sb = sb_append(sb, "[]")
+        end
+        sb = sb_append(sb, ",\"diagnostics\":[")
+
+        var idx = 0
+        when idx < count loop
+            if idx > 0 do
+                sb = sb_append(sb, ",")
+            end
+            let cur_d = vec_get_rt(diag.diagnostics, idx)
+            sb = pass10_emit_json_one(sb, cur_d)
+            idx = idx + 1
+        end
+
+        sb = sb_append(sb, "],\"error_count\":")
+        sb = sb_append_int(sb, diag.error_count)
+        sb = sb_append(sb, ",\"warning_count\":")
+        sb = sb_append_int(sb, count - diag.error_count)
+        sb = sb_append(sb, ",\"compile_time_ms\":")
+        sb = sb_append_int(sb, elapsed_ms)
+        sb = sb_append(sb, "}")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+    g_compile_timer_printed = 1
+    out diag.error_count
+end.
+
+func virc_isatty(fd: int):
+    var buf = vir_alloc(16)
+    var rc = syscall3(0x2000036, fd, 0x40487413, buf)
+    if rc == 0 do out 1 end
+    out 0
+end.
+
+func virc_has_no_color():
+    let env_ptr_ptr = _NSGetEnviron()
+    if env_ptr_ptr == 0 do out 0 end
+    let env_ptr = native_read_i64(env_ptr_ptr, 0)
+    if env_ptr == 0 do out 0 end
+    var idx = 0
+    when true loop
+        let entry = native_read_i64(env_ptr, idx * 8)
+        if entry == 0 do out 0 end
+        if native_read_u8(entry, 0) == 78 and native_read_u8(entry, 1) == 79 and native_read_u8(entry, 2) == 95 and native_read_u8(entry, 3) == 67 and native_read_u8(entry, 4) == 79 and native_read_u8(entry, 5) == 76 and native_read_u8(entry, 6) == 79 and native_read_u8(entry, 7) == 82 and native_read_u8(entry, 8) == 61 do
+            out 1
+        end
+        idx = idx + 1
+    end
+    out 0
+end.
+
+func virc_should_color():
+    if g_color_mode == 1 do out 1 end
+    if g_color_mode == 2 do out 0 end
+    if virc_has_no_color() == 1 do out 0 end
+    if virc_isatty(1) == 1 do out 1 end
+    out 0
+end.
+
+func pass10_emit_diagnostics(diag: &DiagnosticEngine):
     count = vec_len_rt(diag.diagnostics)
     if count == 0 do
         out 0
     end
 
-    var i = 0
-    when i < count loop
-        d = vec_get_rt(diag.diagnostics, i)
-        pass10_print_one(d, source_path)
-        i = i + 1
+    if g_phase_timings == 1 and g_phase_semantic_start_us > 0 do
+        g_phase_semantic_us = virc_elapsed_us() - g_phase_semantic_start_us
+    end
+    if g_diag_json == 1 do
+        out pass10_emit_json(diag)
+    end
+
+    let use_color = virc_should_color()
+
+    if count <= 2 do
+        var i = 0
+        when i < count loop
+            d = vec_get_rt(diag.diagnostics, i)
+            pass10_print_one_detailed(d, use_color)
+            i = i + 1
+        end
+    else
+        var i = 0
+        when i < count loop
+            d = vec_get_rt(diag.diagnostics, i)
+            pass10_print_one_compact(d, use_color)
+            i = i + 1
+        end
+        print_ln("")
     end
 
     # Print summary
@@ -22805,9 +23697,11 @@ func pass10_emit_diagnostics(diag: i64, source_path: i64):
         sb_free(sb)
     end
 
+    virc_print_compile_time()
+
     out diag.error_count
 end.
-func pass10_code_to_prefix(level: i64Level):
+func pass10_code_to_prefix(level: int):
     if level == DiagnosticLevel.Warning do
         out "W"
     eif level == DiagnosticLevel.Info do
@@ -22816,7 +23710,7 @@ func pass10_code_to_prefix(level: i64Level):
     out "E"
 end.
 
-func pass10_code_to_result(level: i64Level):
+func pass10_code_to_result(level: int):
     if level == DiagnosticLevel.Warning do
         out "WARNING"
     eif level == DiagnosticLevel.Info do
@@ -22838,12 +23732,24 @@ end.
 
 func pass10_code_to_msg(code: int, extra: string):
     # Lexer errors (E0xxx)
-    if code == 1 or code == 101 do out "Invalid character in source" end
-    if code == 2 or code == 102 do out "Unterminated string literal" end
-    if code == 3 or code == 103 do out "Invalid numeric literal format" end
+    if code == 1 or code == 101 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do out extra end
+        out "Invalid character in source"
+    end
+    if code == 2 or code == 102 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do out extra end
+        out "Unterminated string literal"
+    end
+    if code == 3 or code == 103 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do out extra end
+        out "Invalid numeric literal format"
+    end
 
     # Parser errors (E1xxx)
-    if code == 1001 do out "Unexpected token in syntax rule" end
+    if code == 1001 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do out extra end
+        out "Unexpected token in syntax rule"
+    end
     if code == 1002 do out "Missing block delimiter 'end' or 'end.'" end
     if code == 1003 do out "Missing colon ':' after condition or signature" end
     if code == 1004 do out "Invalid expression syntax" end
@@ -22857,14 +23763,70 @@ func pass10_code_to_msg(code: int, extra: string):
     if code == 2003 or code == 3001 do out "Type mismatch in expression or operation" end
     if code == 2004 do out "Duplicate symbol definition in current scope" end
     if code == 2005 or code == 3012 do out "Invalid assignment target (not an l-value)" end
-    if code == 2101 do out "Malformed include statement" end
-    if code == 2102 do out "Included source not found" end
-    if code == 2103 do out "Invalid module path token" end
-    if code == 2104 do out "Include recursion or expansion limit reached" end
-    if code == 2111 do out "Malformed import statement" end
-    if code == 2112 do out "Imported module not found" end
-    if code == 2113 do out "Imported symbol not exported or not found" end
-    if code == 2114 do out "Import recursion or expansion limit reached" end
+    if code == 2101 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "failed to parse include statement name: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "failed to parse include statement name"
+    end
+    if code == 2102 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "included source not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "included source not found"
+    end
+    if code == 2103 do out "invalid token '::'; use '.' for qualified names" end
+    if code == 2104 do out "maximum include depth exceeded" end
+    if code == 2111 do out "empty or invalid module name in import" end
+    if code == 2112 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "imported module not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "imported module not found"
+    end
+    if code == 2113 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "imported symbol not exported: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "imported symbol not exported"
+    end
+    if code == 2114 do out "maximum import depth exceeded" end
+    if code == 2201 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "invalid UTF-8 in '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "invalid UTF-8 in source encoding"
+    end
     if code == 3002 do out "Invalid operator for operand type" end
     if code == 3003 do out "Assignment to immutable variable (declared with 'let')" end
     if code == 3004 do out "Type mismatch in variable assignment" end
@@ -23188,17 +24150,57 @@ func pass10_code_to_actions(code: int):
     out "• Review source code against Vir language specification"
 end.
 
-func pass10_print_one(d: Diagnostic, source_path: string):
-    # Cache the aggregate before the first call.  Native bootstrap calls may
-    # clobber entity wrapper locals, while these scalar fields stay stable.
+func pass10_color_red(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1;31m")
+    out sb
+end.
+
+func pass10_color_yellow(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1;33m")
+    out sb
+end.
+
+func pass10_color_bold(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1m")
+    out sb
+end.
+
+func pass10_color_reset(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[0m")
+    out sb
+end.
+
+func pass10_print_one_detailed(d: Diagnostic, use_color: int):
     let d_level = native_read_i64(d as i64, 0)
     let d_message = native_read_i64(d as i64, 8)
-    let d_line = native_read_i64(d as i64, 16)
-    let d_col = native_read_i64(d as i64, 24)
+    let d_span_id = native_read_i64(d as i64, 72)
+    var d_line = native_read_i64(d as i64, 16)
+    var d_col = native_read_i64(d as i64, 24)
     let d_extra = native_read_i64(d as i64, 32) as string
     let d_secondary_line = native_read_i64(d as i64, 40)
     let d_secondary_col = native_read_i64(d as i64, 48)
     let d_secondary_note = native_read_i64(d as i64, 56) as string
+    var actual_file = native_read_i64(d as i64, 80)
+    if d_span_id > 0 and g_active_source_manager != 0 do
+        let sp = sm_get_span(g_active_source_manager, d_span_id)
+        if sp != 0 do
+            d_line = native_read_i64(sp, 8)
+            d_col = native_read_i64(sp, 16)
+            let sp_fid = native_read_i64(sp, 0)
+            actual_file = sm_get_file_path(g_active_source_manager, sp_fid)
+        end
+    end
+
+    if actual_file == 0 or rt_strlen(actual_file) == 0 do
+        if g_active_source_manager != 0 do
+            actual_file = sm_get_file_path(g_active_source_manager, 0)
+        end
+    end
+
     arena:
         print_ln("═══════════════════════════════════════════════")
         print_ln("EXECUTION REPORT")
@@ -23207,12 +24209,29 @@ func pass10_print_one(d: Diagnostic, source_path: string):
 
         var sb = sb_new()
         sb = sb_append(sb, "Result      : ")
+        if use_color == 1 do
+            if d_level == DiagnosticLevel.Warning do
+                sb = pass10_color_yellow(sb)
+            else
+                sb = pass10_color_red(sb)
+            end
+        end
         sb = sb_append(sb, pass10_code_to_result(d_level))
+        if use_color == 1 do
+            sb = pass10_color_reset(sb)
+        end
         print_ln(sb_to_string(sb))
         sb_free(sb)
 
         var sb_code = sb_new()
         sb_code = sb_append(sb_code, "Code        : [")
+        if use_color == 1 do
+            if d_level == DiagnosticLevel.Warning do
+                sb_code = pass10_color_yellow(sb_code)
+            else
+                sb_code = pass10_color_red(sb_code)
+            end
+        end
         sb_code = sb_append(sb_code, pass10_code_to_prefix(d_level))
         if d_message < 1000 do
             sb_code = sb_append(sb_code, "0")
@@ -23224,6 +24243,9 @@ func pass10_print_one(d: Diagnostic, source_path: string):
             sb_code = sb_append(sb_code, "0")
         end
         sb_code = sb_append_int(sb_code, d_message)
+        if use_color == 1 do
+            sb_code = pass10_color_reset(sb_code)
+        end
         sb_code = sb_append(sb_code, "] ")
         sb_code = sb_append(sb_code, pass10_code_to_phase(d_message))
         print_ln(sb_to_string(sb_code))
@@ -23237,7 +24259,7 @@ func pass10_print_one(d: Diagnostic, source_path: string):
         print_ln("───────────────────────────────────────────────")
         var sb_loc = sb_new()
         sb_loc = sb_append(sb_loc, "File        : ")
-        sb_loc = sb_append(sb_loc, source_path)
+        sb_loc = sb_append(sb_loc, actual_file)
         print_ln(sb_to_string(sb_loc))
         sb_free(sb_loc)
 
@@ -23283,6 +24305,15 @@ func pass10_print_one(d: Diagnostic, source_path: string):
         print_ln("Analysis")
         print_ln("───────────────────────────────────────────────")
         print_ln(pass10_code_to_msg(d_message, d_extra))
+        if d_message == 2102 or d_message == 2112 do
+            var sb_req = sb_new()
+            sb_req = sb_append(sb_req, "requested at ")
+            sb_req = sb_append(sb_req, actual_file)
+            sb_req = sb_append(sb_req, ":")
+            sb_req = sb_append_int(sb_req, d_line)
+            print_ln(sb_to_string(sb_req))
+            sb_free(sb_req)
+        end
         print_ln("")
 
         print_ln("Possible Causes")
@@ -23299,14 +24330,88 @@ func pass10_print_one(d: Diagnostic, source_path: string):
     end
 end.
 
-export pass10_emit_diagnostics
+func pass10_print_one_compact(d: Diagnostic, use_color: int):
+    let d_level = native_read_i64(d as i64, 0)
+    let d_message = native_read_i64(d as i64, 8)
+    let d_span_id = native_read_i64(d as i64, 72)
+    var d_line = native_read_i64(d as i64, 16)
+    var d_col = native_read_i64(d as i64, 24)
+    let d_extra = native_read_i64(d as i64, 32) as string
+    var actual_file = native_read_i64(d as i64, 80)
+    if d_span_id > 0 and g_active_source_manager != 0 do
+        let sp = sm_get_span(g_active_source_manager, d_span_id)
+        if sp != 0 do
+            d_line = native_read_i64(sp, 8)
+            d_col = native_read_i64(sp, 16)
+            let sp_fid = native_read_i64(sp, 0)
+            actual_file = sm_get_file_path(g_active_source_manager, sp_fid)
+        end
+    end
+
+    if actual_file == 0 or rt_strlen(actual_file) == 0 do
+        if g_active_source_manager != 0 do
+            actual_file = sm_get_file_path(g_active_source_manager, 0)
+        end
+    end
+
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "[")
+        if use_color == 1 do sb = pass10_color_bold(sb) end
+        sb = sb_append(sb, actual_file)
+        sb = sb_append(sb, ":")
+        sb = sb_append_int(sb, d_line)
+        sb = sb_append(sb, ":")
+        if d_col > 0 do
+            sb = sb_append_int(sb, d_col)
+        else
+            sb = sb_append_int(sb, 1)
+        end
+        if use_color == 1 do sb = pass10_color_reset(sb) end
+        sb = sb_append(sb, "] [")
+        if use_color == 1 do
+            if d_level == DiagnosticLevel.Warning do
+                sb = pass10_color_yellow(sb)
+            else
+                sb = pass10_color_red(sb)
+            end
+        end
+        sb = sb_append(sb, pass10_code_to_prefix(d_level))
+        if d_message < 1000 do sb = sb_append(sb, "0") end
+        if d_message < 100 do sb = sb_append(sb, "0") end
+        if d_message < 10 do sb = sb_append(sb, "0") end
+        sb = sb_append_int(sb, d_message)
+        if use_color == 1 do sb = pass10_color_reset(sb) end
+        sb = sb_append(sb, "] ")
+        sb = sb_append(sb, pass10_code_to_msg(d_message, d_extra))
+        if d_message == 2102 or d_message == 2112 do
+            sb = sb_append(sb, " requested at ")
+            sb = sb_append(sb, actual_file)
+            sb = sb_append(sb, ":")
+            sb = sb_append_int(sb, d_line)
+        end
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+end.
+
+func pass10_print_one(d: Diagnostic):
+    pass10_print_one_detailed(d, 0)
+end.
+
+export pass10_emit_diagnostics, pass10_print_one, pass10_emit_json,
+       virc_timer_init, virc_elapsed_us, virc_print_compile_time, virc_print_phase_timings,
+       g_color_mode, g_diag_json, g_phase_timings, g_time_buf_start, g_compile_timer_printed,
+       g_phase_read_us, g_phase_preprocess_us, g_phase_lex_us, g_phase_parse_us,
+       g_phase_semantic_us, g_phase_semantic_start_us, g_phase_lower_us,
+       g_phase_codegen_us, g_phase_link_us
 # @vir_source stdlib/vir/compiler/semantic.vri 64
 import pass10_emit_diagnostics from compiler.sem_pass10_diagnostics
 
 var g_semantic_err_count: int = 0
 
 
-func semantic_run(ast: &AstNode, source_path: string, verbose: int):
+func semantic_run(ast: &AstNode, verbose: int):
     arena:
         # Semantic tables are phase-local. AST annotations that survive this
         # scope must reference parser-owned data; lowering recomputes qualified
@@ -23380,7 +24485,7 @@ func semantic_run(ast: &AstNode, source_path: string, verbose: int):
         pass9_const_fold(symbols, scopes, diag, ast)
 
         # ── Pass 10: Diagnostics Emission ──
-        let err_count = pass10_emit_diagnostics(diag, source_path)
+        let err_count = pass10_emit_diagnostics(diag)
         g_semantic_err_count = err_count
 
         if verbose == 1 do
@@ -23659,7 +24764,7 @@ entity MirFunc:
  var_buckets: i64 # Vec<Vec<VarMap>> — locals live with the func, not MirBuilder
 end.
 
-func mir_str_hash_64(s: i64):
+func mir_str_hash_64(s: &string):
     n = fat_str_len(s) as i64
     h = n * 17
     var i = 0
@@ -24075,7 +25180,6 @@ export mir_instr_op, mir_instr_dst, mir_instr_src1, mir_instr_src2, mir_instr_au
  ##
 
 import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt from vec_rt
-
 # @vir_source stdlib/vir/compiler/mir_cfg.vri 12
 import MirBlock, mir_block_successors, mir_block_preds, mir_block_replace_preds, mir_block_reset_cfg, mir_block_idom, mir_block_replace_idom, mir_block_dom_children, mir_block_replace_dom_children, mir_block_df, mir_block_replace_df from mir
 
@@ -24245,7 +25349,6 @@ func mir_compute_dominators(blocks: i64, entry_idx: i64):
 end.
 
 export mir_build_cfg, mir_compute_dominators
-
 # @vir_source stdlib/vir/compiler/virc.vri 58
 # @vir_source stdlib/vir/compiler/mir_ssa.vri 1
 ##
@@ -28928,7 +30031,7 @@ var g_dict_var_names: i64 = 0
 
 var g_current_entity_name: i64 = 0
 
-func set_var_type(var_name: i64, type_name: i64):
+func set_var_type(var_name: &string, type_name: &string):
     if g_var_type_hash != 0 and var_name != 0 and type_name != 0 do
         idx = hash_table_lookup(g_var_type_hash, g_var_type_names, var_name)
         if idx >= 0 do
@@ -28942,7 +30045,7 @@ func set_var_type(var_name: i64, type_name: i64):
     end
 end.
 
-func get_var_type(var_name: i64):
+func get_var_type(var_name: &string):
     if g_var_type_hash != 0 and var_name != 0 do
         idx = hash_table_lookup(g_var_type_hash, g_var_type_names, var_name)
         if idx >= 0 do
@@ -28952,7 +30055,7 @@ func get_var_type(var_name: i64):
     out 0
 end.
 
-func mark_dict_var(var_name: i64):
+func mark_dict_var(var_name: &string):
     if g_dict_var_hash != 0 and var_name != 0 do
         if hash_table_lookup(g_dict_var_hash, g_dict_var_names, var_name) < 0 do
             idx = vec_len_rt(g_dict_var_names)
@@ -28962,7 +30065,7 @@ func mark_dict_var(var_name: i64):
     end
 end.
 
-func is_known_dict_var(var_name: i64):
+func is_known_dict_var(var_name: &string):
     if g_dict_var_hash != 0 and var_name != 0 do
         if hash_table_lookup(g_dict_var_hash, g_dict_var_names, var_name) >= 0 do out 1 end
     end
@@ -29006,7 +30109,7 @@ func enum_index_from_type_name(type_name: string):
     out 0 - 1
 end.
 
-func enum_variant_index(enum_name: i64, variant_name: i64):
+func enum_variant_index(enum_name: &string, variant_name: &string):
     if g_enum_variant_names == 0 do out 0 - 1 end
     if enum_name != 0 and fat_str_len(enum_name) > 0 do
         key = qualified_member_name(enum_name as string, variant_name as string)
@@ -29106,7 +30209,7 @@ func scoped_field_is_callable(entity_name: string, field_name: string):
     out 0
 end.
 
-func count_list_items(s: i64):
+func count_list_items(s: &string):
     slen = fat_str_len(s)
     if slen <= 0 do out 0 end
     var count = 1
@@ -29175,7 +30278,7 @@ func get_list_item(s: &string, target_idx: int):
     out fat_str_new("")
 end.
 
-func extract_base_entity_name(type_str: i64):
+func extract_base_entity_name(type_str: &string):
     slen = fat_str_len(type_str as string)
     if slen <= 0 do out fat_str_new("") end
     var i = 0
@@ -29188,7 +30291,7 @@ func extract_base_entity_name(type_str: i64):
     out type_str as string
 end.
 
-func extract_generic_args_content(type_str: i64):
+func extract_generic_args_content(type_str: &string):
     slen = fat_str_len(type_str as string)
     var lt = 0 - 1
     var gt = 0 - 1
@@ -29212,7 +30315,7 @@ func extract_generic_args_content(type_str: i64):
     out fat_str_new("")
 end.
 
-func generic_substitute_type(param_names: i64, arg_types: i64, target_type: i64):
+func generic_substitute_type(param_names: &string, arg_types: &string, target_type: &string):
     tlen = fat_str_len(target_type as string)
     if fat_str_len(param_names as string) == 0 or fat_str_len(arg_types as string) == 0 or tlen == 0 do
         out target_type as string
@@ -29387,7 +30490,7 @@ func infer_expr_type_name(node: &AstNode):
     out fat_str_new("")
 end.
 
-func name_hash_256(name: i64):
+func name_hash_256(name: &string):
     n = fat_str_len(name as int) as i64
     h = n * 17
     var i = 0
@@ -29409,7 +30512,7 @@ func hash_table_new():
     out tab
 end.
 
-func hash_table_lookup(hash_tab: i64, names: i64, name: i64):
+func hash_table_lookup(hash_tab: i64, names: i64, name: &string):
     if hash_tab == 0 or names == 0 do out 0 - 1 end
     bid = name_hash_256(name)
     bucket = vec_get_rt(hash_tab, bid)
@@ -29426,7 +30529,7 @@ func hash_table_lookup(hash_tab: i64, names: i64, name: i64):
     out 0 - 1
 end.
 
-func hash_table_insert(hash_tab: i64, names: i64, name: i64, idx: i64):
+func hash_table_insert(hash_tab: i64, names: i64, name: &string, idx: i64):
     if hash_tab == 0 do out 0 end
     bid = name_hash_256(name)
     bucket = vec_get_rt(hash_tab, bid)
@@ -29438,7 +30541,7 @@ func hash_table_insert(hash_tab: i64, names: i64, name: i64, idx: i64):
     out 0
 end.
 
-func lookup_cached_name(names: i64, name: i64):
+func lookup_cached_name(names: i64, name: &string):
     if names == 0 do out 0 - 1 end
     if names == g_field_names and g_field_hash != 0 do
         out hash_table_lookup(g_field_hash, names, name)
@@ -29872,7 +30975,7 @@ func global_slot_lookup(name: string):
     out hash_table_lookup(g_lower_global_hash, g_lower_global_names, name)
 end.
 
-func find_func_ast(fn_name: i64):
+func find_func_ast(fn_name: &string):
     if g_func_ast_hash != 0 and fn_name != 0 do
         let idx = hash_table_lookup(g_func_ast_hash, g_func_ast_names, fn_name)
         if idx >= 0 do
@@ -29913,7 +31016,7 @@ func get_func_param_mode(fn_ast: &AstNode, p_idx: i64):
     out 0
 end.
 
-func get_scoped_field_type(entity_name: i64, field_name: i64):
+func get_scoped_field_type(entity_name: &string, field_name: &string):
     if g_scoped_field_hash != 0 and entity_name != 0 and field_name != 0 do
         dot_str = fat_str_new(".")
         scoped_key = fat_str_concat(fat_str_concat(entity_name as string, dot_str), field_name as string)
@@ -29933,7 +31036,7 @@ func get_scoped_field_type(entity_name: i64, field_name: i64):
     out fat_str_new("")
 end.
 
-func get_scoped_field_index(entity_name: i64, field_name: i64):
+func get_scoped_field_index(entity_name: &string, field_name: &string):
     if g_scoped_field_hash != 0 and entity_name != 0 and field_name != 0 do
         dot_str = fat_str_new(".")
         scoped_key = fat_str_concat(fat_str_concat(entity_name as string, dot_str), field_name as string)
@@ -29953,7 +31056,7 @@ func get_scoped_field_index(entity_name: i64, field_name: i64):
     out 0 - 1
 end.
 
-func get_scoped_field_offset(entity_name: i64, field_name: i64):
+func get_scoped_field_offset(entity_name: &string, field_name: &string):
     if g_scoped_field_hash != 0 and entity_name != 0 and field_name != 0 do
         dot_str = fat_str_new(".")
         scoped_key = fat_str_concat(fat_str_concat(entity_name as string, dot_str), field_name as string)
@@ -30137,7 +31240,7 @@ func get_expr_entity_type(node: &AstNode):
     out fat_str_new("")
 end.
 
-func find_field_index_for_base(base_name: i64, field_name: i64):
+func find_field_index_for_base(base_name: &string, field_name: &string):
     if base_name != 0 do
         var ent_type = get_var_type(base_name)
         if ent_type == 0 and is_entity_name(base_name) == 1 do
@@ -30246,13 +31349,13 @@ func find_field_index(field_name: &string):
     out 0
 end.
 
-func resolve_callee_alias(callee_name: i64):
+func resolve_callee_alias(callee_name: &string):
     idx = lookup_cached_name(g_import_aliases, callee_name)
     if idx >= 0 do out vec_get_rt(g_import_targets, idx) as string end
     out callee_name as string
 end.
 
-func is_entity_name(type_name: i64):
+func is_entity_name(type_name: &string):
     if type_name < 4096 do out 0 end
     if lookup_cached_name(g_entity_names, type_name) >= 0 do out 1 end
     base_name = extract_base_entity_name(type_name)
@@ -30262,7 +31365,7 @@ func is_entity_name(type_name: i64):
     out 0
 end.
 
-func is_register_field(field_name: i64):
+func is_register_field(field_name: &string):
     if g_register_field_names == 0 do out 0 end
     if field_name < 4096 do out 0 end
     if lookup_cached_name(g_register_field_names, field_name) >= 0 do out 1 end
@@ -30319,7 +31422,7 @@ func builder_set_func(b: &MirBuilder, f: &MirFunc):
 	out b
 end.
 
-func name_hash_bucket(name: i64):
+func name_hash_bucket(name: &string):
 	n = fat_str_len(name) as i64
 	h = n * 17
 	var i = 0
@@ -30503,7 +31606,7 @@ func builder_loop_depth(b: &MirBuilder):
     out vec_len_rt(ls)
 end.
 
-func buckets_get_var(buckets: i64, name: i64):
+func buckets_get_var(buckets: i64, name: &string):
 	if buckets == 0 or name == 0 do out 0 - 1 end
 	bid = name_hash_bucket(name)
 	bucket = vec_get_rt(buckets, bid)
@@ -30960,7 +32063,7 @@ func ast_node_builtin_id(n: &AstNode):
 	out native_read_i64(n as i64, 56)
 end.
 
-func builtin_id_from_name_uncached(name: i64):
+func builtin_id_from_name_uncached(name: &string):
     # Name → BuiltinId discriminant. Used when ast_add_child clobbers .builtin_id
     # (soft ABI) so LIR would otherwise BL the unresolved stub (returns 0).
     if fat_cstr_eq(name, "len") == 1 do out 1 end
@@ -32589,7 +33692,7 @@ func lower_map_emit_operand(b: MirBuilder, out_base: &MirOperand, len_v: i64, va
 	out b_next
 end.
 
-func lower_map_condition(b: MirBuilder, cond: &AstNode, binder_name: i64, current_addr: &MirOperand):
+func lower_map_condition(b: MirBuilder, cond: &AstNode, binder_name: &string, current_addr: &MirOperand):
 	if (cond.node_type == AstType.Compare or cond.node_type == AstType.BinOp) and ast_node_op_of(cond) == OpType.Eq and ast_node_child_count(cond) >= 2 do
 		left = ast_node_child(cond, 0)
 		right = ast_node_child(cond, 1)
@@ -32614,7 +33717,7 @@ func lower_map_condition(b: MirBuilder, cond: &AstNode, binder_name: i64, curren
 	out lower_expr(b, cond)
 end.
 
-func lower_map_body_emit(b: MirBuilder, out_base: &MirOperand, len_v: i64, body: &AstNode, binder_name: i64, binder_op: &MirOperand, current_addr: &MirOperand):
+func lower_map_body_emit(b: MirBuilder, out_base: &MirOperand, len_v: i64, body: &AstNode, binder_name: &string, binder_op: &MirOperand, current_addr: &MirOperand):
 	if (body as i64) == 0 do out b end
 	var body_t = ast_node_type_of(body)
 	if body_t == AstType.Block do
@@ -34659,7 +35762,7 @@ func escape_type_arg(arg: string):
     out res
 end.
 
-func build_specialized_func_name(callee_name: i64, gen_args: i64):
+func build_specialized_func_name(callee_name: &string, gen_args: &string):
     h = canonical_type_hash(gen_args as string)
     hex_str = hash_to_hex8(h)
     var res = fat_str_concat(callee_name as string, fat_str_new("__spec__"))
@@ -34680,7 +35783,7 @@ func build_specialized_func_name(callee_name: i64, gen_args: i64):
     out res
 end.
 
-func clone_ast_with_subst(node: &AstNode, gen_params: i64, gen_args: i64):
+func clone_ast_with_subst(node: &AstNode, gen_params: &string, gen_args: &string):
     if (node as i64) == 0 do out 0 as AstNode end
     let n_ptr = node as i64
     cnt = native_read_i64(n_ptr, 16) as AstType
@@ -34709,7 +35812,7 @@ func clone_ast_with_subst(node: &AstNode, gen_params: i64, gen_args: i64):
     out c
 end.
 
-func specialize_func_def(orig_fn: &AstNode, spec_name: i64, gen_params: i64, gen_args: i64):
+func specialize_func_def(orig_fn: &AstNode, spec_name: &string, gen_params: &string, gen_args: &string):
     var spec_fn = ast_new(AstType.FuncDef)
     let s_ptr = spec_fn as i64
     let o_ptr = orig_fn as i64
@@ -35156,8 +36259,8 @@ end.
 import native_read_i64 from string_rt
 
 func lir_func_id(f: &LirFunc): out native_read_i64(f as i64, 0) end.
-func lir_func_name(f: &LirFunc): out native_read_i64(f as i64, 8) as string end.
-func lir_func_blocks(f: &LirFunc): out native_read_i64(f as i64, 16) end.
+func lir_func_name(f: i64): out native_read_i64(f as i64, 8) as string end.
+func lir_func_blocks(f: i64): out native_read_i64(f as i64, 16) end.
 func lir_func_stack_size(f: i64): out native_read_i64(f as i64, 24) end.
 func lir_func_strings(f: i64): out native_read_i64(f as i64, 32) end.
 
@@ -35967,180 +37070,6 @@ module vir.compiler.target_spec
 
 import rt_streq, native_read_i64, native_write_i64 from string_rt
 import vir_alloc from alloc
-import TargetArch, TargetOS, TargetABI, RuntimeProvider, ObjectFormat, AsmDialect from compiler.mc
-import Platform, sys_platform from rt.syscall
-
-entity TargetSpec:
-    canonical_name:   string;
-    arch:             int;
-    os:               int;
-    call_abi:         int;
-    runtime_provider: int;
-    object_format:    int;
-    asm_dialect:      int;
-    pointer_width:    int;
-    stack_align:      int
-end.
-
-func target_spec_new(name: string, arch: int, os: int, abi: int, provider: int, format: int, dialect: int, ptr_w: int, stack_a: int):
-    let p = vir_alloc(72)
-    native_write_i64(p, 0, name as i64)
-    native_write_i64(p, 8, arch as i64)
-    native_write_i64(p, 16, os as i64)
-    native_write_i64(p, 24, abi as i64)
-    native_write_i64(p, 32, provider as i64)
-    native_write_i64(p, 40, format as i64)
-    native_write_i64(p, 48, dialect as i64)
-    native_write_i64(p, 56, ptr_w as i64)
-    native_write_i64(p, 64, stack_a as i64)
-    out p as TargetSpec
-end.
-
-func target_spec_name(s: &TargetSpec):        out native_read_i64(s, 0) as string end.
-func target_spec_arch(s: i64):        out native_read_i64(s, 8) as int end.
-func target_spec_os(s: i64):          out native_read_i64(s, 16) as int end.
-func target_spec_abi(s: i64):         out native_read_i64(s, 24) as int end.
-func target_spec_provider(s: i64):    out native_read_i64(s, 32) as int end.
-func target_spec_format(s: i64):      out native_read_i64(s, 40) as int end.
-func target_spec_dialect(s: i64):     out native_read_i64(s, 48) as int end.
-func target_spec_ptr_width(s: i64):   out native_read_i64(s, 56) as int end.
-func target_spec_stack_align(s: i64): out native_read_i64(s, 64) as int end.
-
-func target_spec_is_linux(s: &TargetSpec):
-    out (native_read_i64(s, 16) as int) == TargetOS.Linux
-end.
-
-func target_spec_is_darwin(s: &TargetSpec):
-    out (native_read_i64(s, 16) as int) == TargetOS.Darwin
-end.
-
-func target_spec_is_windows(s: &TargetSpec):
-    out (native_read_i64(s, 16) as int) == TargetOS.Windows
-end.
-
-func target_spec_is_wasi(s: &TargetSpec):
-    out (native_read_i64(s, 16) as int) == TargetOS.WASI_P1
-end.
-
-# Factory functions for the 8 canonical targets
-func make_target_macos_arm64():
-    out target_spec_new("macos-arm64", TargetArch.ARM64, TargetOS.Darwin, TargetABI.AAPCS64, RuntimeProvider.DarwinRawSyscall, ObjectFormat.MachO, AsmDialect.DarwinAsm, 8, 16)
-end.
-
-func make_target_macos_arm64_libsystem():
-    out target_spec_new("macos-arm64-libsystem", TargetArch.ARM64, TargetOS.Darwin, TargetABI.AAPCS64, RuntimeProvider.DarwinLibSystem, ObjectFormat.MachO, AsmDialect.DarwinAsm, 8, 16)
-end.
-
-func make_target_linux_arm64():
-    out target_spec_new("linux-arm64", TargetArch.ARM64, TargetOS.Linux, TargetABI.AAPCS64, RuntimeProvider.LinuxSyscall, ObjectFormat.ELF, AsmDialect.GNU_ELF, 8, 16)
-end.
-
-func make_target_windows_arm64():
-    out target_spec_new("windows-arm64", TargetArch.ARM64, TargetOS.Windows, TargetABI.Windows_ARM64, RuntimeProvider.WindowsKernel32, ObjectFormat.PE_COFF, AsmDialect.DarwinAsm, 8, 16)
-end.
-
-func make_target_linux_x86_64():
-    out target_spec_new("linux-x86_64", TargetArch.X86_64, TargetOS.Linux, TargetABI.SysV_AMD64, RuntimeProvider.LinuxSyscall, ObjectFormat.ELF, AsmDialect.GNU_ELF, 8, 16)
-end.
-
-func make_target_windows_x86_64():
-    out target_spec_new("windows-x86_64", TargetArch.X86_64, TargetOS.Windows, TargetABI.Windows_AMD64, RuntimeProvider.WindowsKernel32, ObjectFormat.PE_COFF, AsmDialect.Intel_X86, 8, 16)
-end.
-
-func make_target_linux_riscv64():
-    out target_spec_new("linux-riscv64", TargetArch.RISCV64, TargetOS.Linux, TargetABI.RV64D, RuntimeProvider.LinuxSyscall, ObjectFormat.ELF, AsmDialect.GNU_RISCV, 8, 16)
-end.
-
-func make_target_wasm32_wasi_p1():
-    out target_spec_new("wasm32-wasi-p1", TargetArch.Wasm32, TargetOS.WASI_P1, TargetABI.WasmMVP, RuntimeProvider.WASIP1, ObjectFormat.Wasm, AsmDialect.WasmWAT, 4, 16)
-end.
-
-func get_host_target_spec():
-    let p = sys_platform()
-    if p == Platform.Linux_ARM64 do
-        out make_target_linux_arm64()
-    eif p == Platform.Linux_x86_64 do
-        out make_target_linux_x86_64()
-    eif p == Platform.Linux_RISCV64 do
-        out make_target_linux_riscv64()
-    else
-        out make_target_macos_arm64()
-    end
-end.
-
-func parse_target_spec(str_val: string):
-    # 1. Exact match for 8 canonical target names
-    if rt_streq(str_val, "macos-arm64") do
-        out make_target_macos_arm64()
-    end
-    if rt_streq(str_val, "macos-arm64-libsystem") do
-        out make_target_macos_arm64_libsystem()
-    end
-    if rt_streq(str_val, "linux-arm64") do
-        out make_target_linux_arm64()
-    end
-    if rt_streq(str_val, "windows-arm64") do
-        out make_target_windows_arm64()
-    end
-    if rt_streq(str_val, "linux-x86_64") do
-        out make_target_linux_x86_64()
-    end
-    if rt_streq(str_val, "windows-x86_64") do
-        out make_target_windows_x86_64()
-    end
-    if rt_streq(str_val, "linux-riscv64") do
-        out make_target_linux_riscv64()
-    end
-    if rt_streq(str_val, "wasm32-wasi-p1") do
-        out make_target_wasm32_wasi_p1()
-    end
-
-    # 2. Target aliases
-    if rt_streq(str_val, "arm64-apple-darwin") or rt_streq(str_val, "darwin-arm64") do
-        out make_target_macos_arm64()
-    end
-    if rt_streq(str_val, "aarch64-linux") or rt_streq(str_val, "aarch64-unknown-linux-gnu") do
-        out make_target_linux_arm64()
-    end
-    if rt_streq(str_val, "x86_64-linux") or rt_streq(str_val, "x86_64-unknown-linux-gnu") do
-        out make_target_linux_x86_64()
-    end
-    if rt_streq(str_val, "riscv64-linux") or rt_streq(str_val, "riscv64-unknown-linux-gnu") or rt_streq(str_val, "riscv64") or rt_streq(str_val, "riscv") do
-        out make_target_linux_riscv64()
-    end
-    if rt_streq(str_val, "wasm32-wasi") or rt_streq(str_val, "wasm32") or rt_streq(str_val, "wasm") do
-        out make_target_wasm32_wasi_p1()
-    end
-    if rt_streq(str_val, "x86_64-pc-windows") or rt_streq(str_val, "x86_64-windows") or rt_streq(str_val, "win-x64") do
-        out make_target_windows_x86_64()
-    end
-    if rt_streq(str_val, "arm64-pc-windows") or rt_streq(str_val, "arm64-windows") or rt_streq(str_val, "win-arm64") do
-        out make_target_windows_arm64()
-    end
-    if rt_streq(str_val, "macos-x86_64") or rt_streq(str_val, "x86_64-apple-darwin") or rt_streq(str_val, "darwin-x86_64") do
-        out target_spec_new("macos-x86_64", TargetArch.X86_64, TargetOS.Darwin, TargetABI.SysV_AMD64, RuntimeProvider.DarwinRawSyscall, ObjectFormat.MachO, AsmDialect.DarwinAsm, 8, 16)
-    end
-
-    # 3. Short architecture aliases (resolved against host OS)
-    if rt_streq(str_val, "arm64") or rt_streq(str_val, "aarch64") do
-        let host = get_host_target_spec()
-        if target_spec_is_linux(host) != 0 do
-            out make_target_linux_arm64()
-        else
-            out make_target_macos_arm64()
-        end
-    end
-    if rt_streq(str_val, "x86_64") or rt_streq(str_val, "x86-64") do
-        let host = get_host_target_spec()
-        if target_spec_is_darwin(host) != 0 do
-            out target_spec_new("macos-x86_64", TargetArch.X86_64, TargetOS.Darwin, TargetABI.SysV_AMD64, RuntimeProvider.DarwinRawSyscall, ObjectFormat.MachO, AsmDialect.DarwinAsm, 8, 16)
-        else
-            out make_target_linux_x86_64()
-        end
-    end
-
-    out 0 as TargetSpec
-end.
 # @vir_source stdlib/vir/compiler/mc.vri 1
 ##
  * vir/compiler/mc.vri — Unified Machine Instruction (MCInst) & Relocation Layer
@@ -36864,7 +37793,6 @@ end.
 
 export target_desc_get_arch, target_desc_k, target_desc_color_to_phys
 export target_desc_is_callee_saved, target_desc_is_call_clobbered, target_desc_is_reserved
-
 # @vir_source stdlib/vir/compiler/virc.vri 65
 # @vir_source stdlib/vir/compiler/lir_ra_arena.vri 1
 ##
@@ -36983,7 +37911,6 @@ func ra_arena_reset(arena: i64):
 end.
 
 export ra_arena_new, ra_arena_alloc, ra_arena_checkpoint, ra_arena_reset
-
 # @vir_source stdlib/vir/compiler/virc.vri 66
 # @vir_source stdlib/vir/compiler/lir_liveness.vri 1
 ##
@@ -37777,7 +38704,6 @@ func lir_verify_func(func_obj: LirFunc, ig: InterferenceGraph, assigned_phys: i6
 end.
 
 export lir_verify_func
-
 # @vir_source stdlib/vir/compiler/virc.vri 69
 # @vir_source stdlib/vir/compiler/lir_regalloc_color.vri 1
 ##
@@ -38343,7 +39269,6 @@ import sb_new, sb_append, sb_append_int, sb_to_string, sb_free, native_read_i64 
 import print_str, print_int from compiler.context
 import MirOp, MirOperandType, MirOperand, MirPhi, MirBlock, MirFunc, MirInstr, mir_instr_op, mir_instr_dst, mir_instr_src1, mir_instr_src2, mir_instr_aux, mir_block_id, mir_block_head, mir_block_phis, mir_phi_dst, mir_phi_incoming_blocks, mir_phi_incoming_values, mir_opnd_type, mir_opnd_vreg_id, mir_opnd_imm_val, mir_func_id, mir_func_name, mir_func_blocks, mir_func_strings from mir
 import MirType, MirOp, MirOperandType, MirOperand, MirPhi, MirBlock, MirFunc, MirInstr, mir_instr_op, mir_instr_dst, mir_instr_src1, mir_instr_src2, mir_instr_aux, mir_instr_type, mir_block_id, mir_block_head, mir_block_phis, mir_phi_dst, mir_phi_incoming_blocks, mir_phi_incoming_values, mir_opnd_type, mir_opnd_vreg_id, mir_opnd_imm_val, mir_func_id, mir_func_name, mir_func_blocks, mir_func_strings, MIR_INTR_NOP_MARKER, MIR_INTR_DECL, MIR_INTR_QUIET, MIR_INTR_CHECK_CPU, MIR_INTR_PATCH_POINT, MIR_INTR_PRECOMP, MIR_INTR_EXPOSE, MIR_INTR_ASYNC, MIR_INTR_ATOMIC_VAR, MIR_INTR_TIMEOUT, MIR_INTR_ISOLATE, MIR_INTR_PTR, MIR_INTR_AWAIT_PASS, MIR_INTR_ENSURE, MIR_INTR_REVERT, MIR_INTR_ENUM, MIR_INTR_ERROR, MIR_INTR_EXIST, MIR_INTR_REACTIVE, MIR_INTR_MORPH, MIR_INTR_TRY, MIR_INTR_RESUME, MIR_INTR_EMIT, MIR_INTR_GLOBAL_STORE, MIR_INTR_INDEX_STORE, MIR_INTR_FIELD_STORE, MIR_INTR_THROW, MIR_INTR_PRINT, MIR_INTR_PRINT_STR, MIR_INTR_PRINT_FLOAT, MIR_INTR_PRINT_BOOL, MIR_INTR_TRAIN, MIR_INTR_INFER, MIR_INTR_ARENA, MIR_INTR_BUILTIN, MIR_MEM_MARK, MIR_MEM_RESET, MIR_MEM_PROMOTE, MIR_MEM_DROP, MIR_MEM_ALLOC from mir
-
 # @vir_source stdlib/vir/compiler/lir_lower.vri 19
 import LirType, LirOp, LirOperandType, LirOperand, LirInstr, LirBlock, LirFunc, lir_instr_new, lir_block_new, lir_func_new, lir_block_id, lir_block_instrs, lir_func_id, lir_func_name, lir_func_blocks, lir_func_stack_size, lir_func_strings, lir_opnd_none, lir_opnd_vreg_int, lir_opnd_imm, lir_instr_op, LIR_CMP_EQ, LIR_CMP_NE, LIR_CMP_GT, LIR_CMP_LT, LIR_CMP_GE, LIR_CMP_LE, LIR_JMP_IF, LIR_JMP_IFNOT from lir
 
@@ -38568,7 +39493,6 @@ func lir_lower_program(mir_funcs: i64):
 end.
 
 export lir_lower_func, lir_lower_program
-
 # @vir_source stdlib/vir/compiler/virc.vri 71
 # @vir_source stdlib/vir/compiler/pipeline.vri 1
 ##
@@ -38696,7 +39620,6 @@ func hir_func_new(id: i64, name: string, name2: string, params: i64, body: HirNo
 end.
 
 export HirKind, HirNode, HirFunc, hir_new, hir_add_arg, hir_add_stmt, hir_func_new
-
 # @vir_source stdlib/vir/compiler/pipeline.vri 20
 # @vir_source stdlib/vir/compiler/ast_to_hir.vri 1
 ##
@@ -38711,10 +39634,8 @@ import fat_str_eq, fat_str_len, fat_str_new, native_read_i64, native_write_i64 f
 
 import AstNode, AstType, OpType from parser
 
-
 # @vir_source stdlib/vir/compiler/ast_to_hir.vri 18
 import HirKind, HirNode, HirFunc, hir_new, hir_add_arg, hir_add_stmt, hir_func_new from hir
-
 
 # @vir_source stdlib/vir/compiler/ast_to_hir.vri 21
 import ast_node_name, ast_node_name2, ast_node_type_of, ast_node_op_of, ast_node_line, ast_node_int_val, ast_node_child, ast_node_child_count, ast_node_builtin_id, set_global_prog_ast, enum_index_from_type_name from ast_to_mir
@@ -39223,7 +40144,6 @@ func ast_to_hir_program(prog: AstNode):
 end.
 
 export ast_to_hir_expr, ast_to_hir_stmt, ast_to_hir_func, ast_to_hir_program
-
 # @vir_source stdlib/vir/compiler/pipeline.vri 21
 import ast_to_hir_program from compiler.ast_to_hir
 
@@ -39902,7 +40822,6 @@ export OptTier1, OptTier2, OptTier3, OptTier4, OptTier5, OptTier6,
        OptPassOrchestrator, OptPassInlining, OptPassGVN, OptPassPRE, OptPassSLP,
        OptPassShrinkWrap, OptPassJumpThread, OptPassSROA, OptPassSCCP, OptPassDAE, OptPassDevirt,
        opt_pass_min_level, opt_pass_stage
-
 # @vir_source stdlib/vir/compiler/mir_opt_pipeline.vri 10
 import OptPassConstFold, OptPassStrengthReduce, OptPassCSE, OptPassDCE,
        OptPassLICM, OptPassIVSR, OptPassLoopUnroll, OptPassLoopCollapse, OptPassLoopTiling,
@@ -40138,7 +41057,6 @@ import get_codegen_target, TargetArch from compiler.target
  * ================================================================================
  * Passes 10 (SIMD), 11 (TCO), 12 (IRC), 15 (ARC), 21 (shrink-wrap) are routed here.
  ##
-
 
 # @vir_source stdlib/vir/compiler/opt_backend.vri 9
 import TargetArch, get_codegen_target from target
@@ -40712,7 +41630,6 @@ func opt_arm64_run_lir_post(lf: i64):
 end.
 
 export opt_arm64_run_mir_passes, opt_arm64_run_lir_passes, opt_arm64_run_simd_mir_passes, opt_arm64_run_lir_pre, opt_arm64_run_lir_post
-
 # @vir_source stdlib/vir/compiler/opt_backend.vri 11
 import opt_arm64_run_mir_passes, opt_arm64_run_lir_passes, opt_arm64_run_simd_mir_passes from opt_backend_arm64
 import opt_arm64_run_mir_passes, opt_arm64_run_lir_passes, opt_arm64_run_simd_mir_passes, opt_arm64_run_lir_pre, opt_arm64_run_lir_post from opt_backend_arm64
@@ -40740,7 +41657,6 @@ end.
 
 export opt_x86_run_mir_passes, opt_x86_run_lir_pre, opt_x86_run_lir_post
 
-
 # @vir_source stdlib/vir/compiler/opt_backend.vri 14
 import opt_x86_run_mir_passes, opt_x86_run_lir_pre, opt_x86_run_lir_post from opt_backend_x86
 # @vir_source stdlib/vir/compiler/opt_backend_riscv.vri 1
@@ -40766,7 +41682,6 @@ func opt_riscv_run_lir_post(lf: i64):
 end.
 
 export opt_riscv_run_mir_passes, opt_riscv_run_lir_pre, opt_riscv_run_lir_post
-
 
 # @vir_source stdlib/vir/compiler/opt_backend.vri 16
 import opt_riscv_run_mir_passes, opt_riscv_run_lir_pre, opt_riscv_run_lir_post from opt_backend_riscv
@@ -40794,7 +41709,6 @@ end.
 
 export opt_wasm_run_mir_passes, opt_wasm_run_lir_pre, opt_wasm_run_lir_post
 
-
 # @vir_source stdlib/vir/compiler/opt_backend.vri 18
 import opt_wasm_run_mir_passes, opt_wasm_run_lir_pre, opt_wasm_run_lir_post from opt_backend_wasm
 # @vir_source stdlib/vir/compiler/opt_backend_generic.vri 1
@@ -40816,7 +41730,6 @@ func opt_generic_run_simd_mir_passes(blocks: i64):
 end.
 
 export opt_generic_run_mir_passes, opt_generic_run_lir_passes, opt_generic_run_simd_mir_passes
-
 # @vir_source stdlib/vir/compiler/opt_backend.vri 20
 import opt_generic_run_mir_passes, opt_generic_run_lir_passes, opt_generic_run_simd_mir_passes from opt_backend_generic
 # @vir_source stdlib/vir/compiler/opt_backend_arc.vri 1
@@ -40835,7 +41748,6 @@ func opt_backend_run_arc_passes(blocks: i64, opt_level: int):
 end.
 
 export opt_backend_run_arc_passes
-
 # @vir_source stdlib/vir/compiler/opt_backend.vri 22
 import opt_backend_run_arc_passes from opt_backend_arc
 
@@ -40908,7 +41820,6 @@ func opt_backend_run_lir_post(lf: i64, arch: int, opt_level: int):
 end.
 
 export opt_backend_run_mir_post, opt_backend_run_lir_pre, opt_backend_run_lir_post
-
 # @vir_source stdlib/vir/compiler/pipeline.vri 51
 import opt_backend_run_mir_post, opt_backend_run_lir_post from compiler.opt_backend
 import opt_backend_run_mir_post, opt_backend_run_lir_pre, opt_backend_run_lir_post from compiler.opt_backend
@@ -40920,7 +41831,7 @@ import lir_compute_liveness from compiler.lir_liveness
 import LirFunc, LirBlock from compiler.lir
 
 func lir_func_name(f: &LirFunc): out native_read_i64(f as i64, 8) as string end.
-func lir_func_blocks(f: &LirFunc): out native_read_i64(f as i64, 16) end.
+func lir_func_blocks(f: i64): out native_read_i64(f as i64, 16) end.
 func lir_block_instrs(b: LirBlock): out native_read_i64(b as i64, 8) end.
 
 import lir_allocate_registers_color from compiler.lir_regalloc_color
@@ -47049,8 +47960,6 @@ export x86_arg_reg, x86_emit_movupd_load, x86_emit_movupd_store, x86_emit_addpd,
 export x86_emit_neg_r, x86_emit_shr_imm, x86_emit_shl_imm, x86_emit_cmp_reg_imm32, x86_emit_and_imm8
 export x86_emit_movq_xmm_gpr, x86_emit_movq_gpr_xmm, x86_emit_mulsd_xx, x86_emit_addsd_xx, x86_emit_subsd_xx, x86_emit_divsd_xx, x86_emit_mulss_xx, x86_emit_addss_xx, x86_emit_subss_xx, x86_emit_divss_xx
 export x86_emit_movq_xmm_gpr, x86_emit_movq_gpr_xmm, x86_emit_mulsd_xx, x86_emit_addsd_xx, x86_emit_subsd_xx, x86_emit_divsd_xx, x86_emit_mulss_xx, x86_emit_addss_xx, x86_emit_subss_xx, x86_emit_divss_xx, x86_emit_cvtsi2sd_xg, x86_emit_cvttsd2si_gx
-
-
 # @vir_source stdlib/vir/compiler/virc.vri 80
 # @vir_source stdlib/vir/compiler/lir_codegen_x86.vri 1
 ##
@@ -50647,7 +51556,6 @@ func parse_target_triple(str_val: string):
     end
     out target_triple_new(target_spec_arch(s), target_spec_os(s), target_spec_abi(s), target_spec_format(s), target_spec_dialect(s))
 end.
-
 # @vir_source stdlib/vir/compiler/virc.vri 89
 import parse_target_triple, get_host_triple from compiler.target_triple
 # @vir_source stdlib/vir/compiler/mc_printer.vri 1
@@ -51014,6 +51922,10 @@ func print_mc_inst_x86(inst: MCInst, dialect: int, b: int):
         out bvec_emit_cstr(b, "    syscall
 ")
     end
+    if opc == MCOpcode.X86_64_UD2 do
+        out bvec_emit_cstr(b, "    ud2
+")
+    end
     out b
 end.
 
@@ -51156,6 +52068,10 @@ func print_mc_inst_riscv(inst: MCInst, dialect: int, b: int):
     end
     if opc == MCOpcode.RISCV_ECALL do
         out bvec_emit_cstr(b, "    ecall
+")
+    end
+    if opc == MCOpcode.RISCV_EBREAK do
+        out bvec_emit_cstr(b, "    ebreak
 ")
     end
     if opc == MCOpcode.RISCV_RET do
@@ -51454,6 +52370,12 @@ func print_mc_inst(inst: MCInst, dialect: int, b: int):
 
     if opc == MCOpcode.ARM64_SVC do
         b = bvec_emit_cstr(b, "    svc #")
+        b = bvec_emit_int(b, mc_opnd_imm_val(mc_inst_op0(inst)))
+        out bvec_emit_cstr(b, "
+")
+    end
+    if opc == MCOpcode.ARM64_BRK do
+        b = bvec_emit_cstr(b, "    brk #")
         b = bvec_emit_int(b, mc_opnd_imm_val(mc_inst_op0(inst)))
         out bvec_emit_cstr(b, "
 ")
@@ -53119,7 +54041,6 @@ func print_mc_string_pool(lir_funcs: int, dialect: int, b: int):
 end.
 
 export print_mc_inst, print_mc_function_header, print_mc_function_footer, print_mc_assembly_prologue, print_mc_runtime_stubs, print_mc_string_pool
-
 # @vir_source stdlib/vir/compiler/virc.vri 91
 import print_mc_inst, print_mc_function_header, print_mc_function_footer, print_mc_assembly_prologue, print_mc_runtime_stubs, print_mc_string_pool from compiler.mc_printer
 # @vir_source stdlib/vir/compiler/lir_to_mc.vri 1
@@ -54115,7 +55036,7 @@ func x86_mc_arg_reg(idx: int):
     out 0 # RAX
 end.
 
-func x86_mc_error_intrinsic(insts: i64, kind: i64, d: i64, s1: i64, s2: i64, rd: i64, assigned_phys: i64):
+func x86_mc_error_intrinsic(insts: i64, kind: i64, d: &LirOperand, s1: &LirOperand, s2: &LirOperand, rd: i64, assigned_phys: i64):
     let op_n0 = mc_opnd_none()
     let op_n1 = mc_opnd_none()
     if kind == MIR_INTR_ERX and rd >= 0 do
@@ -54141,7 +55062,7 @@ func x86_mc_error_intrinsic(insts: i64, kind: i64, d: i64, s1: i64, s2: i64, rd:
     out insts
 end.
 
-func lir_func_to_mc_x86_64(func_obj: i64, assigned_phys: i64):
+func lir_func_to_mc_x86_64(func_obj: &LirFunc, assigned_phys: i64):
     var fid = lir_func_id(func_obj)
     if fid < 0 do
         fid = 0
@@ -55017,7 +55938,7 @@ func emit_riscv_stack_adjust(insts: i64, op_reg: MCInstOperand, delta: int, op_n
     out insts
 end.
 
-func riscv_mc_error_intrinsic(insts: i64, kind: i64, d: i64, s1: i64, s2: i64, rd: i64, assigned_phys: i64):
+func riscv_mc_error_intrinsic(insts: i64, kind: i64, d: &LirOperand, s1: &LirOperand, s2: &LirOperand, rd: i64, assigned_phys: i64):
     let op_n0 = mc_opnd_none()
     let op_n1 = mc_opnd_none()
     # s1/x9 is outside the allocator palette and carries erx on RV64.
@@ -55042,7 +55963,7 @@ func riscv_mc_error_intrinsic(insts: i64, kind: i64, d: i64, s1: i64, s2: i64, r
     out insts
 end.
 
-func lir_func_to_mc_riscv64(func_obj: i64, assigned_phys: i64):
+func lir_func_to_mc_riscv64(func_obj: &LirFunc, assigned_phys: i64):
     var fid = lir_func_id(func_obj)
     if fid < 0 do
         fid = 0
@@ -56181,7 +57102,6 @@ func mc_verify_function(mc_insts: i64, arch: int):
     end
     out 1
 end.
-
 # @vir_source stdlib/vir/compiler/virc.vri 95
 import mc_verify_function from compiler.mc_verify
 # @vir_source stdlib/vir/compiler/lir_codegen_riscv.vri 1
@@ -56490,7 +57410,6 @@ func emit_lir_module_riscv64(lir_funcs: i64):
 end.
 
 export emit_lir_module_riscv64
-
 # @vir_source stdlib/vir/compiler/main.vri 1
 ##
  * vir/compiler/main.vri — Vir Self-Hosting Compiler Driver
@@ -56512,14 +57431,12 @@ export emit_lir_module_riscv64
  * Date: 9/3/2026
  ##
 
-
 # @vir_source stdlib/vir/compiler/main.vri 22
-import AstNode, AstType, parse_program, parser_new, ast_new, ast_add_child from parser
-
+import sm_new, sm_build_from_source, g_active_source_manager from source_manager
 # @vir_source stdlib/vir/compiler/main.vri 25
-import compile_pipeline from pipeline
-
+import AstNode, AstType, parse_program, parser_new, ast_new, ast_add_child from parser
 # @vir_source stdlib/vir/compiler/main.vri 27
+import compile_pipeline from pipeline
 # @vir_source stdlib/vir/compiler/binary.vri 1
 ##
  * vir/codegen/binary.vri — Binary Object Format Emitter
@@ -57949,6 +58866,7 @@ var g_imp_aliases = 0
 var g_imp_sym_count = 0
 var g_imp_alias = 0;  # optional rename for single-symbol import … as X
 var g_imp_end = 0;    # byte offset immediately after the parsed import stmt
+var g_imp_chunk_line = 1; # original line of the currently extracted definition
 var g_inc_resolved_path = 0;   # C-string of last successfully read file path
 var g_inc_main_file = 0;       # C-string of root input file
 var g_inc_cur_parent_file = 0; # C-string of current file being expanded
@@ -58568,6 +59486,20 @@ func text_parse_include_name(source: int, at: int):
     out str_from_cstr(buf)
 end.
 
+func inc_count_newlines(source: int, start: int, end_pos: int):
+    let data = native_read_i64(source as i64, 0)
+    var count = 0
+    var i = start
+    when i < end_pos loop
+        if native_read_u8(data, i) == 10 do
+            count = count + 1
+        end
+        i = i + 1
+    end
+    if count == 0 do count = 1 end
+    out count
+end.
+
 func text_skip_include_stmt(source: int, at: int):
     # Return index just past the include statement (after ; or newline).
     data = native_read_i64(source, 0)
@@ -58584,33 +59516,50 @@ func text_skip_include_stmt(source: int, at: int):
 end.
 
 func text_splice_at(source: int, at: int, end_at: int, insert: int):
-    sdata = native_read_i64(source, 0)
-    slen = native_read_i64(source, 8)
-    idata = native_read_i64(insert, 0)
-    ilen = native_read_i64(insert, 8)
-    # Keep the replacement lexically separated from both neighbours.  Many
-    # module files do not end in a newline; without these sentinels an include
-    # followed by `import` becomes `end.import`, corrupting the whole parse.
-    total = at + 1 + ilen + 1 + (slen - end_at)
+    sdata = native_read_i64(source as i64, 0)
+    slen = native_read_i64(source as i64, 8)
+    idata = native_read_i64(insert as i64, 0)
+    ilen = native_read_i64(insert as i64, 8)
+
+    var need_lead_nl = 0
+    if at > 0 and native_read_u8(sdata, at - 1) != 10 do
+        need_lead_nl = 1
+    end
+    var need_trail_nl = 0
+    if ilen > 0 and native_read_u8(idata, ilen - 1) != 10 do
+        need_trail_nl = 1
+    end
+
+    total = at + need_lead_nl + ilen + need_trail_nl + (slen - end_at)
     buf = vir_alloc(total + 1)
-    i = 0
+    var out_i = 0
+    var i = 0
     when i < at loop
-        native_write_u8(buf, i, native_read_u8(sdata, i))
+        native_write_u8(buf, out_i, native_read_u8(sdata, i))
+        out_i = out_i + 1
         i = i + 1
     end
-    native_write_u8(buf, at, 10)
-    j = 0
+    if need_lead_nl == 1 do
+        native_write_u8(buf, out_i, 10)
+        out_i = out_i + 1
+    end
+    var j = 0
     when j < ilen loop
-        native_write_u8(buf, at + 1 + j, native_read_u8(idata, j))
+        native_write_u8(buf, out_i, native_read_u8(idata, j))
+        out_i = out_i + 1
         j = j + 1
     end
-    native_write_u8(buf, at + 1 + ilen, 10)
-    k = end_at
+    if need_trail_nl == 1 do
+        native_write_u8(buf, out_i, 10)
+        out_i = out_i + 1
+    end
+    var k = end_at
     when k < slen loop
-        native_write_u8(buf, at + 1 + ilen + 1 + (k - end_at), native_read_u8(sdata, k))
+        native_write_u8(buf, out_i, native_read_u8(sdata, k))
+        out_i = out_i + 1
         k = k + 1
     end
-    native_write_u8(buf, total, 0)
+    native_write_u8(buf, out_i, 0)
     out str_from_cstr(buf)
 end.
 
@@ -58851,6 +59800,10 @@ func inc_prepend_root_marker(source: string):
 end.
 
 func inc_wrap_source(body: string, r_path: int, p_file: int, p_line: int):
+    out inc_wrap_source_at(body, r_path, 1, p_file, p_line)
+end.
+
+func inc_wrap_source_at(body: string, r_path: int, r_line: int, p_file: int, p_line: int):
     let bdata = native_read_i64(body as i64, 0)
     let blen = native_read_i64(body as i64, 8)
     let rlen = rt_strlen(r_path)
@@ -58861,7 +59814,9 @@ func inc_wrap_source(body: string, r_path: int, p_file: int, p_line: int):
     if blen > 0 and native_read_u8(bdata, blen - 1) != 10 do
         need_nl = 1
     end
-    let total = 17 + rlen + blen + need_nl + 16 + plen + pline_len
+    let rline_str = rt_itoa(r_line)
+    let rline_len = rt_strlen(rline_str)
+    let total = 16 + rlen + rline_len + blen + need_nl + 16 + plen + pline_len
     let buf = vir_alloc(total + 1)
     native_write_u8(buf, 0, 35)
     native_write_u8(buf, 1, 32)
@@ -58885,9 +59840,15 @@ func inc_wrap_source(body: string, r_path: int, p_file: int, p_line: int):
         i = i + 1
     end
     native_write_u8(buf, out_i, 32)
-    native_write_u8(buf, out_i + 1, 49)
-    native_write_u8(buf, out_i + 2, 10)
-    out_i = out_i + 3
+    out_i = out_i + 1
+    i = 0
+    when i < rline_len loop
+        native_write_u8(buf, out_i, native_read_u8(rline_str, i))
+        out_i = out_i + 1
+        i = i + 1
+    end
+    native_write_u8(buf, out_i, 10)
+    out_i = out_i + 1
     i = 0
     when i < blen loop
         native_write_u8(buf, out_i, native_read_u8(bdata, i))
@@ -59027,15 +59988,27 @@ func expand_includes_text(source: int):
         var body = read_include_source(iname)
         if body == 0 do
             inc_locate_marker_before(source, at)
-            print_str("virc: error [E2102] Source Resolution: ")
-            print_str("included source not found: '")
-            print_str(native_read_i64(iname as i64, 0))
-            print_str("' requested at ")
-            print_str(g_inc_cur_parent_file)
-            print_str(":")
-            print_int(g_inc_cur_parent_line)
-            print_str("\n")
             inc_set_error(2102)
+            if g_diag_json == 1 do
+                var early_diag = diagnostic_engine_new()
+                report_error_loc(early_diag, 2102, 0, g_inc_cur_parent_line, 1, native_read_i64(iname as i64, 0) as string)
+                let d0 = vec_get_rt(early_diag.diagnostics, 0)
+                if g_inc_cur_parent_file != 0 do
+                    native_write_i64(d0 as i64, 80, g_inc_cur_parent_file)
+                end
+                pass10_emit_json(early_diag)
+                virc_print_compile_time()
+                sys_exit(1)
+            else
+                print_str("virc: error [E2102] Source Resolution: ")
+                print_str("included source not found: '")
+                print_str(native_read_i64(iname as i64, 0))
+                print_str("' requested at ")
+                print_str(g_inc_cur_parent_file)
+                print_str(":")
+                print_int(g_inc_cur_parent_line)
+                print_str("\n")
+            end
             out source
         end
         var body_path = g_inc_resolved_path
@@ -59056,8 +60029,8 @@ func expand_includes_text(source: int):
             let end_at = text_skip_include_stmt(source, at)
             inc_locate_marker_before(source, at)
             let p_file = g_inc_cur_parent_file
-            let p_line = g_inc_cur_parent_line
-            let wrapped_body = inc_wrap_source(body, inc_key, p_file, p_line + 1)
+            let p_line = g_inc_cur_parent_line + inc_count_newlines(source, at, end_at)
+            let wrapped_body = inc_wrap_source(body, inc_key, p_file, p_line)
             source = text_splice_at(source, at, end_at, wrapped_body)
         end
     end
@@ -59364,6 +60337,7 @@ func text_extract_func(body: int, fname: int):
     fl = native_read_i64(fname, 8)
     i = 0
     at_line = 1
+    var source_line = 1
     when i + fl <= n loop
         if at_line == 1 do
             pref_len = 0
@@ -59389,6 +60363,7 @@ func text_extract_func(body: int, fname: int):
                 if text_eq_ident(data, j, fl, fname) == 1 do
                     after = j + fl
                     if after >= n or text_is_ident_char(native_read_u8(data, after)) == 0 do
+                        g_imp_chunk_line = source_line
                         if is_const == 1 do
                             k = after
                             when k < n and native_read_u8(data, k) != 10 loop
@@ -59418,6 +60393,7 @@ func text_extract_func(body: int, fname: int):
         ch = native_read_u8(data, i)
         if ch == 10 do
             at_line = 1
+            source_line = source_line + 1
         else
             if ch != 32 and ch != 9 do
                 at_line = 0
@@ -59715,8 +60691,8 @@ func text_skip_import_stmt(source: int, at: int):
 end.
 
 func text_validate_import_exports(mod_body: int):
-    # Nested includes splice the whole module, but selective imports must
-    # still enforce exports from the requested module.
+    # A selective import of a module with nested includes splices the whole
+    # source, but it must still enforce that the module exports each symbol.
     let sym_data = native_read_i64(g_imp_syms, 0)
     let sym_len = native_read_i64(g_imp_syms, 8)
     var pos = 0
@@ -59779,6 +60755,8 @@ func text_build_import_body(mod_body: int, alias_only: int):
             if ap > a0 do
                 alias_name = text_fat_from_range(ad, a0, ap - a0)
             end
+            # Even if an included module needs no alias shim, selective import
+            # still requires the requested symbol to be exported and present.
             if text_has_export(mod_body, fname) == 0 do
                 inc_set_error(2113)
                 out 0
@@ -59884,19 +60862,40 @@ func expand_imports_text(source: int):
             out source
         end
         end_at = text_skip_import_stmt(source, at)
+        inc_locate_marker_before(source, at)
+        let import_parent_file = g_inc_cur_parent_file
+        let import_parent_line = g_inc_cur_parent_line
+        let import_resume_line = import_parent_line + inc_count_newlines(source, at, end_at)
         g_inc_resolved_path = 0
         body = read_include_source(g_imp_mod)
         if body == 0 do
-            print_str("virc: error [E2112] Module Resolution: ")
-            print_str("module not found: '")
-            print_str(native_read_i64(g_imp_mod, 0))
-            print_str("'\n")
             inc_set_error(2112)
+            if g_diag_json == 1 do
+                var early_diag = diagnostic_engine_new()
+                report_error_loc(early_diag, 2112, 0, import_parent_line, 1, native_read_i64(g_imp_mod, 0) as string)
+                let d0 = vec_get_rt(early_diag.diagnostics, 0)
+                if import_parent_file != 0 do
+                    native_write_i64(d0 as i64, 80, import_parent_file)
+                end
+                pass10_emit_json(early_diag)
+                virc_print_compile_time()
+                sys_exit(1)
+            else
+                print_str("virc: error [E2112] Module Resolution: ")
+                print_str("module not found: '")
+                print_str(native_read_i64(g_imp_mod, 0))
+                print_str("' requested at ")
+                print_str(import_parent_file)
+                print_str(":")
+                print_int(import_parent_line)
+                print_str("\n")
+            end
             out source
         end
         var body_path = g_inc_resolved_path
         if body_path == 0 do body_path = native_read_i64(g_imp_mod as i64, 0) end
         if inc_validate_utf8_source(body, body_path) == 0 do out source end
+        g_imp_chunk_line = 1
         var imp_key = g_inc_resolved_path
         if imp_key == 0 do
             imp_key = native_read_i64(g_imp_mod as i64, 0)
@@ -59918,6 +60917,9 @@ func expand_imports_text(source: int):
                 ebuf = vir_alloc(1)
                 native_write_u8(ebuf, 0, 0)
                 shim = str_from_cstr(ebuf)
+            end
+            if shim != 0 do
+                shim = inc_wrap_source_at(shim, body_path, g_imp_chunk_line, import_parent_file, import_resume_line)
             end
             source = text_splice_at(source, at, end_at, shim)
         else
@@ -59950,6 +60952,7 @@ func expand_imports_text(source: int):
                 end
             end
             g_inc_mark(imp_key_fat)
+            piece = inc_wrap_source_at(piece, body_path, g_imp_chunk_line, import_parent_file, import_resume_line)
             source = text_splice_at(source, at, end_at, piece)
         end
     end
@@ -60019,7 +61022,7 @@ func compile(source: string, output_path: string):
     lex = lexer_new(source)
     lex = tokenize(lex)
 
-    if fat_str_len(lex.error_msg) > 0 do
+    if lexer_error_message() != 0 do
         print "virc: lex error"
         out 1
     end
@@ -60166,7 +61169,6 @@ func compiler_legacy_main:
 end.
 #*#
 export main, emit_macho_executable, emit_macho_with_entry, FuncLayout, expand_includes_text, expand_imports_text, text_ascii_sanitize, g_inc_base, g_inc_err, g_inc_main_file
-
 # @vir_source stdlib/vir/compiler/virc.vri 97
 import emit_macho_executable, emit_macho_with_entry, FuncLayout, expand_includes_text, expand_imports_text, text_ascii_sanitize, g_inc_base, g_inc_err, g_inc_main_file from compiler.main
 import vec_len, vec_get from vec
@@ -60388,7 +61390,7 @@ func parse_args:
             sys_exit(0)
         end
         if rt_streq(cur, "--help") or rt_streq(cur, "-h") do
-            print_ln("Usage: virc <input.vri> [-o output] [--target macos-arm64|linux-arm64|linux-x86_64|linux-riscv64|wasm32-wasi-p1] [--format macho|elf|wasm]")
+            print_ln("Usage: virc <input.vri> [-o output] [--target macos-arm64|linux-arm64|windows-arm64|linux-x86_64|windows-x86_64|linux-riscv64|wasm32-wasi-p1] [--format macho|elf|pe|wasm]")
             sys_exit(0)
         end
         a = a + 1
@@ -60396,7 +61398,7 @@ func parse_args:
 
     if argc <= base_idx do
         print_ln("virc: error_msg: no input file")
-        print_ln("Usage: virc <input.vri> [-o output] [--target macos-arm64|linux-arm64|linux-x86_64|linux-riscv64|wasm32-wasi-p1] [--format macho|elf|wasm]")
+        print_ln("Usage: virc <input.vri> [-o output] [--target macos-arm64|linux-arm64|windows-arm64|linux-x86_64|windows-x86_64|linux-riscv64|wasm32-wasi-p1] [--format macho|elf|pe|wasm]")
         sys_exit(1)
     end
 
@@ -60499,6 +61501,22 @@ func parse_args:
         eif rt_streq(arg, "-q") or rt_streq(arg, "--quiet") do
             cfg_set_verbose(cfg, 0)
 
+        eif rt_streq(arg, "--color=always") do
+            g_color_mode = 1
+
+        eif rt_streq(arg, "--color=never") do
+            g_color_mode = 2
+
+        eif rt_streq(arg, "--color=auto") do
+            g_color_mode = 0
+
+        eif rt_streq(arg, "--json") do
+            g_diag_json = 1
+            cfg_set_verbose(cfg, 0)
+
+        eif rt_streq(arg, "--timings") do
+            g_phase_timings = 1
+
         eif rt_streq(arg, "-v") or rt_streq(arg, "--version") do
             print_ln("virc 3.3.0 (self-hosted)")
             sys_exit(0)
@@ -60510,8 +61528,8 @@ func parse_args:
             print_ln("")
             print_ln("Options:")
             print_ln("  -o <file>           Output file (default: a.out)")
-            print_ln("  --target <target>   macos-arm64, linux-arm64, linux-x86_64, linux-riscv64 or wasm32-wasi-p1")
-            print_ln("  --format <fmt>      macho, elf or wasm (default: macho)")
+            print_ln("  --target <target>   macos-arm64, linux-arm64, windows-arm64, linux-x86_64, windows-x86_64, linux-riscv64 or wasm32-wasi-p1")
+            print_ln("  --format <fmt>      macho, elf, pe or wasm (default: macho)")
             print_ln("  --mir-full          Enable full MIR optimization pipeline (alias -O3)")
             print_ln("  -O0 .. -O3          Optimization tier (spec §1.2.1, 26 MIR passes)")
             print_ln("  -q, --quiet         Suppress progress messages")
@@ -60607,24 +61625,28 @@ func virc_compile(cfg: CompilerConfig):
     end
     if not is_preexpanded do
         g_inc_main_file = input_path
-        print_ln("virc: expanding includes...")
+        if verbose == 1 and g_diag_json == 0 do print_ln("virc: expanding includes...") end
         source_fat = expand_includes_text(source_fat)
         if g_inc_err == 1 do
-            print_ln("virc: include expansion failed")
+            if g_diag_json == 0 do print_ln("virc: include expansion failed") end
+            virc_print_compile_time()
             sys_exit(1)
         end
         source_fat = expand_imports_text(source_fat)
         if g_inc_err == 1 do
-            print_ln("virc: import expansion failed")
+            if g_diag_json == 0 do print_ln("virc: import expansion failed") end
+            virc_print_compile_time()
             sys_exit(1)
         end
         if g_inc_err == 3 do
-            print_ln("virc: import symbol not exported")
+            if g_diag_json == 0 do print_ln("virc: import symbol not exported") end
+            virc_print_compile_time()
             sys_exit(1)
         end
         source_fat = expand_includes_text(source_fat)
         if g_inc_err == 1 do
-            print_ln("virc: include expansion failed")
+            if g_diag_json == 0 do print_ln("virc: include expansion failed") end
+            virc_print_compile_time()
             sys_exit(1)
         end
     else
@@ -60639,6 +61661,8 @@ func virc_compile(cfg: CompilerConfig):
             sys_exit(1)
         end
     end
+    g_active_source_manager = sm_new()
+    sm_build_from_source(g_active_source_manager, source_fat, input_path)
     if verbose == 1 do
         arena:
             var sb_pre = sb_new()
@@ -60663,14 +61687,37 @@ func virc_compile(cfg: CompilerConfig):
     # Read lexer state through its published Vec/error handles. The Vec is
     # published by lexer_new before the token loop, so alternate loop exits do
     # not depend on aggregate return-register preservation.
-    if lexer_error_message() != 0 do
-        arena:
-            var sb = sb_new()
-            sb = sb_append(sb, "virc: lex error_msg: ")
-            sb = sb_append(sb, lexer_error_message())
-            print_ln(sb_to_string(sb))
-            sb_free(sb)
+    var lex_has_err = 0
+    var lex_err_line = 1
+    var lex_err_col = 1
+    var lex_err_msg = lexer_error_message()
+    let tok_count_raw = lexer_token_count()
+    var ti_check = 0
+    when ti_check < tok_count_raw loop
+        let t = lexer_token_get(ti_check)
+        if t.tok_type == TokType.Error do
+            lex_has_err = 1
+            lex_err_line = t.line
+            lex_err_col = t.col
+            if lex_err_msg == 0 do
+                lex_err_msg = t.str_val as i64
+            end
+            ti_check = tok_count_raw
         end
+        ti_check = ti_check + 1
+    end
+    if lex_has_err == 1 or lexer_error_message() != 0 do
+        if lex_err_msg == 0 do
+            lex_err_msg = "invalid token" as i64
+        end
+        var early_diag = diagnostic_engine_new()
+        report_error_loc(early_diag, 1, 0, lex_err_line, lex_err_col, lex_err_msg as string)
+        if g_diag_json == 1 do
+            pass10_emit_json(early_diag)
+        else
+            pass10_emit_diagnostics(early_diag)
+        end
+        virc_print_compile_time()
         sys_exit(1)
     end
 
@@ -60726,25 +61773,15 @@ func virc_compile(cfg: CompilerConfig):
     # parse_program prints and recovers from individual errors, clearing
     # error_msg so it can report more than one.  error_line remains non-zero
     # after any error and must prevent semantic analysis of a partial AST.
-    if parser2.error_line > 0 and parser2.error_line <= fat_str_len(source_fat) do
-        if parser2.error_msg != 0 do
-            print_ln(parser2.error_msg)
+    if parser2.error_line > 0 do
+        var early_diag = diagnostic_engine_new()
+        report_error_loc(early_diag, 1001, 0, parser2.error_line, 1, parser2.error_msg as string)
+        if g_diag_json == 1 do
+            pass10_emit_json(early_diag)
+        else
+            pass10_emit_diagnostics(early_diag)
         end
-        arena:
-            virc_locate_source(source_fat, parser2.error_line)
-            var sb_pe = sb_new()
-            sb_pe = sb_append(sb_pe, "virc: parse warning at ")
-            # g_virc_diag_file is already a raw NUL-terminated C string. Wrapping
-            # it as a fat string makes sb_append read the wrapper bytes as text.
-            sb_pe = sb_append(sb_pe, g_virc_diag_file)
-            sb_pe = sb_append(sb_pe, ":")
-            sb_pe = sb_append_int(sb_pe, g_virc_diag_line)
-            sb_pe = sb_append(sb_pe, " (expanded line ")
-            sb_pe = sb_append_int(sb_pe, parser2.error_line)
-            sb_pe = sb_append(sb_pe, "): skipping semantic analysis for partial AST")
-            print_ln(sb_to_string(sb_pe))
-            sb_free(sb_pe)
-        end
+        virc_print_compile_time()
         sys_exit(1)
         out 1
     end
@@ -60754,16 +61791,19 @@ func virc_compile(cfg: CompilerConfig):
         print_ln("virc: running semantic analysis...")
     end
 
-    let sem_errors = semantic_run(ast, input_path, verbose)
+    let sem_errors = semantic_run(ast, verbose)
     if sem_errors > 0 do
-        arena:
-            var sb_sem = sb_new()
-            sb_sem = sb_append(sb_sem, "virc: compilation aborted — ")
-            sb_sem = sb_append_int(sb_sem, sem_errors)
-            sb_sem = sb_append(sb_sem, " semantic error(s)")
-            print_ln(sb_to_string(sb_sem))
-            sb_free(sb_sem)
+        if g_diag_json == 0 do
+            arena:
+                var sb_sem = sb_new()
+                sb_sem = sb_append(sb_sem, "virc: compilation aborted — ")
+                sb_sem = sb_append_int(sb_sem, sem_errors)
+                sb_sem = sb_append(sb_sem, " semantic error(s)")
+                print_ln(sb_to_string(sb_sem))
+                sb_free(sb_sem)
+            end
         end
+        virc_print_compile_time()
         sys_exit(1)
         out 1
     end
@@ -61035,13 +62075,20 @@ end.
 # ═══════════════════════════════════════════════════════
 
 func main:
-    print_ln("====================================")
-    print_ln("  virc — Vir Self-Hosting Compiler")
-    print_ln("  v3.3.0 — Generics, Diagnostics & Fixed-Point Compiler")
-    print_ln("====================================")
-
+    virc_timer_init()
     let cfg = parse_args()
+    let verbose = cfg_get_verbose(cfg)
+    if verbose == 1 and g_diag_json == 0 do
+        print_ln("====================================")
+        print_ln("  virc — Vir Self-Hosting Compiler")
+        print_ln("  v3.3.0 — Generics, Diagnostics & Fixed-Point Compiler")
+        print_ln("====================================")
+    end
+
     let result = virc_compile(cfg)
+    if result == 0 do
+        virc_print_compile_time()
+    end
     sys_exit(result)
     out result
 end.
