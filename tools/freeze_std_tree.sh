@@ -130,7 +130,7 @@ set_source_version() {
   local src="$1" version="$2" tmp
   tmp="$(mktemp)"
   sed -E \
-    -e "s/(const VERSION: \"virc )[0-9]+\.[0-9]+\.[0-9]+/\\1$version/" \
+    -e "s/(const VERSION[ :=]+ \"virc )[0-9]+\.[0-9]+\.[0-9]+/\\1$version/" \
     -e "s/(print_ln\(\"  )v[0-9]+\.[0-9]+\.[0-9]+( — Multi-Target Matrix & LIR Pipeline\"\))/\\1v$version\\2/" \
     -e "s/(print_ln\(\"  )v[0-9]+\.[0-9]+\.[0-9]+( — .*\")/\\1v$version\\2/" \
     "$src" >"$tmp"
@@ -152,17 +152,14 @@ build_freeze_bin() {
   set_source_version "$dest/compiler_src/stdlib_vir_compiler/virc.vri" "$version"
 
   echo "Building bin/virc v$version with seed $seed ..."
-  if [ -f "dist/virc-expanded.vri" ]; then
-    "$seed" dist/virc-expanded.vri -o "$output" -q
-  else
-    (cd "$dest" && "$seed" stdlib/vir/compiler/virc.vri -o bin/virc -q)
-  fi
+  (cd "$dest" && "$seed" stdlib/vir/compiler/virc.vri -o bin/virc -q)
   [ -x "$output" ] || die "--with-bin: build succeeded but produced no executable: $output"
   if command -v codesign >/dev/null 2>&1; then codesign -f -s - -i "$IDENT_CODESIGN" "$output" >/dev/null 2>&1 || true; fi
 
   banner="$("$output" --version 2>&1 || true)"
   grep -Eq "v${version}[[:space:]]+Multi-Target Matrix & LIR Pipeline" <<<"$banner" || \
-  grep -Eq "v${version}[[:space:]]+" <<<"$banner" || die "--with-bin: built compiler banner does not contain v$version"
+  grep -Eq "v${version}[[:space:]]+" <<<"$banner" || \
+  grep -Eq "virc ${version}[[:space:]]+" <<<"$banner" || die "--with-bin: built compiler banner does not contain v$version"
 
   smoke_src="$dest/.virc-freeze-smoke.vri"
   smoke_bin="$dest/.virc-freeze-smoke"
