@@ -26,7 +26,7 @@ include compiler.ffi_imports
 import ffi_import_reset, ffi_import_register, ffi_import_find from compiler.ffi_imports
 
 include type_table
-import TypeKind, is_tensor_type_str, parse_tensor_shape, parse_tensor_rank, parse_tensor_stride, parse_tensor_numel, parse_tensor_elem_type, tensor_elem_byte_size, parse_tensor_elem_code from type_table
+import TypeKind, is_tensor_type_str, parse_tensor_shape, parse_tensor_rank, parse_tensor_stride, parse_tensor_numel, parse_tensor_elem_type, tensor_elem_byte_size, parse_tensor_elem_code, is_flux_type_str, parse_flux_lanes, swizzle_char_to_lane from type_table
 
 include compiler.mir
 import print_str, print_ln, g_disable_specialization from compiler.context
@@ -844,6 +844,7 @@ func eval_const_expr(node: &AstNode):
         if fat_cstr_eq(cname, "true") == 1 do out 1 end
         if fat_cstr_eq(cname, "false") == 1 do out 0 end
         if fat_cstr_eq(cname, "null") == 1 do out 0 end
+        if fat_cstr_eq(cname, "void") == 1 do out 0 end
         if g_const_hash > 0 do
             c_idx = hash_table_lookup(g_const_hash, g_const_names, cname)
             if c_idx >= 0 do
@@ -2817,6 +2818,9 @@ func lower_expr_impl(b: MirBuilder, expr: &AstNode):
             if fat_cstr_eq(fname, "null") == 1 do
                 out expr_result(b, mir_opnd_imm(0))
             end
+            if fat_cstr_eq(fname, "void") == 1 do
+                out expr_result(b, mir_opnd_imm(0))
+            end
             if g_const_hash > 0 do
                 c_idx = hash_table_lookup(g_const_hash, g_const_names, fname)
                 if c_idx >= 0 do
@@ -3025,14 +3029,39 @@ func lower_expr_impl(b: MirBuilder, expr: &AstNode):
 
     # 5c. Swizzle / SafeAccess
 	if expr_type == AstType.SwizzleExpr do
-		var (b1, mid) = builder_intern(b, ast_node_name(expr))
 		if ast_node_child_count(expr) > 0 do
-			var b2 = lower_expr(b1, ast_node_child(expr, 0))
+			var b2 = lower_expr(b, ast_node_child(expr, 0))
 			var base = g_lower_expr_result_opnd as MirOperand
-			var (b3, dst) = builder_new_vreg(b2)
-			b3 = emit_set_arg(b3, 0, base)
-			b3 = emit_set_arg(b3, 1, mir_opnd_imm(mid))
-			out expr_result(emit_intrinsic(b3, MIR_INTR_SWIZZLE, mir_opnd_vreg(dst), mir_opnd_imm(mid)), mir_opnd_vreg(dst))
+			var mask = ast_node_name(expr)
+			var m_len = fat_str_len(mask)
+			let alloc_sz = 16 + m_len * 8
+			var b_mut = emit_set_arg(b2, 0, mir_opnd_imm(alloc_sz))
+			var (b_dst, dst_base) = builder_new_vreg(b_mut)
+			ins_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(dst_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+			annotate_owned_alloc(ins_alloc, dst_base, alloc_sz, 16, ast_node_line(expr))
+			b_dst = builder_add_instr(b_dst, ins_alloc)
+			b_mut = b_dst
+			b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(dst_base))
+			b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(0))
+			b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(m_len))
+			b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+			b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(dst_base))
+			b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(8))
+			b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(m_len))
+			b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+			var si = 0
+			when si < m_len loop
+				var sc = fat_str_byte_at(mask as int, si)
+				var src_lane = swizzle_char_to_lane(sc)
+				b_mut = emit_set_arg(b_mut, 0, mir_opnd_imm(src_lane))
+				var (b_l, elem_v) = builder_new_vreg(b_mut)
+				b_l = emit_intrinsic(b_l, MIR_INTR_INDEX, mir_opnd_vreg(elem_v), base)
+				b_mut = emit_set_arg(b_l, 0, mir_opnd_imm(si))
+				b_mut = emit_set_arg(b_mut, 1, mir_opnd_vreg(elem_v))
+				b_mut = emit_intrinsic(b_mut, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(dst_base))
+				si = si + 1
+			end
+			out expr_result(b_mut, mir_opnd_vreg(dst_base))
 		end
 	end
 	if expr_type == AstType.SafeAccessExpr do
@@ -3095,6 +3124,9 @@ func lower_expr_impl(b: MirBuilder, expr: &AstNode):
 		callee = resolve_callee_alias(ast_node_name(expr))
 		if is_entity_name(callee) == 1 do
 			out lower_aggregate(b, MIR_INTR_ENTITY, expr)
+		end
+		if fat_cstr_eq(callee, "flux") == 1 do
+			out lower_aggregate(b, MIR_INTR_ARRAY, expr)
 		end
 		# Parser lookup_builtin can miss (fat vs C-string table names) and
 		# emit a Call instead of BuiltinCall. Reclassify by callee name.
@@ -4296,6 +4328,12 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 				if expr_nt == AstType.DictLiteral do var_t = fat_str_new("dict") end
 				if expr_nt == AstType.QuantizeExpr do var_t = fat_str_new("QuantizedTensor") end
 				if expr_nt == AstType.EnumConstruct do var_t = ast_node_name2(expr) end
+				if expr_nt == AstType.SwizzleExpr do
+					var_t = fat_str_concat(fat_str_new("flux<int, "), fat_str_concat(fat_str_new(rt_itoa(fat_str_len(ast_node_name(expr)))), fat_str_new(">")))
+				end
+				if expr_nt == AstType.Call and fat_cstr_eq(ast_node_name(expr), "flux") == 1 do
+					var_t = fat_str_concat(fat_str_new("flux<int, "), fat_str_concat(fat_str_new(rt_itoa(ast_node_child_count(expr))), fat_str_new(">")))
+				end
 				if expr_nt == AstType.EntityLiteral or expr_nt == AstType.Call do
 					var cname = resolve_callee_alias(ast_node_name(expr))
 					if is_entity_name(cname) == 1 do
@@ -4621,6 +4659,35 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 				b3 = emit_intrinsic_typed(b3, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(bv), elem_m_typ)
 			end
 			out b3
+		end
+		out b
+	end
+
+	if stmt_type == AstType.SwizzleAssign do
+		var target_name = ast_node_name(stmt)
+		var mask_str = ast_node_name2(stmt)
+		var mask_len = fat_str_len(mask_str)
+		var bv = get_var_vreg(b, target_name)
+		if bv >= 0 and ast_node_child_count(stmt) > 0 do
+			var b2 = lower_expr(b, ast_node_child(stmt, 0))
+			var rhs_op = g_lower_expr_result_opnd as MirOperand
+			var b_cur = b2
+			var k = 0
+			when k < mask_len loop
+				var ch = fat_str_byte_at(mask_str as int, k)
+				var dst_lane = swizzle_char_to_lane(ch)
+				if dst_lane >= 0 do
+					b_cur = emit_set_arg(b_cur, 0, mir_opnd_imm(k))
+					var (b_load, elem_v) = builder_new_vreg(b_cur)
+					b_load = emit_intrinsic(b_load, MIR_INTR_INDEX, mir_opnd_vreg(elem_v), rhs_op)
+					b_load = emit_set_arg(b_load, 0, mir_opnd_imm(dst_lane))
+					b_load = emit_set_arg(b_load, 1, mir_opnd_vreg(elem_v))
+					b_load = emit_intrinsic(b_load, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(bv))
+					b_cur = b_load
+				end
+				k = k + 1
+			end
+			out b_cur
 		end
 		out b
 	end
