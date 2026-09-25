@@ -634,16 +634,26 @@ func infer_expr_type_name(node: &AstNode):
         if fat_cstr_eq(callee_name, "flux") == 1 do
             var child_c = ast_node_child_count(node)
             var flux_elem_t = fat_str_new("int")
-            if child_c > 0 do
-                var first_ch = ast_node_child(node, 0)
-                var first_nt = ast_node_type_of(first_ch)
-                if first_nt == AstType.LiteralFloat do
-                    flux_elem_t = fat_str_new("float")
+            var has_float = false
+            var has_int = false
+            var ci = 0
+            when ci < child_c loop
+                var ch_node = ast_node_child(node, ci)
+                var ch_nt = ast_node_type_of(ch_node)
+                var ch_t = infer_expr_type_name(ch_node)
+                if ch_nt == AstType.LiteralFloat or fat_cstr_eq(ch_t, "float") == 1 or fat_cstr_eq(ch_t, "f64") == 1 or fat_cstr_eq(ch_t, "f32") == 1 do
+                    has_float = true
+                else
+                    has_int = true
                 end
-                var inferred_first_t = infer_expr_type_name(first_ch)
-                if fat_cstr_eq(inferred_first_t, "float") == 1 or fat_cstr_eq(inferred_first_t, "f64") == 1 do
-                    flux_elem_t = fat_str_new("float")
-                end
+                ci = ci + 1
+            end
+            if has_float and has_int do
+                print_str("virc: error: [E3001] heterogeneous flux lanes not supported\n")
+                sys_exit(1)
+            end
+            if has_float do
+                flux_elem_t = fat_str_new("float")
             end
             out fat_str_concat(fat_str_new("flux<"), fat_str_concat(flux_elem_t, fat_str_concat(fat_str_new(", "), fat_str_concat(fat_str_new(rt_itoa(child_c)), fat_str_new(">")))))
         end
@@ -670,7 +680,20 @@ func infer_expr_type_name(node: &AstNode):
     end
     if nt == AstType.SwizzleExpr do
         var sw_len = fat_str_len(ast_node_name(node))
-        out fat_str_concat(fat_str_new("flux<int, "), fat_str_concat(fat_str_new(rt_itoa(sw_len)), fat_str_new(">")))
+        var sw_elem = fat_str_new("int")
+        if ast_node_child_count(node) > 0 do
+            var c_node = ast_node_child(node, 0)
+            var c_t = infer_expr_type_name(c_node)
+            if (c_t as i64) == 0 or fat_str_len(c_t) == 0 do
+                if ast_node_type_of(c_node) == AstType.Identifier do
+                    c_t = get_var_type(ast_node_name(c_node))
+                end
+            end
+            if is_flux_type_str(c_t) and (parse_flux_elem_type(c_t) as int) == (TypeKind.Float as int) do
+                sw_elem = fat_str_new("float")
+            end
+        end
+        out fat_str_concat(fat_str_new("flux<"), fat_str_concat(sw_elem, fat_str_concat(fat_str_new(", "), fat_str_concat(fat_str_new(rt_itoa(sw_len)), fat_str_new(">")))))
     end
     if nt == AstType.EntityLiteral do
         let gen_args_lit = ast_node_name2(node)
@@ -2163,6 +2186,39 @@ func emit_load_typed(b: MirBuilder, dst_v: i64, addr: &MirOperand, sz: i64, sgn:
 	out builder_add_instr(b, ins)
 end.
 
+func emit_flux_clone(b: MirBuilder, src_opnd: &MirOperand, flux_type: string):
+	var fc_lanes = parse_flux_lanes(flux_type)
+	if fc_lanes <= 0 do fc_lanes = 4 end
+	var fc_is_float = (parse_flux_elem_type(flux_type) as int) == (TypeKind.Float as int)
+	let fc_alloc_sz = 16 + fc_lanes * 8
+	var b_mut = emit_set_arg(b, 0, mir_opnd_imm(fc_alloc_sz))
+	var (b_fdc, fc_base) = builder_new_vreg(b_mut)
+	var ins_fdc_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(fc_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+	annotate_owned_alloc(ins_fdc_alloc, fc_base, fc_alloc_sz, 16, 0)
+	b_fdc = builder_add_instr(b_fdc, ins_fdc_alloc)
+	b_fdc = emit_set_arg(b_fdc, 0, mir_opnd_vreg(fc_base))
+	b_fdc = emit_set_arg(b_fdc, 1, mir_opnd_imm(0))
+	b_fdc = emit_set_arg(b_fdc, 2, mir_opnd_imm(fc_lanes))
+	b_fdc = emit_intrinsic(b_fdc, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+	b_fdc = emit_set_arg(b_fdc, 0, mir_opnd_vreg(fc_base))
+	b_fdc = emit_set_arg(b_fdc, 1, mir_opnd_imm(8))
+	b_fdc = emit_set_arg(b_fdc, 2, mir_opnd_imm(fc_lanes))
+	b_fdc = emit_intrinsic(b_fdc, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+	var fc_i = 0
+	when fc_i < fc_lanes loop
+		b_fdc = emit_set_arg(b_fdc, 0, mir_opnd_imm(fc_i))
+		var (b_fdc_elem, fc_elem_v) = builder_new_vreg(b_fdc)
+		var fc_load_typ = MirType.Int64 as i64
+		if fc_is_float do fc_load_typ = MirType.F64 as i64 end
+		b_fdc = emit_intrinsic_typed(b_fdc_elem, MIR_INTR_INDEX, mir_opnd_vreg(fc_elem_v), src_opnd, fc_load_typ)
+		b_fdc = emit_set_arg(b_fdc, 0, mir_opnd_imm(fc_i))
+		b_fdc = emit_set_arg(b_fdc, 1, mir_opnd_vreg(fc_elem_v))
+		b_fdc = emit_intrinsic(b_fdc, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(fc_base))
+		fc_i = fc_i + 1
+	end
+	out (b_fdc, mir_opnd_vreg(fc_base))
+end.
+
 func lower_aggregate(b: MirBuilder, kind: i64, expr: &AstNode):
 	# Arrays / entities / tuples all lower to a heap buffer of n 8-byte slots.
 	# Allocate via the `alloc` builtin (id 3) and store each element with
@@ -2498,6 +2554,17 @@ func lower_call_args(b: &MirBuilder, expr: &AstNode, start_child: i64, arg_base:
 		arg = ast_node_child(expr, i)
 		var b2 = lower_expr(b_mut, arg)
 		var aop = g_lower_expr_result_opnd as MirOperand
+		var arg_flux_t = infer_expr_type_name(arg)
+		if (arg_flux_t as i64) == 0 or fat_str_len(arg_flux_t) == 0 do
+			if ast_node_type_of(arg) == AstType.Identifier do
+				arg_flux_t = get_var_type(ast_node_name(arg))
+			end
+		end
+		if is_flux_type_str(arg_flux_t) do
+			var (b_cl, cl_op) = emit_flux_clone(b2, aop, arg_flux_t)
+			b2 = b_cl
+			aop = cl_op
+		end
 		if g_mir_scratch_top < vec_len_rt(g_mir_scratch_args) do
 			vec_set_rt(g_mir_scratch_args, g_mir_scratch_top, aop as i64)
 		else
@@ -2622,6 +2689,17 @@ func lower_call_with_ref_support_ast(b: MirBuilder, expr: &AstNode, callee: stri
         if pmode == 0 do
             var b_eval = lower_expr(b_cur, arg)
             var aop = g_lower_expr_result_opnd as MirOperand
+            var arg_flux_t = infer_expr_type_name(arg)
+            if (arg_flux_t as i64) == 0 or fat_str_len(arg_flux_t) == 0 do
+                if ast_node_type_of(arg) == AstType.Identifier do
+                    arg_flux_t = get_var_type(ast_node_name(arg))
+                end
+            end
+            if is_flux_type_str(arg_flux_t) do
+                var (b_cl, cl_op) = emit_flux_clone(b_eval, aop, arg_flux_t)
+                b_eval = b_cl
+                aop = cl_op
+            end
             b_cur = b_eval
             staged_args = vec_push_rt(staged_args, aop as i64)
         else
@@ -3038,6 +3116,22 @@ func lower_expr_impl(b: MirBuilder, expr: &AstNode):
 					end
 					if l_elem != r_elem do
 						print_str("virc: error: [E3001] flux element type mismatch in binary op\n")
+						sys_exit(1)
+					end
+				end
+				if is_flux_type_str(bin_lt) and not is_flux_type_str(bin_rt) do
+					let l_elem = parse_flux_elem_type(bin_lt) as int
+					let r_is_float = fat_cstr_eq(bin_rt, "float") == 1 or fat_cstr_eq(bin_rt, "f64") == 1 or fat_cstr_eq(bin_rt, "f32") == 1
+					if (l_elem == (TypeKind.Int as int) and r_is_float) or (l_elem == (TypeKind.Float as int) and not r_is_float) do
+						print_str("virc: error: [E3001] flux element and scalar operand type mismatch in binary op\n")
+						sys_exit(1)
+					end
+				end
+				if not is_flux_type_str(bin_lt) and is_flux_type_str(bin_rt) do
+					let r_elem = parse_flux_elem_type(bin_rt) as int
+					let l_is_float = fat_cstr_eq(bin_lt, "float") == 1 or fat_cstr_eq(bin_lt, "f64") == 1 or fat_cstr_eq(bin_lt, "f32") == 1
+					if (r_elem == (TypeKind.Int as int) and l_is_float) or (r_elem == (TypeKind.Float as int) and not l_is_float) do
+						print_str("virc: error: [E3001] flux element and scalar operand type mismatch in binary op\n")
 						sys_exit(1)
 					end
 				end
@@ -4608,42 +4702,16 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 				end
 			end
 			# Flux copy semantics in VarDecl: deep-copy when source or declared type is flux
-			# and the initializer is a variable reference (flux pointer, not a constructor).
+			# and the initializer is not a freshly created vector value.
 			var vd_flux_type = declared_t
 			if (vd_flux_type as i64) == 0 or fat_str_len(vd_flux_type) == 0 do
 				vd_flux_type = infer_expr_type_name(expr)
 			end
-			if is_flux_type_str(vd_flux_type) and ast_node_type_of(expr) == AstType.Identifier do
-				var vd_fc_lanes = parse_flux_lanes(vd_flux_type)
-				if vd_fc_lanes <= 0 do vd_fc_lanes = 4 end
-				var vd_fc_is_float = (parse_flux_elem_type(vd_flux_type) as int) == (TypeKind.Float as int)
-				let vd_fc_alloc_sz = 16 + vd_fc_lanes * 8
-				b2 = emit_set_arg(b2, 0, mir_opnd_imm(vd_fc_alloc_sz))
-				var (b_vd_fdc, vd_fc_base) = builder_new_vreg(b2)
-				var ins_vd_fdc_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(vd_fc_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
-				annotate_owned_alloc(ins_vd_fdc_alloc, vd_fc_base, vd_fc_alloc_sz, 16, 0)
-				b_vd_fdc = builder_add_instr(b_vd_fdc, ins_vd_fdc_alloc)
-				b_vd_fdc = emit_set_arg(b_vd_fdc, 0, mir_opnd_vreg(vd_fc_base))
-				b_vd_fdc = emit_set_arg(b_vd_fdc, 1, mir_opnd_imm(0))
-				b_vd_fdc = emit_set_arg(b_vd_fdc, 2, mir_opnd_imm(vd_fc_lanes))
-				b_vd_fdc = emit_intrinsic(b_vd_fdc, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
-				b_vd_fdc = emit_set_arg(b_vd_fdc, 0, mir_opnd_vreg(vd_fc_base))
-				b_vd_fdc = emit_set_arg(b_vd_fdc, 1, mir_opnd_imm(8))
-				b_vd_fdc = emit_set_arg(b_vd_fdc, 2, mir_opnd_imm(vd_fc_lanes))
-				b_vd_fdc = emit_intrinsic(b_vd_fdc, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
-				var vd_fci = 0
-				when vd_fci < vd_fc_lanes loop
-					b_vd_fdc = emit_set_arg(b_vd_fdc, 0, mir_opnd_imm(vd_fci))
-					var (b_vd_fdc_e, vd_fce_v) = builder_new_vreg(b_vd_fdc)
-					var vd_fc_load_typ = MirType.Int64 as i64
-					if vd_fc_is_float do vd_fc_load_typ = MirType.F64 as i64 end
-					b_vd_fdc = emit_intrinsic_typed(b_vd_fdc_e, MIR_INTR_INDEX, mir_opnd_vreg(vd_fce_v), val_opnd, vd_fc_load_typ)
-					b_vd_fdc = emit_set_arg(b_vd_fdc, 0, mir_opnd_imm(vd_fci))
-					b_vd_fdc = emit_set_arg(b_vd_fdc, 1, mir_opnd_vreg(vd_fce_v))
-					b_vd_fdc = emit_intrinsic(b_vd_fdc, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(vd_fc_base))
-					vd_fci = vd_fci + 1
-				end
-				val_opnd = mir_opnd_vreg(vd_fc_base)
+			var vd_expr_nt = ast_node_type_of(expr)
+			var vd_is_fresh = vd_expr_nt == AstType.BinOp or vd_expr_nt == AstType.UnaryMinus or vd_expr_nt == AstType.UnaryNot or vd_expr_nt == AstType.SwizzleExpr or vd_expr_nt == AstType.Call
+			if is_flux_type_str(vd_flux_type) and not vd_is_fresh do
+				var (b_vd_fdc, vd_cloned) = emit_flux_clone(b2, val_opnd, vd_flux_type)
+				val_opnd = vd_cloned
 				b2 = b_vd_fdc
 			end
 			var (b3, v) = builder_new_vreg(b2)
@@ -4693,7 +4761,7 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 				if expr_nt == AstType.QuantizeExpr do var_t = fat_str_new("QuantizedTensor") end
 				if expr_nt == AstType.EnumConstruct do var_t = ast_node_name2(expr) end
 				if expr_nt == AstType.SwizzleExpr do
-					var_t = fat_str_concat(fat_str_new("flux<int, "), fat_str_concat(fat_str_new(rt_itoa(fat_str_len(ast_node_name(expr)))), fat_str_new(">")))
+					var_t = infer_expr_type_name(expr)
 				end
 				if expr_nt == AstType.Call and fat_cstr_eq(ast_node_name(expr), "flux") == 1 do
 					var flux_child_c = ast_node_child_count(expr)
@@ -4929,37 +4997,11 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 		if (fc_flux_type as i64) == 0 or fat_str_len(fc_flux_type) == 0 do
 			fc_flux_type = assign_source_t
 		end
-		if is_flux_type_str(fc_flux_type) and (mir_opnd_type(val_opnd) as int) != 0 do
-			var fc_lanes = parse_flux_lanes(fc_flux_type)
-			if fc_lanes <= 0 do fc_lanes = 4 end
-			var fc_is_float = (parse_flux_elem_type(fc_flux_type) as int) == (TypeKind.Float as int)
-			let fc_alloc_sz = 16 + fc_lanes * 8
-			b2 = emit_set_arg(b2, 0, mir_opnd_imm(fc_alloc_sz))
-			var (b_fdc, fc_base) = builder_new_vreg(b2)
-			var ins_fdc_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(fc_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
-			annotate_owned_alloc(ins_fdc_alloc, fc_base, fc_alloc_sz, 16, 0)
-			b_fdc = builder_add_instr(b_fdc, ins_fdc_alloc)
-			b_fdc = emit_set_arg(b_fdc, 0, mir_opnd_vreg(fc_base))
-			b_fdc = emit_set_arg(b_fdc, 1, mir_opnd_imm(0))
-			b_fdc = emit_set_arg(b_fdc, 2, mir_opnd_imm(fc_lanes))
-			b_fdc = emit_intrinsic(b_fdc, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
-			b_fdc = emit_set_arg(b_fdc, 0, mir_opnd_vreg(fc_base))
-			b_fdc = emit_set_arg(b_fdc, 1, mir_opnd_imm(8))
-			b_fdc = emit_set_arg(b_fdc, 2, mir_opnd_imm(fc_lanes))
-			b_fdc = emit_intrinsic(b_fdc, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
-			var fc_i = 0
-			when fc_i < fc_lanes loop
-				b_fdc = emit_set_arg(b_fdc, 0, mir_opnd_imm(fc_i))
-				var (b_fdc_elem, fc_elem_v) = builder_new_vreg(b_fdc)
-				var fc_load_typ = MirType.Int64 as i64
-				if fc_is_float do fc_load_typ = MirType.F64 as i64 end
-				b_fdc = emit_intrinsic_typed(b_fdc_elem, MIR_INTR_INDEX, mir_opnd_vreg(fc_elem_v), val_opnd, fc_load_typ)
-				b_fdc = emit_set_arg(b_fdc, 0, mir_opnd_imm(fc_i))
-				b_fdc = emit_set_arg(b_fdc, 1, mir_opnd_vreg(fc_elem_v))
-				b_fdc = emit_intrinsic(b_fdc, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(fc_base))
-				fc_i = fc_i + 1
-			end
-			val_opnd = mir_opnd_vreg(fc_base)
+		var fc_expr_nt = ast_node_type_of(expr)
+		var fc_is_fresh = fc_expr_nt == AstType.BinOp or fc_expr_nt == AstType.UnaryMinus or fc_expr_nt == AstType.UnaryNot or fc_expr_nt == AstType.SwizzleExpr or fc_expr_nt == AstType.Call
+		if is_flux_type_str(fc_flux_type) and not fc_is_fresh and (mir_opnd_type(val_opnd) as int) != 0 do
+			var (b_fdc, fc_cloned) = emit_flux_clone(b2, val_opnd, fc_flux_type)
+			val_opnd = fc_cloned
 			b2 = b_fdc
 		end
 		v = get_var_vreg(b2, target_name)
@@ -5355,8 +5397,21 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 			if child_count > 0 do
 				var b_value = lower_expr(b_ret, ast_node_child(stmt, 0))
 				var ret_value = g_lower_expr_result_opnd as MirOperand
+				var ret_flux_t = infer_expr_type_name(ast_node_child(stmt, 0))
+				if (ret_flux_t as i64) == 0 or fat_str_len(ret_flux_t) == 0 do
+					let r_ch = ast_node_child(stmt, 0)
+					if ast_node_type_of(r_ch) == AstType.Identifier do
+						ret_flux_t = get_var_type(ast_node_name(r_ch))
+					end
+				end
+				if is_flux_type_str(ret_flux_t) do
+					var (b_rcl, rcl_op) = emit_flux_clone(b_value, ret_value, ret_flux_t)
+					b_value = b_rcl
+					ret_value = rcl_op
+				end
 				b_ret = emit_move(b_value, g_func_ret_vreg, ret_value)
 				if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+					b_ret = emit_intrinsic(b_ret, MIR_MEM_PROMOTE, mir_opnd_vreg(g_func_ret_vreg), mir_opnd_vreg(g_func_ret_vreg))
 					var ams_len = vec_len_rt(g_arena_mark_stack)
 					var ams_i = ams_len - 1
 					when ams_i >= 0 loop
@@ -5364,7 +5419,6 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 						b_ret = emit_intrinsic(b_ret, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
 						ams_i = ams_i - 1
 					end
-					b_ret = emit_intrinsic(b_ret, MIR_MEM_PROMOTE, mir_opnd_none(), mir_opnd_vreg(g_func_ret_vreg))
 				end
 			end
 			if g_func_normal_ensure_block >= 0 do
@@ -5378,6 +5432,18 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 		if child_count > 0 do
 			var b2 = lower_expr(b, ast_node_child(stmt, 0))
 			var ret_opnd = g_lower_expr_result_opnd as MirOperand
+			var ret_flux_t2 = infer_expr_type_name(ast_node_child(stmt, 0))
+			if (ret_flux_t2 as i64) == 0 or fat_str_len(ret_flux_t2) == 0 do
+				let r_ch2 = ast_node_child(stmt, 0)
+				if ast_node_type_of(r_ch2) == AstType.Identifier do
+					ret_flux_t2 = get_var_type(ast_node_name(r_ch2))
+				end
+			end
+			if is_flux_type_str(ret_flux_t2) do
+				var (b_rcl2, rcl_op2) = emit_flux_clone(b2, ret_opnd, ret_flux_t2)
+				b2 = b_rcl2
+				ret_opnd = rcl_op2
+			end
 			ins = mir_instr_new(MirOp.Return, mir_opnd_none(), ret_opnd, mir_opnd_none())
 			b2 = builder_add_instr(b2, ins)
 			out b2
@@ -5756,17 +5822,7 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 				bt = emit_move(bt, g_try_err_vreg, tv)
 				b = bt
 			end
-			# Restore active arena marks down to the try's outer depth
-			if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
-				var ams_len = vec_len_rt(g_arena_mark_stack)
-				var ams_i = ams_len - 1
-				when ams_i >= g_try_arena_depth loop
-					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
-					b = emit_intrinsic(b, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
-					ams_i = ams_i - 1
-				end
-			end
-			# Promote escaped vars from any arena being exited by throw
+			# Promote escaped vars from any arena being exited by throw BEFORE reset
 			if g_arena_escaped_stack != 0 and vec_len_rt(g_arena_escaped_stack) > 0 do
 				var aes_len = vec_len_rt(g_arena_escaped_stack)
 				var aes_i = aes_len - 1
@@ -5779,7 +5835,8 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 							let ev_name = vec_get_rt(ev_list, evi) as string
 							let ev_vr = get_var_vreg(b, ev_name)
 							if ev_vr >= 0 do
-								b = emit_intrinsic(b, MIR_MEM_PROMOTE, mir_opnd_none(), mir_opnd_vreg(ev_vr))
+								b = emit_intrinsic(b, MIR_MEM_PROMOTE, mir_opnd_vreg(ev_vr), mir_opnd_vreg(ev_vr))
+								b = set_var_vreg(b, ev_name, ev_vr)
 							end
 							evi = evi + 1
 						end
@@ -5790,6 +5847,16 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 			# Promote the thrown error value if it was a vreg
 			if g_try_err_vreg >= 0 do
 				b = emit_intrinsic(b, MIR_MEM_PROMOTE, mir_opnd_none(), mir_opnd_vreg(g_try_err_vreg))
+			end
+			# Restore active arena marks down to the try's outer depth
+			if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+				var ams_len = vec_len_rt(g_arena_mark_stack)
+				var ams_i = ams_len - 1
+				when ams_i >= g_try_arena_depth loop
+					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+					b = emit_intrinsic(b, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+					ams_i = ams_i - 1
+				end
 			end
 			b = emit_jump(b, g_try_revert_block)
 			var (bd, dead_id) = builder_add_block(b)
@@ -5876,17 +5943,18 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 				b_fail = builder_set_current_block(b_fail, ok_block)
 				b1 = b_fail
 			end
-			b1 = emit_intrinsic(b1, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mark_vreg))
 			let esc_cnt = vec_len_rt(esc_names)
 			var esc_i = 0
 			when esc_i < esc_cnt loop
 				let esc_n = vec_get_rt(esc_names, esc_i) as string
 				let esc_vr = get_var_vreg(b1, esc_n)
 				if esc_vr >= 0 do
-					b1 = emit_intrinsic(b1, MIR_MEM_PROMOTE, mir_opnd_none(), mir_opnd_vreg(esc_vr))
+					b1 = emit_intrinsic(b1, MIR_MEM_PROMOTE, mir_opnd_vreg(esc_vr), mir_opnd_vreg(esc_vr))
+					b1 = set_var_vreg(b1, esc_n, esc_vr)
 				end
 				esc_i = esc_i + 1
 			end
+			b1 = emit_intrinsic(b1, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mark_vreg))
 		end
 		out b1
 	end
@@ -6104,6 +6172,27 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 			if g_try_revert_block >= 0 do
 				if g_try_parent_err_vreg >= 0 and g_try_err_vreg >= 0 do
 					b = emit_move(b, g_try_parent_err_vreg, mir_opnd_vreg(g_try_err_vreg))
+				end
+				if g_arena_escaped_stack != 0 and vec_len_rt(g_arena_escaped_stack) > 0 do
+					var aes_len = vec_len_rt(g_arena_escaped_stack)
+					var aes_i = aes_len - 1
+					when aes_i >= g_try_arena_depth loop
+						let ev_list = vec_get_rt(g_arena_escaped_stack, aes_i)
+						if ev_list != 0 do
+							let ev_cnt = vec_len_rt(ev_list)
+							var evi = 0
+							when evi < ev_cnt loop
+								let ev_name = vec_get_rt(ev_list, evi) as string
+								let ev_vr = get_var_vreg(b, ev_name)
+								if ev_vr >= 0 do
+									b = emit_intrinsic(b, MIR_MEM_PROMOTE, mir_opnd_vreg(ev_vr), mir_opnd_vreg(ev_vr))
+									b = set_var_vreg(b, ev_name, ev_vr)
+								end
+								evi = evi + 1
+							end
+						end
+						aes_i = aes_i - 1
+					end
 				end
 				if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
 					var ams_len = vec_len_rt(g_arena_mark_stack)

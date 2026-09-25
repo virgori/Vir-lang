@@ -9,6 +9,7 @@ Supports kinds:
   - run_fail: compile succeeds, run traps/exits non-zero via error path
   - structural: runtime/behavioral gate + MIR/symbol/structural oracle check
   - wasm_run: compile to WASI, execute with Node.js, and inspect linear memory
+  - riscv_structural: compile to RV64 ELF and inspect instruction encodings
   - blocked_contract: unconditionally reports BLOCKED (never PASS)
 """
 
@@ -18,6 +19,7 @@ import argparse
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -385,6 +387,64 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                 stdout=r_stdout,
                 stderr=r_stderr,
                 reason="Wasm execution matched expected oracle",
+            )
+
+        if entry.kind == "riscv_structural":
+            artifact = bin_out.read_bytes()
+            if entry.test_id == "SIMD-014":
+                correct_fmv_d_x = struct.pack("<I", 0xF2038153)
+                wrong_fmv_d_x = struct.pack("<I", 0xF0038153)
+                valid = correct_fmv_d_x in artifact and wrong_fmv_d_x not in artifact
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="PASS" if valid else "FAIL",
+                    target="linux-riscv64",
+                    compile_exit=c_exit,
+                    run_exit=None,
+                    stdout=c_stdout,
+                    stderr=c_stderr,
+                    reason="FMV.D.X uses funct7 0x79" if valid else "RISC-V artifact is missing the correct FMV.D.X encoding or still contains funct7 0x78",
+                )
+
+            if entry.test_id == "TARGET-RISCV-003":
+                words = struct.unpack(f"<{len(artifact) // 4}I", artifact[: len(artifact) // 4 * 4])
+                jal_offsets = []
+                for word in words:
+                    if word & 0x7F != 0x6F or (word >> 7) & 0x1F != 1:
+                        continue
+                    imm = (
+                        ((word >> 31) & 1) << 20
+                        | ((word >> 21) & 0x3FF) << 1
+                        | ((word >> 20) & 1) << 11
+                        | ((word >> 12) & 0xFF) << 12
+                    )
+                    if imm & (1 << 20):
+                        imm -= 1 << 21
+                    jal_offsets.append(imm)
+                valid = any(offset > 0 for offset in jal_offsets) and any(offset < 0 for offset in jal_offsets)
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="PASS" if valid else "FAIL",
+                    target="linux-riscv64",
+                    compile_exit=c_exit,
+                    run_exit=None,
+                    stdout=c_stdout,
+                    stderr=c_stderr,
+                    reason="Forward and entry-point JAL offsets are patched" if valid else f"Expected positive and negative patched JAL offsets, got {jal_offsets}",
+                )
+
+            return TestResult(
+                test_id=entry.test_id,
+                kind=entry.kind,
+                status="FAIL",
+                target="linux-riscv64",
+                compile_exit=c_exit,
+                run_exit=None,
+                stdout=c_stdout,
+                stderr=c_stderr,
+                reason=f"No RISC-V structural oracle for {entry.test_id}",
             )
 
         # Run artifact
