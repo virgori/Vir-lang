@@ -257,13 +257,11 @@ const { WASI } = require('wasi');
 const wasmPath = process.argv[1];
 const wasi = new WASI({
   version: 'preview1',
-  args: process.argv.slice(2),
   args: [wasmPath],
   env: process.env,
   preopens: { '.': '.' }
 });
 
-const wasmBuffer = fs.readFileSync(process.argv[2]);
 const wasmBuffer = fs.readFileSync(wasmPath);
 WebAssembly.instantiate(wasmBuffer, wasi.getImportObject())
   .then(({ instance }) => {
