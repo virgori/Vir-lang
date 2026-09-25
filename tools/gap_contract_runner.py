@@ -437,7 +437,13 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                 words = struct.unpack(f"<{len(artifact) // 4}I", artifact[: len(artifact) // 4 * 4])
                 # Check that scalar integer/FP ops are present and RVV vector major opcode (0x57) is not used for flux
                 has_scalar_add = any((w & 0xFE00707F) == 0x00000033 for w in words)
-                valid = has_scalar_add
+                has_rvv = any((w & 0x7F) == 0x57 for w in words)
+                valid = has_scalar_add and not has_rvv
+                reason = "RISC-V rv64d lowered flux operations to scalar loop fallback cleanly without RVV opcodes"
+                if not has_scalar_add:
+                    reason = "RISC-V scalar fallback instructions missing"
+                elif has_rvv:
+                    reason = "RISC-V binary contains RVV opcode 0x57 when RVV is disabled"
                 return TestResult(
                     test_id=entry.test_id,
                     kind=entry.kind,
@@ -447,7 +453,7 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                     run_exit=None,
                     stdout=c_stdout,
                     stderr=c_stderr,
-                    reason="RISC-V rv64d lowered flux operations to scalar loop fallback cleanly" if valid else "RISC-V scalar fallback instructions missing",
+                    reason=reason,
                 )
 
             if entry.test_id == "SIMD-014":
