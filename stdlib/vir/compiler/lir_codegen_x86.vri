@@ -509,21 +509,41 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
         out emit_call_fixup_x86(cb, call_fixups, 1, LIR_RT_PRINT_STR, rd)
     end
     if kind == MIR_INTR_ADDR_OF do
-        cid = native_read_i64(ins_src1 as i64, 32)
-        f_strings = native_read_i64(func_obj as i64, 32)
-        if f_strings > 0 and cid >= 0 and cid < vec_len_rt(f_strings) do
-            cname = vec_get_rt(f_strings, cid)
-            fi = x86_find_func_index(lir_funcs, cname)
-            if fi >= 0 and rd >= 0 do
-                imm_at = (codebuf_offset(cb) + 2) as i64
-                cb = x86_emit_mov_reg_imm64(cb, rd as int, 0)
-                cf = native_read_i64(call_fixups, 0)
-                cf = vec_push_rt(cf, x86_call_fixup_new(imm_at, 2, fi))
-                native_write_i64(call_fixups, 0, cf)
-                out cb
+        var target_rd = rd
+        if target_rd < 0 do target_rd = SCR end
+        if native_read_i64(ins_src1 as i64, 0) == (LirOperandType.Imm as i64) do
+            cid = native_read_i64(ins_src1 as i64, 32)
+            f_strings = native_read_i64(func_obj as i64, 32)
+            if f_strings > 0 and cid >= 0 and cid < vec_len_rt(f_strings) do
+                cname = vec_get_rt(f_strings, cid)
+                fi = x86_find_func_index(lir_funcs, cname)
+                if fi >= 0 do
+                    imm_at = (codebuf_offset(cb) + 2) as i64
+                    cb = x86_emit_mov_reg_imm64(cb, target_rd as int, 0)
+                    cf = native_read_i64(call_fixups, 0)
+                    cf = vec_push_rt(cf, x86_call_fixup_new(imm_at, 2, fi))
+                    native_write_i64(call_fixups, 0, cf)
+                    if rd < 0 do
+                        cb = store_spilled_result_x86(cb, ins_dst as LirOperand, target_rd)
+                    end
+                    out cb
+                end
             end
+            print_str("virc: linker error: unresolved function address: ")
+            if f_strings > 0 and cid >= 0 and cid < vec_len_rt(f_strings) do
+                cname = vec_get_rt(f_strings, cid)
+                print_str(cname as string)
+            end
+            print_str("\n")
+            sys_exit(1)
+            out cb
         end
-        if rd >= 0 do cb = x86_emit_mov_reg_imm64(cb, rd as int, 0) end
+        if rd >= 0 do
+            cb = x86_emit_mov_reg_imm64(cb, rd as int, 0)
+        eif (ins_dst as i64) != 0 do
+            cb = x86_emit_mov_reg_imm64(cb, target_rd as int, 0)
+            cb = store_spilled_result_x86(cb, ins_dst as LirOperand, target_rd)
+        end
         out cb
     end
     if x86_intr_is_payload(kind) == 1 do
@@ -1789,6 +1809,34 @@ func emit_lir_rt_stubs_x86(cb: &CodeBuf, offs: i64, vir_free_off: i64, rt_promot
             cb = x86_emit_ret(cb)
             cb = patch_rel32(cb, eq_false_fixup - 4, eq_false)
             cb = patch_rel32(cb, eq_true_fixup - 4, eq_true)
+        eif k == LIR_RT_ARG_COUNT do
+            # The ELF entry stores argc in the arena runtime header.
+            cb = x86_emit_mov_reg_mem(cb, X86_RAX, X86_R15, 8)
+            cb = x86_emit_ret(cb)
+        eif k == LIR_RT_GET_ARG do
+            # RDI = zero-based argument index. Reject negative and out-of-range
+            # indexes before loading argv[index] from the runtime header.
+            cb = x86_emit_cmp_reg_imm32(cb, X86_RDI, 0)
+            cb = x86_emit_jl_rel32(cb, 0)
+            let argNegativeFixup = codebuf_offset(cb) as int
+
+            cb = x86_emit_mov_reg_mem(cb, X86_RCX, X86_R15, 8)
+            cb = x86_emit_cmp_rr(cb, X86_RDI, X86_RCX)
+            cb = x86_emit_jge_rel32(cb, 0)
+            let argRangeFixup = codebuf_offset(cb) as int
+
+            cb = x86_emit_mov_reg_mem(cb, X86_RAX, X86_R15, 16)
+            cb = x86_emit_mov_rr(cb, X86_RCX, X86_RDI)
+            cb = x86_emit_shl_imm(cb, X86_RCX, 3)
+            cb = x86_emit_add_rr(cb, X86_RAX, X86_RCX)
+            cb = x86_emit_mov_reg_mem(cb, X86_RAX, X86_RAX, 0)
+            cb = x86_emit_ret(cb)
+
+            let argNull = codebuf_offset(cb) as int
+            cb = x86_emit_xor_rr(cb, X86_RAX, X86_RAX)
+            cb = x86_emit_ret(cb)
+            cb = patch_rel32(cb, argNegativeFixup - 4, argNull)
+            cb = patch_rel32(cb, argRangeFixup - 4, argNull)
         eif k == LIR_RT_ALLOC do
             # RDI = requested size, R15 = pointer to bump_curr
             cb = x86_emit_cmp_imm0(cb, X86_RDI)
@@ -2527,7 +2575,9 @@ func emit_lir_module_x86_64(lir_funcs: i64):
         ci = ci + 1
     end
 
-    cb.start_offset = codebuf_offset(cb)
+    let cur_start_off = codebuf_offset(cb)
+    cb.start_offset = cur_start_off
+    native_write_i64(cb as i64, 24, cur_start_off)
 
     cb = x86_emit_push(cb, X86_RBP)
     cb = x86_emit_mov_rr(cb, X86_RBP, X86_RSP)
@@ -2544,6 +2594,15 @@ func emit_lir_module_x86_64(lir_funcs: i64):
     cb = x86_emit_mov_reg_imm32(cb, SCR as int, 32768)
     cb = x86_emit_add_rr(cb, X86_RSI, SCR as int)
     cb = x86_emit_mov_mem_reg(cb, X86_R15, 0, X86_RSI)
+
+    # Linux ELF enters at _start with argc at [initial RSP] and argv starting
+    # at [initial RSP + 8]. RBP is initial RSP - 8 after the prologue above.
+    cb = x86_emit_mov_reg_mem(cb, X86_RAX, X86_RBP, 8)
+    cb = x86_emit_mov_mem_reg(cb, X86_R15, 8, X86_RAX)
+    cb = x86_emit_mov_rr(cb, X86_RAX, X86_RBP)
+    cb = x86_emit_mov_reg_imm32(cb, SCR as int, 16)
+    cb = x86_emit_add_rr(cb, X86_RAX, SCR as int)
+    cb = x86_emit_mov_mem_reg(cb, X86_R15, 16, X86_RAX)
 
     if n_funcs > 0 do
         init_name = fat_str_new("__vir_global_init")
