@@ -476,7 +476,7 @@ func lir_instr_has_def(ins: LirInstr):
     if dst == 0 do out 0 end
     if native_read_i64(dst, 0) == 0 do out 0 end
     op = native_read_i64(ins_i, 0)
-    if op == (LirOp.Nop as i64) or op == (LirOp.Jmp as i64) or op == (LirOp.JmpCond as i64) or op == (LirOp.Ret as i64) or op == (LirOp.Push as i64) or op == (LirOp.Store as i64) or op == (LirOp.SetArg as i64) or op == (LirOp.TailCall as i64) or op == (LirOp.VStore as i64) do
+    if op == (LirOp.Nop as i64) or op == (LirOp.Jmp as i64) or op == (LirOp.JmpCond as i64) or op == (LirOp.Ret as i64) or op == (LirOp.Push as i64) or op == (LirOp.Store as i64) or op == (LirOp.SetArg as i64) or op == (LirOp.TailCall as i64) or op == (LirOp.VStore as i64) or (op >= (LirOp.VLoad as i64) and op <= (LirOp.Shuffle as i64)) do
         out 0
     end
     if op == (LirOp.Intrinsic as i64) do
@@ -487,7 +487,10 @@ func lir_instr_has_def(ins: LirInstr):
         if kind == MIR_INTR_GLOBAL_STORE or kind == MIR_INTR_INDEX_STORE or kind == MIR_INTR_FIELD_STORE or kind == MIR_INTR_THROW or kind == MIR_INTR_PRINT or kind == MIR_INTR_PRINT_STR or kind == MIR_INTR_PRINT_FLOAT or kind == MIR_INTR_PRINT_BOOL or kind == MIR_INTR_TRAIN or kind == MIR_INTR_INFER do
             out 0
         end
-        if kind == MIR_INTR_ARENA or kind == MIR_MEM_MARK or kind == MIR_MEM_RESET or kind == MIR_MEM_PROMOTE or kind == MIR_MEM_DROP do
+        if kind == MIR_MEM_PROMOTE do
+            out 1
+        end
+        if kind == MIR_INTR_ARENA or kind == MIR_MEM_MARK or kind == MIR_MEM_RESET or kind == MIR_MEM_DROP do
             s1 = native_read_i64(ins_i, 24)
             if s1 != 0 and native_read_i64(s1, 0) != 0 do
                 out 0
@@ -1299,39 +1302,10 @@ func emit_lir_intrinsic(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assigned
     end
     if kind == MIR_MEM_PROMOTE do
         if rs1 >= 0 do
-            # Skip if not a valid heap/arena pointer (p < 65536)
-            cb = arm64_movz_imm64(cb, 9, 65536)
-            cb = arm64_cmp_rr(cb, rs1 as int, 9)
-            let not_ptr_fixup = codebuf_offset(cb) as int
-            cb = arm64_blt_imm19(cb, 0)
-
-            # Read allocation header at p - 16
-            cb = arm64_sub_imm(cb, 9, rs1 as int, 16)
-            cb = arm64_ldr_uoff(cb, 10, 9, 0) # total size
-            cb = arm64_cmp_imm0(cb, 10)
-            let bad_hdr_fixup = codebuf_offset(cb) as int
-            cb = arm64_ble_imm19(cb, 0)
-
-            # obj_end = (p - 16) + total_size
-            cb = arm64_add_rrr(cb, 11, 9, 10)
-
-            # If obj_end > *(X28 + 0): bump *(X28 + 0) up to obj_end
-            cb = arm64_ldr_uoff(cb, 12, 28, 0) # cur_bump
-            cb = arm64_cmp_rr(cb, 11, 12)
-            let not_greater_fixup = codebuf_offset(cb) as int
-            cb = arm64_ble_imm19(cb, 0)
-            cb = arm64_str_uoff(cb, 11, 28, 0)
-
-            let promote_end = codebuf_offset(cb) as int
-            let imm_ng = ((promote_end - not_greater_fixup) shr 2) and 0x7FFFF
-            cb = codebuf_patch_u32(cb, not_greater_fixup, (0x5400000D or (imm_ng shl 5)) as int)
-
-            let imm_bh = ((promote_end - bad_hdr_fixup) shr 2) and 0x7FFFF
-            cb = codebuf_patch_u32(cb, bad_hdr_fixup, (0x5400000D or (imm_bh shl 5)) as int)
-
-            let imm_np = ((promote_end - not_ptr_fixup) shr 2) and 0x7FFFF
-            cb = codebuf_patch_u32(cb, not_ptr_fixup, (0x5400000B or (imm_np shl 5)) as int)
-
+            cb = arm64_mov_rr(cb, 0, rs1 as int)
+            cb = arm64_mov_rr(cb, 1, 28)
+            cb = arm64_ldr_uoff(cb, 2, 28, 0)
+            cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_PROMOTE_GRAPH, rd)
             out cb
         end
         out arm64_nop(cb)
@@ -2136,6 +2110,242 @@ func emit_lir_rt_free_stub(cb: &CodeBuf, vir_free_off: i64):
 
     let imm_above = ((heap_free_target - above_arena_fixup) shr 2) and 0x7FFFF
     cb = codebuf_patch_u32(cb, above_arena_fixup, (0x5400000A or (imm_above shl 5)) as int)
+
+    out cb
+end.
+
+func emit_lir_rt_promote_stub(cb: &CodeBuf):
+    let stub_entry_off = codebuf_offset(cb) as i64
+
+    # X0 = p, X1 = arena_base, X2 = arena_top
+    # Guard 1: if p < 65536: return p
+    cb = arm64_movz_imm64(cb, 9, 65536)
+    cb = arm64_cmp_rr(cb, 0, 9)
+    let g1_fixup = codebuf_offset(cb) as int
+    cb = arm64_blt_imm19(cb, 0)
+
+    # Guard 2: if arena_base <= 0 or arena_top <= arena_base: return p
+    cb = arm64_cmp_imm0(cb, 1)
+    let g2_fixup = codebuf_offset(cb) as int
+    cb = arm64_ble_imm19(cb, 0)
+
+    cb = arm64_cmp_rr(cb, 2, 1)
+    let g3_fixup = codebuf_offset(cb) as int
+    cb = arm64_ble_imm19(cb, 0)
+
+    # Guard 3: if p < arena_base: return p
+    cb = arm64_cmp_rr(cb, 0, 1)
+    let g4_fixup = codebuf_offset(cb) as int
+    cb = arm64_blt_imm19(cb, 0)
+
+    # Guard 4: if p >= arena_top: return p
+    cb = arm64_cmp_rr(cb, 0, 2)
+    let g5_fixup = codebuf_offset(cb) as int
+    cb = arm64_bge_imm19(cb, 0)
+
+    # Forwarding check at p - 16:
+    cb = arm64_sub_imm(cb, 9, 0, 16)
+    cb = arm64_ldr_uoff(cb, 10, 9, 8) # mark_flag
+    cb = arm64_add_imm(cb, 11, 10, 1) # if mark_flag == -1, mark_flag + 1 == 0
+    cb = arm64_cmp_imm0(cb, 11)
+    let not_fwd_fixup = codebuf_offset(cb) as int
+    cb = arm64_bne_imm19(cb, 0)
+
+    # Forwarded! Return hdr[0]
+    cb = arm64_ldr_uoff(cb, 0, 9, 0)
+    cb = arm64_ret(cb)
+
+    let not_fwd_off = codebuf_offset(cb) as int
+    let imm_nf = ((not_fwd_off - not_fwd_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, not_fwd_fixup, (0x54000001 or (imm_nf shl 5)) as int)
+
+    # Prologue: save X19-X22, FP, LR
+    cb = arm64_sub_imm(cb, 31, 31, 48)
+    cb = arm64_str_uoff(cb, 29, 31, 0)
+    cb = arm64_str_uoff(cb, 30, 31, 8)
+    cb = arm64_str_uoff(cb, 19, 31, 16)
+    cb = arm64_str_uoff(cb, 20, 31, 24)
+    cb = arm64_str_uoff(cb, 21, 31, 32)
+    cb = arm64_str_uoff(cb, 22, 31, 40)
+    cb = arm64_add_imm(cb, 29, 31, 0)
+
+    cb = arm64_mov_rr(cb, 19, 0) # X19 = p
+    cb = arm64_mov_rr(cb, 20, 1) # X20 = arena_base
+    cb = arm64_mov_rr(cb, 21, 2) # X21 = arena_top
+
+    # Read total_size from hdr[0]
+    cb = arm64_sub_imm(cb, 9, 19, 16)
+    cb = arm64_ldr_uoff(cb, 10, 9, 0) # total_size
+
+    # Validate size:
+    cb = arm64_cmp_imm0(cb, 10)
+    let bad_sz_fixup = codebuf_offset(cb) as int
+    cb = arm64_ble_imm19(cb, 0)
+    cb = arm64_movz_imm64(cb, 11, 67108864)
+    cb = arm64_cmp_rr(cb, 10, 11)
+    let too_big_fixup = codebuf_offset(cb) as int
+    cb = arm64_bgt_imm19(cb, 0)
+
+    # payload_size = total_size - 16
+    cb = arm64_sub_imm(cb, 12, 10, 16)
+    let sz_ok_fixup = codebuf_offset(cb) as int
+    cb = arm64_b_imm26(cb, 0)
+
+    # Fallback size estimation from payload
+    let bad_sz_off = codebuf_offset(cb) as int
+    let imm_bs = ((bad_sz_off - bad_sz_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, bad_sz_fixup, (0x5400000D or (imm_bs shl 5)) as int)
+    let imm_tb = ((bad_sz_off - too_big_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, too_big_fixup, (0x5400000C or (imm_tb shl 5)) as int)
+
+    # Read array length: n = *p
+    cb = arm64_ldr_uoff(cb, 10, 19, 0)
+    cb = arm64_cmp_imm0(cb, 10)
+    let neg_n_fixup = codebuf_offset(cb) as int
+    cb = arm64_blt_imm19(cb, 0)
+    cb = arm64_movz_imm64(cb, 11, 8388608)
+    cb = arm64_cmp_rr(cb, 10, 11)
+    let big_n_fixup = codebuf_offset(cb) as int
+    cb = arm64_bgt_imm19(cb, 0)
+
+    # size = (16 + n * 8 + 15) & ~15
+    cb = arm64_lsl_imm(cb, 12, 10, 3)
+    cb = arm64_add_imm(cb, 12, 12, 31)
+    cb = arm64_lsr_imm(cb, 12, 12, 4)
+    cb = arm64_lsl_imm(cb, 12, 12, 4)
+    let fallback_ok_fixup = codebuf_offset(cb) as int
+    cb = arm64_b_imm26(cb, 0)
+
+    # Default size = 32
+    let neg_n_off = codebuf_offset(cb) as int
+    let imm_nn = ((neg_n_off - neg_n_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, neg_n_fixup, (0x5400000B or (imm_nn shl 5)) as int)
+    let imm_bn = ((neg_n_off - big_n_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, big_n_fixup, (0x5400000C or (imm_bn shl 5)) as int)
+    cb = arm64_mov_imm16(cb, 12, 32)
+
+    let do_alloc_off = codebuf_offset(cb) as int
+    let imm_sok = ((do_alloc_off - sz_ok_fixup) shr 2) and 0x3FFFFFF
+    codebuf_patch_u32(cb, sz_ok_fixup, (0x14000000 or imm_sok) as int)
+    let imm_fok = ((do_alloc_off - fallback_ok_fixup) shr 2) and 0x3FFFFFF
+    codebuf_patch_u32(cb, fallback_ok_fixup, (0x14000000 or imm_fok) as int)
+
+    # Allocate from permanent heap at *(X28 + 80):
+    # total_alloc = payload_size (X12) + 16 (in X10)
+    cb = arm64_add_imm(cb, 10, 12, 16)
+
+    # cur_heap = *(X28 + 80)
+    cb = arm64_ldr_uoff(cb, 11, 28, 80)
+    cb = arm64_cbnz_imm19(cb, 11, 8)
+    cb = arm64_ldr_uoff(cb, 11, 28, 24) # heap_end fallback
+
+    # cur_heap = (cur_heap - total_alloc) & ~15
+    cb = arm64_sub_rrr(cb, 11, 11, 10)
+    cb = arm64_lsr_imm(cb, 11, 11, 4)
+    cb = arm64_lsl_imm(cb, 11, 11, 4)
+    cb = arm64_str_uoff(cb, 11, 28, 80)
+
+    # Write new object header:
+    cb = arm64_str_uoff(cb, 10, 11, 0) # hdr[0] = total_alloc
+    cb = arm64_mov_imm16(cb, 13, 1)
+    cb = arm64_str_uoff(cb, 13, 11, 8) # hdr[8] = 1
+
+    # new_p = cur_heap + 16 (in X22)
+    cb = arm64_add_imm(cb, 22, 11, 16)
+
+    # Copy payload from p (X19) to new_p (X22): payload_size = X12
+    cb = arm64_mov_imm16(cb, 13, 0)
+    let copy_loop_off = codebuf_offset(cb) as int
+    cb = arm64_cmp_rr(cb, 13, 12)
+    let copy_done_fixup = codebuf_offset(cb) as int
+    cb = arm64_bge_imm19(cb, 0)
+    cb = arm64_ldr_reg(cb, 14, 19, 13)
+    cb = arm64_str_reg(cb, 14, 22, 13)
+    cb = arm64_add_imm(cb, 13, 13, 8)
+    cb = arm64_b_imm26(cb, (copy_loop_off - (codebuf_offset(cb) as int)) as int)
+
+    let copy_done_off = codebuf_offset(cb) as int
+    let imm_cd = ((copy_done_off - copy_done_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, copy_done_fixup, (0x5400000A or (imm_cd shl 5)) as int)
+
+    # Mark original object as forwarded: hdr[8] = -1, hdr[0] = new_p
+    cb = arm64_sub_imm(cb, 9, 19, 16)
+    cb = arm64_mov_imm16(cb, 14, 0)
+    cb = arm64_mvn_rr(cb, 14, 14)
+    cb = arm64_str_uoff(cb, 14, 9, 8)
+    cb = arm64_str_uoff(cb, 22, 9, 0)
+
+    # Recursively promote child pointers in new_p:
+    cb = arm64_mov_imm16(cb, 13, 0)
+    let child_loop_off = codebuf_offset(cb) as int
+    cb = arm64_cmp_rr(cb, 13, 12)
+    let child_done_fixup = codebuf_offset(cb) as int
+    cb = arm64_bge_imm19(cb, 0)
+
+    cb = arm64_ldr_reg(cb, 0, 22, 13) # X0 = child
+    cb = arm64_movz_imm64(cb, 9, 65536)
+    cb = arm64_cmp_rr(cb, 0, 9)
+    let skip_ch1 = codebuf_offset(cb) as int
+    cb = arm64_blt_imm19(cb, 0)
+    cb = arm64_cmp_rr(cb, 0, 20)
+    let skip_ch2 = codebuf_offset(cb) as int
+    cb = arm64_blt_imm19(cb, 0)
+    cb = arm64_cmp_rr(cb, 0, 21)
+    let skip_ch3 = codebuf_offset(cb) as int
+    cb = arm64_bge_imm19(cb, 0)
+
+    # Child needs promotion:
+    cb = arm64_sub_imm(cb, 31, 31, 16)
+    cb = arm64_str_uoff(cb, 13, 31, 0)
+    cb = arm64_mov_rr(cb, 1, 20)
+    cb = arm64_mov_rr(cb, 2, 21)
+    let rel_self = stub_entry_off - (codebuf_offset(cb) as i64)
+    cb = arm64_bl_imm26(cb, rel_self as int)
+    cb = arm64_ldr_uoff(cb, 13, 31, 0)
+    cb = arm64_add_imm(cb, 31, 31, 16)
+    cb = arm64_str_reg(cb, 0, 22, 13)
+
+    let next_ch_off = codebuf_offset(cb) as int
+    let imm_sc1 = ((next_ch_off - skip_ch1) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, skip_ch1, (0x5400000B or (imm_sc1 shl 5)) as int)
+    let imm_sc2 = ((next_ch_off - skip_ch2) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, skip_ch2, (0x5400000B or (imm_sc2 shl 5)) as int)
+    let imm_sc3 = ((next_ch_off - skip_ch3) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, skip_ch3, (0x5400000A or (imm_sc3 shl 5)) as int)
+
+    cb = arm64_add_imm(cb, 13, 13, 8)
+    cb = arm64_b_imm26(cb, (child_loop_off - (codebuf_offset(cb) as int)) as int)
+
+    let child_done_off = codebuf_offset(cb) as int
+    let imm_cd2 = ((child_done_off - child_done_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, child_done_fixup, (0x5400000A or (imm_cd2 shl 5)) as int)
+
+    # Return new_p:
+    cb = arm64_mov_rr(cb, 0, 22)
+
+    # Epilogue:
+    cb = arm64_ldr_uoff(cb, 29, 31, 0)
+    cb = arm64_ldr_uoff(cb, 30, 31, 8)
+    cb = arm64_ldr_uoff(cb, 19, 31, 16)
+    cb = arm64_ldr_uoff(cb, 20, 31, 24)
+    cb = arm64_ldr_uoff(cb, 21, 31, 32)
+    cb = arm64_ldr_uoff(cb, 22, 31, 40)
+    cb = arm64_add_imm(cb, 31, 31, 48)
+    cb = arm64_ret(cb)
+
+    # Guard exits: return original p in X0
+    let g_ret_off = codebuf_offset(cb) as int
+    cb = arm64_ret(cb)
+    let imm_g1 = ((g_ret_off - g1_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, g1_fixup, (0x5400000B or (imm_g1 shl 5)) as int)
+    let imm_g2 = ((g_ret_off - g2_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, g2_fixup, (0x5400000D or (imm_g2 shl 5)) as int)
+    let imm_g3 = ((g_ret_off - g3_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, g3_fixup, (0x5400000D or (imm_g3 shl 5)) as int)
+    let imm_g4 = ((g_ret_off - g4_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, g4_fixup, (0x5400000B or (imm_g4 shl 5)) as int)
+    let imm_g5 = ((g_ret_off - g5_fixup) shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, g5_fixup, (0x5400000A or (imm_g5 shl 5)) as int)
 
     out cb
 end.
@@ -3535,7 +3745,7 @@ func emit_lir_rt_stubs(cb: &CodeBuf, offs: i64, is_linux: i64, vir_free_off: i64
                 let pg_rel = rt_promote_graph_off - pg_target
                 cb = arm64_b_imm26(cb, pg_rel as int)
             else
-                cb = arm64_ret(cb)
+                cb = emit_lir_rt_promote_stub(cb)
             end
         eif k == LIR_RT_ALLOC do
             cb = emit_lir_rt_alloc_stub(cb, is_linux)
@@ -4437,7 +4647,11 @@ func emit_lir_arm64_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, l
                 let v_l_scalar = (v_aux shr 24) and 1
                 let v_r_scalar = (v_aux shr 25) and 1
 
-                if rd >= 0 and a >= 0 and breg >= 0 do
+                var r_dst = rd
+                if r_dst < 0 and ins_dst != 0 do
+                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
+                end
+                if r_dst >= 0 and a >= 0 and breg >= 0 do
                     var vi = 0
                     when vi < v_lanes loop
                         let lane_off = 16 + vi * 8
@@ -4459,10 +4673,10 @@ func emit_lir_arm64_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, l
                             eif op == LirOp.VMul do
                                 cb = arm64_fmul_ddd(cb, 4, 2, 3)
                             eif op == LirOp.VFma do
-                                cb = arm64_ldr_d_uoff(cb, 5, rd as int, lane_off as int)
+                                cb = arm64_ldr_d_uoff(cb, 5, r_dst as int, lane_off as int)
                                 cb = arm64_fmadd_dddd(cb, 4, 2, 3, 5)
                             end
-                            cb = arm64_str_d_uoff(cb, 4, rd as int, lane_off as int)
+                            cb = arm64_str_d_uoff(cb, 4, r_dst as int, lane_off as int)
                         else
                             if v_l_scalar == 1 do
                                 cb = arm64_mov_rr(cb, 13, a as int)
@@ -4481,7 +4695,7 @@ func emit_lir_arm64_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, l
                             eif op == LirOp.VMul do
                                 cb = arm64_mul_rrr(cb, 15, 13, 14)
                             end
-                            cb = arm64_str_uoff(cb, 15, rd as int, lane_off as int)
+                            cb = arm64_str_uoff(cb, 15, r_dst as int, lane_off as int)
                         end
                         vi = vi + 1
                     end
@@ -4489,43 +4703,73 @@ func emit_lir_arm64_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, l
                 last_cmp_pred = 0 - 1
             eif op == LirOp.Splat do
                 a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                var r_dst = rd
+                if r_dst < 0 and ins_dst != 0 do
+                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
+                end
                 s_aux = native_read_i64(ins as i64, 40)
                 var s_lanes = (s_aux shr 8) and 255
                 if s_lanes <= 0 do s_lanes = 4 end
-                if rd >= 0 and a >= 0 do
+                if r_dst >= 0 and a >= 0 do
                     var si = 0
                     when si < s_lanes loop
-                        cb = arm64_str_uoff(cb, a as int, rd as int, (16 + si * 8) as int)
+                        cb = arm64_str_uoff(cb, a as int, r_dst as int, (16 + si * 8) as int)
                         si = si + 1
                     end
                 end
                 last_cmp_pred = 0 - 1
             eif op == LirOp.Shuffle do
                 a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                var r_dst = rd
+                if r_dst < 0 and ins_dst != 0 do
+                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
+                end
                 sh_aux = native_read_i64(ins as i64, 40)
                 var sh_lanes = (sh_aux shr 8) and 255
                 if sh_lanes <= 0 do sh_lanes = 4 end
                 let sh_mask = (sh_aux shr 32)
-                if rd >= 0 and a >= 0 do
-                    var shi = 0
-                    when shi < sh_lanes loop
-                        let src_lane = (sh_mask shr (shi * 4)) and 15
-                        cb = arm64_ldr_uoff(cb, 13, a as int, (16 + src_lane * 8) as int)
-                        cb = arm64_str_uoff(cb, 13, rd as int, (16 + shi * 8) as int)
-                        shi = shi + 1
+                if r_dst >= 0 and a >= 0 do
+                    if r_dst == a do
+                        cb = arm64_sub_imm(cb, 31, 31, 32)
+                        var ski = 0
+                        when ski < sh_lanes loop
+                            let src_lane = (sh_mask shr (ski * 4)) and 15
+                            cb = arm64_ldr_uoff(cb, 13, a as int, (16 + src_lane * 8) as int)
+                            cb = arm64_str_uoff(cb, 13, 31, (ski * 8) as int)
+                            ski = ski + 1
+                        end
+                        ski = 0
+                        when ski < sh_lanes loop
+                            cb = arm64_ldr_uoff(cb, 13, 31, (ski * 8) as int)
+                            cb = arm64_str_uoff(cb, 13, r_dst as int, (16 + ski * 8) as int)
+                            ski = ski + 1
+                        end
+                        cb = arm64_add_imm(cb, 31, 31, 32)
+                    else
+                        var shi = 0
+                        when shi < sh_lanes loop
+                            let src_lane = (sh_mask shr (shi * 4)) and 15
+                            cb = arm64_ldr_uoff(cb, 13, a as int, (16 + src_lane * 8) as int)
+                            cb = arm64_str_uoff(cb, 13, r_dst as int, (16 + shi * 8) as int)
+                            shi = shi + 1
+                        end
                     end
                 end
                 last_cmp_pred = 0 - 1
             eif op == LirOp.VLoad do
                 a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                var r_dst = rd
+                if r_dst < 0 and ins_dst != 0 do
+                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
+                end
                 vl_aux = native_read_i64(ins as i64, 40)
                 var vl_lanes = (vl_aux shr 8) and 255
                 if vl_lanes <= 0 do vl_lanes = 4 end
-                if rd >= 0 and a >= 0 do
+                if r_dst >= 0 and a >= 0 do
                     var vli = 0
                     when vli < vl_lanes loop
                         cb = arm64_ldr_uoff(cb, 13, a as int, (vli * 8) as int)
-                        cb = arm64_str_uoff(cb, 13, rd as int, (16 + vli * 8) as int)
+                        cb = arm64_str_uoff(cb, 13, r_dst as int, (16 + vli * 8) as int)
                         vli = vli + 1
                     end
                 end
@@ -4968,6 +5212,7 @@ func emit_lir_module_arm64(lir_funcs: i64, is_linux: i64):
     cb = arm64_movz_imm64(cb, 11, 0x80000000)
     cb = arm64_add_rrr(cb, 11, 28, 11)
     cb = arm64_str_uoff(cb, 11, 28, 24)
+    cb = arm64_str_uoff(cb, 11, 28, 80)
     # Save argc and argv in heap header:
     cb = arm64_str_uoff(cb, 19, 28, 8)     # *(X28 + 8) = argc
     cb = arm64_str_uoff(cb, 20, 28, 16)    # *(X28 + 16) = argv
