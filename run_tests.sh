@@ -63,6 +63,8 @@ run_test_in_group() {
     expected_diag=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC:[[:space:]]*//p' "$test" | head -1)
     local expected_line
     expected_line=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC_LINE:[[:space:]]*//p' "$test" | head -1)
+    local expected_col
+    expected_col=$(sed -n 's/^#[[:space:]]*EXPECT_DIAGNOSTIC_COL\(UMN\)\{0,1\}:[[:space:]]*//p' "$test" | head -1)
     local expected_exit
     expected_exit=$(sed -n 's/^#[[:space:]]*EXPECT_EXIT:[[:space:]]*//p' "$test" | head -1)
     local expected_member
@@ -89,6 +91,8 @@ run_test_in_group() {
                 fail_reason="kỳ vọng diagnostic code: $expected_diag"
             elif [ -n "$expected_line" ] && ! grep -E -i -q "([Ll]ine[[:space:]]*:[[:space:]]*$expected_line\b|[Ll]ine[[:space:]]+$expected_line\b)" <<<"$reject_out"; then
                 fail_reason="kỳ vọng diagnostic line: $expected_line"
+            elif [ -n "$expected_col" ] && ! grep -E -i -q "([Cc]olumn[[:space:]]*:[[:space:]]*$expected_col\b|[Cc]olumn[[:space:]]+$expected_col\b|:[0-9]+:$expected_col:)" <<<"$reject_out"; then
+                fail_reason="kỳ vọng diagnostic column: $expected_col"
             elif [ -n "$expected_member" ] && ! grep -Fq "$expected_member" <<<"$reject_out"; then
                 fail_reason="kỳ vọng diagnostic member: $expected_member"
             elif [ -n "$expected_receiver" ] && ! grep -Fq "$expected_receiver" <<<"$reject_out"; then
@@ -237,6 +241,19 @@ run_ufcs_mc_target() {
         && grep -Fq "Box.score" "$asm_path" \
         && grep -Fq "Wrapper.to_box" "$asm_path"; then
         if [ "$target" != "linux-riscv64" ] || { grep -Eq '^[[:space:]]*la[[:space:]].*make_box' "$asm_path" && grep -Eq '^[[:space:]]*jalr[[:space:]]' "$asm_path"; }; then
+            if [ "$target" = "linux-x86_64" ]; then
+                local spill_bin="./scratch/ufcs_x86_spill.bin"
+                local spill_out
+                if ! spill_out=$($VIRC "tests/strict_v2/ufcs_x86_fn_ptr_spill_e2e.vri" --target linux-x86_64 -o "$spill_bin" -q 2>&1) \
+                    || [ ! -s "$spill_bin" ] \
+                    || ! objdump -d "$spill_bin" 2>/dev/null | grep -Eq 'movabsq[[:space:]]+\$0x[0-9a-f]+,[[:space:]]+%r10'; then
+                    echo "  [FAIL-MC] UFCS linux-x86_64 fn ptr spill"
+                    if [ -n "$spill_out" ]; then echo "    $spill_out"; fi
+                    GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+                    TOTAL_FAIL=$((TOTAL_FAIL+1))
+                    return
+                fi
+            fi
             echo "  [PASS-MC] UFCS $target assembly"
             GP_PASS[$g]=$((GP_PASS[$g]+1))
             TOTAL_PASS=$((TOTAL_PASS+1))
@@ -923,6 +940,11 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_unresolved_receiver_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_entity_receiver_type_mismatch_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_type_mismatch_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_url_parse_positive_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_x86_fn_ptr_spill_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_receiver_forms_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_eval_order_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_cross_type_chain_e2e.vri"
@@ -932,6 +954,11 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_unresolved_receiver_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_entity_receiver_type_mismatch_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_type_mismatch_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_url_parse_positive_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_x86_fn_ptr_spill_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_entity_receiver_wrong_type_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_receiver_wrong_type_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_missing_member_rejected.vri"

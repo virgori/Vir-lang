@@ -11,7 +11,7 @@ include vec_rt
 import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt, vec_pop_rt from vec_rt
 
 include string_rt
-import rt_streq, fat_str_eq, fat_str_len, fat_cstr_eq, fat_str_new, fat_str_concat, fat_str_slice, rt_itoa, rt_strlen, fat_str_byte_at, sb_new, sb_append, sb_append_int, sb_to_string, sb_free from string_rt
+import rt_streq, fat_str_eq, fat_str_len, fat_cstr_eq, fat_str_new, fat_str_concat, fat_str_slice, rt_itoa, rt_strlen, fat_str_byte_at, sb_new, sb_append, sb_append_char, sb_append_int, sb_to_string, sb_free from string_rt
 
 # Local fail-fast exit: avoids importing sys_exit (avoid include chain crash).
 # On macOS ARM64: X16=0x2000001, SVC #0x80. On Linux ARM64: X8=93, SVC #0.
@@ -23,7 +23,7 @@ include parser
 import AstNode, AstType, OpType from parser
 
 include compiler.ffi_imports
-import ffi_import_reset, ffi_import_register from compiler.ffi_imports
+import ffi_import_reset, ffi_import_register, ffi_import_find from compiler.ffi_imports
 
 include type_table
 import TypeKind, is_tensor_type_str, parse_tensor_shape, parse_tensor_rank, parse_tensor_stride, parse_tensor_numel, parse_tensor_elem_type, tensor_elem_byte_size, parse_tensor_elem_code from type_table
@@ -1069,6 +1069,21 @@ func set_global_prog_ast(ast: &AstNode):
                 end
             end
         end
+        if child_type == AstType.BundleExpr do
+            const_name = ast_node_name(child)
+            if fat_str_len(const_name) > 0 do
+                val = 0
+                if ast_node_child_count(child) > 0 do
+                    val = eval_const_expr(ast_node_child(child, 0))
+                end
+                if hash_table_lookup(g_const_hash, g_const_names, const_name) < 0 do
+                    idx = vec_len_rt(g_const_names)
+                    g_const_names = vec_push_rt(g_const_names, const_name as i64)
+                    g_const_values = vec_push_rt(g_const_values, val)
+                    hash_table_insert(g_const_hash, g_const_names, const_name, idx)
+                end
+            end
+        end
         if child_type == AstType.EntityDef or child_type == AstType.PackedDef or child_type == AstType.RegisterDef do
             entity_name = ast_node_name(child)
             var is_packed = 0
@@ -1151,7 +1166,8 @@ func set_global_prog_ast(ast: &AstNode):
     var global_i = 0
     when global_i < global_n loop
         global_node = ast_node_child(ast, global_i)
-        if ast_node_type_of(global_node) == AstType.VarDecl do
+        g_node_type = ast_node_type_of(global_node)
+        if g_node_type == AstType.VarDecl or g_node_type == AstType.ReactiveDecl or g_node_type == AstType.MorphDecl do
             global_name = ast_node_name(global_node)
             if hash_table_lookup(g_lower_global_hash, g_lower_global_names, global_name) < 0 do
                 global_slot = vec_len_rt(g_lower_global_names)
@@ -1498,6 +1514,16 @@ func find_field_index_for_base(base_name: &string, field_name: &string):
         if fat_cstr_eq(field_name, "len") == 1 do out 4 end
         if fat_cstr_eq(field_name, "int_val") == 1 do out 6 end
         if fat_cstr_eq(field_name, "float_val") == 1 do out 7 end
+        if fat_cstr_eq(field_name, "file_id") == 1 do out 8 end
+        if fat_cstr_eq(field_name, "span_id") == 1 do out 9 end
+    end
+
+    # CodeBuf entity fields (arch: 0, data: 1, len: 2, start_offset: 3)
+    if fat_cstr_eq(base_name, "cb") == 1 or fat_cstr_eq(base_name, "code") == 1 do
+        if fat_cstr_eq(field_name, "arch") == 1 do out 0 end
+        if fat_cstr_eq(field_name, "data") == 1 do out 1 end
+        if fat_cstr_eq(field_name, "len") == 1 do out 2 end
+        if fat_cstr_eq(field_name, "start_offset") == 1 do out 3 end
     end
 
     out find_field_index(field_name)
@@ -1514,6 +1540,9 @@ func find_field_index(field_name: &string):
     if fat_cstr_eq(field_name, "float_val") == 1 do out 6 end
     if fat_cstr_eq(field_name, "builtin_id") == 1 do out 7 end
     if fat_cstr_eq(field_name, "children") == 1 do out 8 end
+    if fat_cstr_eq(field_name, "span_id") == 1 do out 9 end
+    if fat_cstr_eq(field_name, "file_id") == 1 do out 8 end
+    if fat_cstr_eq(field_name, "start_offset") == 1 do out 3 end
 
     if fat_cstr_eq(field_name, "parent_id") == 1 do out 1 end
     if fat_cstr_eq(field_name, "symbols") == 1 do out 2 end
@@ -2801,7 +2830,23 @@ func lower_expr_impl(b: MirBuilder, expr: &AstNode):
 				b_global = emit_intrinsic(b_global, MIR_INTR_GLOBAL_LOAD, mir_opnd_vreg(global_vreg), mir_opnd_imm(global_slot))
 				out expr_result(b_global, mir_opnd_vreg(global_vreg))
 			end
-			var (b1, cid) = builder_intern(b, fname)
+			let resolved_fn = resolve_callee_alias(fname)
+			let is_fn = (find_func_ast(resolved_fn as i64) as i64 != 0) or (find_func_ast(fname as i64) as i64 != 0)
+			let is_ffi = (ffi_import_find(resolved_fn) >= 0) or (ffi_import_find(fname) >= 0)
+			if not is_fn and not is_ffi do
+				var sb_err = sb_new()
+				sb_err = sb_append(sb_err, "virc: error: lowering unresolved identifier: ")
+				var f_len = fat_str_len(fname)
+				var fi = 0
+				when fi < f_len loop
+					sb_err = sb_append_char(sb_err, fat_str_byte_at(fname, fi))
+					fi = fi + 1
+				end
+				print_ln(sb_to_string(sb_err))
+				sb_free(sb_err)
+				sys_exit(1)
+			end
+			var (b1, cid) = builder_intern(b, resolved_fn)
 			var (b2, dst) = builder_new_vreg(b1)
 			b2 = emit_intrinsic(b2, MIR_INTR_ADDR_OF, mir_opnd_vreg(dst), mir_opnd_imm(cid))
 			out expr_result(b2, mir_opnd_vreg(dst))
@@ -3175,45 +3220,82 @@ func lower_expr_impl(b: MirBuilder, expr: &AstNode):
 			b6 = builder_add_instr(b6, mir_instr_new(MirOp.Call, mir_opnd_vreg(dst), mir_opnd_imm(nargs), mir_opnd_vreg(fn_vreg)))
 			out expr_result(b6, mir_opnd_vreg(dst))
 		end
-			if callee_kind != 201 or fat_str_len(resolved_name) == 0 do
+		if callee_kind != 201 and callee_kind != 203 do
+			var sb_err1 = sb_new()
+			sb_err1 = sb_append(sb_err1, "virc: error: lowering unresolved method or UFCS call: ")
+			var m_len = fat_str_len(mname)
+			var mi = 0
+			when mi < m_len loop
+				sb_err1 = sb_append_char(sb_err1, fat_str_byte_at(mname, mi))
+				mi = mi + 1
+			end
+			print_ln(sb_to_string(sb_err1))
+			sb_free(sb_err1)
+			sys_exit(1)
+			out expr_result(b, mir_opnd_imm(0))
+		end
+		if callee_kind == 203 do
+			if fat_str_len(resolved_name) == 0 do
 				resolved_name = mname
 			end
-			var (b0, mid) = builder_intern(b, resolved_name)
-			# Normalize method/UFCS into an ordinary call AST so ref/out argument
-			# staging, address passing, and writeback use the same code path.
-			call_expr = ast_new(AstType.Call)
-			call_expr.name = resolved_name
-			call_expr = ast_add_child(call_expr, recv)
-			var m_ai = 1
-			when m_ai < nch loop
-				call_expr = ast_add_child(call_expr, ast_node_child(expr, m_ai))
-				m_ai = m_ai + 1
-			end
-			method_ast = find_func_ast(resolved_name as i64)
-			sig_ast = method_ast
-			if (method_ast as i64) != 0 do
-				var has_explicit_this = false
-				if ast_node_child_count(method_ast) > 0 do
-					m_p0 = ast_node_child(method_ast, 0)
-					if fat_cstr_eq(ast_node_name(m_p0), "this") do has_explicit_this = true end
+			let resolved_fn = resolve_callee_alias(resolved_name)
+			let is_fn = (find_func_ast(resolved_fn as i64) as i64 != 0) or (find_func_ast(resolved_name as i64) as i64 != 0)
+			let is_ffi = (ffi_import_find(resolved_fn) >= 0) or (ffi_import_find(resolved_name) >= 0)
+			if not is_fn and not is_ffi do
+				var sb_err2 = sb_new()
+				sb_err2 = sb_append(sb_err2, "virc: error: lowering unresolved UFCS free function target: ")
+				var r_len = fat_str_len(resolved_name)
+				var ri = 0
+				when ri < r_len loop
+					sb_err2 = sb_append_char(sb_err2, fat_str_byte_at(resolved_name, ri))
+					ri = ri + 1
 				end
-				if not has_explicit_this do
-					sig_ast = ast_new(AstType.FuncDef)
-					this_param = ast_new(AstType.ParamDef)
-					this_param.name = fat_str_new("this")
-					this_param.int_val = 0
-					sig_ast = ast_add_child(sig_ast, this_param)
-					var spi = 0
-					when spi < ast_node_child_count(method_ast) loop
-						sp = ast_node_child(method_ast, spi)
-						spt = ast_node_type_of(sp)
-						if spt == AstType.Identifier or spt == AstType.ParamDef or spt == AstType.RefParam or spt == AstType.OutParam do
-							sig_ast = ast_add_child(sig_ast, sp)
-						end
-						spi = spi + 1
+				print_ln(sb_to_string(sb_err2))
+				sb_free(sb_err2)
+				sys_exit(1)
+				out expr_result(b, mir_opnd_imm(0))
+			end
+			resolved_name = resolved_fn
+		end
+		if callee_kind == 201 and fat_str_len(resolved_name) == 0 do
+			resolved_name = mname
+		end
+		var (b0, mid) = builder_intern(b, resolved_name)
+		# Normalize method/UFCS into an ordinary call AST so ref/out argument
+		# staging, address passing, and writeback use the same code path.
+		call_expr = ast_new(AstType.Call)
+		call_expr.name = resolved_name
+		call_expr = ast_add_child(call_expr, recv)
+		var m_ai = 1
+		when m_ai < nch loop
+			call_expr = ast_add_child(call_expr, ast_node_child(expr, m_ai))
+			m_ai = m_ai + 1
+		end
+		method_ast = find_func_ast(resolved_name as i64)
+		sig_ast = method_ast
+		if (method_ast as i64) != 0 do
+			var has_explicit_this = false
+			if ast_node_child_count(method_ast) > 0 do
+				m_p0 = ast_node_child(method_ast, 0)
+				if fat_cstr_eq(ast_node_name(m_p0), "this") do has_explicit_this = true end
+			end
+			if not has_explicit_this and callee_kind == 201 do
+				sig_ast = ast_new(AstType.FuncDef)
+				this_param = ast_new(AstType.ParamDef)
+				this_param.name = fat_str_new("this")
+				this_param.int_val = 0
+				sig_ast = ast_add_child(sig_ast, this_param)
+				var spi = 0
+				when spi < ast_node_child_count(method_ast) loop
+					sp = ast_node_child(method_ast, spi)
+					spt = ast_node_type_of(sp)
+					if spt == AstType.Identifier or spt == AstType.ParamDef or spt == AstType.RefParam or spt == AstType.OutParam do
+						sig_ast = ast_add_child(sig_ast, sp)
 					end
+					spi = spi + 1
 				end
 			end
+		end
 			out lower_call_with_ref_support_ast(b0, call_expr, resolved_name, mid, 0 - 1, sig_ast)
 		end
 
