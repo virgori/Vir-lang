@@ -435,7 +435,7 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
             artifact = bin_out.read_bytes()
             if entry.test_id == "SIMD-RISCV-001":
                 # Limit scan strictly to the executable machine code in .text section
-                code_bytes = artifact
+                code_bytes = None
                 if len(artifact) >= 64 and artifact[:4] == b"\x7fELF" and artifact[4] == 2:
                     try:
                         e_shoff = struct.unpack_from("<Q", artifact, 40)[0]
@@ -454,8 +454,31 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                                 if s_name == ".text" and sh_size > 0:
                                     code_bytes = artifact[sh_offset : sh_offset + sh_size]
                                     break
-                    except Exception:
-                        pass
+                    except Exception as ex:
+                        return TestResult(
+                            test_id=entry.test_id,
+                            kind=entry.kind,
+                            status="FAIL",
+                            target="linux-riscv64",
+                            compile_exit=c_exit,
+                            run_exit=None,
+                            stdout=c_stdout,
+                            stderr=c_stderr,
+                            reason=f"ELF section header parsing error for RISC-V binary: {ex}",
+                        )
+
+                if code_bytes is None:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target="linux-riscv64",
+                        compile_exit=c_exit,
+                        run_exit=None,
+                        stdout=c_stdout,
+                        stderr=c_stderr,
+                        reason="Could not extract .text section from RISC-V ELF binary (parsing failed or .text missing)",
+                    )
                 words = struct.unpack(f"<{len(code_bytes) // 4}I", code_bytes[: len(code_bytes) // 4 * 4])
                 # Check that scalar integer/FP ops are present in .text and RVV vector major opcode (0x57) is not used for flux
                 has_scalar_add = any((w & 0xFE00707F) == 0x00000033 for w in words)
