@@ -1038,6 +1038,92 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                     reason="1D loop stride-2 vectorization + odd tail N=5 and missing_slp_tail mutation check verified",
                 )
 
+            if entry.test_id == "SIMD-PROMOTE-001":
+                raw = bin_out.read_bytes()
+                words = struct.unpack(f"<{len(raw) // 4}I", raw[: len(raw) // 4 * 4])
+                arm_has_neon = any(w in (0x3CED6A60, 0x3CAD6AC0) or (w & 0xFFC00000) in (0x3DC00000, 0x3D800000) for w in words)
+                if not arm_has_neon or r_exit != 0 or r_stdout.strip() != "42":
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target=target,
+                        compile_exit=c_exit,
+                        run_exit=r_exit,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason=f"ARM64 promotion execution or NEON opcodes failed (arm_has_neon={arm_has_neon}, exit={r_exit}, stdout={r_stdout.strip()})",
+                    )
+                ns_bin = tmp_path / "prom_nosimd"
+                ns_c_exit, _, _ = run_command([str(virc_bin), str(fixture_path), "--no-simd", "-o", str(ns_bin)], cwd=ROOT, timeout=compile_timeout)
+                ns_r_exit, ns_stdout, _ = run_command([str(ns_bin)], cwd=ROOT, timeout=timeout)
+                ns_raw = ns_bin.read_bytes() if ns_bin.exists() else b""
+                ns_words = struct.unpack(f"<{len(ns_raw) // 4}I", ns_raw[: len(ns_raw) // 4 * 4]) if ns_raw else ()
+                ns_has_neon_stub = any(w in (0x3CED6A60, 0x3CAD6AC0) for w in ns_words)
+                if ns_c_exit != 0 or ns_r_exit != 0 or ns_stdout.strip() != "42" or ns_has_neon_stub:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target=target,
+                        compile_exit=ns_c_exit,
+                        run_exit=ns_r_exit,
+                        stdout=ns_stdout,
+                        stderr=r_stderr,
+                        reason=f"ARM64 --no-simd promotion failed to suppress NEON stub (ns_has_neon_stub={ns_has_neon_stub})",
+                    )
+                x86_bin = tmp_path / "prom_x86"
+                run_command([str(virc_bin), str(fixture_path), "--target", "linux-x86_64", "-o", str(x86_bin)], cwd=ROOT, timeout=compile_timeout)
+                x86_bytes = x86_bin.read_bytes() if x86_bin.exists() else b""
+                x86_has_movdqu = (b"\xf3\x0f\x6f" in x86_bytes) or (b"\xf3\x41\x0f\x6f" in x86_bytes) or (b"\xf3\x0f\x7f" in x86_bytes)
+                x86_ns_bin = tmp_path / "prom_x86_ns"
+                run_command([str(virc_bin), str(fixture_path), "--target", "linux-x86_64", "--no-simd", "-o", str(x86_ns_bin)], cwd=ROOT, timeout=compile_timeout)
+                x86_ns_bytes = x86_ns_bin.read_bytes() if x86_ns_bin.exists() else b""
+                x86_ns_has_movdqu = (b"\xf3\x0f\x6f" in x86_ns_bytes) or (b"\xf3\x41\x0f\x6f" in x86_ns_bytes)
+                if not x86_has_movdqu or x86_ns_has_movdqu:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target="linux-x86_64",
+                        compile_exit=c_exit,
+                        run_exit=None,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason=f"x86-64 SSE2 promotion check failed (has_movdqu={x86_has_movdqu}, ns_has_movdqu={x86_ns_has_movdqu})",
+                    )
+                wasm_bin = tmp_path / "prom_wasm.wasm"
+                run_command([str(virc_bin), str(fixture_path), "--target", "wasm32-wasi-p1", "-o", str(wasm_bin)], cwd=ROOT, timeout=compile_timeout)
+                wasm_bytes = wasm_bin.read_bytes() if wasm_bin.exists() else b""
+                wasm_has_v128 = (b"\xfd\x00" in wasm_bytes) and (b"\xfd\x0b" in wasm_bytes)
+                wasm_ns_bin = tmp_path / "prom_wasm_ns.wasm"
+                run_command([str(virc_bin), str(fixture_path), "--target", "wasm32-wasi-p1", "--no-simd", "-o", str(wasm_ns_bin)], cwd=ROOT, timeout=compile_timeout)
+                wasm_ns_bytes = wasm_ns_bin.read_bytes() if wasm_ns_bin.exists() else b""
+                wasm_ns_has_v128 = (b"\xfd\x00" in wasm_ns_bytes) or (b"\xfd\x0b" in wasm_ns_bytes)
+                if not wasm_has_v128 or wasm_ns_has_v128:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target="wasm32-wasi-p1",
+                        compile_exit=c_exit,
+                        run_exit=None,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason=f"Wasm32 SIMD128 promotion check failed (has_v128={wasm_has_v128}, ns_has_v128={wasm_ns_has_v128})",
+                    )
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="PASS",
+                    target=target,
+                    compile_exit=c_exit,
+                    run_exit=r_exit,
+                    stdout=r_stdout,
+                    stderr=r_stderr,
+                    reason="Multi-target promotion SIMD fast path (ARM64 NEON, x86-64 SSE2, Wasm SIMD128) and --no-simd fallback verified",
+                )
+
             if entry.test_id == "TARGET-002":
                 if r_exit != 37:
                     return TestResult(
