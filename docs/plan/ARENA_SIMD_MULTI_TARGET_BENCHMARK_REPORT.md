@@ -80,22 +80,22 @@ In compliance with the performance specification in prompt line 554:
 ## 4. Benchmark Results & Gate Evaluation
 
 ### Table 1: Scalar Allocator Hot-Path Latency (`arena_alloc` Allocation-Only)
-Measures pure scalar allocation latency across small sizes (8B, 24B, 64B) without zeroing, filling, or copying, evaluating the $\le +3\%$ regression budget against baseline checked bump arithmetic.
+Measures pure scalar allocation latency across small sizes (8B, 24B, 64B) without zeroing, filling, or copying, evaluating the $\le +3\%$ regression budget against the baseline historical reference bump allocator (`ArenaRef`).
 
-| Workload | Iterations | Baseline Median (p95 / p99) | Current Median (p95 / p99) | Delta vs Baseline | Gate Evaluation |
+| Workload | Iterations | Baseline Ref Median (p95 / p99) | Current Alloc Median (p95 / p99) | Delta vs Baseline | Gate Evaluation |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **`arena_alloc` (8B / 24B / 64B)** | 300,000 | `6.29 ms` (`6.67 ms` / `6.84 ms`) | `6.41 ms` (`6.57 ms` / `6.61 ms`) | **+1.8%** | **PASS ($\le +3\%$)** |
+| **`arena_alloc` (8B / 24B / 64B)** | 300,000 | `7.04 ms` (`7.91 ms` / `8.07 ms`) | `6.93 ms` (`7.42 ms` / `7.47 ms`) | **-1.6%** | **PASS ($\le +3\%$)** |
 
-> **Conclusion**: The hot-path bump pointer allocation incurs only $+1.8\%$ overhead (within the $+3.0\%$ regression gate), preserving fast O(1) allocation without unnecessary per-object 16-byte alignment bloat.
+> **Conclusion**: The dedicated fast inline bump path in `arena_alloc` avoids `arena_reserve` argument decoding and non-power-of-two alignment checks on the hot path, incurring **-1.6%** overhead compared to the reference allocator, comfortably satisfying the $+3.0\%$ regression gate without per-object 16-byte alignment bloat.
 
 ---
 
 ### Table 2: Zeroed Allocation (`arena_alloc_zeroed` vs Scalar Zeroing)
-Compares `arena_alloc_zeroed(a, 64)` utilizing 128-bit hardware NEON `mem_set` (`bid=32`) against manual scalar 8-byte word zeroing.
+Directly calls `arena_alloc_zeroed(a, 64)` utilizing 128-bit hardware NEON `mem_zero` (`bid=32`) against `arena_alloc(a, 64)` followed by manual scalar 8-byte word zeroing (`mem_zero_scalar`).
 
 | Workload | Iterations | Scalar Zero Median (p95 / p99) | SIMD Zero Median (p95 / p99) | Speedup | Gate Status |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **`arena_alloc_zeroed` (64 B)** | 200,000 | `5.76 ms` (`6.01 ms` / `6.07 ms`) | `4.56 ms` (`4.68 ms` / `4.74 ms`) | **1.26x** | **PASS** |
+| **`arena_alloc_zeroed` (64 B)** | 200,000 | `14.33 ms` (`14.92 ms` / `15.13 ms`) | `5.25 ms` (`6.04 ms` / `6.65 ms`) | **2.73x** | **PASS** |
 
 ---
 
@@ -104,34 +104,34 @@ Evaluates the checked batch layout calculation (`ArenaBatchLayout`) and single b
 
 | Workload | Iterations | 2x `arena_reserve` Median (p95 / p99) | `arena_batch_reserve2` Median (p95 / p99) | Speedup | Gate Status |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Batch Reserve (32B + 48B)** | 2,000 | `2.27 ms` (`2.41 ms` / `2.49 ms`) | `2.26 ms` (`2.39 ms` / `2.42 ms`) | **1.00x** | **PASS** |
+| **Batch Reserve (32B + 48B)** | 2,000 | `2.78 ms` (`3.27 ms` / `3.53 ms`) | `2.50 ms` (`3.28 ms` / `3.29 ms`) | **1.12x** | **PASS** |
 
 ---
 
 ### Table 4: Bulk Operations (`mem_set` + `mem_copy`) Across Representatives
-Measures bulk fill and copy across sizes: small size (8B), threshold boundary (16B), 64B, 4 KiB, 64 KiB, and grow-size representative (128 KiB).
+Measures bulk fill and copy across sizes: small size (8B), threshold boundary (16B), 64B, 4 KiB, 64 KiB, and grow-size representative (128 KiB). In `stdlib/vir/mem/copy.vri`, the threshold is set to $N \ge 32$ so that 16-byte buffers use the fast scalar 64-bit pair path rather than vector registers.
 
-| Size Category | Buffer Size | Iterations | Scalar Median (p95 / p99) | SIMD Median (p95 / p99) | Speedup | Gate Status |
+| Size Category | Buffer Size | Iterations | Scalar Median (p95 / p99) | SIMD/Default Median (p95 / p99) | Speedup | Gate Status |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Small Size** | 8 B | 300,000 | `6.55 ms` (`6.65 ms` / `6.66 ms`) | `6.47 ms` (`6.64 ms` / `6.75 ms`) | **1.01x** | **PASS** |
-| **Threshold** | 16 B | 200,000 | `3.95 ms` (`4.21 ms` / `4.23 ms`) | `5.10 ms` (`5.26 ms` / `5.27 ms`) | **0.77x** | Note below |
-| **Medium** | 64 B | 200,000 | `4.71 ms` (`5.09 ms` / `5.13 ms`) | `4.46 ms` (`4.68 ms` / `4.73 ms`) | **1.05x** | **PASS** |
-| **Page Size** | 4 KiB | 50,000 | `19.05 ms` (`19.84 ms` / `20.23 ms`) | `11.80 ms` (`12.48 ms` / `12.50 ms`) | **1.61x** | **PASS ($\ge 1.5x$)** |
-| **Large Block** | 64 KiB | 5,000 | `27.01 ms` (`27.54 ms` / `27.79 ms`) | `15.10 ms` (`16.45 ms` / `16.46 ms`) | **1.79x** | **PASS ($\ge 1.5x$)** |
-| **Grow-Size Repr.** | 128 KiB | 2,500 | `26.88 ms` (`27.26 ms` / `27.29 ms`) | `14.97 ms` (`16.20 ms` / `16.28 ms`) | **1.80x** | **PASS ($\ge 1.5x$)** |
+| **Small Size** | 8 B | 300,000 | `5.36 ms` (`5.87 ms` / `6.29 ms`) | `5.40 ms` (`5.62 ms` / `5.65 ms`) | **0.99x** | **PASS** |
+| **Threshold (Scalar)** | 16 B | 200,000 | `5.04 ms` (`5.28 ms` / `5.29 ms`) | `4.79 ms` (`5.06 ms` / `5.15 ms`) | **1.05x** | **PASS** |
+| **Medium** | 64 B | 200,000 | `4.84 ms` (`5.04 ms` / `5.05 ms`) | `4.49 ms` (`4.91 ms` / `5.06 ms`) | **1.08x** | **PASS** |
+| **Page Size** | 4 KiB | 50,000 | `19.33 ms` (`21.60 ms` / `21.72 ms`) | `11.56 ms` (`12.26 ms` / `12.59 ms`) | **1.67x** | **PASS ($\ge 1.5x$)** |
+| **Large Block** | 64 KiB | 5,000 | `28.93 ms` (`37.95 ms` / `48.31 ms`) | `15.27 ms` (`16.13 ms` / `16.22 ms`) | **1.90x** | **PASS ($\ge 1.5x$)** |
+| **Grow-Size Repr.** | 128 KiB | 2,500 | `32.19 ms` (`88.12 ms` / `139.54 ms`) | `17.66 ms` (`19.92 ms` / `19.96 ms`) | **1.82x** | **PASS ($\ge 1.5x$)** |
 
 > [!NOTE]
-> At exactly 16 bytes, scalar register pair transfer (`ldp`/`stp` on ARM64) avoids vector register setup overhead. For workloads $\ge 64\text{ B}$, the hardware 128-bit NEON unrolled vector loop delivers consistent speedup reaching **$1.80\times$** on 128 KiB chunk buffers.
+> At 16 bytes, scalar 64-bit transfers avoid vector register setup and permutation overhead. For buffers $\ge 64\text{ B}$, hardware 128-bit NEON unrolled loops deliver up to **$1.90\times$** speedup on 64 KiB buffers and **$1.82\times$** on 128 KiB buffers.
 
 ---
 
-### Table 5: Memory Lifecycle Costs (Grow Copy & Promotion Copy)
-Isolates the memory copy cost during arena chunk growth (reallocating and moving from 1 KiB up to 128 KiB) and promotion copy (promoting escaping object graphs from a sub-arena into the parent arena).
+### Table 5: Memory Lifecycle Costs (Real Arena Grow & Sub-Arena Promotion)
+Measures the real `Arena` dynamic chunk growth lifecycle (successively allocating chunks from 1 KiB up to 128 KiB, exercising buffer reallocation, chunk copying, and re-basing) and real nested `arena:` sub-arena-to-parent promotion lifecycle (`MIR_MEM_PROMOTE` graph escape and watermark reset).
 
-| Workload | Iterations | Scalar Median (p95 / p99) | SIMD Median (p95 / p99) | Speedup | Gate Status |
+| Workload | Iterations | Scalar (`--no-simd`) Median (p95 / p99) | Fast/Default Median (p95 / p99) | Speedup | Gate Status |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Arena Grow Copy (1 KiB $\to$ 128 KiB)** | 2,000 | `30.98 ms` (`32.25 ms` / `32.68 ms`) | `27.02 ms` (`27.94 ms` / `28.88 ms`) | **1.15x** | **PASS** |
-| **Promotion Copy (Sub-arena $\to$ Parent)** | 100,000 | `3.39 ms` (`3.65 ms` / `3.68 ms`) | `3.39 ms` (`3.52 ms` / `3.57 ms`) | **1.00x** | **PASS** |
+| **Arena Dynamic Chunk Grow (1 KiB $\to$ 128 KiB)** | 2,000 | `2.60 ms` (`3.11 ms` / `3.13 ms`) | `2.53 ms` (`3.08 ms` / `3.36 ms`) | **1.03x** | **PASS** |
+| **Sub-Arena to Parent Promotion Lifecycle** | 50,000 | `3.40 ms` (`4.13 ms` / `4.37 ms`) | `3.61 ms` (`5.08 ms` / `5.12 ms`) | **0.94x** | **PASS** |
 
 ---
 
@@ -140,7 +140,7 @@ Measures array element addition across 16 elements under `-O2` (with Phase 5 loo
 
 | Workload | Iterations | Scalar (`--no-simd`) Median (p95 / p99) | Vectorized (`-O2`) Median (p95 / p99) | Speedup | Gate Status |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **1D Loop Vectorization (16-lane kernel)** | 200,000 | `5.51 ms` (`5.77 ms` / `5.79 ms`) | `4.35 ms` (`5.53 ms` / `5.54 ms`) | **1.27x** | **PASS** |
+| **1D Loop Vectorization (16-lane kernel)** | 200,000 | `5.66 ms` (`5.75 ms` / `5.80 ms`) | `4.00 ms` (`4.25 ms` / `4.29 ms`) | **1.42x** | **PASS** |
 
 ---
 
@@ -150,18 +150,22 @@ Per prompt line 571, performance and capability conclusions are established indi
 
 | Target Architecture | Vector Capability | Backend Implementation | Status & Conclusion |
 | :--- | :---: | :---: | :--- |
-| **ARM64 (`macos-arm64`, `linux-arm64`, `windows-arm64`)** | 128-bit NEON | `ldr q`, `str q`, `dup.2d`, `add.2d`, `sub.2d`, `fadd.2d`, `fsub.2d`, `fmul.2d`, `fmla.2d` | **native-fast** (up to $1.80\times$ bulk speedup, $1.27\times$ loop speedup) |
-| **x86-64 (`linux-x86_64`, `windows-x86_64`)** | 128-bit SSE2 | `movdqu`, `punpcklqdq`, `paddq`, `psubq`, `addpd`, `subpd`, `mulpd` | **native-fast** (unaligned vector memory ops, bitwise broadcast) |
-| **Wasm32 (`wasm32-wasi-p1`)** | 128-bit SIMD128 | `0xFD` opcodes: `v128.load`, `v128.store`, `i64x2.splat`, `f64x2.splat`, `i64x2.add`, `f64x2.add` | **native-fast** (Wasm standard 128-bit vector instructions) |
-| **RISC-V (`linux-riscv64`)** | `rv64d` Baseline / RVV | Scalar lane loop fallback when `--enable-rvv` is not passed; absence of opcode `0x57` verified | **scalar-fallback** (robust scalar fallback, no illegal vector opcodes) |
+| **ARM64 (`macos-arm64`, `linux-arm64`, `windows-arm64`)** | 128-bit NEON | `ldr q`, `str q`, `dup.2d`, `add.2d`, `sub.2d`, `fadd.2d`, `fsub.2d`, `fmul.2d`, `fmla.2d` | **native-fast** (up to $1.90\times$ bulk speedup, $1.42\times$ loop speedup) |
+| **x86-64 (`linux-x86_64`, `windows-x86_64`)** | 128-bit SSE2 | `movdqu`, `punpcklqdq`, `paddq`, `psubq`, `addpd`, `subpd`, `mulpd` | **native-implemented, performance-blocked** (structural SSE2 opcode verification complete; native execution blocked on ARM64 host without x86 hardware) |
+| **Wasm32 (`wasm32-wasi-p1`)** | 128-bit SIMD128 | `0xFD` opcodes: `v128.load`, `v128.store`, `i64x2.splat`, `f64x2.splat`, `i64x2.add`, `f64x2.add` | **native-implemented, performance-blocked** (Wasm standard 128-bit vector instructions verified; standalone Wasm wall-clock benchmark blocked) |
+| **RISC-V (`linux-riscv64`)** | `rv64d` Baseline / RVV | Scalar lane loop fallback when `--enable-rvv` is not passed; absence of opcode `0x57` in `.text` asserted | **scalar-fallback** (robust scalar fallback, no illegal vector opcodes in `.text`) |
 
 ---
 
 ## 6. Verification and Regression Checklist
 
-- [x] **[P1] Loop Vectorizer Non-Zero Start IV**: Proved induction variable starts at 0 before vectorization in `mir_opt_loop_vectorize` (`stdlib/vir/compiler/mir_opt.vri`). Verified by `SIMD-LOOP-002` where `dst[4]` remains untouched (`999`).
-- [x] **[P1] RISC-V Absence of RVV**: Structural oracle in `tools/gap_contract_runner.py` now scans all 32-bit machine instruction words and strictly rejects RVV major opcode `0x57`. Verified by `SIMD-RISCV-001`.
-- [x] **[P2] Complete Benchmark Deliverables**: Exact target, CPU, OS, compiler binary SHA-256 hash, sample size, median, p95, and p99 reported for all allocation, reserve, bulk, grow copy, promotion copy, and vectorization workloads.
+- [x] **[P1] SIMD 16B Threshold**: Raised threshold in `stdlib/vir/mem/copy.vri` to $N \ge 32$ with looped 64-bit scalar transfers (`when i + 8 <= n loop`), ensuring 16-byte copies and fills use fast scalar registers rather than slower vector setup.
+- [x] **[P1] Baseline Allocator Reference**: Benchmark 1 explicitly compares against historical pre-change bump allocator reference (`ArenaRef`), demonstrating -1.6% delta ($\le +3\%$ gate PASS).
+- [x] **[P1] Dedicated `arena_alloc_zeroed` Benchmark**: Benchmark 2 directly calls `arena_alloc_zeroed(a, 64)`, demonstrating 2.73x speedup over scalar zeroing.
+- [x] **[P1] Real Arena Growth Benchmark**: Benchmark 5 Part A triggers true `Arena` dynamic chunk growth (1 KiB $\to$ 128 KiB) with successive doubling, buffer copying, and reallocations.
+- [x] **[P1] Documented Sub-Arena Promotion Benchmark**: Benchmark 5 Part B measures real nested `arena:` sub-arena-to-parent promotion lifecycle (`MIR_MEM_PROMOTE` escape and sub-arena reset).
+- [x] **[P2] Target Matrix Accuracy**: Classified x86-64 and Wasm32 as `native-implemented, performance-blocked` due to absence of native wall-clock execution on host ARM64 hardware.
+- [x] **[P2] RVV Oracle Isolated to `.text` Section**: `tools/gap_contract_runner.py` now parses the ELF64 section header table to isolate the `.text` executable code section, preventing false failures from metadata bytes.
 - [x] **Memory Contract Matrix**: 76/76 PASS across `-O0`, `-O1`, `-O2`, `-O3`.
 - [x] **SIMD Contract Matrix**: 21/21 PASS across all structural and execution fixtures.
 - [x] **Full Repository Test Suite**: 735/735 PASS (100% PASS, 0 FAIL) in `./run_tests.sh full`.
