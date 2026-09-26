@@ -5,7 +5,7 @@
 All requirements specified in `docs/plan/STRICT_V2_ARENA_SIMD_MULTI_TARGET_IMPLEMENTATION_PROMPT.md` (Phases 0 through 5) have been completely implemented in the production compiler (`stdlib/vir/compiler/*.vri` and synchronized `stdlib/vir/compiler/virc.vri`), self-host verified to a bit-for-bit fixed point (`stage2 == stage3`), and validated across all contract, structural, and performance gates:
 
 - **Memory Contract Suite (`tests/memory_contract/manifest.tsv`)**: **78 / 78 PASS (100%)** across all four optimization levels (`-O0`, `-O1`, `-O2`, `-O3`), with 0 FAIL and 0 BLOCKED (including integer overflow regression test `MEM-OVERFLOW-001` and deep-graph promotion test `MEM-PROMOTE-DEEP-001`).
-- **SIMD & Multi-Target Structural Suite (`SIMD-*`)**: **23 / 23 PASS (100%)**, including:
+- **SIMD & Multi-Target Structural Suite**: **22 / 22 PASS (100%)** under `--filter '^SIMD-'`, plus **TARGET-RISCV-003** (RISC-V RVV-absence oracle) for **23 tests total** in the gap-contract suite, including:
   - Machine-opcode structural verification for ARM64 NEON (`ldr q`, `str q`, `add.2d`, `fadd.2d`).
   - Machine-opcode structural verification for x86-64 SSE2 (`movdqu`, `paddq`, `addpd`).
   - Binary opcode verification for Wasm SIMD128 (`0xFD` prefix `v128.load`, `v128.store`, `i64x2.add`, `f64x2.add`).
@@ -16,7 +16,7 @@ All requirements specified in `docs/plan/STRICT_V2_ARENA_SIMD_MULTI_TARGET_IMPLE
   - Non-zero induction variable regression test ensuring loop vectorizer preserves elements when start $\neq 0$ (`SIMD-LOOP-002`).
 - **Full Test Suite (`./run_tests.sh full`)**: **737 / 737 PASS (100% PASS, 0 FAIL)** across all 31 language specification groups (§1 - §31).
 - **Self-Host Bootstrap Fixed Point**: `stage2` and `stage3` compilers produced bit-for-bit identical Mach-O binaries:
-  `SHA256: af80ec46df0f81e11d103dc3533e65675b2bc47bc3a6db193e0ea70f24b53ea1`.
+  `SHA256: 3e9f84e9a398fab1c5c59e848d59318115591ddc40ba7464c813816b491e24f8`.
 
 ---
 

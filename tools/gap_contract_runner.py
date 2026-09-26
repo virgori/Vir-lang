@@ -1076,21 +1076,35 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                 run_command([str(virc_bin), str(fixture_path), "--target", "linux-x86_64", "-o", str(x86_bin)], cwd=ROOT, timeout=compile_timeout)
                 x86_bytes = x86_bin.read_bytes() if x86_bin.exists() else b""
                 x86_has_movdqu = (b"\xf3\x0f\x6f" in x86_bytes) or (b"\xf3\x41\x0f\x6f" in x86_bytes) or (b"\xf3\x0f\x7f" in x86_bytes)
+                # Semantic execution: run native or via qemu-x86_64 emulator
+                import platform as _platform
+                _x86_exe_cmd = None
+                if _platform.machine() in ("x86_64", "AMD64"):
+                    _x86_exe_cmd = [str(x86_bin)]
+                elif x86_bin.exists():
+                    import shutil as _shutil
+                    _qemu = _shutil.which("qemu-x86_64") or _shutil.which("qemu-x86_64-static")
+                    if _qemu:
+                        _x86_exe_cmd = [_qemu, str(x86_bin)]
+                x86_r_exit, x86_r_stdout = None, None
+                if _x86_exe_cmd is not None:
+                    x86_r_exit, x86_r_stdout, _ = run_command(_x86_exe_cmd, cwd=ROOT, timeout=timeout)
                 x86_ns_bin = tmp_path / "prom_x86_ns"
                 run_command([str(virc_bin), str(fixture_path), "--target", "linux-x86_64", "--no-simd", "-o", str(x86_ns_bin)], cwd=ROOT, timeout=compile_timeout)
                 x86_ns_bytes = x86_ns_bin.read_bytes() if x86_ns_bin.exists() else b""
                 x86_ns_has_movdqu = (b"\xf3\x0f\x6f" in x86_ns_bytes) or (b"\xf3\x41\x0f\x6f" in x86_ns_bytes)
-                if not x86_has_movdqu or x86_ns_has_movdqu:
+                x86_semantic_ok = (x86_r_exit is None) or (x86_r_exit == 0 and x86_r_stdout is not None and x86_r_stdout.strip() == "42")
+                if not x86_has_movdqu or x86_ns_has_movdqu or not x86_semantic_ok:
                     return TestResult(
                         test_id=entry.test_id,
                         kind=entry.kind,
                         status="FAIL",
                         target="linux-x86_64",
                         compile_exit=c_exit,
-                        run_exit=None,
-                        stdout=r_stdout,
+                        run_exit=x86_r_exit,
+                        stdout=x86_r_stdout or r_stdout,
                         stderr=r_stderr,
-                        reason=f"x86-64 SSE2 promotion check failed (has_movdqu={x86_has_movdqu}, ns_has_movdqu={x86_ns_has_movdqu})",
+                        reason=f"x86-64 promotion check failed (has_movdqu={x86_has_movdqu}, ns_has_movdqu={x86_ns_has_movdqu}, semantic_ok={x86_semantic_ok}, x86_exit={x86_r_exit}, x86_stdout={repr(x86_r_stdout)})",
                     )
                 wasm_bin = tmp_path / "prom_wasm.wasm"
                 run_command([str(virc_bin), str(fixture_path), "--target", "wasm32-wasi-p1", "-o", str(wasm_bin)], cwd=ROOT, timeout=compile_timeout)
