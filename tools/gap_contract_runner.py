@@ -434,16 +434,38 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
         if entry.kind == "riscv_structural":
             artifact = bin_out.read_bytes()
             if entry.test_id == "SIMD-RISCV-001":
-                words = struct.unpack(f"<{len(artifact) // 4}I", artifact[: len(artifact) // 4 * 4])
-                # Check that scalar integer/FP ops are present and RVV vector major opcode (0x57) is not used for flux
+                # Limit scan strictly to the executable machine code in .text section
+                code_bytes = artifact
+                if len(artifact) >= 64 and artifact[:4] == b"\x7fELF" and artifact[4] == 2:
+                    try:
+                        e_shoff = struct.unpack_from("<Q", artifact, 40)[0]
+                        e_shentsize = struct.unpack_from("<H", artifact, 58)[0]
+                        e_shnum = struct.unpack_from("<H", artifact, 60)[0]
+                        e_shstrndx = struct.unpack_from("<H", artifact, 62)[0]
+                        if e_shoff > 0 and e_shnum > 0 and e_shstrndx < e_shnum:
+                            sh_records = [
+                                struct.unpack_from("<IIQQQQ", artifact, e_shoff + i * e_shentsize)
+                                for i in range(e_shnum)
+                            ]
+                            strtab_hdr = sh_records[e_shstrndx]
+                            strtab = artifact[strtab_hdr[4] : strtab_hdr[4] + strtab_hdr[5]]
+                            for name_off, sh_type, sh_flags, sh_addr, sh_offset, sh_size in sh_records:
+                                s_name = strtab[name_off:].split(b"\0")[0].decode("ascii", errors="ignore")
+                                if s_name == ".text" and sh_size > 0:
+                                    code_bytes = artifact[sh_offset : sh_offset + sh_size]
+                                    break
+                    except Exception:
+                        pass
+                words = struct.unpack(f"<{len(code_bytes) // 4}I", code_bytes[: len(code_bytes) // 4 * 4])
+                # Check that scalar integer/FP ops are present in .text and RVV vector major opcode (0x57) is not used for flux
                 has_scalar_add = any((w & 0xFE00707F) == 0x00000033 for w in words)
                 has_rvv = any((w & 0x7F) == 0x57 for w in words)
                 valid = has_scalar_add and not has_rvv
-                reason = "RISC-V rv64d lowered flux operations to scalar loop fallback cleanly without RVV opcodes"
+                reason = "RISC-V rv64d lowered flux operations to scalar loop fallback cleanly without RVV opcodes in .text"
                 if not has_scalar_add:
-                    reason = "RISC-V scalar fallback instructions missing"
+                    reason = "RISC-V scalar fallback instructions missing in .text"
                 elif has_rvv:
-                    reason = "RISC-V binary contains RVV opcode 0x57 when RVV is disabled"
+                    reason = "RISC-V .text section contains RVV opcode 0x57 when RVV is disabled"
                 return TestResult(
                     test_id=entry.test_id,
                     kind=entry.kind,
