@@ -165,18 +165,14 @@ end.
 
 func arena_ref_alloc(a: ArenaRef, bytes: int):
     if bytes <= 0 do out null end
-    var a_align = 8
-    let mask = a_align - 1
-    let aligned_offset = (a.offset + mask) & ~mask
-    if aligned_offset < a.offset or aligned_offset + bytes < aligned_offset do
-        out null
+    let aligned_offset = (a.offset + 7) & ~7
+    let next_off = aligned_offset + bytes
+    if next_off <= a.cap and next_off > a.offset and a.base != null do
+        let p = a.base + aligned_offset
+        a.offset = next_off
+        out p
     end
-    if aligned_offset + bytes > a.cap do
-        out null
-    end
-    let p = a.base + aligned_offset
-    a.offset = aligned_offset + bytes
-    out p
+    out null
 end.
 
 func arena_ref_free(a: ArenaRef):
