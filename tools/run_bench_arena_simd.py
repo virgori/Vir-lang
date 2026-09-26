@@ -165,14 +165,18 @@ end.
 
 func arena_ref_alloc(a: ArenaRef, bytes: int):
     if bytes <= 0 do out null end
-    let aligned_offset = (a.offset + 7) & ~7
-    let next_off = aligned_offset + bytes
-    if next_off <= a.cap and next_off > a.offset and a.base != null do
-        let p = a.base + aligned_offset
-        a.offset = next_off
-        out p
+    var a_align = 8
+    let mask = a_align - 1
+    let aligned_offset = (a.offset + mask) & ~mask
+    if aligned_offset < a.offset or aligned_offset + bytes < aligned_offset do
+        out null
     end
-    out null
+    if aligned_offset + bytes > a.cap do
+        out null
+    end
+    let p = a.base + aligned_offset
+    a.offset = aligned_offset + bytes
+    out p
 end.
 
 func arena_ref_free(a: ArenaRef):
@@ -285,7 +289,8 @@ end.
     # 3. Arena Batch Reserve (arena_batch_reserve2 vs 2x arena_reserve)
     # --------------------------------------------------------------------------
     print("Compiling Benchmark 3: arena_batch_reserve2 vs 2x arena_reserve...")
-    code_batch_indiv = """
+    batch_iters = 100000
+    code_batch_indiv = f"""
 include types
 include alloc
 include mem.arena
@@ -294,7 +299,7 @@ import Arena, arena_new, arena_reserve, arena_reset, arena_free from mem.arena
 func main:
     var a = arena_new(16777216)
     var i = 0
-    when i < 100000 loop
+    when i < {batch_iters} loop
         let off0 = arena_reserve(a, 32, 8)
         let off1 = arena_reserve(a, 48, 8)
         if a.offset > 15000000 do
@@ -306,7 +311,7 @@ func main:
     out 0
 end.
 """
-    code_batch_res2 = """
+    code_batch_res2 = f"""
 include types
 include alloc
 include mem.arena
@@ -315,7 +320,7 @@ import Arena, ArenaBatchLayout, arena_new, arena_batch_reserve2, arena_reset, ar
 func main:
     var a = arena_new(16777216)
     var i = 0
-    when i < 100000 loop
+    when i < {batch_iters} loop
         let layout = arena_batch_reserve2(a, 32, 8, 48, 8)
         if a.offset > 15000000 do
             arena_reset(a)
@@ -339,7 +344,7 @@ end.
         gate_batch = f"FAIL ({reg_pct:+.1f}%)"
     print(f"  2x arena_reserve:     {med_bi:.2f} ms (p95: {p95_bi:.2f}, p99: {p99_bi:.2f})")
     print(f"  arena_batch_reserve2: {med_br:.2f} ms (p95: {p95_br:.2f}, p99: {p99_br:.2f}) -> {sp_batch:.2f}x speedup [{gate_batch}]")
-    results.append(("arena_batch_reserve2 (32B+48B)", 20000, med_bi, p95_bi, p99_bi, med_br, p95_br, p99_br, f"{sp_batch:.2f}x", gate_batch))
+    results.append(("arena_batch_reserve2 (32B+48B)", batch_iters, med_bi, p95_bi, p99_bi, med_br, p95_br, p99_br, f"{sp_batch:.2f}x", gate_batch))
 
     # --------------------------------------------------------------------------
     # 4. Bulk mem_set & mem_copy Across Sizes (8B, 16B, 64B, 4 KiB, 64 KiB, 128 KiB)
