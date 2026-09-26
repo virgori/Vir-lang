@@ -218,6 +218,27 @@ def run_x86_linux(binary_path: Path, timeout: float = 15.0) -> tuple[Optional[in
     return None, "", "No x86_64 executor available (native, qemu-x86_64, or qemu-system-x86_64)"
 
 
+def has_x86_spilled_promote_reload(binary: bytes) -> bool:
+    """Find `StackMem -> RDI` immediately followed by the promote pointer guard."""
+    prefix = b"\x48\xc7\xc7"
+    suffix = (
+        b"\x48\x01\xef"  # add rdi, rbp
+        b"\x48\x8b\x3f"  # mov rdi, [rdi]
+        b"\x48\x89\xf8"  # mov rax, rdi (default bypass result)
+        b"\x49\xc7\xc2\x00\x00\x01\x00"  # mov r10, 65536
+        b"\x4c\x39\xd7"  # cmp rdi, r10
+    )
+    start = 0
+    while True:
+        at = binary.find(prefix, start)
+        if at < 0:
+            return False
+        displacement = int.from_bytes(binary[at + 3:at + 7], "little", signed=True)
+        if displacement < 0 and binary[at + 7:at + 7 + len(suffix)] == suffix:
+            return True
+        start = at + 1
+
+
 def check_compile_fail_oracle(oracle: str, compile_output: str) -> tuple[bool, str]:
     """Verify that compile error diagnostic satisfies oracle keywords."""
     out_lower = compile_output.lower()
@@ -1226,6 +1247,7 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                     )
                 x86_simd_bytes = x86_simd_bin.read_bytes()
                 has_movdqu = (b"\xf3\x0f\x6f" in x86_simd_bytes) or (b"\xf3\x41\x0f\x6f" in x86_simd_bytes) or (b"\xf3\x0f\x7f" in x86_simd_bytes)
+                simd_has_spill_reload = has_x86_spilled_promote_reload(x86_simd_bytes)
                 simd_exit, simd_out, simd_err = run_x86_linux(x86_simd_bin, timeout=timeout)
 
                 x86_ns_bin = tmp_path / "prom_x86_nosimd"
@@ -1244,12 +1266,13 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                     )
                 x86_ns_bytes = x86_ns_bin.read_bytes()
                 ns_has_movdqu = (b"\xf3\x0f\x6f" in x86_ns_bytes) or (b"\xf3\x41\x0f\x6f" in x86_ns_bytes) or (b"\xf3\x0f\x7f" in x86_ns_bytes)
+                ns_has_spill_reload = has_x86_spilled_promote_reload(x86_ns_bytes)
                 ns_exit, ns_out, ns_err = run_x86_linux(x86_ns_bin, timeout=timeout)
 
                 simd_ok = (simd_exit is not None and simd_exit == 0 and simd_out.strip() == "42")
                 ns_ok = (ns_exit is not None and ns_exit == 0 and ns_out.strip() == "42")
 
-                if not has_movdqu or ns_has_movdqu or not simd_ok or not ns_ok:
+                if not has_movdqu or ns_has_movdqu or not simd_has_spill_reload or not ns_has_spill_reload or not simd_ok or not ns_ok:
                     return TestResult(
                         test_id=entry.test_id,
                         kind=entry.kind,
@@ -1259,7 +1282,7 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                         run_exit=simd_exit,
                         stdout=simd_out,
                         stderr=simd_err or ns_err,
-                        reason=f"x86-64 nested arena promotion failed (has_movdqu={has_movdqu}, ns_has_movdqu={ns_has_movdqu}, simd_ok={simd_ok}, simd_exit={simd_exit}, simd_out={repr(simd_out)}, ns_ok={ns_ok}, ns_exit={ns_exit}, ns_out={repr(ns_out)})",
+                        reason=f"x86-64 nested arena promotion failed (has_movdqu={has_movdqu}, ns_has_movdqu={ns_has_movdqu}, simd_has_spill_reload={simd_has_spill_reload}, ns_has_spill_reload={ns_has_spill_reload}, simd_ok={simd_ok}, simd_exit={simd_exit}, simd_out={repr(simd_out)}, ns_ok={ns_ok}, ns_exit={ns_exit}, ns_out={repr(ns_out)})",
                     )
 
                 return TestResult(
@@ -1271,7 +1294,7 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                     run_exit=0,
                     stdout=simd_out,
                     stderr="",
-                    reason="x86-64 nested arena deep-graph promotion verified under QEMU (both default SIMD and --no-simd exited 0 with stdout 42)",
+                    reason="x86-64 spilled-source deep-graph promotion verified under QEMU (both default SIMD and --no-simd exited 0 with stdout 42)",
                 )
 
             if entry.test_id == "TARGET-002":
