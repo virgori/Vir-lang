@@ -5,18 +5,19 @@
 All requirements specified in `docs/plan/STRICT_V2_ARENA_SIMD_MULTI_TARGET_IMPLEMENTATION_PROMPT.md` (Phases 0 through 5) have been completely implemented in the production compiler (`stdlib/vir/compiler/*.vri` and synchronized `stdlib/vir/compiler/virc.vri`), self-host verified to a bit-for-bit fixed point (`stage2 == stage3`), and validated across all contract, structural, and performance gates:
 
 - **Memory Contract Suite (`tests/memory_contract/manifest.tsv`)**: **78 / 78 PASS (100%)** across all four optimization levels (`-O0`, `-O1`, `-O2`, `-O3`), with 0 FAIL and 0 BLOCKED (including integer overflow regression test `MEM-OVERFLOW-001` and deep-graph promotion test `MEM-PROMOTE-DEEP-001`).
-- **SIMD & Multi-Target Structural Suite**: **22 / 22 PASS (100%)** under `--filter '^SIMD-'`, plus **TARGET-RISCV-003** (RISC-V RVV-absence oracle) for **23 tests total** in the gap-contract suite, including:
+- **SIMD & Multi-Target Structural Suite**: **23 / 23 PASS (100%)** under `--filter '^SIMD-'`, plus **TARGET-RISCV-003** (RISC-V RVV-absence oracle) for **24 tests total** in the gap-contract suite, including:
   - Machine-opcode structural verification for ARM64 NEON (`ldr q`, `str q`, `add.2d`, `fadd.2d`).
   - Machine-opcode structural verification for x86-64 SSE2 (`movdqu`, `paddq`, `addpd`).
   - Binary opcode verification for Wasm SIMD128 (`0xFD` prefix `v128.load`, `v128.store`, `i64x2.add`, `f64x2.add`).
   - Hardened structural oracle for RISC-V baseline `rv64d` verifying scalar loop fallback, strictly asserting the absence of RVV major opcode `0x57` (`SIMD-RISCV-001`), and failing immediately if `.text` section extraction fails.
-  - Multi-target hardware SIMD promotion parity oracle (`SIMD-PROMOTE-001`) verifying 16-byte SIMD load/store execution and `--no-simd` suppression across ARM64 NEON, x86-64 SSE2, and Wasm SIMD128.
+  - Multi-target hardware SIMD promotion parity oracle (`SIMD-PROMOTE-001`) verifying 16-byte SIMD load/store execution and `--no-simd` suppression across ARM64 NEON, x86-64 SSE2, and Wasm SIMD128, with strict enforcement requiring real execution (missing executor fails the test).
+  - x86-64 nested arena deep-graph promotion semantic oracle (`SIMD-PROMOTE-X86-001`) executed under real Linux x86_64 in QEMU for both default SIMD and `--no-simd`, verifying recursive relocation of child pointers (`values[0]`, `values[7]`, `child.id`, `child.tag`, `payload`) after post-reset arena memory clobbering.
   - Straight-line SLP pair vectorization (`SIMD-SLP-001`) and alias-guard negative mutation check (`--mutate-mir=missing_slp_alias_check`).
   - 1D loop stride-2 vectorization with scalar tail cleanup (`SIMD-LOOP-001`) and tail-omission mutation check (`--mutate-mir=missing_slp_tail`).
   - Non-zero induction variable regression test ensuring loop vectorizer preserves elements when start $\neq 0$ (`SIMD-LOOP-002`).
 - **Full Test Suite (`./run_tests.sh full`)**: **737 / 737 PASS (100% PASS, 0 FAIL)** across all 31 language specification groups (§1 - §31).
 - **Self-Host Bootstrap Fixed Point**: `stage2` and `stage3` compilers produced bit-for-bit identical Mach-O binaries:
-  `SHA256: 3e9f84e9a398fab1c5c59e848d59318115591ddc40ba7464c813816b491e24f8`.
+  `SHA256: c620062136c9ba20a500bfaf10225a41de7f8d79dbccb639e2fc8e0d1c595e54`.
 
 ---
 
@@ -160,7 +161,7 @@ Per prompt line 571, performance and capability conclusions are established indi
 | Target Architecture | Vector Capability | Backend Implementation | Status & Conclusion |
 | :--- | :---: | :---: | :--- |
 | **ARM64 (`macos-arm64`, `linux-arm64`, `windows-arm64`)** | 128-bit NEON | `ldr q`, `str q`, `dup.2d`, `add.2d`, `sub.2d`, `fadd.2d`, `fsub.2d`, `fmul.2d`, `fmla.2d` | **native-fast** (up to $1.85\times$ bulk speedup, $1.36\times$ loop speedup; verified in `SIMD-PROMOTE-001`) |
-| **x86-64 (`linux-x86_64`, `windows-x86_64`)** | 128-bit SSE2 | `movdqu`, `punpcklqdq`, `paddq`, `psubq`, `addpd`, `subpd`, `mulpd`, `emit_lir_rt_promote_stub_x86` | **native-implemented, performance-blocked** (SSE2 opcode verification complete in `SIMD-SSE2-001` and `SIMD-PROMOTE-001`; native wall-clock execution blocked on ARM64 host without x86 hardware) |
+| **x86-64 (`linux-x86_64`, `windows-x86_64`)** | 128-bit SSE2 | `movdqu`, `punpcklqdq`, `paddq`, `psubq`, `addpd`, `subpd`, `mulpd`, `emit_lir_rt_promote_stub_x86` | **native-implemented, semantics-verified via QEMU** (SSE2 opcode verification complete in `SIMD-SSE2-001` and `SIMD-PROMOTE-001`; full semantic execution of nested arena deep-graph promotion verified under real Linux x86_64 in QEMU for both SIMD and `--no-simd` in `SIMD-PROMOTE-X86-001`; native wall-clock benchmark performance-blocked on ARM64 host) |
 | **Wasm32 (`wasm32-wasi-p1`)** | 128-bit SIMD128 | `0xFD` opcodes: `v128.load`, `v128.store`, `i64x2.splat`, `f64x2.splat`, `i64x2.add`, `f64x2.add` | **native-implemented, performance-blocked** (Wasm standard 128-bit vector instructions verified in `SIMD-WASM-001` and `SIMD-PROMOTE-001`; standalone Wasm wall-clock benchmark blocked) |
 | **RISC-V (`linux-riscv64`)** | `rv64d` Baseline / RVV | Scalar lane loop fallback when `--enable-rvv` is not passed; absence of opcode `0x57` in `.text` asserted | **scalar-fallback** (robust scalar fallback, no illegal vector opcodes in `.text`) |
 
@@ -185,6 +186,6 @@ Per prompt line 571, performance and capability conclusions are established indi
 - [x] **[P2] Shared Constant for Batch Iterations**: Batch reserve benchmark uses single source of truth `batch_iters = 100000` across workload and summary reporting.
 - [x] **[P2] Target Matrix Accuracy**: Classified x86-64 and Wasm32 as `native-implemented, performance-blocked` due to absence of native wall-clock execution on host ARM64 hardware.
 - [x] **Memory Contract Matrix**: 78/78 PASS across `-O0`, `-O1`, `-O2`, `-O3` (including `MEM-OVERFLOW-001` and `MEM-PROMOTE-DEEP-001`).
-- [x] **SIMD Contract Matrix**: 23/23 PASS across all structural and execution fixtures (including `SIMD-PROMOTE-001`).
+- [x] **SIMD Contract Matrix**: 23/23 PASS under `--filter '^SIMD-'` (including `SIMD-PROMOTE-001` and `SIMD-PROMOTE-X86-001` under QEMU), plus `TARGET-RISCV-003` for 24 tests total.
 - [x] **Full Repository Test Suite**: 737/737 PASS (100% PASS, 0 FAIL) in `./run_tests.sh full`.
-- [x] **Self-Host Bootstrap Fixed Point**: Stage 2 equals Stage 3 bit-for-bit (`SHA256: af80ec46df0f81e11d103dc3533e65675b2bc47bc3a6db193e0ea70f24b53ea1`).
+- [x] **Self-Host Bootstrap Fixed Point**: Stage 2 equals Stage 3 bit-for-bit (`SHA256: c620062136c9ba20a500bfaf10225a41de7f8d79dbccb639e2fc8e0d1c595e54`).

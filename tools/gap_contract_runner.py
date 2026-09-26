@@ -135,6 +135,89 @@ def run_command(cmd: list[str], cwd: Path, timeout: float = 5.0) -> tuple[int, s
         return -998, "", str(e)
 
 
+def run_x86_linux(binary_path: Path, timeout: float = 15.0) -> tuple[Optional[int], str, str]:
+    """Execute a Linux x86_64 ELF binary via native host, qemu-x86_64, or qemu-system-x86_64 micro-VM."""
+    import platform
+    if not binary_path.exists():
+        return None, "", f"Binary {binary_path} does not exist"
+
+    # 1. Native x86_64 host
+    if platform.machine() in ("x86_64", "AMD64"):
+        ret, out, err = run_command([str(binary_path)], cwd=ROOT, timeout=timeout)
+        return ret, out, err
+
+    # 2. User-mode QEMU if available
+    qemu_user = shutil.which("qemu-x86_64") or shutil.which("qemu-x86_64-static")
+    if qemu_user:
+        ret, out, err = run_command([qemu_user, str(binary_path)], cwd=ROOT, timeout=timeout)
+        return ret, out, err
+
+    # 3. System-mode QEMU with Linux micro-VM
+    qemu_sys = shutil.which("qemu-system-x86_64") or "/opt/homebrew/bin/qemu-system-x86_64"
+    kernel_path = Path("/tmp/vmlinuz-x86_64")
+    busybox_path = Path("/tmp/busybox-x86_64")
+    if Path(qemu_sys).exists() and kernel_path.exists() and busybox_path.exists():
+        with tempfile.TemporaryDirectory(prefix="vir_qemu_") as tmpdir:
+            td = Path(tmpdir)
+            rootfs = td / "rootfs"
+            rootfs.mkdir()
+            for d in ["bin", "proc", "sys", "dev", "vir_test"]:
+                (rootfs / d).mkdir()
+            shutil.copy2(busybox_path, rootfs / "bin/busybox")
+            (rootfs / "bin/busybox").chmod(0o755)
+            shutil.copy2(binary_path, rootfs / "vir_test/test_binary")
+            (rootfs / "vir_test/test_binary").chmod(0o755)
+            init_script = (
+                "#!/bin/busybox sh\n"
+                "/bin/busybox mount -t proc proc /proc 2>/dev/null\n"
+                "/bin/busybox mount -t sysfs sysfs /sys 2>/dev/null\n"
+                "/bin/busybox mknod /dev/null c 1 3 2>/dev/null\n"
+                "/bin/busybox mknod /dev/tty c 5 0 2>/dev/null\n"
+                "/vir_test/test_binary\n"
+                'echo "EXIT_CODE:$?"\n'
+                "echo o > /proc/sysrq-trigger 2>/dev/null || /bin/busybox poweroff -f 2>/dev/null\n"
+            )
+            init_file = rootfs / "init"
+            init_file.write_text(init_script)
+            init_file.chmod(0o755)
+            initrd_path = td / "initramfs.cpio.gz"
+            subprocess.run(
+                f"cd {rootfs} && find . | cpio -H newc -o 2>/dev/null | gzip -9 > {initrd_path}",
+                shell=True,
+                check=True
+            )
+            qcmd = [
+                str(qemu_sys),
+                "-kernel", str(kernel_path),
+                "-initrd", str(initrd_path),
+                "-append", "console=ttyS0 panic=-1 quiet rdinit=/init",
+                "-nographic",
+                "-no-reboot",
+                "-m", "2048M",
+                "-cpu", "max"
+            ]
+            proc = subprocess.run(qcmd, capture_output=True, text=True, timeout=timeout)
+            raw_out = proc.stdout
+            clean_text = re.sub(r"\x1b[a-zA-Z]|\x1b\[[0-9;?]*[a-zA-Z]", "", raw_out)
+            if "Booting from ROM" in clean_text:
+                clean_text = clean_text.split("Booting from ROM", 1)[1]
+                clean_text = clean_text.lstrip(".")
+            stdout_lines = []
+            exit_code = None
+            for line in clean_text.splitlines():
+                line = line.strip()
+                if line.startswith("EXIT_CODE:"):
+                    try:
+                        exit_code = int(line.split(":", 1)[1].strip())
+                    except ValueError:
+                        pass
+                elif not line.startswith("[") and line:
+                    stdout_lines.append(line)
+            return exit_code, "\n".join(stdout_lines), proc.stderr
+
+    return None, "", "No x86_64 executor available (native, qemu-x86_64, or qemu-system-x86_64)"
+
+
 def check_compile_fail_oracle(oracle: str, compile_output: str) -> tuple[bool, str]:
     """Verify that compile error diagnostic satisfies oracle keywords."""
     out_lower = compile_output.lower()
@@ -1076,24 +1159,12 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                 run_command([str(virc_bin), str(fixture_path), "--target", "linux-x86_64", "-o", str(x86_bin)], cwd=ROOT, timeout=compile_timeout)
                 x86_bytes = x86_bin.read_bytes() if x86_bin.exists() else b""
                 x86_has_movdqu = (b"\xf3\x0f\x6f" in x86_bytes) or (b"\xf3\x41\x0f\x6f" in x86_bytes) or (b"\xf3\x0f\x7f" in x86_bytes)
-                # Semantic execution: run native or via qemu-x86_64 emulator
-                import platform as _platform
-                _x86_exe_cmd = None
-                if _platform.machine() in ("x86_64", "AMD64"):
-                    _x86_exe_cmd = [str(x86_bin)]
-                elif x86_bin.exists():
-                    import shutil as _shutil
-                    _qemu = _shutil.which("qemu-x86_64") or _shutil.which("qemu-x86_64-static")
-                    if _qemu:
-                        _x86_exe_cmd = [_qemu, str(x86_bin)]
-                x86_r_exit, x86_r_stdout = None, None
-                if _x86_exe_cmd is not None:
-                    x86_r_exit, x86_r_stdout, _ = run_command(_x86_exe_cmd, cwd=ROOT, timeout=timeout)
+                x86_r_exit, x86_r_stdout, x86_r_stderr = run_x86_linux(x86_bin, timeout=timeout)
                 x86_ns_bin = tmp_path / "prom_x86_ns"
                 run_command([str(virc_bin), str(fixture_path), "--target", "linux-x86_64", "--no-simd", "-o", str(x86_ns_bin)], cwd=ROOT, timeout=compile_timeout)
                 x86_ns_bytes = x86_ns_bin.read_bytes() if x86_ns_bin.exists() else b""
                 x86_ns_has_movdqu = (b"\xf3\x0f\x6f" in x86_ns_bytes) or (b"\xf3\x41\x0f\x6f" in x86_ns_bytes)
-                x86_semantic_ok = (x86_r_exit is None) or (x86_r_exit == 0 and x86_r_stdout is not None and x86_r_stdout.strip() == "42")
+                x86_semantic_ok = (x86_r_exit is not None and x86_r_exit == 0 and x86_r_stdout is not None and x86_r_stdout.strip() == "42")
                 if not x86_has_movdqu or x86_ns_has_movdqu or not x86_semantic_ok:
                     return TestResult(
                         test_id=entry.test_id,
@@ -1103,7 +1174,7 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                         compile_exit=c_exit,
                         run_exit=x86_r_exit,
                         stdout=x86_r_stdout or r_stdout,
-                        stderr=r_stderr,
+                        stderr=x86_r_stderr or r_stderr,
                         reason=f"x86-64 promotion check failed (has_movdqu={x86_has_movdqu}, ns_has_movdqu={x86_ns_has_movdqu}, semantic_ok={x86_semantic_ok}, x86_exit={x86_r_exit}, x86_stdout={repr(x86_r_stdout)})",
                     )
                 wasm_bin = tmp_path / "prom_wasm.wasm"
@@ -1136,6 +1207,71 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                     stdout=r_stdout,
                     stderr=r_stderr,
                     reason="Multi-target promotion SIMD fast path (ARM64 NEON, x86-64 SSE2, Wasm SIMD128) and --no-simd fallback verified",
+                )
+
+            if entry.test_id == "SIMD-PROMOTE-X86-001":
+                x86_simd_bin = tmp_path / "prom_x86_simd"
+                c_exit, _, _ = run_command([str(virc_bin), str(fixture_path), "--target", "linux-x86_64", "-o", str(x86_simd_bin)], cwd=ROOT, timeout=compile_timeout)
+                if c_exit != 0 or not x86_simd_bin.exists():
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target="linux-x86_64",
+                        compile_exit=c_exit,
+                        run_exit=None,
+                        stdout="",
+                        stderr="",
+                        reason="Compilation for linux-x86_64 default SIMD failed",
+                    )
+                x86_simd_bytes = x86_simd_bin.read_bytes()
+                has_movdqu = (b"\xf3\x0f\x6f" in x86_simd_bytes) or (b"\xf3\x41\x0f\x6f" in x86_simd_bytes) or (b"\xf3\x0f\x7f" in x86_simd_bytes)
+                simd_exit, simd_out, simd_err = run_x86_linux(x86_simd_bin, timeout=timeout)
+
+                x86_ns_bin = tmp_path / "prom_x86_nosimd"
+                ns_c_exit, _, _ = run_command([str(virc_bin), str(fixture_path), "--target", "linux-x86_64", "--no-simd", "-o", str(x86_ns_bin)], cwd=ROOT, timeout=compile_timeout)
+                if ns_c_exit != 0 or not x86_ns_bin.exists():
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target="linux-x86_64",
+                        compile_exit=ns_c_exit,
+                        run_exit=None,
+                        stdout="",
+                        stderr="",
+                        reason="Compilation for linux-x86_64 --no-simd failed",
+                    )
+                x86_ns_bytes = x86_ns_bin.read_bytes()
+                ns_has_movdqu = (b"\xf3\x0f\x6f" in x86_ns_bytes) or (b"\xf3\x41\x0f\x6f" in x86_ns_bytes) or (b"\xf3\x0f\x7f" in x86_ns_bytes)
+                ns_exit, ns_out, ns_err = run_x86_linux(x86_ns_bin, timeout=timeout)
+
+                simd_ok = (simd_exit is not None and simd_exit == 0 and simd_out.strip() == "42")
+                ns_ok = (ns_exit is not None and ns_exit == 0 and ns_out.strip() == "42")
+
+                if not has_movdqu or ns_has_movdqu or not simd_ok or not ns_ok:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target="linux-x86_64",
+                        compile_exit=c_exit,
+                        run_exit=simd_exit,
+                        stdout=simd_out,
+                        stderr=simd_err or ns_err,
+                        reason=f"x86-64 nested arena promotion failed (has_movdqu={has_movdqu}, ns_has_movdqu={ns_has_movdqu}, simd_ok={simd_ok}, simd_exit={simd_exit}, simd_out={repr(simd_out)}, ns_ok={ns_ok}, ns_exit={ns_exit}, ns_out={repr(ns_out)})",
+                    )
+
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="PASS",
+                    target="linux-x86_64",
+                    compile_exit=0,
+                    run_exit=0,
+                    stdout=simd_out,
+                    stderr="",
+                    reason="x86-64 nested arena deep-graph promotion verified under QEMU (both default SIMD and --no-simd exited 0 with stdout 42)",
                 )
 
             if entry.test_id == "TARGET-002":
