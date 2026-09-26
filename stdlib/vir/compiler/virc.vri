@@ -52540,6 +52540,7 @@ end.
 
 func emit_lir_rt_promote_stub_x86(cb: &CodeBuf):
     # RDI = p, RSI = arena_base, RDX = arena_top
+    let stub_entry_off = codebuf_offset(cb) as int
     # Guard 1: if p < 65536: return p (in RAX)
     cb = x86_emit_mov_rr(cb, X86_RAX, X86_RDI)
     cb = x86_emit_cmp_reg_imm32(cb, X86_RDI, 65536)
@@ -52682,14 +52683,80 @@ func emit_lir_rt_promote_stub_x86(cb: &CodeBuf):
     cb = x86_emit_mov_mem_reg(cb, X86_RBX, 0 - 8, X86_R8)
     cb = x86_emit_mov_mem_reg(cb, X86_RBX, 0 - 16, X86_RAX)
 
-    # Restore registers and return
+    # Recursively promote child pointers in new_p (RAX):
+    # R11 = scan offset (caller-saved; 0..R14 step 8).
+    # Stack at entry of loop body: 4 callee pushes (32B) + original ret-addr (8B) = 40B below RSP.
+    # Around call: push RAX + push R11 = +16B; CALL pushes ret-addr +8B => 64B -> 16-aligned.
+    cb = x86_emit_xor_rr(cb, X86_R11, X86_R11)
+    let child_loop_off = codebuf_offset(cb) as int
+    cb = x86_emit_cmp_rr(cb, X86_R11, X86_R14)
+    cb = x86_emit_jge_rel32(cb, 0)
+    let child_done_fixup = codebuf_offset(cb) as int
+
+    # Load child = [new_p + R11] into R10
+    cb = x86_emit_mov_rr(cb, X86_R10, X86_RAX)
+    cb = x86_emit_add_rr(cb, X86_R10, X86_R11)
+    cb = x86_emit_mov_reg_mem(cb, X86_R10, X86_R10, 0)
+
+    # Skip: child <= 65535
+    cb = x86_emit_cmp_reg_imm32(cb, X86_R10, 65536)
+    cb = x86_emit_jl_rel32(cb, 0)
+    let skip_ch1 = codebuf_offset(cb) as int
+
+    # Skip: child < arena_base
+    cb = x86_emit_cmp_rr(cb, X86_R10, X86_R12)
+    cb = x86_emit_jl_rel32(cb, 0)
+    let skip_ch2 = codebuf_offset(cb) as int
+
+    # Skip: child >= arena_top
+    cb = x86_emit_cmp_rr(cb, X86_R10, X86_R13)
+    cb = x86_emit_jge_rel32(cb, 0)
+    let skip_ch3 = codebuf_offset(cb) as int
+
+    # Call self(child, arena_base, arena_top); save new_p and scan offset
+    cb = x86_emit_push(cb, X86_RAX)
+    cb = x86_emit_push(cb, X86_R11)
+    cb = x86_emit_mov_rr(cb, X86_RDI, X86_R10)
+    cb = x86_emit_mov_rr(cb, X86_RSI, X86_R12)
+    cb = x86_emit_mov_rr(cb, X86_RDX, X86_R13)
+    cb = x86_emit_call_rel32(cb, 0)
+    let call_fixup = codebuf_offset(cb) as int
+    cb = patch_rel32(cb, call_fixup - 4, stub_entry_off)
+    # RAX = promoted child pointer
+    cb = x86_emit_pop(cb, X86_R11)
+    cb = x86_emit_add_rsp_imm(cb, 8)           # discard saved new_p slot
+    # Reload new_p from [RBX - 16] (hdr[0] = new_p, written above)
+    cb = x86_emit_mov_reg_mem(cb, X86_R9, X86_RBX, 0 - 16)
+    # Store promoted child back to [new_p + R11]
+    cb = x86_emit_mov_rr(cb, X86_R8, X86_R9)
+    cb = x86_emit_add_rr(cb, X86_R8, X86_R11)
+    cb = x86_emit_mov_mem_reg(cb, X86_R8, 0, X86_RAX)
+    # Restore RAX = new_p for next iteration
+    cb = x86_emit_mov_rr(cb, X86_RAX, X86_R9)
+
+    let next_ch_off = codebuf_offset(cb) as int
+    cb = patch_rel32(cb, skip_ch1 - 4, next_ch_off)
+    cb = patch_rel32(cb, skip_ch2 - 4, next_ch_off)
+    cb = patch_rel32(cb, skip_ch3 - 4, next_ch_off)
+
+    # R11 += 8; continue loop
+    cb = x86_emit_mov_reg_imm32(cb, X86_R9, 8)
+    cb = x86_emit_add_rr(cb, X86_R11, X86_R9)
+    cb = x86_emit_jmp_rel32(cb, 0)
+    let loop_back_site = codebuf_offset(cb) as int
+    cb = patch_rel32(cb, loop_back_site - 4, child_loop_off)
+
+    let child_done_off = codebuf_offset(cb) as int
+    cb = patch_rel32(cb, child_done_fixup - 4, child_done_off)
+
+    # Restore callee-saved registers and return new_p (RAX)
     cb = x86_emit_pop(cb, X86_R14)
     cb = x86_emit_pop(cb, X86_R13)
     cb = x86_emit_pop(cb, X86_R12)
     cb = x86_emit_pop(cb, X86_RBX)
     cb = x86_emit_ret(cb)
 
-    # Patch guard exits to return p
+    # Patch guard exits to return p (RAX set at guard-1 entry)
     let done_off = codebuf_offset(cb) as int
     cb = patch_rel32(cb, g1_fixup - 4, done_off)
     cb = patch_rel32(cb, g2_fixup - 4, done_off)
