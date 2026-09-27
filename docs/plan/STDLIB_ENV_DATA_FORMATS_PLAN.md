@@ -126,13 +126,13 @@ Không được dùng empty string để biểu diễn cả hai trạng thái.
 Nếu Vir có Option:
 
 ```vir
-Option<string>
+Option(string)
 ```
 
 thì ưu tiên:
 
 ```vir
-env.get(name) -> Option<string>
+env.get(name) -> Option(string)
 ```
 
 Nếu chưa có Option chuẩn thì sử dụng error/result/value model phù hợp hiện tại.
@@ -340,7 +340,7 @@ thì phải trả snapshot.
 Ví dụ semantic:
 
 ```text
-Map<string, string>
+Map(string, string)
 ```
 
 hoặc:

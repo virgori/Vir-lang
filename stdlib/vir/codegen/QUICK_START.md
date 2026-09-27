@@ -20,8 +20,8 @@
 
 ## Key APIs
 - `emit_vir_kernel_module(name: String)` — emits kernel assembly for target
-- `emit_object_file(code: Vec<u8>, arch: Arch)` — emits Mach-O/ELF object file
-- `link_objects(objects: Vec<ObjectFile>, arch: Arch)` — links objects to executable
+- `emit_object_file(code: Vec(u8), arch: Arch)` — emits Mach-O/ELF object file
+- `link_objects(objects: Vec(ObjectFile), arch: Arch)` — links objects to executable
 
 ## Contact
 - For questions, check commit history or contact previous maintainers.
