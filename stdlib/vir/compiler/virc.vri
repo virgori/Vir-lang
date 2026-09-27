@@ -169,7 +169,7 @@ enum Platform:
     Linux_RISCV64  = 4
     Wasm32_WASI_P1 = 5
 end.
-# Compile-time constant — set by the compiler based on target
+# Compile-time constant — default host platform fallback
 const HOST_PLATFORM = Platform.MacOS_ARM64
 
 var g_platform_override: int = -1
@@ -178,11 +178,13 @@ func set_platform_override(p: int):
     g_platform_override = p
 end.
 
+extern func vir_get_platform() -> int
+
 func sys_platform():
     if g_platform_override >= 0 do
         out g_platform_override
     end
-    out HOST_PLATFORM
+    out vir_get_platform()
 end.
 
 # ═══════════════════════════════════════════════════════
@@ -1137,7 +1139,10 @@ func tlsf_seg_add(base: int, size: int):
         # pointer with a bounded binary search instead of scanning every
         # segment on the hot path.
         var pos = cnt
-        when pos > 0 and native_read_i64(g_tlsf_ctrl, 3848 + (pos - 1) * 16) > base loop
+        when pos > 0 loop
+            if native_read_i64(g_tlsf_ctrl, 3848 + (pos - 1) * 16) <= base do
+                break
+            end
             let prev_off = 3848 + (pos - 1) * 16
             let cur_off = 3848 + pos * 16
             native_write_i64(g_tlsf_ctrl, cur_off, native_read_i64(g_tlsf_ctrl, prev_off))
@@ -2330,7 +2335,9 @@ end.
 # ═══════════════════════════════════════════════════════
 
 func rt_strcmp(a: int, b: int):
-
+    if a == b do out 0 end
+    if a == 0 do out 0 - 1 end
+    if b == 0 do out 1 end
     var i = 0
     when true loop
         let ca = native_read_u8(a, i)
@@ -2346,7 +2353,8 @@ func rt_strcmp(a: int, b: int):
     out 0
 end.
 func rt_streq(a: int, b: int):
-
+    if a == b do out 1 end
+    if a == 0 or b == 0 do out 0 end
     out rt_strcmp(a, b) == 0
 end.
 # Wrap a C string pointer as a string entity {data, byte_len, char_len}
@@ -8441,6 +8449,7 @@ enum BuiltinId:
     AtomicSub64     = 81
     AtomicCas64     = 82
     AtomicExchange64 = 83
+    Platform        = 105
 end.
 entity BuiltinEntry:
     name:   string,
@@ -8623,6 +8632,7 @@ func build_builtins:
     table = vec_push_rt(table, BuiltinEntry ( name: "syscall4", bid: BuiltinId.Syscall ))
     table = vec_push_rt(table, BuiltinEntry ( name: "syscall5", bid: BuiltinId.Syscall ))
     table = vec_push_rt(table, BuiltinEntry ( name: "syscall6", bid: BuiltinId.Syscall ))
+    table = vec_push_rt(table, BuiltinEntry ( name: "vir_get_platform", bid: BuiltinId.Platform ))
     builtin_bucket_build(table)
     out table
 end.
@@ -24588,17 +24598,16 @@ import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt
 
 import rt_streq, fat_str_eq, fat_str_len, fat_str_byte_at, fat_cstr_eq, rt_strcat, rt_itoa, rt_strlen, sb_append_char from string_rt
 
-import vir_alloc, alloc from rt.alloc
+import vir_alloc, vir_free, alloc from rt.alloc
 
 import DiagnosticEngine, DiagnosticLevel, Diagnostic from context
 
 import g_active_source_manager, sm_get_file_path, sm_get_span from source_manager
 
-import sys_getrusage, sys_clock_gettime, sys_platform, Platform from rt.syscall
+import sys_getrusage, sys_clock_gettime, sys_platform, Platform, sys_open, sys_read, sys_close, VIR_O_RDONLY from rt.syscall
 
 extern func syscall2(num: int, a1: int, a2: int) -> int
 extern func syscall3(num: int, a1: int, a2: int, a3: int) -> int
-extern func _NSGetEnviron() -> int
 
 var g_color_mode: int = 0
 var g_time_buf_start: int = 0
@@ -24983,25 +24992,51 @@ func pass10_emit_json(diag: &DiagnosticEngine):
 end.
 
 func virc_isatty(fd: int):
-    var buf = vir_alloc(16)
-    var rc = syscall3(0x2000036, fd, 0x40487413, buf)
+    var buf = vir_alloc(128)
+    let plat = sys_platform()
+    var rc = 0 - 1
+    if plat == Platform.Linux_x86_64 do
+        rc = syscall3(16, fd, 0x5401, buf)
+    eif plat == Platform.Linux_ARM64 or plat == Platform.Linux_RISCV64 do
+        rc = syscall3(29, fd, 0x5401, buf)
+    else
+        rc = syscall3(0x2000036, fd, 0x40487413, buf)
+    end
+    vir_free(buf)
     if rc == 0 do out 1 end
     out 0
 end.
 
 func virc_has_no_color():
-    let env_ptr_ptr = _NSGetEnviron()
-    if env_ptr_ptr == 0 do out 0 end
-    let env_ptr = native_read_i64(env_ptr_ptr, 0)
-    if env_ptr == 0 do out 0 end
-    var idx = 0
-    when true loop
-        let entry = native_read_i64(env_ptr, idx * 8)
-        if entry == 0 do out 0 end
-        if native_read_u8(entry, 0) == 78 and native_read_u8(entry, 1) == 79 and native_read_u8(entry, 2) == 95 and native_read_u8(entry, 3) == 67 and native_read_u8(entry, 4) == 79 and native_read_u8(entry, 5) == 76 and native_read_u8(entry, 6) == 79 and native_read_u8(entry, 7) == 82 and native_read_u8(entry, 8) == 61 do
-            out 1
+    let plat = sys_platform()
+    if plat == Platform.Linux_ARM64 or plat == Platform.Linux_x86_64 or plat == Platform.Linux_RISCV64 do
+        let fd = sys_open("/proc/self/environ" as int, VIR_O_RDONLY, 0)
+        if fd >= 0 do
+            let buf_size = 4096
+            let buf = vir_alloc(buf_size)
+            let n = sys_read(fd, buf, buf_size)
+            sys_close(fd)
+            if n > 0 do
+                var i = 0
+                when i + 8 < n loop
+                    var at_start = 0
+                    if i == 0 do
+                        at_start = 1
+                    eif native_read_u8(buf, i - 1) == 0 do
+                        at_start = 1
+                    end
+                    if at_start == 1 do
+                        if native_read_u8(buf, i) == 78 and native_read_u8(buf, i + 1) == 79 and native_read_u8(buf, i + 2) == 95 and native_read_u8(buf, i + 3) == 67 and native_read_u8(buf, i + 4) == 79 and native_read_u8(buf, i + 5) == 76 and native_read_u8(buf, i + 6) == 79 and native_read_u8(buf, i + 7) == 82 and native_read_u8(buf, i + 8) == 61 do
+                            vir_free(buf)
+                            out 1
+                        end
+                    end
+                    i = i + 1
+                end
+            end
+            vir_free(buf)
         end
-        idx = idx + 1
+        out 0
     end
     out 0
 end.
@@ -34290,7 +34325,7 @@ end.
 
 func resolve_builtin_id(expr: &AstNode):
     bid = ast_node_builtin_id(expr) as i64
-    if bid >= 1 and bid <= 100 do
+    if bid >= 1 and bid <= 120 do
         out bid
     end
     out builtin_id_from_name(ast_node_name(expr))
@@ -38962,7 +38997,7 @@ export lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_au
 export lir_opnd_type, lir_opnd_vreg, lir_opnd_imm_val, lir_opnd_label_id, lir_opnd_phys_reg_val, lir_opnd_stack_offset
 export LIR_CMP_EQ, LIR_CMP_NE, LIR_CMP_GT, LIR_CMP_LT, LIR_CMP_GE, LIR_CMP_LE, LIR_JMP_IF, LIR_JMP_IFNOT
 export lir_op_tag
-export LIR_RT_NATIVE_READ_U8, LIR_RT_NATIVE_WRITE_U8, LIR_RT_NATIVE_READ_I64, LIR_RT_NATIVE_WRITE_I64, LIR_RT_UNRESOLVED, LIR_RT_POW, LIR_RT_MATMUL, LIR_RT_FMA, LIR_RT_ALLOC, LIR_RT_PRINT_STR, LIR_RT_GET_ARG, LIR_RT_ARG_COUNT, LIR_RT_VOLATILE_READ, LIR_RT_VOLATILE_WRITE, LIR_RT_VOLATILE_READ8, LIR_RT_VOLATILE_WRITE8, LIR_RT_DMB, LIR_RT_DSB, LIR_RT_ISB, LIR_RT_WFI, LIR_RT_WFE, LIR_RT_SEV, LIR_RT_NOP, LIR_RT_STR_LEN, LIR_RT_STR_CAT, LIR_RT_STR_EQ, LIR_RT_WRITE_BYTES, LIR_RT_SLURP_LEN, LIR_RT_SLURP_FILE, LIR_RT_INT_TO_STR, LIR_RT_SYSCALL, LIR_RT_PORT_CREATE, LIR_RT_PORT_SEND, LIR_RT_PORT_RECV, LIR_RT_ARR_NEW, LIR_RT_ARR_PUSH, LIR_RT_ARR_LEN, LIR_RT_QUANTIZE, LIR_RT_BACKWARD, LIR_RT_BOOL_TO_STR, LIR_RT_PRINT_FLOAT, LIR_RT_PRINT_BOOL, LIR_RT_FREE, LIR_RT_PROMOTE_GRAPH, LIR_RT_STUB_COUNT
+export LIR_RT_NATIVE_READ_U8, LIR_RT_NATIVE_WRITE_U8, LIR_RT_NATIVE_READ_I64, LIR_RT_NATIVE_WRITE_I64, LIR_RT_UNRESOLVED, LIR_RT_POW, LIR_RT_MATMUL, LIR_RT_FMA, LIR_RT_ALLOC, LIR_RT_PRINT_STR, LIR_RT_GET_ARG, LIR_RT_ARG_COUNT, LIR_RT_VOLATILE_READ, LIR_RT_VOLATILE_WRITE, LIR_RT_VOLATILE_READ8, LIR_RT_VOLATILE_WRITE8, LIR_RT_DMB, LIR_RT_DSB, LIR_RT_ISB, LIR_RT_WFI, LIR_RT_WFE, LIR_RT_SEV, LIR_RT_NOP, LIR_RT_STR_LEN, LIR_RT_STR_CAT, LIR_RT_STR_EQ, LIR_RT_WRITE_BYTES, LIR_RT_SLURP_LEN, LIR_RT_SLURP_FILE, LIR_RT_INT_TO_STR, LIR_RT_SYSCALL, LIR_RT_PORT_CREATE, LIR_RT_PORT_SEND, LIR_RT_PORT_RECV, LIR_RT_ARR_NEW, LIR_RT_ARR_PUSH, LIR_RT_ARR_LEN, LIR_RT_PLATFORM, LIR_RT_EXIT_PROG, LIR_RT_QUANTIZE, LIR_RT_BACKWARD, LIR_RT_MATMUL_F64, LIR_RT_FMA_F64, LIR_RT_BOOL_TO_STR, LIR_RT_PRINT_FLOAT, LIR_RT_PRINT_BOOL, LIR_RT_FREE, LIR_RT_PROMOTE_GRAPH, LIR_RT_STUB_COUNT
 # @vir_source stdlib/vir/compiler/virc.vri 64
 # @vir_source stdlib/vir/compiler/lir_target_desc.vri 1
 ##
@@ -45075,7 +45110,7 @@ import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt, vec_free_rt 
 import rt_streq, fat_str_eq, fat_cstr_eq, fat_str_new, sb_new, sb_append, sb_append_int, sb_to_string, sb_free, native_read_i64, native_write_i64, native_read_u8 from string_rt
 import print_str, print_int from rt.io
 import sys_exit from rt.syscall
-import LirType, LirOp, LirOperandType, LirOperand, LirInstr, LirBlock, LirFunc, lir_func_id, lir_func_name, lir_func_blocks, lir_func_stack_size, lir_func_strings, lir_block_id, lir_block_instrs, lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_aux, lir_instr_typ, lir_opnd_type, lir_opnd_vreg, lir_opnd_imm_val, lir_opnd_label_id, lir_opnd_phys_reg_val, lir_opnd_stack_offset, LIR_CMP_EQ, LIR_CMP_NE, LIR_CMP_GT, LIR_CMP_LT, LIR_CMP_GE, LIR_CMP_LE, LIR_JMP_IF, LIR_JMP_IFNOT, LIR_RT_UNRESOLVED, LIR_RT_POW, LIR_RT_MATMUL, LIR_RT_FMA, LIR_RT_ALLOC, LIR_RT_PRINT_STR, LIR_RT_GET_ARG, LIR_RT_ARG_COUNT, LIR_RT_NATIVE_READ_U8, LIR_RT_NATIVE_WRITE_U8, LIR_RT_NATIVE_READ_I64, LIR_RT_NATIVE_WRITE_I64, LIR_RT_VOLATILE_READ, LIR_RT_VOLATILE_WRITE, LIR_RT_VOLATILE_READ8, LIR_RT_VOLATILE_WRITE8, LIR_RT_DMB, LIR_RT_DSB, LIR_RT_ISB, LIR_RT_WFI, LIR_RT_WFE, LIR_RT_SEV, LIR_RT_NOP, LIR_RT_SYSCALL, LIR_RT_PORT_CREATE, LIR_RT_PORT_SEND, LIR_RT_PORT_RECV, LIR_RT_ARR_NEW, LIR_RT_ARR_PUSH, LIR_RT_ARR_LEN, LIR_RT_EXIT_PROG, LIR_RT_QUANTIZE, LIR_RT_BACKWARD, LIR_RT_MATMUL_F64, LIR_RT_FMA_F64, LIR_RT_BOOL_TO_STR, LIR_RT_PRINT_FLOAT, LIR_RT_PRINT_BOOL, LIR_RT_FREE, LIR_RT_STUB_COUNT from compiler.lir
+import LirType, LirOp, LirOperandType, LirOperand, LirInstr, LirBlock, LirFunc, lir_func_id, lir_func_name, lir_func_blocks, lir_func_stack_size, lir_func_strings, lir_block_id, lir_block_instrs, lir_instr_op, lir_instr_dst, lir_instr_src1, lir_instr_src2, lir_instr_aux, lir_instr_typ, lir_opnd_type, lir_opnd_vreg, lir_opnd_imm_val, lir_opnd_label_id, lir_opnd_phys_reg_val, lir_opnd_stack_offset, LIR_CMP_EQ, LIR_CMP_NE, LIR_CMP_GT, LIR_CMP_LT, LIR_CMP_GE, LIR_CMP_LE, LIR_JMP_IF, LIR_JMP_IFNOT, LIR_RT_UNRESOLVED, LIR_RT_POW, LIR_RT_MATMUL, LIR_RT_FMA, LIR_RT_ALLOC, LIR_RT_PRINT_STR, LIR_RT_GET_ARG, LIR_RT_ARG_COUNT, LIR_RT_NATIVE_READ_U8, LIR_RT_NATIVE_WRITE_U8, LIR_RT_NATIVE_READ_I64, LIR_RT_NATIVE_WRITE_I64, LIR_RT_VOLATILE_READ, LIR_RT_VOLATILE_WRITE, LIR_RT_VOLATILE_READ8, LIR_RT_VOLATILE_WRITE8, LIR_RT_DMB, LIR_RT_DSB, LIR_RT_ISB, LIR_RT_WFI, LIR_RT_WFE, LIR_RT_SEV, LIR_RT_NOP, LIR_RT_SYSCALL, LIR_RT_PORT_CREATE, LIR_RT_PORT_SEND, LIR_RT_PORT_RECV, LIR_RT_ARR_NEW, LIR_RT_ARR_PUSH, LIR_RT_ARR_LEN, LIR_RT_PLATFORM, LIR_RT_EXIT_PROG, LIR_RT_QUANTIZE, LIR_RT_BACKWARD, LIR_RT_MATMUL_F64, LIR_RT_FMA_F64, LIR_RT_BOOL_TO_STR, LIR_RT_PRINT_FLOAT, LIR_RT_PRINT_BOOL, LIR_RT_FREE, LIR_RT_STUB_COUNT from compiler.lir
 import MIR_INTR_PRINT, MIR_INTR_PRINT_STR, MIR_INTR_PARAM, MIR_INTR_GLOBAL_LOAD, MIR_INTR_GLOBAL_STORE, MIR_INTR_ADDR_OF, MIR_INTR_CAST, MIR_INTR_NOP_MARKER, MIR_INTR_DECL, MIR_INTR_QUIET, MIR_INTR_CHECK_CPU, MIR_INTR_PATCH_POINT, MIR_INTR_PRECOMP, MIR_INTR_EXPOSE, MIR_INTR_ASYNC, MIR_INTR_ATOMIC_VAR, MIR_INTR_TIMEOUT, MIR_INTR_ISOLATE, MIR_INTR_PTR, MIR_INTR_AWAIT_PASS, MIR_INTR_ENSURE, MIR_INTR_REVERT, MIR_INTR_STR_LIT, MIR_INTR_INTERP, MIR_INTR_ENUM, MIR_INTR_ERROR, MIR_INTR_EXIST, MIR_INTR_BUILTIN, MIR_INTR_INDEX, MIR_INTR_INDEX_STORE, MIR_INTR_FIELD, MIR_INTR_FIELD_STORE, MIR_INTR_ARRAY, MIR_INTR_ENTITY, MIR_INTR_TUPLE, MIR_INTR_BUNDLE, MIR_INTR_INFER, MIR_INTR_TRAIN, MIR_INTR_REACTIVE, MIR_INTR_MORPH, MIR_INTR_QUANTIZE, MIR_INTR_BIT_EXTRACT, MIR_INTR_BIT_INSERT, MIR_INTR_BACKWARD from compiler.mir
 import MIR_INTR_PRINT, MIR_INTR_PRINT_STR, MIR_INTR_PARAM, MIR_INTR_GLOBAL_LOAD, MIR_INTR_GLOBAL_STORE, MIR_INTR_LOAD_ADDR, MIR_INTR_ADDR_OF, MIR_INTR_CAST, MIR_INTR_THROW, MIR_INTR_ERX, MIR_INTR_NOP_MARKER, MIR_INTR_DECL, MIR_INTR_QUIET, MIR_INTR_CHECK_CPU, MIR_INTR_PATCH_POINT, MIR_INTR_PRECOMP, MIR_INTR_EXPOSE, MIR_INTR_ASYNC, MIR_INTR_ATOMIC_VAR, MIR_INTR_TIMEOUT, MIR_INTR_ISOLATE, MIR_INTR_PTR, MIR_INTR_AWAIT_PASS, MIR_INTR_ENSURE, MIR_INTR_REVERT, MIR_INTR_STR_LIT, MIR_INTR_STR_EQ, MIR_INTR_INTERP, MIR_INTR_ENUM, MIR_INTR_ERROR, MIR_INTR_EXIST, MIR_INTR_BUILTIN, MIR_INTR_INDEX, MIR_INTR_INDEX_STORE, MIR_INTR_FIELD, MIR_INTR_FIELD_STORE, MIR_INTR_ARRAY, MIR_INTR_ARENA, MIR_INTR_ENTITY, MIR_INTR_TUPLE, MIR_INTR_BUNDLE, MIR_INTR_INFER, MIR_INTR_TRAIN, MIR_INTR_REACTIVE, MIR_INTR_MORPH, MIR_INTR_QUANTIZE, MIR_INTR_BIT_EXTRACT, MIR_INTR_BIT_INSERT, MIR_INTR_BACKWARD, MIR_INTR_PERCENT, MIR_INTR_PRINT_FLOAT, MIR_INTR_PRINT_BOOL, MIR_MEM_MARK, MIR_MEM_RESET, MIR_MEM_PROMOTE, MIR_MEM_DROP, MIR_MEM_ALLOC from compiler.mir
 import ffi_import_find, ffi_import_mark_used, ffi_import_used_count, ffi_import_used_at, ffi_arm64_stubs_reset, ffi_arm64_stub_add, ffi_arm64_stub_offset, MACHO_FFI_CODE_OFFSET from compiler.ffi_imports
@@ -45642,7 +45677,7 @@ func lir_stub_for_callee_name(cname: string):
     if fat_cstr_eq(cname, "arr_new") or rt_streq(cname as int, "arr_new") do out LIR_RT_ARR_NEW end
     if fat_cstr_eq(cname, "push") or fat_cstr_eq(cname, "arr_push") or rt_streq(cname as int, "push") or rt_streq(cname as int, "arr_push") do out LIR_RT_ARR_PUSH end
     if fat_cstr_eq(cname, "len") or fat_cstr_eq(cname, "arr_len") or rt_streq(cname as int, "len") or rt_streq(cname as int, "arr_len") do out LIR_RT_ARR_LEN end
-    if fat_cstr_eq(cname, "vir_get_platform") or rt_streq(cname as int, "vir_get_platform") do out LIR_RT_PLATFORM end
+    if fat_cstr_eq(cname, "vir_get_platform") or fat_cstr_eq(cname, "sys_platform") or rt_streq(cname as int, "vir_get_platform") or rt_streq(cname as int, "sys_platform") do out LIR_RT_PLATFORM end
     if fat_cstr_eq(cname, "exit") or fat_cstr_eq(cname, "exit_prog") or fat_cstr_eq(cname, "sys_exit") or rt_streq(cname as int, "exit") or rt_streq(cname as int, "exit_prog") or rt_streq(cname as int, "sys_exit") do out LIR_RT_EXIT_PROG end
     out 0 - 1
 end.
@@ -45724,6 +45759,10 @@ func emit_lir_intrinsic(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assigned
         slot = native_read_i64(ins_src1 as i64, 32)
         if rd >= 0 and slot >= 0 and slot < 4092 do
             out arm64_ldr_uoff(cb, rd as int, 28, (32 + slot * 8) as int)
+        end
+        if rd < 0 and slot >= 0 and slot < 4092 do
+            cb = arm64_ldr_uoff(cb, SCR as int, 28, (32 + slot * 8) as int)
+            out emit_spill_store(cb, ins_dst as i64, SCR)
         end
         out arm64_nop(cb)
     end
@@ -46264,10 +46303,14 @@ func emit_lir_intrinsic(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assigned
             end
             out cb
         end
-        # ── Inline sys_platform() (bid == 105) → MOV Xd, #0 (macOS_ARM64) ──
+        # ── Inline sys_platform() (bid == 105) → MOV Xd, #2 (Linux_ARM64) or #0 (macOS_ARM64) ──
         if bid == 105 do
             if rd >= 0 do
-                cb = arm64_movz_imm64(cb, rd as int, 0)
+                var plat_val = 0
+                if is_linux == 1 do
+                    plat_val = 2
+                end
+                cb = arm64_movz_imm64(cb, rd as int, plat_val)
             end
             out cb
         end
@@ -50369,6 +50412,16 @@ func emit_lir_arm64_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, l
                     if src1_typ == 5 do # Imm
                         imm_val = native_read_i64(ins_src1 as i64, 32)
                         cb = arm64_movz_imm64(cb, 0, imm_val as int)
+                    eif src1_typ == 4 do # StackMem reload
+                        off = native_read_i64(ins_src1 as i64, 24)
+                        if off < 0 and off >= 0 - 255 do
+                            cb = arm64_ldur(cb, 0, 29, off as int)
+                        else
+                            if off < 0 do
+                                cb = emit_fp_sub_addr(cb, 9, 0 - off)
+                                cb = arm64_ldr_uoff(cb, 0, 9, 0)
+                            end
+                        end
                     eif rs1 >= 0 and rs1 != 0 do
                         cb = arm64_mov_rr(cb, 0, rs1 as int)
                     eif src1_typ == 0 do
@@ -50493,9 +50546,9 @@ func emit_lir_module_arm64(lir_funcs: i64, is_linux: i64):
         cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
         cb = arm64_mov_from_sp(cb, 29)
 
-        # ── Initialize 8GB Global Arena Heap via Linux mmap ──
+        # ── Initialize 256MB Global Arena Heap via Linux mmap ──
         cb = arm64_mov_imm16(cb, 0, 0)
-        cb = arm64_movz_imm64(cb, 1, 0x200000000)
+        cb = arm64_movz_imm64(cb, 1, 268435456)
         cb = arm64_mov_imm16(cb, 2, 3)         # PROT_READ | PROT_WRITE
         cb = arm64_mov_imm16(cb, 3, 34)        # MAP_PRIVATE | MAP_ANONYMOUS (0x22)
         cb = codebuf_emit_u32(cb, 0x92800004) # MOVN X4, #0 (-1 fd)
@@ -50529,7 +50582,11 @@ func emit_lir_module_arm64(lir_funcs: i64, is_linux: i64):
     cb = arm64_mov_imm16(cb, 10, 32768)
     cb = arm64_add_rrr(cb, 1, 28, 10)
     cb = arm64_str_uoff(cb, 1, 28, 0)
-    cb = arm64_movz_imm64(cb, 11, 0x80000000)
+    if is_linux == 1 do
+        cb = arm64_movz_imm64(cb, 11, 268435456)
+    else
+        cb = arm64_movz_imm64(cb, 11, 0x80000000)
+    end
     cb = arm64_add_rrr(cb, 11, 28, 11)
     cb = arm64_str_uoff(cb, 11, 28, 24)
     cb = arm64_str_uoff(cb, 11, 28, 80)
@@ -51010,40 +51067,33 @@ func x86_emit_test_rr(cb: CodeBuf, a: int, b: int):
     out codebuf_emit_byte(cb, x86_modrm(3, b, a))
 end.
 
+func x86_emit_disp(cb: CodeBuf, reg_or_op: int, base: int, disp: int):
+    let b7 = base and 7
+    if disp == 0 and b7 != 5 do
+        cb = codebuf_emit_byte(cb, x86_modrm(0, reg_or_op, base))
+        if b7 == 4 do cb = codebuf_emit_byte(cb, 0x24) end
+        out cb
+    eif disp >= (0 - 128) and disp <= 127 do
+        cb = codebuf_emit_byte(cb, x86_modrm(1, reg_or_op, base))
+        if b7 == 4 do cb = codebuf_emit_byte(cb, 0x24) end
+        out codebuf_emit_byte(cb, disp and 0xFF)
+    else
+        cb = codebuf_emit_byte(cb, x86_modrm(2, reg_or_op, base))
+        if b7 == 4 do cb = codebuf_emit_byte(cb, 0x24) end
+        out codebuf_emit_i32(cb, disp)
+    end
+end.
+
 func x86_emit_mov_reg_mem(cb: CodeBuf, dst: int, base: int, disp: int):
     cb = codebuf_emit_byte(cb, x86_rex_w(dst, base))
     cb = codebuf_emit_byte(cb, 0x8B)
-    let b7 = base and 7
-    if disp == 0 and b7 != 5 do
-        cb = codebuf_emit_byte(cb, x86_modrm(0, dst, base))
-        if b7 == 4 do
-            cb = codebuf_emit_byte(cb, 0x24)
-        end
-        out cb
-    end
-    cb = codebuf_emit_byte(cb, x86_modrm(1, dst, base))
-    if b7 == 4 do
-        cb = codebuf_emit_byte(cb, 0x24)
-    end
-    out codebuf_emit_byte(cb, disp and 0xFF)
+    out x86_emit_disp(cb, dst, base, disp)
 end.
 
 func x86_emit_mov_mem_reg(cb: CodeBuf, base: int, disp: int, src: int):
     cb = codebuf_emit_byte(cb, x86_rex_w(src, base))
     cb = codebuf_emit_byte(cb, 0x89)
-    let b7 = base and 7
-    if disp == 0 and b7 != 5 do
-        cb = codebuf_emit_byte(cb, x86_modrm(0, src, base))
-        if b7 == 4 do
-            cb = codebuf_emit_byte(cb, 0x24)
-        end
-        out cb
-    end
-    cb = codebuf_emit_byte(cb, x86_modrm(1, src, base))
-    if b7 == 4 do
-        cb = codebuf_emit_byte(cb, 0x24)
-    end
-    out codebuf_emit_byte(cb, disp and 0xFF)
+    out x86_emit_disp(cb, src, base, disp)
 end.
 
 func x86_emit_mov_reg_mem32(cb: CodeBuf, dst: int, base: int, disp: int):
@@ -51051,19 +51101,7 @@ func x86_emit_mov_reg_mem32(cb: CodeBuf, dst: int, base: int, disp: int):
         cb = codebuf_emit_byte(cb, x86_rex(dst, base))
     end
     cb = codebuf_emit_byte(cb, 0x8B)
-    let b7 = base and 7
-    if disp == 0 and b7 != 5 do
-        cb = codebuf_emit_byte(cb, x86_modrm(0, dst, base))
-        if b7 == 4 do
-            cb = codebuf_emit_byte(cb, 0x24)
-        end
-        out cb
-    end
-    cb = codebuf_emit_byte(cb, x86_modrm(1, dst, base))
-    if b7 == 4 do
-        cb = codebuf_emit_byte(cb, 0x24)
-    end
-    out codebuf_emit_byte(cb, disp and 0xFF)
+    out x86_emit_disp(cb, dst, base, disp)
 end.
 
 func x86_emit_mov_mem_reg32(cb: CodeBuf, base: int, disp: int, src: int):
@@ -51071,19 +51109,7 @@ func x86_emit_mov_mem_reg32(cb: CodeBuf, base: int, disp: int, src: int):
         cb = codebuf_emit_byte(cb, x86_rex(src, base))
     end
     cb = codebuf_emit_byte(cb, 0x89)
-    let b7 = base and 7
-    if disp == 0 and b7 != 5 do
-        cb = codebuf_emit_byte(cb, x86_modrm(0, src, base))
-        if b7 == 4 do
-            cb = codebuf_emit_byte(cb, 0x24)
-        end
-        out cb
-    end
-    cb = codebuf_emit_byte(cb, x86_modrm(1, src, base))
-    if b7 == 4 do
-        cb = codebuf_emit_byte(cb, 0x24)
-    end
-    out codebuf_emit_byte(cb, disp and 0xFF)
+    out x86_emit_disp(cb, src, base, disp)
 end.
 
 func x86_emit_mov_reg_mem16(cb: CodeBuf, dst: int, base: int, disp: int):
@@ -51092,19 +51118,7 @@ func x86_emit_mov_reg_mem16(cb: CodeBuf, dst: int, base: int, disp: int):
         cb = codebuf_emit_byte(cb, x86_rex(dst, base))
     end
     cb = codebuf_emit_byte(cb, 0x8B)
-    let b7 = base and 7
-    if disp == 0 and b7 != 5 do
-        cb = codebuf_emit_byte(cb, x86_modrm(0, dst, base))
-        if b7 == 4 do
-            cb = codebuf_emit_byte(cb, 0x24)
-        end
-        out cb
-    end
-    cb = codebuf_emit_byte(cb, x86_modrm(1, dst, base))
-    if b7 == 4 do
-        cb = codebuf_emit_byte(cb, 0x24)
-    end
-    out codebuf_emit_byte(cb, disp and 0xFF)
+    out x86_emit_disp(cb, dst, base, disp)
 end.
 
 func x86_emit_mov_mem_reg16(cb: CodeBuf, base: int, disp: int, src: int):
@@ -51113,38 +51127,14 @@ func x86_emit_mov_mem_reg16(cb: CodeBuf, base: int, disp: int, src: int):
         cb = codebuf_emit_byte(cb, x86_rex(src, base))
     end
     cb = codebuf_emit_byte(cb, 0x89)
-    let b7 = base and 7
-    if disp == 0 and b7 != 5 do
-        cb = codebuf_emit_byte(cb, x86_modrm(0, src, base))
-        if b7 == 4 do
-            cb = codebuf_emit_byte(cb, 0x24)
-        end
-        out cb
-    end
-    cb = codebuf_emit_byte(cb, x86_modrm(1, src, base))
-    if b7 == 4 do
-        cb = codebuf_emit_byte(cb, 0x24)
-    end
-    out codebuf_emit_byte(cb, disp and 0xFF)
+    out x86_emit_disp(cb, src, base, disp)
 end.
 
 func x86_emit_movzx_reg_mem8(cb: CodeBuf, dst: int, base: int, disp: int):
     cb = codebuf_emit_byte(cb, x86_rex_w(dst, base))
     cb = codebuf_emit_byte(cb, 0x0F)
     cb = codebuf_emit_byte(cb, 0xB6)
-    let b7 = base and 7
-    if disp == 0 and b7 != 5 do
-        cb = codebuf_emit_byte(cb, x86_modrm(0, dst, base))
-        if b7 == 4 do
-            cb = codebuf_emit_byte(cb, 0x24)
-        end
-        out cb
-    end
-    cb = codebuf_emit_byte(cb, x86_modrm(1, dst, base))
-    if b7 == 4 do
-        cb = codebuf_emit_byte(cb, 0x24)
-    end
-    out codebuf_emit_byte(cb, disp and 0xFF)
+    out x86_emit_disp(cb, dst, base, disp)
 end.
 
 func x86_emit_mov_mem_reg8(cb: CodeBuf, base: int, disp: int, src: int):
@@ -51153,19 +51143,7 @@ func x86_emit_mov_mem_reg8(cb: CodeBuf, base: int, disp: int, src: int):
     if base >= X86_R8 do rex = rex or 0x01 end
     cb = codebuf_emit_byte(cb, rex)
     cb = codebuf_emit_byte(cb, 0x88)
-    let b7 = base and 7
-    if disp == 0 and b7 != 5 do
-        cb = codebuf_emit_byte(cb, x86_modrm(0, src, base))
-        if b7 == 4 do
-            cb = codebuf_emit_byte(cb, 0x24)
-        end
-        out cb
-    end
-    cb = codebuf_emit_byte(cb, x86_modrm(1, src, base))
-    if b7 == 4 do
-        cb = codebuf_emit_byte(cb, 0x24)
-    end
-    out codebuf_emit_byte(cb, disp and 0xFF)
+    out x86_emit_disp(cb, src, base, disp)
 end.
 
 func x86_emit_setge(cb: CodeBuf, dst: int):
@@ -51468,20 +51446,7 @@ func x86_emit_movdqu_load(cb: CodeBuf, xmm_dst: int, r_base: int, disp: int):
     if rex != 0x40 do cb = codebuf_emit_byte(cb, rex) end
     cb = codebuf_emit_byte(cb, 0x0F)
     cb = codebuf_emit_byte(cb, 0x6F)
-    let b7 = r_base and 7
-    if disp == 0 and b7 != 5 do
-        cb = codebuf_emit_byte(cb, x86_modrm(0, xmm_dst, r_base))
-        if b7 == 4 do cb = codebuf_emit_byte(cb, 0x24) end
-        out cb
-    eif disp >= (0 - 128) and disp <= 127 do
-        cb = codebuf_emit_byte(cb, x86_modrm(1, xmm_dst, r_base))
-        if b7 == 4 do cb = codebuf_emit_byte(cb, 0x24) end
-        out codebuf_emit_byte(cb, disp and 0xFF)
-    else
-        cb = codebuf_emit_byte(cb, x86_modrm(2, xmm_dst, r_base))
-        if b7 == 4 do cb = codebuf_emit_byte(cb, 0x24) end
-        out codebuf_emit_i32(cb, disp)
-    end
+    out x86_emit_disp(cb, xmm_dst, r_base, disp)
 end.
 
 func x86_emit_movdqu_store(cb: CodeBuf, r_base: int, disp: int, xmm_src: int):
@@ -51492,20 +51457,7 @@ func x86_emit_movdqu_store(cb: CodeBuf, r_base: int, disp: int, xmm_src: int):
     if rex != 0x40 do cb = codebuf_emit_byte(cb, rex) end
     cb = codebuf_emit_byte(cb, 0x0F)
     cb = codebuf_emit_byte(cb, 0x7F)
-    let b7 = r_base and 7
-    if disp == 0 and b7 != 5 do
-        cb = codebuf_emit_byte(cb, x86_modrm(0, xmm_src, r_base))
-        if b7 == 4 do cb = codebuf_emit_byte(cb, 0x24) end
-        out cb
-    eif disp >= (0 - 128) and disp <= 127 do
-        cb = codebuf_emit_byte(cb, x86_modrm(1, xmm_src, r_base))
-        if b7 == 4 do cb = codebuf_emit_byte(cb, 0x24) end
-        out codebuf_emit_byte(cb, disp and 0xFF)
-    else
-        cb = codebuf_emit_byte(cb, x86_modrm(2, xmm_src, r_base))
-        if b7 == 4 do cb = codebuf_emit_byte(cb, 0x24) end
-        out codebuf_emit_i32(cb, disp)
-    end
+    out x86_emit_disp(cb, xmm_src, r_base, disp)
 end.
 
 func x86_emit_punpcklqdq(cb: CodeBuf, xmm_dst: int, xmm_src: int):
@@ -51646,7 +51598,11 @@ end.
 
 func x86_stub_for_builtin_id(bid: i64):
     if bid == 11 do out LIR_RT_STR_CAT end
+    if bid == 12 do out LIR_RT_STR_EQ end
+    if bid == 18 do out LIR_RT_EXIT_PROG end
     if bid == 19 do out LIR_RT_INT_TO_STR end
+    if bid == 22 do out LIR_RT_PRINT_STR end
+    if bid == 30 do out LIR_RT_SYSCALL end
     if bid == 1000 do out LIR_RT_BOOL_TO_STR end
     if bid == 3 or bid == 35 or bid == 49 or bid == 50 do out LIR_RT_ALLOC end
     if bid == 4 do out LIR_RT_FREE end
@@ -51894,6 +51850,15 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
             cb = x86_emit_mov_reg_imm64(cb, rd as int, 0)
             out cb
         end
+        if f_strings > 0 and sid >= 0 and sid < vec_len_rt(f_strings) and rd < 0 do
+            s_val = vec_get_rt(f_strings, sid)
+            sf = native_read_i64(str_fixups, 0)
+            imm_off = (codebuf_offset(cb) + 2) as i64
+            sf = vec_push_rt(sf, x86_str_fixup_new(imm_off, s_val as i64, SCR))
+            native_write_i64(str_fixups, 0, sf)
+            cb = x86_emit_mov_reg_imm64(cb, SCR as int, 0)
+            out store_spilled_result_x86(cb, ins_dst as LirOperand, SCR)
+        end
         if rd >= 0 do
             cb = x86_emit_mov_reg_imm64(cb, rd as int, 0)
             out cb
@@ -51917,6 +51882,10 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
         slot = native_read_i64(ins_src1 as i64, 32)
         if rd >= 0 and slot >= 0 and slot < 4092 do
             out x86_emit_mov_reg_mem(cb, rd as int, X86_R15, (32 + slot * 8) as int)
+        end
+        if rd < 0 and slot >= 0 and slot < 4092 do
+            cb = x86_emit_mov_reg_mem(cb, SCR as int, X86_R15, (32 + slot * 8) as int)
+            out store_spilled_result_x86(cb, ins_dst as LirOperand, SCR)
         end
         out x86_emit_nop(cb)
     end
@@ -52013,19 +51982,32 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
     end
     if kind == MIR_INTR_PARAM do
         abi = native_read_i64(ins_src1 as i64, 32)
-        if rd >= 0 and abi >= 0 and abi < 6 do
+        if abi >= 0 and abi < 6 do
             areg = x86_arg_reg(abi as int)
-            if rd != areg do
-                cb = x86_emit_mov_rr(cb, rd as int, areg)
+            if rd >= 0 do
+                if rd != areg do
+                    cb = x86_emit_mov_rr(cb, rd as int, areg)
+                end
+            else
+                if (ins_dst as i64) != 0 do
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, areg)
+                end
             end
             out cb
         end
-        if abi >= 6 and rd >= 0 do
+        if abi >= 6 do
             # SysV AMD64 ABI: stack parameters start at [RBP + 16]
             off = 16 + ((abi - 6) * 8)
             cb = x86_emit_mov_reg_imm32(cb, SCR as int, off as int)
             cb = x86_emit_add_rr(cb, SCR as int, X86_RBP)
-            cb = x86_emit_mov_reg_mem(cb, rd as int, SCR as int, 0)
+            if rd >= 0 do
+                cb = x86_emit_mov_reg_mem(cb, rd as int, SCR as int, 0)
+            else
+                cb = x86_emit_mov_reg_mem(cb, SCR as int, SCR as int, 0)
+                if (ins_dst as i64) != 0 do
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, SCR)
+                end
+            end
             out cb
         end
         out x86_emit_nop(cb)
@@ -52192,8 +52174,11 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
     if kind == MIR_INTR_INDEX do
         # SetArg(0) places the flattened index in RDI.  Tensor elements start
         # after the 16-byte [len, cap] header.
-        if rd >= 0 and rs1 >= 0 do
-            cb = x86_emit_mov_rr(cb, X86_RAX, rs1 as int)
+        var idx_base = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR2)
+        if idx_base >= 0 do
+            var idx_rd = rd
+            if idx_rd < 0 do idx_rd = X86_RAX end
+            cb = x86_emit_mov_rr(cb, X86_RAX, idx_base as int)
             cb = x86_emit_mov_rr(cb, SCR as int, X86_RDI)
             var shift = 3
             if ins_typ == (LirType.F32 as i64) or ins_typ == (LirType.Int32 as i64) do
@@ -52209,13 +52194,16 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
             end
             cb = x86_emit_add_rr(cb, SCR as int, X86_RAX)
             if ins_typ == (LirType.F32 as i64) or ins_typ == (LirType.Int32 as i64) do
-                cb = x86_emit_mov_reg_mem32(cb, rd as int, SCR as int, 16)
+                cb = x86_emit_mov_reg_mem32(cb, idx_rd as int, SCR as int, 16)
             eif ins_typ == (LirType.Int16 as i64) do
-                cb = x86_emit_mov_reg_mem16(cb, rd as int, SCR as int, 16)
+                cb = x86_emit_mov_reg_mem16(cb, idx_rd as int, SCR as int, 16)
             eif ins_typ == (LirType.Int8 as i64) do
-                cb = x86_emit_movzx_reg_mem8(cb, rd as int, SCR as int, 16)
+                cb = x86_emit_movzx_reg_mem8(cb, idx_rd as int, SCR as int, 16)
             else
-                cb = x86_emit_mov_reg_mem(cb, rd as int, SCR as int, 16)
+                cb = x86_emit_mov_reg_mem(cb, idx_rd as int, SCR as int, 16)
+            end
+            if rd < 0 and (ins_dst as i64) != 0 do
+                out store_spilled_result_x86(cb, ins_dst as LirOperand, idx_rd)
             end
             out cb
         end
@@ -52223,8 +52211,9 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
     end
     if kind == MIR_INTR_INDEX_STORE do
         # SetArg(0/1) places index/value in RDI/RSI.
-        if rs1 >= 0 do
-            cb = x86_emit_mov_rr(cb, X86_RAX, rs1 as int)
+        var idxs_base = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR2)
+        if idxs_base >= 0 do
+            cb = x86_emit_mov_rr(cb, X86_RAX, idxs_base as int)
             cb = x86_emit_mov_rr(cb, SCR as int, X86_RDI)
             var shift = 3
             if ins_typ == (LirType.F32 as i64) or ins_typ == (LirType.Int32 as i64) do
@@ -52253,15 +52242,23 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
         out x86_emit_nop(cb)
     end
     if kind == MIR_INTR_FIELD do
-        if rd >= 0 and rs1 >= 0 do
-            cb = x86_emit_mov_reg_mem(cb, rd as int, rs1 as int, 0)
+        # resolve_or_imm_reg_x86 handles spilled (StackMem) source pointers too
+        f_base = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR2)
+        if f_base >= 0 do
+            var f_dst = rd
+            if f_dst < 0 do f_dst = SCR end
+            cb = x86_emit_mov_reg_mem(cb, f_dst as int, f_base as int, 0)
+            if rd < 0 and (ins_dst as i64) != 0 do
+                out store_spilled_result_x86(cb, ins_dst as LirOperand, f_dst)
+            end
             out cb
         end
         out x86_emit_nop(cb)
     end
     if kind == MIR_INTR_FIELD_STORE do
-        if rs1 >= 0 do
-            cb = x86_emit_mov_mem_reg(cb, rs1 as int, 0, X86_RSI)
+        fs_base = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR2)
+        if fs_base >= 0 do
+            cb = x86_emit_mov_mem_reg(cb, fs_base as int, 0, X86_RSI)
             out cb
         end
         out x86_emit_nop(cb)
@@ -52420,7 +52417,27 @@ func x86_stub_for_callee_name(cname: string):
     out 0 - 1
 end.
 
+func reverse_pending_stack_args_x86(cb: &CodeBuf, pending_stk: i64):
+    if pending_stk > 1 do
+        var rev_i = 0
+        let half = pending_stk / 2
+        when rev_i < half loop
+            let off1 = rev_i * 8
+            let off2 = (pending_stk - 1 - rev_i) * 8
+            cb = x86_emit_mov_reg_mem(cb, SCR as int, X86_RSP, off1 as int)
+            cb = x86_emit_mov_reg_mem(cb, SCR2 as int, X86_RSP, off2 as int)
+            cb = x86_emit_mov_mem_reg(cb, X86_RSP, off1 as int, SCR2 as int)
+            cb = x86_emit_mov_mem_reg(cb, X86_RSP, off2 as int, SCR as int)
+            rev_i = rev_i + 1
+        end
+    end
+    out cb
+end.
+
 func emit_lir_call_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, func_obj: &LirFunc, lir_funcs: i64, call_fixups: i64, pending_stk: i64, assigned_phys: i64):
+    if pending_stk > 1 do
+        cb = reverse_pending_stack_args_x86(cb, pending_stk)
+    end
     sid = native_read_i64(ins as i64, 40)
     ins_src2 = native_read_i64(ins as i64, 32)
     var is_dynamic = 0
@@ -54063,125 +54080,201 @@ func emit_lir_x86_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, lir
                     else
                         # Allocated operands never use RAX; reserve it for a
                         # stack destination so neither input is clobbered.
-                        cb = x86_emit_mov_rr(cb, add_dst as int, a as int)
-                        cb = x86_emit_add_rr(cb, add_dst as int, breg as int)
+                        if add_dst == breg and add_dst != a do
+                            cb = x86_emit_add_rr(cb, add_dst as int, a as int)
+                        else
+                            if add_dst != a do cb = x86_emit_mov_rr(cb, add_dst as int, a as int) end
+                            cb = x86_emit_add_rr(cb, add_dst as int, breg as int)
+                        end
                     end
                     cb = store_spilled_result_x86(cb, ins_dst as LirOperand, add_dst)
                 end
             eif op == LirOp.Sub do
                 a = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg_x86(cb, ins_src2, assigned_phys, SCR2)
-                if rd >= 0 and a >= 0 and breg >= 0 do
+                sub_dst = rd
+                if sub_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    sub_dst = X86_RAX
+                end
+                if sub_dst >= 0 and a >= 0 and breg >= 0 do
                     if ins_typ == (LirType.F64 as i64) do
                         cb = x86_emit_movq_xmm_gpr(cb, 0, a as int)
                         cb = x86_emit_movq_xmm_gpr(cb, 1, breg as int)
                         cb = x86_emit_subsd_xx(cb, 0, 1)
-                        cb = x86_emit_movq_gpr_xmm(cb, rd as int, 0)
+                        cb = x86_emit_movq_gpr_xmm(cb, sub_dst as int, 0)
                     eif ins_typ == (LirType.F32 as i64) do
                         cb = x86_emit_movq_xmm_gpr(cb, 0, a as int)
                         cb = x86_emit_movq_xmm_gpr(cb, 1, breg as int)
                         cb = x86_emit_subss_xx(cb, 0, 1)
-                        cb = x86_emit_movq_gpr_xmm(cb, rd as int, 0)
+                        cb = x86_emit_movq_gpr_xmm(cb, sub_dst as int, 0)
                     else
-                        cb = x86_emit_mov_rr(cb, rd as int, a as int)
-                        cb = x86_emit_sub_rr(cb, rd as int, breg as int)
+                        if sub_dst == breg and sub_dst != a do
+                            cb = x86_emit_mov_rr(cb, SCR as int, a as int)
+                            cb = x86_emit_sub_rr(cb, SCR as int, sub_dst as int)
+                            cb = x86_emit_mov_rr(cb, sub_dst as int, SCR as int)
+                        else
+                            if sub_dst != a do cb = x86_emit_mov_rr(cb, sub_dst as int, a as int) end
+                            cb = x86_emit_sub_rr(cb, sub_dst as int, breg as int)
+                        end
                     end
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, sub_dst)
                 end
             eif op == LirOp.Mul do
                 a = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg_x86(cb, ins_src2, assigned_phys, SCR2)
-                if rd >= 0 and a >= 0 and breg >= 0 do
+                mul_dst = rd
+                if mul_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    mul_dst = X86_RAX
+                end
+                if mul_dst >= 0 and a >= 0 and breg >= 0 do
                     if ins_typ == (LirType.F64 as i64) do
                         cb = x86_emit_movq_xmm_gpr(cb, 0, a as int)
                         cb = x86_emit_movq_xmm_gpr(cb, 1, breg as int)
                         cb = x86_emit_mulsd_xx(cb, 0, 1)
-                        cb = x86_emit_movq_gpr_xmm(cb, rd as int, 0)
+                        cb = x86_emit_movq_gpr_xmm(cb, mul_dst as int, 0)
                     eif ins_typ == (LirType.F32 as i64) do
                         cb = x86_emit_movq_xmm_gpr(cb, 0, a as int)
                         cb = x86_emit_movq_xmm_gpr(cb, 1, breg as int)
                         cb = x86_emit_mulss_xx(cb, 0, 1)
-                        cb = x86_emit_movq_gpr_xmm(cb, rd as int, 0)
+                        cb = x86_emit_movq_gpr_xmm(cb, mul_dst as int, 0)
                     else
-                        cb = x86_emit_mov_rr(cb, rd as int, a as int)
-                        cb = x86_emit_imul_rr(cb, rd as int, breg as int)
+                        if mul_dst == breg and mul_dst != a do
+                            cb = x86_emit_imul_rr(cb, mul_dst as int, a as int)
+                        else
+                            if mul_dst != a do cb = x86_emit_mov_rr(cb, mul_dst as int, a as int) end
+                            cb = x86_emit_imul_rr(cb, mul_dst as int, breg as int)
+                        end
                     end
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, mul_dst)
                 end
             eif op == LirOp.Div do
                 a = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg_x86(cb, ins_src2, assigned_phys, SCR2)
-                if rd >= 0 and a >= 0 and breg >= 0 do
+                div_dst = rd
+                if div_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    div_dst = X86_RAX
+                end
+                if div_dst >= 0 and a >= 0 and breg >= 0 do
                     if ins_typ == (LirType.F64 as i64) do
                         cb = x86_emit_movq_xmm_gpr(cb, 0, a as int)
                         cb = x86_emit_movq_xmm_gpr(cb, 1, breg as int)
                         cb = x86_emit_divsd_xx(cb, 0, 1)
-                        cb = x86_emit_movq_gpr_xmm(cb, rd as int, 0)
+                        cb = x86_emit_movq_gpr_xmm(cb, div_dst as int, 0)
                     eif ins_typ == (LirType.F32 as i64) do
                         cb = x86_emit_movq_xmm_gpr(cb, 0, a as int)
                         cb = x86_emit_movq_xmm_gpr(cb, 1, breg as int)
                         cb = x86_emit_divss_xx(cb, 0, 1)
-                        cb = x86_emit_movq_gpr_xmm(cb, rd as int, 0)
+                        cb = x86_emit_movq_gpr_xmm(cb, div_dst as int, 0)
                     else
                         cb = x86_emit_mov_rr(cb, X86_RAX, a as int)
                         cb = x86_emit_cqo(cb)
                         cb = x86_emit_idiv(cb, breg as int)
-                        if rd != X86_RAX do
-                            cb = x86_emit_mov_rr(cb, rd as int, X86_RAX)
+                        if div_dst != X86_RAX do
+                            cb = x86_emit_mov_rr(cb, div_dst as int, X86_RAX)
                         end
                     end
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, div_dst)
                 end
             eif op == LirOp.Rem do
                 a = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg_x86(cb, ins_src2, assigned_phys, SCR2)
-                if rd >= 0 and a >= 0 and breg >= 0 do
+                rem_dst = rd
+                if rem_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    rem_dst = X86_RDX
+                end
+                if rem_dst >= 0 and a >= 0 and breg >= 0 do
                     cb = x86_emit_mov_rr(cb, X86_RAX, a as int)
                     cb = x86_emit_cqo(cb)
                     cb = x86_emit_idiv(cb, breg as int)
-                    if rd != X86_RDX do
-                        cb = x86_emit_mov_rr(cb, rd as int, X86_RDX)
+                    if rem_dst != X86_RDX do
+                        cb = x86_emit_mov_rr(cb, rem_dst as int, X86_RDX)
                     end
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, rem_dst)
                 end
             eif op == LirOp.And do
                 a = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg_x86(cb, ins_src2, assigned_phys, SCR2)
-                if rd >= 0 and a >= 0 and breg >= 0 do
-                    cb = x86_emit_mov_rr(cb, rd as int, a as int)
-                    cb = x86_emit_and_rr(cb, rd as int, breg as int)
+                and_dst = rd
+                if and_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    and_dst = X86_RAX
+                end
+                if and_dst >= 0 and a >= 0 and breg >= 0 do
+                    if and_dst == breg and and_dst != a do
+                        cb = x86_emit_and_rr(cb, and_dst as int, a as int)
+                    else
+                        if and_dst != a do cb = x86_emit_mov_rr(cb, and_dst as int, a as int) end
+                        cb = x86_emit_and_rr(cb, and_dst as int, breg as int)
+                    end
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, and_dst)
                 end
             eif op == LirOp.Or do
                 a = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg_x86(cb, ins_src2, assigned_phys, SCR2)
-                if rd >= 0 and a >= 0 and breg >= 0 do
-                    cb = x86_emit_mov_rr(cb, rd as int, a as int)
-                    cb = x86_emit_or_rr(cb, rd as int, breg as int)
+                or_dst = rd
+                if or_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    or_dst = X86_RAX
+                end
+                if or_dst >= 0 and a >= 0 and breg >= 0 do
+                    if or_dst == breg and or_dst != a do
+                        cb = x86_emit_or_rr(cb, or_dst as int, a as int)
+                    else
+                        if or_dst != a do cb = x86_emit_mov_rr(cb, or_dst as int, a as int) end
+                        cb = x86_emit_or_rr(cb, or_dst as int, breg as int)
+                    end
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, or_dst)
                 end
             eif op == LirOp.Xor do
                 a = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg_x86(cb, ins_src2, assigned_phys, SCR2)
-                if rd >= 0 and a >= 0 and breg >= 0 do
-                    cb = x86_emit_mov_rr(cb, rd as int, a as int)
-                    cb = x86_emit_xor_rr(cb, rd as int, breg as int)
+                xor_dst = rd
+                if xor_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    xor_dst = X86_RAX
+                end
+                if xor_dst >= 0 and a >= 0 and breg >= 0 do
+                    if xor_dst == breg and xor_dst != a do
+                        cb = x86_emit_xor_rr(cb, xor_dst as int, a as int)
+                    else
+                        if xor_dst != a do cb = x86_emit_mov_rr(cb, xor_dst as int, a as int) end
+                        cb = x86_emit_xor_rr(cb, xor_dst as int, breg as int)
+                    end
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, xor_dst)
                 end
             eif op == LirOp.Shl do
                 a = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg_x86(cb, ins_src2, assigned_phys, SCR2)
-                if rd >= 0 and a >= 0 and breg >= 0 do
-                    cb = x86_emit_mov_rr(cb, rd as int, a as int)
+                shl_dst = rd
+                if shl_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    shl_dst = X86_RAX
+                end
+                if shl_dst >= 0 and a >= 0 and breg >= 0 do
                     cb = x86_emit_mov_rr(cb, X86_RCX, breg as int)
-                    cb = x86_emit_shl_cl(cb, rd as int)
+                    if shl_dst != a do cb = x86_emit_mov_rr(cb, shl_dst as int, a as int) end
+                    cb = x86_emit_shl_cl(cb, shl_dst as int)
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, shl_dst)
                 end
             eif op == LirOp.Shr do
                 a = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
                 breg = resolve_or_imm_reg_x86(cb, ins_src2, assigned_phys, SCR2)
-                if rd >= 0 and a >= 0 and breg >= 0 do
-                    cb = x86_emit_mov_rr(cb, rd as int, a as int)
+                shr_dst = rd
+                if shr_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    shr_dst = X86_RAX
+                end
+                if shr_dst >= 0 and a >= 0 and breg >= 0 do
                     cb = x86_emit_mov_rr(cb, X86_RCX, breg as int)
-                    cb = x86_emit_shr_cl(cb, rd as int)
+                    if shr_dst != a do cb = x86_emit_mov_rr(cb, shr_dst as int, a as int) end
+                    cb = x86_emit_shr_cl(cb, shr_dst as int)
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, shr_dst)
                 end
             eif op == LirOp.Not do
                 a = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
-                if rd >= 0 and a >= 0 do
-                    cb = x86_emit_mov_rr(cb, rd as int, a as int)
-                    cb = x86_emit_not_rr(cb, rd as int)
+                not_dst = rd
+                if not_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    not_dst = X86_RAX
+                end
+                if not_dst >= 0 and a >= 0 do
+                    cb = x86_emit_mov_rr(cb, not_dst as int, a as int)
+                    cb = x86_emit_not_rr(cb, not_dst as int)
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, not_dst)
                 end
             eif op == LirOp.Pow do
                 a_pow = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
@@ -54202,6 +54295,9 @@ func emit_lir_x86_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, lir
                     if a_pow >= 0 and a_pow != X86_RDI do cb = x86_emit_mov_rr(cb, X86_RDI, a_pow as int) end
                 end
                 cb = emit_call_fixup_x86(cb, call_fixups, 1, LIR_RT_POW, rd)
+                if rd < 0 do
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, X86_RAX)
+                end
             eif op == LirOp.MatMul or op == LirOp.Fma do
                 a_dot = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
                 b_dot = resolve_or_imm_reg_x86(cb, ins_src2, assigned_phys, SCR2)
@@ -54559,8 +54655,13 @@ func emit_lir_x86_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, lir
                 if a >= 0 and breg >= 0 do
                     cb = x86_emit_cmp_rr(cb, a as int, breg as int)
                 end
-                if rd >= 0 do
-                    cb = emit_setcc(cb, rd as int, ins_aux)
+                cmp_dst = rd
+                if cmp_dst < 0 and (ins_dst as i64) != 0 and native_read_i64(ins_dst as i64, 0) == 4 do
+                    cmp_dst = X86_RAX
+                end
+                if cmp_dst >= 0 do
+                    cb = emit_setcc(cb, cmp_dst as int, ins_aux)
+                    cb = store_spilled_result_x86(cb, ins_dst as LirOperand, cmp_dst)
                 end
             eif op == LirOp.Load do
                 load_base = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR)
@@ -54603,6 +54704,13 @@ func emit_lir_x86_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, lir
                 pending_stk = emit_lir_call_x86(cb, ins, rd, func_obj, lir_funcs, call_fixups, pending_stk, assigned_phys)
             eif op == LirOp.Intrinsic do
                 cb = emit_lir_intrinsic_x86(cb, ins, rd, rs1, assigned_phys, call_fixups, func_obj, str_fixups, recent_setargs, lir_funcs)
+                if pending_stk > 0 do
+                    let bytes = pending_stk * 8
+                    if bytes > 0 and bytes <= 4096 do
+                        cb = x86_emit_add_rsp_imm(cb, bytes)
+                    end
+                    pending_stk = 0
+                end
             eif op == LirOp.Jmp do
                 tgt = 0 - 1
                 if (ins_src1 as i64) != 0 do
@@ -54651,6 +54759,13 @@ func emit_lir_x86_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, lir
                     if src1_typ == 5 do # Imm
                         imm_val = native_read_i64(ins_src1 as i64, 32)
                         cb = x86_emit_mov_reg_imm64(cb, X86_RAX, imm_val as int)
+                    eif src1_typ == 4 do # StackMem reload
+                        off = native_read_i64(ins_src1 as i64, 24)
+                        if off < 0 do
+                            cb = x86_emit_mov_reg_imm32(cb, SCR as int, off as int)
+                            cb = x86_emit_add_rr(cb, SCR as int, X86_RBP)
+                            cb = x86_emit_mov_reg_mem(cb, X86_RAX, SCR as int, 0)
+                        end
                     eif rs1 >= 0 and rs1 != X86_RAX do
                         cb = x86_emit_mov_rr(cb, X86_RAX, rs1 as int)
                     eif src1_typ == 0 do
@@ -54801,6 +54916,7 @@ func emit_lir_module_x86_64(lir_funcs: i64):
     # at [initial RSP + 8]. RBP is initial RSP - 8 after the prologue above.
     cb = x86_emit_mov_reg_mem(cb, X86_RAX, X86_RBP, 8)
     cb = x86_emit_mov_mem_reg(cb, X86_R15, 8, X86_RAX)
+    cb = x86_emit_mov_rr(cb, X86_RAX, X86_RBP)
     cb = x86_emit_mov_reg_imm32(cb, SCR as int, 16)
     cb = x86_emit_add_rr(cb, X86_RAX, SCR as int)
     cb = x86_emit_mov_mem_reg(cb, X86_R15, 16, X86_RAX)
@@ -62884,6 +63000,31 @@ func emit_lir_module_riscv64(lir_funcs: i64):
                             print_str("virc: linker error: unresolved function address: missing symbol operand\n")
                             sys_exit(1)
                         end
+                    eif kind == (MIR_INTR_PRINT as int) or kind == 2 do
+                        if lir_opnd_type(s1) == (LirOperandType.Imm as int) do
+                            cb = rv_emit_li(cb, RV_A0, lir_opnd_imm_val(s1))
+                        eif lir_opnd_type(s1) == (LirOperandType.VRegInt as int) do
+                            let s1_off = 0 - (32 + (lir_opnd_vreg(s1) * 8))
+                            cb = codebuf_emit_u32(cb, rv_ld(RV_A0, RV_S0, s1_off))
+                        end
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_SP, RV_SP, 0 - 32))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_T0, RV_ZERO, 10))
+                        cb = codebuf_emit_u32(cb, rv_sb(RV_T0, RV_SP, 31))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_T1, RV_SP, 31))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_T2, RV_ZERO, 10))
+                        cb = codebuf_emit_u32(cb, rv_rem(RV_T3, RV_A0, RV_T2))
+                        cb = codebuf_emit_u32(cb, rv_div(RV_A0, RV_A0, RV_T2))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_T3, RV_T3, 48))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_T1, RV_T1, 0 - 1))
+                        cb = codebuf_emit_u32(cb, rv_sb(RV_T3, RV_T1, 0))
+                        cb = codebuf_emit_u32(cb, rv_bne(RV_A0, RV_ZERO, 0 - 20))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_A2, RV_SP, 32))
+                        cb = codebuf_emit_u32(cb, rv_sub(RV_A2, RV_A2, RV_T1))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_A1, RV_T1, 0))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_A0, RV_ZERO, 1))
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_A7, RV_ZERO, 64))
+                        cb = codebuf_emit_u32(cb, rv_ecall())
+                        cb = codebuf_emit_u32(cb, rv_addi(RV_SP, RV_SP, 32))
                     else
                         rv_lir_unsupported(op, kind)
                     end
@@ -67674,7 +67815,7 @@ import vec_len, vec_get from vec
 # Configuration
 # ═══════════════════════════════════════════════════════
 
-const VERSION = "virc 3.8.0 (self-hosted)"
+const VERSION = "virc 3.8.1 (self-hosted)"
 
 entity CompilerConfig:
     input_path:     int;    # string pointer
@@ -67882,7 +68023,7 @@ func parse_args:
     when a < argc loop
         let cur = get_arg(a)
         if rt_streq(cur, "--version") or rt_streq(cur, "-v") do
-            print_ln("virc 3.8.0 (self-hosted)")
+            print_ln("virc 3.8.1 (self-hosted)")
             sys_exit(0)
         end
         if rt_streq(cur, "--help") or rt_streq(cur, "-h") do
@@ -68026,7 +68167,7 @@ func parse_args:
             g_phase_timings = 1
 
         eif rt_streq(arg, "-v") or rt_streq(arg, "--version") do
-            print_ln("virc 3.8.0 (self-hosted)")
+            print_ln("virc 3.8.1 (self-hosted)")
             sys_exit(0)
 
         eif rt_streq(arg, "-h") or rt_streq(arg, "--help") do
@@ -68605,7 +68746,7 @@ end.
 func virc_print_banner:
     print_ln("====================================")
     print_ln("  virc — Vir Self-Hosting Compiler")
-    print_ln("  v3.8.0 — Multi-Target SIMD, Arena & Safe MC Pipeline")
+    print_ln("  v3.8.1 — Multi-Target SIMD, Arena & Safe MC Pipeline")
     print_ln("====================================")
 end.
 
