@@ -300,6 +300,62 @@ run_ufcs_mc_target() {
     TOTAL_FAIL=$((TOTAL_FAIL+1))
 }
 
+run_ufcs_mc_wasm() {
+    local g=11
+    local wasm_fixture="tests/strict_v2/ufcs_riscv_unresolved_e2e.vri"
+    local fc_wasm_call="./scratch/fc_call_wasm.wasm"
+    rm -f "$fc_wasm_call"
+    local fc_wcall_out
+    fc_wcall_out=$($VIRC "$wasm_fixture" --target wasm32 --mutate-mir=unresolved_direct_call -o "$fc_wasm_call" 2>&1)
+    local fc_wcall_rc=$?
+    if [ $fc_wcall_rc -eq 0 ] || [ -e "$fc_wasm_call" ] || ! echo "$fc_wcall_out" | grep -Fq "unresolved direct function call"; then
+        echo "  [FAIL-MC] UFCS wasm32 fail-closed unresolved direct call (rc=$fc_wcall_rc)"
+        if [ -n "$fc_wcall_out" ]; then echo "    $fc_wcall_out"; fi
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+        TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+
+    local fc_wasm_addr="./scratch/fc_addr_wasm.wasm"
+    rm -f "$fc_wasm_addr"
+    local fc_waddr_out
+    fc_waddr_out=$($VIRC "$wasm_fixture" --target wasm32 --mutate-mir=unresolved_addr_of -o "$fc_wasm_addr" 2>&1)
+    local fc_waddr_rc=$?
+    if [ $fc_waddr_rc -eq 0 ] || [ -e "$fc_wasm_addr" ] || ! echo "$fc_waddr_out" | grep -Fq "unresolved function address"; then
+        echo "  [FAIL-MC] UFCS wasm32 fail-closed unresolved address-of (rc=$fc_waddr_rc)"
+        if [ -n "$fc_waddr_out" ]; then echo "    $fc_waddr_out"; fi
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+        TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+
+    echo "  [PASS-MC] UFCS wasm32 backend fail-closed"
+    GP_PASS[$g]=$((GP_PASS[$g]+1))
+    TOTAL_PASS=$((TOTAL_PASS+1))
+}
+
+run_ufcs_opt_matrix() {
+    local g=11
+    local opt
+    for opt in -O0 -O1 -O2 -O3; do
+        local fc_opt_bin="./scratch/fc_opt_${opt}.out"
+        rm -f "$fc_opt_bin"
+        local fc_opt_out
+        fc_opt_out=$($VIRC "tests/strict_v2/ufcs_cross_type_chain_e2e.vri" "$opt" --mutate-mir=unresolved_direct_call -o "$fc_opt_bin" 2>&1)
+        local fc_opt_rc=$?
+        if [ $fc_opt_rc -eq 0 ] || [ -e "$fc_opt_bin" ] || ! echo "$fc_opt_out" | grep -Fq "unresolved direct function call"; then
+            echo "  [FAIL-MC] UFCS $opt fail-closed unresolved direct call (rc=$fc_opt_rc)"
+            if [ -n "$fc_opt_out" ]; then echo "    $fc_opt_out"; fi
+            GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+            TOTAL_FAIL=$((TOTAL_FAIL+1))
+            return
+        fi
+    done
+    echo "  [PASS-MC] UFCS optimization matrix (-O0..-O3) fail-closed"
+    GP_PASS[$g]=$((GP_PASS[$g]+1))
+    TOTAL_PASS=$((TOTAL_PASS+1))
+}
+
 run_enum_mc_target() {
     local g=8
     local target="$1"
@@ -1015,6 +1071,7 @@ run_group_11() {
         run_test_in_group 11 "tests/bootstrap_codegen/cg_ufcs_strict_resolution.vri"
         run_test_in_group 11 "tests/strict_v2/backend_unresolved_structural_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_riscv_unresolved_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_module_root_collision_e2e.vri"
     else
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
@@ -1049,11 +1106,14 @@ run_group_11() {
         run_test_in_group 11 "tests/bootstrap_codegen/cg_ufcs_strict_resolution.vri"
         run_test_in_group 11 "tests/strict_v2/backend_unresolved_structural_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_riscv_unresolved_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_module_root_collision_e2e.vri"
         run_test_in_group 11 "tests/vri/test_ufcs.vri"
     fi
     run_ufcs_mc_target "linux-arm64"
     run_ufcs_mc_target "linux-x86_64"
     run_ufcs_mc_target "linux-riscv64"
+    run_ufcs_mc_wasm
+    run_ufcs_opt_matrix
     local pass_cnt=${GP_PASS[11]}
     local fail_cnt=${GP_FAIL[11]}
     local total_cnt=$((pass_cnt + fail_cnt))
