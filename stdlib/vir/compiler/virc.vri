@@ -8124,7 +8124,8 @@ enum AstType:
     PercentExpr     = 116,   # Spec §10.1 postfix percent (e.g. 10% == 0.1)
     SizeofExpr      = 117,   # Spec §4.4 / §7.3 sizeof(Type) operator
     OutParam        = 119,   # Spec §14 parameter mode Out
-    SwizzleAssign   = 120    # Spec §24.2 swizzle write-mask: v~mask = expr
+    SwizzleAssign   = 120,   # Spec §24.2 swizzle write-mask: v~mask = expr
+    VarDeclGroup    = 121    # Grouped var/let/const declaration list
 end.
 
 enum ParamMode:
@@ -8662,24 +8663,27 @@ entity Parser:
         token_count:    int,
         error_msg:          string,
         error_line:     int,
-        builtins:       int
+        builtins:       int,
+        error_col:      int
 end.
 func parser_new(tokens: int):
 
     tc = vec_len_rt(tokens)
     held_toks = tokens
     bi = build_builtins()
-    p = page_alloc(48)
+    p = page_alloc(56)
     native_write_i64(p, 0, held_toks)
     native_write_i64(p, 8, 0)
     native_write_i64(p, 16, tc)
     native_write_i64(p, 24, "" as i64)
     native_write_i64(p, 32, 0)
     native_write_i64(p, 40, bi)
+    native_write_i64(p, 48, 0)
     pp = p as Parser
     pp.error_msg = ""
     pp.error_line = 0
     pp.builtins = bi
+    pp.error_col = 0
     out pp
 end.
 # ═══════════════════════════════════════════════════════
@@ -8704,6 +8708,21 @@ func parse_error(ref p: Parser, msg: string):
         # identify the root error rather than a cascading EOF diagnostic.
         if p.error_line == 0 do
             p.error_line = t.line
+            p.error_col = t.col
+        end
+    end
+    out p
+end.
+func parse_error_loc(ref p: Parser, msg: string, line: int, col: int):
+
+    first_error = p.error_line == 0
+    p = parse_error(p, msg)
+    if first_error do
+        if line > 0 do
+            p.error_line = line
+        end
+        if col > 0 do
+            p.error_col = col
         end
     end
     out p
@@ -9850,13 +9869,24 @@ func parse_expr_bp(ref p: Parser, min_bp: int):
     var (p2, left) = parse_unary(p)
     pratt_more = true
     when pratt_more loop
-        p2 = skip_newlines(p2)
-        op_t = peek(p2)
-        tt = op_t.tok_type
-        lbp = infix_bp_left(tt)
-        if lbp < min_bp do
-            pratt_more = false
-        eif tt == TokType.As or tt == TokType.Cast do
+        var p_scan = p2
+        if check(p_scan, TokType.Newline) do
+            p_scan = skip_newlines(p_scan)
+            let tok = peek(p_scan)
+            let cand_lbp = infix_bp_left(tok.tok_type)
+            if cand_lbp < min_bp or (cand_lbp == 0 and tok.tok_type != TokType.As and tok.tok_type != TokType.Cast) do
+                pratt_more = false
+            else
+                p2 = p_scan
+            end
+        end
+        if pratt_more do
+            op_t = peek(p2)
+            tt = op_t.tok_type
+            lbp = infix_bp_left(tt)
+            if lbp < min_bp do
+                pratt_more = false
+            eif tt == TokType.As or tt == TokType.Cast do
             # Cast binds tighter than the following lower-precedence operator.
             # Keep the Pratt loop running so `(x as int and mask)` consumes
             # `and mask` instead of returning with `and` before `)`.
@@ -9887,6 +9917,7 @@ func parse_expr_bp(ref p: Parser, min_bp: int):
             p2 = p4
         else
             pratt_more = false
+        end
         end
     end
     out (p2, left)
@@ -10280,8 +10311,7 @@ func parse_var_decl_single(ref p: Parser, is_const: bool):
         if matched do
             var (p7, init) = parse_expr(p6)
             decl = ast_add_child(decl, init)
-            var (p8, _) = match_tok(p7, TokType.Semicolon)
-            out (p8, decl)
+            out (p7, decl)
         end
         out (p2, decl)
     end
@@ -10312,6 +10342,7 @@ func parse_var_decl_single(ref p: Parser, is_const: bool):
     decl_name = name_tok.str_val
     decl.name = decl_name
     decl.line = name_tok.line
+    decl.int_val = name_tok.col
 
     p3 = p2
     # Type annotation: x: int = 10. Parser handles are mutable, so decide
@@ -10351,66 +10382,186 @@ func parse_var_decl_single(ref p: Parser, is_const: bool):
         # ast_add_child corrupts soft .name/.name2 — restore for lowering / var map.
         decl.name = decl_name
         decl.name2 = saved_name2
-        # Skip optional semicolon
-        var (p6, _) = match_tok(p5, TokType.Semicolon)
-        out (p6, decl)
+        out (p5, decl)
     end
     decl.name = decl_name
     out (p3, decl)
 end.
-func parse_var_decl(ref p: Parser, is_const: bool):
-
-    p = skip_newlines(p)
-    var (p2, first_decl) = parse_var_decl_single(p, is_const)
-
-    p_curr = p2
-    block = ast_new(AstType.Block)
-    block = ast_add_child(block, first_decl)
-    count = 1
-
-    when true loop
-        var has_sep = false
-        var (p_sep, had_comma) = match_tok(p_curr, TokType.Comma)
-        if had_comma do
-            has_sep = true
-            p_curr = p_sep
-        else
-            var (p_sep2, had_semi) = match_tok(p_curr, TokType.Semicolon)
-            if had_semi do
-                has_sep = true
-                p_curr = p_sep2
+func is_destruct_decl_ahead(ref p: Parser) -> bool:
+    if not check(p, TokType.LParen) do
+        out false
+    end
+    var offset = 1
+    var depth = 1
+    when (p.pos + offset) < p.token_count loop
+        let t = peek_n(p, offset)
+        if t.tok_type == TokType.Eof or t.tok_type == TokType.End do
+            out false
+        eif t.tok_type == TokType.LParen do
+            depth = depth + 1
+        eif t.tok_type == TokType.RParen do
+            depth = depth - 1
+            if depth == 0 do
+                let t_after = peek_n(p, offset + 1)
+                if t_after.tok_type == TokType.Assign do
+                    out true
+                end
+                out false
             end
         end
-        if not has_sep do
+        offset = offset + 1
+    end
+    out false
+end.
+func parse_var_decl(ref p: Parser, is_const: bool, kw_col: int, kw_line: int):
+
+    var is_newline_block = false
+    if check(p, TokType.Newline) do
+        is_newline_block = true
+    end
+    p = skip_newlines(p)
+
+    if check(p, TokType.Eof) do
+        p = parse_error(p, "unexpected end of file in declaration")
+        out (p, ast_new(AstType.VarDecl))
+    end
+
+    let tok = peek(p)
+    if is_newline_block and tok.col <= kw_col do
+        p = parse_error_at(p, "expected declaration indented after keyword", tok.line)
+        out (p, ast_new(AstType.VarDecl))
+    end
+
+    var (p2, first_decl) = parse_var_decl_single(p, is_const)
+    if p2.error_line > 0 do
+        out (p2, first_decl)
+    end
+
+    var last_decl_line = first_decl.line
+
+    var group = ast_new(AstType.VarDeclGroup)
+    group.line = kw_line
+    group = ast_add_child(group, first_decl)
+    var count = 1
+    var p_curr = p2
+
+    when true loop
+        # 1. Comma is NOT a declaration separator (Spec v2.0 §1.0)
+        if check(p_curr, TokType.Comma) do
+            let tok = peek(p_curr)
+            let tok_next = peek_n(p_curr, 1)
+            var is_decl_continuation = false
+            if not is_reserved_keyword(tok_next.tok_type) do
+                if tok_next.tok_type == TokType.Ident or tok_next.tok_type == TokType.PtrKw or tok_next.tok_type == TokType.LParen do
+                    is_decl_continuation = true
+                end
+            end
+            if is_decl_continuation do
+                p_curr = parse_error_loc(p_curr, "[E1001] comma is not allowed as declaration separator; use newline or ';'", tok.line, tok.col)
+                break
+            end
+            var (p_comma, _) = advance(p_curr)
+            p_curr = p_comma
             break
         end
 
-        p_next = skip_newlines(p_curr)
+        # 2. Check for separator: semicolon and/or newline
+        var had_semi = false
+        if check(p_curr, TokType.Semicolon) do
+            had_semi = true
+            var (p_semi, _) = advance(p_curr)
+            p_curr = p_semi
+        end
 
-        if check(p_next, TokType.Ident) do
-            next_idx = p_next.pos + 1
-            if next_idx < p_next.token_count do
-                t2 = vec_get_rt(p_next.tokens, next_idx)
-                if t2.tok_type == TokType.Assign or t2.tok_type == TokType.Colon or t2.tok_type == TokType.Semicolon or t2.tok_type == TokType.Newline do
-                    var (p_sub, nxt_decl) = parse_var_decl_single(p_next, is_const)
-                    block = ast_add_child(block, nxt_decl)
-                    count = count + 1
-                    p_curr = p_sub
-                    skip
-                end
+        var had_newline = false
+        if check(p_curr, TokType.Newline) do
+            had_newline = true
+            p_curr = skip_newlines(p_curr)
+        end
+
+        let tok = peek(p_curr)
+        if tok.line > last_decl_line do
+            had_newline = true
+        end
+
+        if not had_semi and not had_newline do
+            break
+        end
+
+        # 3. Check for boundary tokens
+        if tok.tok_type == TokType.Eof or tok.tok_type == TokType.End or tok.tok_type == TokType.Else or tok.tok_type == TokType.Eif or tok.tok_type == TokType.EnsureKw or tok.tok_type == TokType.RevertKw do
+            break
+        end
+
+        # 4. Indentation / line boundary check
+        if had_newline do
+            if tok.col <= kw_col do
+                break
+            end
+        else
+            if tok.line != kw_line and tok.col <= kw_col do
+                break
             end
         end
-        break
+
+        # 5. Check if next token can start a declaration
+        if is_reserved_keyword(tok.tok_type) do
+            break
+        end
+
+        var can_start_decl = false
+        if tok.tok_type == TokType.LParen do
+            can_start_decl = is_destruct_decl_ahead(p_curr)
+        eif is_name_token(tok.tok_type) or tok.tok_type == TokType.Ident or tok.tok_type == TokType.PtrKw do
+            let tok_next = peek_n(p_curr, 1)
+            if tok_next.line == tok.line and (tok_next.tok_type == TokType.Assign or tok_next.tok_type == TokType.Colon) do
+                can_start_decl = true
+            end
+        end
+
+        if not can_start_decl do
+            break
+        end
+
+        # 6. Parse the next declaration
+        var (p_sub, nxt_decl) = parse_var_decl_single(p_curr, is_const)
+        if p_sub.error_line > 0 do
+            p_curr = p_sub
+            break
+        end
+
+        last_decl_line = nxt_decl.line
+
+        # 7. Check for duplicate declaration name within the same group
+        var is_dup = false
+        var d_i = 0
+        when d_i < vec_len_rt(group.children) loop
+            let prev_decl = vec_get_rt(group.children, d_i) as AstNode
+            if fat_str_eq(prev_decl.name, nxt_decl.name) == 1 do
+                is_dup = true
+            end
+            d_i = d_i + 1
+        end
+        if is_dup do
+            var dup_col = nxt_decl.int_val
+            if dup_col <= 0 do dup_col = 1 end
+            p_curr = parse_error_loc(p_curr, "[E1001] duplicate variable name in declaration group", nxt_decl.line, dup_col)
+            break
+        end
+
+        group = ast_add_child(group, nxt_decl)
+        count = count + 1
+        p_curr = p_sub
     end
 
     if count == 1 do
-        out (p2, first_decl)
+        out (p_curr, first_decl)
     end
-    out (p_curr, block)
+    out (p_curr, group)
 end.
-func parse_const_decl(ref p: Parser):
+func parse_const_decl(ref p: Parser, kw_col: int, kw_line: int):
 
-    var (p2, decl) = parse_var_decl(p, true)
+    var (p2, decl) = parse_var_decl(p, true, kw_col, kw_line)
     out (p2, decl)
 end.
 func parse_if_stmt(ref p: Parser):
@@ -10705,9 +10856,9 @@ func parse_case_stmt(ref p: Parser):
                         p5 = p_arm
                         body = ast_add_child(body, arm_stmt)
                     end
-                    when check(p5, TokType.Semicolon) loop
-                        var (p_semi, _) = advance(p5)
-                        p5 = p_semi
+                    when check(p5, TokType.Semicolon) or check(p5, TokType.Comma) loop
+                        var (p_sep, _) = advance(p5)
+                        p5 = p_sep
                     end
                     p5 = skip_newlines(p5)
                 end
@@ -12064,7 +12215,7 @@ func parse_statement(ref p: Parser):
         if check(p2, TokType.Var) or check(p2, TokType.Let) or check(p2, TokType.Const) do
             is_const = check(p2, TokType.Const) or check(p2, TokType.Let)
             var (p3, _) = advance(p2)
-            var (p4, vd) = parse_var_decl(p3, is_const)
+            var (p4, vd) = parse_var_decl(p3, is_const, t.col, t.line)
             n = ast_new(AstType.AtomicVarDecl)
             n.line = t.line
             n = ast_add_child(n, vd)
@@ -12079,9 +12230,9 @@ func parse_statement(ref p: Parser):
         var (p2, _) = advance(p)
         if check(p2, TokType.Var) do
             var (p3, _) = advance(p2)
-            out parse_var_decl(p3, false)
+            out parse_var_decl(p3, false, t.col, t.line)
         end
-        out parse_var_decl(p2, false)
+        out parse_var_decl(p2, false, t.col, t.line)
     end
 
     # `precomp:` / `precomp func` / `precomp if`
@@ -12373,17 +12524,17 @@ func parse_statement(ref p: Parser):
 
     if t.tok_type == TokType.Var do
         var (p2, _) = advance(p)
-        out parse_var_decl(p2, false)
+        out parse_var_decl(p2, false, t.col, t.line)
     end
 
     if t.tok_type == TokType.Const do
         var (p2, _) = advance(p)
-        out parse_const_decl(p2)
+        out parse_const_decl(p2, t.col, t.line)
     end
 
     if t.tok_type == TokType.Let do
         var (p2, _) = advance(p)
-        out parse_const_decl(p2)
+        out parse_const_decl(p2, t.col, t.line)
     end
 
     if t.tok_type == TokType.If do
@@ -13404,6 +13555,7 @@ func parse_program(ref p: Parser):
             end
             if p.error_line == 0 do
                 p.error_line = p2.error_line
+                p.error_col = p2.error_col
                 p.error_msg = p2.error_msg
             end
             var (p_adv, _) = advance(p)
@@ -13414,7 +13566,15 @@ func parse_program(ref p: Parser):
             end
         else
             p = p2
-            prog = ast_add_child(prog, stmt)
+            if stmt.node_type == AstType.VarDeclGroup do
+                var vi = 0
+                when vi < vec_len_rt(stmt.children) loop
+                    prog = ast_add_child(prog, vec_get_rt(stmt.children, vi))
+                    vi = vi + 1
+                end
+            else
+                prog = ast_add_child(prog, stmt)
+            end
         end
         # Skip optional trailing semicolons at top level
         when check(p, TokType.Semicolon) loop
@@ -15448,6 +15608,17 @@ func pass2_walk_node(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &Dia
         out 0
     end
 
+    if node.node_type == AstType.VarDeclGroup do
+        child_count = vec_len_rt(node.children)
+        var vi = 0
+        when vi < child_count loop
+            child = vec_get_rt(node.children, vi)
+            pass2_walk_node(symbols, scopes, diag, child)
+            vi = vi + 1
+        end
+        out 0
+    end
+
     if node.node_type == AstType.ExternFunc do
         if fat_str_len(node.name) > 0 do
             # Extern declarations carry a complete signature.  Count only
@@ -15542,11 +15713,12 @@ func pass2_register(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &Diag
             out found
         end
         # Expanded/multi-include: identical redeclare is idempotent (extern+func,
-        # duplicate consts across modules). Keep the first symbol.
-        if old_kind == kind do
+        # duplicate consts across modules) at global/module scope (curr_scope == 0).
+        # In local scopes (curr_scope > 0), same-scope redefinition is an error.
+        if curr_scope == 0 and old_kind == kind do
             out found
         end
-        if old_kind == SymbolKind.Func and kind == SymbolKind.Func do
+        if curr_scope == 0 and old_kind == SymbolKind.Func and kind == SymbolKind.Func do
             out found
         end
         report_error(diag, 1001, line, 0)
@@ -15616,7 +15788,7 @@ import SymbolTable, SymbolKind, SymbolNode, symbol_alloc from symbol_table
 
 import ScopeTree, ScopeKind, ScopeNode, scope_push, scope_pop, scope_add_symbol, scope_current_id from scope_tree
 
-import DiagnosticEngine, report_error, report_error_info from context
+import DiagnosticEngine, report_error, report_error_info, report_error_loc from context
 
 import print_str, print_int, print_newline from io
 
@@ -16222,6 +16394,27 @@ func pass3_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &Diagnost
         out 0
     end
 
+    if node.node_type == AstType.VarDeclGroup do
+        child_count = vec_len_rt(node.children)
+        var vi = 0
+        when vi < child_count loop
+            child = vec_get_rt(node.children, vi)
+            curr_scope = scope_current_id(scopes)
+            if curr_scope > 0 and fat_str_len(child.name) > 0 and not fat_str_eq(child.name, fat_str_new("_")) do
+                existing_sym = pass3_lookup_in_scope_exact(symbols, scopes, curr_scope, child.name)
+                if existing_sym != -1 do
+                    var col = child.int_val
+                    if col <= 0 do col = 1 end
+                    report_error_loc(diag, 1001, 0, child.line, col, "[E1001] duplicate variable name in scope")
+                    out 0
+                end
+            end
+            pass3_walk(symbols, scopes, diag, child)
+            vi = vi + 1
+        end
+        out 0
+    end
+
     if node.node_type == AstType.TryStmt do
         # `err` is an implicit variable bound to the thrown value inside the
         # revert handler. Register it for the whole try/revert scope.
@@ -16408,6 +16601,30 @@ func pass3_lookup_chain(ref symbols: SymbolTable, ref scopes: ScopeTree, start_s
     end
     out -1
 end.
+func pass3_lookup_in_scope_exact(ref symbols: SymbolTable, ref scopes: ScopeTree, scope_id: int, name: string):
+    if fat_str_len(name) == 0 do
+        out -1
+    end
+    if scope_id <= 0 do
+        out -1
+    end
+    scopes_vec = native_read_i64(scopes as i64, 0)
+    syms_vec = native_read_i64(symbols as i64, 0)
+    scope_node = vec_get_rt(scopes_vec, scope_id)
+    sym_list = native_read_i64(scope_node as i64, 16)
+    count = vec_len_rt(sym_list)
+    var i = 0
+    when i < count loop
+        sym_id = vec_get_rt(sym_list, i)
+        sym = vec_get_rt(syms_vec, sym_id)
+        sym_name = native_read_i64(sym as i64, 8) as string
+        if fat_str_eq(sym_name, name) == 1 do
+            out sym_id
+        end
+        i = i + 1
+    end
+    out -1
+end.
 func pass3_enclosing_func_scope(ref scopes: ScopeTree, curr_scope: int):
     if curr_scope <= 0 do
         out curr_scope
@@ -16539,6 +16756,17 @@ func pass4_resolve_type_name(name: string):
 end.
 func pass4_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, node: &AstNode):
     if node as i64 == 0 do
+        out 0
+    end
+
+    if node.node_type == AstType.VarDeclGroup do
+        child_count = vec_len_rt(node.children)
+        var vi = 0
+        when vi < child_count loop
+            child = vec_get_rt(node.children, vi)
+            pass4_walk(symbols, scopes, child)
+            vi = vi + 1
+        end
         out 0
     end
 
@@ -17023,6 +17251,17 @@ func pass5_infer_expr(ref symbols: SymbolTable, ref scopes: ScopeTree, node: &As
     out TypeKind.Void
 end.
 func pass5_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, node: &AstNode):
+
+    if node.node_type == AstType.VarDeclGroup do
+        child_count = vec_len_rt(node.children)
+        var vi = 0
+        when vi < child_count loop
+            child = vec_get_rt(node.children, vi)
+            pass5_walk(symbols, scopes, child)
+            vi = vi + 1
+        end
+        out 0
+    end
 
     if node.node_type == AstType.VarDecl or node.node_type == AstType.ConstDecl do
         child_count = vec_len_rt(node.children)
@@ -17846,6 +18085,10 @@ func pass6_types_compatible(declared: i64, actual: TypeKind):
         out 1
     end
     if actual == TypeKind.Bool and pass6_is_integer_like(declared as TypeKind) == 1 do
+        out 1
+    end
+    # Numeric widening: integer literals and values can be assigned to float variables.
+    if declared == TypeKind.Float as i64 and pass6_is_integer_like(actual) == 1 do
         out 1
     end
     if declared == TypeKind.Array as i64 and actual == TypeKind.Entity do
@@ -20667,6 +20910,12 @@ func pass6_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &Diagnost
             syms_vec = native_read_i64(symbols as i64, 0)
             sym = vec_get_rt(syms_vec, sid)
             native_write_i64(sym as i64, 32, node as i64)
+            if fat_str_len(node.name2) > 0 do
+                var declared_ty = pass6_resolve_ffi_type(node.name2)
+                if declared_ty != TypeKind.Void do
+                    native_write_i64(sym as i64, 16, declared_ty as i64)
+                end
+            end
             if fat_str_len(node.name2) > 0 and is_tensor_type_str(node.name2) do
                 native_write_i64(sym as i64, 16, TypeKind.Tensor as i64)
             eif fat_str_len(node.name2) > 0 and is_flux_type_str(node.name2 as int) do
@@ -20688,7 +20937,12 @@ func pass6_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &Diagnost
                 child0 = vec_get_rt(node.children, 0)
                 inferred = pass6_infer_type(symbols, scopes, child0)
                 if inferred != TypeKind.Void do
-                    native_write_i64(sym as i64, 16, inferred as i64)
+                    if sym.type_id != 0 and pass6_types_compatible(sym.type_id, inferred) == 0 do
+                        report_error(diag, 3007, node.line, 0)
+                    end
+                    if sym.type_id == 0 do
+                        native_write_i64(sym as i64, 16, inferred as i64)
+                    end
                 end
             end
         end
@@ -20752,6 +21006,17 @@ func pass6_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &Diagnost
         out 0
     end
 
+    if node.node_type == AstType.VarDeclGroup do
+        child_count = vec_len_rt(node.children)
+        var vi = 0
+        when vi < child_count loop
+            child = vec_get_rt(node.children, vi)
+            pass6_walk(symbols, scopes, diag, child)
+            vi = vi + 1
+        end
+        out 0
+    end
+
     if node.node_type == AstType.ConstDecl do
         child_count = vec_len_rt(node.children)
         var i = 0
@@ -20765,6 +21030,12 @@ func pass6_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &Diagnost
             syms_vec = native_read_i64(symbols as i64, 0)
             sym = vec_get_rt(syms_vec, sid)
             native_write_i64(sym as i64, 32, node as i64)
+            if fat_str_len(node.name2) > 0 do
+                var declared_ty = pass6_resolve_ffi_type(node.name2)
+                if declared_ty != TypeKind.Void do
+                    native_write_i64(sym as i64, 16, declared_ty as i64)
+                end
+            end
             if fat_str_len(node.name2) > 0 and is_tensor_type_str(node.name2) do
                 native_write_i64(sym as i64, 16, TypeKind.Tensor as i64)
             eif fat_str_len(node.name2) > 0 and is_flux_type_str(node.name2 as int) do
@@ -20786,7 +21057,12 @@ func pass6_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &Diagnost
                 child0 = vec_get_rt(node.children, 0)
                 inferred = pass6_infer_type(symbols, scopes, child0)
                 if inferred != TypeKind.Void do
-                    native_write_i64(sym as i64, 16, inferred as i64)
+                    if sym.type_id != 0 and pass6_types_compatible(sym.type_id, inferred) == 0 do
+                        report_error(diag, 3007, node.line, 0)
+                    end
+                    if sym.type_id == 0 do
+                        native_write_i64(sym as i64, 16, inferred as i64)
+                    end
                 end
             end
         end
@@ -22920,6 +23196,19 @@ func pass8_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &Diagnost
         out claimed
     end
 
+    if pass8_ast_type(node) == AstType.VarDeclGroup do
+        let child_count = vec_len_rt(pass8_ast_children(node))
+        var vi = 0
+        var claimed = 0
+        when vi < child_count loop
+            let child = vec_get_rt(pass8_ast_children(node), vi)
+            claimed = pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
+                                bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals)
+            vi = vi + 1
+        end
+        out claimed
+    end
+
     # 4. Variable / Constant Declaration (let x = init / var x = init)
     if pass8_ast_type(node) == AstType.VarDecl or pass8_ast_type(node) == AstType.ConstDecl do
         var claimed = 0
@@ -23742,6 +24031,20 @@ func pass9_eval_precomp_stmt(ctx: int, node: &AstNode):
     end
 
 
+    if node.node_type == AstType.VarDeclGroup do
+        let child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            if pass9_ctx_has_returned(ctx) == 1 or pass9_ctx_has_error(ctx) == 1 do
+                out 0
+            end
+            let child = vec_get_rt(node.children, i) as AstNode
+            pass9_eval_precomp_stmt(ctx, child)
+            i = i + 1
+        end
+        out 0
+    end
+
     pass9_eval_precomp_expr(ctx, node)
     out 0
 end.
@@ -23750,7 +24053,7 @@ func pass9_eval_precomp_node(ctx: int, node: &AstNode):
     if (node as i64) == 0 do
         out 0
     end
-    if node.node_type == AstType.Block or node.node_type == AstType.IfStmt or node.node_type == AstType.ReturnStmt or node.node_type == AstType.ThrowStmt or node.node_type == AstType.PrintStmt or node.node_type == AstType.VarDecl or node.node_type == AstType.Assign do
+    if node.node_type == AstType.Block or node.node_type == AstType.IfStmt or node.node_type == AstType.ReturnStmt or node.node_type == AstType.ThrowStmt or node.node_type == AstType.PrintStmt or node.node_type == AstType.VarDecl or node.node_type == AstType.Assign or node.node_type == AstType.VarDeclGroup do
         pass9_eval_precomp_stmt(ctx, node)
         out pass9_ctx_get_return_val(ctx)
     end
@@ -24083,7 +24386,7 @@ import DiagnosticEngine, DiagnosticLevel, Diagnostic from context
 
 import g_active_source_manager, sm_get_file_path, sm_get_span from source_manager
 
-import sys_getrusage, sys_platform, Platform from rt.syscall
+import sys_getrusage, sys_clock_gettime, sys_platform, Platform from rt.syscall
 
 extern func syscall2(num: int, a1: int, a2: int) -> int
 extern func syscall3(num: int, a1: int, a2: int, a3: int) -> int
@@ -24106,41 +24409,62 @@ var g_phase_link_us: int = 0
 
 func virc_timer_init():
     if g_time_buf_start == 0 do
-        g_time_buf_start = vir_alloc(16)
         let plat = sys_platform()
-        var clk = 1; # Linux CLOCK_MONOTONIC
         if plat == Platform.MacOS_ARM64 or plat == Platform.MacOS_x86_64 do
-            clk = 6; # macOS CLOCK_MONOTONIC
+            g_time_buf_start = vir_alloc(144)
+            sys_getrusage(0, g_time_buf_start)
+        else
+            g_time_buf_start = vir_alloc(16)
+            sys_clock_gettime(1, g_time_buf_start)
         end
-        sys_clock_gettime(clk, g_time_buf_start)
     end
 end.
 
 func virc_elapsed_us():
-    let buf = vir_alloc(16)
     let plat = sys_platform()
-    var clk = 1
     if plat == Platform.MacOS_ARM64 or plat == Platform.MacOS_x86_64 do
-        clk = 6
+        let buf = vir_alloc(144)
+        sys_getrusage(0, buf)
+        let u_sec = native_read_i64(buf, 0)
+        let u_usec = native_read_i64(buf, 8)
+        let s_sec = native_read_i64(buf, 16)
+        let s_usec = native_read_i64(buf, 24)
+        var st_u_sec = 0
+        var st_u_usec = 0
+        var st_s_sec = 0
+        var st_s_usec = 0
+        if g_time_buf_start != 0 do
+            st_u_sec = native_read_i64(g_time_buf_start, 0)
+            st_u_usec = native_read_i64(g_time_buf_start, 8)
+            st_s_sec = native_read_i64(g_time_buf_start, 16)
+            st_s_usec = native_read_i64(g_time_buf_start, 24)
+        end
+        let cur_us = (u_sec + s_sec) * 1000000 + u_usec + s_usec
+        let start_us = (st_u_sec + st_s_sec) * 1000000 + st_u_usec + st_s_usec
+        var total = cur_us - start_us
+        if total < 0 do total = 0 end
+        out total
+    else
+        let buf = vir_alloc(16)
+        sys_clock_gettime(1, buf)
+        let sec = native_read_i64(buf, 0)
+        let nsec = native_read_i64(buf, 8)
+        var s_sec = 0
+        var s_nsec = 0
+        if g_time_buf_start != 0 do
+            s_sec = native_read_i64(g_time_buf_start, 0)
+            s_nsec = native_read_i64(g_time_buf_start, 8)
+        end
+        var d_sec = sec - s_sec
+        var d_nsec = nsec - s_nsec
+        if d_nsec < 0 do
+            d_sec = d_sec - 1
+            d_nsec = d_nsec + 1000000000
+        end
+        var total = d_sec * 1000000 + (d_nsec / 1000)
+        if total < 0 do total = 0 end
+        out total
     end
-    sys_clock_gettime(clk, buf)
-    let sec = native_read_i64(buf, 0)
-    let nsec = native_read_i64(buf, 8)
-    var s_sec = 0
-    var s_nsec = 0
-    if g_time_buf_start != 0 do
-        s_sec = native_read_i64(g_time_buf_start, 0)
-        s_nsec = native_read_i64(g_time_buf_start, 8)
-    end
-    var d_sec = sec - s_sec
-    var d_nsec = nsec - s_nsec
-    if d_nsec < 0 do
-        d_sec = d_sec - 1
-        d_nsec = d_nsec + 1000000000
-    end
-    var total = d_sec * 1000000 + (d_nsec / 1000)
-    if total < 0 do total = 0 end
-    out total
 end.
 
 func virc_print_phase_timings():
@@ -24180,9 +24504,6 @@ func virc_print_compile_time():
     let total_us = virc_elapsed_us()
     var ms = total_us / 1000
     var frac = (total_us mod 1000) / 10
-    if ms == 0 and frac == 0 do
-        frac = 10
-    end
     virc_print_phase_timings()
     arena:
         var sb = sb_new()
@@ -32691,12 +33012,13 @@ func find_field_index_for_base(base_name: &string, field_name: &string):
         if fat_cstr_eq(field_name, "error_msg") == 1 do out 8 end
     end
 
-    # Parser entity fields (tokens:0, pos:1, token_count:2, error_msg:3, error_line:4, builtins:5)
+    # Parser entity fields (tokens:0, pos:1, token_count:2, error_msg:3, error_line:4, builtins:5, error_col:6)
     if fat_cstr_eq(field_name, "token_count") == 1 do out 2 end
     if fat_cstr_eq(field_name, "builtins") == 1 do out 5 end
     if fat_cstr_eq(field_name, "tokens") == 1 do out 0 end
     if fat_cstr_eq(field_name, "pos") == 1 do out 1 end
     if fat_cstr_eq(field_name, "error_line") == 1 do out 4 end
+    if fat_cstr_eq(field_name, "error_col") == 1 do out 6 end
     if fat_cstr_eq(field_name, "error_msg") == 1 do
         if fat_cstr_eq(base_name, "lex") == 1 or fat_cstr_eq(base_name, "lex2") == 1 or fat_cstr_eq(base_name, "l") == 1 do
             out 8
@@ -32714,7 +33036,7 @@ func find_field_index_for_base(base_name: &string, field_name: &string):
     # Token entity fields (tok_type:0, line:1, col:2, start:3, len:4, str_val:5, int_val:6, float_val:7)
     if fat_cstr_eq(field_name, "tok_type") == 1 do out 0 end
     if fat_cstr_eq(field_name, "str_val") == 1 do out 5 end
-    if fat_cstr_eq(base_name, "t") == 1 or fat_cstr_eq(base_name, "t2") == 1 or fat_cstr_eq(base_name, "t3") == 1 or fat_cstr_eq(base_name, "tok") == 1 or fat_cstr_eq(base_name, "op_tok") == 1 or fat_cstr_eq(base_name, "id_tok") == 1 or fat_cstr_eq(base_name, "name_tok") == 1 or fat_cstr_eq(base_name, "field_tok") == 1 or fat_cstr_eq(base_name, "count_tok") == 1 or fat_cstr_eq(base_name, "int_tok") == 1 or fat_cstr_eq(base_name, "hi_tok") == 1 or fat_cstr_eq(base_name, "it") == 1 or fat_cstr_eq(base_name, "st") == 1 or fat_cstr_eq(base_name, "cur") == 1 or fat_cstr_eq(base_name, "prev") == 1 or fat_cstr_eq(base_name, "vt") == 1 or fat_cstr_eq(base_name, "end_tok") == 1 or fat_cstr_eq(base_name, "val_tok") == 1 do
+    if fat_cstr_eq(base_name, "t") == 1 or fat_cstr_eq(base_name, "t2") == 1 or fat_cstr_eq(base_name, "t3") == 1 or fat_cstr_eq(base_name, "tok") == 1 or fat_cstr_eq(base_name, "op_tok") == 1 or fat_cstr_eq(base_name, "id_tok") == 1 or fat_cstr_eq(base_name, "name_tok") == 1 or fat_cstr_eq(base_name, "field_tok") == 1 or fat_cstr_eq(base_name, "count_tok") == 1 or fat_cstr_eq(base_name, "int_tok") == 1 or fat_cstr_eq(base_name, "hi_tok") == 1 or fat_cstr_eq(base_name, "it") == 1 or fat_cstr_eq(base_name, "st") == 1 or fat_cstr_eq(base_name, "cur") == 1 or fat_cstr_eq(base_name, "prev") == 1 or fat_cstr_eq(base_name, "vt") == 1 or fat_cstr_eq(base_name, "end_tok") == 1 or fat_cstr_eq(base_name, "val_tok") == 1 or fat_cstr_eq(base_name, "t_next") == 1 or fat_cstr_eq(base_name, "t_first") == 1 or fat_cstr_eq(base_name, "t_comma") == 1 or fat_cstr_eq(base_name, "last_tok") == 1 or fat_cstr_eq(base_name, "nxt_last_tok") == 1 or fat_cstr_eq(base_name, "tok_next") == 1 or fat_cstr_eq(base_name, "cand_t") == 1 do
         if fat_cstr_eq(field_name, "line") == 1 do out 1 end
         if fat_cstr_eq(field_name, "col") == 1 do out 2 end
         if fat_cstr_eq(field_name, "start") == 1 do out 3 end
@@ -32775,6 +33097,7 @@ func find_field_index(field_name: &string):
     if fat_cstr_eq(field_name, "pos") == 1 do out 2 end
     if fat_cstr_eq(field_name, "token_count") == 1 do out 3 end
     if fat_cstr_eq(field_name, "error_line") == 1 do out 4 end
+    if fat_cstr_eq(field_name, "error_col") == 1 do out 6 end
     if fat_cstr_eq(field_name, "tokens") == 1 do out 5 end
     if fat_cstr_eq(field_name, "paren_depth") == 1 do out 6 end
     if fat_cstr_eq(field_name, "builtins") == 1 do out 6 end
@@ -35766,6 +36089,18 @@ end.
 
 func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 	stmt_type = ast_node_type_of(stmt)
+
+	if stmt_type == AstType.VarDeclGroup do
+		child_count = ast_node_child_count(stmt)
+		var b_curr = b
+		var vi = 0
+		when vi < child_count loop
+			child = ast_node_child(stmt, vi)
+			b_curr = lower_stmt(b_curr, child)
+			vi = vi + 1
+		end
+		out b_curr
+	end
 
     # 1. VarDecl & ConstDecl
 	if stmt_type == AstType.VarDecl or stmt_type == AstType.ConstDecl do
@@ -66987,7 +67322,14 @@ func virc_compile(cfg: CompilerConfig):
     # after any error and must prevent semantic analysis of a partial AST.
     if parser2.error_line > 0 do
         var early_diag = diagnostic_engine_new()
-        report_error_loc(early_diag, 1001, 0, parser2.error_line, 1, parser2.error_msg as string)
+        var err_col = parser2.error_col
+        if err_col <= 0 do
+            err_col = native_read_i64(parser2 as i64, 48) as int
+        end
+        if err_col <= 0 do
+            err_col = 1
+        end
+        report_error_loc(early_diag, 1001, 0, parser2.error_line, err_col, parser2.error_msg as string)
         if g_diag_json == 1 do
             pass10_emit_json(early_diag)
         else

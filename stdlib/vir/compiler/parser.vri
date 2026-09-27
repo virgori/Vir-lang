@@ -163,7 +163,8 @@ enum AstType:
     PercentExpr     = 116,   # Spec §10.1 postfix percent (e.g. 10% == 0.1)
     SizeofExpr      = 117,   # Spec §4.4 / §7.3 sizeof(Type) operator
     OutParam        = 119,   # Spec §14 parameter mode Out
-    SwizzleAssign   = 120    # Spec §24.2 swizzle write-mask: v~mask = expr
+    SwizzleAssign   = 120,   # Spec §24.2 swizzle write-mask: v~mask = expr
+    VarDeclGroup    = 121    # Grouped var/let/const declaration list
 end.
 
 enum ParamMode:
@@ -701,24 +702,27 @@ entity Parser:
         token_count:    int,
         error_msg:          string,
         error_line:     int,
-        builtins:       int
+        builtins:       int,
+        error_col:      int
 end.
 func parser_new(tokens: int):
 
     tc = vec_len_rt(tokens)
     held_toks = tokens
     bi = build_builtins()
-    p = page_alloc(48)
+    p = page_alloc(56)
     native_write_i64(p, 0, held_toks)
     native_write_i64(p, 8, 0)
     native_write_i64(p, 16, tc)
     native_write_i64(p, 24, "" as i64)
     native_write_i64(p, 32, 0)
     native_write_i64(p, 40, bi)
+    native_write_i64(p, 48, 0)
     pp = p as Parser
     pp.error_msg = ""
     pp.error_line = 0
     pp.builtins = bi
+    pp.error_col = 0
     out pp
 end.
 # ═══════════════════════════════════════════════════════
@@ -743,6 +747,21 @@ func parse_error(ref p: Parser, msg: string):
         # identify the root error rather than a cascading EOF diagnostic.
         if p.error_line == 0 do
             p.error_line = t.line
+            p.error_col = t.col
+        end
+    end
+    out p
+end.
+func parse_error_loc(ref p: Parser, msg: string, line: int, col: int):
+
+    first_error = p.error_line == 0
+    p = parse_error(p, msg)
+    if first_error do
+        if line > 0 do
+            p.error_line = line
+        end
+        if col > 0 do
+            p.error_col = col
         end
     end
     out p
@@ -1889,13 +1908,24 @@ func parse_expr_bp(ref p: Parser, min_bp: int):
     var (p2, left) = parse_unary(p)
     pratt_more = true
     when pratt_more loop
-        p2 = skip_newlines(p2)
-        op_t = peek(p2)
-        tt = op_t.tok_type
-        lbp = infix_bp_left(tt)
-        if lbp < min_bp do
-            pratt_more = false
-        eif tt == TokType.As or tt == TokType.Cast do
+        var p_scan = p2
+        if check(p_scan, TokType.Newline) do
+            p_scan = skip_newlines(p_scan)
+            let tok = peek(p_scan)
+            let cand_lbp = infix_bp_left(tok.tok_type)
+            if cand_lbp < min_bp or (cand_lbp == 0 and tok.tok_type != TokType.As and tok.tok_type != TokType.Cast) do
+                pratt_more = false
+            else
+                p2 = p_scan
+            end
+        end
+        if pratt_more do
+            op_t = peek(p2)
+            tt = op_t.tok_type
+            lbp = infix_bp_left(tt)
+            if lbp < min_bp do
+                pratt_more = false
+            eif tt == TokType.As or tt == TokType.Cast do
             # Cast binds tighter than the following lower-precedence operator.
             # Keep the Pratt loop running so `(x as int and mask)` consumes
             # `and mask` instead of returning with `and` before `)`.
@@ -1926,6 +1956,7 @@ func parse_expr_bp(ref p: Parser, min_bp: int):
             p2 = p4
         else
             pratt_more = false
+        end
         end
     end
     out (p2, left)
@@ -2319,8 +2350,7 @@ func parse_var_decl_single(ref p: Parser, is_const: bool):
         if matched do
             var (p7, init) = parse_expr(p6)
             decl = ast_add_child(decl, init)
-            var (p8, _) = match_tok(p7, TokType.Semicolon)
-            out (p8, decl)
+            out (p7, decl)
         end
         out (p2, decl)
     end
@@ -2351,6 +2381,7 @@ func parse_var_decl_single(ref p: Parser, is_const: bool):
     decl_name = name_tok.str_val
     decl.name = decl_name
     decl.line = name_tok.line
+    decl.int_val = name_tok.col
 
     p3 = p2
     # Type annotation: x: int = 10. Parser handles are mutable, so decide
@@ -2390,66 +2421,186 @@ func parse_var_decl_single(ref p: Parser, is_const: bool):
         # ast_add_child corrupts soft .name/.name2 — restore for lowering / var map.
         decl.name = decl_name
         decl.name2 = saved_name2
-        # Skip optional semicolon
-        var (p6, _) = match_tok(p5, TokType.Semicolon)
-        out (p6, decl)
+        out (p5, decl)
     end
     decl.name = decl_name
     out (p3, decl)
 end.
-func parse_var_decl(ref p: Parser, is_const: bool):
-
-    p = skip_newlines(p)
-    var (p2, first_decl) = parse_var_decl_single(p, is_const)
-
-    p_curr = p2
-    block = ast_new(AstType.Block)
-    block = ast_add_child(block, first_decl)
-    count = 1
-
-    when true loop
-        var has_sep = false
-        var (p_sep, had_comma) = match_tok(p_curr, TokType.Comma)
-        if had_comma do
-            has_sep = true
-            p_curr = p_sep
-        else
-            var (p_sep2, had_semi) = match_tok(p_curr, TokType.Semicolon)
-            if had_semi do
-                has_sep = true
-                p_curr = p_sep2
+func is_destruct_decl_ahead(ref p: Parser) -> bool:
+    if not check(p, TokType.LParen) do
+        out false
+    end
+    var offset = 1
+    var depth = 1
+    when (p.pos + offset) < p.token_count loop
+        let t = peek_n(p, offset)
+        if t.tok_type == TokType.Eof or t.tok_type == TokType.End do
+            out false
+        eif t.tok_type == TokType.LParen do
+            depth = depth + 1
+        eif t.tok_type == TokType.RParen do
+            depth = depth - 1
+            if depth == 0 do
+                let t_after = peek_n(p, offset + 1)
+                if t_after.tok_type == TokType.Assign do
+                    out true
+                end
+                out false
             end
         end
-        if not has_sep do
+        offset = offset + 1
+    end
+    out false
+end.
+func parse_var_decl(ref p: Parser, is_const: bool, kw_col: int, kw_line: int):
+
+    var is_newline_block = false
+    if check(p, TokType.Newline) do
+        is_newline_block = true
+    end
+    p = skip_newlines(p)
+
+    if check(p, TokType.Eof) do
+        p = parse_error(p, "unexpected end of file in declaration")
+        out (p, ast_new(AstType.VarDecl))
+    end
+
+    let tok = peek(p)
+    if is_newline_block and tok.col <= kw_col do
+        p = parse_error_at(p, "expected declaration indented after keyword", tok.line)
+        out (p, ast_new(AstType.VarDecl))
+    end
+
+    var (p2, first_decl) = parse_var_decl_single(p, is_const)
+    if p2.error_line > 0 do
+        out (p2, first_decl)
+    end
+
+    var last_decl_line = first_decl.line
+
+    var group = ast_new(AstType.VarDeclGroup)
+    group.line = kw_line
+    group = ast_add_child(group, first_decl)
+    var count = 1
+    var p_curr = p2
+
+    when true loop
+        # 1. Comma is NOT a declaration separator (Spec v2.0 §1.0)
+        if check(p_curr, TokType.Comma) do
+            let tok = peek(p_curr)
+            let tok_next = peek_n(p_curr, 1)
+            var is_decl_continuation = false
+            if not is_reserved_keyword(tok_next.tok_type) do
+                if tok_next.tok_type == TokType.Ident or tok_next.tok_type == TokType.PtrKw or tok_next.tok_type == TokType.LParen do
+                    is_decl_continuation = true
+                end
+            end
+            if is_decl_continuation do
+                p_curr = parse_error_loc(p_curr, "[E1001] comma is not allowed as declaration separator; use newline or ';'", tok.line, tok.col)
+                break
+            end
+            var (p_comma, _) = advance(p_curr)
+            p_curr = p_comma
             break
         end
 
-        p_next = skip_newlines(p_curr)
+        # 2. Check for separator: semicolon and/or newline
+        var had_semi = false
+        if check(p_curr, TokType.Semicolon) do
+            had_semi = true
+            var (p_semi, _) = advance(p_curr)
+            p_curr = p_semi
+        end
 
-        if check(p_next, TokType.Ident) do
-            next_idx = p_next.pos + 1
-            if next_idx < p_next.token_count do
-                t2 = vec_get_rt(p_next.tokens, next_idx)
-                if t2.tok_type == TokType.Assign or t2.tok_type == TokType.Colon or t2.tok_type == TokType.Semicolon or t2.tok_type == TokType.Newline do
-                    var (p_sub, nxt_decl) = parse_var_decl_single(p_next, is_const)
-                    block = ast_add_child(block, nxt_decl)
-                    count = count + 1
-                    p_curr = p_sub
-                    skip
-                end
+        var had_newline = false
+        if check(p_curr, TokType.Newline) do
+            had_newline = true
+            p_curr = skip_newlines(p_curr)
+        end
+
+        let tok = peek(p_curr)
+        if tok.line > last_decl_line do
+            had_newline = true
+        end
+
+        if not had_semi and not had_newline do
+            break
+        end
+
+        # 3. Check for boundary tokens
+        if tok.tok_type == TokType.Eof or tok.tok_type == TokType.End or tok.tok_type == TokType.Else or tok.tok_type == TokType.Eif or tok.tok_type == TokType.EnsureKw or tok.tok_type == TokType.RevertKw do
+            break
+        end
+
+        # 4. Indentation / line boundary check
+        if had_newline do
+            if tok.col <= kw_col do
+                break
+            end
+        else
+            if tok.line != kw_line and tok.col <= kw_col do
+                break
             end
         end
-        break
+
+        # 5. Check if next token can start a declaration
+        if is_reserved_keyword(tok.tok_type) do
+            break
+        end
+
+        var can_start_decl = false
+        if tok.tok_type == TokType.LParen do
+            can_start_decl = is_destruct_decl_ahead(p_curr)
+        eif is_name_token(tok.tok_type) or tok.tok_type == TokType.Ident or tok.tok_type == TokType.PtrKw do
+            let tok_next = peek_n(p_curr, 1)
+            if tok_next.line == tok.line and (tok_next.tok_type == TokType.Assign or tok_next.tok_type == TokType.Colon) do
+                can_start_decl = true
+            end
+        end
+
+        if not can_start_decl do
+            break
+        end
+
+        # 6. Parse the next declaration
+        var (p_sub, nxt_decl) = parse_var_decl_single(p_curr, is_const)
+        if p_sub.error_line > 0 do
+            p_curr = p_sub
+            break
+        end
+
+        last_decl_line = nxt_decl.line
+
+        # 7. Check for duplicate declaration name within the same group
+        var is_dup = false
+        var d_i = 0
+        when d_i < vec_len_rt(group.children) loop
+            let prev_decl = vec_get_rt(group.children, d_i) as AstNode
+            if fat_str_eq(prev_decl.name, nxt_decl.name) == 1 do
+                is_dup = true
+            end
+            d_i = d_i + 1
+        end
+        if is_dup do
+            var dup_col = nxt_decl.int_val
+            if dup_col <= 0 do dup_col = 1 end
+            p_curr = parse_error_loc(p_curr, "[E1001] duplicate variable name in declaration group", nxt_decl.line, dup_col)
+            break
+        end
+
+        group = ast_add_child(group, nxt_decl)
+        count = count + 1
+        p_curr = p_sub
     end
 
     if count == 1 do
-        out (p2, first_decl)
+        out (p_curr, first_decl)
     end
-    out (p_curr, block)
+    out (p_curr, group)
 end.
-func parse_const_decl(ref p: Parser):
+func parse_const_decl(ref p: Parser, kw_col: int, kw_line: int):
 
-    var (p2, decl) = parse_var_decl(p, true)
+    var (p2, decl) = parse_var_decl(p, true, kw_col, kw_line)
     out (p2, decl)
 end.
 func parse_if_stmt(ref p: Parser):
@@ -2744,9 +2895,9 @@ func parse_case_stmt(ref p: Parser):
                         p5 = p_arm
                         body = ast_add_child(body, arm_stmt)
                     end
-                    when check(p5, TokType.Semicolon) loop
-                        var (p_semi, _) = advance(p5)
-                        p5 = p_semi
+                    when check(p5, TokType.Semicolon) or check(p5, TokType.Comma) loop
+                        var (p_sep, _) = advance(p5)
+                        p5 = p_sep
                     end
                     p5 = skip_newlines(p5)
                 end
@@ -4103,7 +4254,7 @@ func parse_statement(ref p: Parser):
         if check(p2, TokType.Var) or check(p2, TokType.Let) or check(p2, TokType.Const) do
             is_const = check(p2, TokType.Const) or check(p2, TokType.Let)
             var (p3, _) = advance(p2)
-            var (p4, vd) = parse_var_decl(p3, is_const)
+            var (p4, vd) = parse_var_decl(p3, is_const, t.col, t.line)
             n = ast_new(AstType.AtomicVarDecl)
             n.line = t.line
             n = ast_add_child(n, vd)
@@ -4118,9 +4269,9 @@ func parse_statement(ref p: Parser):
         var (p2, _) = advance(p)
         if check(p2, TokType.Var) do
             var (p3, _) = advance(p2)
-            out parse_var_decl(p3, false)
+            out parse_var_decl(p3, false, t.col, t.line)
         end
-        out parse_var_decl(p2, false)
+        out parse_var_decl(p2, false, t.col, t.line)
     end
 
     # `precomp:` / `precomp func` / `precomp if`
@@ -4412,17 +4563,17 @@ func parse_statement(ref p: Parser):
 
     if t.tok_type == TokType.Var do
         var (p2, _) = advance(p)
-        out parse_var_decl(p2, false)
+        out parse_var_decl(p2, false, t.col, t.line)
     end
 
     if t.tok_type == TokType.Const do
         var (p2, _) = advance(p)
-        out parse_const_decl(p2)
+        out parse_const_decl(p2, t.col, t.line)
     end
 
     if t.tok_type == TokType.Let do
         var (p2, _) = advance(p)
-        out parse_const_decl(p2)
+        out parse_const_decl(p2, t.col, t.line)
     end
 
     if t.tok_type == TokType.If do
@@ -5443,6 +5594,7 @@ func parse_program(ref p: Parser):
             end
             if p.error_line == 0 do
                 p.error_line = p2.error_line
+                p.error_col = p2.error_col
                 p.error_msg = p2.error_msg
             end
             var (p_adv, _) = advance(p)
@@ -5453,7 +5605,15 @@ func parse_program(ref p: Parser):
             end
         else
             p = p2
-            prog = ast_add_child(prog, stmt)
+            if stmt.node_type == AstType.VarDeclGroup do
+                var vi = 0
+                when vi < vec_len_rt(stmt.children) loop
+                    prog = ast_add_child(prog, vec_get_rt(stmt.children, vi))
+                    vi = vi + 1
+                end
+            else
+                prog = ast_add_child(prog, stmt)
+            end
         end
         # Skip optional trailing semicolons at top level
         when check(p, TokType.Semicolon) loop
