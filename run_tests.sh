@@ -515,6 +515,7 @@ run_group_4() {
         run_test_in_group 4 "tests/spec_gap_contract/generic_nested_bracket_split.vri"
         run_test_in_group 4 "tests/spec_gap_contract/generic_collision_disambiguation.vri"
         run_test_in_group 4 "tests/spec_gap_contract/generic_multi_unresolved_negative.vri"
+        run_test_in_group 4 "tests/test_void_value_lowering.vri"
     else
         run_test_in_group 4 "tests/test_adv_001_i64_max.vri"
         run_test_in_group 4 "tests/test_adv_009_bool_chain.vri"
@@ -553,6 +554,7 @@ run_group_4() {
         run_test_in_group 4 "tests/spec_gap_contract/generic_nested_bracket_split.vri"
         run_test_in_group 4 "tests/spec_gap_contract/generic_collision_disambiguation.vri"
         run_test_in_group 4 "tests/spec_gap_contract/generic_multi_unresolved_negative.vri"
+        run_test_in_group 4 "tests/test_void_value_lowering.vri"
     fi
     local pass_cnt=${GP_PASS[4]}
     local fail_cnt=${GP_FAIL[4]}
