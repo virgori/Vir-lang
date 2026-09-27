@@ -254,7 +254,41 @@ run_ufcs_mc_target() {
                     return
                 fi
             fi
-            echo "  [PASS-MC] UFCS $target assembly"
+
+            # Structural negative check: backend fail-closed on unresolved direct call and address-of
+            local mut_fixture="tests/strict_v2/ufcs_cross_type_chain_e2e.vri"
+            if [ "$target" = "linux-riscv64" ]; then
+                mut_fixture="tests/strict_v2/ufcs_riscv_unresolved_e2e.vri"
+            fi
+
+            local fc_bin="./scratch/fc_call_${target}.out"
+            rm -f "$fc_bin"
+            local fc_call_out
+            fc_call_out=$($VIRC "$mut_fixture" --target "$target" --mutate-mir=unresolved_direct_call -o "$fc_bin" 2>&1)
+            local fc_call_rc=$?
+            if [ $fc_call_rc -eq 0 ] || [ -e "$fc_bin" ] || ! echo "$fc_call_out" | grep -Fq "unresolved direct function call"; then
+                echo "  [FAIL-MC] UFCS $target fail-closed unresolved direct call (rc=$fc_call_rc)"
+                if [ -n "$fc_call_out" ]; then echo "    $fc_call_out"; fi
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+                TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+
+            # Structural negative check: backend fail-closed on unresolved address-of
+            local fc_addr_bin="./scratch/fc_addr_${target}.out"
+            rm -f "$fc_addr_bin"
+            local fc_addr_out
+            fc_addr_out=$($VIRC "$mut_fixture" --target "$target" --mutate-mir=unresolved_addr_of -o "$fc_addr_bin" 2>&1)
+            local fc_addr_rc=$?
+            if [ $fc_addr_rc -eq 0 ] || [ -e "$fc_addr_bin" ] || ! echo "$fc_addr_out" | grep -Fq "unresolved function address"; then
+                echo "  [FAIL-MC] UFCS $target fail-closed unresolved address-of (rc=$fc_addr_rc)"
+                if [ -n "$fc_addr_out" ]; then echo "    $fc_addr_out"; fi
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+                TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+
+            echo "  [PASS-MC] UFCS $target assembly & backend fail-closed"
             GP_PASS[$g]=$((GP_PASS[$g]+1))
             TOTAL_PASS=$((TOTAL_PASS+1))
             return
@@ -979,6 +1013,8 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_cross_type_chain_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_declaration_order_e2e.vri"
         run_test_in_group 11 "tests/bootstrap_codegen/cg_ufcs_strict_resolution.vri"
+        run_test_in_group 11 "tests/strict_v2/backend_unresolved_structural_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_riscv_unresolved_e2e.vri"
     else
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
@@ -1011,6 +1047,8 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_nested_reg_pressure_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_optional_chaining_rejected.vri"
         run_test_in_group 11 "tests/bootstrap_codegen/cg_ufcs_strict_resolution.vri"
+        run_test_in_group 11 "tests/strict_v2/backend_unresolved_structural_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_riscv_unresolved_e2e.vri"
         run_test_in_group 11 "tests/vri/test_ufcs.vri"
     fi
     run_ufcs_mc_target "linux-arm64"
