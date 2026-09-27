@@ -52,8 +52,8 @@ stdlib/vir/
 ├── prelude.vri                          # Std prelude (auto-import)
 ├── core/
 │   ├── types.vri                        # Primitives, limits, constants
-│   ├── option.vri                       # Option<T> = Some(T) | None
-│   ├── result.vri                       # Result<T, E> = Ok(T) | Err(E)
+│   ├── option.vri                       # Option(T) = Some(T) | None
+│   ├── result.vri                       # Result(T, E) = Ok(T) | Err(E)
 │   ├── ops.vri                          # Checked arithmetic
 │   └── bits.vri                         # Bit manipulation, popcount, clz
 ├── mem/
@@ -83,12 +83,12 @@ stdlib/vir/
 ├── env/
 │   └── env.vri                          # OS detection, env vars, signals
 ├── collections/
-│   ├── vec.vri                          # Vec<T> dynamic array
-│   ├── deque.vri                        # Deque<T>
+│   ├── vec.vri                          # Vec(T) dynamic array
+│   ├── deque.vri                        # Deque(T)
 │   ├── heap.vri                         # MinHeap<T> priority queue
 │   ├── ring.vri                         # RingBuffer<T>
-│   ├── map.vri                          # HashMap<K, V> (FNV-1a, open addressing)
-│   └── set.vri                          # HashSet<T>
+│   ├── map.vri                          # Map(K, V) (FNV-1a, open addressing)
+│   └── set.vri                          # Set(T)
 ├── error/
 │   └── error.vri                        # Error type, error chains
 ├── cli/
@@ -382,8 +382,8 @@ Phase A: Bootstrap        Phase B: Usable           Phase C: Production       Ph
 vir/core/
 ├── types.vri          # i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, bool, byte
 ├── limits.vri         # I8_MIN, I8_MAX, I64_MAX, U64_MAX, F64_EPSILON, F64_MAX
-├── option.vri         # Option<T> = Some(T) | None
-├── result.vri         # Result<T, E> = Ok(T) | Err(E)
+├── option.vri         # Option(T) = Some(T) | None
+├── result.vri         # Result(T, E) = Ok(T) | Err(E)
 ├── enum.vri           # Enum support macros / helpers
 ├── record.vri         # Record/struct helper (like dataclasses)
 ├── convert.vri        # to_i64(), to_f64(), to_str(), parse_int(), parse_float()
@@ -430,9 +430,9 @@ func unwrap(r: Result) -> giá_trị  # panic nếu Err
 func map(r: Result, f: func) -> Result
 
 # ops.vri (từ C23 <stdckdint.h>)
-func add_checked(a: i64, b: i64) -> Result<i64, OverflowError>
-func sub_checked(a: i64, b: i64) -> Result<i64, OverflowError>
-func mul_checked(a: i64, b: i64) -> Result<i64, OverflowError>
+func add_checked(a: i64, b: i64) -> Result(i64, OverflowError)
+func sub_checked(a: i64, b: i64) -> Result(i64, OverflowError)
+func mul_checked(a: i64, b: i64) -> Result(i64, OverflowError)
 
 # bits.vri (từ C23 <stdbit.h>)
 func count_ones(x: u64) -> u32  # popcount
@@ -550,9 +550,9 @@ func str_cmp(a: String, b: String) -> i32  # lexicographic
 func str_contains(haystack: String, needle: String) -> bool
 func str_starts_with(s: String, prefix: String) -> bool
 func str_ends_with(s: String, suffix: String) -> bool
-func str_find(s: String, needle: String) -> Option<u64>
-func str_split(s: String, delim: String) -> Vec<String>
-func str_join(parts: Vec<String>, sep: String) -> String
+func str_find(s: String, needle: String) -> Option(u64)
+func str_split(s: String, delim: String) -> Vec(String)
+func str_join(parts: Vec(String), sep: String) -> String
 func str_trim(s: String) -> String
 func str_to_upper(s: String) -> String
 func str_to_lower(s: String) -> String
@@ -603,12 +603,12 @@ vir/io/
 ```
 # traits.vri
 trait Reader
-  func read(buf: Slice) -> Result<u64, IoError>
+  func read(buf: Slice) -> Result(u64, IoError)
 end
 
 trait Writer
-  func write(data: Slice) -> Result<u64, IoError>
-  func flush() -> Result<(), IoError>
+  func write(data: Slice) -> Result(u64, IoError)
+  func flush() -> Result(void, IoError)
 end
 
 # stdio.vri
@@ -616,7 +616,7 @@ func print(s: String)  # write to stdout, no newline
 func println(s: String)  # write to stdout + newline
 func eprint(s: String)  # write to stderr
 func eprintln(s: String)  # write to stderr + newline
-func read_line() -> Result<String, IoError>  # read line from stdin
+func read_line() -> Result(String, IoError)  # read line from stdin
 
 # file.vri
 entity File
@@ -632,14 +632,14 @@ enum FileMode
   ReadWrite = 3
 end
 
-func file_open(path: String, mode: FileMode) -> Result<File, IoError>
-func file_read(f: File, buf: Slice) -> Result<u64, IoError>
-func file_read_all(f: File) -> Result<String, IoError>
-func file_write(f: File, data: Slice) -> Result<u64, IoError>
-func file_write_str(f: File, s: String) -> Result<u64, IoError>
-func file_close(f: File) -> Result<(), IoError>
-func file_seek(f: File, offset: i64, whence: SeekFrom) -> Result<u64, IoError>
-func file_size(f: File) -> Result<u64, IoError>
+func file_open(path: String, mode: FileMode) -> Result(File, IoError)
+func file_read(f: File, buf: Slice) -> Result(u64, IoError)
+func file_read_all(f: File) -> Result(String, IoError)
+func file_write(f: File, data: Slice) -> Result(u64, IoError)
+func file_write_str(f: File, s: String) -> Result(u64, IoError)
+func file_close(f: File) -> Result(void, IoError)
+func file_seek(f: File, offset: i64, whence: SeekFrom) -> Result(u64, IoError)
+func file_size(f: File) -> Result(u64, IoError)
 
 # format.vri
 func format(template: String, args: ...) -> String
@@ -669,10 +669,10 @@ end
 
 func path_new(s: String) -> Path
 func path_join(base: Path, child: String) -> Path
-func path_parent(p: Path) -> Option<Path>
-func path_filename(p: Path) -> Option<String>
-func path_stem(p: Path) -> Option<String>  # filename without extension
-func path_extension(p: Path) -> Option<String>
+func path_parent(p: Path) -> Option(Path)
+func path_filename(p: Path) -> Option(String)
+func path_stem(p: Path) -> Option(String)  # filename without extension
+func path_extension(p: Path) -> Option(String)
 func path_is_absolute(p: Path) -> bool
 func path_normalize(p: Path) -> Path
 func path_exists(p: Path) -> bool
@@ -802,9 +802,9 @@ vir/env/
 **API tối thiểu:**
 ```
 # vars.vri
-func get_env(key: String) -> Option<String>
+func get_env(key: String) -> Option(String)
 func set_env(key: String, val: String)
-func env_vars() -> Vec<(String, String)>
+func env_vars() -> Vec((String, String))
 
 # platform.vri
 enum OS
@@ -840,8 +840,8 @@ func abort()  # immediate abort
 
 ```
 vir/collections/
-├── vec.vri            # Vec<T> — dynamic array
-├── deque.vri          # Deque<T> — double-ended queue
+├── vec.vri            # Vec(T) — dynamic array
+├── deque.vri          # Deque(T) — double-ended queue
 ├── heap.vri           # MinHeap<T> — priority queue
 └── ring.vri           # RingBuffer<T> — fixed-size ring
 ```
@@ -941,7 +941,7 @@ vir/cli/
 entity ArgParser
   name: String
   description: String
-  args: Vec<ArgDef>
+  args: Vec(ArgDef)
 end
 
 entity ArgDef
@@ -950,22 +950,22 @@ entity ArgDef
   long: String           # "--verbose"
   help: String
   required: bool
-  default: Option<String>
+  default: Option(String)
 end
 
 entity ParsedArgs
-  positional: Vec<String>
-  flags: Map<String, String>
+  positional: Vec(String)
+  flags: Map(String, String)
 end
 
 func arg_parser_new(name: String, desc: String) -> ArgParser
 func arg_add(p: ArgParser, def: ArgDef)
-func arg_parse(p: ArgParser, argv: Vec<String>) -> Result<ParsedArgs, String>
-func arg_get(parsed: ParsedArgs, name: String) -> Option<String>
+func arg_parse(p: ArgParser, argv: Vec(String)) -> Result(ParsedArgs, String)
+func arg_get(parsed: ParsedArgs, name: String) -> Option(String)
 func arg_has(parsed: ParsedArgs, name: String) -> bool
 
 # shlex
-func shlex_split(s: String) -> Vec<String>
+func shlex_split(s: String) -> Vec(String)
 func shlex_quote(s: String) -> String
 ```
 
@@ -1001,7 +1001,7 @@ entity StackFrame
   line: u64
 end
 
-func capture_trace() -> Vec<StackFrame>
+func capture_trace() -> Vec(StackFrame)
 func print_trace()
 ```
 
@@ -1024,7 +1024,7 @@ func map_contains(m: Map, key) -> bool
 func map_len(m: Map) -> u64
 func map_keys(m: Map) -> Vec
 func map_values(m: Map) -> Vec
-func map_entries(m: Map) -> Vec<(key, value)>
+func map_entries(m: Map) -> Vec((key, value))
 func map_iter(m: Map) -> Iterator
 func map_free(m: Map)
 ```
@@ -1049,11 +1049,11 @@ enum JsonValue
   Bool(bool)
   Number(f64)
   Str(String)
-  Array(Vec<JsonValue>)
-  Object(Map<String, JsonValue>)
+  Array(Vec(JsonValue))
+  Object(Map(String, JsonValue))
 end
 
-func json_parse(s: String) -> Result<JsonValue, ParseError>
+func json_parse(s: String) -> Result(JsonValue, ParseError)
 func json_stringify(v: JsonValue) -> String
 func json_stringify_pretty(v: JsonValue, indent: u32) -> String
 ```
@@ -1064,33 +1064,33 @@ func json_stringify_pretty(v: JsonValue, indent: u32) -> String
 entity Regex  ...  end
 entity Match  start: u64; end: u64; text: String  end
 
-func regex_new(pattern: String) -> Result<Regex, ParseError>
+func regex_new(pattern: String) -> Result(Regex, ParseError)
 func regex_is_match(r: Regex, text: String) -> bool
-func regex_find(r: Regex, text: String) -> Option<Match>
-func regex_find_all(r: Regex, text: String) -> Vec<Match>
+func regex_find(r: Regex, text: String) -> Option(Match)
+func regex_find_all(r: Regex, text: String) -> Vec(Match)
 func regex_replace(r: Regex, text: String, repl: String) -> String
-func regex_split(r: Regex, text: String) -> Vec<String>
+func regex_split(r: Regex, text: String) -> Vec(String)
 ```
 
 ### 4.5. `vir/fs` — Filesystem
 
 ```
-func fs_read(path: Path) -> Result<String, IoError>
-func fs_read_bytes(path: Path) -> Result<Buffer, IoError>
-func fs_write(path: Path, content: String) -> Result<(), IoError>
-func fs_write_bytes(path: Path, data: Slice) -> Result<(), IoError>
-func fs_append(path: Path, content: String) -> Result<(), IoError>
-func fs_remove(path: Path) -> Result<(), IoError>
-func fs_rename(old: Path, new: Path) -> Result<(), IoError>
-func fs_copy(src: Path, dst: Path) -> Result<(), IoError>
-func fs_create_dir(path: Path) -> Result<(), IoError>
-func fs_create_dir_all(path: Path) -> Result<(), IoError>
-func fs_remove_dir(path: Path) -> Result<(), IoError>
-func fs_list_dir(path: Path) -> Result<Vec<DirEntry>, IoError>
-func fs_metadata(path: Path) -> Result<Metadata, IoError>
-func fs_temp_file() -> Result<File, IoError>
+func fs_read(path: Path) -> Result(String, IoError)
+func fs_read_bytes(path: Path) -> Result(Buffer, IoError)
+func fs_write(path: Path, content: String) -> Result(void, IoError)
+func fs_write_bytes(path: Path, data: Slice) -> Result(void, IoError)
+func fs_append(path: Path, content: String) -> Result(void, IoError)
+func fs_remove(path: Path) -> Result(void, IoError)
+func fs_rename(old: Path, new: Path) -> Result(void, IoError)
+func fs_copy(src: Path, dst: Path) -> Result(void, IoError)
+func fs_create_dir(path: Path) -> Result(void, IoError)
+func fs_create_dir_all(path: Path) -> Result(void, IoError)
+func fs_remove_dir(path: Path) -> Result(void, IoError)
+func fs_list_dir(path: Path) -> Result(Vec(DirEntry), IoError)
+func fs_metadata(path: Path) -> Result(Metadata, IoError)
+func fs_temp_file() -> Result(File, IoError)
 func fs_temp_dir() -> Path
-func fs_glob(pattern: String) -> Vec<Path>
+func fs_glob(pattern: String) -> Vec(Path)
 ```
 
 ### 4.6. `vir/process` — Process Control
@@ -1098,9 +1098,9 @@ func fs_glob(pattern: String) -> Vec<Path>
 ```
 entity Command
   program: String
-  args: Vec<String>
-  env: Map<String, String>
-  cwd: Option<Path>
+  args: Vec(String)
+  env: Map(String, String)
+  cwd: Option(Path)
 end
 
 entity Output
@@ -1113,10 +1113,10 @@ func cmd_new(program: String) -> Command
 func cmd_arg(c: Command, arg: String) -> Command
 func cmd_env(c: Command, key: String, val: String) -> Command
 func cmd_cwd(c: Command, dir: Path) -> Command
-func cmd_run(c: Command) -> Result<Output, IoError>
-func cmd_spawn(c: Command) -> Result<Process, IoError>
-func process_wait(p: Process) -> Result<i32, IoError>
-func process_kill(p: Process) -> Result<(), IoError>
+func cmd_run(c: Command) -> Result(Output, IoError)
+func cmd_spawn(c: Command) -> Result(Process, IoError)
+func process_wait(p: Process) -> Result(i32, IoError)
+func process_kill(p: Process) -> Result(void, IoError)
 func current_pid() -> u64
 ```
 
@@ -1170,8 +1170,8 @@ func fmt_oct(n: u64) -> String
 ```
 func sort(v: Vec, cmp: func)  # in-place, stable sort
 func sort_by_key(v: Vec, key: func)
-func binary_search(v: Vec, target) -> Option<u64>
-func binary_search_by(v: Vec, cmp: func) -> Option<u64>
+func binary_search(v: Vec, target) -> Option(u64)
+func binary_search_by(v: Vec, cmp: func) -> Option(u64)
 func is_sorted(v: Vec, cmp: func) -> bool
 ```
 
@@ -1281,8 +1281,8 @@ Phase B:                                                    │
 
 ```
  ①  vir/core/types       → kiểu cơ bản, limits
- ②  vir/core/option      → Option<T>
- ③  vir/core/result      → Result<T,E>
+ ②  vir/core/option      → Option(T)
+ ③  vir/core/result      → Result(T, E)
  ④  vir/core/ops         → checked arithmetic
  ⑤  vir/core/bits        → bit manipulation
  ⑥  vir/error            → Error trait + common errors
@@ -1340,7 +1340,7 @@ Mỗi module phải đạt:
 | Feature | Vir (target) | Rust (stdlib) | Go (stdlib) | Zig (stdlib) |
 |---------|-------------|---------------|-------------|-------------|
 | String | UTF-8, immutable | UTF-8, owned/borrowed | UTF-8, slice | UTF-8, slice |
-| Error | Result<T,E> | Result<T,E> | error interface | error union |
+| Error | Result(T, E) | Result(T, E) | error interface | error union |
 | Memory | Manual + arena | Ownership + borrow | GC | Allocator param |
 | Collections | Vec, Map, Set | Vec, HashMap, etc. | slice, map | ArrayList, HashMap |
 | Async | Future + EventLoop | async/await (tokio) | goroutines | async/await |
