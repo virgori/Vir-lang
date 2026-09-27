@@ -274,6 +274,20 @@ run_ufcs_mc_target() {
                 return
             fi
 
+            # Check -S emission fails closed and emits no assembly artifact
+            local fc_s="./scratch/fc_call_${target}.s"
+            rm -f "$fc_s"
+            local fc_s_out
+            fc_s_out=$($VIRC "$mut_fixture" --target "$target" --mutate-mir=unresolved_direct_call -S -o "$fc_s" 2>&1)
+            local fc_s_rc=$?
+            if [ $fc_s_rc -eq 0 ] || [ -e "$fc_s" ]; then
+                echo "  [FAIL-MC] UFCS $target -S emitted artifact on unresolved direct call (rc=$fc_s_rc)"
+                if [ -n "$fc_s_out" ]; then echo "    $fc_s_out"; fi
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+                TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+
             # Structural negative check: backend fail-closed on unresolved address-of
             local fc_addr_bin="./scratch/fc_addr_${target}.out"
             rm -f "$fc_addr_bin"
@@ -346,6 +360,19 @@ run_ufcs_opt_matrix() {
         if [ $fc_opt_rc -eq 0 ] || [ -e "$fc_opt_bin" ] || ! echo "$fc_opt_out" | grep -Fq "unresolved direct function call"; then
             echo "  [FAIL-MC] UFCS $opt fail-closed unresolved direct call (rc=$fc_opt_rc)"
             if [ -n "$fc_opt_out" ]; then echo "    $fc_opt_out"; fi
+            GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+            TOTAL_FAIL=$((TOTAL_FAIL+1))
+            return
+        fi
+
+        local fc_opt_s="./scratch/fc_opt_${opt}.s"
+        rm -f "$fc_opt_s"
+        local fc_opt_s_out
+        fc_opt_s_out=$($VIRC "tests/strict_v2/ufcs_cross_type_chain_e2e.vri" "$opt" --mutate-mir=unresolved_direct_call -S -o "$fc_opt_s" 2>&1)
+        local fc_opt_s_rc=$?
+        if [ $fc_opt_s_rc -eq 0 ] || [ -e "$fc_opt_s" ]; then
+            echo "  [FAIL-MC] UFCS $opt -S emitted artifact on unresolved direct call (rc=$fc_opt_s_rc)"
+            if [ -n "$fc_opt_s_out" ]; then echo "    $fc_opt_s_out"; fi
             GP_FAIL[$g]=$((GP_FAIL[$g]+1))
             TOTAL_FAIL=$((TOTAL_FAIL+1))
             return
@@ -1072,6 +1099,8 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/backend_unresolved_structural_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_riscv_unresolved_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_module_root_collision_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_module_order_ab_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_module_order_ba_rejected.vri"
     else
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
@@ -1107,6 +1136,8 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/backend_unresolved_structural_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_riscv_unresolved_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_module_root_collision_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_module_order_ab_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_module_order_ba_rejected.vri"
         run_test_in_group 11 "tests/vri/test_ufcs.vri"
     fi
     run_ufcs_mc_target "linux-arm64"
