@@ -811,6 +811,8 @@ run_group_7() {
         run_test_in_group 7 "tests/vri/test_adv_017_struct_fields.vri"
         run_test_in_group 7 "tests/strict_v2/packed_layout_mixed_width_e2e.vri"
         run_test_in_group 7 "tests/strict_v2/packed_missing_field_type_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/entity_field_access_valid.vri"
+        run_test_in_group 7 "tests/strict_v2/entity_brace_instantiation_rejected.vri"
     else
         run_test_in_group 7 "tests/vri/test_3vars.vri"
         run_test_in_group 7 "tests/vri/test_6vars.vri"
@@ -867,6 +869,8 @@ run_group_7() {
         run_test_in_group 7 "tests/strict_v2/packed_constructor_unknown_field_rejected.vri"
         run_test_in_group 7 "tests/strict_v2/packed_u8_overflow_rejected.vri"
         run_test_in_group 7 "tests/strict_v2/packed_u8_underflow_rejected.vri"
+        run_test_in_group 7 "tests/strict_v2/entity_field_access_valid.vri"
+        run_test_in_group 7 "tests/strict_v2/entity_brace_instantiation_rejected.vri"
     fi
     local pass_cnt=${GP_PASS[7]}
     local fail_cnt=${GP_FAIL[7]}
@@ -1779,6 +1783,7 @@ run_group_29() {
         run_test_in_group 29 "tests/strict_v2/diag_guidance_e5003_rejected.vri"
         run_test_in_group 29 "tests/strict_v2/diag_guidance_e5004_rejected.vri"
         run_test_in_group 29 "tests/strict_v2/diag_guidance_e5006_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e3008_rejected.vri"
     else
         run_test_in_group 29 "tests/test_kw_valid.vri"
         # Diagnostic guidance cause & action regression tests
@@ -1789,6 +1794,7 @@ run_group_29() {
         run_test_in_group 29 "tests/strict_v2/diag_guidance_e5003_rejected.vri"
         run_test_in_group 29 "tests/strict_v2/diag_guidance_e5004_rejected.vri"
         run_test_in_group 29 "tests/strict_v2/diag_guidance_e5006_rejected.vri"
+        run_test_in_group 29 "tests/strict_v2/diag_guidance_e3008_rejected.vri"
     fi
     local pass_cnt=${GP_PASS[29]}
     local fail_cnt=${GP_FAIL[29]}
