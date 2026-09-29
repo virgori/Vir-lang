@@ -120,16 +120,16 @@ semantics (today falls back to default).
 
 | ID | Symbol | Signature | Status | Impl |
 |---|---|---|---|---|
-| `env.get` | `env.get` | `env.get(key: string) -> Option(string)` | proposed | rename surface (drop free `get`) |
+| `env.get` | `env.get` | `env.get(key: string) -> Option of (string)` | proposed | rename surface (drop free `get`) |
 | `env.unwrapOr` | `env.unwrapOr` | `env.unwrapOr(key: string, fallback: string) -> string
 # SPEC wrote env.or — illegal identifier (`or` keyword); unwrapOr matches option/result` | proposed | was SPEC `env.or` (keyword) |
 | `env.has` | `env.has` | `env.has(key: string) -> bool` | proposed | present |
 | `env.set` | `env.set` | `env.set(key: string, value: string) -> Result` | proposed | void success · bare `Result` (A) |
 | `env.remove` | `env.remove` | `env.remove(key: string) -> Result` | proposed | void success · bare `Result` (A) |
-| `env.int` | `env.int` | `env.int(key: string) -> Option(int)` | proposed | change from default-arg |
-| `env.bool` | `env.bool` | `env.bool(key: string) -> Option(bool)` | proposed | change from default-arg |
-| `env.require` | `env.require` | `env.require(key: string) -> Result(string)` | proposed | present |
-| `env.args` | `env.args` | `env.args() -> Vec(string)` | proposed | present free → ns method |
+| `env.int` | `env.int` | `env.int(key: string) -> Option of (int)` | proposed | change from default-arg |
+| `env.bool` | `env.bool` | `env.bool(key: string) -> Option of (bool)` | proposed | change from default-arg |
+| `env.require` | `env.require` | `env.require(key: string) -> Result of (string)` | proposed | present |
+| `env.args` | `env.args` | `env.args() -> Vec of (string)` | proposed | present free → ns method |
 | `env.name` | `env.name` | `env.name() -> string` | proposed | rename `program_name` |
 | `env.cwd` | `env.cwd` | `env.cwd() -> string` | proposed | present |
 | `env.home` | `env.home` | `env.home() -> string` | proposed | rename `home_dir` |
@@ -147,7 +147,7 @@ previous: get
 -->
 
 ```vir
-env.get(key: string) -> Option(string)
+env.get(key: string) -> Option of (string)
 ```
 
 Look up environment variable `key`.
@@ -352,7 +352,7 @@ previous: int
 -->
 
 ```vir
-env.int(key: string) -> Option(int)
+env.int(key: string) -> Option of (int)
 ```
 
 Parse `key` as integer.
@@ -394,7 +394,7 @@ previous: bool
 -->
 
 ```vir
-env.bool(key: string) -> Option(bool)
+env.bool(key: string) -> Option of (bool)
 ```
 
 Parse `key` as boolean (accepted tokens above).
@@ -435,7 +435,7 @@ previous: require
 -->
 
 ```vir
-env.require(key: string) -> Result(string)
+env.require(key: string) -> Result of (string)
 ```
 
 Require `key` to be present; fail explicitly otherwise.

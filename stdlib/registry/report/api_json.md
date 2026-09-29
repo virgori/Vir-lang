@@ -7,7 +7,7 @@ Namespace: global `json` (`JsonNamespace`) · `include json`
 
 | Tên | Chữ ký (rút gọn) | Ghi chú |
 |---|---|---|
-| `json.parse` | `(s) -> Result(JsonValue)` | |
+| `json.parse` | `(s) -> Result of (JsonValue)` | |
 | `json.stringify` | `(val) -> string` | compact |
 | `json.pretty` | `(val) -> string` | indent 2 |
 | `json.null` | `() -> JsonValue` | |
@@ -16,10 +16,10 @@ Namespace: global `json` (`JsonNamespace`) · `include json`
 | `json.string` | `(s) -> JsonValue` | |
 | `json.array` | `() -> JsonValue` | |
 | `json.object` | `() -> JsonValue` | |
-| `json.get` | `(obj, key) -> Option(JsonValue)` | |
+| `json.get` | `(obj, key) -> Option of (JsonValue)` | |
 | `json.set` | `(obj, key, val)` | |
 | `json.has` | `(obj, key) -> bool` | |
-| `json.at` | `(arr, idx) -> Option(JsonValue)` | |
+| `json.at` | `(arr, idx) -> Option of (JsonValue)` | |
 | `json.push` | `(arr, item)` | |
 | `json.len` | `(val) -> int` | |
 | `json.kind` | `(val) -> int` | |
@@ -27,8 +27,8 @@ Namespace: global `json` (`JsonNamespace`) · `include json`
 | `json.asString` | `(val) -> string` | |
 | `json.asBool` | `(val) -> bool` | |
 | `json.isNull` | `(val) -> bool` | |
-| `json.asArray` | `(val) -> Option(JsonValue)` | tag Array |
-| `json.asObject` | `(val) -> Option(JsonValue)` | tag Object |
+| `json.asArray` | `(val) -> Option of (JsonValue)` | tag Array |
+| `json.asObject` | `(val) -> Option of (JsonValue)` | tag Object |
 | `json.key` | `(obj, idx) -> string` | |
 | `json.value` | `(obj, idx) -> JsonValue` | |
 | `json.getInt` | `(obj, key, default) -> int` | |

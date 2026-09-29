@@ -19,7 +19,7 @@ notes: >-
 RFC 8259 JSON as an in-memory **`JsonValue`** tree under namespace **`json`**.
 
 ```vir
-let r = json.parse(text)           # Result(JsonValue)
+let r = json.parse(text)           # Result of (JsonValue)
 let s = json.stringify(val)      # compact string
 let p = json.pretty(val)         # indent 2
 json.set(obj, "port", json.number(8080))
@@ -88,7 +88,7 @@ with Q3/Q4. Exactness for integers outside domain = **reject**, not demote.
 ## Failure model (locked — D1)
 
 ```text
-json.parse(s) -> Result(JsonValue)
+json.parse(s) -> Result of (JsonValue)
 ```
 
 `Err` uses [`Error`](error.md) with **`ErrorKind.InvalidData`**, plus **byte
@@ -134,10 +134,10 @@ json
 
 | Op | Contract |
 |---|---|
-| `get` | `Option(JsonValue)` — missing key → `None` |
+| `get` | `Option of (JsonValue)` — missing key → `None` |
 | `has` | `bool` |
 | `set` | upsert by key |
-| `at` | `Option(JsonValue)` — `None` if wrong tag / OOB; `Some(null)` if JSON null (D2) |
+| `at` | `Option of (JsonValue)` — `None` if wrong tag / OOB; `Some(null)` if JSON null (D2) |
 | `push` | append to array |
 | `len` | array length or object entry count; else `0` |
 | `getInt` / `getStr` / `getBool` | typed get with **default** on missing / wrong type |
@@ -152,7 +152,7 @@ json
 | `json_stringify_pretty` | `json.pretty` | keep |
 | `json_null` … `json_object` | `json.null` … | keep |
 | `json_obj_get` / `set` | `json.get` / `set` | keep |
-| `json_arr_get` | `json.at` → `Option(JsonValue)` | **behavior change** (D2) |
+| `json_arr_get` | `json.at` → `Option of (JsonValue)` | **behavior change** (D2) |
 | `as_int` … | `asInt` … | **rename** + snake alias |
 | `count` / `size` | `len` | **alias** → remove (D5) |
 | `json_obj_key_at` / `val_at` | `json.key` / `json.value` | **rename** + ns |
@@ -166,7 +166,7 @@ json
 |---|---|---|---|
 | `json.JsonType` | `JsonType` | enum | draft |
 | `json.JsonValue` | `JsonValue` | entity | draft |
-| `json.parse` | `json.parse` | `json.parse(s: string) -> Result(JsonValue)` | draft |
+| `json.parse` | `json.parse` | `json.parse(s: string) -> Result of (JsonValue)` | draft |
 | `json.stringify` | `json.stringify` | `json.stringify(val: JsonValue) -> string` | draft |
 | `json.pretty` | `json.pretty` | `json.pretty(val: JsonValue) -> string` | draft |
 | `json.null` | `json.null` | `json.null() -> JsonValue` | draft |
@@ -176,10 +176,10 @@ json
 | `json.string` | `json.string` | `json.string(s: string) -> JsonValue` | draft |
 | `json.array` | `json.array` | `json.array() -> JsonValue` | draft |
 | `json.object` | `json.object` | `json.object() -> JsonValue` | draft |
-| `json.get` | `json.get` | `json.get(obj: JsonValue, key: string) -> Option(JsonValue)` | draft |
+| `json.get` | `json.get` | `json.get(obj: JsonValue, key: string) -> Option of (JsonValue)` | draft |
 | `json.set` | `json.set` | `json.set(obj: JsonValue, key: string, val: JsonValue)` | draft |
 | `json.has` | `json.has` | `json.has(obj: JsonValue, key: string) -> bool` | draft |
-| `json.at` | `json.at` | `json.at(arr: JsonValue, idx: int) -> Option(JsonValue)` | proposed |
+| `json.at` | `json.at` | `json.at(arr: JsonValue, idx: int) -> Option of (JsonValue)` | proposed |
 | `json.push` | `json.push` | `json.push(arr: JsonValue, item: JsonValue)` | draft |
 | `json.len` | `json.len` | `json.len(val: JsonValue) -> int` | draft |
 | `json.key` | `json.key` | `json.key(obj: JsonValue, idx: int) -> string` | proposed |
@@ -211,7 +211,7 @@ previous: json.read
 -->
 
 ```vir
-json.parse(s: string) -> Result(JsonValue)
+json.parse(s: string) -> Result of (JsonValue)
 ```
 
 Parse one JSON value from `s`. Trailing non-whitespace → error. Empty input →
@@ -279,10 +279,10 @@ json.object() -> JsonValue
 ## Object / array ops
 
 ```vir
-json.get(obj: JsonValue, key: string) -> Option(JsonValue)
+json.get(obj: JsonValue, key: string) -> Option of (JsonValue)
 json.set(obj: JsonValue, key: string, val: JsonValue)
 json.has(obj: JsonValue, key: string) -> bool
-json.at(arr: JsonValue, idx: int) -> Option(JsonValue)
+json.at(arr: JsonValue, idx: int) -> Option of (JsonValue)
 json.push(arr: JsonValue, item: JsonValue)
 json.len(val: JsonValue) -> int
 json.key(obj: JsonValue, idx: int) -> string
@@ -334,7 +334,7 @@ json.fromBools(values) -> JsonValue
 
 ### Status
 
-`draft` — **present**. Exact `[T]` / `Vec(T)` parameter spelling follows source.
+`draft` — **present**. Exact `[T]` / `Vec of (T)` parameter spelling follows source.
 
 ---
 
@@ -389,7 +389,7 @@ Json-specific gaps: D1 error mapping; D2 `at` → `Option`; D3 float Number;
 Gates before any `stable` claim:
 1. Dedup `json.vri` / `data/json.vri`
 2. Error mapping → `Error` + `InvalidData`
-3. `at` → `Option(JsonValue)` behavior
+3. `at` → `Option of (JsonValue)` behavior
 4. `JsonValue` ownership audit
 5. Float Number / `numberFloat` / `asFloat` after float gate
 6. CamelCase renames; drop `count`/`size`

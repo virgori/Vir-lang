@@ -178,25 +178,25 @@ Use Vir types: `string`, `int`, `bool`, `float`, …
 **Generics use parentheses `()`, never Rust/C++/TS `<>`:**
 
 ```text
-Result(T)           # default error type Error
-Result(T, E)        # explicit error type
-Option(T)
-Vec(T) · Map(K, V) · Set(T) · Deque(T)
+Result of (T)           # default error type Error
+Result of (T, E)        # explicit error type
+Option of (T)
+Vec of (T) · Map of (K, V) · Set of (T) · Deque of (T)
 ```
 
 Do not write bare `Result` / `Option` when the success payload type is known.
 
 **Void success (decision A — locked):** when success has **no payload**, write
-bare `Result` meaning `Ok()` | `Err(error)`. Do **not** use `Result(void)` /
-`Result(())` until `void` / unit is confirmed as a valid Vir generic argument.
+bare `Result` meaning `Ok()` | `Err(error)`. Do **not** use `Result of (void)` /
+`Result of (())` until `void` / unit is confirmed as a valid Vir generic argument.
 
 ```text
 fs.write(...)      -> Result
 env.set(...)       -> Result
 process.kill(...)  -> Result
 
-process.spawn(...) -> Result(Child)
-parse.int(...)     -> Result(int)
+process.spawn(...) -> Result of (Child)
+parse.int(...)     -> Result of (int)
 ```
 
 Bare `Result` here is intentional type information (void success), not omission.

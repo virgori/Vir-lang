@@ -158,10 +158,10 @@ Do **not** document `path.exists` / `path.isFile` / `path.isDir`.
 | `path.new` | `path.new` | `path.new(s: string) -> Path` | proposed |
 | `path.normalize` | `path.normalize` | `path.normalize(p: Path) -> Path` · lexical · **verify at implement** | planned |
 | `path.join` | `path.join` | `path.join(base: Path, child: string) -> Path` | proposed |
-| `path.parent` | `path.parent` | `path.parent(p: Path) -> Option(Path)` | proposed |
-| `path.name` | `path.name` | `path.name(p: Path) -> Option(string)` | proposed |
-| `path.stem` | `path.stem` | `path.stem(p: Path) -> Option(string)` | proposed |
-| `path.extension` | `path.extension` | `path.extension(p: Path) -> Option(string)` | proposed |
+| `path.parent` | `path.parent` | `path.parent(p: Path) -> Option of (Path)` | proposed |
+| `path.name` | `path.name` | `path.name(p: Path) -> Option of (string)` | proposed |
+| `path.stem` | `path.stem` | `path.stem(p: Path) -> Option of (string)` | proposed |
+| `path.extension` | `path.extension` | `path.extension(p: Path) -> Option of (string)` | proposed |
 | `path.withExt` | `path.withExt` | `path.withExt(p: Path, ext: string) -> Path` | proposed |
 | `path.isAbsolute` | `path.isAbsolute` | `path.isAbsolute(p: Path) -> bool` | proposed |
 | `path.isRelative` | `path.isRelative` | `path.isRelative(p: Path) -> bool` | proposed |
@@ -308,7 +308,7 @@ previous: path_parent
 -->
 
 ```vir
-path.parent(p: Path) -> Option(Path)
+path.parent(p: Path) -> Option of (Path)
 ```
 
 Parent path by cutting at the last separator in the stored string.
@@ -371,7 +371,7 @@ previous: path_filename
 -->
 
 ```vir
-path.name(p: Path) -> Option(string)
+path.name(p: Path) -> Option of (string)
 ```
 
 Final path component (file **or** directory name).
@@ -434,7 +434,7 @@ previous: path_stem
 -->
 
 ```vir
-path.stem(p: Path) -> Option(string)
+path.stem(p: Path) -> Option of (string)
 ```
 
 Stem of the final component: text before the last `.` in that component,
@@ -502,7 +502,7 @@ previous: path.ext
 -->
 
 ```vir
-path.extension(p: Path) -> Option(string)
+path.extension(p: Path) -> Option of (string)
 ```
 
 Final extension of the name component. Canonical public name: **`extension`**

@@ -106,3 +106,26 @@ var x = 42
 var y: i32 = 42
 const PI = 3.14
 ```
+
+## Generics
+
+Vir's canonical generic syntax is `of (...)` in declarations, type applications, constructors, and explicit generic calls.
+
+```vir
+entity Box of (T):
+    value: T
+end.
+
+func wrap of (T)(value: T) -> Box of (T):
+    out Box of (T)(value: value)
+end.
+
+var boxed = wrap of (int)(42)
+var nested: dict of (string, Box of (int))
+```
+
+- `of` is contextual, not a general infix operator.
+- `(...)` following `of (...)` contains runtime call/constructor arguments.
+- Tensor is not an ordinary generic: write `tensor[T; S...]`, never `tensor of (T)[S...]` or `tensor(T)[S...]`.
+- `[...]` remains list/dict literal, indexing, or dimension syntax.
+- Do not generate `Box<T>`; angle-bracket generics are legacy compatibility syntax only.

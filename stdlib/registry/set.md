@@ -7,7 +7,7 @@ source:
     path: vir/collections/set.vri
 status: closed
 notes: >-
-  Design closed with map ownership/hash/invalidation. Impl may stay Map(T, bool).
+  Design closed with map ownership/hash/invalidation. Impl may stay Map of (T, bool).
   free/isEmpty/withCap public. Algebra/iter planned. Owning-element lifecycle
   gate same as map. Docs only.
 ---
@@ -15,7 +15,7 @@ notes: >-
 # Set
 
 Hash set. **Same hash / equality contract** as [`map`](map.md). May continue to
-be implemented as `Map(T, bool)`.
+be implemented as `Map of (T, bool)`.
 
 ```vir
 let s = set.new(hash, eq)

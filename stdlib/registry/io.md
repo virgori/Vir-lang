@@ -44,7 +44,7 @@ Standard streams, stream traits, buffered adapters, and composition helpers.
 | I4 | `io.print*` accepts **`string` only** — no implicit formatting | locked |
 | I5 | `chain` / `tee` combinators; `tee` fail-fast, non-atomic | **planned** |
 | I6 | `writeAll`, `BufferedReader` / `BufferedWriter` / `LineWriter` | locked |
-| I7 | `byte()` → `Result(Option(u8))` / EOF | locked |
+| I7 | `byte()` → `Result of (Option of (u8))` / EOF | locked |
 | I8 | File trait ⊥ `io` namespace | locked |
 
 ### Reader methods (locked)
@@ -71,7 +71,7 @@ until(delim) / line() / lines() / byte()
 - Delimiter at start → `Ok(Some(empty Buffer))`
 - Trailing data without delim → return that chunk; subsequent call hits EOF
 
-`line()` → `Result(Option(string))`: LF and CRLF; no whitespace trim;
+`line()` → `Result of (Option of (string))`: LF and CRLF; no whitespace trim;
 invalid UTF-8 → `InvalidData`.
 
 ### Writer / buffered (locked)
@@ -110,7 +110,7 @@ migrate ordinary I/O failures to `throw int`.
 | Abort / invariant / logic bug | `throw` / `panic` |
 | `stdio` convenience (`print` / `readln`) | keep current fire-and-forget; no fake error propagation until stream APIs exist |
 
-**Signatures use Vir generics with `()`** — e.g. `Result(T)`, `Option(T)`, `Result(Option(u8))`. Default `Result` error type is `Error` unless stated.
+**Signatures use Vir generics with `()`** — e.g. `Result of (T)`, `Option of (T)`, `Result of (Option of (u8))`. Default `Result` error type is `Error` unless stated.
 
 ### Reader family (target semantics)
 
@@ -594,19 +594,19 @@ io.stderr().flush()
 
 ## 2. `Reader`
 
-Current: `interface Reader` with `read(buf: Slice) -> Result` (`Ok(n)` bytes; `Ok(0)` = EOF) in `vir/io/traits.vri`. **Not exported.**
+Current: `interface Reader` with `read(buf: Slice) -> Result of (int)` (`Ok(n)` bytes; `Ok(0)` = EOF) in `vir/io/traits.vri`. **Not exported.**
 
 | Public method | Signature (target) | Impl | Notes |
 |---|---|---|---|
-| `read` | `reader.read(buf: Slice) -> Result(int)` | **present** | `Ok(n)` / `Ok(0)` / `Err` |
-| `exact` | `reader.exact(buf: Slice) -> Result(int)` | **missing** | or `exact(n) -> Result(Buffer)` per contract lock |
-| `atleast` | `reader.atleast(buf: Slice, min: int) -> Result(int)` | **missing** | `n >= min` or `Err(UnexpectedEof)` |
-| `all` | `reader.all() -> Result(Buffer)` | **present** as `read_all` | **rename** → method |
+| `read` | `reader.read(buf: Slice) -> Result of (int)` | **present** | `Ok(n)` / `Ok(0)` / `Err` |
+| `exact` | `reader.exact(buf: Slice) -> Result of (int)` | **missing** | or `exact(n) -> Result of (Buffer)` per contract lock |
+| `atleast` | `reader.atleast(buf: Slice, min: int) -> Result of (int)` | **missing** | `n >= min` or `Err(UnexpectedEof)` |
+| `all` | `reader.all() -> Result of (Buffer)` | **present** as `read_all` | **rename** → method |
 | `limit` | `reader.limit(max: int) -> Reader` | **missing** | composable cap; no I/O yet |
-| `until` | `reader.until(delim) -> Result(Option(Buffer))` | **missing** | non-empty byte seq; consume+exclude |
-| `line` | `reader.line() -> Result(Option(string))` | **missing** on trait | LF/CRLF; `InvalidData` on bad UTF-8 |
+| `until` | `reader.until(delim) -> Result of (Option of (Buffer))` | **missing** | non-empty byte seq; consume+exclude |
+| `line` | `reader.line() -> Result of (Option of (string))` | **missing** on trait | LF/CRLF; `InvalidData` on bad UTF-8 |
 | `lines` | `reader.lines()` | **planned** | iterator type not locked |
-| `byte` | `reader.byte() -> Result(Option(u8))` | **incomplete** | EOF = `Ok(None)`; must not swallow fill errors |
+| `byte` | `reader.byte() -> Result of (Option of (u8))` | **incomplete** | EOF = `Ok(None)`; must not swallow fill errors |
 
 ### Semantics
 
@@ -679,7 +679,7 @@ api: Reader.read
 -->
 
 ```vir
-(r: Reader).read(buf: Slice) -> Result(int)
+(r: Reader).read(buf: Slice) -> Result of (int)
 ```
 
 Primitive read into caller-owned borrowed memory; may return short count.
@@ -715,7 +715,7 @@ api: Reader.exact
 -->
 
 ```vir
-(r: Reader).exact(buf: Slice) -> Result(int)
+(r: Reader).exact(buf: Slice) -> Result of (int)
 ```
 
 Fill `buf` completely or fail/EOF.
@@ -755,7 +755,7 @@ api: Reader.atleast
 -->
 
 ```vir
-(r: Reader).atleast(buf: Slice, min: int) -> Result(int)
+(r: Reader).atleast(buf: Slice, min: int) -> Result of (int)
 ```
 
 Read at least `min` bytes into `buf` (`min` ≤ `buf.len`).
@@ -796,7 +796,7 @@ previous: read_all
 -->
 
 ```vir
-(r: Reader).all() -> Result(Buffer)
+(r: Reader).all() -> Result of (Buffer)
 ```
 
 Read all remaining bytes until EOF into an owned `Buffer`.
@@ -807,7 +807,7 @@ None (receiver).
 
 ### Returns
 
-`Result(Buffer)` — empty Buffer allowed; `Err(…)` on I/O failure.
+`Result of (Buffer)` — empty Buffer allowed; `Err(…)` on I/O failure.
 
 ### Errors
 
@@ -875,7 +875,7 @@ api: Reader.until
 -->
 
 ```vir
-(r: Reader).until(delim) -> Result(Option(Buffer))
+(r: Reader).until(delim) -> Result of (Option of (Buffer))
 ```
 
 Read until a single **byte** delimiter into an owned `Buffer`. Delimiter is
@@ -925,7 +925,7 @@ api: Reader.line
 -->
 
 ```vir
-(r: Reader).line() -> Result(Option(string))
+(r: Reader).line() -> Result of (Option of (string))
 ```
 
 Binary → text: read one line, decode as **strict UTF-8** `string` (newline
@@ -937,7 +937,7 @@ None.
 
 ### Returns
 
-`Result(Option(string))` — `None` at EOF with no line; `Err` on I/O or invalid UTF-8 (`InvalidData`).
+`Result of (Option of (string))` — `None` at EOF with no line; `Err` on I/O or invalid UTF-8 (`InvalidData`).
 
 ### Errors
 

@@ -8,7 +8,7 @@ source:
 status: closed
 notes: >-
   $ grammar aligned with Vir native interpolation; no {} and no new compiler
-  syntax. fmt.format → Result(string). printf/printfln planned under fmt. Float specs
+  syntax. fmt.format → Result of (string). printf/printfln planned under fmt. Float specs
   wait format.float stable. Docs-only; verify $$ escape vs compiler before
   marking source-literal examples stable. No .vri until map applied.
 ---
@@ -21,7 +21,7 @@ Apply a **runtime** template string to argument values.
 |---|---|
 | Native interpolation | Compiler expands `$name` / `$(expr)` / `$$` in **source** literals |
 | [`format`](format.md) | One value → string (specific rendering) |
-| [`parse`](parse.md) | String → value (`Result(T)`) |
+| [`parse`](parse.md) | String → value (`Result of (T)`) |
 | **`fmt`** | Dynamic template + args at **runtime** |
 | [`builder`](builder.md) | Efficient append |
 | [`io`](io.md) | Transport / console |
@@ -35,7 +35,7 @@ Templates from files, config, or translations are passed **directly** to
 | In `fmt` | Not in `fmt` |
 |---|---|
 | Runtime `$` / `$(…)` placeholders | Source-literal native interpolation |
-| `FmtArg` wrappers + `format` → `Result(string)` | `{}` / printf `%` grammars |
+| `FmtArg` wrappers + `format` → `Result of (string)` | `{}` / printf `%` grammars |
 | Planned `printf` / `printfln` (same `$` grammar) | Overloading [`io.print`](io.md) |
 | Specs `d/x/X/b/o/s` + align/pad | Stable `f` until float gate |
 | | Named args, auto-increment `{}`, dynamic width, custom formatters |
@@ -110,7 +110,7 @@ fmt.int(n) -> FmtArg
 fmt.str(s) -> FmtArg
 fmt.bool(value) -> FmtArg
 
-fmt.format(template, args) -> Result(string)
+fmt.format(template, args) -> Result of (string)
 ```
 
 `printf` / `printfln`: same `$` grammar as `format`; write to stdout. Belong to
@@ -149,7 +149,7 @@ into the template. Do **not** invent `FmtError` / new `ErrorKind` in this pass.
 | `fmt.int` | `fmt.int` | `fmt.int(n: int) -> FmtArg` | proposed |
 | `fmt.str` | `fmt.str` | `fmt.str(s: string) -> FmtArg` | proposed |
 | `fmt.bool` | `fmt.bool` | `fmt.bool(value: bool) -> FmtArg` | proposed |
-| `fmt.format` | `fmt.format` | `fmt.format(template: string, args: Vec(FmtArg)) -> Result(string)` | proposed |
+| `fmt.format` | `fmt.format` | `fmt.format(template: string, args: Vec of (FmtArg)) -> Result of (string)` | proposed |
 | `fmt.float` | `fmt.float` | `fmt.float(value: float) -> FmtArg` | planned |
 | `fmt.printf` | `fmt.printf` | `fmt.printf(template: string, args: Vec)` | planned |
 | `fmt.printfln` | `fmt.printfln` | `fmt.printfln(template: string, args: Vec)` | planned |
@@ -160,7 +160,7 @@ into the template. Do **not** invent `FmtError` / new `ErrorKind` in this pass.
 ## `fmt.format`
 
 ```vir
-fmt.format(template: string, args: Vec(FmtArg)) -> Result(string)
+fmt.format(template: string, args: Vec of (FmtArg)) -> Result of (string)
 ```
 
 Render `template` with positional `$` placeholders. Strict arg count / types.

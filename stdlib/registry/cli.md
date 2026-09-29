@@ -75,9 +75,9 @@ Facades = common case. Entities = configuration / rendering. **Do not merge or d
 |---|---|---|---|---|
 | `cli.ask` | `cli.ask` | `cli.ask(prompt: string) -> string` | proposed | move |
 | `cli.confirm` | `cli.confirm` | `cli.confirm(prompt: string) -> bool` | planned | missing facade |
-| `cli.choose` | `cli.choose` | `cli.choose(prompt: string, options: Vec) -> int` | planned | missing facade |
+| `cli.choose` | `cli.choose` | `cli.choose(prompt: string, options: Vec of (string)) -> int` | planned | missing facade |
 | `cli.password` | `cli.password` | `cli.password(prompt: string) -> string` | incomplete | move + incomplete |
-| `cli.multi` | `cli.multi` | `cli.multi(prompt: string, options: Vec) -> Vec` | planned | missing facade |
+| `cli.multi` | `cli.multi` | `cli.multi(prompt: string, options: Vec of (string)) -> Vec of (int)` | planned | missing facade |
 
 ---
 
@@ -198,7 +198,7 @@ api: cli.choose
 -->
 
 ```vir
-cli.choose(prompt: string, options: Vec) -> int
+cli.choose(prompt: string, options: Vec of (string)) -> int
 ```
 
 Single-select from a list of **string** options. Returns a **0-based index**
@@ -211,7 +211,7 @@ without copy/stringify of the selected value.
 
 Title / question.
 
-#### `options: Vec`
+#### `options: Vec of (string)`
 
 List of `string` choices. Must not be empty (cannot complete with empty list).
 
@@ -325,7 +325,7 @@ api: cli.multi
 -->
 
 ```vir
-cli.multi(prompt: string, options: Vec) -> Vec
+cli.multi(prompt: string, options: Vec of (string)) -> Vec of (int)
 ```
 
 Multi-select over string options. Returns a `Vec` of **0-based indices**.
@@ -336,7 +336,7 @@ Multi-select over string options. Returns a `Vec` of **0-based indices**.
 
 Title / question.
 
-#### `options: Vec`
+#### `options: Vec of (string)`
 
 List of `string` choices.
 

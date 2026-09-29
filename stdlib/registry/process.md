@@ -11,7 +11,7 @@ source:
 status: closed
 notes: >-
   Design closed P1–P6. Flat process.*; exit/abort here not env. shell deferred.
-  Output stdout/stderr = Buffer. Result(T); Child pipes = Reader/Writer.
+  Output stdout/stderr = Buffer. Result of (T); Child pipes = Reader/Writer.
   No ProcessError kind. Docs only — pipe lifecycle / platform kill / error map
   need impl audit before full stable.
 ---
@@ -31,9 +31,9 @@ notes: >-
 let cmd = process.command("git")
 process.args(cmd, ["status"])
 process.stdout(cmd, Stdio.Pipe)
-let child = process.spawn(cmd)    # Result(Child)
+let child = process.spawn(cmd)    # Result of (Child)
 # …
-let status = process.wait(child)  # Result(ExitStatus)
+let status = process.wait(child)  # Result of (ExitStatus)
 ```
 
 **Design closed ≠ full API stable** until pipe lifecycle, platform termination,
@@ -98,7 +98,7 @@ failure. Program outcome lives in `ExitStatus`.
 
 ## Errors (closed)
 
-Recoverable ops → `Result(T)` with default [`Error`](error.md) (same family as `io`/`fs`).
+Recoverable ops → `Result of (T)` with default [`Error`](error.md) (same family as `io`/`fs`).
 Prefer [`IoError`](error.md) / `ErrorKind` already in registry for OS failures;
 `InvalidData` for invalid configuration. **No** `ProcessError` / new `ErrorKind`
 in this pass. Keep operation + OS errno in error context when available.
@@ -174,7 +174,7 @@ blocking.
 | `command_new` | `process.command` | **rename** |
 | `command_arg` / `args` / `cwd` / `env` | `process.arg` / … | **rename** |
 | `command_stdin` / `stdout` / `stderr` | `process.stdin` / … | **rename** |
-| `command_spawn` | `process.spawn` | **rename** · `Result(Child)` |
+| `command_spawn` | `process.spawn` | **rename** · `Result of (Child)` |
 | `child_wait` | `process.wait` | **rename** · `ExitStatus` |
 | `child_kill` | `process.kill` | **rename** |
 | `command_output` | `process.output` | **rename** · `Buffer` payloads |
@@ -206,11 +206,11 @@ Flat names only — **no** `process.command.arg` nesting (P6).
 | `process.stdin` | `process.stdin` | `process.stdin(cmd, mode: Stdio)` | proposed |
 | `process.stdout` | `process.stdout` | `process.stdout(cmd, mode: Stdio)` | proposed |
 | `process.stderr` | `process.stderr` | `process.stderr(cmd, mode: Stdio)` | proposed |
-| `process.spawn` | `process.spawn` | `process.spawn(cmd) -> Result(Child)` | proposed |
-| `process.wait` | `process.wait` | `process.wait(child) -> Result(ExitStatus)` | proposed |
+| `process.spawn` | `process.spawn` | `process.spawn(cmd) -> Result of (Child)` | proposed |
+| `process.wait` | `process.wait` | `process.wait(child) -> Result of (ExitStatus)` | proposed |
 | `process.kill` | `process.kill` | `process.kill(child) -> Result` · void success · bare `Result` (A) | proposed |
-| `process.output` | `process.output` | `process.output(cmd) -> Result(Output)` | proposed |
-| `process.status` | `process.status` | `process.status(cmd) -> Result(ExitStatus)` | proposed |
+| `process.output` | `process.output` | `process.output(cmd) -> Result of (Output)` | proposed |
+| `process.status` | `process.status` | `process.status(cmd) -> Result of (ExitStatus)` | proposed |
 | `process.exit` | `process.exit` | `process.exit(code: int)` | proposed |
 | `process.abort` | `process.abort` | `process.abort()` | proposed |
 
@@ -240,8 +240,8 @@ process.stderr(cmd, mode: Stdio)
 ## `process.spawn` / `wait` / `kill`
 
 ```vir
-process.spawn(cmd) -> Result(Child)
-process.wait(child) -> Result(ExitStatus)
+process.spawn(cmd) -> Result of (Child)
+process.wait(child) -> Result of (ExitStatus)
 process.kill(child) -> Result  # void success · bare Result (decision A)
 ```
 
@@ -255,8 +255,8 @@ process.kill(child) -> Result  # void success · bare Result (decision A)
 ## `process.output` / `process.status`
 
 ```vir
-process.output(cmd) -> Result(Output)
-process.status(cmd) -> Result(ExitStatus)
+process.output(cmd) -> Result of (Output)
+process.status(cmd) -> Result of (ExitStatus)
 ```
 
 ### Status
@@ -287,7 +287,7 @@ process.abort()
 ## Implementation readiness
 
 1. Flat `process.*`; move `exit`/`abort` from env public API.
-2. `Buffer` output; typed Child pipes; `Result(T)` (default `Error`).
+2. `Buffer` output; typed Child pipes; `Result of (T)` (default `Error`).
 3. Drop public `shell`; keep migration aliases briefly.
 4. Audit pipe close, wait/kill, and errno→Error mapping before “stable”.
 

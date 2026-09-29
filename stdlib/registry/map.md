@@ -23,7 +23,7 @@ Default **hash map**. No iteration-order guarantee.
 ```vir
 let m = map.new(hash, eq)
 map.insert(m, key, value)
-let v = map.get(m, key)    # Option(V) copy — only for safely copyable V
+let v = map.get(m, key)    # Option of (V) copy — only for safely copyable V
 ```
 
 Do **not** keep a second public module (`hashmap`) with the same role.
@@ -53,10 +53,10 @@ semantics for owning types — must be **enforced**, not only documented.
 
 | Op | Contract |
 |---|---|
-| `get` | `Option(V)` — **copy** of value; does **not** transfer ownership out of the map. Stable only when `V` is **safely copyable**. |
+| `get` | `Option of (V)` — **copy** of value; does **not** transfer ownership out of the map. Stable only when `V` is **safely copyable**. |
 | `insert` (new key) | **Move** key and value into the map. Returns `None`. |
 | `insert` (existing key) | Keep **old key** in the table; replace value; return `Some(oldValue)`. Caller owns `oldValue`. |
-| `remove` | Remove entry; **move out** value via `Option(V)`. |
+| `remove` | Remove entry; **move out** value via `Option of (V)`. |
 | `getRef` | **planned** — not public |
 
 ### Replace / key parameter
@@ -129,10 +129,10 @@ map
 ├── string          # convenience
 ├── int             # convenience
 │
-├── insert          # -> Option(V)
-├── get             # -> Option(V) · copy-limited
+├── insert          # -> Option of (V)
+├── get             # -> Option of (V) · copy-limited
 ├── contains
-├── remove          # -> Option(V)
+├── remove          # -> Option of (V)
 │
 ├── len
 ├── isEmpty
@@ -156,7 +156,7 @@ map.iter
 | `map_with_cap` | `map.withCap(cap, hash, eq)` | **rename** |
 | `string_map_new` | `map.string()` | **rename** |
 | — | `map.int()` | **new** convenience |
-| `map_insert` | `map.insert` | **rename** · `Option(V)` |
+| `map_insert` | `map.insert` | **rename** · `Option of (V)` |
 | `map_get` | `map.get` | **rename** · Copy gate |
 | `map_contains` | `map.contains` | **rename** |
 | `map_remove` | `map.remove` | **rename** |
@@ -178,10 +178,10 @@ maintain two independent public hash-map implementations.
 | `map.withCap` | `map.withCap` | `map.withCap(cap, hash, eq) -> Map` | proposed |
 | `map.string` | `map.string` | `map.string() -> Map` | proposed |
 | `map.int` | `map.int` | `map.int() -> Map` | proposed |
-| `map.insert` | `map.insert` | `map.insert(m, key, value) -> Option(V)` | proposed |
-| `map.get` | `map.get` | `map.get(m, key) -> Option(V)` | proposed |
+| `map.insert` | `map.insert` | `map.insert(m, key, value) -> Option of (V)` | proposed |
+| `map.get` | `map.get` | `map.get(m, key) -> Option of (V)` | proposed |
 | `map.contains` | `map.contains` | `map.contains(m, key) -> bool` | proposed |
-| `map.remove` | `map.remove` | `map.remove(m, key) -> Option(V)` | proposed |
+| `map.remove` | `map.remove` | `map.remove(m, key) -> Option of (V)` | proposed |
 | `map.len` | `map.len` | `map.len(m) -> int` | proposed |
 | `map.isEmpty` | `map.isEmpty` | `map.isEmpty(m) -> bool` | proposed |
 | `map.clear` | `map.clear` | `map.clear(m)` | proposed |
@@ -227,9 +227,9 @@ Wrappers over `map.new` with content hash/eq for `string` / `int` keys.
 ## `map.insert` / `get` / `remove`
 
 ```vir
-map.insert(m, key, value) -> Option(V)
-map.get(m, key) -> Option(V)
-map.remove(m, key) -> Option(V)
+map.insert(m, key, value) -> Option of (V)
+map.get(m, key) -> Option of (V)
+map.remove(m, key) -> Option of (V)
 ```
 
 ### Status

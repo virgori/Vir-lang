@@ -40,7 +40,7 @@ panic / todo / …  → abort / invariant  (separate API — not error.*)
 | `ErrorKind`, `Error`, `IoError` | Public `IoErrorKind` — **removed** |
 | Construct / access / display / errno bridge | `panic_msg` / `unreachable` / `todo` / `unimplemented` |
 | `fromErrno` / `toError` | One convenience ctor per kind |
-| Optional cause chain (semantic) | Promising `source: Option(ptr)` as public ABI |
+| Optional cause chain (semantic) | Promising `source: Option of (ptr)` as public ABI |
 | | `data.error` / `compiler.errors` — other domains |
 
 Aligns with locked I/O:
@@ -215,9 +215,9 @@ error.chain
 
 > An `Error` may retain an optional source/cause error.
 
-Implementation today may box via `Option(ptr)` / `native_box`. That storage is
+Implementation today may box via `Option of (ptr)` / `native_box`. That storage is
 an **implementation detail**. Registry does **not** freeze public ABI as
-`Option(ptr)`. Target may become `Option` of `Error` (or equivalent) when the
+`Option of (ptr)`. Target may become `Option` of `Error` (or equivalent) when the
 language representation is clean.
 
 ## errno SSOT (closed)
@@ -286,7 +286,7 @@ error.toError(io: IoError) -> Error
 | `error.withSource` | `error.withSource` | `error.withSource(kind, msg, source: Error) -> Error` | proposed |
 | `error.kind` | `error.kind` | `error.kind(e: Error) -> ErrorKind` | proposed |
 | `error.message` | `error.message` | `error.message(e: Error) -> string` | proposed |
-| `error.source` | `error.source` | `error.source(e: Error) -> Option(Error)` · cause | proposed |
+| `error.source` | `error.source` | `error.source(e: Error) -> Option of (Error)` · cause | proposed |
 | `error.string` | `error.string` | `error.string(e: Error) -> string` | proposed |
 | `error.chain` | `error.chain` | `error.chain(e: Error) -> string` | proposed |
 | `error.kindName` | `error.kindName` | `error.kindName(kind: ErrorKind) -> string` | proposed |
@@ -425,7 +425,7 @@ previous: error_source
 -->
 
 ```vir
-error.source(e: Error) -> Option(Error)
+error.source(e: Error) -> Option of (Error)
 ```
 
 Optional cause. Success payload is an `Error` (semantic); not a public `ptr`.

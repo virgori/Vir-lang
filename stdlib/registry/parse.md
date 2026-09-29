@@ -22,8 +22,8 @@ notes: >-
 under [`string`](string.md) or [`format`](format.md).
 
 ```vir
-parse.int(s) -> Result(int)
-parse.intRadix(s, base) -> Result(int)
+parse.int(s) -> Result of (int)
+parse.intRadix(s, base) -> Result of (int)
 ```
 
 Opposite direction → [`format`](format.md).
@@ -33,7 +33,7 @@ Opposite direction → [`format`](format.md).
 | In `parse` | Not in `parse` |
 |---|---|
 | Strict whole-string numeric parse | Auto-trim / stop-at-first-non-digit |
-| `Result(int)` / `Result(float)` | Panic / silent `0` on failure |
+| `Result of (int)` / `Result of (float)` | Panic / silent `0` on failure |
 | Decimal `int` + explicit radix | Stable `parse.float` until real impl |
 | | Template / fmt |
 | | Compiler lexer “read part of token” parsers (audit call-sites) |
@@ -102,7 +102,7 @@ parse.int("")      → Err(ParseIntError)
 ## Grammar — `parse.intRadix` (closed)
 
 ```vir
-parse.intRadix(s, base) -> Result(int)
+parse.intRadix(s, base) -> Result of (int)
 ```
 
 `base` ∈ {2, 8, 10, 16} only.
@@ -163,7 +163,7 @@ JSON float numbers (see [`json`](json.md) — dual int+float after this gate).
 ## Planned — not stable (`parse.float`)
 
 ```text
-parse.float(s) -> Result(float)
+parse.float(s) -> Result of (float)
 ```
 
 **Never** publish today’s stub (`parse_float` → `0`) as the contract.
@@ -219,11 +219,11 @@ Stable only after the float gate (F1–F6) passes.
 
 | ID | Symbol | Signature | Status |
 |---|---|---|---|
-| `parse.int` | `parse.int` | `parse.int(s: string) -> Result(int)` | proposed |
-| `parse.intRadix` | `parse.intRadix` | `parse.intRadix(s: string, base: int) -> Result(int)` | proposed |
-| `parse.float` | `parse.float` | `parse.float(s: string) -> Result(float)` | planned |
+| `parse.int` | `parse.int` | `parse.int(s: string) -> Result of (int)` | proposed |
+| `parse.intRadix` | `parse.intRadix` | `parse.intRadix(s: string, base: int) -> Result of (int)` | proposed |
+| `parse.float` | `parse.float` | `parse.float(s: string) -> Result of (float)` | planned |
 
-Default error type is [`Error`](error.md): `Result(int)` / `Result(float)`.
+Default error type is [`Error`](error.md): `Result of (int)` / `Result of (float)`.
 
 ---
 
@@ -233,7 +233,7 @@ Default error type is [`Error`](error.md): `Result(int)` / `Result(float)`.
 <!-- id: parse.int previous: str_to_i64 -->
 
 ```vir
-parse.int(s: string) -> Result(int)
+parse.int(s: string) -> Result of (int)
 ```
 
 Strict decimal whole-string parse → `Ok(int)` or `Err` (`ParseIntError`).
@@ -260,7 +260,7 @@ blindly swap compiler token scanners.
 <!-- id: parse.intRadix -->
 
 ```vir
-parse.intRadix(s: string, base: int) -> Result(int)
+parse.intRadix(s: string, base: int) -> Result of (int)
 ```
 
 Strict parse for `base` ∈ {2, 8, 10, 16} with optional matching prefix.
@@ -280,7 +280,7 @@ Strict parse for `base` ∈ {2, 8, 10, 16} with optional matching prefix.
 ## `parse.float` *(planned)*
 
 ```vir
-parse.float(s: string) -> Result(float)
+parse.float(s: string) -> Result of (float)
 ```
 
 Not stable. Must not expose stub-zero behavior.

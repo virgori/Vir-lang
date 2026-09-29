@@ -508,6 +508,12 @@ run_group_1() {
         run_test_in_group 1 "tests/vri/test_48.vri"
         run_test_in_group 1 "tests/vri/test_add.vri"
         run_test_in_group 1 "tests/vri/test_add_rt.vri"
+        run_test_in_group 1 "tests/strict_v2/test_spec1_separator_e2e.vri"
+        run_test_in_group 1 "tests/strict_v2/test_spec1_pipeline_opt_tiers_e2e.vri"
+        run_test_in_group 1 "tests/strict_v2/spec1_decl_comma_rejected.vri"
+        run_test_in_group 1 "tests/strict_v2/spec1_when_colon_rejected.vri"
+        run_test_in_group 1 "tests/strict_v2/spec1_when_do_rejected.vri"
+        run_test_in_group 1 "tests/strict_v2/spec1_else_colon_rejected.vri"
     else
         run_test_in_group 1 "tests/vri/test_48.vri"
         run_test_in_group 1 "tests/vri/test_add.vri"
@@ -553,6 +559,12 @@ run_group_1() {
         run_test_in_group 1 "tests/vri/test_reassign.vri"
         run_test_in_group 1 "tests/vri/test_spill.vri"
         run_test_in_group 1 "tests/vri/test_this.vri"
+        run_test_in_group 1 "tests/strict_v2/test_spec1_separator_e2e.vri"
+        run_test_in_group 1 "tests/strict_v2/test_spec1_pipeline_opt_tiers_e2e.vri"
+        run_test_in_group 1 "tests/strict_v2/spec1_decl_comma_rejected.vri"
+        run_test_in_group 1 "tests/strict_v2/spec1_when_colon_rejected.vri"
+        run_test_in_group 1 "tests/strict_v2/spec1_when_do_rejected.vri"
+        run_test_in_group 1 "tests/strict_v2/spec1_else_colon_rejected.vri"
     fi
     local pass_cnt=${GP_PASS[1]}
     local fail_cnt=${GP_FAIL[1]}
@@ -568,9 +580,15 @@ run_group_2() {
     if [ "$MODE" = "min" ]; then
         run_test_in_group 2 "tests/bootstrap_codegen/cg_comment.vri"
         run_test_in_group 2 "tests/bootstrap_codegen/cg_edge_comment_eof.vri"
+        run_test_in_group 2 "tests/bootstrap_codegen/utf8_comment_and_string.vri"
+        run_test_in_group 2 "tests/bootstrap_codegen/utf8_identifier_comment.vri"
+        run_test_in_group 2 "tests/strict_v2/test_spec2_comments_comprehensive_e2e.vri"
     else
         run_test_in_group 2 "tests/bootstrap_codegen/cg_comment.vri"
         run_test_in_group 2 "tests/bootstrap_codegen/cg_edge_comment_eof.vri"
+        run_test_in_group 2 "tests/bootstrap_codegen/utf8_comment_and_string.vri"
+        run_test_in_group 2 "tests/bootstrap_codegen/utf8_identifier_comment.vri"
+        run_test_in_group 2 "tests/strict_v2/test_spec2_comments_comprehensive_e2e.vri"
     fi
     local pass_cnt=${GP_PASS[2]}
     local fail_cnt=${GP_FAIL[2]}
@@ -1711,6 +1729,8 @@ run_group_26() {
         run_test_in_group 26 "tests/strict_v2/quantize_integer_tensor_negative.vri"
         run_test_in_group 26 "tests/strict_v2/tensor_empty_shape_negative.vri"
         run_test_in_group 26 "tests/strict_v2/tensor_zero_dimension_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/tensor_of_syntax_rejected.vri"
+        run_test_in_group 26 "tests/strict_v2/tensor_paren_syntax_rejected.vri"
         run_test_in_group 26 "tests/strict_v2/train_backward_external_negative.vri"
         run_test_in_group 26 "tests/strict_v2/train_backward_integer_negative.vri"
         run_test_in_group 26 "tests/test_adv_030_fma.vri"

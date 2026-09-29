@@ -7,14 +7,14 @@ Namespace: global `env` (`EnvNamespace`) · `include env`
 
 | Tên | Chữ ký (rút gọn) | Ghi chú |
 |---|---|---|
-| `env.get` | `(key) -> Option(string)` | |
+| `env.get` | `(key) -> Option of (string)` | |
 | `env.unwrapOr` | `(key, fallback) -> string` | SPEC ghi `env.or` — `or` là keyword Vir |
 | `env.has` | `(key) -> bool` | |
 | `env.set` | `(key, val) -> Result` | |
 | `env.remove` | `(key) -> Result` | |
-| `env.int` | `(key) -> Option(int)` | thiếu / parse fail → `None` |
-| `env.bool` | `(key) -> Option(bool)` | thiếu / parse fail → `None` |
-| `env.require` | `(key) -> Result(string)` | |
+| `env.int` | `(key) -> Option of (int)` | thiếu / parse fail → `None` |
+| `env.bool` | `(key) -> Option of (bool)` | thiếu / parse fail → `None` |
+| `env.require` | `(key) -> Result of (string)` | |
 | `env.args` | `() -> …` | argv |
 | `env.name` | `() -> string` | argv[0] |
 | `env.cwd` | `() -> string` | |

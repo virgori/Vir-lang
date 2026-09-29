@@ -190,7 +190,7 @@ Enum without accessor is not enough — **add** `category` even if missing today
 | `unicode.utf8Len` | `unicode.utf8Len` | `unicode.utf8Len(cp: int) -> int` | proposed |
 | `unicode.encodeUtf8` | `unicode.encodeUtf8` | encode one scalar into buffer/bytes | proposed |
 | `unicode.Utf8Decoded` | `Utf8Decoded` | entity · `codepoint: int`, `nbytes: int` | proposed |
-| `unicode.decodeUtf8` | `unicode.decodeUtf8` | `decodeUtf8(s: Slice, offset: int) -> Result(Utf8Decoded)` | proposed |
+| `unicode.decodeUtf8` | `unicode.decodeUtf8` | `decodeUtf8(s: Slice, offset: int) -> Result of (Utf8Decoded)` | proposed |
 | `unicode.validUtf8` | `unicode.validUtf8` | `unicode.validUtf8(s: Slice) -> bool` | proposed |
 | `unicode.countUtf8` | `unicode.countUtf8` | `unicode.countUtf8(s: Slice) -> int` | proposed |
 
@@ -243,7 +243,7 @@ unicode.utf8Len(cp: int) -> int
 unicode.encodeUtf8(...)
 unicode.utf8Len(cp: int) -> int
 unicode.encodeUtf8(...)
-unicode.decodeUtf8(s: Slice, offset: int) -> Result(Utf8Decoded)
+unicode.decodeUtf8(s: Slice, offset: int) -> Result of (Utf8Decoded)
 unicode.validUtf8(s: Slice) -> bool
 unicode.countUtf8(s: Slice) -> int
 ```
@@ -256,7 +256,7 @@ entity Utf8Decoded:
     nbytes: int       # bytes consumed from the Slice
 ```
 
-`decodeUtf8` returns `Result(Utf8Decoded)`. Malformed → `Err` with
+`decodeUtf8` returns `Result of (Utf8Decoded)`. Malformed → `Err` with
 [`ErrorKind.InvalidData`](error.md); no silent `U+FFFD` success. Do **not**
 depend on tuple syntax for this public ABI.
 
