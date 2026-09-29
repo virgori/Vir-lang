@@ -58,7 +58,7 @@ env
 
 ```vir
 env.get("HOME")
-env.or("APP_MODE", "dev")
+env.unwrapOr("APP_MODE", "dev")
 env.has("CI")
 
 env.set("APP_MODE", "prod")
@@ -81,7 +81,7 @@ process.exit(0)    # not env.exit
 | Current | Public | Impl note | Action |
 |---|---|---|---|
 | `get` / `env.get` | `env.get` | present | **remove** free alias |
-| `get_or` / `env.get_or` | `env.or` | present | **rename** + remove free alias |
+| `get_or` / `env.get_or` / was SPEC `env.or` | **`env.unwrapOr`** | present | **rename** · `or` is Vir keyword → same shape as `option.unwrapOr` |
 | `has` / `env.has` | `env.has` | present | keep ns; remove free alias |
 | `set` / `env.set` | `env.set` | present → `Result` | keep ns; remove free alias |
 | `remove` / `env.remove` | `env.remove` | present → `Result` | keep ns; remove free alias |
@@ -105,7 +105,7 @@ process.exit(0)    # not env.exit
 | API | Return | Notes |
 |---|---|---|
 | `env.get(key)` | `Option` of `string` | missing → `None` |
-| `env.or(key, fallback)` | `string` | value or fallback; never `Option` |
+| `env.unwrapOr(key, fallback)` | `string` | value or fallback; never `Option` · was SPEC `env.or` |
 | `env.int(key)` | `Option` of `int` | parse fail / missing → `None` *(today uses default — change)* |
 | `env.bool(key)` | `Option` of `bool` | parse fail / missing → `None` *(today uses default — change)* |
 | `env.require(key)` | `Result` · `Ok(string)` / `Err(…)` | explicit failure when missing |
@@ -121,10 +121,11 @@ semantics (today falls back to default).
 | ID | Symbol | Signature | Status | Impl |
 |---|---|---|---|---|
 | `env.get` | `env.get` | `env.get(key: string) -> Option(string)` | proposed | rename surface (drop free `get`) |
-| `env.or` | `env.or` | `env.or(key: string, fallback: string) -> string` | proposed | rename from `get_or` |
+| `env.unwrapOr` | `env.unwrapOr` | `env.unwrapOr(key: string, fallback: string) -> string
+# SPEC wrote env.or — illegal identifier (`or` keyword); unwrapOr matches option/result` | proposed | was SPEC `env.or` (keyword) |
 | `env.has` | `env.has` | `env.has(key: string) -> bool` | proposed | present |
-| `env.set` | `env.set` | `env.set(key: string, value: string) -> Result` | proposed | void success · form pending audit |
-| `env.remove` | `env.remove` | `env.remove(key: string) -> Result` | proposed | void success · form pending audit |
+| `env.set` | `env.set` | `env.set(key: string, value: string) -> Result` | proposed | void success · bare `Result` (A) |
+| `env.remove` | `env.remove` | `env.remove(key: string) -> Result` | proposed | void success · bare `Result` (A) |
 | `env.int` | `env.int` | `env.int(key: string) -> Option(int)` | proposed | change from default-arg |
 | `env.bool` | `env.bool` | `env.bool(key: string) -> Option(bool)` | proposed | change from default-arg |
 | `env.require` | `env.require` | `env.require(key: string) -> Result(string)` | proposed | present |
@@ -173,25 +174,26 @@ let opt = env.get("HOME")
 
 ### See also
 
-- `env.or`
+- `env.unwrapOr`
 - `env.require`
 
 ---
 
-<a id="env.or"></a>
-## `env.or`
+<a id="env.unwrapOr"></a>
+## `env.unwrapOr`
 
 <!--
-id: env.or
-api: env.or
-previous: get_or
+id: env.unwrapOr
+api: env.unwrapOr
+previous: get_or, env.or, getOr
 -->
 
 ```vir
-env.or(key: string, fallback: string) -> string
+env.unwrapOr(key: string, fallback: string) -> string
 ```
 
-Environment value **or** fallback. Clearer than `get_or` under namespace `env`.
+Environment value or fallback. SPEC name was `env.or` — illegal Vir identifier
+(`or` is a keyword); **`unwrapOr`** matches `option.unwrapOr` / `result.unwrapOr`.
 
 ### Parameters
 
@@ -214,7 +216,7 @@ None.
 ### Example
 
 ```vir
-let mode = env.or("APP_MODE", "dev")
+let mode = env.unwrapOr("APP_MODE", "dev")
 ```
 
 ### See also
@@ -378,7 +380,7 @@ let port = env.int("PORT")
 ### Notes
 
 **Semantics change:** today `int(key, default) -> int`. Target drops default;
-use `env.or` + parse, or unwrap `Option`, for fallbacks.
+use `env.unwrapOr` + parse, or unwrap `Option`, for fallbacks.
 
 ---
 

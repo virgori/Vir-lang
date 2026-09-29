@@ -184,10 +184,39 @@ Option(T)
 Vec(T) · Map(K, V) · Set(T) · Deque(T)
 ```
 
-Do not write bare `Result` / `Option` in signatures when the payload type is
-known. Void-success `Result` (no payload) may stay as `Result` until a unit
-type form is audited — mark that intentionally.
+Do not write bare `Result` / `Option` when the success payload type is known.
+
+**Void success (decision A — locked):** when success has **no payload**, write
+bare `Result` meaning `Ok()` | `Err(error)`. Do **not** use `Result(void)` /
+`Result(())` until `void` / unit is confirmed as a valid Vir generic argument.
+
+```text
+fs.write(...)      -> Result
+env.set(...)       -> Result
+process.kill(...)  -> Result
+
+process.spawn(...) -> Result(Child)
+parse.int(...)     -> Result(int)
+```
+
+Bare `Result` here is intentional type information (void success), not omission.
 Do not invent foreign names (`str`, `bytes`) unless that type exists in Vir.
+
+## Core registry cluster
+
+Design-closed docs (not impl-stable): `option` · `result` · `vec` · `buffer` ·
+`slice` · `fs` · `path` · `json`.
+
+Rules for this cluster:
+
+- Generics use `()` only.
+- `closed` = Q8 docs complete; never implies API `stable`.
+- Prefer CORE SPEC **canonical names** in docs (`unwrapOr`, `parse`,
+  `readText`, `extension`, `atLeast`, `get`, …). Older names stay in
+  `previous:` / migration maps for implementers.
+- Mark SPEC APIs not yet in source as **`planned`** with
+  “verify at implement” — do not block design on source inventory alone.
+- Keep A–D, Q1–Q8, and the six implementation gaps.
 
 ## Relationship to `stdlib.vri`
 

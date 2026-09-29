@@ -88,7 +88,7 @@ BufferedReader / BufferedWriter / LineWriter
 
 ### Console (locked)
 
-`io.print` / `println` / `eprint` / `eprintln` / `readLine` — fire-and-forget,
+`io.print` / `println` / `eprint` / `eprintln` / `readln` — fire-and-forget,
 **`string` only**. Format numbers via native interpolation or
 [`format`](format.md) first — not implicit `print(255)`.
 
@@ -108,7 +108,7 @@ migrate ordinary I/O failures to `throw int`.
 | Genuine absence (no value, not a fault) | `Option` (`Some` / `None`) |
 | Cleanup | `ensure` |
 | Abort / invariant / logic bug | `throw` / `panic` |
-| `stdio` convenience (`print` / `readLine`) | keep current fire-and-forget; no fake error propagation until stream APIs exist |
+| `stdio` convenience (`print` / `readln`) | keep current fire-and-forget; no fake error propagation until stream APIs exist |
 
 **Signatures use Vir generics with `()`** — e.g. `Result(T)`, `Option(T)`, `Result(Option(u8))`. Default `Result` error type is `Error` unless stated.
 
@@ -162,7 +162,7 @@ buffer → `None`. That swallows I/O errors. **Must fix** before public `byte()`
 Keep for now (no error migration in the rename pass):
 
 ```vir
-io.print / io.println / io.eprint / io.eprintln / io.readLine
+io.print / io.println / io.eprint / io.eprintln / io.readln
 ```
 
 Error-aware path comes later via:
@@ -240,7 +240,7 @@ recognize delimiters spanning read boundaries.
 | `eprintln` | `io.eprintln` | present → **rename** ns | keep |
 | `eprint_str` | — | present | **remove** public alias |
 | `eprint_ln` | — | present | **remove** public alias |
-| `readln` | `io.readLine` | present → **rename** | rename (`readln` → `readLine`) |
+| `readln` | **`io.readln`** | present | keep · `readln` was mistaken camelCase |
 | `read_line` | — | present | **remove** public alias |
 | `read_line_secret` | `cli.password` | present | **move** + **incomplete** (see `cli.md`) |
 | `input` | `cli.ask` | present | **move** |
@@ -273,7 +273,7 @@ Must use the same `Reader` / `Writer` abstraction — no special-cased stream-on
 | `io.println` | `io.println` | `io.println(s: string) -> void` | proposed | rename |
 | `io.eprint` | `io.eprint` | `io.eprint(s: string) -> void` | proposed | rename |
 | `io.eprintln` | `io.eprintln` | `io.eprintln(s: string) -> void` | proposed | rename |
-| `io.readLine` | `io.readLine` | `io.readLine() -> string` | proposed | rename |
+| `io.readln` | `io.readln` | `io.readln() -> string` | proposed | present |
 | `io.stdin` | `io.stdin` | `io.stdin() -> Reader` | planned | missing |
 | `io.stdout` | `io.stdout` | `io.stdout() -> Writer` | planned | missing |
 | `io.stderr` | `io.stderr` | `io.stderr() -> Writer` | planned | missing |
@@ -435,17 +435,17 @@ io.eprintln("failed")
 
 ---
 
-<a id="io.readLine"></a>
-## `io.readLine`
+<a id="io.readln"></a>
+## `io.readln`
 
 <!--
-id: io.readLine
-api: io.readLine
-previous: readln
+id: io.readln
+api: io.readln
+previous: readLine
 -->
 
 ```vir
-io.readLine() -> string
+io.readln() -> string
 ```
 
 Reads one line from stdin up to LF. Result excludes LF; trailing CR from CRLF is stripped.
@@ -467,7 +467,7 @@ None as `Result` today. EOF returns what was collected.
 ### Example
 
 ```vir
-let line = io.readLine()
+let line = io.readln()
 ```
 
 ### See also
@@ -929,7 +929,7 @@ api: Reader.line
 ```
 
 Binary → text: read one line, decode as **strict UTF-8** `string` (newline
-stripping aligned with `io.readLine`). Not the same as `until(0x0A)` (`Buffer`).
+stripping aligned with `io.readln`). Not the same as `until(0x0A)` (`Buffer`).
 
 ### Parameters
 
@@ -1701,7 +1701,7 @@ None at construction.
 | Area | Present | Rename / replace | Missing / planned | Incomplete |
 |---|---|---|---|---|
 | Console print/eprint | yes | ns + drop aliases | — | — |
-| `io.readLine` | as `readln` | rename | — | — |
+| `io.readln` | as `readln` | present | — | — |
 | `io.stdin/out/err` | — | — | yes | — |
 | Free flush | stub | replace w/ stream flush | — | stub |
 | `Reader.read` | yes | export/publicize | — | — |

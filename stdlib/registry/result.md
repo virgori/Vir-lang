@@ -7,11 +7,10 @@ source:
     path: vir/core/result.vri
   - name: compiler.result.def
     path: vir/compiler/result.vri
-status: draft
+status: closed
 notes: >-
-  Ok/Err stay language-level. unwrap_or→or, unwrap_or_else→orWith (f receives E),
-  or_else→recover (Result→Result). and_then merges into flatMap; ok merges into
-  toOption; try_all→all. Error payloads: error.md. No .vri yet.
+  Design closed (R1–R3). Callable HOF → planned. result.all fail-fast + ownership;
+  planned until reclaim-on-error proven. A unchanged. No .vri (Q5).
 ---
 
 # Result
@@ -85,34 +84,52 @@ Bare source `enum Result:` with erased payloads is an **implementation
 mechanism**. Registry does not invent unsupported generic syntax in examples;
 meaning remains parameterized `Result`.
 
+
+## Naming (CORE SPEC)
+
+| Source / previous | Canonical |
+|---|---|
+| `unwrap_or` / was `result.or` | **`result.unwrapOr`** |
+| `unwrap_or_else` | **`result.orWith`** · planned (callable) |
+| `or_else` | **`result.recover`** |
+
+## Decisions R1–R3 (locked)
+
+| ID | Decision |
+|---|---|
+| R1 | HOF needing callable ABI (`map` / `mapErr` / `flatMap` / `recover` / `orWith`) → **`planned`**. Stay in target design; not `stable` until ABI confirmed. Align with option O2. |
+| R2 | Keep `result.all(results: Vec(Result(T, E))) -> Result(Vec(T), E)` in target surface; impl depends on `vec` + error ownership. |
+| R3 | Keep `Result(T)`, `Result(T, E)`, and bare `Result` for void success. **Do not reopen A.** |
+
+### `result.all` semantics (locked)
+
+Fail-fast in element order:
+
+1. All `Ok` → `Ok` of collected success payloads (moved, not owning-copied).
+2. First `Err(e)` → return that `e`; do not continue.
+
+If the implementation cannot reclaim already-processed success payloads when a
+later element fails, `result.all` remains **`planned`**. Do not mark `stable` by
+ignoring retained resources.
+
 ## Public surface (closed)
+
 
 ```text
 result
-├── isOk
-├── isErr
+├── isOk · isErr
+├── unwrap · unwrapErr · expect · unwrapOr
+├── toOption · error
 │
-├── unwrap
-├── unwrapErr
-├── expect
-├── or
-├── orWith
-│
-├── map
-├── mapErr
-├── flatMap
-├── recover
-│
-├── toOption
-├── error
-└── all
+├── orWith · map · mapErr · flatMap · recover   # planned · callable ABI (R1)
+└── all                                          # planned · reclaim gate (R2)
 ```
 
 ### Semantic families
 
 | Family | Shape |
 |---|---|
-| `or` / `orWith` | `Result` → success `T` |
+| `unwrapOr` / `orWith` | `Result` → success `T` |
 | `map` / `mapErr` / `flatMap` / `recover` | `Result` → `Result` |
 | `toOption` / `error` | `Result` → `Option` |
 | `all` | `Vec` of `Result` → `Result` of `Vec` |
@@ -120,7 +137,7 @@ result
 ### Extract / fallback (vs Option)
 
 ```text
-result.or(r, default)     Ok(v) → v; Err(_) → default
+result.unwrapOr(r, default)     Ok(v) → v; Err(_) → default
 result.orWith(r, f)       Ok(v) → v; Err(e) → f(e)
 ```
 
@@ -143,7 +160,7 @@ value-level `or` / `orWith`.
 Three non-overlapping operations:
 
 ```text
-result.or(r, value)       Result → T
+result.unwrapOr(r, value)       Result → T
 result.orWith(r, f)       Result → T
 result.recover(r, f)      Result → Result
 ```
@@ -176,7 +193,7 @@ result.flatMap(r, f)      Ok(v) → f(v); Err(e) → Err(e)
 | `unwrap` | `result.unwrap` | `T` or panic | **rename** |
 | `unwrap_err` | `result.unwrapErr` | `E` or panic | **rename** |
 | `expect` | `result.expect` | `T` or panic | **rename** |
-| `unwrap_or` | `result.or` | `T` | **rename** |
+| `unwrap_or` | `result.unwrapOr` | `T` | **rename** |
 | `unwrap_or_else` | `result.orWith` | `T` (`f(e)`) | **rename** |
 | `map` | `result.map` | `Result` | **rename** |
 | `map_err` | `result.mapErr` | `Result` | **rename** · **core** |
@@ -205,15 +222,15 @@ inspect / inspectErr / flatten / transpose
 | `result.unwrap` | `result.unwrap` | `result.unwrap(r: Result) -> T` | proposed |
 | `result.unwrapErr` | `result.unwrapErr` | `result.unwrapErr(r: Result) -> E` | proposed |
 | `result.expect` | `result.expect` | `result.expect(r: Result, msg: string) -> T` | proposed |
-| `result.or` | `result.or` | `result.or(r: Result, default: T) -> T` | proposed |
-| `result.orWith` | `result.orWith` | `result.orWith(r: Result, f: E -> T) -> T` | proposed |
-| `result.map` | `result.map` | `result.map(r: Result(T, E), f: …) -> Result(…)` | proposed |
-| `result.mapErr` | `result.mapErr` | `result.mapErr(r: Result(T, E), f: …) -> Result(…)` | proposed |
-| `result.flatMap` | `result.flatMap` | `result.flatMap(r: Result(T, E), f: …) -> Result(…)` | proposed |
-| `result.recover` | `result.recover` | `result.recover(r: Result(T, E), f: …) -> Result(…)` | proposed |
+| `result.unwrapOr` | `result.unwrapOr` | `result.unwrapOr(r: Result, default: T) -> T` | proposed |
+| `result.orWith` | `result.orWith` | `result.orWith(r: Result, f: E -> T) -> T` | planned |
+| `result.map` | `result.map` | `result.map(r: Result(T, E), f: …) -> Result(…)` | planned |
+| `result.mapErr` | `result.mapErr` | `result.mapErr(r: Result(T, E), f: …) -> Result(…)` | planned |
+| `result.flatMap` | `result.flatMap` | `result.flatMap(r: Result(T, E), f: …) -> Result(…)` | planned |
+| `result.recover` | `result.recover` | `result.recover(r: Result(T, E), f: …) -> Result(…)` | planned |
 | `result.toOption` | `result.toOption` | `result.toOption(r: Result(T, E)) -> Option(T)` | proposed |
 | `result.error` | `result.error` | `result.error(r: Result(T, E)) -> Option(E)` | proposed |
-| `result.all` | `result.all` | `result.all(results: Vec(Result(T, E))) -> Result(Vec(T), E)` | proposed |
+| `result.all` | `result.all` | `result.all(results: Vec(Result(T, E))) -> Result(Vec(T), E)` | planned |
 
 ---
 
@@ -373,17 +390,17 @@ Same as `unwrap` with custom panic message.
 
 ---
 
-<a id="result.or"></a>
-## `result.or`
+<a id="result.unwrapOr"></a>
+## `result.unwrapOr`
 
 <!--
-id: result.or
-api: result.or
+id: result.unwrapOr
+api: result.unwrapOr
 previous: unwrap_or
 -->
 
 ```vir
-result.or(r: Result, default: T) -> T
+result.unwrapOr(r: Result, default: T) -> T
 ```
 
 | Case | Result |
@@ -439,7 +456,7 @@ no absence payload.
 
 ### See also
 
-- `result.or`
+- `result.unwrapOr`
 - `result.recover`
 
 ---
@@ -715,8 +732,6 @@ namespace after Vec rename pass).
 
 ## Implementation readiness
 
-Public result API map is closed for this refactor.
-Implementation may proceed against this registry.
-
-Error payloads: see [`error.md`](error.md) (sole `ErrorKind`; no public
-`IoErrorKind`).
+**Design status: closed** (R1–R3). Error payloads: [`error.md`](error.md).
+Callable HOF and `all` stay `planned` until ABI / reclaim gates clear.
+No `.vri` until authorized (Q5).

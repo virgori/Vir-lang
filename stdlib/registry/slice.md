@@ -5,7 +5,7 @@ summary: Borrowed binary view (ptr, len) — namespace-only slice.*.
 source:
   - name: slice
     path: vir/mem/slice.vri
-status: draft
+status: closed
 notes: >-
   Separate from buffer.md — Slice does not own storage. Namespace-only like
   buffer/path. Indexing is get/set (not byte — avoids Reader.byte confusion).
@@ -50,6 +50,32 @@ slice.copyTo(s, dst)
 | Content equality / find byte | `buffer.push*` / `buffer.free` |
 | | Receiver `s.get` — **not public** |
 | | Lifetime extension beyond owner — **impossible** |
+
+## Decisions S1–S2 (locked)
+
+## CORE SPEC name map
+
+| SPEC | Canonical |
+|---|---|
+| subslice | **`slice.sub`** (locked) — no new alias |
+| `slice.len` | canonical target; may stay **planned**; field `s.len` temporary (S1) |
+| no `slice.free` | locked — non-owning |
+
+
+
+| ID | Decision |
+|---|---|
+| S1 | `slice.len(s) -> int` is the **canonical** API; may stay **`planned`** until the namespace accessor exists. Field `s.len` is a temporary access path. |
+| S2 | Borrow / invalidation contract is **closed in docs**. Borrow-checker enforcement is an **implementation gate**. |
+
+`Slice` is a borrowed view: it does **not** own or free backing memory.
+A `Buffer` must not `free`, `grow`, or otherwise restructure/relocate storage
+while a `Slice` into it is still in use.
+
+In-place content changes within existing storage do **not** by themselves
+invalidate a slice; changes that affect size or memory location must follow the
+borrow contract. `copyTo` remains overlap-safe. Endianness of buffer integer
+helpers stays little-endian ([`buffer`](buffer.md)).
 
 ## Borrow lifetime (closed)
 
@@ -801,6 +827,5 @@ slice.fill(s, 0)
 
 ## Implementation readiness
 
-Public slice API map is closed for this refactor.
-Implementation may proceed against this registry.
-Binary model (`Buffer` + `Slice` + `string`) is closed with [`buffer.md`](buffer.md).
+**Design status: closed** (S1–S2). Binary model closed with [`buffer`](buffer.md).
+`slice.len` may remain planned; borrow checker = gate. No `.vri` until Q5.

@@ -208,7 +208,7 @@ Flat names only — **no** `process.command.arg` nesting (P6).
 | `process.stderr` | `process.stderr` | `process.stderr(cmd, mode: Stdio)` | proposed |
 | `process.spawn` | `process.spawn` | `process.spawn(cmd) -> Result(Child)` | proposed |
 | `process.wait` | `process.wait` | `process.wait(child) -> Result(ExitStatus)` | proposed |
-| `process.kill` | `process.kill` | `process.kill(child) -> Result` · void success · form pending audit | proposed |
+| `process.kill` | `process.kill` | `process.kill(child) -> Result` · void success · bare `Result` (A) | proposed |
 | `process.output` | `process.output` | `process.output(cmd) -> Result(Output)` | proposed |
 | `process.status` | `process.status` | `process.status(cmd) -> Result(ExitStatus)` | proposed |
 | `process.exit` | `process.exit` | `process.exit(code: int)` | proposed |
@@ -242,7 +242,7 @@ process.stderr(cmd, mode: Stdio)
 ```vir
 process.spawn(cmd) -> Result(Child)
 process.wait(child) -> Result(ExitStatus)
-process.kill(child) -> Result  # void success; typed void Result pending audit
+process.kill(child) -> Result  # void success · bare Result (decision A)
 ```
 
 ### Status
@@ -291,4 +291,4 @@ process.abort()
 3. Drop public `shell`; keep migration aliases briefly.
 4. Audit pipe close, wait/kill, and errno→Error mapping before “stable”.
 
-**Next docs queue:** Data Formats — continue [`json`](json.md) (draft) → toml/yaml/…
+**Next:** core registry (option…json) design-closed. Open **csv** wave. No `.vri` / no PR.

@@ -5,7 +5,7 @@ summary: Owned growable binary storage — namespace-only buffer.*.
 source:
   - name: buffer
     path: vir/mem/buffer.vri
-status: draft
+status: closed
 notes: >-
   Namespace-only like path. No receiver b.*. Integer push/set encode little-endian
   by default. write_bytes/grow/patch_u32 internal. Pair with slice.md; bridge is
@@ -74,6 +74,29 @@ u32 / setU32
 No `…LE` suffix while LE is the only public integer encoding. Big-endian is out
 of this surface until a real need appears.
 
+## Decision B1 (locked)
+
+## CORE SPEC name map (reconcile — no invent)
+
+| SPEC | Canonical in this registry |
+|---|---|
+| `buffer.withCap(cap)` | **`buffer.new(cap)`** — capacity constructor already locked |
+| `buffer.empty()` | keep — distinct empty ctor |
+| `buffer.get` | **canonical** byte read (previous public name `buffer.byte`) |
+| `buffer.byte` | → **`buffer.get`** (SPEC: no public `byte` alias) |
+| `buffer.copyTo` | **not a Buffer method** — use [`slice.copyTo`](slice.md) on `buffer.slice(b)` |
+| Integer push/set | `pushU16`/`U32`/`U64`, `setU32`, … — LE locked |
+
+Do **not** invent `buffer.withCap` as a second public name.
+
+`Buffer` is owned, mutable, contiguous **binary** storage (no implicit UTF-8 decode). It owns storage under **move** semantics and must be **`buffer.free`**
+explicitly under the current lifecycle. Do not assume automatic destruction the
+language does not guarantee. Growing / restructuring that may relocate storage
+invalidates outstanding [`Slice`](slice.md) views (see borrow rules below).
+
+Little-endian integer helpers remain locked. `copyTo` on slices is overlap-safe
+(see [`slice`](slice.md)).
+
 ## Ownership and borrow invalidation (closed)
 
 `Buffer` is a **Move** type today. Mutating APIs take `ref b: Buffer`.
@@ -114,7 +137,7 @@ buffer
 ├── pushU64
 ├── write
 │
-├── byte
+├── get          # was byte (SPEC)
 ├── u32
 ├── set
 ├── setU32
@@ -152,7 +175,7 @@ No public `buffer.default`. No public `buffer.bytes()`.
 | `buffer_push_u64` | `buffer.pushU64` | LE uint64 | **rename** |
 | `buffer_write` | `buffer.write` | append `Slice` | **rename** |
 | `buffer_write_bytes` | — | raw `ptr` + count | **internal** |
-| `buffer_read_u8` | `buffer.byte` | byte at offset | **rename** |
+| `buffer_read_u8` / `buffer.get` | `buffer.get` | byte at offset | **rename** · SPEC canonical `get` |
 | `buffer_read_u32` | `buffer.u32` | LE u32 at offset | **rename** |
 | `buffer_write_at` | `buffer.set` | byte at offset | **rename** |
 | `buffer_write_u32_at` | `buffer.setU32` | LE u32 at offset | **rename** |
@@ -179,7 +202,7 @@ No public `buffer.default`. No public `buffer.bytes()`.
 | `buffer.pushU32` | `buffer.pushU32` | `buffer.pushU32(b: Buffer, value: int) -> void` | proposed |
 | `buffer.pushU64` | `buffer.pushU64` | `buffer.pushU64(b: Buffer, value: int) -> void` | proposed |
 | `buffer.write` | `buffer.write` | `buffer.write(b: Buffer, data: Slice) -> void` | proposed |
-| `buffer.byte` | `buffer.byte` | `buffer.byte(b: Buffer, offset: int) -> int` | proposed |
+| `buffer.get` | `buffer.get` | `buffer.get(b: Buffer, offset: int) -> int` | proposed |
 | `buffer.u32` | `buffer.u32` | `buffer.u32(b: Buffer, offset: int) -> int` | proposed |
 | `buffer.set` | `buffer.set` | `buffer.set(b: Buffer, offset: int, value: int) -> void` | proposed |
 | `buffer.setU32` | `buffer.setU32` | `buffer.setU32(b: Buffer, offset: int, value: int) -> void` | proposed |
@@ -594,17 +617,18 @@ buffer.write(b, data)
 
 ---
 
-<a id="buffer.byte"></a>
-## `buffer.byte`
+<a id="buffer.get"></a>
+## `buffer.get`
 
 <!--
-id: buffer.byte
-api: buffer.byte
+id: buffer.get
+api: buffer.get
+previous: buffer.byte
 previous: buffer_read_u8
 -->
 
 ```vir
-buffer.byte(b: Buffer, offset: int) -> int
+buffer.get(b: Buffer, offset: int) -> int
 ```
 
 Reads one byte at `offset` (`0 ≤ offset < len`).
@@ -634,7 +658,7 @@ Pairs with `buffer.set`. Does not grow.
 ### Example
 
 ```vir
-let x = buffer.byte(b, 0)
+let x = buffer.get(b, 0)
 ```
 
 ### Status
@@ -767,7 +791,7 @@ buffer.set(b, 0, 0xFF)
 
 ### See also
 
-- `buffer.byte`
+- `buffer.get`
 - `buffer.setU32`
 
 ---
@@ -1278,5 +1302,5 @@ buffer.free(b)
 
 ## Implementation readiness
 
-Public buffer API map is closed for this refactor.
-Implementation may proceed against this registry.
+**Design status: closed** (B1). Explicit `free` + move/invalidate rules locked.
+No `.vri` until authorized (Q5).

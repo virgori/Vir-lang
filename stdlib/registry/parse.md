@@ -146,18 +146,19 @@ These are **implementation targets**, not a claim that current `parse_int` /
 
 Shared with [`format.float`](format.md). APIs stay **`planned`** until **all**
 rows pass. This section locks the gate; it does **not** certify implementation.
+Do **not** auto-promote to `stable`.
 
 | ID | Requirement |
 |---|---|
-| F1 | Binary64 round-trip suite with [`format.float`](format.md) (`prec` 0…17, ties-to-even) |
-| F2 | Non-finite canonical spellings: `nan` / `inf` / `-inf` (case **audit** with format) |
+| F1 | **Two APIs** (fixed `prec` alone does **not** guarantee round-trip for every binary64): (a) [`format.float`](format.md) shortest-round-trip; (b) [`format.floatFixed`](format.md) fixed precision + ties-to-even. Both must pass the suite before stable. **No overloading (Q2).** |
+| F2 | Non-finite spellings **lowercase only**: `nan` / `inf` / `-inf`. Format emits these; parse accepts **exactly** these three. No automatic uppercase / mixed-case variants in the first contract. |
 | F3 | Signed zero preserved on parse↔format |
 | F4 | Subnormals covered; finite overflow → `ParseFloatError` (**not** silent `inf`) |
 | F5 | Whole-string strictness (same family as `parse.int`); no trim |
 | F6 | Today’s stub `parse_float` → `0` and untested `native_f64_to_str` are **not** public contract |
 
 Dependents that wait: [`fmt.float`](fmt.md), [`builder.writeFloat`](builder.md),
-JSON floating numbers (see [`json`](json.md)).
+JSON float numbers (see [`json`](json.md) — dual int+float after this gate).
 
 ## Planned — not stable (`parse.float`)
 
@@ -167,14 +168,15 @@ parse.float(s) -> Result(float)
 
 **Never** publish today’s stub (`parse_float` → `0`) as the contract.
 
-**Target contract** (with [`format.float`](format.md)):
+**Target contract** (with [`format.float`](format.md) / [`format.floatFixed`](format.md)):
 
 | Item | Contract |
 |---|---|
-| Grammar | Optional sign, decimal, exponent; non-finite canonical `nan` / `inf` / `-inf` |
+| Grammar | Optional sign, decimal, exponent; non-finite **only** `nan` / `inf` / `-inf` |
 | Strictness | Whole string (same family as `parse.int`) |
 | Invalid | `ParseFloatError` |
 | Finite overflow | `ParseFloatError` — **not** silent infinity |
+| Case | Reject `NaN` / `Inf` / … in first contract (F2) |
 
 Stable only after the float gate (F1–F6) passes.
 

@@ -7,11 +7,10 @@ source:
     path: vir/core/option.vri
   - name: compiler.option.def
     path: vir/compiler/option.vri
-status: draft
+status: closed
 notes: >-
-  Constructors Some/None stay language-level. Free is_some/unwrap are impl/prelude
-  only. Critical rename: unwrap_or_else → orWith; or_else → otherwise (different
-  return types). HOF locked as public; callable ABI is impl debt. No .vri until map applied.
+  Design closed (O1–O4). zip deferred until Pair(T,U). Callable HOF → planned.
+  and planned. Ownership: payload only; move vs copy rules. No .vri (Q5).
 ---
 
 # Option
@@ -36,7 +35,7 @@ Operations use namespace **`option.*`**:
 
 ```vir
 option.isSome(opt)
-option.or(opt, default)
+option.unwrapOr(opt, default)
 option.map(opt, f)
 ```
 
@@ -81,28 +80,21 @@ examples, note that as an **implementation gap** — do not fall back to `<>`.
 
 ```text
 option
-├── isSome
-├── isNone
+├── isSome · isNone          # proposed / present
+├── unwrap · expect · unwrapOr
+├── otherwise · toResult     # proposed / present
 │
-├── unwrap
-├── expect
-├── or
-├── orWith
+├── unwrapOrElse · map · flatMap · filter   # planned · callable ABI (O2)
+├── and                                 # planned (O3)
 │
-├── otherwise
-├── and
-├── map
-├── flatMap
-├── filter
-├── zip
-└── toResult
+# zip — deferred from public core until Pair(T, U) (O1)
 ```
 
 ### Semantic families
 
 | Family | Shape |
 |---|---|
-| `or` / `orWith` | `Option` → contained `T` (or default) |
+| `unwrapOr` / `unwrapOrElse` | `Option` → contained `T` (or default) |
 | `otherwise` / `and` / `filter` | `Option` → `Option` |
 | `map` | `Option` → `Option` (transformed payload) |
 | `flatMap` | `Option` → `Option` via `T → Option` |
@@ -114,19 +106,17 @@ Source today has **two different** APIs:
 
 | Current | Returns | Canonical |
 |---|---|---|
-| `unwrap_or(default)` | `T` | `option.or` |
-| `unwrap_or_else(f)` | `T` (lazy) | `option.orWith` |
+| `unwrap_or(default)` | `T` | **`option.unwrapOr`** |
+| `unwrap_or_else(f)` | `T` (lazy) | **`option.unwrapOrElse`** |
 | `or_else(alt)` | **`Option`** | `option.otherwise` |
 
 Do **not** map both `unwrap_or_else` and `or_else` to `orElse`.
 
 ```vir
-option.or(opt, value)            # → T
-option.orWith(opt, f)            # → T, lazy
-option.otherwise(opt, alt)       # → Option
+option.unwrapOr(opt, value)        # → T
+option.unwrapOrElse(opt, f)        # → T, lazy · planned
+option.otherwise(opt, alt)         # → Option
 ```
-
-Boolean keyword `or` is unrelated: public name is qualified `option.or`.
 
 ## Migration map
 
@@ -137,39 +127,58 @@ Boolean keyword `or` is unrelated: public name is qualified `option.or`.
 | `is_none` | `option.isNone` | `bool` | **rename**; remove free public |
 | `unwrap` | `option.unwrap` | `T` or panic | **rename**; remove free public |
 | `expect` | `option.expect` | `T` or panic | **rename**; remove free public |
-| `unwrap_or` | `option.or` | `T` | **rename** |
-| `unwrap_or_else` | `option.orWith` | `T` | **rename** |
+| `unwrap_or` | `option.unwrapOr` | `T` | **rename** |
+| `unwrap_or_else` | `option.unwrapOrElse` | `T` | **rename**; **planned** (O2) |
 | `or_else` | `option.otherwise` | `Option` | **rename** |
 | — | `option.and` | `Option` | **planned** (trivial) |
-| `map` | `option.map` | `Option` | **rename**; keep public |
-| `flat_map` | `option.flatMap` | `Option` | **rename**; keep public |
-| `filter` | `option.filter` | `Option` | **rename**; keep public |
-| `zip` | `option.zip` | `Option` of pair | **rename**; pair type = source dependency |
+| `map` | `option.map` | `Option` | **rename**; **planned** until callable ABI (O2) |
+| `flat_map` | `option.flatMap` | `Option` | **rename**; **planned** (O2) |
+| `filter` | `option.filter` | `Option` | **rename**; **planned** (O2) |
+| `zip` | — | — | **defer** until `Pair(T, U)` (O1) |
 | `option_to_result` | `option.toResult` | `Result` | **move** into `core/option.vri` |
 
 Prelude (`compiler/option_prelude.vri`) may keep minimal free helpers for
 bootstrap; not the user-facing contract.
 
-## Callable / HOF debt
+## Decisions O1–O4 (locked)
 
-`map` / `flatMap` / `filter` / `orWith` take callables. Current `func` / `ptr`
-representation may be incomplete. That is **implementation debt** — the public
-contract still includes these operations (unlike deferring the large `vec` HOF
-set).
+| ID | Decision |
+|---|---|
+| O1 | **`zip` deferred** from public core until standardized `Pair(T, U)`. Do not invent a pair type only for `option`. |
+| O2 | HOF needing callable ABI (`map` / `flatMap` / `filter` / `orWith`) → **`planned`**. Target surface + semantics remain in docs; not `stable` until ABI confirmed. |
+| O3 | `option.and` stays **`planned`**; not required present to close design. |
+| O4 | Typo `Option(U)` → `Option(U)` fixed. |
 
-## `zip` pair representation
+Ops without callbacks (`isSome` / `isNone` / `unwrap` / `expect` / `or` / `otherwise` / `toResult`) keep their own statuses.
 
-Today’s source:
 
-```vir
-Option.Some((unwrap(a), unwrap(b)))
-```
+## Naming (CORE SPEC)
 
-Registry does **not** invent a public tuple type name. Document:
+Canonical public names follow the CORE SPEC. Source/snake names migrate later.
 
-> Success payload is whatever pair/tuple representation the current
-> implementation produces. Stabilize against the language pair/tuple story
-> when that lands; until then `zip` is present with a representation dependency.
+| Source / previous | Canonical |
+|---|---|
+| `unwrap_or` / was `option.or` | **`option.unwrapOr`** |
+| `unwrap_or_else` / was `option.orWith` | **`option.unwrapOrElse`** · planned (callable ABI) |
+| `or_else` | **`option.otherwise`** |
+
+Do not keep parallel `or` / `orWith` as second public names.
+
+## Ownership (locked)
+
+`Option(T)` owns **no** resources beyond the payload `T`.
+
+| Access | Rule |
+|---|---|
+| Move payload out | Old `Option` must not be used as if it still holds the payload |
+| Copy payload | Only when `T` is **safely copyable** |
+| Forbidden | Shallow-copy of unique ownership |
+
+## Callable HOF (O2)
+
+`map` / `flatMap` / `filter` / `orWith` remain in the **target** surface as
+**`planned`** until callable ABI is confirmed. Do not silently drop them from
+design; do not mark them `stable` early.
 
 ## API
 
@@ -179,14 +188,14 @@ Registry does **not** invent a public tuple type name. Document:
 | `option.isNone` | `option.isNone` | `option.isNone(opt: Option(T)) -> bool` | proposed |
 | `option.unwrap` | `option.unwrap` | `option.unwrap(opt: Option(T)) -> T` | proposed |
 | `option.expect` | `option.expect` | `option.expect(opt: Option(T), msg: string) -> T` | proposed |
-| `option.or` | `option.or` | `option.or(opt: Option(T), default: T) -> T` | proposed |
-| `option.orWith` | `option.orWith` | `option.orWith(opt: Option(T), f: …) -> T` | proposed |
+| `option.unwrapOr` | `option.unwrapOr` | `option.unwrapOr(opt: Option(T), default: T) -> T` | proposed |
+| `option.unwrapOrElse` | `option.unwrapOrElse` | `option.unwrapOrElse(opt: Option(T), f: …) -> T` | planned |
 | `option.otherwise` | `option.otherwise` | `option.otherwise(opt: Option(T), alt: Option(T)) -> Option(T)` | proposed |
 | `option.and` | `option.and` | `option.and(opt: Option(T), next: Option(U)) -> Option(U)` | planned |
-| `option.map` | `option.map` | `option.map(opt: Option(T), f: …) -> Option(U)(U)` | proposed |
-| `option.flatMap` | `option.flatMap` | `option.flatMap(opt: Option(T), f: …) -> Option(U)(U)` | proposed |
-| `option.filter` | `option.filter` | `option.filter(opt: Option(T), predicate: …) -> Option(T)` | proposed |
-| `option.zip` | `option.zip` | `option.zip(a: Option(T), b: Option(U)) -> Option` · pair shape **audit** | proposed |
+| `option.map` | `option.map` | `option.map(opt: Option(T), f: …) -> Option(U)` | planned |
+| `option.flatMap` | `option.flatMap` | `option.flatMap(opt: Option(T), f: …) -> Option(U)` | planned |
+| `option.filter` | `option.filter` | `option.filter(opt: Option(T), predicate: …) -> Option(T)` | planned |
+| `option.zip` | — | deferred until `Pair(T, U)` (O1) | deferred |
 | `option.toResult` | `option.toResult` | `option.toResult(opt: Option(T), error: E) -> Result(T, E)` | proposed |
 
 ---
@@ -291,7 +300,7 @@ Valid primitive; **not** preferred normal flow when absence is expected
 ### See also
 
 - `option.expect`
-- `option.or`
+- `option.unwrapOr`
 
 ---
 
@@ -330,17 +339,17 @@ option.expect(opt, "configuration required")
 
 ---
 
-<a id="option.or"></a>
-## `option.or`
+<a id="option.unwrapOr"></a>
+## `option.unwrapOr`
 
 <!--
-id: option.or
-api: option.or
+id: option.unwrapOr
+api: option.unwrapOr
 previous: unwrap_or
 -->
 
 ```vir
-option.or(opt: Option(T), default: T) -> T
+option.unwrapOr(opt: Option(T), default: T) -> T
 ```
 
 | Case | Result |
@@ -355,7 +364,7 @@ Eager default. Not `option.otherwise` (that returns `Option`).
 ### Example
 
 ```vir
-let v = option.or(opt, 0)
+let v = option.unwrapOr(opt, 0)
 ```
 
 ### Status
@@ -368,22 +377,22 @@ let v = option.or(opt, 0)
 
 ### See also
 
-- `option.orWith`
+- `option.unwrapOrElse`
 - `option.otherwise`
 
 ---
 
-<a id="option.orWith"></a>
-## `option.orWith`
+<a id="option.unwrapOrElse"></a>
+## `option.unwrapOrElse`
 
 <!--
-id: option.orWith
-api: option.orWith
+id: option.unwrapOrElse
+api: option.unwrapOrElse
 previous: unwrap_or_else
 -->
 
 ```vir
-option.orWith(opt: Option(T), f: …) -> T
+option.unwrapOrElse(opt: Option(T), f: …) -> T
 ```
 
 | Case | Result |
@@ -406,7 +415,7 @@ fallback) and from former name collision with `or_else`.
 
 ### See also
 
-- `option.or`
+- `option.unwrapOr`
 - `option.otherwise`
 
 ---
@@ -445,7 +454,7 @@ alongside `orWith`.
 ### See also
 
 - `option.and`
-- `option.or`
+- `option.unwrapOr`
 
 ---
 
@@ -495,7 +504,7 @@ previous: map
 -->
 
 ```vir
-option.map(opt: Option(T), f: …) -> Option(U)(U)
+option.map(opt: Option(T), f: …) -> Option(U)
 ```
 
 | Case | Result |
@@ -505,7 +514,7 @@ option.map(opt: Option(T), f: …) -> Option(U)(U)
 
 ### Semantics
 
-Basic `Option` algebra. Public despite callable-ABI debt.
+Target algebra. Status **`planned`** until callable ABI confirmed (O2).
 
 ### Status
 
@@ -532,7 +541,7 @@ previous: flat_map
 -->
 
 ```vir
-option.flatMap(opt: Option(T), f: …) -> Option(U)(U)
+option.flatMap(opt: Option(T), f: …) -> Option(U)
 ```
 
 | Case | Result |
@@ -589,7 +598,7 @@ option.filter(opt: Option(T), predicate: …) -> Option(T)
 ---
 
 <a id="option.zip"></a>
-## `option.zip`
+## `option.zip` *(deferred — O1)*
 
 <!--
 id: option.zip
@@ -614,7 +623,7 @@ tuple type name ahead of the language.
 
 ### Status
 
-`proposed` — **present** as `zip`; representation dependency noted.
+`deferred` — **out of public core** until `Pair(T, U)` (O1). Source may still have `zip`; not canonical.
 
 ### Implementation mapping
 
@@ -661,19 +670,19 @@ Error payload type follows current `Result` / `Err` conventions.
 
 ### See also
 
-- `option.or`
+- `option.unwrapOr`
 - Result registry *(next)*
 
 ---
 
 ## Implementation readiness
 
-Public option API map is closed for this refactor.
-Implementation may proceed against this registry.
+**Design status: closed** (O1–O4 + ownership). Q8 surface / ownership / error /
+lifecycle / semantics reflected. Implementation may proceed against this map
+(Q5: no `.vri` until authorized).
 
-Priority when coding `core/option.vri`:
-
-1. Namespace / canonical names (`or` / `orWith` / `otherwise` — do not collapse).
-2. Add `and`; move `toResult` out of compiler-only module.
-3. Keep constructors language-level (`Some` / `None`).
-4. HOF stay public; improve callable ABI separately.
+1. Namespace renames (`unwrapOr` / `unwrapOrElse` / `otherwise`).
+2. Add `and` when convenient; not a design blocker.
+3. Callable HOF remain `planned` until ABI confirmed — then may become proposed/stable.
+4. Do **not** reintroduce public `zip` before `Pair(T, U)`.
+5. Keep constructors language-level (`Some` / `None`).
