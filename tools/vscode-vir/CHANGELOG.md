@@ -2,6 +2,104 @@
 
 All notable changes to the Vir Language Support extension will be documented in this file.
 
+## [4.7.0]
+
+### Changed
+- `->` is Lime `#BEF264` in the dark themes (darker lime `#4D7C0F` in Quantum Light so it stays readable on white), in both the TextMate and semantic layers.
+- Banner palette: text `#B5EDFF`, decoration (`##` / `#*#` frame and `====` rules) `#67E8F9`, title (first content line) `#D6F6FF` bold. Quantum Light uses darker cyans of the same hue.
+
+### Fixed
+- File banners were not recognised when the file starts with a blank line (e.g. `src/core/sys.vri`): TextMate tokenizes line by line, so `\A(?:[ \t]*\n)*` could never match. Leading blank lines / shebang are now a small wrapper state around the banner.
+
+### Added
+- **Active / inactive symbol highlighting.** Module names, functions, types, constants and imported symbols are coloured Active `#FFB454` / Inactive `#92745F` (light theme: `#B45309` / `#7A5C48`, since `#FFB454` is 1.8:1 on white). State is per symbol, including each name inside `import a, b from mod`. `include` / `import` / `from` keep their colours; the line is never dimmed; no warning or error is produced for inactive symbols; unresolved symbols are never painted inactive.
+  - The compiler is the single source of truth: `virc --ide-semantic --json` emits `ide.symbols` (`name`, `kind`, `line`, `state`) from its declaration table and reference graph (calls, callbacks passed as values, type uses, constants; roots are `main`, top-level code and `export`s; transitive). The extension does no usage analysis of its own; it only locates the reported name on the reported line.
+  - New semantic modifiers `active` / `inactive`, new token types `moduleName`, `importedSymbol`, `constant`, `bannerTitle`, new setting `vir.semantic.symbolState.enabled`.
+  - Snapshots are cached by document version; a request for a newer version aborts the stale compiler process; a cancelled semantic-token request stops waiting.
+- `npm test`: unit tests (banner title, symbol location/state mapping, theme colours) and compiler-backed fixtures for direct call, indirect call, callback, unused import, unresolved symbol and cross-module dependency (`test/fixtures`, skipped until the compiler emits `ide.symbols`).
+
+### Removed
+- The regex-based `functionUnused` semantic token (name matching in the document) and the opacity/italic decorations for module/function active/inactive state.
+
+## [4.6.10]
+
+### Fixed
+- Root cause of the two-tone `->`: `language-configuration.json` declared `<` `>` as a bracket pair, so VS Code's bracket pair colorization painted the `>` of `->` (and every comparison `<` / `>`) with a nesting color while `-` kept its token color. `<` `>` are no longer brackets; only `{}` `[]` `()` are colorized.
+
+## [4.6.9]
+
+### Fixed
+- Semantic tokens no longer emit strings, numbers, operators or `->`; these are owned solely by the TextMate grammar, so no second layer can split `->` into two colors.
+- Function names were tagged at the wrong column when the name occurred inside `func` (e.g. `func f`).
+- Parameter and constant names before `:` were mis-tagged as object keys; only inside `{ ... }` now.
+
+## [4.6.8]
+
+### Added
+- Warn when `virgori.virgori-core` is installed alongside this extension. It registers the same `source.vri` grammar, its own semantic-token provider (which paints `->`, `-` and `>` as overlapping operators), and themes with identical names, so `->` renders in two colors regardless of this extension's grammar.
+
+## [4.6.7]
+
+### Fixed
+- Tensor shape grammar never matched: the `:` type-annotation rule always won the leftmost-match race, so `tensor[i32; 12, 13]` fell back to generic brackets and plain integers. Shape rules now absorb the leading `:`, `var`/`let`/`const`, or `->`.
+- Semantic tokens were pushed out of positional order, which made VS Code drop or mis-render overlapping ranges (the two-tone `->`). Tokens are now collected, sorted, and de-overlapped before emission.
+- `-1` and other negative literals tokenize as a single number instead of a stray operator plus digit.
+
+### Changed
+- AI/ML shape scopes get an exclusive palette (tensor type, shape delimiters, element type, dimensions). UFCS moved off teal so the tensor family owns it; tensor types no longer share the scalar-type color.
+
+## [4.6.6]
+
+### Fixed
+- `->`: dedicated `#returnArrow` grammar + semantic `returnArrow`; operators no longer tokenize lone `-` / `>` (fixes two-color arrow).
+- Unary `-` on literals no longer styled as binary operator.
+
+### Added
+- `tensor[elem; dims]` / `Matrix<>` shape scopes (violet delimiters, amber element type, teal dimensions) — distinct from operators, keywords, and plain integers.
+
+## [4.6.5]
+
+### Added
+- Semantic token `shapeDimension` for static shape literals (`tensor[…; …]`, `Matrix<…>`, `Vector<…>`), driven by `virc --ide-semantic` JSON `shapeDimensions` when available; fallback heuristics when not.
+- Setting `vir.semantic.shape.compilerBacked` (default on). Maps to TextMate scope `constant.numeric.dimension.vri` — themes choose whether to color distinctly.
+
+### Compiler
+- `ide_semantic` / `sem_pass_ide` collect shape dimension values from resolved type annotations.
+
+## [4.6.4]
+
+### Changed
+- Theme: file banner colors +30% brightness; `#*#` / `##` block comments +16% (all Vir themes).
+
+## [4.6.3]
+
+### Fixed
+- `->` highlighted as one token (`keyword.operator.vri`); avoid splitting `-` / `>` via separate operator alternates and conflicting theme rules for `keyword.operator.arrow.vri`.
+
+## [4.6.2]
+
+### Added
+- File header banner highlighting: first `#*#` / `##` block at BOF (after shebang/blank lines) uses scopes `comment.block.banner.vri` and `comment.block.banner.content.vri`
+- Theme colors for banner in Quantum / Matrix / Forge dark themes and **Vir Quantum Light** fallback theme
+- npm script `vsix` → packages `vir-lang-<version>.vsix` (use instead of `compile` alone)
+
+### Note
+- `npm run compile` only emits TypeScript to `out/`; run `npm run vsix` or `npm run package` to build the installable extension.
+
+## [4.6.0]
+
+### Added
+- Compiler-backed IDE semantic: `virc --ide-semantic --json` (variable lifetime + module include activity)
+- Extension decorations, focus lifetime on cursor, hover, command `Vir: Show Variable Lifetime`
+- Settings: `vir.semantic.lifetime.*`, `vir.compiler.path`
+
+## [4.5.8]
+
+### Added
+- TextMate: generic `of (...)`, UFCS `.method()`, `->` arrow scope, module namespace paths, `tensor`/`flux`/generic container types
+- Distinct `#*#` / `##` block comment body and delimiter colors (Vir themes)
+- Language `vir-modulereg` for `stdlib.vri` and `module.list` (comments, module keys, paths)
+
 ## [4.5.7] - 2026-09-04
 
 ### Fixed
