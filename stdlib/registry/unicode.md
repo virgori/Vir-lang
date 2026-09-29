@@ -63,6 +63,9 @@ claim UCD provenance that does not exist.
    (`unicode_version` in front matter). Siblings only reference it.
 2. **Current value:** `pre-UCD` (unset). Subset / hand-written tables =
    **implementation debt**, not a conformance claim for any Unicode release.
+   **Do not publish Unicode conformance** until official UCD tables are imported
+   **and** tested. When a generator exists, pin **one** UCD version for all
+   dependent modules.
 3. **First UCD import:** the commit that lands UCD-derived tables **must** set
    `unicode_version: X.Y.Z` here and in [`README.md`](README.md) to the exact
    UCD release used to generate those tables. No silent upgrades.
@@ -100,10 +103,11 @@ unicode
 └── countUtf8
 ```
 
-Plus type:
+Plus types:
 
 ```text
 UnicodeCategory   # Lu, Ll, … — public with unicode.category
+Utf8Decoded       # codepoint + nbytes — decodeUtf8 Ok payload (Q1)
 ```
 
 ## Scalar rules (closed)
@@ -185,13 +189,14 @@ Enum without accessor is not enough — **add** `category` even if missing today
 | `unicode.category` | `unicode.category` | `unicode.category(cp: int) -> UnicodeCategory` | proposed |
 | `unicode.utf8Len` | `unicode.utf8Len` | `unicode.utf8Len(cp: int) -> int` | proposed |
 | `unicode.encodeUtf8` | `unicode.encodeUtf8` | encode one scalar into buffer/bytes | proposed |
-| `unicode.decodeUtf8` | `unicode.decodeUtf8` | `decodeUtf8(s: Slice, offset: int) -> Result` · Ok = scalar + byte length (product form **audit**) | proposed |
+| `unicode.Utf8Decoded` | `Utf8Decoded` | entity · `codepoint: int`, `nbytes: int` | proposed |
+| `unicode.decodeUtf8` | `unicode.decodeUtf8` | `decodeUtf8(s: Slice, offset: int) -> Result(Utf8Decoded)` | proposed |
 | `unicode.validUtf8` | `unicode.validUtf8` | `unicode.validUtf8(s: Slice) -> bool` | proposed |
 | `unicode.countUtf8` | `unicode.countUtf8` | `unicode.countUtf8(s: Slice) -> int` | proposed |
 
-Exact `encodeUtf8` / `decodeUtf8` payload shapes follow implementer choice
-(`Buffer` append vs fixed scratch) without reintroducing public `ptr` +
-`out_len` as the user ABI.
+`encodeUtf8` buffer shape follows implementer choice (`Buffer` append vs scratch)
+without public `ptr` + `out_len`. **`decodeUtf8` Ok type is locked (Q1):**
+`Utf8Decoded` — not an unverified tuple form.
 
 ---
 
@@ -236,15 +241,24 @@ UCD General Category for the pinned Unicode version.
 ```vir
 unicode.utf8Len(cp: int) -> int
 unicode.encodeUtf8(...)
-unicode.decodeUtf8(s: Slice, offset: int) -> Result
+unicode.utf8Len(cp: int) -> int
+unicode.encodeUtf8(...)
+unicode.decodeUtf8(s: Slice, offset: int) -> Result(Utf8Decoded)
 unicode.validUtf8(s: Slice) -> bool
 unicode.countUtf8(s: Slice) -> int
 ```
 
-`decodeUtf8` **Ok** payload must expose the decoded scalar and the number of
-bytes consumed (today’s `utf8_decode` + `out_len`). Exact product / entity
-spelling is **audit** — do not invent a public name until chosen. Malformed →
-`Err` with [`ErrorKind.InvalidData`](error.md); no silent `U+FFFD` success.
+### `Utf8Decoded` (Q1 — locked)
+
+```text
+entity Utf8Decoded:
+    codepoint: int    # decoded Unicode scalar
+    nbytes: int       # bytes consumed from the Slice
+```
+
+`decodeUtf8` returns `Result(Utf8Decoded)`. Malformed → `Err` with
+[`ErrorKind.InvalidData`](error.md); no silent `U+FFFD` success. Do **not**
+depend on tuple syntax for this public ABI.
 
 ### Status
 

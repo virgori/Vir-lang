@@ -117,25 +117,26 @@ Not terminal display width; not grapheme-cluster width.
 
 ## Float gate (closed — design criteria)
 
-Shared with [`parse.float`](parse.md). See that file for F1–F6. This module’s
-half of the gate:
+Shared with [`parse.float`](parse.md). See that file for F1–F6. Do **not**
+auto-promote to `stable`. This module’s half:
 
 | Item | Contract |
 |---|---|
-| `prec` | Digits **after** decimal point; range `0…17` for binary64 |
-| Rounding | Round-to-nearest, **ties-to-even** |
+| `format.float(value)` | **Shortest round-trip** string for binary64 (F1a) — Q2 |
+| `format.floatFixed(value, prec)` | Digits **after** decimal `prec` in `0…17`, ties-to-even (F1b) — Q2 |
+| Overloading | **Out** — two distinct names; no overload / default-arg dual API |
 | Decimal separator | `.` (locale-independent) |
-| NaN | `nan` |
-| +∞ / −∞ | `inf` / `-inf` |
+| NaN / ±∞ | Emit **`nan`** / **`inf`** / **`-inf`** only (F2 — lowercase) |
 | Negative zero | Preserve sign |
 
 Stub / untested `native_f64_to_str` must **not** become public contract.
 [`fmt.float`](fmt.md) / [`builder.writeFloat`](builder.md) wait on this gate.
 
-## Planned — not stable (`format.float`)
+## Planned — not stable (`format.float` / `format.floatFixed`)
 
 ```text
-format.float(value, prec)
+format.float(value)                 # shortest round-trip (Q2)
+format.floatFixed(value, prec)      # fixed precision (Q2)
 ```
 
 Not stable until the float gate (F1–F6) passes.
@@ -150,9 +151,9 @@ Not stable until the float gate (F1–F6) passes.
 | `format_pad_left` | `format.padLeft` | **rename** |
 | `format_pad_right` | `format.padRight` | **rename** |
 | `format_center` | `format.padCenter` | **rename** |
-| `format_float` | `format.float` | **planned** |
+| `format_float` | `format.float` + `format.floatFixed` | **planned** · split (Q2) |
 | `i64_to_str` | → `format.int` | temp wrapper → deprecate |
-| `f64_to_str` | → `format.float` | planned / deprecate with float |
+| `f64_to_str` | → `format.float` (shortest) | planned / deprecate with float |
 | `fmt.*` | — | **later** pass · own registry |
 | `sb_append_i64` / … | — | **later** · use `builder.write` + `format.int` for now |
 
@@ -170,7 +171,7 @@ Not stable until the float gate (F1–F6) passes.
 | `format_pad_left` | `format.padLeft` | **rename** |
 | `format_pad_right` | `format.padRight` | **rename** |
 | `format_center` | `format.padCenter` | **rename** |
-| `format_float` | `format.float` | **planned** |
+| `format_float` | `format.float` / `format.floatFixed` | **planned** · split (Q2) |
 
 ## API
 
@@ -185,7 +186,8 @@ Not stable until the float gate (F1–F6) passes.
 | `format.padLeft` | `format.padLeft` | `format.padLeft(s, width: int, fill: int) -> string` | proposed |
 | `format.padRight` | `format.padRight` | `format.padRight(s, width: int, fill: int) -> string` | proposed |
 | `format.padCenter` | `format.padCenter` | `format.padCenter(s, width: int, fill: int) -> string` | proposed |
-| `format.float` | `format.float` | `format.float(value: float, prec: int) -> string` | planned |
+| `format.float` | `format.float` | `format.float(value: float) -> string` | planned |
+| `format.floatFixed` | `format.floatFixed` | `format.floatFixed(value: float, prec: int) -> string` | planned |
 
 ---
 
@@ -293,14 +295,20 @@ See padding rules above. `fill` must be a valid Unicode scalar
 ---
 
 <a id="format.float"></a>
-## `format.float` *(planned)*
+## `format.float` / `format.floatFixed` *(planned)*
 
 ```vir
-format.float(value: float, prec: int) -> string
+format.float(value: float) -> string
+format.floatFixed(value: float, prec: int) -> string
 ```
 
-Not stable. Gate on documented `prec` / rounding / specials / round-trip tests.
-Must not ship stub behavior as contract.
+| Symbol | Role |
+|---|---|
+| `format.float` | Shortest round-trip (F1a) |
+| `format.floatFixed` | Fixed digits-after-decimal `prec` 0…17, ties-to-even (F1b) |
+
+**Q2 locked:** two names — **no** function overloading. Not stable until F1–F6
+([`parse.md`](parse.md)) pass. Must not ship stub behavior as contract.
 
 ### Status
 

@@ -205,5 +205,5 @@ Same grammar as `fmt.format`; output to stdout. Not `io.print` overloads.
 
 1. Replace `{}` engine with `$` grammar; return `Result` + `InvalidData`.
 2. Align integer specs with [`format.intRadix`](format.md) (no prefix).
-3. Gate float on F1–F6 in [`parse.md`](parse.md) / [`format.md`](format.md).
+3. Gate float on F1–F6; use [`format.float`](format.md) / [`format.floatFixed`](format.md) (Q2).
 4. Confirm `$$` vs native before stabilizing source-literal examples.

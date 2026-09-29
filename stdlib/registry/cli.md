@@ -27,7 +27,7 @@ formatting → `format`.
 
 | In `cli` | Out |
 |---|---|
-| `ask` / `confirm` / `choose` / `password` / `multi` | `io.print` / `io.readLine` / stdin·stdout·stderr |
+| `ask` / `confirm` / `choose` / `password` / `multi` | `io.print` / `io.readln` / stdin·stdout·stderr |
 | Prompt entities (`TextPrompt`, …) | `fs.*` |
 | (later) `cli.args` / `cli.shlex` | `format.*` |
 
@@ -95,7 +95,7 @@ cli.ask(prompt: string) -> string
 ```
 
 Shows `prompt`, reads one line from stdin, applies the same line-ending strip
-rules as `io.readLine`.
+rules as `io.readln`.
 
 ### Parameters
 
@@ -105,7 +105,7 @@ Text shown before waiting. Does **not** auto-append a newline.
 
 ### Returns
 
-`string` — user-entered text (no trailing LF / stripped CR as per `io.readLine`).
+`string` — user-entered text (no trailing LF / stripped CR as per `io.readln`).
 
 ### Errors
 
@@ -120,7 +120,7 @@ io.println(name)
 
 ### See also
 
-- `io.readLine`
+- `io.readln`
 - `cli.password`
 - `TextPrompt`
 
@@ -233,9 +233,12 @@ Empty `options`: must not complete (exact signal TBD: panic / `throw` / loop —
 ### Example
 
 ```vir
-let colors = ["Red", "Green", "Blue"]
+var colors = vec_new()
+vec_push(colors, "Red")
+vec_push(colors, "Green")
+vec_push(colors, "Blue")
 let selected = cli.choose("Color?", colors)
-io.println(colors[selected])
+io.println(vec_get(colors, selected))
 ```
 
 ### See also
@@ -276,7 +279,7 @@ disable_echo()
 ensure restore_echo()
 ```
 
-- Line ending is not part of the returned string (same strip rules as `io.readLine`).
+- Line ending is not part of the returned string (same strip rules as `io.readln`).
 
 ### Parameters
 
@@ -359,10 +362,16 @@ None as `Result` in the basic contract.
 ### Example
 
 ```vir
-let tags = ["Vir", "Compiler", "Runtime"]
+var tags = vec_new()
+vec_push(tags, "Vir")
+vec_push(tags, "Compiler")
+vec_push(tags, "Runtime")
 let selected = cli.multi("Tags?", tags)
-for index in selected
-    io.println(tags[index])
+var i = 0
+when i < vec_len(selected) loop
+    let idx = vec_get(selected, i)
+    io.println(vec_get(tags, idx))
+    i = i + 1
 end
 ```
 

@@ -77,6 +77,14 @@ run_test_in_group() {
     expected_action=$(sed -n 's/^#[[:space:]]*EXPECT_ACTION:[[:space:]]*//p' "$test" | head -1)
     local expected_compile_fail
     expected_compile_fail=$(sed -n 's/^#[[:space:]]*EXPECT_COMPILE_FAIL:[[:space:]]*//p' "$test" | head -1)
+    local expected_stdin
+    expected_stdin=$(perl -0777 -ne '
+        if (/#\s*STDIN_START\n((?:#[^\n]*\n)+?)#\s*STDIN_END/m) {
+            my $b = $1; $b =~ s/^#[ \t]?//mg; print $b;
+        } elsif (/#\s*STDIN:\s*([^\n]+)/m) {
+            my $v = $1; $v =~ s/\\n/\n/g; $v =~ s/\\r/\r/g; print $v;
+        }
+    ' "$test")
 
     # Negative test (compile rejection expected)
     if [[ "$test" == *_rejected.vri ]] || [[ "$test" == *_rejected_*.vri ]] || [[ "$test" == *_negative.vri ]]; then
@@ -153,7 +161,11 @@ run_test_in_group() {
     # Thực thi với timeout 5 giây
     # Positive test: run
     local actual
-    actual=$(perl -e 'alarm 5; exec @ARGV' -- "$A_OUT" 2>&1)
+    if [ -n "$expected_stdin" ]; then
+        actual=$(printf "%s" "$expected_stdin" | perl -e 'alarm 5; exec @ARGV' -- "$A_OUT" 2>&1)
+    else
+        actual=$(perl -e 'alarm 5; exec @ARGV' -- "$A_OUT" 2>&1)
+    fi
     local rc=$?
 
     # Chuẩn hoá whitespace
@@ -672,6 +684,13 @@ run_group_4() {
         run_test_in_group 4 "tests/spec_gap_contract/generic_collision_disambiguation.vri"
         run_test_in_group 4 "tests/spec_gap_contract/generic_multi_unresolved_negative.vri"
         run_test_in_group 4 "tests/test_void_value_lowering.vri"
+    fi
+    if [ "${RUN_TYPE_SAFETY_CONTRACT:-0}" = "1" ]; then
+        run_contract_suite_in_group 4 \
+            "Full type-system soundness contract" \
+            "tests/type_safety_contract/manifest.tsv" \
+            "tests/type_safety_contract" \
+            "${TYPE_SAFETY_CONTRACT_TARGET:-macos-arm64}"
     fi
     local pass_cnt=${GP_PASS[4]}
     local fail_cnt=${GP_FAIL[4]}
@@ -1420,10 +1439,14 @@ run_group_18() {
         run_test_in_group 18 "tests/bootstrap_codegen/cg_getarg.vri"
         run_test_in_group 18 "tests/test_adv_071_exit_code.vri"
         run_test_in_group 18 "tests/test_arg_count.vri"
+        run_test_in_group 18 "tests/strict_v2/stdio_cli_e2e.vri"
+        run_test_in_group 18 "tests/strict_v2/stdio_full_api_e2e.vri"
     else
         run_test_in_group 18 "tests/bootstrap_codegen/cg_getarg.vri"
         run_test_in_group 18 "tests/test_adv_071_exit_code.vri"
         run_test_in_group 18 "tests/test_arg_count.vri"
+        run_test_in_group 18 "tests/strict_v2/stdio_cli_e2e.vri"
+        run_test_in_group 18 "tests/strict_v2/stdio_full_api_e2e.vri"
         run_test_in_group 18 "tests/test_helper_argc.vri"
         run_test_in_group 18 "tests/vri/test_adv_071_exit_code.vri"
         run_test_in_group 18 "tests/test_argc.vri"

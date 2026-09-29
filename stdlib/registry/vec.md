@@ -5,7 +5,7 @@ summary: Owned growable typed collection Vec(T) — namespace-only vec.*.
 source:
   - name: collections.vec
     path: vir/collections/vec.vri
-status: draft
+status: closed
 notes: >-
   Implemented in collections/vec.vri. Callables today are vec_* (no generic entity
   methods yet); registry names remain vec.*. Stride = size_of(T); ZST unsupported.
@@ -144,18 +144,42 @@ Allocates new backing storage and copies each `T` by value (bitwise /
 assignment copy as the language defines for `T`). Does **not** recursively
 deep-clone resources that `T` points to.
 
+## Decisions V1–V3 (locked)
+
+| ID | Decision |
+|---|---|
+| V1 | Element Drop is a **language/implementation gate**. Missing destructor is **not** standardized “correct” behavior. |
+| V2 | Canonical docs use `vec.*`; source `vec_*` is a **migration gap**. |
+| V3 | Lock move/copy; **no** public borrowed-element references until borrow contracts are enforced. |
+
+### Ownership (locked)
+
+Aligned with other locked collections:
+
+| Op | Ownership |
+|---|---|
+| `push` / `insert` / `extend` | **Move** element(s) **into** the `Vec` |
+| `pop` / `remove` / `swapRemove` | **Move** element **out** to the caller |
+| `get` / `tryGet` / `first` / `last` | **Copy** only when `T` is safely copyable |
+| `clear` / `truncate` | End lifetime of removed elements |
+
+Because Element Drop is incomplete (V1): ops that discard elements **without**
+returning them are **not `stable`** for resource-owning `T` that need
+destructors. Callers may move elements out before reclaiming storage — a
+**temporary** limit, not a long-term contract.
+
+Keep: **ZST unsupported**; **`Vec(u8)` ≠ `Buffer`**.
+
 ### `clear` / `truncate` and element ownership
 
 Today Vir has **no** general destructor / Drop semantics for arbitrary `T`.
 
 | Op | Storage | Elements leaving the logical array |
 |---|---|---|
-| `clear` | `len = 0`; capacity retained | not destroy/released by Vec |
-| `truncate` | shrink `len` only when `newLen < len` | same — no element destructors run |
+| `clear` | `len = 0`; capacity retained | lifetimes end; destructors **not** run today (V1) |
+| `truncate` | shrink `len` when `newLen < len` | same |
 
-**Limitation (closed for this pass):** registry does **not** promise that
-removed/truncated elements are destroyed. When Move/resource types and
-destructors exist, this contract must be revisited — do not assume it now.
+Do **not** document missing Drop as desired permanent semantics.
 
 ### Ownership / free
 
@@ -174,7 +198,16 @@ vec.free(v)
 Growth strategy today: double capacity (minimum 8 slots when growing from
 `reserve`), subject to overflow guards above.
 
+## CORE SPEC surface note
+
+CORE SPEC minimal list is a **subset**. Extra ops already locked here
+(`filled`, `first`/`last`, `swapRemove`, `extend`, `clone`, `copyRange`, …)
+remain part of this module’s closed surface. HOF stay **uncurated** / out of
+this core wave. Ops not listed in either surface stay **out** unless marked
+`planned` with a full entry.
+
 ## Public surface (closed)
+
 
 ```text
 vec
@@ -667,6 +700,12 @@ vec.set(v: Vec(T), i: int, x: T) -> void
 ```
 
 Replace element at `i`. Panic on OOB. Does not extend length.
+
+**Ownership (V3):** the new value `x` is **moved in**. The previous element at
+`i` is **moved out of the logical slot** and its lifetime ends. Because Element
+Drop is incomplete (V1), discarding that previous owning value without a
+returned handle is **not `stable`** for resource-owning `T` — same gate as
+`clear` / `truncate`. Do not silently leak as a long-term contract.
 
 ### Errors
 
@@ -1468,19 +1507,16 @@ Public while explicit ownership is required (same stance as `buffer.free`).
 
 ## Implementation readiness
 
-Public vec contract is closed and core ops are implemented in
-`stdlib/vir/collections/vec.vri`.
+**Design status: closed** (V1–V3). Core ops exist under `vec_*` (migration gap V2).
+Element Drop + borrow refs = gates — do not auto-`stable` for owning `T`.
+No `.vri` redesign until authorized (Q5). Higher-order map/filter remain uncurated.
 
 | Item | Status |
 |---|---|
-| `size_of(T)` stride / alloc / move | **done** |
-| Overflow guards (`len+additional`, `cap*esz`, doubling) | **done** |
-| ZST rejected | **done** |
-| Self-`extend` | **done** |
-| `vec_swap` / `vec_copy_range` | **done** |
-| Free old buffer on reserve grow | **done** |
-| `vec.*` namespace object | **blocked** — no generic entity methods yet; use `vec_*` |
-| Element Drop on clear/truncate/remove | **later** — language limitation |
+| `size_of(T)` stride / alloc / move | **done** (source) |
+| Overflow guards / ZST reject / self-extend / swap / copyRange | **done** (source) |
+| `vec.*` namespace object | **blocked** — use `vec_*` until generic methods |
+| Element Drop on clear/truncate/remove | **gate** (V1) |
 | Higher-order map/filter/… | **uncurated** |
 
 Bootstrap `compiler/vec_prelude.vri` and `rt/vec_rt.vri` remain non-public.

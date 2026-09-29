@@ -8,11 +8,10 @@ source:
   - name: data.json
     path: vir/data/json.vri
     notes: duplicate / alias path — public namespace is json
-status: draft
+status: closed
 notes: >-
-  Inventory from JsonNamespace + free helpers. Number payload is int today;
-  JSON float numbers gated on format/parse float gate. camelCase renames proposed
-  for as_*/is_null. No .vri until map accepted. Docs-only.
+  Design closed (D1–D5, Q3–Q4, CORE SPEC). Canonical parse/stringify (CORE SPEC).
+  Ownership/float/error-map = gates. Duplicate json paths = gap. No .vri (Q5).
 ---
 
 # Json
@@ -20,8 +19,8 @@ notes: >-
 RFC 8259 JSON as an in-memory **`JsonValue`** tree under namespace **`json`**.
 
 ```vir
-let r = json.read(text)          # Result(JsonValue)
-let s = json.write(val)          # compact string
+let r = json.parse(text)           # Result(JsonValue)
+let s = json.stringify(val)      # compact string
 let p = json.pretty(val)         # indent 2
 json.set(obj, "port", json.number(8080))
 ```
@@ -29,15 +28,36 @@ json.set(obj, "port", json.number(8080))
 Physical modules today: `vir/json.vri` and `vir/data/json.vri` (alias).
 **Public docs use `json.*` only** — users never need `data.json` as a second API.
 
+## Decisions D1–D5 (locked) · Q3–Q4 (locked)
+
+## Naming (CORE SPEC)
+
+| Previous / source | Canonical |
+|---|---|
+| `json.read` / `json_parse` | **`json.parse`** |
+| `json.write` / `json_stringify` | **`json.stringify`** |
+| `json.pretty` | keep |
+| `asArray` / `asObject` | **`planned`** — add to surface; verify in source at implement time |
+
+## Ownership gate
+
+`JsonValue` ownership must be audited before APIs that return or copy values
+are `stable`. No shallow-copy of dynamically owned payloads. Design may be
+**closed** while this gate remains open.
+
+Do **not** auto-promote `json` to `stable` while float, ownership, or related
+gates remain open. **Q7:** finish this file before opening the **csv** wave;
+TOML / YAML / XML later.
+
 ## Boundary
 
 | In `json` | Not in `json` |
 |---|---|
 | Parse / stringify / tree ops | Streaming SAX / pull parsers |
 | Object / array mutators on `JsonValue` | Schema validation language |
-| Integer JSON numbers (current) | Stable float JSON numbers before float gate |
+| Dual int + float numbers (float after gate) | Silent int→float coercion |
 | | YAML / TOML / XML (separate namespaces) |
-| | Treating `count` / `size` as distinct semantics from `len` |
+| | Distinct public semantics for `count` / `size` |
 
 ## Types (closed inventory)
 
@@ -48,65 +68,66 @@ JsonValue    # tagged tree node
 
 `JsonParser` / `JsonBuf` are **implementation** — not public surface.
 
-## Number model (locked for this draft)
+## Number model (locked — D3 · Q3 · Q4)
 
 | Fact | Contract |
 |---|---|
-| Constructor | `json.number(n: int) -> JsonValue` |
-| Unbox | `json.asInt(v) -> int` (today `as_int`) |
-| Parse | JSON numbers that fit signed 64-bit integers → `Number` |
-| Float JSON | **Not stable** until [`float gate`](parse.md) (F1–F6). Do not invent `json.float` / `number(float)` in this pass. |
-| Gap | Fractional / exponent JSON numbers vs int-only storage = **implementation gap** — document; do not silently claim full RFC number support as certified |
+| Integer ctor | `json.number(n: int) -> JsonValue` |
+| Float ctor | `json.numberFloat(f: float) -> JsonValue` — **planned** after float gate (Q4) |
+| Unbox | `json.asInt` · `json.asFloat` (**planned** with float path) |
+| Parse int in domain | → int-backed Number |
+| Parse int **out of domain** | → `Err` `InvalidData` (**Q3**) — never silent float |
+| Parse fractional / exp | → float path **only after** float gate; until then treat as gap / reject per impl policy documented as debt |
+| Forbidden | Overloading `json.number`; silent int→float |
 
-RFC 8259 allows arbitrary precision numbers; Vir’s public contract for this wave
-is **int-backed `Number`** plus a future float path after the float gate. Exact
-overflow / reject rules for out-of-int64 JSON numbers = **audit** against
-`json_parse_num`.
+**Source today:** int-only storage — **implementation gap** vs dual contract.
 
-## Failure model (closed)
+RFC 8259 allows arbitrary precision; Vir’s locked model is **dual int + float**
+with Q3/Q4. Exactness for integers outside domain = **reject**, not demote.
+
+## Failure model (locked — D1)
 
 ```text
-json.read(s) -> Result(JsonValue)
+json.parse(s) -> Result(JsonValue)
 ```
 
-Errors use the existing parse-error payload from `vir.data.error` (position /
-line / col / message). Map into [`Error`](error.md) /
-domain kind **audit** — do not invent a second parallel error taxonomy in docs
-until that mapping is closed. Trailing garbage after one value → error (present).
+`Err` uses [`Error`](error.md) with **`ErrorKind.InvalidData`**, plus **byte
+offset**, **line**, **column**, and **reason** string. Do **not** invent a new
+`ErrorKind`. Source may still use `vir.data.error` parse-error entities —
+mapping onto `Error` + `InvalidData` is an **implementation gap**.
 
-Nesting depth limit **128** (present) — keep as contract; do not raise in docs
-without an explicit decision.
+Trailing garbage after one value → error. Nesting depth limit **128** (present).
 
 ## Public surface (proposed)
 
 ```text
 json
-├── read · write · pretty
+├── parse · stringify · pretty
 │
-├── null · bool · number · string · array · object
+├── null · bool · number · numberFloat · string · array · object
 │
 ├── get · set · has
 ├── at · push
-├── len                    # count/size → aliases → merge
-├── key · value            # indexed object walk (present as key_at / val_at)
+├── len                    # only canonical length (D5)
+├── key · value
 │
 ├── kind
-├── asInt · asString · asBool · isNull
+├── asInt · asFloat · asString · asBool · isNull
+├── asArray · asObject              # planned · verify at implement
 │
 ├── getInt · getStr · getBool
 └── fromInts · fromStrings · fromBools
 ```
 
-## Naming (proposed)
+## Naming (locked — D4 / D5)
 
-| Current | Public | Action |
+| Current | Canonical | Action |
 |---|---|---|
-| `json.read` / `json_parse` | `json.read` | keep |
-| `json.write` / `json_stringify` | `json.write` | keep |
-| `json.pretty` / `json_stringify_pretty` | `json.pretty` | keep |
-| `as_int` / `as_string` / `as_bool` / `is_null` | `asInt` / `asString` / `asBool` / `isNull` | **rename** |
-| `count` / `size` | → `len` | **merge** (aliases optional during migrate) |
-| `json_obj_key_at` / `json_obj_val_at` | `json.key` / `json.value` | **rename** · expose on namespace |
+| `as_int` / `as_string` / `as_bool` / `is_null` | `asInt` / `asString` / `asBool` / `isNull` | **rename**; snake = alias → remove |
+| — | `asFloat` | **new** with float path |
+| — | `numberFloat` | **planned** (Q4) · no `number` overload |
+| `count` / `size` | `len` | **aliases** during migrate → **remove** |
+| `json_obj_key_at` / `val_at` | `json.key` / `json.value` | **rename** + ns |
 | free `kind` / `len` / … | `json.*` only | drop free public aliases when map applied |
 
 ## Semantics notes (locked)
@@ -116,31 +137,28 @@ json
 | `get` | `Option(JsonValue)` — missing key → `None` |
 | `has` | `bool` |
 | `set` | upsert by key |
-| `at` | array index; out-of-range / wrong tag → **audit** (today returns `null` JsonValue — may be debt vs `Option`) |
+| `at` | `Option(JsonValue)` — `None` if wrong tag / OOB; `Some(null)` if JSON null (D2) |
 | `push` | append to array |
 | `len` | array length or object entry count; else `0` |
-| `getInt` / `getStr` / `getBool` | typed get with **default** on missing / wrong type (no panic) |
-| `write` | compact RFC stringify |
-| `pretty` | indent **2** spaces (present) |
-
-Malformed UTF-8 / escapes / isolated surrogates: follow RFC 8259 rejection
-claimed by source — conformance suite is **implementation debt** until audited.
+| `getInt` / `getStr` / `getBool` | typed get with **default** on missing / wrong type |
+| `stringify` / `pretty` | compact / indent **2** |
 
 ## Migration map
 
 | Current | Public | Action |
 |---|---|---|
-| `json_parse` | `json.read` | keep ns · free → internal |
-| `json_stringify` | `json.write` | keep |
+| `json_parse` | `json.parse` | keep ns · free → internal |
+| `json_stringify` | `json.stringify` | keep |
 | `json_stringify_pretty` | `json.pretty` | keep |
 | `json_null` … `json_object` | `json.null` … | keep |
 | `json_obj_get` / `set` | `json.get` / `set` | keep |
-| `json_arr_get` / `push` | `json.at` / `push` | keep |
-| `as_int` … | `asInt` … | **rename** |
-| `count` / `size` | `len` | **merge** |
+| `json_arr_get` | `json.at` → `Option(JsonValue)` | **behavior change** (D2) |
+| `as_int` … | `asInt` … | **rename** + snake alias |
+| `count` / `size` | `len` | **alias** → remove (D5) |
 | `json_obj_key_at` / `val_at` | `json.key` / `json.value` | **rename** + ns |
 | `data.json` include | `json` | **alias** only |
-| float JSON number API | — | **planned** after float gate |
+| float Number / `asFloat` / `numberFloat` | — | **planned** after float gate (Q4) |
+| parse-error entity | `Error` + `InvalidData` | **map** (D1) |
 
 ## API
 
@@ -148,25 +166,29 @@ claimed by source — conformance suite is **implementation debt** until audited
 |---|---|---|---|
 | `json.JsonType` | `JsonType` | enum | draft |
 | `json.JsonValue` | `JsonValue` | entity | draft |
-| `json.read` | `json.read` | `json.read(s: string) -> Result(JsonValue)` | draft |
-| `json.write` | `json.write` | `json.write(val: JsonValue) -> string` | draft |
+| `json.parse` | `json.parse` | `json.parse(s: string) -> Result(JsonValue)` | draft |
+| `json.stringify` | `json.stringify` | `json.stringify(val: JsonValue) -> string` | draft |
 | `json.pretty` | `json.pretty` | `json.pretty(val: JsonValue) -> string` | draft |
 | `json.null` | `json.null` | `json.null() -> JsonValue` | draft |
 | `json.bool` | `json.bool` | `json.bool(b: bool) -> JsonValue` | draft |
 | `json.number` | `json.number` | `json.number(n: int) -> JsonValue` | draft |
+| `json.numberFloat` | `json.numberFloat` | `json.numberFloat(f: float) -> JsonValue` | planned |
 | `json.string` | `json.string` | `json.string(s: string) -> JsonValue` | draft |
 | `json.array` | `json.array` | `json.array() -> JsonValue` | draft |
 | `json.object` | `json.object` | `json.object() -> JsonValue` | draft |
 | `json.get` | `json.get` | `json.get(obj: JsonValue, key: string) -> Option(JsonValue)` | draft |
 | `json.set` | `json.set` | `json.set(obj: JsonValue, key: string, val: JsonValue)` | draft |
 | `json.has` | `json.has` | `json.has(obj: JsonValue, key: string) -> bool` | draft |
-| `json.at` | `json.at` | `json.at(arr: JsonValue, idx: int) -> JsonValue` | draft |
+| `json.at` | `json.at` | `json.at(arr: JsonValue, idx: int) -> Option(JsonValue)` | proposed |
 | `json.push` | `json.push` | `json.push(arr: JsonValue, item: JsonValue)` | draft |
 | `json.len` | `json.len` | `json.len(val: JsonValue) -> int` | draft |
 | `json.key` | `json.key` | `json.key(obj: JsonValue, idx: int) -> string` | proposed |
 | `json.value` | `json.value` | `json.value(obj: JsonValue, idx: int) -> JsonValue` | proposed |
 | `json.kind` | `json.kind` | `json.kind(val: JsonValue) -> int` | draft |
 | `json.asInt` | `json.asInt` | `json.asInt(val: JsonValue) -> int` | proposed |
+| `json.asFloat` | `json.asFloat` | `json.asFloat(val: JsonValue) -> float` | planned |
+| `json.asArray` | `json.asArray` | `json.asArray(val: JsonValue) -> …` · shape **verify at implement** | planned |
+| `json.asObject` | `json.asObject` | `json.asObject(val: JsonValue) -> …` · shape **verify at implement** | planned |
 | `json.asString` | `json.asString` | `json.asString(val: JsonValue) -> string` | proposed |
 | `json.asBool` | `json.asBool` | `json.asBool(val: JsonValue) -> bool` | proposed |
 | `json.isNull` | `json.isNull` | `json.isNull(val: JsonValue) -> bool` | proposed |
@@ -177,53 +199,50 @@ claimed by source — conformance suite is **implementation debt** until audited
 | `json.fromStrings` | `json.fromStrings` | `json.fromStrings(values) -> JsonValue` | draft |
 | `json.fromBools` | `json.fromBools` | `json.fromBools(values) -> JsonValue` | draft |
 
-`Result(JsonValue)` uses default [`Error`](error.md) once error mapping is
-closed; until then source may return a dedicated parse-error value —
-**implementation gap**.
-
 ---
 
-<a id="json.read"></a>
-## `json.read`
+<a id="json.parse"></a>
+## `json.parse`
 
 <!--
-id: json.read
-api: json.read
-previous: json_parse
+id: json.parse
+api: json.parse
+previous: json.read
 -->
 
 ```vir
-json.read(s: string) -> Result(JsonValue)
+json.parse(s: string) -> Result(JsonValue)
 ```
 
 Parse one JSON value from `s`. Trailing non-whitespace → error. Empty input →
 error (present).
 
-### Status
-
-`draft` — **present** as `json.read` / `json_parse`.
-
 ### Errors
 
-Parse failure (syntax, depth, trailing garbage). Exact `Error` mapping **audit**.
+`Err` → [`Error`](error.md) with `ErrorKind.InvalidData`, offset / line / col /
+reason (D1). Source mapping = **implementation gap**.
+
+### Status
+
+`draft` — **present** as `json.parse` / `json_parse`.
 
 ### See also
 
-- [`json.write`](#json.write)
+- [`json.stringify`](#json.stringify)
 
 ---
 
-<a id="json.write"></a>
-## `json.write` / `json.pretty`
+<a id="json.stringify"></a>
+## `json.stringify` / `json.pretty`
 
 <!--
-id: json.write
-api: json.write
-previous: json_stringify
+id: json.stringify
+api: json.stringify
+previous: json.write
 -->
 
 ```vir
-json.write(val: JsonValue) -> string
+json.stringify(val: JsonValue) -> string
 json.pretty(val: JsonValue) -> string
 ```
 
@@ -242,35 +261,42 @@ Serialize. `pretty` uses indent width **2**.
 json.null() -> JsonValue
 json.bool(b: bool) -> JsonValue
 json.number(n: int) -> JsonValue
+json.numberFloat(f: float) -> JsonValue   # planned · Q4 · float gate
 json.string(s: string) -> JsonValue
 json.array() -> JsonValue
 json.object() -> JsonValue
 ```
 
+**Q4:** no overload of `number`. Source today = int only (**gap**).
+
 ### Status
 
-`draft` — **present**. Float constructor **out** until float gate.
+`draft` — **present** (`number`). `numberFloat` **planned**.
 
 ---
 
-<a id="json.get"></a>
+<a id="json.at"></a>
 ## Object / array ops
 
 ```vir
 json.get(obj: JsonValue, key: string) -> Option(JsonValue)
 json.set(obj: JsonValue, key: string, val: JsonValue)
 json.has(obj: JsonValue, key: string) -> bool
-json.at(arr: JsonValue, idx: int) -> JsonValue
+json.at(arr: JsonValue, idx: int) -> Option(JsonValue)
 json.push(arr: JsonValue, item: JsonValue)
 json.len(val: JsonValue) -> int
 json.key(obj: JsonValue, idx: int) -> string
 json.value(obj: JsonValue, idx: int) -> JsonValue
 ```
 
+`at` (D2): `None` if not an array or index out of range; `Some(v)` including
+`Some(json.null())` for JSON null. **Source today** returns null-`JsonValue` on
+OOB — **gap** vs contract. Ownership of returned `JsonValue` = **impl gate**
+before `stable`.
+
 ### Status
 
-`draft` / `proposed` (`key` / `value` rename). `at` out-of-range → null-value
-behavior may be **debt** vs `Option(JsonValue)`.
+`proposed` (`at` change) / `draft` (others).
 
 ---
 
@@ -280,6 +306,7 @@ behavior may be **debt** vs `Option(JsonValue)`.
 ```vir
 json.kind(val: JsonValue) -> int
 json.asInt(val: JsonValue) -> int
+json.asFloat(val: JsonValue) -> float    # planned · float gate
 json.asString(val: JsonValue) -> string
 json.asBool(val: JsonValue) -> bool
 json.isNull(val: JsonValue) -> bool
@@ -288,12 +315,11 @@ json.getStr(obj: JsonValue, key: string, default: string) -> string
 json.getBool(obj: JsonValue, key: string, default: bool) -> bool
 ```
 
-Wrong-tag unbox behavior (e.g. `asInt` on non-Number) = **audit** — do not
-document as panic without evidence.
+Wrong-tag unbox behavior = **audit**. Snake aliases during migration (D4).
 
 ### Status
 
-`proposed` renames; getters **present**.
+`proposed` renames; `asFloat` **planned**; getters **present**.
 
 ---
 
@@ -308,22 +334,64 @@ json.fromBools(values) -> JsonValue
 
 ### Status
 
-`draft` — **present**. Exact `[T]` / `Vec(T)` parameter spelling follows
-language array form in source.
+`draft` — **present**. Exact `[T]` / `Vec(T)` parameter spelling follows source.
 
 ---
 
-## Open questions
+---
 
-1. Map parse errors onto [`Error`](error.md) / `ErrorKind` without a parallel
-   public error type?
-2. `json.at` → `Option(JsonValue)` vs null-`JsonValue`?
-3. Post–float-gate: store JSON numbers as `float`, decimal string, or dual?
+<a id="json.asArray"></a>
+## `json.asArray` / `json.asObject`
+
+<!--
+id: json.asArray
+api: json.asArray
+-->
+
+```vir
+json.asArray(val: JsonValue) -> …     # shape verify at implement
+json.asObject(val: JsonValue) -> …    # shape verify at implement
+```
+
+Typed views / casts for array and object `JsonValue`s. Return type
+(`Option` / `Result` / bare) and ownership of nested values — **verify at
+implement** against source; do not invent until audited.
+
+### Status
+
+`planned`.
+
+### See also
+
+- `json.kind`
+- `json.at` / `json.get`
+
+---
+
+## Implementation gaps (keep visible)
+
+Contract ≠ source. Do not mark `stable` until closed:
+
+1. `Option` / `Result` may still be unparameterized in source enums  
+2. Trait / I/O signatures may still say bare `Result` where payload exists  
+3. `unicode.category` accessor missing  
+4. `parse_float` stub → `0`  
+5. `json.vri` / `data/json.vri` duplicate load paths  
+6. Unicode tables ≠ any official UCD release (`pre-UCD`)
+
+Json-specific gaps: D1 error mapping; D2 `at` → `Option`; D3 float Number;
+`JsonValue` ownership / copy semantics.
 
 ## Implementation readiness
 
-1. Deduplicate `json.vri` / `data/json.vri` under one public `json` load path.
-2. Apply camelCase renames; merge `count`/`size` → `len`.
-3. Audit RFC number edge cases vs int-only storage; keep float path gated.
-4. Close error mapping to [`error`](error.md).
-5. Do not mark `stable` until conformance suite + error mapping land.
+**Design status: closed** (CORE SPEC + D1–D5 + Q3–Q4). Not implementation-stable.
+
+Gates before any `stable` claim:
+1. Dedup `json.vri` / `data/json.vri`
+2. Error mapping → `Error` + `InvalidData`
+3. `at` → `Option(JsonValue)` behavior
+4. `JsonValue` ownership audit
+5. Float Number / `numberFloat` / `asFloat` after float gate
+6. CamelCase renames; drop `count`/`size`
+
+`asArray`/`asObject` are **planned** — verify shapes at implement. No `.vri` until Q5.

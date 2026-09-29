@@ -11,12 +11,11 @@ source:
     path: vir/io/file.vri
   - name: io
     path: vir/rt/io.vri
-status: draft
+status: closed
 previous: [file]
 notes: >-
-  Public namespace is fs.* (not file.*). Deduplicate fs vs fs.fs before applying
-  public rename. rt/io remains internal. Binary-first; text via explicit *Text APIs.
-  No .vri changes until implementation against this map.
+  Design closed (F1–F4). All path params Path. Dedup fs/fs.fs before source
+  migration. Binary-first; *Text planned. No .vri until authorized (Q5).
 ---
 
 # Fs
@@ -30,17 +29,18 @@ fs.exists(p)
 fs.isFile(p)
 fs.isDir(p)
 fs.read(path)
-fs.text(path)
+fs.readText(path)
 fs.write(path, data)
 fs.open(path, mode)
 
-let f = fs.open("data.bin", FileMode.Read)
+let f = fs.open(path.new("data.bin"), FileMode.Read)
 f.read(buf)
 f.close()
 ```
 
 `f` is an ordinary local variable name for a `File` handle — **not** a public
-namespace. Do not use `file.*` or a bare `f.*` namespace.
+namespace. Do not use `file.*` or a bare `f.*` namespace. Strings become `Path`
+via [`path.new`](path.md) (F3).
 
 ## Impl legend
 
@@ -59,10 +59,10 @@ namespace. Do not use `file.*` or a bare `f.*` namespace.
 |---|---|
 | Path helpers (`exists`…`size`) | **present** in `fs` — keep under `fs.*` |
 | `fs.isFile` / `fs.isDir` | **present** as `path_is_file` / `path_is_dir` → **move** |
-| `fs.exists` arg | today `string` (+ `path_exists(Path)`) → target **`Path`** |
+| `fs.exists` arg | today may be `string`; **contract `Path`** (F2/F3) |
 | `fs.read` payload | today `string` → target **`Ok(Buffer)`** |
-| `fs.text` | **missing** — strict UTF-8 → `Ok(string)` |
-| `fs.write` / `append` / `writeAtomic` | today `string` → target **`Slice`** binary |
+| `fs.readText` | **missing** — strict UTF-8 → `Ok(string)` |
+| `fs.write` / `append` / `writeAtomic` | path **`Path`**; data **`Slice`** (F3) |
 | `writeText` / `appendText` / `writeTextAtomic` | **missing** |
 | `fs` vs `fs.fs` | duplicate → **merge first**, then apply public API |
 | Handle `file_open` / `file_read` / … | **present** in `io.file` → **rename** to `fs.open` / `File.*` |
@@ -70,6 +70,31 @@ namespace. Do not use `file.*` or a bare `f.*` namespace.
 | `file_write_str` / `read_file` / `write_file` | **remove** public |
 | `rt/io` `VirFile` / `file_open_*` / … | **internal** |
 | Dot-style methods on `File` | **missing** as public surface (snake `file_*` today) |
+
+
+## Decisions F1–F4 (locked)
+
+## Naming (CORE SPEC)
+
+| Previous | Canonical |
+|---|---|
+| `fs.text` | **`fs.readText`** · planned |
+| `File.atleast` | **`File.atLeast`** · planned |
+| `fs.mkdir` | **`fs.mkdir`** · **planned** — semantics (recursive?) verify at implement |
+| `File.flush` | **`File.flush`** · **planned** — align with [`io`](io.md) Writer when implemented |
+
+Keep broader locked surface (`append`, `writeAtomic`, `copy`, `size`, `seek`, `all`, …).
+
+ F1 | Public design is namespace **`fs` only**. Dedup `fs` / `fs.fs` is required **before source migration**, not a blocker for closing this doc. |
+| F2 | Filesystem **probes** take **`Path`**. |
+| F3 | **All** filesystem path parameters (`open` / `read` / `write` / `append` / `remove` / `rename` / `copy` / `size` / `create` / `*Text` / …) use canonical **`Path`**. Do not mix `string` and `Path` per method. |
+| F4 | `readText`/`*Text`, `File.exact`, `File.atLeast`, `mkdir`, `File.flush` stay **`planned`** under the written contracts. |
+
+Convert ordinary strings with the verified [`path.new`](path.md) API — do **not**
+invent extra constructors in this doc.
+
+`fs.read` → `Result(Buffer)`. Void-success ops → bare `Result` (decision A).
+Text APIs do **not** replace the binary-first surface.
 
 ## Boundary
 
@@ -141,6 +166,7 @@ fs
 ├── appendText
 ├── writeAtomic
 ├── writeTextAtomic
+├── mkdir          # planned
 ├── remove
 ├── rename
 ├── copy
@@ -211,18 +237,18 @@ Physical runtime names stay **internal**.
 | `exists` / `path_exists` | `fs.exists` | `fs.exists(p: Path) -> bool` | `vir/fs.vri` + `vir/path/path.vri` | keep ns; **change** arg `string`→`Path`; absorb `path_exists` |
 | `path_is_file` | `fs.isFile` | `fs.isFile(p: Path) -> bool` | `vir/path/path.vri` | **move** + rename |
 | `path_is_dir` | `fs.isDir` | `fs.isDir(p: Path) -> bool` | `vir/path/path.vri` | **move** + rename |
-| `read` | `fs.read` | `fs.read(path: string) -> Result(Buffer)` | `vir/fs.vri` | rename + **change** payload (`string`→`Buffer`) |
-| — | `fs.text` | `fs.text(path: string) -> Result(string)` | decode over `fs.read` | **missing** / planned |
-| `write` | `fs.write` | `fs.write(path: string, data: Slice) -> Result` | `vir/fs.vri` | rename + **change** arg (`string`→`Slice`) |
-| — | `fs.writeText` | `fs.writeText(path: string, text: string) -> Result` | — | **missing** / planned |
-| `append` | `fs.append` | `fs.append(path: string, data: Slice) -> Result` | `vir/fs.vri` | rename + **change** arg (`string`→`Slice`) |
-| — | `fs.appendText` | `fs.appendText(path: string, text: string) -> Result` | — | **missing** / planned |
-| `write_atomic` | `fs.writeAtomic` | `fs.writeAtomic(path: string, data: Slice) -> Result` | `vir/fs.vri` | rename + **change** arg (`string`→`Slice`) |
-| — | `fs.writeTextAtomic` | `fs.writeTextAtomic(path: string, text: string) -> Result` | — | **missing** / planned |
-| `remove` | `fs.remove` | `fs.remove(path: string) -> Result` | `vir/fs.vri` | keep |
-| `rename` | `fs.rename` | `fs.rename(old_path: string, new_path: string) -> Result` | `vir/fs.vri` | keep |
-| `copy` | `fs.copy` | `fs.copy(src: string, dst: string) -> Result` | `vir/fs.vri` | keep |
-| `size` | `fs.size` | `fs.size(path: string) -> Result(int)` | `vir/fs.vri` | keep |
+| `read` | `fs.read` | `fs.read(path: Path) -> Result(Buffer)` | `vir/fs.vri` | rename + **change** payload (`string`→`Buffer`) |
+| — | `fs.readText` | `fs.readText(path: Path) -> Result(string)` | decode over `fs.read` | **missing** / planned |
+| `write` | `fs.write` | `fs.write(path: Path, data: Slice) -> Result` | `vir/fs.vri` | rename + **change** arg (`string`→`Slice`) |
+| — | `fs.writeText` | `fs.writeText(path: Path, text: string) -> Result` | — | **missing** / planned |
+| `append` | `fs.append` | `fs.append(path: Path, data: Slice) -> Result` | `vir/fs.vri` | rename + **change** arg (`string`→`Slice`) |
+| — | `fs.appendText` | `fs.appendText(path: Path, text: string) -> Result` | — | **missing** / planned |
+| `write_atomic` | `fs.writeAtomic` | `fs.writeAtomic(path: Path, data: Slice) -> Result` | `vir/fs.vri` | rename + **change** arg (`string`→`Slice`) |
+| — | `fs.writeTextAtomic` | `fs.writeTextAtomic(path: Path, text: string) -> Result` | — | **missing** / planned |
+| `remove` | `fs.remove` | `fs.remove(path: Path) -> Result` | `vir/fs.vri` | keep |
+| `rename` | `fs.rename` | `fs.rename(old_path: Path, new_path: Path) -> Result` | `vir/fs.vri` | keep |
+| `copy` | `fs.copy` | `fs.copy(src: Path, dst: Path) -> Result` | `vir/fs.vri` | keep |
+| `size` | `fs.size` | `fs.size(path: Path) -> Result(int)` | `vir/fs.vri` | keep |
 | `FsNamespace` / `fs` | `fs` namespace object | — | `vir/fs.vri` | keep / align methods |
 | `fs_*_impl` | — | — | `vir/fs.vri` | **internal** |
 | duplicate `fs.fs` | — | — | `vir/fs/fs.vri` | **merge** *(before public rename)* |
@@ -231,12 +257,12 @@ Physical runtime names stay **internal**.
 
 | Current symbol | Public | Signature (target) | Source | Action |
 |---|---|---|---|---|
-| `file_open` | `fs.open` | `fs.open(path: string, mode: FileMode) -> Result(File)` | `vir/io/file.vri` | rename |
-| `file_create` | `fs.create` | `fs.create(path: string) -> Result(File)` | `vir/io/file.vri` | rename |
+| `file_open` | `fs.open` | `fs.open(path: Path, mode: FileMode) -> Result(File)` | `vir/io/file.vri` | rename |
+| `file_create` | `fs.create` | `fs.create(path: Path) -> Result(File)` | `vir/io/file.vri` | rename |
 | `file_close` | `File.close` | `(f: File).close() -> void` | `vir/io/file.vri` | rename |
 | `file_read` | `File.read` | `(f: File).read(buf: Slice) -> Result(int)` | `vir/io/file.vri` | rename |
 | — | `File.exact` | `(f: File).exact(buf: Slice) -> Result(int)` | — | **missing** / planned |
-| — | `File.atleast` | `(f: File).atleast(buf: Slice, min: int) -> Result(int)` | — | **missing** / planned |
+| — | `File.atLeast` | `(f: File).atLeast(buf: Slice, min: int) -> Result(int)` | — | **missing** / planned |
 | `file_read_all` | `File.all` | `(f: File).all() -> Result(Buffer)` | `vir/io/file.vri` | **merge** → `all` |
 | `file_read_bytes` | `File.all` | same | `vir/io/file.vri` | **merge** → `all` (not `readBytes`) |
 | `file_write` | `File.write` | `(f: File).write(data: Slice) -> Result` | `vir/io/file.vri` | rename |
@@ -282,29 +308,30 @@ documents **canonical** API only.
 | `fs.exists` | `fs.exists` | `fs.exists(p: Path) -> bool` | proposed |
 | `fs.isFile` | `fs.isFile` | `fs.isFile(p: Path) -> bool` | proposed |
 | `fs.isDir` | `fs.isDir` | `fs.isDir(p: Path) -> bool` | proposed |
-| `fs.read` | `fs.read` | `fs.read(path: string) -> Result(Buffer)` | proposed |
-| `fs.text` | `fs.text` | `fs.text(path: string) -> Result(string)` | planned |
-| `fs.write` | `fs.write` | `fs.write(path: string, data: Slice) -> Result` | proposed |
-| `fs.writeText` | `fs.writeText` | `fs.writeText(path: string, text: string) -> Result` | planned |
-| `fs.append` | `fs.append` | `fs.append(path: string, data: Slice) -> Result` | proposed |
-| `fs.appendText` | `fs.appendText` | `fs.appendText(path: string, text: string) -> Result` | planned |
-| `fs.writeAtomic` | `fs.writeAtomic` | `fs.writeAtomic(path: string, data: Slice) -> Result` | proposed |
-| `fs.writeTextAtomic` | `fs.writeTextAtomic` | `fs.writeTextAtomic(path: string, text: string) -> Result` | planned |
-| `fs.remove` | `fs.remove` | `fs.remove(path: string) -> Result` | proposed |
-| `fs.rename` | `fs.rename` | `fs.rename(old_path: string, new_path: string) -> Result` | proposed |
-| `fs.copy` | `fs.copy` | `fs.copy(src: string, dst: string) -> Result` | proposed |
-| `fs.size` | `fs.size` | `fs.size(path: string) -> Result(int)` | proposed |
-| `fs.open` | `fs.open` | `fs.open(path: string, mode: FileMode) -> Result(File)` | proposed |
-| `fs.create` | `fs.create` | `fs.create(path: string) -> Result(File)` | proposed |
+| `fs.read` | `fs.read` | `fs.read(path: Path) -> Result(Buffer)` | proposed |
+| `fs.readText` | `fs.readText` | `fs.readText(path: Path) -> Result(string)` | planned |
+| `fs.write` | `fs.write` | `fs.write(path: Path, data: Slice) -> Result` | proposed |
+| `fs.writeText` | `fs.writeText` | `fs.writeText(path: Path, text: string) -> Result` | planned |
+| `fs.append` | `fs.append` | `fs.append(path: Path, data: Slice) -> Result` | proposed |
+| `fs.appendText` | `fs.appendText` | `fs.appendText(path: Path, text: string) -> Result` | planned |
+| `fs.writeAtomic` | `fs.writeAtomic` | `fs.writeAtomic(path: Path, data: Slice) -> Result` | proposed |
+| `fs.writeTextAtomic` | `fs.writeTextAtomic` | `fs.writeTextAtomic(path: Path, text: string) -> Result` | planned |
+| `fs.remove` | `fs.remove` | `fs.remove(path: Path) -> Result` | proposed |
+| `fs.rename` | `fs.rename` | `fs.rename(old_path: Path, new_path: Path) -> Result` | proposed |
+| `fs.copy` | `fs.copy` | `fs.copy(src: Path, dst: Path) -> Result` | proposed |
+| `fs.size` | `fs.size` | `fs.size(path: Path) -> Result(int)` | proposed |
+| `fs.open` | `fs.open` | `fs.open(path: Path, mode: FileMode) -> Result(File)` | proposed |
+| `fs.create` | `fs.create` | `fs.create(path: Path) -> Result(File)` | proposed |
 | `fs.File.read` | `File.read` | `(f: File).read(buf: Slice) -> Result(int)` | proposed |
 | `fs.File.exact` | `File.exact` | `(f: File).exact(buf: Slice) -> Result(int)` | planned |
-| `fs.File.atleast` | `File.atleast` | `(f: File).atleast(buf: Slice, min: int) -> Result(int)` | planned |
+| `fs.File.atLeast` | `File.atLeast` | `(f: File).atLeast(buf: Slice, min: int) -> Result(int)` | planned |
 | `fs.File.all` | `File.all` | `(f: File).all() -> Result(Buffer)` | proposed |
 | `fs.File.write` | `File.write` | `(f: File).write(data: Slice) -> Result` | proposed |
 | `fs.File.writeAll` | `File.writeAll` | `(f: File).writeAll(data: Slice) -> Result` | proposed |
 | `fs.File.seek` | `File.seek` | `(f: File).seek(offset: int, whence: io.SeekFrom) -> Result(int)` | proposed |
 | `fs.File.size` | `File.size` | `(f: File).size() -> Result(int)` | proposed |
 | `fs.File.close` | `File.close` | `(f: File).close() -> void` | proposed |
+| `fs.File.flush` | `File.flush` | `(f: File).flush() -> Result` · **verify at implement** | planned |
 
 ---
 
@@ -497,15 +524,15 @@ previous: read
 -->
 
 ```vir
-fs.read(path: string) -> Result(Buffer)
+fs.read(path: Path) -> Result(Buffer)
 ```
 
 Reads the entire file at `path` into an owned **`Buffer`**. Always binary.
-Does not return `string` — use `fs.text` for UTF-8 text.
+Does not return `string` — use `fs.readText` for UTF-8 text.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 Path of a readable file (not a directory).
 
@@ -539,22 +566,23 @@ let r = fs.read("model.gguf")
 
 ### See also
 
-- `fs.text`
+- `fs.readText`
 - `fs.write`
 - `fs.open`
 
 ---
 
-<a id="fs.text"></a>
-## `fs.text`
+<a id="fs.readText"></a>
+## `fs.readText`
 
 <!--
-id: fs.text
-api: fs.text
+id: fs.readText
+api: fs.readText
+previous: fs.text
 -->
 
 ```vir
-fs.text(path: string) -> Result(string)
+fs.readText(path: Path) -> Result(string)
 ```
 
 Reads the entire file and returns a UTF-8 **`string`**. Explicit text layer
@@ -562,7 +590,7 @@ over binary `fs.read`.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 Path of a readable text file.
 
@@ -588,7 +616,7 @@ Lossy decoding, if ever needed, is a separate API — not part of this surface.
 ### Example
 
 ```vir
-let r = fs.text("config.txt")
+let r = fs.readText("config.txt")
 ```
 
 ### Status
@@ -616,7 +644,7 @@ previous: write
 -->
 
 ```vir
-fs.write(path: string, data: Slice) -> Result
+fs.write(path: Path, data: Slice) -> Result
 ```
 
 Creates or truncates `path` and writes all bytes of `data` (binary primitive).
@@ -626,7 +654,7 @@ Vir has **no** function overload: `string` must use `fs.writeText`.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 Destination path.
 
@@ -683,7 +711,7 @@ api: fs.writeText
 -->
 
 ```vir
-fs.writeText(path: string, text: string) -> Result
+fs.writeText(path: Path, text: string) -> Result
 ```
 
 Writes UTF-8 bytes of `text` to `path` (create/truncate). Same underlying write
@@ -691,7 +719,7 @@ path as `fs.write` after taking a `Slice` of the string bytes.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 Destination path.
 
@@ -729,7 +757,7 @@ New; UTF-8 bytes → same impl as `fs.write`.
 ### See also
 
 - `fs.write`
-- `fs.text`
+- `fs.readText`
 - `fs.appendText`
 
 ---
@@ -744,14 +772,14 @@ previous: append
 -->
 
 ```vir
-fs.append(path: string, data: Slice) -> Result
+fs.append(path: Path, data: Slice) -> Result
 ```
 
 Appends binary `data` to `path`, creating the file if needed.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 File to append to.
 
@@ -802,14 +830,14 @@ api: fs.appendText
 -->
 
 ```vir
-fs.appendText(path: string, text: string) -> Result
+fs.appendText(path: Path, text: string) -> Result
 ```
 
 Appends UTF-8 bytes of `text` to `path`, creating the file if needed.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 File to append to.
 
@@ -860,7 +888,7 @@ previous: write_atomic
 -->
 
 ```vir
-fs.writeAtomic(path: string, data: Slice) -> Result
+fs.writeAtomic(path: Path, data: Slice) -> Result
 ```
 
 Writes binary `data` via a temporary file then renames into `path` so readers
@@ -868,7 +896,7 @@ avoid partial content on success.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 Final destination.
 
@@ -921,14 +949,14 @@ api: fs.writeTextAtomic
 -->
 
 ```vir
-fs.writeTextAtomic(path: string, text: string) -> Result
+fs.writeTextAtomic(path: Path, text: string) -> Result
 ```
 
 Atomic write of UTF-8 `text` (temp + rename). Text twin of `fs.writeAtomic`.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 Final destination.
 
@@ -980,14 +1008,14 @@ previous: remove
 -->
 
 ```vir
-fs.remove(path: string) -> Result
+fs.remove(path: Path) -> Result
 ```
 
 Removes the filesystem entry at `path` (host unlink semantics for directories).
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 Entry to remove.
 
@@ -1029,18 +1057,18 @@ previous: rename
 -->
 
 ```vir
-fs.rename(old_path: string, new_path: string) -> Result
+fs.rename(old_path: Path, new_path: Path) -> Result
 ```
 
 Renames or moves `old_path` to `new_path` (host `rename` rules).
 
 ### Parameters
 
-#### `old_path: string`
+#### `old_path: Path`
 
 Existing path.
 
-#### `new_path: string`
+#### `new_path: Path`
 
 Destination path.
 
@@ -1082,18 +1110,18 @@ previous: copy
 -->
 
 ```vir
-fs.copy(src: string, dst: string) -> Result
+fs.copy(src: Path, dst: Path) -> Result
 ```
 
 Copies file contents from `src` to `dst`. Not a directory tree copy.
 
 ### Parameters
 
-#### `src: string`
+#### `src: Path`
 
 Source file.
 
-#### `dst: string`
+#### `dst: Path`
 
 Destination file.
 
@@ -1136,14 +1164,14 @@ previous: size
 -->
 
 ```vir
-fs.size(path: string) -> Result(int)
+fs.size(path: Path) -> Result(int)
 ```
 
 Returns the size of the file at `path` in **bytes**.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 Existing measurable file.
 
@@ -1186,7 +1214,7 @@ previous: file_open
 -->
 
 ```vir
-fs.open(path: string, mode: FileMode) -> Result(File)
+fs.open(path: Path, mode: FileMode) -> Result(File)
 ```
 
 Opens `path` and returns a `File` handle for streaming I/O.
@@ -1194,7 +1222,7 @@ Semantic factory — not `File.new`.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 File path.
 
@@ -1241,7 +1269,7 @@ previous: file_create
 -->
 
 ```vir
-fs.create(path: string) -> Result(File)
+fs.create(path: Path) -> Result(File)
 ```
 
 Creates or truncates `path` for writing and returns a `File` handle.
@@ -1249,7 +1277,7 @@ Semantic factory — not `File.new`.
 
 ### Parameters
 
-#### `path: string`
+#### `path: Path`
 
 Destination path.
 
@@ -1338,7 +1366,7 @@ let f = fs.open("data.bin", FileMode.Read)
 ### See also
 
 - `File.exact`
-- `File.atleast`
+- `File.atLeast`
 - `File.all`
 - `fs.read`
 
@@ -1394,23 +1422,24 @@ New method on `File`; share semantics with `Reader.exact`.
 ### See also
 
 - `File.read`
-- `File.atleast`
+- `File.atLeast`
 
 ---
 
-<a id="fs.File.atleast"></a>
-## `File.atleast`
+<a id="fs.File.atLeast"></a>
+## `File.atLeast`
 
 <!--
-id: fs.File.atleast
-api: File.atleast
+id: fs.File.atLeast
+api: File.atLeast
+previous: File.atleast
 -->
 
 ```vir
-(f: File).atleast(buf: Slice, min: int) -> Result(int)
+(f: File).atLeast(buf: Slice, min: int) -> Result(int)
 ```
 
-Reads at least `min` bytes into `buf` (up to capacity). Matches `Reader.atleast`.
+Reads at least `min` bytes into `buf` (up to capacity). Matches `Reader.atLeast` / io contract spelling.
 
 ### Parameters
 
@@ -1433,7 +1462,7 @@ I/O failure; EOF before `min` bytes → **`UnexpectedEof`**.
 ### Example
 
 ```vir
-# f.atleast(buf, 4)
+# f.atLeast(buf, 4)
 ```
 
 ### Status
@@ -1442,7 +1471,7 @@ I/O failure; EOF before `min` bytes → **`UnexpectedEof`**.
 
 ### Implementation mapping
 
-New method on `File`; share semantics with `Reader.atleast`.
+New method on `File`; share semantics with Reader atleast/atLeast contract.
 
 ### See also
 
@@ -1482,7 +1511,7 @@ Bad handle; read failure.
 ### Semantics
 
 Merges today’s dual impl paths `file_read_all` and `file_read_bytes` into one
-public semantic. Handle API stays binary-first; whole-file text stays on `fs.text`.
+public semantic. Handle API stays binary-first; whole-file text stays on `fs.readText`.
 
 ### Example
 
@@ -1570,6 +1599,9 @@ previous: file_write_all
 
 ```vir
 (f: File).writeAll(data: Slice) -> Result
+
+Must not report void-success `Ok` until **all** bytes are written (or return `Err`).
+Partial writes are not success under this contract.
 ```
 
 Writes the entire `Slice`, retrying until complete or an error occurs.
@@ -1768,7 +1800,90 @@ f.close()
 
 ---
 
+---
+
+<a id="fs.mkdir"></a>
+## `fs.mkdir`
+
+<!--
+id: fs.mkdir
+api: fs.mkdir
+-->
+
+```vir
+fs.mkdir(path: Path) -> Result
+```
+
+Create a directory. Recursive parents / exist-ok / mode bits — **verify at
+implement** against host POSIX and current `fs` helpers.
+
+### Parameters
+
+#### `path: Path`
+
+Directory path (`Path`, not bare `string`).
+
+### Returns
+
+Bare `Result` — `Ok()` on success.
+
+### Errors
+
+`IoError` / `Error` kinds for permission, exists (if not exist-ok), parent
+missing (if non-recursive). Exact set **verify at implement**.
+
+### Status
+
+`planned` — not yet present under this public name.
+
+### See also
+
+- `fs.create`
+- `fs.exists`
+- `fs.isDir`
+
+---
+
+<a id="fs.File.flush"></a>
+## `File.flush`
+
+<!--
+id: fs.File.flush
+api: File.flush
+-->
+
+```vir
+(f: File).flush() -> Result
+```
+
+Flush buffered writes for this handle. Align with [`io`](io.md) `Writer.flush`
+when that surface lands — **verify at implement**.
+
+### Parameters
+
+None (receiver `File`).
+
+### Returns
+
+Bare `Result` — `Ok()` when flush succeeds.
+
+### Errors
+
+I/O flush failures as `Err`.
+
+### Status
+
+`planned` — not yet present under this public name.
+
+### See also
+
+- `File.write`
+- `File.close`
+
+---
+
 ## Implementation readiness
 
-Public filesystem API map is closed for this refactor.
-Implementation may proceed against this registry.
+**Design status: closed** (F1–F4). All path params = `Path`; binary-first;
+`*Text` / exact / `atLeast` / `mkdir` / `flush` planned. Dedup `fs`/`fs.fs`
+before source migration. No `.vri` until authorized (Q5).

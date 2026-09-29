@@ -5,7 +5,7 @@ summary: Path values and pure lexical path-string operations — namespace-only 
 source:
   - name: path
     path: vir/path/path.vri
-status: draft
+status: closed
 notes: >-
   path = representation + pure path manipulation. Filesystem probes live in fs
   (exists / isFile / isDir). No receiver-style p.*; no path_* public names.
@@ -44,8 +44,7 @@ end
 | | Receiver API `p.join` / `p.name` — **not public** |
 | | Snake names `path_join` / `path_filename` — **impl only** |
 
-Host separator today: `PATH_SEP = "/"` (POSIX). Documented behavior matches
-`vir/path/path.vri`.
+Host separator today: `PATH_SEP = "/"` (**POSIX** — P1). Multi-OS later. Behavior matches `vir/path/path.vri`.
 
 ## Public surface (closed)
 
@@ -53,28 +52,47 @@ Host separator today: `PATH_SEP = "/"` (POSIX). Documented behavior matches
 path
 ├── new
 ├── join
+├── normalize          # planned
 ├── parent
 ├── name
 ├── stem
-├── ext
+├── extension
 ├── withExt
-├── absolute
-├── relative
+├── isAbsolute
+├── isRelative
 └── string
 ```
 
 ```vir
 path.new(...)
 path.join(...)
+path.normalize(...)       # planned
 path.parent(...)
 path.name(...)
 path.stem(...)
-path.ext(...)
+path.extension(...)
 path.withExt(...)
-path.absolute(...)
-path.relative(...)
+path.isAbsolute(...)
+path.isRelative(...)
 path.string(...)
 ```
+
+## Decisions P1–P2 (locked)
+
+## Naming (CORE SPEC)
+
+Ops (CORE SPEC; normalize planned): `new` · `join` · `parent` · `name` · `stem` ·
+**`extension`** · `withExt` · **`isAbsolute`** · **`isRelative`** · `string` ·
+**`normalize`** (planned).
+
+| Previous | Canonical |
+|---|---|
+| `path.ext` | **`path.extension`** |
+| `path.absolute` | **`path.isAbsolute`** |
+| `path.relative` | **`path.isRelative`** |
+| — | **`path.normalize`** · planned · lexical only; ≠ fs canonicalize |
+
+`path.new` / `path.string` remain conversion APIs.
 
 ## Type: `Path`
 
@@ -82,15 +100,15 @@ path.string(...)
 Path
 ```
 
-Implementation representation today:
+Opaque value. Callers use `path.new(s)` / `path.string(p)` (verified surface —
+do not invent alternate constructors in docs). Internal representation (e.g.
+`raw: string` today) is **not** public ABI.
 
-```text
-raw: string
-```
+Path ops are **lexical only**: no filesystem access, no symlink resolve, no
+equating lexical normalize with filesystem canonicalize.
 
-`raw` is an **implementation** field — not a required public contract. Callers
-obtain a string via `path.string(p)` so `Path` storage may change later without
-forcing `p.raw` access.
+`fs` consumes `Path`; conversion to a native OS path is an **implementation**
+detail — not a reason to expose `Path` layout. Surface: 10 present ops + **`normalize` planned** (CORE SPEC).
 
 ## Migration map
 
@@ -102,10 +120,10 @@ forcing `p.raw` access.
 | `path_parent` | `path.parent` | last-sep cut → `Option` of `Path` | **rename** |
 | `path_filename` | `path.name` | final component → `Option` of `string` | **rename** |
 | `path_stem` | `path.stem` | stem of final component | **rename** |
-| `path_extension` | `path.ext` | ext **without** leading `.` | **rename** |
+| `path_extension` | `path.extension` | ext **without** leading `.` | **rename** |
 | `path_with_extension` | `path.withExt` | lexical transform only | **rename** |
-| `path_is_absolute` | `path.absolute` | lexical predicate | **rename** |
-| `path_is_relative` | `path.relative` | `not absolute` | **rename** |
+| `path_is_absolute` | `path.isAbsolute` | lexical predicate | **rename** |
+| `path_is_relative` | `path.isRelative` | `not absolute` | **rename** |
 | `path_to_string` | `path.string` | returns stored string | **rename** |
 | `path_exists` | `fs.exists` | native probe | **move** → [`fs.md`](fs.md) |
 | `path_is_file` | `fs.isFile` | native probe | **move** → [`fs.md`](fs.md) |
@@ -138,14 +156,15 @@ Do **not** document `path.exists` / `path.isFile` / `path.isDir`.
 | ID | Symbol | Signature | Status |
 |---|---|---|---|
 | `path.new` | `path.new` | `path.new(s: string) -> Path` | proposed |
+| `path.normalize` | `path.normalize` | `path.normalize(p: Path) -> Path` · lexical · **verify at implement** | planned |
 | `path.join` | `path.join` | `path.join(base: Path, child: string) -> Path` | proposed |
 | `path.parent` | `path.parent` | `path.parent(p: Path) -> Option(Path)` | proposed |
 | `path.name` | `path.name` | `path.name(p: Path) -> Option(string)` | proposed |
 | `path.stem` | `path.stem` | `path.stem(p: Path) -> Option(string)` | proposed |
-| `path.ext` | `path.ext` | `path.ext(p: Path) -> Option(string)` | proposed |
+| `path.extension` | `path.extension` | `path.extension(p: Path) -> Option(string)` | proposed |
 | `path.withExt` | `path.withExt` | `path.withExt(p: Path, ext: string) -> Path` | proposed |
-| `path.absolute` | `path.absolute` | `path.absolute(p: Path) -> bool` | proposed |
-| `path.relative` | `path.relative` | `path.relative(p: Path) -> bool` | proposed |
+| `path.isAbsolute` | `path.isAbsolute` | `path.isAbsolute(p: Path) -> bool` | proposed |
+| `path.isRelative` | `path.isRelative` | `path.isRelative(p: Path) -> bool` | proposed |
 | `path.string` | `path.string` | `path.string(p: Path) -> string` | proposed |
 
 ---
@@ -400,7 +419,7 @@ path.name(path.new("a/b/c.vri"))
 ### See also
 
 - `path.stem`
-- `path.ext`
+- `path.extension`
 - `path.parent`
 
 ---
@@ -468,26 +487,26 @@ path.stem(path.new("a/b/c.vri"))
 ### See also
 
 - `path.name`
-- `path.ext`
+- `path.extension`
 - `path.withExt`
 
 ---
 
-<a id="path.ext"></a>
-## `path.ext`
+<a id="path.extension"></a>
+## `path.extension`
 
 <!--
-id: path.ext
-api: path.ext
-previous: path_extension
+id: path.extension
+api: path.extension
+previous: path.ext
 -->
 
 ```vir
-path.ext(p: Path) -> Option(string)
+path.extension(p: Path) -> Option(string)
 ```
 
-Final extension of the name component. Canonical public abbreviation: **`ext`**
-(not `extension`).
+Final extension of the name component. Canonical public name: **`extension`**
+(previous / short form `ext` is migration-only).
 
 ### Parameters
 
@@ -520,7 +539,7 @@ the returned string). Leading-dot names have no extension.
 ### Example
 
 ```vir
-path.ext(path.new("a/b/c.vri"))
+path.extension(path.new("a/b/c.vri"))
 # Some("vri")
 ```
 
@@ -605,22 +624,22 @@ let q = path.withExt(p, "md")
 
 ### See also
 
-- `path.ext`
+- `path.extension`
 - `path.stem`
 
 ---
 
-<a id="path.absolute"></a>
-## `path.absolute`
+<a id="path.isAbsolute"></a>
+## `path.isAbsolute`
 
 <!--
-id: path.absolute
-api: path.absolute
-previous: path_is_absolute
+id: path.isAbsolute
+api: path.isAbsolute
+previous: path.absolute
 -->
 
 ```vir
-path.absolute(p: Path) -> bool
+path.isAbsolute(p: Path) -> bool
 ```
 
 Lexical absolute-path predicate. No filesystem access.
@@ -647,9 +666,9 @@ context. Does not resolve against the process cwd.
 ### Example
 
 ```vir
-path.absolute(path.new("/usr/bin"))
+path.isAbsolute(path.new("/usr/bin"))
 # true
-path.absolute(path.new("src/main.vri"))
+path.isAbsolute(path.new("src/main.vri"))
 # false
 ```
 
@@ -663,24 +682,24 @@ path.absolute(path.new("src/main.vri"))
 
 ### See also
 
-- `path.relative`
+- `path.isRelative`
 
 ---
 
-<a id="path.relative"></a>
-## `path.relative`
+<a id="path.isRelative"></a>
+## `path.isRelative`
 
 <!--
-id: path.relative
-api: path.relative
-previous: path_is_relative
+id: path.isRelative
+api: path.isRelative
+previous: path.relative
 -->
 
 ```vir
-path.relative(p: Path) -> bool
+path.isRelative(p: Path) -> bool
 ```
 
-Lexical relative-path predicate — negation of `path.absolute`.
+Lexical relative-path predicate — negation of `path.isAbsolute`.
 
 ### Parameters
 
@@ -690,7 +709,7 @@ Path to test.
 
 ### Returns
 
-`bool` — `true` when `path.absolute(p)` is `false`.
+`bool` — `true` when `path.isAbsolute(p)` is `false`.
 
 ### Errors
 
@@ -703,7 +722,7 @@ Not `path.isRelative`. No filesystem access.
 ### Example
 
 ```vir
-path.relative(path.new("src/main.vri"))
+path.isRelative(path.new("src/main.vri"))
 # true
 ```
 
@@ -717,7 +736,7 @@ path.relative(path.new("src/main.vri"))
 
 ### See also
 
-- `path.absolute`
+- `path.isAbsolute`
 
 ---
 
@@ -777,6 +796,50 @@ io.println(path.string(p))
 
 ---
 
+---
+
+<a id="path.normalize"></a>
+## `path.normalize`
+
+<!--
+id: path.normalize
+api: path.normalize
+-->
+
+```vir
+path.normalize(p: Path) -> Path
+```
+
+Lexical normalize only (`.` / `..` / redundant separators). **Not** filesystem
+canonicalize / symlink resolution — that stays on `fs` if added later.
+
+### Parameters
+
+#### `p: Path`
+
+Input path.
+
+### Returns
+
+`Path` — lexically normalized form. Exact collapse rules **verify at
+implement**.
+
+### Errors
+
+None (pure lexical transform).
+
+### Status
+
+`planned` — verify at implement.
+
+### See also
+
+- `path.join`
+- `path.parent`
+- `fs.exists` *(existence is not normalize)*
+
+---
+
 ## Filesystem probes (moved to `fs`)
 
 Canonical public home — see [`fs.md`](fs.md):
@@ -798,5 +861,5 @@ No duplicate public aliases under `path`.
 
 ## Implementation readiness
 
-Public path API map is closed for this refactor.
-Implementation may proceed against this registry.
+**Design status: closed** (P1–P2). Opaque `Path` locked for `fs` Path signatures.
+No `.vri` until authorized (Q5).
