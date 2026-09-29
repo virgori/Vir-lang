@@ -54,6 +54,9 @@ stdlib/registry/
 **Crypto / TLS (docs draft):** [`crypto.md`](crypto.md) · [`tls.md`](tls.md) —
 experimental; not production-ready; first harden `hash` → `hmac` → `rng`.
 `rand` is outside cryptographic guarantees.
+
+**Remaining-library audits:** [`report/AUDIT.md`](report/AUDIT.md) (collections,
+core, string, fs, format, data, net, concurrency, misc + compile smoke).
 **Core Collections (4/4 design closed):** `vec` · `map` · `set` · `deque`.
 Closed = documentation design, not implementation certification.
 

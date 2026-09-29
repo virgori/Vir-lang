@@ -13,6 +13,22 @@ migration aliases. No claim of API `stable`.
 | crypto | [`../crypto.md`](../crypto.md) | `stdlib/vir/crypto/*` | **docs draft** | experimental; compile blocked; harden hash→hmac→rng first — [`crypto.md`](crypto.md) |
 | tls | [`../tls.md`](../tls.md) | `stdlib/vir/tls/*` | **docs draft** | native `native_tls_*` boundary; not pure-Vir crypto |
 
+## Remaining libraries (audit 2026-09-29)
+
+Full rollup: [`AUDIT.md`](AUDIT.md) · inventory: [`INVENTORY.md`](INVENTORY.md)
+
+| Cluster | Report | Smoke highlights |
+|---|---|---|
+| Collections | [`collections.md`](collections.md) | `vec` OK; map/set/deque/buffer/slice FAIL |
+| Core | [`core.md`](core.md) | `option`/`result` OK |
+| String | [`string_cluster.md`](string_cluster.md) | `char` OK; fat-string ABI blocks rest |
+| FS/OS | [`fs_os.md`](fs_os.md) | `fs` OK; path/process FAIL |
+| Format | [`format_cluster.md`](format_cluster.md) | all blocked |
+| Data/encoding | [`data.md`](data.md) | base64/hex/csv/toml/xml/yaml/ini/url OK |
+| Net/web | [`net.md`](net.md) | no registry; net/http FAIL |
+| Concurrency | [`concurrency.md`](concurrency.md) | no registry; blocked |
+| Misc | [`misc.md`](misc.md) | math/regex OK; rand ≠ CSPRNG |
+
 ## Blockers
 
 1. **`io` module remount** — `stdlib.vri` maps `io` → `rt/io.vri` (compiler
@@ -22,10 +38,14 @@ migration aliases. No claim of API `stable`.
    undeclared RNG/TLS native symbols; entire tree experimental.
 3. **json ownership / float Number / error→Error** — still design gates; this
    wave only naming + `at` Option + array/object views.
+4. **Fat-string ABI** — blocks `string`/`builder`/many dependents (`char_len`/`byte_len`).
+5. **Missing registry** for high-traffic modules — net/http/rand/time/csv/… (see inventory).
 
 ## Next after this wave
 
 - Remount console `io` safely  
-- csv (Q7)  
+- csv (Q7) + data-format registries (encode/base64/hex dedup)  
 - Dedup `json.vri` / `data/json.vri` load paths at resolver level  
 - Implement milestone: `crypto.hash` → `hmac` → `rng` (compile + vectors + FFI)  
+- Fix fat-string fields so string cluster includes  
+- Collections: map → set after `str_new` / entity field fix  

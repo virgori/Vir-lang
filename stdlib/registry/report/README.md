@@ -6,13 +6,13 @@ Track how far `stdlib/vir/` matches `stdlib/registry/*.md` contracts.
 
 | File | Role |
 |---|---|
-| [`API.md`](API.md) | Index danh sách tên hàm (env / json / io / cli) |
-| [`api_env.md`](api_env.md) | API `env` |
-| [`api_json.md`](api_json.md) | API `json` |
-| [`api_io.md`](api_io.md) | API `io` (console) |
-| [`api_cli.md`](api_cli.md) | API `cli` |
+| [`AUDIT.md`](AUDIT.md) | **Rollup audit** — remaining libraries + compile smoke |
+| [`INVENTORY.md`](INVENTORY.md) | Dirs without registry SSOT |
+| [`API.md`](API.md) | Index tên hàm wave env/json/io/cli |
+| [`api_env.md`](api_env.md) / [`api_json.md`](api_json.md) / [`api_io.md`](api_io.md) / [`api_cli.md`](api_cli.md) | API lists |
 | [`STATUS.md`](STATUS.md) | Wave rollup — done / blocked |
-| [`env.md`](env.md) / [`json.md`](json.md) / [`io.md`](io.md) / [`cli.md`](cli.md) | Checklist trạng thái implement |
+| [`env.md`](env.md) / [`json.md`](json.md) / [`io.md`](io.md) / [`cli.md`](cli.md) / [`crypto.md`](crypto.md) | Wave checklists |
+| [`collections.md`](collections.md) · [`core.md`](core.md) · [`string_cluster.md`](string_cluster.md) · [`fs_os.md`](fs_os.md) · [`format_cluster.md`](format_cluster.md) · [`data.md`](data.md) · [`net.md`](net.md) · [`concurrency.md`](concurrency.md) · [`misc.md`](misc.md) | Cluster audits |
 
 Status values (checklist):
 
@@ -20,7 +20,7 @@ Status values (checklist):
 |---|---|
 | `done` | Public name + contract shape in source |
 | `alias` | New name present; old name kept for callers |
-| `partial` | Present but incomplete (e.g. password echo still on) |
+| `partial` | Present but incomplete |
 | `planned` | Registry-only; not in source yet |
 | `blocked` | Needs remount / ABI / gate before finish |
 | `skip` | Explicitly out of this wave |
