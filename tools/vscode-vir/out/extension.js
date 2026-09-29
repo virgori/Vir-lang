@@ -38,6 +38,8 @@ exports.deactivate = deactivate;
 const vscode = __importStar(require("vscode"));
 const semanticTokens_1 = require("./semanticTokens");
 const lspClient_1 = require("./lspClient");
+const lifetimeDecorations_1 = require("./lifetimeDecorations");
+const virIdeSemantic_1 = require("./virIdeSemantic");
 const fallbackKeywords = [
     "entity",
     "func",
@@ -183,10 +185,83 @@ function registerFallbackDiagnostics(context) {
     context.subscriptions.push(vscode.workspace.onDidCloseTextDocument((doc) => collection.delete(doc.uri)));
     vscode.workspace.textDocuments.forEach(validate);
 }
+function registerLifetimeHover(context) {
+    const provider = vscode.languages.registerHoverProvider({ language: "vir", scheme: "file" }, {
+        async provideHover(document, position) {
+            const snap = await (0, virIdeSemantic_1.fetchIdeSnapshot)(document);
+            if (!snap) {
+                return undefined;
+            }
+            const line = position.line + 1;
+            const col = position.character + 1;
+            const occ = snap.occurrences.find((o) => o.kind === 0 && o.line === line && col >= o.col && col <= o.endCol);
+            const parts = [];
+            if (occ) {
+                const state = occ.state & 16
+                    ? "invalid"
+                    : occ.state & 8
+                        ? "out"
+                        : occ.state & 4
+                            ? "moved"
+                            : occ.state & 1
+                                ? "declared"
+                                : "alive";
+                parts.push(`**variable** · \`${state}\` · symbol #${occ.symbolId}`);
+            }
+            const mod = snap.modules.find((m) => m.line === line);
+            if (mod) {
+                parts.push(`**module** \`${mod.name}\` · \`${mod.state}\``);
+            }
+            const fn = snap.functions?.find((f) => f.line === line && col >= f.col && col <= f.endCol);
+            if (fn) {
+                parts.push(`**function** \`${fn.name}\` · \`${fn.state}\` · symbol #${fn.symbolId}`);
+            }
+            if (parts.length === 0) {
+                return undefined;
+            }
+            return new vscode.Hover(new vscode.MarkdownString(parts.join("\n\n")));
+        }
+    });
+    context.subscriptions.push(provider);
+}
+/** Other installed extensions that also claim the `vir` language / `source.vri` grammar. */
+const CONFLICTING_EXTENSION_IDS = ["virgori.virgori-core"];
+function warnAboutConflictingExtensions(context) {
+    const found = CONFLICTING_EXTENSION_IDS.filter((id) => vscode.extensions.getExtension(id));
+    if (found.length === 0) {
+        return;
+    }
+    const key = "vir.conflictWarned";
+    if (context.globalState.get(key) === found.join(",")) {
+        return;
+    }
+    void vscode.window
+        .showWarningMessage(`Vir-lang: ${found.join(", ")} also provides Vir highlighting (grammar, semantic tokens, same theme names). ` +
+        "Two providers overlap and split tokens such as `->` into two colors. Disable or uninstall it.", "Show Extension", "Don't Warn Again")
+        .then((choice) => {
+        if (choice === "Show Extension") {
+            void vscode.commands.executeCommand("workbench.extensions.search", `@installed ${found[0]}`);
+        }
+        else if (choice === "Don't Warn Again") {
+            void context.globalState.update(key, found.join(","));
+        }
+    });
+}
 async function activate(context) {
     const cfg = vscode.workspace.getConfiguration("vir");
+    warnAboutConflictingExtensions(context);
     if (cfg.get("semantic.enableEnhanced", true)) {
         (0, semanticTokens_1.registerSemanticTokens)(context);
+    }
+    if (cfg.get("semantic.lifetime.enabled", true)) {
+        const lifetime = new lifetimeDecorations_1.LifetimeDecorationController();
+        context.subscriptions.push(lifetime);
+        registerLifetimeHover(context);
+        for (const doc of vscode.workspace.textDocuments) {
+            if (doc.languageId === "vir") {
+                void lifetime.refresh(doc);
+            }
+        }
     }
     context.subscriptions.push(vscode.commands.registerCommand("vir.restartLanguageServer", async () => {
         await (0, lspClient_1.restartVirLanguageClient)(context);
