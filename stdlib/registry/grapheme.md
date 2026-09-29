@@ -61,7 +61,7 @@ GraphemeCluster
 ```
 
 `grapheme.clusters(s) -> Vec` of `GraphemeCluster`.  
-`grapheme.at(s, idx) -> Option(GraphemeCluster)`.
+`grapheme.at(s, idx) -> Option of (GraphemeCluster)`.
 
 Registry does not invent a different collection type. Field meanings follow
 implementation; any byte-vs-codepoint bugs in today’s `clusters` builder are
@@ -93,8 +93,8 @@ unless a later audit unifies — keep `Option` while source does.
 |---|---|---|---|
 | `grapheme.GraphemeCluster` | `GraphemeCluster` | type | proposed |
 | `grapheme.count` | `grapheme.count` | `grapheme.count(s: string) -> int` | proposed |
-| `grapheme.at` | `grapheme.at` | `grapheme.at(s: string, i: int) -> Option(GraphemeCluster)` | proposed |
-| `grapheme.clusters` | `grapheme.clusters` | `grapheme.clusters(s: string) -> Vec(GraphemeCluster)` | proposed |
+| `grapheme.at` | `grapheme.at` | `grapheme.at(s: string, i: int) -> Option of (GraphemeCluster)` | proposed |
+| `grapheme.clusters` | `grapheme.clusters` | `grapheme.clusters(s: string) -> Vec of (GraphemeCluster)` | proposed |
 | `grapheme.reverse` | `grapheme.reverse` | `grapheme.reverse(s: string) -> string` | proposed |
 
 ---
@@ -118,7 +118,7 @@ Number of extended grapheme clusters.
 ## `grapheme.at`
 
 ```vir
-grapheme.at(s: string, i: int) -> Option(GraphemeCluster)
+grapheme.at(s: string, i: int) -> Option of (GraphemeCluster)
 ```
 
 Cluster at grapheme index `i`, or `None`.

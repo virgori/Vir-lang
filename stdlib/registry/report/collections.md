@@ -11,7 +11,7 @@
 | `map` | `collections/map.vri` | SipHash; free-func style |
 | `set` | `collections/set.vri` | Depends on map |
 | `deque` | `collections/deque.vri` | Parser `*` issues |
-| `buffer` | `mem/buffer.vri` | Byte buffer ≠ `Vec(u8)` |
+| `buffer` | `mem/buffer.vri` | Byte buffer ≠ `Vec of (u8)` |
 | `slice` | `mem/slice.vri` | Borrowed view |
 | `hashmap` | `collections/hashmap.vri` | **No registry** — migrate → `map` |
 | Deferred | lru/ring/bloom/btree/heap/… | Explicitly not core this wave |

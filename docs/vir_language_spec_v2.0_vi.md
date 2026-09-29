@@ -504,7 +504,7 @@ Khi hai module phụ thuộc lẫn nhau về *kiểu* (không cần logic thực
 lazy include satellite;              # chỉ nhập kiểu, không parse toàn bộ
 
 entity GatewayConfig:
-    satellites: array[satellite.SatInfo]     # dùng kiểu từ satellite
+    satellites: array of (satellite.SatInfo) # dùng kiểu từ satellite
 end.
 ```
 
@@ -557,8 +557,49 @@ end.
 | `array` | Mảng động co giãn | **Move** |
 | `dict` | Từ điển khoá-giá trị | **Move** |
 | `map` | Biểu thức biến đổi (transformation) | biểu thức |
-| `flux<T,N>` | Vector SIMD kích thước cố định — N phần tử kiểu T | **Copy** |
+| `flux of (T, N)` | Vector SIMD kích thước cố định — N phần tử kiểu T | **Copy** |
 | `deck` | Buffer chia sẻ CPU-GPU (có kiểu, cố định) | **Move** (handle) |
+
+#### 4.2.1 Cú pháp generic — `of (...)`
+
+Vir dùng duy nhất cú pháp **`of (...)`** cho tham số generic. `of` là từ khoá theo ngữ cảnh: nó chỉ mở danh sách tham số generic sau tên khai báo, tên kiểu hoặc callee có hỗ trợ generic.
+
+```text
+generic-declaration := name "of" "(" generic-parameter ("," generic-parameter)* ")"
+generic-application := name "of" "(" generic-argument  ("," generic-argument)*  ")"
+```
+
+```vir
+entity Vec of (T):
+    data: ptr
+    len: int
+    cap: int
+end.
+
+enum Result of (T, E):
+    Ok(value: T)
+    Err(error: E)
+end.
+
+func identity of (T)(value: T) -> T:
+    out value
+end.
+
+var names: Vec of (string)
+var index: dict of (string, Vec of (int))
+var answer = identity of (int)(42)
+var lanes: flux of (f32, 4)
+var weights: tensor[f32; 784, 128]
+```
+
+Quy tắc:
+
+- Dấu `(...)` ngay sau `of` chứa **tham số/đối số generic**; dấu `(...)` tiếp theo vẫn là danh sách đối số runtime hoặc constructor.
+- `of (...)` chỉ áp dụng cho generic thông thường. `tensor` là kiểu chuyên biệt có shape và dùng production riêng `tensor[T; S...]`; `tensor of (T)[S...]` không phải cú pháp chuẩn.
+- `[T]` vẫn là kiểu mảng động. Trong `tensor[T; S...]`, dấu `;` phân cách kiểu phần tử `T` với shape tĩnh `S...`.
+- Generic lồng nhau lặp lại `of (...)`, ví dụ `dict of (string, Vec of (User))`.
+- Cú pháp kiểu Rust/C++ `Name<T>` **không còn là cú pháp chuẩn**. Compiler có thể tạm chấp nhận nó ở chế độ tương thích với cảnh báo deprecation, nhưng code và tài liệu mới phải dùng `Name of (T)`.
+- Thay đổi cú pháp này không thay đổi type identity, ownership, ABI hoặc cách suy luận kiểu.
 
 ### 4.3 Giá trị trực tiếp (Literals)
 
@@ -1318,12 +1359,12 @@ end
 Khi một enum có ít nhất một biến thể (variant) mang tham số (payload), enum đó trở thành **Tagged Union**. Biến thể có thể chứa một hoặc nhiều trường dữ liệu, đồng thời hỗ trợ tham số kiểu tổng quát (Generics).
 
 ```vir
-enum Option<T>:
+enum Option of (T):
     Some(value: T)
     None
 end.
 
-enum Result<T, E>:
+enum Result of (T, E):
     Ok(value: T)
     Err(error: E)
 end.
@@ -2674,18 +2715,18 @@ var ages = ["Alice": 30, "Bob": 25]
 Khai báo với kiểu tường minh:
 
 ```vir
-var ages: dict[string, int] = ["Alice": 30, "Bob": 25]
+var ages: dict of (string, int) = ["Alice": 30, "Bob": 25]
 ```
 
 - `[key: value, ...]` — dict literal, compiler suy luận kiểu từ phần tử đầu tiên
-- Chú thích kiểu `dict[K, V]` tuỳ chọn
+- Chú thích kiểu `dict of (K, V)` tuỳ chọn
 - Kiểu khoá `K` phải thỏa **`Hashable`** (xem §20.1.4): nguyên thuỷ có sẵn; entity tự định nghĩa
 - Khoá trùng được xác định bằng **so sánh bằng** (`equals` / `operator ==`), không chỉ bằng hash
 
 #### 20.1.2 Thao tác
 
 ```vir
-var m: dict[string, int] = []      # dict rỗng (chú thích kiểu bắt buộc cho dict rỗng)
+var m: dict of (string, int) = []  # dict rỗng (chú thích kiểu bắt buộc cho dict rỗng)
 
 m["Alice"] = 30                    # gán
 print m["Alice"]                   # đọc → 30
@@ -2715,7 +2756,7 @@ Thứ tự duyệt **không đảm bảo** (hash table không giữ thứ tự c
 
 #### 20.1.4 Hashable — Hash & Equality
 
-`dict[K, V]` chỉ chấp nhận `K: Hashable`. Hash chọn bucket; **khóa trùng** chỉ khi so sánh bằng trả về true (hai khóa cùng hash chưa chắc cùng khóa).
+`dict of (K, V)` chỉ chấp nhận `K: Hashable`. Hash chọn bucket; **khóa trùng** chỉ khi so sánh bằng trả về true (hai khóa cùng hash chưa chắc cùng khóa).
 
 ##### Contract
 
@@ -2731,7 +2772,7 @@ end.
 | Kiểu trả về của `hash` | Luôn **`u64`** — không dùng `int` (tránh hash âm; không phụ thuộc `int` 32/64-bit; khớp FNV / SipHash / xxHash) |
 | `equals` | Bắt buộc cho khóa entity (cùng kiểu `Self`) |
 | `operator ==` | Nếu kiểu định nghĩa `operator ==(a: T, b: T) -> bool`, `dict` được dùng `==` thay cho `equals` (cùng semantics) |
-| Ràng buộc compile-time | `dict[K, V]` lỗi kiểu nếu `K` không phải `Hashable` |
+| Ràng buộc compile-time | `dict of (K, V)` lỗi kiểu nếu `K` không phải `Hashable` |
 
 Nguyên thuỷ được coi là đã triển khai `Hashable` sẵn (không cần khai báo `interface`).
 
@@ -2762,7 +2803,7 @@ entity Point:
     end.
 end.
 
-var grid: dict[Point, string] = [Point(x: 0, y: 0): "origin"]
+var grid: dict of (Point, string) = [Point(x: 0, y: 0): "origin"]
 ```
 
 Tương đương equality bằng toán tử (nếu dùng `==` thay `equals`):
@@ -3273,11 +3314,11 @@ Vir cung cấp từ khoá hạng nhất cho vector SIMD, buffer chia sẻ GPU, t
 
 ### 24.1 Vector SIMD — `flux`
 
-`flux<T, N>` khai báo vector SIMD có độ rộng cố định gồm `N` phần tử kiểu `T`. Compiler ánh xạ các phép toán sang lệnh SIMD native (ARM NEON, x86 SSE/AVX, WASM SIMD).
+`flux of (T, N)` khai báo vector SIMD có độ rộng cố định gồm `N` phần tử kiểu `T`. Compiler ánh xạ các phép toán sang lệnh SIMD native (ARM NEON, x86 SSE/AVX, WASM SIMD).
 
 ```vir
-var pos: flux<f32, 4> = flux(1.0, 2.0, 3.0, 1.0)
-var vel: flux<f32, 4> = flux(0.1, 0.0, -0.5, 0.0)
+var pos: flux of (f32, 4) = flux(1.0, 2.0, 3.0, 1.0)
+var vel: flux of (f32, 4) = flux(0.1, 0.0, -0.5, 0.0)
 
 var next_pos = pos + vel          # cộng từng phần tử — một lệnh SIMD
 ```
@@ -3301,18 +3342,18 @@ var next_pos = pos + vel          # cộng từng phần tử — một lệnh S
 Toán tử swizzle `~` xáo trộn hoặc nhân bản các kênh vector theo tên. Tên kênh theo quy ước `xyzw` (vị trí) hoặc `rgba` (màu sắc).
 
 ```vir
-var v: flux<f32, 4> = flux(1.0, 2.0, 3.0, 4.0)
+var v: flux of (f32, 4) = flux(1.0, 2.0, 3.0, 4.0)
 
-var xyz  = v~xyz              # flux<f32, 3> — bỏ w
-var zyx  = v~zyx              # flux<f32, 3> — đảo xyz
-var xxxx = v~xxxx             # flux<f32, 4> — broadcast x
-var rg   = v~rg               # flux<f32, 2> — đồng nghĩa với xy
+var xyz  = v~xyz              # flux of (f32, 3) — bỏ w
+var zyx  = v~zyx              # flux of (f32, 3) — đảo xyz
+var xxxx = v~xxxx             # flux of (f32, 4) — broadcast x
+var rg   = v~rg               # flux of (f32, 2) — đồng nghĩa với xy
 ```
 
 **Quy tắc:**
 - Ký tự kênh: `x`=0, `y`=1, `z`=2, `w`=3 (tương đương `r`, `g`, `b`, `a`)
-- Độ rộng kết quả = số ký tự: `v~xy` → `flux<T, 2>`
-- Kênh có thể lặp: `v~xxyy` → `flux<T, 4>`
+- Độ rộng kết quả = số ký tự: `v~xy` → `flux of (T, 2)`
+- Kênh có thể lặp: `v~xxyy` → `flux of (T, 4)`
 - Swizzle là compile-time — không chi phí runtime (ánh xạ sang lệnh shuffle hoặc được gập)
 
 **Write-masking — ghi chọn lọc qua swizzle:**
@@ -3320,7 +3361,7 @@ var rg   = v~rg               # flux<f32, 2> — đồng nghĩa với xy
 Swizzle bên **vế trái** phép gán giới hạn kênh được ghi, các kênh không nêu giữ nguyên giá trị cũ:
 
 ```vir
-var v: flux<f32, 4> = flux(1.0, 2.0, 3.0, 4.0)
+var v: flux of (f32, 4) = flux(1.0, 2.0, 3.0, 4.0)
 
 v~xy = flux(10.0, 20.0)          # v = flux(10.0, 20.0, 3.0, 4.0) — z, w giữ nguyên
 v~z  = flux(99.0)                 # v = flux(10.0, 20.0, 99.0, 4.0) — chỉ ghi z
@@ -3412,7 +3453,7 @@ deck screen: Pixel[1920 * 1080]
 
 func render:
     var p = Pixel(r: 31, g: 0, b: 0)
-    var v: flux<f32, 4> = get_pos()
+    var v: flux of (f32, 4) = get_pos()
 
     # Swizzle + pipeline
     v~xyz |> project |> draw
@@ -3528,18 +3569,33 @@ Không phải hai nghĩa `isolate` tách rời — cùng Isolation, hai producti
 
 Vir tích hợp các nguyên bản AI/ML cấp ngôn ngữ: tensor aligned, matmul native, autodiff, và quantization — không phụ thuộc thư viện ngoài.
 
-### 26.1 Kiểu Tensor — `tensor<T>[S...]`
+### 26.1 Kiểu Tensor — `tensor[T; S...]`
 
 ```vir
-var weights: tensor<f32>[784, 128]
-var input:   tensor<f32>[1, 784]
-var output:  tensor<f32>[1, 128]
+var weights: tensor[f32; 784, 128]
+var input:   tensor[f32; 1, 784]
+var output:  tensor[f32; 1, 128]
 ```
 
-`tensor<T>[S...]` khai báo mảng N chiều với alignment phù hợp cho NPU/GPU. Bộ nhớ tự động căn chỉnh (aligned allocation), layout row-major. Compiler sinh lệnh load/store SIMD aligned.
+```text
+tensor-type := "tensor" "[" element-type ";" dimension ("," dimension)* "]"
+```
 
-**Kiểu phần tử T hỗ trợ:** `f32`, `f16`, `i8`, `u8` (quantized), `i32` (accumulator)
+`tensor[T; S...]` khai báo mảng N chiều với alignment phù hợp cho NPU/GPU. Cú pháp này mở rộng quy ước kiểu mảng `[T]`: `T` vẫn là kiểu phần tử, còn phần sau dấu `;` là shape tĩnh. `tensor` là kiểu chuyên biệt mang cả kiểu phần tử và shape, không phải một generic thông thường; vì vậy không dùng `of`. Cả `tensor of (T)[S...]` và `tensor(T)[S...]` đều không hợp lệ. Bộ nhớ tự động căn chỉnh (aligned allocation), layout row-major. Compiler sinh lệnh load/store SIMD aligned.
+
+**Kiểu phần tử T hỗ trợ:** `f32`, `f16`, `f64`, `i8`, `u8` (quantized), `i32` (accumulator)
 **Chiều:** Bất kỳ số chiều D ≥ 1; kích thước kiểm tra tại biên dịch
+
+Một kiểu tensor đã phân tích phải mang thông tin kiểu có cấu trúc:
+
+```text
+tensor[i32; 3, 2]
+    element_type = i32
+    rank         = 2
+    shape        = [3, 2]
+```
+
+Kiểm tra kiểu và lowering phải phân nhánh theo `element_type` đã được phân tích (`f32`/`f64` là floating-point, `i32` là integer), không được dò ký tự trong toàn bộ chuỗi tên kiểu.
 
 | Thuộc tính | Mô tả |
 |-----------|--------|
@@ -3562,7 +3618,7 @@ var fused  = a >< b                    # fused multiply-accumulate (FMA)
 **Kiểm tra kiểu matmul:**
 
 ```
-tensor<T>[M, K]  **  tensor<T>[K, N]  →  tensor<T>[M, N]
+tensor[T; M, K]  **  tensor[T; K, N]  →  tensor[T; M, N]
 ```
 
 Kích thước không khớp là **lỗi kiểu tại biên dịch** — không runtime panic.
@@ -3710,7 +3766,7 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 | Từ khoá / Toán tử | Mục đích |
 |-------------------|--------|
 | `mold` | Khai báo bit-field đa dụng — đóng gói dữ liệu, không phải hardware-volatile (§16.6) |
-| `flux<T, N>` | Kiểu vector SIMD — N phần tử kiểu T; ánh xạ sang ARM NEON / x86 SSE-AVX / WASM SIMD (§23.1) |
+| `flux of (T, N)` | Kiểu vector SIMD — N phần tử kiểu T; ánh xạ sang ARM NEON / x86 SSE-AVX / WASM SIMD (§23.1) |
 | `deck` | Buffer chia sẻ — vùng nhớ có kiểu, cố định cho CPU-GPU hoặc pipeline nhiều giai đoạn (§23.3) |
 | `~` | Hậu tố swizzle — xáo trộn/nhân bản kênh `flux`: `v~xyz`, `v~rgba`; hỗ trợ write-masking: `v~xy = flux(a, b)` (§24.2) |
 | `lock` | Tiền tố nguyên tử — đọc-sửa-ghi sequentially consistent (§23.4) |
@@ -3808,7 +3864,7 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 
 | Từ khoá / Toán tử | Mục đích |
 |---------|----------|
-| `tensor<T>[S...]` | Mảng N chiều NPU/GPU-aligned — layout row-major, aligned 64-byte (§26.1) |
+| `tensor[T; S...]` | Mảng N chiều NPU/GPU-aligned — layout row-major, aligned 64-byte (§26.1) |
 | `**` | Matmul — ánh xạ sang SIMD/Tensor-core (NEON FMMLA, AVX-512, WASM simd128) (§26.2) |
 | `><` | Fused multiply-accumulate (FMA) — nhân + cộng tích lũy một lệnh, không round-off trung gian (§26.2) |
 | `infer` | Block inference không gradient — tắt autodiff, thấp RAM (§26.3) |
@@ -3883,7 +3939,7 @@ Từ cao đến thấp:
 | `port` | — | Cổng tín hiệu cấp module có kiểu — MPSC, hàng đợi, an toàn qua async task (§23) |
 | `send` / `recv` | — | Gửi/nhận thông điệp port — `send` không chặn, `recv` là điểm tạm dừng (§23.2–23.3) |
 | `mold` | `register` (dùng đóng gói) | `mold Tên: u16 r:5, g:6, b:5 end.` — bit-field đa dụng (§16.6) |
-| `flux` | — | `flux<T, N>` — kiểu vector SIMD, ánh xạ sang NEON/SSE-AVX/WASM SIMD (§24.1) |
+| `flux` | — | `flux of (T, N)` — kiểu vector SIMD, ánh xạ sang NEON/SSE-AVX/WASM SIMD (§24.1) |
 | Swizzle `~` | — | `v~xyz` — hậu tố xáo trộn/nhân bản kênh `flux`; write-masking: `v~xy = flux(a, b)` (§24.2) |
 | `deck` | — | `deck tên: Kiểu[kích_thước]` — buffer chia sẻ CPU-GPU (§24.3) |
 | `lock` / `!!` | — | Đọc-sửa-ghi nguyên tử: `lock x += 1` hoặc `x!! += 1` (§24.4) |
@@ -3895,7 +3951,7 @@ Từ cao đến thấp:
 | `bundle` | — | Nhúng tài nguyên vào binary lúc biên dịch — slice hằng, zero-overhead, không I/O (§25.3) |
 | `expose` | — | Chú thích hàm thành API endpoint — compiler sinh REST/IPC/WASM glue code (§25.4) |
 | `isolate` (block) | `try(isolate:)` (snapshot/retry) | Cùng Isolation: block = sandbox policy; try = snapshot/retry policy (§13.7, §25.5) |
-| `tensor<T>[S...]` | — | Mảng N chiều NPU/GPU-aligned — row-major, aligned 64-byte, kiểm tra kích thước tại biên dịch (§26.1) |
+| `tensor[T; S...]` | — | Mảng N chiều NPU/GPU-aligned — row-major, aligned 64-byte, kiểm tra kích thước tại biên dịch (§26.1) |
 | `**` | — | Matmul — `[M,K]**[K,N]→[M,N]`; ánh xạ NEON FMMLA / AVX-512 / WASM simd128 (§26.2) |
 | `><` | — | Fused multiply-accumulate (FMA) — nhân + cộng tích lũy một lệnh, tránh round-off (§26.2) |
 | `infer` | — | Block inference không gradient — tắt autodiff, ~50% RAM ít hơn train (§26.3) |
@@ -3911,8 +3967,8 @@ Từ cao đến thấp:
 | Quy tắc biên lexer nội suy | — | `$ident` dừng tại `[`, toán tử; dùng `$(expr)` cho biểu thức phức tạp (§12.6) |
 | arr_compact | — | `arr_compact(arr)` — thu hồi dead space resize mảng (§19.4) |
 | Kiểu mũi tên trả về | `func f(): int` | `func f() -> int:` |
-| dict (thay map) | `map[K,V]` | Kiểu `dict[K,V]` + literal `[key: value, ...]` — cùng cú pháp `[]`, có `:` là dict |
-| `Hashable` / dict key | `method hash -> int`; entity so field-by-field | `interface Hashable`: `hash -> u64` + `equals` (hoặc `operator ==`); `dict[K,V]` yêu cầu `K: Hashable` (§20.1.4) |
+| dict (thay map) | `map[K,V]` | Kiểu `dict of (K, V)` + literal `[key: value, ...]` — cùng cú pháp `[]`, có `:` là dict |
+| `Hashable` / dict key | `method hash -> int`; entity so field-by-field | `interface Hashable`: `hash -> u64` + `equals` (hoặc `operator ==`); `dict of (K, V)` yêu cầu `K: Hashable` (§20.1.4) |
 | Map biểu thức | — | `map x in list: out expr end` — biến đổi |
 | Kiểu có kích thước | `int`, `float`, `string`, `bool` | + `i8`–`i64`, `u8`–`u64`, `ptr` |
 | Include đường dẫn | `include math;` | + `include net.http;` (ánh xạ thư mục) |

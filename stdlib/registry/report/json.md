@@ -10,9 +10,9 @@ Registry: [`../json.md`](../json.md)
 | `json.pretty` | done | |
 | constructors (`null`…`object`) | done | |
 | `json.get` / `set` / `has` / `push` / `len` | done | |
-| `json.at` | done | → `Option(JsonValue)` |
+| `json.at` | done | → `Option of (JsonValue)` |
 | `json.asInt` / `asString` / `asBool` / `isNull` | done | snake aliases kept |
-| `json.asArray` / `asObject` | done | `Option(JsonValue)` when tag matches |
+| `json.asArray` / `asObject` | done | `Option of (JsonValue)` when tag matches |
 | `json.numberFloat` / `asFloat` | planned | float gate |
 | error → `Error` / ownership | blocked | design gates |
 | dual `json.vri` / `data/json.vri` | partial | content synced; resolver dedup later |

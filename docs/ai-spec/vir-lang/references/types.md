@@ -35,7 +35,7 @@ end.
 | `register` / `mold` | Bit layouts | Copy |
 | `array` / list `[…]` | Dynamic | Move |
 | `dict` `["k": v]` | Key-value | Move |
-| `flux<T,N>` | Fixed SIMD vector | Copy |
+| `flux of (T, N)` | Fixed SIMD vector | Copy |
 | `deck` | Shared CPU-GPU buffer handle | Move |
 
 ```vir
@@ -52,7 +52,7 @@ enum Color:
 end.
 
 # Tagged union / Payload enum (generic or non-generic)
-enum Option<T>:
+enum Option of (T):
     Some(value: T)
     None
 end.
@@ -115,6 +115,50 @@ end
   - `E3041`: Duplicate binder variable name in pattern.
   - `E3042`: Generic type argument mismatch.
   - `E3043`: Direct equality comparison `==` on payload enum (must use `case` pattern matching).
+
+## Generic syntax
+
+The sole canonical generic syntax is `of (...)` for both declarations and applications:
+
+```vir
+entity Vec of (T):
+    data: ptr
+    len: int
+end.
+
+enum Result of (T, E):
+    Ok(value: T)
+    Err(error: E)
+end.
+
+func identity of (T)(value: T) -> T:
+    out value
+end.
+
+var names: Vec of (string)
+var table: dict of (string, Vec of (int))
+var value = identity of (int)(42)
+var lanes: flux of (f32, 4)
+var weights: tensor[f32; 784, 128]
+```
+
+- `of` is contextual after a generic-capable declaration, type, or callee.
+- The next `(...)` after a generic specialization is the normal runtime call/constructor list.
+- `of (...)` is for ordinary generics. Tensor has the dedicated syntax `tensor[T; S...]`; never write `tensor of (T)[S...]` or `tensor(T)[S...]`.
+- `[...]` remains for literals, indexing, and tensor dimensions.
+- `Name<T>` is legacy compatibility syntax only; never generate it in new Vir code.
+
+## Tensor type syntax
+
+Tensor is a specialized shape-carrying type rather than an ordinary generic:
+
+```vir
+var a: tensor[i32; 3, 2]
+var b: tensor[i32; 2, 3]
+var c = a ** b
+```
+
+`tensor[T; S...]` extends the `[T]` array-type convention; `;` separates `T` from its static shape. The parsed type information is `{ element_type, rank, shape }`. Type checking and lowering must use `element_type` directly: `f32` and `f64` select floating-point operations, while `i32` selects integer operations. Never infer the element category by scanning the complete type-name string.
 
 ## Ownership (summary)
 
@@ -184,5 +228,5 @@ end
 ## Agent rules
 
 1. Prefer `int` / `string` / `bool` for simple examples unless FFI needs fixed width.
-2. Do not invent generic syntax beyond documented forms (`array`, `Option`, `Result`, `flux<T,N>`, …).
+2. Always spell generic declarations and applications as `Name of (...)`; never generate Rust/C++-style `Name<T>`.
 3. If unsure whether a type exists in the current toolchain, say so and point to `stdlib/vir/`.

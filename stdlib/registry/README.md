@@ -17,16 +17,16 @@ registry/ (flat)
 
 ## Generic notation
 
-Vir generics use parentheses `()`, never Rust/C++/TS `<>`:
+Vir generics use **`of (...)`**, never Rust/C++/TS `<>` (and not bare `Name(T)`):
 
 ```text
-Result(T) · Result(T, E) · Option(T)
-Vec(T) · Map(K, V) · Set(T) · Deque(T)
+Result of (T) · Result of (T, E) · Option of (T)
+Vec of (T) · Map of (K, V) · Set of (T) · Deque of (T)
 ```
 
-Write `Result(T)` when the error type is the default [`Error`](error.md); use
-`Result(T, E)` only when `E` is explicit. Void-success APIs use bare `Result`
-(`Ok()` / `Err`) — decision **A** locked; not `Result(void)` until unit is a
+Write `Result of (T)` when the error type is the default [`Error`](error.md); use
+`Result of (T, E)` only when `E` is explicit. Void-success APIs use bare `Result`
+(`Ok()` / `Err`) — decision **A** locked; not `Result of (void)` until unit is a
 confirmed Vir generic argument.
 
 **Process (mandatory for redesign clusters)**
@@ -84,7 +84,7 @@ ordered_map · concurrent_map · persistent
 
 | ID | Decision |
 |---|---|
-| Q1 | `unicode.decodeUtf8` → `Result(Utf8Decoded)` · entity `codepoint` + `nbytes` |
+| Q1 | `unicode.decodeUtf8` → `Result of (Utf8Decoded)` · entity `codepoint` + `nbytes` |
 | Q2 | `format.float(value)` + `format.floatFixed(value, prec)` — no overloading |
 | Q3 | JSON int out of `int` domain → `InvalidData` (no silent float) |
 | Q4 | `json.number(int)` keep; `json.numberFloat(float)` planned — no overload |
@@ -137,9 +137,9 @@ migration `previous`. New SPEC APIs without source yet = **`planned`**
 | `process` | `process` | lifecycle + subprocess; exit/abort |
 | `buffer` (`mem/buffer.vri`) | `buffer` | owned binary storage |
 | `slice` (`mem/slice.vri`) | `slice` | borrowed binary view |
-| `collections.vec` | `vec` | owned growable `Vec(T)` |
-| `option` (`core/option.vri`) | `option` | `Option(T)` helpers (`Some`/`None` language-level) |
-| `result` (`core/result.vri`) | `result` | `Result(T, E)` helpers (`Ok`/`Err` language-level) |
+| `collections.vec` | `vec` | owned growable `Vec of (T)` |
+| `option` (`core/option.vri`) | `option` | `Option of (T)` helpers (`Some`/`None` language-level) |
+| `result` (`core/result.vri`) | `result` | `Result of (T, E)` helpers (`Ok`/`Err` language-level) |
 | `error` (`error/error.vri`) | `error` | `ErrorKind` + `Error` + `IoError`; errno SSOT |
 | `string` (`str/string.vri`) | `string` | immutable UTF-8 text; `str_*` impl-only |
 | `builder` (`str/builder.vri`) | `builder` | mutable UTF-8 construction; always-valid |

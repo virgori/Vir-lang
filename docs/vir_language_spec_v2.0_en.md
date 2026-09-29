@@ -565,8 +565,49 @@ end.
 | `array` | Dynamic growable array | **Move** |
 | `dict` | Key-value dictionary | **Move** |
 | `map` | Transformation expression | expression |
-| `flux<T,N>` | Fixed-width SIMD vector — N elements of type T | **Copy** |
+| `flux of (T, N)` | Fixed-width SIMD vector — N elements of type T | **Copy** |
 | `deck` | Shared CPU-GPU buffer (typed, fixed-size) | **Move** (handle) |
+
+#### 4.2.1 Generic syntax — `of (...)`
+
+Vir uses **`of (...)`** as its sole canonical syntax for generic parameters. `of` is contextual: it opens a generic argument list only after a generic-capable declaration name, type name, or callee.
+
+```text
+generic-declaration := name "of" "(" generic-parameter ("," generic-parameter)* ")"
+generic-application := name "of" "(" generic-argument  ("," generic-argument)*  ")"
+```
+
+```vir
+entity Vec of (T):
+    data: ptr
+    len: int
+    cap: int
+end.
+
+enum Result of (T, E):
+    Ok(value: T)
+    Err(error: E)
+end.
+
+func identity of (T)(value: T) -> T:
+    out value
+end.
+
+var names: Vec of (string)
+var index: dict of (string, Vec of (int))
+var answer = identity of (int)(42)
+var lanes: flux of (f32, 4)
+var weights: tensor[f32; 784, 128]
+```
+
+Rules:
+
+- The `(...)` immediately after `of` contains **generic parameters/arguments**; a following `(...)` remains the runtime call or constructor argument list.
+- `of (...)` applies only to ordinary generics. `tensor` is a shape-carrying specialized type with its own `tensor[T; S...]` production; `tensor of (T)[S...]` is not canonical syntax.
+- `[T]` remains the dynamic-array type. In `tensor[T; S...]`, `;` separates element type `T` from the static shape `S...`.
+- Nested generics repeat `of (...)`, for example `dict of (string, Vec of (User))`.
+- Rust/C++-style `Name<T>` is **no longer canonical syntax**. The compiler may temporarily accept it in compatibility mode with a deprecation warning, but new code and documentation must use `Name of (T)`.
+- This syntax change does not alter type identity, ownership, ABI, or type inference.
 
 ### 4.3 Literals
 
@@ -1326,12 +1367,12 @@ Enum values are integer constants starting from 0.
 An enum with at least one payload-bearing variant is a tagged union. Variants may carry one or more typed fields and may use generic type parameters.
 
 ```vir
-enum Option<T>:
+enum Option of (T):
     Some(value: T)
     None
 end.
 
-enum Result<T, E>:
+enum Result of (T, E):
     Ok(value: T)
     Err(error: E)
 end.
@@ -2659,11 +2700,11 @@ var ages = ["Alice": 30, "Bob": 25]
 Explicit type annotation:
 
 ```vir
-var ages: dict[string, int] = ["Alice": 30, "Bob": 25]
+var ages: dict of (string, int) = ["Alice": 30, "Bob": 25]
 ```
 
 - `[key: value, ...]` — dict literal; the compiler infers types from the first element
-- `dict[K, V]` type annotation is optional
+- `dict of (K, V)` type annotation is optional
 - Key type `K` must satisfy **`Hashable`** (see §20.1.4): built-ins are provided; entities define their own
 - Key identity uses **equality** (`equals` / `operator ==`), not hash alone
 
@@ -2672,7 +2713,7 @@ Canonical: `docs/vir_language_spec_v2.0_vi.md` §20.1.
 #### 20.1.2 Operations
 
 ```vir
-var m: dict[string, int] = []      # empty dict (type annotation required for empty dict)
+var m: dict of (string, int) = []  # empty dict (type annotation required for empty dict)
 
 m["Alice"] = 30                    # set
 print m["Alice"]                   # get → 30
@@ -2702,7 +2743,7 @@ Iteration order is **not guaranteed** (hash table does not preserve insertion or
 
 #### 20.1.4 Hashable — Hash & Equality
 
-`dict[K, V]` accepts only `K: Hashable`. Hash selects the bucket; **key identity** requires equality to return true (same hash does not imply same key).
+`dict of (K, V)` accepts only `K: Hashable`. Hash selects the bucket; **key identity** requires equality to return true (same hash does not imply same key).
 
 ##### Contract
 
@@ -2718,7 +2759,7 @@ end.
 | `hash` return type | Always **`u64`** — never `int` (no negative hashes; independent of `int` width; fits FNV / SipHash / xxHash) |
 | `equals` | Required for entity keys (`Self` = same type) |
 | `operator ==` | If the type defines `operator ==(a: T, b: T) -> bool`, `dict` may use `==` instead of `equals` (same semantics) |
-| Compile-time constraint | `dict[K, V]` is a type error unless `K` is `Hashable` |
+| Compile-time constraint | `dict of (K, V)` is a type error unless `K` is `Hashable` |
 
 Built-in types are treated as already implementing `Hashable` (no explicit `interface` declaration required).
 
@@ -2749,7 +2790,7 @@ entity Point:
     end.
 end.
 
-var grid: dict[Point, string] = [Point(x: 0, y: 0): "origin"]
+var grid: dict of (Point, string) = [Point(x: 0, y: 0): "origin"]
 ```
 
 Equality via operator (if using `==` instead of `equals`):
@@ -3263,11 +3304,11 @@ Vir provides first-class keywords for SIMD vectors, GPU shared buffers, swizzle 
 
 ### 24.1 SIMD Vector — `flux`
 
-`flux<T, N>` declares a fixed-width SIMD vector of `N` elements of type `T`. The compiler maps operations to native SIMD instructions (ARM NEON, x86 SSE/AVX, WASM SIMD).
+`flux of (T, N)` declares a fixed-width SIMD vector of `N` elements of type `T`. The compiler maps operations to native SIMD instructions (ARM NEON, x86 SSE/AVX, WASM SIMD).
 
 ```vir
-var pos: flux<f32, 4> = flux(1.0, 2.0, 3.0, 1.0)
-var vel: flux<f32, 4> = flux(0.1, 0.0, -0.5, 0.0)
+var pos: flux of (f32, 4) = flux(1.0, 2.0, 3.0, 1.0)
+var vel: flux of (f32, 4) = flux(0.1, 0.0, -0.5, 0.0)
 
 var next_pos = pos + vel          # element-wise add — single SIMD instruction
 ```
@@ -3291,18 +3332,18 @@ var next_pos = pos + vel          # element-wise add — single SIMD instruction
 The swizzle operator `~` reorders or replicates vector channels by name. Channel names follow the `xyzw` convention (positions) or `rgba` (colors).
 
 ```vir
-var v: flux<f32, 4> = flux(1.0, 2.0, 3.0, 4.0)
+var v: flux of (f32, 4) = flux(1.0, 2.0, 3.0, 4.0)
 
-var xyz  = v~xyz              # flux<f32, 3> — drop w
-var zyx  = v~zyx              # flux<f32, 3> — reverse xyz
-var xxxx = v~xxxx             # flux<f32, 4> — broadcast x
-var rg   = v~rg               # flux<f32, 2> — synonymous with xy
+var xyz  = v~xyz              # flux of (f32, 3) — drop w
+var zyx  = v~zyx              # flux of (f32, 3) — reverse xyz
+var xxxx = v~xxxx             # flux of (f32, 4) — broadcast x
+var rg   = v~rg               # flux of (f32, 2) — synonymous with xy
 ```
 
 **Rules:**
 - Channel letters: `x`=0, `y`=1, `z`=2, `w`=3 (equivalently `r`, `g`, `b`, `a`)
-- Result width equals the number of letters: `v~xy` → `flux<T, 2>`
-- Channels may repeat: `v~xxyy` → `flux<T, 4>`
+- Result width equals the number of letters: `v~xy` → `flux of (T, 2)`
+- Channels may repeat: `v~xxyy` → `flux of (T, 4)`
 - Swizzle is compile-time — no runtime cost (maps to shuffle instruction or is folded)
 
 **Pipeline integration:**
@@ -3384,7 +3425,7 @@ deck screen: Pixel[1920 * 1080]
 
 func render:
     var p = Pixel(r: 31, g: 0, b: 0)
-    var v: flux<f32, 4> = get_pos()
+    var v: flux of (f32, 4) = get_pos()
 
     # Swizzle + pipeline
     v~xyz |> project |> draw
@@ -3504,18 +3545,33 @@ Vir integrates language-level AI/ML primitives: aligned tensors, native matmul, 
 
 Canonical: `docs/vir_language_spec_v2.0_vi.md` §26.
 
-### 26.1 Tensor type — `tensor<T>[S...]`
+### 26.1 Tensor type — `tensor[T; S...]`
 
 ```vir
-var weights: tensor<f32>[784, 128]
-var input:   tensor<f32>[1, 784]
-var output:  tensor<f32>[1, 128]
+var weights: tensor[f32; 784, 128]
+var input:   tensor[f32; 1, 784]
+var output:  tensor[f32; 1, 128]
 ```
 
-`tensor<T>[S...]` declares an N-dimensional array with NPU/GPU-friendly alignment. Memory is aligned automatically; layout is row-major. The compiler emits aligned SIMD loads/stores.
+```text
+tensor-type := "tensor" "[" element-type ";" dimension ("," dimension)* "]"
+```
 
-**Element types T:** `f32`, `f16`, `i8`, `u8` (quantized), `i32` (accumulator)  
+`tensor[T; S...]` declares an N-dimensional array with NPU/GPU-friendly alignment. This extends the `[T]` array-type convention: `T` remains the element type, while the portion after `;` is the static shape. A tensor is a specialized type carrying both an element type and a shape, not an ordinary generic, so it does not use `of`. Both `tensor of (T)[S...]` and `tensor(T)[S...]` are invalid. Memory is aligned automatically; layout is row-major. The compiler emits aligned SIMD loads/stores.
+
+**Element types T:** `f32`, `f16`, `f64`, `i8`, `u8` (quantized), `i32` (accumulator)  
 **Rank:** any D ≥ 1; sizes checked at compile time
+
+A parsed tensor type carries structured type information:
+
+```text
+tensor[i32; 3, 2]
+    element_type = i32
+    rank         = 2
+    shape        = [3, 2]
+```
+
+Type checking and lowering must dispatch on the parsed `element_type` (`f32`/`f64` are floating-point; `i32` is integer), never by scanning characters in the complete type-name string.
 
 | Property | Description |
 |----------|-------------|
@@ -3538,7 +3594,7 @@ var fused  = a >< b                    # fused multiply-accumulate (FMA)
 **Matmul type check:**
 
 ```
-tensor<T>[M, K]  **  tensor<T>[K, N]  →  tensor<T>[M, N]
+tensor[T; M, K]  **  tensor[T; K, N]  →  tensor[T; M, N]
 ```
 
 Shape mismatch is a **compile-time type error** — no runtime panic.
@@ -3687,7 +3743,7 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 | Keyword / Operator | Purpose |
 |-------------------|---------|
 | `mold` | Declare general-purpose bit-field — compact data packing, not hardware-volatile (§16.6) |
-| `flux<T, N>` | SIMD vector type — N elements of type T; maps to ARM NEON / x86 SSE-AVX / WASM SIMD (§24.1) |
+| `flux of (T, N)` | SIMD vector type — N elements of type T; maps to ARM NEON / x86 SSE-AVX / WASM SIMD (§24.1) |
 | `deck` | Shared buffer — typed, fixed-size region for CPU-GPU or multi-stage pipelines (§24.3) |
 | `~` | Swizzle postfix — reorder or replicate `flux` channels: `v~xyz`, `v~rgba` (§24.2) |
 | `lock` | Atomic read-modify-write prefix — sequentially consistent (§24.4) |
@@ -3781,7 +3837,7 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 
 | Keyword / operator | Purpose |
 |---------|---------|
-| `tensor<T>[S...]` | N-D NPU/GPU-aligned array — row-major, 64-byte aligned (§26.1) |
+| `tensor[T; S...]` | N-D NPU/GPU-aligned array — row-major, 64-byte aligned (§26.1) |
 | `**` | Matmul — maps to SIMD/tensor-core (§26.2) |
 | `><` | Fused multiply-accumulate (FMA) (§26.2) |
 | `infer` | Gradient-free inference block — autodiff off, lower RAM (§26.3) |
@@ -3850,8 +3906,8 @@ From highest to lowest:
 | resume | — | `resume retry` / `resume revert` — flow control inside local revert |
 | erx | — | Error register — reads thrown error code |
 | Return type arrow | `func f(): int` | `func f() -> int:` |
-| dict (was map) | `map[K,V]` | Type `dict[K,V]` + literal `[key: value, ...]` — same `[]` syntax; presence of `:` means dict |
-| `Hashable` / dict key | `method hash -> int`; field-by-field entity eq | `interface Hashable`: `hash -> u64` + `equals` (or `operator ==`); `dict[K,V]` requires `K: Hashable` (§20.1.4) |
+| dict (was map) | `map[K,V]` | Type `dict of (K, V)` + literal `[key: value, ...]` — same `[]` syntax; presence of `:` means dict |
+| `Hashable` / dict key | `method hash -> int`; field-by-field entity eq | `interface Hashable`: `hash -> u64` + `equals` (or `operator ==`); `dict of (K, V)` requires `K: Hashable` (§20.1.4) |
 | Map expression | — | `map x in list: out expr end` — transformation |
 | Sized types | `int`, `float`, `string`, `bool` | + `i8`–`i64`, `u8`–`u64`, `ptr` |
 | Include paths | `include math;` | + `include net.http;` (dot-path directory mapping) |
@@ -3874,7 +3930,7 @@ From highest to lowest:
 | `select` | — | Event multiplexing — `select: on t1 as r: ... end` races multiple tasks (§22.8) |
 | `quiet` | — | Detached fire-and-forget task — no handle, errors logged not propagated (§22.9) |
 | `mold` | `register` (data packing use) | `mold Name: u16 r:5, g:6, b:5 end.` — general-purpose bit-field (§16.6) |
-| `flux` | — | `flux<T, N>` — SIMD vector type, mapped to NEON/SSE-AVX/WASM SIMD (§24.1) |
+| `flux` | — | `flux of (T, N)` — SIMD vector type, mapped to NEON/SSE-AVX/WASM SIMD (§24.1) |
 | Swizzle `~` | — | `v~xyz` — postfix channel reorder/replicate for `flux` (§24.2) |
 | `deck` | — | `deck name: Type[size]` — shared CPU-GPU buffer (§24.3) |
 | `lock` / `!!` | — | Atomic read-modify-write: `lock x += 1` or `x!! += 1` (§24.4) |
@@ -3886,7 +3942,7 @@ From highest to lowest:
 | `bundle` | — | Embed resources into the binary at compile time — constant slice, no I/O (§25.3) |
 | `expose` | — | Annotate a function as an API endpoint — compiler emits REST/IPC/WASM glue (§25.4) |
 | `isolate` (block) | `try(isolate:)` (snapshot/retry) | Same Isolation: block = sandbox policy; try = snapshot/retry (§13.7, §25.5) |
-| `tensor<T>[S...]` | — | N-D NPU/GPU-aligned array — row-major, 64-byte aligned, sizes checked at compile time (§26.1) |
+| `tensor[T; S...]` | — | N-D NPU/GPU-aligned array — row-major, 64-byte aligned, sizes checked at compile time (§26.1) |
 | `**` | — | Matmul — `[M,K]**[K,N]→[M,N]`; NEON FMMLA / AVX-512 / WASM simd128 (§26.2) |
 | `><` | — | Fused multiply-accumulate (FMA) — multiply+accumulate in one instruction (§26.2) |
 | `infer` | — | Gradient-free inference block — autodiff off, ~50% less RAM than train (§26.3) |

@@ -8,7 +8,7 @@ source:
 status: closed
 notes: >-
   Namespace-only string.*. No public str_* aliases. No string.eq (use ==).
-  find = codepoint index; byteFind = byte. fromBytes strict UTF-8 → Result(string).
+  find = codepoint index; byteFind = byte. fromBytes strict UTF-8 → Result of (string).
   lower/upper/trim Unicode-aware (ASCII-only impl = debt). Parse/format → parse.md / format.md.
   Builder / unicode pack = separate registries. No .vri until map applied.
 ---
@@ -30,7 +30,7 @@ No public type named `bytes`. Binary I/O stays on [`buffer`](buffer.md) /
 ```vir
 let n = string.len(s)          # codepoints
 let b = string.bytes(s)        # UTF-8 bytes
-let i = string.find(s, "→")    # Option(codepoint index)
+let i = string.find(s, "→")    # Option of (int)  # codepoint index
 let t = string.slice(s, 0, i)  # codepoint range → new string
 ```
 
@@ -43,7 +43,7 @@ aliases.
 |---|---|
 | Immutable UTF-8 text ops | Public `str_*` aliases |
 | Two-lane indexing: codepoint vs byte | Grapheme count / clusters → [`grapheme`](grapheme.md) *(later)* |
-| Strict `fromBytes` → `Result(string)` | Minting invalid UTF-8 |
+| Strict `fromBytes` → `Result of (string)` | Minting invalid UTF-8 |
 | Search / slice / case / trim / split-join | `string.eq` — use language `==` |
 | Explicit `free` (current ownership) | Parse/format → [`parse`](parse.md) / [`format`](format.md) |
 | | Mutable build → [`builder`](builder.md) |
@@ -61,7 +61,7 @@ Buffer ──slice──────────→ Slice ──→ string
 Canonical binary→text entry:
 
 ```vir
-string.fromBytes(slice) -> Result(string)
+string.fromBytes(slice) -> Result of (string)
 ```
 
 No public `string.fromBuffer`.
@@ -116,8 +116,8 @@ Valid `string` values always remain well-formed UTF-8.
 ## Search (closed)
 
 ```text
-string.find(s, needle)      → Option(codepoint index)
-string.byteFind(s, needle)  → Option(byte index)
+string.find(s, needle)      → Option of (int)  # codepoint index
+string.byteFind(s, needle)  → Option of (int)  # byte index
 ```
 
 Current `str_find` returning a **byte** index is **implementation debt**.
@@ -236,7 +236,7 @@ string
 |---|---|---|
 | `str_empty` | `string.empty` | **rename** |
 | `str_new` | — / language literal | **internal** or language path; not required on thin surface |
-| `str_from_bytes` | `string.fromBytes` | **rename** + **strict UTF-8** → `Result(string)` |
+| `str_from_bytes` | `string.fromBytes` | **rename** + **strict UTF-8** → `Result of (string)` |
 | `str_len` | `string.len` | **rename** |
 | `str_byte_len` | `string.bytes` | **rename** |
 | `str_is_empty` | `string.isEmpty` | **rename** |
@@ -278,7 +278,7 @@ string
 | ID | Symbol | Signature | Status |
 |---|---|---|---|
 | `string.empty` | `string.empty` | `string.empty() -> string` | proposed |
-| `string.fromBytes` | `string.fromBytes` | `string.fromBytes(s: Slice) -> Result(string)` | proposed |
+| `string.fromBytes` | `string.fromBytes` | `string.fromBytes(s: Slice) -> Result of (string)` | proposed |
 | `string.len` | `string.len` | `string.len(s: string) -> int` | proposed |
 | `string.bytes` | `string.bytes` | `string.bytes(s: string) -> int` | proposed |
 | `string.isEmpty` | `string.isEmpty` | `string.isEmpty(s: string) -> bool` | proposed |
@@ -289,8 +289,8 @@ string
 | `string.cmp` | `string.cmp` | `string.cmp(a: string, b: string) -> int` | proposed |
 | `string.concat` | `string.concat` | `string.concat(a: string, b: string) -> string` | proposed |
 | `string.contains` | `string.contains` | `string.contains(s, needle: string) -> bool` | proposed |
-| `string.find` | `string.find` | `string.find(s, needle: string) -> Option(int)` | proposed |
-| `string.byteFind` | `string.byteFind` | `string.byteFind(s, needle: string) -> Option(int)` | proposed |
+| `string.find` | `string.find` | `string.find(s, needle: string) -> Option of (int)` | proposed |
+| `string.byteFind` | `string.byteFind` | `string.byteFind(s, needle: string) -> Option of (int)` | proposed |
 | `string.startsWith` | `string.startsWith` | `string.startsWith(s, prefix: string) -> bool` | proposed |
 | `string.endsWith` | `string.endsWith` | `string.endsWith(s, suffix: string) -> bool` | proposed |
 | `string.trim` | `string.trim` | `string.trim(s: string) -> string` | proposed |
@@ -347,7 +347,7 @@ previous: str_from_bytes
 -->
 
 ```vir
-string.fromBytes(s: Slice) -> Result(string)
+string.fromBytes(s: Slice) -> Result of (string)
 ```
 
 Validate `s` as UTF-8, copy into a new `string`.
@@ -666,7 +666,7 @@ previous: str_find
 -->
 
 ```vir
-string.find(s: string, needle: string) -> Option(int)
+string.find(s: string, needle: string) -> Option of (int)
 ```
 
 First occurrence of `needle` as **codepoint** index, or `None`.
@@ -700,7 +700,7 @@ previous: str_find
 -->
 
 ```vir
-string.byteFind(s: string, needle: string) -> Option(int)
+string.byteFind(s: string, needle: string) -> Option of (int)
 ```
 
 First occurrence as **byte** index, or `None`.

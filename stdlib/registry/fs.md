@@ -93,7 +93,7 @@ Keep broader locked surface (`append`, `writeAtomic`, `copy`, `size`, `seek`, `a
 Convert ordinary strings with the verified [`path.new`](path.md) API — do **not**
 invent extra constructors in this doc.
 
-`fs.read` → `Result(Buffer)`. Void-success ops → bare `Result` (decision A).
+`fs.read` → `Result of (Buffer)`. Void-success ops → bare `Result` (decision A).
 Text APIs do **not** replace the binary-first surface.
 
 ## Boundary
@@ -237,8 +237,8 @@ Physical runtime names stay **internal**.
 | `exists` / `path_exists` | `fs.exists` | `fs.exists(p: Path) -> bool` | `vir/fs.vri` + `vir/path/path.vri` | keep ns; **change** arg `string`→`Path`; absorb `path_exists` |
 | `path_is_file` | `fs.isFile` | `fs.isFile(p: Path) -> bool` | `vir/path/path.vri` | **move** + rename |
 | `path_is_dir` | `fs.isDir` | `fs.isDir(p: Path) -> bool` | `vir/path/path.vri` | **move** + rename |
-| `read` | `fs.read` | `fs.read(path: Path) -> Result(Buffer)` | `vir/fs.vri` | rename + **change** payload (`string`→`Buffer`) |
-| — | `fs.readText` | `fs.readText(path: Path) -> Result(string)` | decode over `fs.read` | **missing** / planned |
+| `read` | `fs.read` | `fs.read(path: Path) -> Result of (Buffer)` | `vir/fs.vri` | rename + **change** payload (`string`→`Buffer`) |
+| — | `fs.readText` | `fs.readText(path: Path) -> Result of (string)` | decode over `fs.read` | **missing** / planned |
 | `write` | `fs.write` | `fs.write(path: Path, data: Slice) -> Result` | `vir/fs.vri` | rename + **change** arg (`string`→`Slice`) |
 | — | `fs.writeText` | `fs.writeText(path: Path, text: string) -> Result` | — | **missing** / planned |
 | `append` | `fs.append` | `fs.append(path: Path, data: Slice) -> Result` | `vir/fs.vri` | rename + **change** arg (`string`→`Slice`) |
@@ -248,7 +248,7 @@ Physical runtime names stay **internal**.
 | `remove` | `fs.remove` | `fs.remove(path: Path) -> Result` | `vir/fs.vri` | keep |
 | `rename` | `fs.rename` | `fs.rename(old_path: Path, new_path: Path) -> Result` | `vir/fs.vri` | keep |
 | `copy` | `fs.copy` | `fs.copy(src: Path, dst: Path) -> Result` | `vir/fs.vri` | keep |
-| `size` | `fs.size` | `fs.size(path: Path) -> Result(int)` | `vir/fs.vri` | keep |
+| `size` | `fs.size` | `fs.size(path: Path) -> Result of (int)` | `vir/fs.vri` | keep |
 | `FsNamespace` / `fs` | `fs` namespace object | — | `vir/fs.vri` | keep / align methods |
 | `fs_*_impl` | — | — | `vir/fs.vri` | **internal** |
 | duplicate `fs.fs` | — | — | `vir/fs/fs.vri` | **merge** *(before public rename)* |
@@ -257,19 +257,19 @@ Physical runtime names stay **internal**.
 
 | Current symbol | Public | Signature (target) | Source | Action |
 |---|---|---|---|---|
-| `file_open` | `fs.open` | `fs.open(path: Path, mode: FileMode) -> Result(File)` | `vir/io/file.vri` | rename |
-| `file_create` | `fs.create` | `fs.create(path: Path) -> Result(File)` | `vir/io/file.vri` | rename |
+| `file_open` | `fs.open` | `fs.open(path: Path, mode: FileMode) -> Result of (File)` | `vir/io/file.vri` | rename |
+| `file_create` | `fs.create` | `fs.create(path: Path) -> Result of (File)` | `vir/io/file.vri` | rename |
 | `file_close` | `File.close` | `(f: File).close() -> void` | `vir/io/file.vri` | rename |
-| `file_read` | `File.read` | `(f: File).read(buf: Slice) -> Result(int)` | `vir/io/file.vri` | rename |
-| — | `File.exact` | `(f: File).exact(buf: Slice) -> Result(int)` | — | **missing** / planned |
-| — | `File.atLeast` | `(f: File).atLeast(buf: Slice, min: int) -> Result(int)` | — | **missing** / planned |
-| `file_read_all` | `File.all` | `(f: File).all() -> Result(Buffer)` | `vir/io/file.vri` | **merge** → `all` |
+| `file_read` | `File.read` | `(f: File).read(buf: Slice) -> Result of (int)` | `vir/io/file.vri` | rename |
+| — | `File.exact` | `(f: File).exact(buf: Slice) -> Result of (int)` | — | **missing** / planned |
+| — | `File.atLeast` | `(f: File).atLeast(buf: Slice, min: int) -> Result of (int)` | — | **missing** / planned |
+| `file_read_all` | `File.all` | `(f: File).all() -> Result of (Buffer)` | `vir/io/file.vri` | **merge** → `all` |
 | `file_read_bytes` | `File.all` | same | `vir/io/file.vri` | **merge** → `all` (not `readBytes`) |
 | `file_write` | `File.write` | `(f: File).write(data: Slice) -> Result` | `vir/io/file.vri` | rename |
 | `file_write_all` | `File.writeAll` | `(f: File).writeAll(data: Slice) -> Result` | `vir/io/file.vri` | rename |
 | `file_write_str` | — | — | `vir/io/file.vri` | **remove** public (text via `fs.*Text`) |
-| `file_seek` | `File.seek` | `(f: File).seek(offset: int, whence: io.SeekFrom) -> Result(int)` | `vir/io/file.vri` | rename; whence from **`io`** |
-| `file_size` | `File.size` | `(f: File).size() -> Result(int)` | `vir/io/file.vri` | rename |
+| `file_seek` | `File.seek` | `(f: File).seek(offset: int, whence: io.SeekFrom) -> Result of (int)` | `vir/io/file.vri` | rename; whence from **`io`** |
+| `file_size` | `File.size` | `(f: File).size() -> Result of (int)` | `vir/io/file.vri` | rename |
 | `File` / `FileMode` | `File` / `FileMode` | (types) | `vir/io/file.vri` | keep |
 | `SeekFrom` (if local) | `io.SeekFrom` | (type) | traits / `io` | **canonical home `io`** — no `fs.SeekFrom` |
 | `read_file` / `write_file` | — | — | `vir/io/file.vri` | **remove** alias |
@@ -308,8 +308,8 @@ documents **canonical** API only.
 | `fs.exists` | `fs.exists` | `fs.exists(p: Path) -> bool` | proposed |
 | `fs.isFile` | `fs.isFile` | `fs.isFile(p: Path) -> bool` | proposed |
 | `fs.isDir` | `fs.isDir` | `fs.isDir(p: Path) -> bool` | proposed |
-| `fs.read` | `fs.read` | `fs.read(path: Path) -> Result(Buffer)` | proposed |
-| `fs.readText` | `fs.readText` | `fs.readText(path: Path) -> Result(string)` | planned |
+| `fs.read` | `fs.read` | `fs.read(path: Path) -> Result of (Buffer)` | proposed |
+| `fs.readText` | `fs.readText` | `fs.readText(path: Path) -> Result of (string)` | planned |
 | `fs.write` | `fs.write` | `fs.write(path: Path, data: Slice) -> Result` | proposed |
 | `fs.writeText` | `fs.writeText` | `fs.writeText(path: Path, text: string) -> Result` | planned |
 | `fs.append` | `fs.append` | `fs.append(path: Path, data: Slice) -> Result` | proposed |
@@ -319,17 +319,17 @@ documents **canonical** API only.
 | `fs.remove` | `fs.remove` | `fs.remove(path: Path) -> Result` | proposed |
 | `fs.rename` | `fs.rename` | `fs.rename(old_path: Path, new_path: Path) -> Result` | proposed |
 | `fs.copy` | `fs.copy` | `fs.copy(src: Path, dst: Path) -> Result` | proposed |
-| `fs.size` | `fs.size` | `fs.size(path: Path) -> Result(int)` | proposed |
-| `fs.open` | `fs.open` | `fs.open(path: Path, mode: FileMode) -> Result(File)` | proposed |
-| `fs.create` | `fs.create` | `fs.create(path: Path) -> Result(File)` | proposed |
-| `fs.File.read` | `File.read` | `(f: File).read(buf: Slice) -> Result(int)` | proposed |
-| `fs.File.exact` | `File.exact` | `(f: File).exact(buf: Slice) -> Result(int)` | planned |
-| `fs.File.atLeast` | `File.atLeast` | `(f: File).atLeast(buf: Slice, min: int) -> Result(int)` | planned |
-| `fs.File.all` | `File.all` | `(f: File).all() -> Result(Buffer)` | proposed |
+| `fs.size` | `fs.size` | `fs.size(path: Path) -> Result of (int)` | proposed |
+| `fs.open` | `fs.open` | `fs.open(path: Path, mode: FileMode) -> Result of (File)` | proposed |
+| `fs.create` | `fs.create` | `fs.create(path: Path) -> Result of (File)` | proposed |
+| `fs.File.read` | `File.read` | `(f: File).read(buf: Slice) -> Result of (int)` | proposed |
+| `fs.File.exact` | `File.exact` | `(f: File).exact(buf: Slice) -> Result of (int)` | planned |
+| `fs.File.atLeast` | `File.atLeast` | `(f: File).atLeast(buf: Slice, min: int) -> Result of (int)` | planned |
+| `fs.File.all` | `File.all` | `(f: File).all() -> Result of (Buffer)` | proposed |
 | `fs.File.write` | `File.write` | `(f: File).write(data: Slice) -> Result` | proposed |
 | `fs.File.writeAll` | `File.writeAll` | `(f: File).writeAll(data: Slice) -> Result` | proposed |
-| `fs.File.seek` | `File.seek` | `(f: File).seek(offset: int, whence: io.SeekFrom) -> Result(int)` | proposed |
-| `fs.File.size` | `File.size` | `(f: File).size() -> Result(int)` | proposed |
+| `fs.File.seek` | `File.seek` | `(f: File).seek(offset: int, whence: io.SeekFrom) -> Result of (int)` | proposed |
+| `fs.File.size` | `File.size` | `(f: File).size() -> Result of (int)` | proposed |
 | `fs.File.close` | `File.close` | `(f: File).close() -> void` | proposed |
 | `fs.File.flush` | `File.flush` | `(f: File).flush() -> Result` · **verify at implement** | planned |
 
@@ -524,7 +524,7 @@ previous: read
 -->
 
 ```vir
-fs.read(path: Path) -> Result(Buffer)
+fs.read(path: Path) -> Result of (Buffer)
 ```
 
 Reads the entire file at `path` into an owned **`Buffer`**. Always binary.
@@ -582,7 +582,7 @@ previous: fs.text
 -->
 
 ```vir
-fs.readText(path: Path) -> Result(string)
+fs.readText(path: Path) -> Result of (string)
 ```
 
 Reads the entire file and returns a UTF-8 **`string`**. Explicit text layer
@@ -1164,7 +1164,7 @@ previous: size
 -->
 
 ```vir
-fs.size(path: Path) -> Result(int)
+fs.size(path: Path) -> Result of (int)
 ```
 
 Returns the size of the file at `path` in **bytes**.
@@ -1214,7 +1214,7 @@ previous: file_open
 -->
 
 ```vir
-fs.open(path: Path, mode: FileMode) -> Result(File)
+fs.open(path: Path, mode: FileMode) -> Result of (File)
 ```
 
 Opens `path` and returns a `File` handle for streaming I/O.
@@ -1269,7 +1269,7 @@ previous: file_create
 -->
 
 ```vir
-fs.create(path: Path) -> Result(File)
+fs.create(path: Path) -> Result of (File)
 ```
 
 Creates or truncates `path` for writing and returns a `File` handle.
@@ -1320,7 +1320,7 @@ previous: file_read
 -->
 
 ```vir
-(f: File).read(buf: Slice) -> Result(int)
+(f: File).read(buf: Slice) -> Result of (int)
 ```
 
 Reads up to `buf` capacity into `buf` from the current file position.
@@ -1381,7 +1381,7 @@ api: File.exact
 -->
 
 ```vir
-(f: File).exact(buf: Slice) -> Result(int)
+(f: File).exact(buf: Slice) -> Result of (int)
 ```
 
 Reads exactly `buf` capacity bytes into `buf`. Matches `Reader.exact`.
@@ -1436,7 +1436,7 @@ previous: File.atleast
 -->
 
 ```vir
-(f: File).atLeast(buf: Slice, min: int) -> Result(int)
+(f: File).atLeast(buf: Slice, min: int) -> Result of (int)
 ```
 
 Reads at least `min` bytes into `buf` (up to capacity). Matches `Reader.atLeast` / io contract spelling.
@@ -1490,7 +1490,7 @@ previous: file_read_all, file_read_bytes
 -->
 
 ```vir
-(f: File).all() -> Result(Buffer)
+(f: File).all() -> Result of (Buffer)
 ```
 
 Reads from the current position to EOF into an owned **`Buffer`**.
@@ -1656,7 +1656,7 @@ previous: file_seek
 -->
 
 ```vir
-(f: File).seek(offset: int, whence: io.SeekFrom) -> Result(int)
+(f: File).seek(offset: int, whence: io.SeekFrom) -> Result of (int)
 ```
 
 Moves the file position. Matches `Seeker.seek`.
@@ -1712,7 +1712,7 @@ previous: file_size
 -->
 
 ```vir
-(f: File).size() -> Result(int)
+(f: File).size() -> Result of (int)
 ```
 
 Returns the size of the open file in **bytes** (does not require closing).

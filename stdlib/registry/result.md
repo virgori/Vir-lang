@@ -1,7 +1,7 @@
 ---
 module: result
 title: Result
-summary: Result(T, E) — Ok(T) or Err(E); namespace result.*; language-level constructors.
+summary: Result of (T, E) — Ok(T) or Err(E); namespace result.*; language-level constructors.
 source:
   - name: result
     path: vir/core/result.vri
@@ -15,11 +15,11 @@ notes: >-
 
 # Result
 
-`Result(T, E)` is either a successful value of type `T` or an error value of
+`Result of (T, E)` is either a successful value of type `T` or an error value of
 type `E`.
 
 ```text
-Result(T, E)
+Result of (T, E)
 ├── Ok(T)
 └── Err(E)
 ```
@@ -77,8 +77,8 @@ stdlib APIs returning `Result`.
 
 ## Generic contract (closed)
 
-**Semantic contract:** `Result(T, E)` with success type `T` and error type `E`.
-When the error type is the stdlib default [`Error`](error.md), write **`Result(T)`**.
+**Semantic contract:** `Result of (T, E)` with success type `T` and error type `E`.
+When the error type is the stdlib default [`Error`](error.md), write **`Result of (T)`**.
 
 Bare source `enum Result:` with erased payloads is an **implementation
 mechanism**. Registry does not invent unsupported generic syntax in examples;
@@ -98,8 +98,8 @@ meaning remains parameterized `Result`.
 | ID | Decision |
 |---|---|
 | R1 | HOF needing callable ABI (`map` / `mapErr` / `flatMap` / `recover` / `orWith`) → **`planned`**. Stay in target design; not `stable` until ABI confirmed. Align with option O2. |
-| R2 | Keep `result.all(results: Vec(Result(T, E))) -> Result(Vec(T), E)` in target surface; impl depends on `vec` + error ownership. |
-| R3 | Keep `Result(T)`, `Result(T, E)`, and bare `Result` for void success. **Do not reopen A.** |
+| R2 | Keep `result.all(results: Vec of (Result of (T, E))) -> Result of (Vec of (T), E)` in target surface; impl depends on `vec` + error ownership. |
+| R3 | Keep `Result of (T)`, `Result of (T, E)`, and bare `Result` for void success. **Do not reopen A.** |
 
 ### `result.all` semantics (locked)
 
@@ -224,13 +224,13 @@ inspect / inspectErr / flatten / transpose
 | `result.expect` | `result.expect` | `result.expect(r: Result, msg: string) -> T` | proposed |
 | `result.unwrapOr` | `result.unwrapOr` | `result.unwrapOr(r: Result, default: T) -> T` | proposed |
 | `result.orWith` | `result.orWith` | `result.orWith(r: Result, f: E -> T) -> T` | planned |
-| `result.map` | `result.map` | `result.map(r: Result(T, E), f: …) -> Result(…)` | planned |
-| `result.mapErr` | `result.mapErr` | `result.mapErr(r: Result(T, E), f: …) -> Result(…)` | planned |
-| `result.flatMap` | `result.flatMap` | `result.flatMap(r: Result(T, E), f: …) -> Result(…)` | planned |
-| `result.recover` | `result.recover` | `result.recover(r: Result(T, E), f: …) -> Result(…)` | planned |
-| `result.toOption` | `result.toOption` | `result.toOption(r: Result(T, E)) -> Option(T)` | proposed |
-| `result.error` | `result.error` | `result.error(r: Result(T, E)) -> Option(E)` | proposed |
-| `result.all` | `result.all` | `result.all(results: Vec(Result(T, E))) -> Result(Vec(T), E)` | planned |
+| `result.map` | `result.map` | `result.map(r: Result of (T, E), f: …) -> Result of (…)` | planned |
+| `result.mapErr` | `result.mapErr` | `result.mapErr(r: Result of (T, E), f: …) -> Result of (…)` | planned |
+| `result.flatMap` | `result.flatMap` | `result.flatMap(r: Result of (T, E), f: …) -> Result of (…)` | planned |
+| `result.recover` | `result.recover` | `result.recover(r: Result of (T, E), f: …) -> Result of (…)` | planned |
+| `result.toOption` | `result.toOption` | `result.toOption(r: Result of (T, E)) -> Option of (T)` | proposed |
+| `result.error` | `result.error` | `result.error(r: Result of (T, E)) -> Option of (E)` | proposed |
+| `result.all` | `result.all` | `result.all(results: Vec of (Result of (T, E))) -> Result of (Vec of (T), E)` | planned |
 
 ---
 
@@ -471,7 +471,7 @@ previous: map
 -->
 
 ```vir
-result.map(r: Result(T, E), f: (T) -> U) -> Result(U, E)
+result.map(r: Result of (T, E), f: (T) -> U) -> Result of (U, E)
 ```
 
 | Case | Result |
@@ -504,7 +504,7 @@ previous: map_err
 -->
 
 ```vir
-result.mapErr(r: Result(T, E), f: (E) -> F) -> Result(T, F)
+result.mapErr(r: Result of (T, E), f: (E) -> F) -> Result of (T, F)
 ```
 
 | Case | Result |
@@ -542,7 +542,7 @@ previous: flat_map, and_then
 -->
 
 ```vir
-result.flatMap(r: Result(T, E), f: (T) -> Result(U, E)) -> Result(U, E)
+result.flatMap(r: Result of (T, E), f: (T) -> Result of (U, E)) -> Result of (U, E)
 ```
 
 | Case | Result |
@@ -579,7 +579,7 @@ previous: or_else
 -->
 
 ```vir
-result.recover(r: Result(T, E), f: (E) -> Result(T, E)) -> Result(T, E)
+result.recover(r: Result of (T, E), f: (E) -> Result of (T, E)) -> Result of (T, E)
 ```
 
 | Case | Result |
@@ -617,7 +617,7 @@ previous: result_to_option, ok
 -->
 
 ```vir
-result.toOption(r: Result(T, E)) -> Option(T)
+result.toOption(r: Result of (T, E)) -> Option of (T)
 ```
 
 | Case | Result |
@@ -655,7 +655,7 @@ previous: err
 -->
 
 ```vir
-result.error(r: Result(T, E)) -> Option(E)
+result.error(r: Result of (T, E)) -> Option of (E)
 ```
 
 | Case | Result |
@@ -697,7 +697,7 @@ previous: try_all
 -->
 
 ```vir
-result.all(results: Vec(Result(T, E))) -> Result(Vec(T), E)
+result.all(results: Vec of (Result of (T, E))) -> Result of (Vec of (T), E)
 ```
 
 Aggregate a vector of results.

@@ -1,7 +1,7 @@
 ---
 module: vec
 title: Vec
-summary: Owned growable typed collection Vec(T) — namespace-only vec.*.
+summary: Owned growable typed collection Vec of (T) — namespace-only vec.*.
 source:
   - name: collections.vec
     path: vir/collections/vec.vri
@@ -14,14 +14,14 @@ notes: >-
 
 # Vec
 
-Owned, growable **typed** collection `Vec(T)`. Public API is **namespace-only**:
+Owned, growable **typed** collection `Vec of (T)`. Public API is **namespace-only**:
 `vec.<op>(…)`.
 
 ```text
 string  → UTF-8 text
 Buffer  → owned growable binary          (byte)
 Slice   → borrowed binary view
-Vec(T)  → owned growable typed collection (element T)
+Vec of (T)  → owned growable typed collection (element T)
 ```
 
 ```vir
@@ -47,8 +47,8 @@ for a `vec` namespace object). Registry / docs use canonical `vec.*` names; map
 | | Higher-order `map`/`filter`/… — **uncurated** |
 | | Receiver `v.push` — **not public** |
 
-`Vec(u8)` is **not** `Buffer`. Even after element-width correctness lands,
-`Vec(u8)` remains a typed collection of `u8`; `Buffer` remains the binary
+`Vec of (u8)` is **not** `Buffer`. Even after element-width correctness lands,
+`Vec of (u8)` remains a typed collection of `u8`; `Buffer` remains the binary
 builder/storage abstraction.
 
 ## Generic reality (closed)
@@ -56,7 +56,7 @@ builder/storage abstraction.
 **Contract:**
 
 ```text
-Vec(T)
+Vec of (T)
 stride / grow unit = size_of(T)
 ```
 
@@ -67,13 +67,13 @@ slot assumptions removed from the core surface.
 
 | Layer | Meaning |
 |---|---|
-| Contract | `Vec(T)`, stride = `size_of(T)` |
+| Contract | `Vec of (T)`, stride = `size_of(T)` |
 | Implementation | element-width addressing on core ops |
 | Still out | generic `vec` namespace object (no generic methods yet) |
 
 ### Zero-sized types (closed)
 
-If `size_of(T) == 0`, `Vec(T)` is **currently unsupported** unless the
+If `size_of(T) == 0`, `Vec of (T)` is **currently unsupported** unless the
 compiler/source later proves a defined representation. Do not assume pointer /
 stride math works for ZST with today’s layout.
 
@@ -168,7 +168,7 @@ returning them are **not `stable`** for resource-owning `T` that need
 destructors. Callers may move elements out before reclaiming storage — a
 **temporary** limit, not a long-term contract.
 
-Keep: **ZST unsupported**; **`Vec(u8)` ≠ `Buffer`**.
+Keep: **ZST unsupported**; **`Vec of (u8)` ≠ `Buffer`**.
 
 ### `clear` / `truncate` and element ownership
 
@@ -257,7 +257,7 @@ ABI is locked:
 ```text
 forEach  map  filter  any  all  fold
 zip  enumerate  flatten  dedup
-Pair<A,B>   # local helper for zip/enumerate
+Pair of (A,B)   # local helper for zip/enumerate
 ```
 
 Status if mentioned elsewhere: `experimental` / uncurated — not teachable as
@@ -327,36 +327,36 @@ registry — document as:
 
 | ID | Symbol | Signature | Status |
 |---|---|---|---|
-| `vec.new` | `vec.new` | `vec.new() -> Vec(T)` | proposed |
-| `vec.withCap` | `vec.withCap` | `vec.withCap(cap: int) -> Vec(T)` | proposed |
-| `vec.filled` | `vec.filled` | `vec.filled(value: T, n: int) -> Vec(T)` | proposed |
-| `vec.len` | `vec.len` | `vec.len(v: Vec(T)) -> int` | proposed |
-| `vec.cap` | `vec.cap` | `vec.cap(v: Vec(T)) -> int` | proposed |
-| `vec.isEmpty` | `vec.isEmpty` | `vec.isEmpty(v: Vec(T)) -> bool` | proposed |
-| `vec.get` | `vec.get` | `vec.get(v: Vec(T), i: int) -> T` | proposed |
-| `vec.tryGet` | `vec.tryGet` | `vec.tryGet(v: Vec(T), i: int) -> Option(T)` | proposed |
-| `vec.set` | `vec.set` | `vec.set(v: Vec(T), i: int, x: T) -> void` | proposed |
-| `vec.first` | `vec.first` | `vec.first(v: Vec(T)) -> Option(T)` | proposed |
-| `vec.last` | `vec.last` | `vec.last(v: Vec(T)) -> Option(T)` | proposed |
-| `vec.push` | `vec.push` | `vec.push(v: Vec(T), x: T) -> …` | proposed |
-| `vec.pop` | `vec.pop` | `vec.pop(v: Vec(T)) -> Option(T)` | proposed |
-| `vec.insert` | `vec.insert` | `vec.insert(v: Vec(T), i: int, x: T) -> void` | proposed |
-| `vec.remove` | `vec.remove` | `vec.remove(v: Vec(T), i: int) -> T` | proposed |
-| `vec.swapRemove` | `vec.swapRemove` | `vec.swapRemove(v: Vec(T), i: int) -> T` | proposed |
-| `vec.extend` | `vec.extend` | `vec.extend(v: Vec(T), other: Vec(T)) -> void` | proposed |
-| `vec.contains` | `vec.contains` | `vec.contains(v: Vec(T), x: T) -> bool` | proposed |
-| `vec.find` | `vec.find` | `vec.find(v: Vec(T), x: T) -> Option(int)` · index | proposed |
-| `vec.count` | `vec.count` | `vec.count(v: Vec(T), x: T) -> int` | proposed |
-| `vec.reverse` | `vec.reverse` | `vec.reverse(v: Vec(T)) -> void` | proposed |
-| `vec.swap` | `vec.swap` | `vec.swap(v: Vec(T), a: int, b: int) -> void` | proposed |
-| `vec.clone` | `vec.clone` | `vec.clone(v: Vec(T)) -> Vec(T)` | proposed |
-| `vec.copyRange` | `vec.copyRange` | `vec.copyRange(v: Vec(T), from: int, to: int) -> Vec(T)` | proposed |
-| `vec.eq` | `vec.eq` | `vec.eq(a: Vec(T), b: Vec(T)) -> bool` | proposed |
-| `vec.reserve` | `vec.reserve` | `vec.reserve(v: Vec(T), additional: int) -> void` | proposed |
-| `vec.shrinkToFit` | `vec.shrinkToFit` | `vec.shrinkToFit(v: Vec(T)) -> void` | proposed |
-| `vec.truncate` | `vec.truncate` | `vec.truncate(v: Vec(T), newLen: int) -> void` | proposed |
-| `vec.clear` | `vec.clear` | `vec.clear(v: Vec(T)) -> void` | proposed |
-| `vec.free` | `vec.free` | `vec.free(v: Vec(T)) -> void` | proposed |
+| `vec.new` | `vec.new` | `vec.new() -> Vec of (T)` | proposed |
+| `vec.withCap` | `vec.withCap` | `vec.withCap(cap: int) -> Vec of (T)` | proposed |
+| `vec.filled` | `vec.filled` | `vec.filled(value: T, n: int) -> Vec of (T)` | proposed |
+| `vec.len` | `vec.len` | `vec.len(v: Vec of (T)) -> int` | proposed |
+| `vec.cap` | `vec.cap` | `vec.cap(v: Vec of (T)) -> int` | proposed |
+| `vec.isEmpty` | `vec.isEmpty` | `vec.isEmpty(v: Vec of (T)) -> bool` | proposed |
+| `vec.get` | `vec.get` | `vec.get(v: Vec of (T), i: int) -> T` | proposed |
+| `vec.tryGet` | `vec.tryGet` | `vec.tryGet(v: Vec of (T), i: int) -> Option of (T)` | proposed |
+| `vec.set` | `vec.set` | `vec.set(v: Vec of (T), i: int, x: T) -> void` | proposed |
+| `vec.first` | `vec.first` | `vec.first(v: Vec of (T)) -> Option of (T)` | proposed |
+| `vec.last` | `vec.last` | `vec.last(v: Vec of (T)) -> Option of (T)` | proposed |
+| `vec.push` | `vec.push` | `vec.push(v: Vec of (T), x: T) -> …` | proposed |
+| `vec.pop` | `vec.pop` | `vec.pop(v: Vec of (T)) -> Option of (T)` | proposed |
+| `vec.insert` | `vec.insert` | `vec.insert(v: Vec of (T), i: int, x: T) -> void` | proposed |
+| `vec.remove` | `vec.remove` | `vec.remove(v: Vec of (T), i: int) -> T` | proposed |
+| `vec.swapRemove` | `vec.swapRemove` | `vec.swapRemove(v: Vec of (T), i: int) -> T` | proposed |
+| `vec.extend` | `vec.extend` | `vec.extend(v: Vec of (T), other: Vec of (T)) -> void` | proposed |
+| `vec.contains` | `vec.contains` | `vec.contains(v: Vec of (T), x: T) -> bool` | proposed |
+| `vec.find` | `vec.find` | `vec.find(v: Vec of (T), x: T) -> Option of (int)` · index | proposed |
+| `vec.count` | `vec.count` | `vec.count(v: Vec of (T), x: T) -> int` | proposed |
+| `vec.reverse` | `vec.reverse` | `vec.reverse(v: Vec of (T)) -> void` | proposed |
+| `vec.swap` | `vec.swap` | `vec.swap(v: Vec of (T), a: int, b: int) -> void` | proposed |
+| `vec.clone` | `vec.clone` | `vec.clone(v: Vec of (T)) -> Vec of (T)` | proposed |
+| `vec.copyRange` | `vec.copyRange` | `vec.copyRange(v: Vec of (T), from: int, to: int) -> Vec of (T)` | proposed |
+| `vec.eq` | `vec.eq` | `vec.eq(a: Vec of (T), b: Vec of (T)) -> bool` | proposed |
+| `vec.reserve` | `vec.reserve` | `vec.reserve(v: Vec of (T), additional: int) -> void` | proposed |
+| `vec.shrinkToFit` | `vec.shrinkToFit` | `vec.shrinkToFit(v: Vec of (T)) -> void` | proposed |
+| `vec.truncate` | `vec.truncate` | `vec.truncate(v: Vec of (T), newLen: int) -> void` | proposed |
+| `vec.clear` | `vec.clear` | `vec.clear(v: Vec of (T)) -> void` | proposed |
+| `vec.free` | `vec.free` | `vec.free(v: Vec of (T)) -> void` | proposed |
 
 ---
 
@@ -370,7 +370,7 @@ previous: vec_new
 -->
 
 ```vir
-vec.new() -> Vec(T)
+vec.new() -> Vec of (T)
 ```
 
 Empty vector; no allocation (`data = null`, `cap = 0` today).
@@ -381,7 +381,7 @@ None (type argument `T`).
 
 ### Returns
 
-`Vec(T)`
+`Vec of (T)`
 
 ### Errors
 
@@ -395,7 +395,7 @@ No public `vec.empty()` constructor — `new` is the empty constructor;
 ### Example
 
 ```vir
-let v = vec.new<int>()
+let v = vec.new of (int)()
 ```
 
 ### Status
@@ -423,7 +423,7 @@ previous: vec_with_cap
 -->
 
 ```vir
-vec.withCap(cap: int) -> Vec(T)
+vec.withCap(cap: int) -> Vec of (T)
 ```
 
 Empty vector with preallocated capacity for `cap` **elements**.
@@ -436,7 +436,7 @@ Element slots to allocate (`len = 0`).
 
 ### Returns
 
-`Vec(T)`
+`Vec of (T)`
 
 ### Errors
 
@@ -473,7 +473,7 @@ previous: vec_filled
 -->
 
 ```vir
-vec.filled(value: T, n: int) -> Vec(T)
+vec.filled(value: T, n: int) -> Vec of (T)
 ```
 
 Vector of `n` elements, each equal to `value`.
@@ -490,7 +490,7 @@ Element count.
 
 ### Returns
 
-`Vec(T)` with `len = n`.
+`Vec of (T)` with `len = n`.
 
 ### Errors
 
@@ -499,7 +499,7 @@ Alloc failure per runtime.
 ### Example
 
 ```vir
-let v = vec.filled<int>(0, 10)
+let v = vec.filled of (int)(0, 10)
 ```
 
 ### Status
@@ -526,7 +526,7 @@ previous: vec_len
 -->
 
 ```vir
-vec.len(v: Vec(T)) -> int
+vec.len(v: Vec of (T)) -> int
 ```
 
 Number of elements (`len`), not capacity and not bytes.
@@ -562,7 +562,7 @@ previous: vec_cap
 -->
 
 ```vir
-vec.cap(v: Vec(T)) -> int
+vec.cap(v: Vec of (T)) -> int
 ```
 
 Allocated capacity in **elements**.
@@ -592,7 +592,7 @@ previous: vec_is_empty
 -->
 
 ```vir
-vec.isEmpty(v: Vec(T)) -> bool
+vec.isEmpty(v: Vec of (T)) -> bool
 ```
 
 `true` when `len == 0`.
@@ -622,7 +622,7 @@ previous: vec_get
 -->
 
 ```vir
-vec.get(v: Vec(T), i: int) -> T
+vec.get(v: Vec of (T), i: int) -> T
 ```
 
 Element at index `i`. Panic on OOB. Hot-path primitive (like `slice.get`).
@@ -662,7 +662,7 @@ previous: vec_try_get
 -->
 
 ```vir
-vec.tryGet(v: Vec(T), i: int) -> Option(T)
+vec.tryGet(v: Vec of (T), i: int) -> Option of (T)
 ```
 
 Element at `i`, or `None` if out of bounds. Does not panic.
@@ -696,7 +696,7 @@ previous: vec_set
 -->
 
 ```vir
-vec.set(v: Vec(T), i: int, x: T) -> void
+vec.set(v: Vec of (T), i: int, x: T) -> void
 ```
 
 Replace element at `i`. Panic on OOB. Does not extend length.
@@ -736,7 +736,7 @@ previous: vec_first
 -->
 
 ```vir
-vec.first(v: Vec(T)) -> Option(T)
+vec.first(v: Vec of (T)) -> Option of (T)
 ```
 
 First element, or `None` if empty.
@@ -766,7 +766,7 @@ previous: vec_last
 -->
 
 ```vir
-vec.last(v: Vec(T)) -> Option(T)
+vec.last(v: Vec of (T)) -> Option of (T)
 ```
 
 Last element, or `None` if empty.
@@ -796,7 +796,7 @@ previous: vec_push
 -->
 
 ```vir
-vec.push(v: Vec(T), x: T) -> …
+vec.push(v: Vec of (T), x: T) -> …
 ```
 
 Append `x`, growing if needed. Today’s source returns the vector value; public
@@ -833,7 +833,7 @@ previous: vec_pop
 -->
 
 ```vir
-vec.pop(v: Vec(T)) -> Option(T)
+vec.pop(v: Vec of (T)) -> Option of (T)
 ```
 
 Remove and return the last element, or `None` if empty.
@@ -863,7 +863,7 @@ previous: vec_insert
 -->
 
 ```vir
-vec.insert(v: Vec(T), i: int, x: T) -> void
+vec.insert(v: Vec of (T), i: int, x: T) -> void
 ```
 
 Insert `x` at `i`, shifting the tail right. Allows `i == len` (append-at-end).
@@ -901,7 +901,7 @@ previous: vec_remove
 -->
 
 ```vir
-vec.remove(v: Vec(T), i: int) -> T
+vec.remove(v: Vec of (T), i: int) -> T
 ```
 
 Remove element at `i`, **preserving order** of the remaining elements. Returns
@@ -941,7 +941,7 @@ previous: vec_swap_remove
 -->
 
 ```vir
-vec.swapRemove(v: Vec(T), i: int) -> T
+vec.swapRemove(v: Vec of (T), i: int) -> T
 ```
 
 Remove element at `i` in **O(1)** by swapping with the last element, then
@@ -981,7 +981,7 @@ previous: vec_extend
 -->
 
 ```vir
-vec.extend(v: Vec(T), other: Vec(T)) -> void
+vec.extend(v: Vec of (T), other: Vec of (T)) -> void
 ```
 
 Append all elements of `other` onto `v`.
@@ -1021,7 +1021,7 @@ previous: vec_contains
 -->
 
 ```vir
-vec.contains(v: Vec(T), x: T) -> bool
+vec.contains(v: Vec of (T), x: T) -> bool
 ```
 
 Whether any element equals `x` (`==`).
@@ -1055,7 +1055,7 @@ previous: vec_find
 -->
 
 ```vir
-vec.find(v: Vec(T), x: T) -> Option(int)
+vec.find(v: Vec of (T), x: T) -> Option of (int)
 ```
 
 First **index** where the element equals `x`, or `None`.
@@ -1100,7 +1100,7 @@ previous: vec_count
 -->
 
 ```vir
-vec.count(v: Vec(T), x: T) -> int
+vec.count(v: Vec of (T), x: T) -> int
 ```
 
 Number of elements equal to `x`.
@@ -1129,7 +1129,7 @@ previous: vec_reverse
 -->
 
 ```vir
-vec.reverse(v: Vec(T)) -> void
+vec.reverse(v: Vec of (T)) -> void
 ```
 
 Reverse elements in place.
@@ -1157,7 +1157,7 @@ api: vec.swap
 -->
 
 ```vir
-vec.swap(v: Vec(T), a: int, b: int) -> void
+vec.swap(v: Vec of (T), a: int, b: int) -> void
 ```
 
 Exchange elements at indices `a` and `b` in place.
@@ -1212,7 +1212,7 @@ previous: vec_clone
 -->
 
 ```vir
-vec.clone(v: Vec(T)) -> Vec(T)
+vec.clone(v: Vec of (T)) -> Vec of (T)
 ```
 
 Full-vector copy into new storage.
@@ -1248,10 +1248,10 @@ previous: vec_slice
 -->
 
 ```vir
-vec.copyRange(v: Vec(T), from: int, to: int) -> Vec(T)
+vec.copyRange(v: Vec of (T), from: int, to: int) -> Vec of (T)
 ```
 
-New **owned** `Vec(T)` containing a copy of the half-open range `[from, to)`.
+New **owned** `Vec of (T)` containing a copy of the half-open range `[from, to)`.
 
 ### Parameters
 
@@ -1261,7 +1261,7 @@ Element indices; half-open.
 
 ### Returns
 
-`Vec(T)` — independent allocation.
+`Vec of (T)` — independent allocation.
 
 ### Errors
 
@@ -1308,7 +1308,7 @@ previous: vec_eq
 -->
 
 ```vir
-vec.eq(a: Vec(T), b: Vec(T)) -> bool
+vec.eq(a: Vec of (T), b: Vec of (T)) -> bool
 ```
 
 Content equality: same length and pairwise `==` elements.
@@ -1342,7 +1342,7 @@ previous: vec_reserve
 -->
 
 ```vir
-vec.reserve(v: Vec(T), additional: int) -> void
+vec.reserve(v: Vec of (T), additional: int) -> void
 ```
 
 Ensure capacity for at least `len + additional` **elements**.
@@ -1381,7 +1381,7 @@ previous: vec_shrink_to_fit
 -->
 
 ```vir
-vec.shrinkToFit(v: Vec(T)) -> void
+vec.shrinkToFit(v: Vec of (T)) -> void
 ```
 
 Shrink capacity to `len` (free storage if empty).
@@ -1411,7 +1411,7 @@ previous: vec_truncate
 -->
 
 ```vir
-vec.truncate(v: Vec(T), newLen: int) -> void
+vec.truncate(v: Vec of (T), newLen: int) -> void
 ```
 
 If `newLen < len`, set `len = newLen`. Does **not** grow when `newLen ≥ len`
@@ -1446,7 +1446,7 @@ previous: vec_clear
 -->
 
 ```vir
-vec.clear(v: Vec(T)) -> void
+vec.clear(v: Vec of (T)) -> void
 ```
 
 Set `len = 0`; capacity retained.
@@ -1481,7 +1481,7 @@ previous: vec_free
 -->
 
 ```vir
-vec.free(v: Vec(T)) -> void
+vec.free(v: Vec of (T)) -> void
 ```
 
 Release owned storage. Do not use `v` afterward.

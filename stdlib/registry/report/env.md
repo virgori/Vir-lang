@@ -10,8 +10,8 @@ Registry: [`../env.md`](../env.md)
 | `env.has` | done | |
 | `env.set` | done | bare `Result` |
 | `env.remove` | done | bare `Result` |
-| `env.int` | done | → `Option(int)`; free `int(key, default)` migration only |
-| `env.bool` | done | → `Option(bool)`; free `bool(key, default)` migration only |
+| `env.int` | done | → `Option of (int)`; free `int(key, default)` migration only |
+| `env.bool` | done | → `Option of (bool)`; free `bool(key, default)` migration only |
 | `env.require` | done | |
 | `env.args` | done | method on `env` |
 | `env.name` | done | previous: `program_name` free |

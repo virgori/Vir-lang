@@ -232,7 +232,7 @@ Sets every byte in `s` to `value` (via `mem_set` today).
 | `slice.sub` | `slice.sub` | `slice.sub(s: Slice, from: int, to: int) -> Slice` | proposed |
 | `slice.len` | `slice.len` | `slice.len(s: Slice) -> int` | planned |
 | `slice.eq` | `slice.eq` | `slice.eq(a: Slice, b: Slice) -> bool` | proposed |
-| `slice.find` | `slice.find` | `slice.find(s: Slice, byte: int) -> Option(int)` | proposed |
+| `slice.find` | `slice.find` | `slice.find(s: Slice, byte: int) -> Option of (int)` | proposed |
 | `slice.copyTo` | `slice.copyTo` | `slice.copyTo(src: Slice, dst: Slice) -> void` | proposed |
 | `slice.fill` | `slice.fill` | `slice.fill(s: Slice, value: int) -> void` | proposed |
 
@@ -652,7 +652,7 @@ previous: slice_find_byte
 -->
 
 ```vir
-slice.find(s: Slice, byte: int) -> Option(int)
+slice.find(s: Slice, byte: int) -> Option of (int)
 ```
 
 First index of `byte`, or `None`.

@@ -198,79 +198,74 @@ Crypto does **not** bypass the Vir borrow checker.
 | HKDF in `pbkdf2.vri` | `crypto.hkdf.*` | **split** when public |
 | `auth` → `include crypto` | `crypto.rng` + `crypto.hash` | **migrate** |
 
-## Compile inventory (native `virc`, audit date)
+## Compile inventory (native `bin/virc`, verified 2026-09-29)
 
-Docs status only — implementation must re-verify.
-
-| Module | Compile | Notes |
-|---|---|---|
-| `crypto` | blocked | umbrella; entity `[int; N]` / legacy syntax |
-| `crypto.mod` | blocked | depends on children |
-| `crypto.hash` | blocked | entity fixed arrays |
-| `crypto.hmac` | blocked | depends on hash |
-| `crypto.rng` | blocked | string ABI + `extern` RNG |
-| `crypto.aes` | blocked | legacy `extern` syntax |
-| `crypto.chacha20` | blocked | tree not clean |
-| `crypto.ed25519` | blocked | compile + stub |
-| `crypto.x25519` | blocked | compile tree |
-| `crypto.rsa` | blocked | compile + security |
-| `crypto.pbkdf2` | blocked | hash dependency |
-| `crypto.jwt` | blocked | hash/encoding deps |
-| `crypto.x509` | blocked | validation stub; string ABI |
-| `crypto.subtle` | blocked | semantic E2002 |
+| Module | Compile | Runtime vectors | Maturity |
+|---|---|---|---|
+| `crypto.hash` | **PASS** | NIST empty/abc/56-byte + double-finish | experimental |
+| `crypto.hmac` | **PASS** | RFC 4231 case 1 + verify negatives | experimental |
+| `crypto.rng` | **PASS** | `/dev/urandom` non-zero + `bytes(0)` Err | experimental |
+| `crypto.mod` | **PASS** | re-exports hash/hmac/rng only | experimental |
+| `crypto` umbrella | blocked | legacy tree | stub/legacy |
+| `crypto.subtle` | blocked | — | blocked (E2002 / `[int; N]`) |
+| `crypto.aes` | blocked | — | experimental |
+| `crypto.chacha20` | blocked | — | experimental |
+| `crypto.ed25519` | blocked | fail-closed when usable | stub |
+| `crypto.x25519` | blocked | — | experimental |
+| `crypto.rsa` | blocked | — | unsafe/experimental |
+| `crypto.pbkdf2` | blocked | — | experimental |
+| `crypto.jwt` | blocked | — | blocked |
+| `crypto.x509` | blocked | validate fail-closed | stub |
+| `tls` / `tls.cert` | blocked | — | native FFI blocked |
+| `auth` | blocked | — | blocked by crypto umbrella |
+| `base64` / `hex` | PASS | — | supporting (not crypto) |
 
 Encoding modules used by crypto compile smoke: **ok** (`base64` / `hex`).
 
 ## RNG source (CSPRNG)
 
-`crypto.rng` intended order (`vir/crypto/rng.vri`):
+Current production path (`vir/crypto/rng.vri`):
 
-1. `native_getrandom`
-2. `vir_random_bytes`
-3. `/dev/urandom` via `sys_open` / `sys_read`
+1. `/dev/urandom` via `sys_open` / `sys_read`
+
+`native_getrandom` / `vir_random_bytes` are **not** declared: undeclared
+`extern` aborts Darwin dyld at load even before fallback. Reintroduce only
+after in-tree stubs exist and link+runtime tests pass.
 
 Rules:
 
-- backend failure → `Err`
+- backend failure → `Result.Err`
 - **never** fall back to `rand` (xoshiro)
-- native symbols must **exist at link** and be runtime-tested
-- umbrella `crypto.vri` currently only calls `native_getrandom` (no urandom fallback)
-
-Declarations exist in Vir source; **no in-tree C definition** was found for
-`native_getrandom` / `vir_random_bytes` at audit time — treat FFI as incomplete
-until link tests pass.
+- buffer fully initialized before `Ok`
 
 ## Area status
 
-### `crypto.hash` — candidate for hardening
+### `crypto.hash` — experimental (milestone 1)
 
 ```text
-crypto.hash.sha256
-crypto.hash.sha512
+crypto.hash.sha256   → sha256(data, len)   [legacy sha256_hash]
+crypto.hash.sha512   → sha512(data, len)   [legacy sha512_hash]
 ```
 
-Requirements: compile clean; NIST/official vectors via **production** module;
-fixed digest lengths; streaming state transitions valid if retained.
+Native include PASS. NIST vectors via `tests/crypto/test_hash_nist.vri`.
+Streaming: `sha256_new` / `update` / `finish` with `ref` + `alloc` buffers
+(finalized reuse returns zero digest). Not a security audit claim.
 
-### `crypto.hmac` — candidate for hardening
+### `crypto.hmac` — experimental (milestone 1)
 
 ```text
-crypto.hmac.sha256
-crypto.hmac.verify
+crypto.hmac.sha256   → hmac_sha256(...)   # bare `sha256` clashes with hash
+crypto.hmac.verify   → verify(...)
 ```
 
-Requirements: hash-only dependency; constant-time verify; reject bad tag length;
-key ownership documented. Current CT-style compare is directionally ok.
+RFC 4231 case 1 + bad length / tampered tag. CT-style xor-accumulate compare.
 
-### `crypto.rng` — candidate for hardening
+### `crypto.rng` — experimental (milestone 1)
 
 ```text
-crypto.rng.bytes
-crypto.rng.fill
+crypto.rng.bytes → bytes(len) → Result
+crypto.rng.fill  → fill(buf, len) → Result
 ```
-
-Requirements: OS/native CSPRNG only; `Err` on failure; link+runtime tests;
-buffer fully initialized before `Ok`.
 
 ### `crypto.subtle` — blocked
 
@@ -375,12 +370,12 @@ vectors, no hidden FFI failure.
 | `crypto.hash.sha512` | `crypto.hash.sha512` | `(data) -> Digest` | proposed |
 | `crypto.hmac.sha256` | `crypto.hmac.sha256` | `(key, msg) -> Tag` | proposed |
 | `crypto.hmac.verify` | `crypto.hmac.verify` | `(key, msg, tag) -> Result` / bool+Result TBD | proposed |
-| `crypto.rng.bytes` | `crypto.rng.bytes` | `(n) -> Result(Buffer)` | proposed |
+| `crypto.rng.bytes` | `crypto.rng.bytes` | `(n) -> Result of (Buffer)` | proposed |
 | `crypto.rng.fill` | `crypto.rng.fill` | `(buf) -> Result` | proposed |
 | `crypto.subtle.equal` | `crypto.subtle.equal` | `(a, b) -> bool` (CT) | proposed |
-| `crypto.ed25519.sign` | `crypto.ed25519.sign` | `… -> Result(Signature)` | planned (fail-closed now) |
+| `crypto.ed25519.sign` | `crypto.ed25519.sign` | `… -> Result of (Signature)` | planned (fail-closed now) |
 | `crypto.ed25519.verify` | `crypto.ed25519.verify` | `… -> Result` / verification outcome | planned (fail-closed now) |
-| `crypto.x509.validate` | `crypto.x509.validate` | `… -> Result(Validation)` | planned (fail-closed now) |
+| `crypto.x509.validate` | `crypto.x509.validate` | `… -> Result of (Validation)` | planned (fail-closed now) |
 
 Exact signatures lock when each area closes; prefer `Result` for all fallible
 security operations (E1).

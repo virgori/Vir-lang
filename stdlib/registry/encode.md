@@ -106,7 +106,7 @@ encode.asciiLossy(s: Slice) -> Buffer     # non-ASCII → '?'
 
 | Current | Public | Action |
 |---|---|---|
-| `utf8_to_utf16` | `encode.utf8ToUtf16` | **rename** · `Slice`→`Result(Buffer)` · UTF-16LE |
+| `utf8_to_utf16` | `encode.utf8ToUtf16` | **rename** · `Slice`→`Result of (Buffer)` · UTF-16LE |
 | `utf16_to_utf8` | `encode.utf16ToUtf8` | **rename** |
 | `utf8_to_utf32` | `encode.utf8ToUtf32` | **rename** · add `Result` if missing |
 | `utf32_to_utf8` | `encode.utf32ToUtf8` | **rename** |
@@ -119,10 +119,10 @@ encode.asciiLossy(s: Slice) -> Buffer     # non-ASCII → '?'
 
 | ID | Symbol | Signature | Status |
 |---|---|---|---|
-| `encode.utf8ToUtf16` | `encode.utf8ToUtf16` | `encode.utf8ToUtf16(s: Slice) -> Result(Buffer)` | proposed |
-| `encode.utf16ToUtf8` | `encode.utf16ToUtf8` | `encode.utf16ToUtf8(s: Slice) -> Result(Buffer)` | proposed |
-| `encode.utf8ToUtf32` | `encode.utf8ToUtf32` | `encode.utf8ToUtf32(s: Slice) -> Result(Buffer)` | proposed |
-| `encode.utf32ToUtf8` | `encode.utf32ToUtf8` | `encode.utf32ToUtf8(s: Slice) -> Result(Buffer)` | proposed |
+| `encode.utf8ToUtf16` | `encode.utf8ToUtf16` | `encode.utf8ToUtf16(s: Slice) -> Result of (Buffer)` | proposed |
+| `encode.utf16ToUtf8` | `encode.utf16ToUtf8` | `encode.utf16ToUtf8(s: Slice) -> Result of (Buffer)` | proposed |
+| `encode.utf8ToUtf32` | `encode.utf8ToUtf32` | `encode.utf8ToUtf32(s: Slice) -> Result of (Buffer)` | proposed |
+| `encode.utf32ToUtf8` | `encode.utf32ToUtf8` | `encode.utf32ToUtf8(s: Slice) -> Result of (Buffer)` | proposed |
 | `encode.asciiLossy` | `encode.asciiLossy` | `encode.asciiLossy(s: Slice) -> Buffer` | proposed |
 
 ---
@@ -131,7 +131,7 @@ encode.asciiLossy(s: Slice) -> Buffer     # non-ASCII → '?'
 ## `encode.utf8ToUtf16`
 
 ```vir
-encode.utf8ToUtf16(s: Slice) -> Result(Buffer)
+encode.utf8ToUtf16(s: Slice) -> Result of (Buffer)
 ```
 
 Decode UTF-8 via [`unicode`](unicode.md) SSOT; emit **UTF-16LE** into
@@ -147,7 +147,7 @@ Decode UTF-8 via [`unicode`](unicode.md) SSOT; emit **UTF-16LE** into
 ## `encode.utf16ToUtf8`
 
 ```vir
-encode.utf16ToUtf8(s: Slice) -> Result(Buffer)
+encode.utf16ToUtf8(s: Slice) -> Result of (Buffer)
 ```
 
 Interpret `s` as **UTF-16LE** bytes; emit UTF-8 `Buffer`. Truncated/invalid
@@ -163,7 +163,7 @@ surrogate pairs → `Err(InvalidData)`.
 ## `encode.utf8ToUtf32`
 
 ```vir
-encode.utf8ToUtf32(s: Slice) -> Result(Buffer)
+encode.utf8ToUtf32(s: Slice) -> Result of (Buffer)
 ```
 
 Emit **UTF-32LE** code units into `Buffer`.
@@ -178,7 +178,7 @@ Emit **UTF-32LE** code units into `Buffer`.
 ## `encode.utf32ToUtf8`
 
 ```vir
-encode.utf32ToUtf8(s: Slice) -> Result(Buffer)
+encode.utf32ToUtf8(s: Slice) -> Result of (Buffer)
 ```
 
 Interpret `s` as **UTF-32LE**; emit UTF-8. Invalid scalar → `Err(InvalidData)`.

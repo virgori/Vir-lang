@@ -21,8 +21,8 @@ design wave (`vec` · `map` · `set` · `deque`).
 let d = deque.new()
 deque.pushBack(d, x)
 deque.pushFront(d, y)
-let a = deque.popFront(d)   # Option(T) · move out
-let peek = deque.front(d)   # Option(T) · copy-limited
+let a = deque.popFront(d)   # Option of (T) · move out
+let peek = deque.front(d)   # Option of (T) · copy-limited
 ```
 
 > Same ownership principle as [`map`](map.md) / [`vec`](vec.md): the deque owns
@@ -146,10 +146,10 @@ a second deque implementation solely for the new API.
 | `deque.withCap` | `deque.withCap` | `deque.withCap(cap: int) -> Deque` | proposed |
 | `deque.pushFront` | `deque.pushFront` | `deque.pushFront(d, value)` | proposed |
 | `deque.pushBack` | `deque.pushBack` | `deque.pushBack(d, value)` | proposed |
-| `deque.popFront` | `deque.popFront` | `deque.popFront(d) -> Option(T)` | proposed |
-| `deque.popBack` | `deque.popBack` | `deque.popBack(d) -> Option(T)` | proposed |
-| `deque.front` | `deque.front` | `deque.front(d) -> Option(T)` | proposed |
-| `deque.back` | `deque.back` | `deque.back(d) -> Option(T)` | proposed |
+| `deque.popFront` | `deque.popFront` | `deque.popFront(d) -> Option of (T)` | proposed |
+| `deque.popBack` | `deque.popBack` | `deque.popBack(d) -> Option of (T)` | proposed |
+| `deque.front` | `deque.front` | `deque.front(d) -> Option of (T)` | proposed |
+| `deque.back` | `deque.back` | `deque.back(d) -> Option of (T)` | proposed |
 | `deque.len` | `deque.len` | `deque.len(d) -> int` | proposed |
 | `deque.isEmpty` | `deque.isEmpty` | `deque.isEmpty(d) -> bool` | proposed |
 | `deque.clear` | `deque.clear` | `deque.clear(d)` | proposed |
@@ -177,10 +177,10 @@ deque.withCap(cap: int) -> Deque
 ```vir
 deque.pushFront(d, value)
 deque.pushBack(d, value)
-deque.popFront(d) -> Option(T)
-deque.popBack(d) -> Option(T)
-deque.front(d) -> Option(T)
-deque.back(d) -> Option(T)
+deque.popFront(d) -> Option of (T)
+deque.popBack(d) -> Option of (T)
+deque.front(d) -> Option of (T)
+deque.back(d) -> Option of (T)
 ```
 
 ### Status

@@ -1,7 +1,7 @@
 ---
 module: option
 title: Option
-summary: Option(T) — Some(T) or None; namespace option.* for helpers; language-level constructors.
+summary: Option of (T) — Some(T) or None; namespace option.* for helpers; language-level constructors.
 source:
   - name: option
     path: vir/core/option.vri
@@ -9,16 +9,16 @@ source:
     path: vir/compiler/option.vri
 status: closed
 notes: >-
-  Design closed (O1–O4). zip deferred until Pair(T,U). Callable HOF → planned.
+  Design closed (O1–O4). zip deferred until Pair of (T,U). Callable HOF → planned.
   and planned. Ownership: payload only; move vs copy rules. No .vri (Q5).
 ---
 
 # Option
 
-`Option(T)` is either one value of type `T` or the absence of a value.
+`Option of (T)` is either one value of type `T` or the absence of a value.
 
 ```text
-Option(T)
+Option of (T)
 ├── Some(T)
 └── None
 ```
@@ -66,13 +66,13 @@ docs when absence is expected — callers should branch or use `or` / `orWith`.
 
 ## Generic contract (closed)
 
-**Semantic contract:** `Option(T)` with payload type `T`.
+**Semantic contract:** `Option of (T)` with payload type `T`.
 
 Source may currently write an unparameterized `enum Option` with a generic
 payload slot. That is an **implementation mechanism**, not a reason to document
 an untyped public contract.
 
-Document public contracts as `Option(T)` using Vir `()` generics.
+Document public contracts as `Option of (T)` using Vir `()` generics.
 If a given compiler stage only accepts unparameterized `Option` in
 examples, note that as an **implementation gap** — do not fall back to `<>`.
 
@@ -87,7 +87,7 @@ option
 ├── unwrapOrElse · map · flatMap · filter   # planned · callable ABI (O2)
 ├── and                                 # planned (O3)
 │
-# zip — deferred from public core until Pair(T, U) (O1)
+# zip — deferred from public core until Pair of (T, U) (O1)
 ```
 
 ### Semantic families
@@ -134,7 +134,7 @@ option.otherwise(opt, alt)         # → Option
 | `map` | `option.map` | `Option` | **rename**; **planned** until callable ABI (O2) |
 | `flat_map` | `option.flatMap` | `Option` | **rename**; **planned** (O2) |
 | `filter` | `option.filter` | `Option` | **rename**; **planned** (O2) |
-| `zip` | — | — | **defer** until `Pair(T, U)` (O1) |
+| `zip` | — | — | **defer** until `Pair of (T, U)` (O1) |
 | `option_to_result` | `option.toResult` | `Result` | **move** into `core/option.vri` |
 
 Prelude (`compiler/option_prelude.vri`) may keep minimal free helpers for
@@ -144,10 +144,10 @@ bootstrap; not the user-facing contract.
 
 | ID | Decision |
 |---|---|
-| O1 | **`zip` deferred** from public core until standardized `Pair(T, U)`. Do not invent a pair type only for `option`. |
+| O1 | **`zip` deferred** from public core until standardized `Pair of (T, U)`. Do not invent a pair type only for `option`. |
 | O2 | HOF needing callable ABI (`map` / `flatMap` / `filter` / `orWith`) → **`planned`**. Target surface + semantics remain in docs; not `stable` until ABI confirmed. |
 | O3 | `option.and` stays **`planned`**; not required present to close design. |
-| O4 | Typo `Option(U)` → `Option(U)` fixed. |
+| O4 | Typo `Option of (U)` → `Option of (U)` fixed. |
 
 Ops without callbacks (`isSome` / `isNone` / `unwrap` / `expect` / `or` / `otherwise` / `toResult`) keep their own statuses.
 
@@ -166,7 +166,7 @@ Do not keep parallel `or` / `orWith` as second public names.
 
 ## Ownership (locked)
 
-`Option(T)` owns **no** resources beyond the payload `T`.
+`Option of (T)` owns **no** resources beyond the payload `T`.
 
 | Access | Rule |
 |---|---|
@@ -184,19 +184,19 @@ design; do not mark them `stable` early.
 
 | ID | Symbol | Signature | Status |
 |---|---|---|---|
-| `option.isSome` | `option.isSome` | `option.isSome(opt: Option(T)) -> bool` | proposed |
-| `option.isNone` | `option.isNone` | `option.isNone(opt: Option(T)) -> bool` | proposed |
-| `option.unwrap` | `option.unwrap` | `option.unwrap(opt: Option(T)) -> T` | proposed |
-| `option.expect` | `option.expect` | `option.expect(opt: Option(T), msg: string) -> T` | proposed |
-| `option.unwrapOr` | `option.unwrapOr` | `option.unwrapOr(opt: Option(T), default: T) -> T` | proposed |
-| `option.unwrapOrElse` | `option.unwrapOrElse` | `option.unwrapOrElse(opt: Option(T), f: …) -> T` | planned |
-| `option.otherwise` | `option.otherwise` | `option.otherwise(opt: Option(T), alt: Option(T)) -> Option(T)` | proposed |
-| `option.and` | `option.and` | `option.and(opt: Option(T), next: Option(U)) -> Option(U)` | planned |
-| `option.map` | `option.map` | `option.map(opt: Option(T), f: …) -> Option(U)` | planned |
-| `option.flatMap` | `option.flatMap` | `option.flatMap(opt: Option(T), f: …) -> Option(U)` | planned |
-| `option.filter` | `option.filter` | `option.filter(opt: Option(T), predicate: …) -> Option(T)` | planned |
-| `option.zip` | — | deferred until `Pair(T, U)` (O1) | deferred |
-| `option.toResult` | `option.toResult` | `option.toResult(opt: Option(T), error: E) -> Result(T, E)` | proposed |
+| `option.isSome` | `option.isSome` | `option.isSome(opt: Option of (T)) -> bool` | proposed |
+| `option.isNone` | `option.isNone` | `option.isNone(opt: Option of (T)) -> bool` | proposed |
+| `option.unwrap` | `option.unwrap` | `option.unwrap(opt: Option of (T)) -> T` | proposed |
+| `option.expect` | `option.expect` | `option.expect(opt: Option of (T), msg: string) -> T` | proposed |
+| `option.unwrapOr` | `option.unwrapOr` | `option.unwrapOr(opt: Option of (T), default: T) -> T` | proposed |
+| `option.unwrapOrElse` | `option.unwrapOrElse` | `option.unwrapOrElse(opt: Option of (T), f: …) -> T` | planned |
+| `option.otherwise` | `option.otherwise` | `option.otherwise(opt: Option of (T), alt: Option of (T)) -> Option of (T)` | proposed |
+| `option.and` | `option.and` | `option.and(opt: Option of (T), next: Option of (U)) -> Option of (U)` | planned |
+| `option.map` | `option.map` | `option.map(opt: Option of (T), f: …) -> Option of (U)` | planned |
+| `option.flatMap` | `option.flatMap` | `option.flatMap(opt: Option of (T), f: …) -> Option of (U)` | planned |
+| `option.filter` | `option.filter` | `option.filter(opt: Option of (T), predicate: …) -> Option of (T)` | planned |
+| `option.zip` | — | deferred until `Pair of (T, U)` (O1) | deferred |
+| `option.toResult` | `option.toResult` | `option.toResult(opt: Option of (T), error: E) -> Result of (T, E)` | proposed |
 
 ---
 
@@ -210,7 +210,7 @@ previous: is_some
 -->
 
 ```vir
-option.isSome(opt: Option(T)) -> bool
+option.isSome(opt: Option of (T)) -> bool
 ```
 
 `true` iff `opt` is `Some(_)`.
@@ -247,7 +247,7 @@ previous: is_none
 -->
 
 ```vir
-option.isNone(opt: Option(T)) -> bool
+option.isNone(opt: Option of (T)) -> bool
 ```
 
 `true` iff `opt` is `None`.
@@ -276,7 +276,7 @@ previous: unwrap
 -->
 
 ```vir
-option.unwrap(opt: Option(T)) -> T
+option.unwrap(opt: Option of (T)) -> T
 ```
 
 | Case | Result |
@@ -314,7 +314,7 @@ previous: expect
 -->
 
 ```vir
-option.expect(opt: Option(T), msg: string) -> T
+option.expect(opt: Option of (T), msg: string) -> T
 ```
 
 Same as `unwrap`, with custom panic message.
@@ -349,7 +349,7 @@ previous: unwrap_or
 -->
 
 ```vir
-option.unwrapOr(opt: Option(T), default: T) -> T
+option.unwrapOr(opt: Option of (T), default: T) -> T
 ```
 
 | Case | Result |
@@ -392,7 +392,7 @@ previous: unwrap_or_else
 -->
 
 ```vir
-option.unwrapOrElse(opt: Option(T), f: …) -> T
+option.unwrapOrElse(opt: Option of (T), f: …) -> T
 ```
 
 | Case | Result |
@@ -430,7 +430,7 @@ previous: or_else
 -->
 
 ```vir
-option.otherwise(opt: Option(T), alt: Option(T)) -> Option(T)
+option.otherwise(opt: Option of (T), alt: Option of (T)) -> Option of (T)
 ```
 
 | Case | Result |
@@ -467,7 +467,7 @@ api: option.and
 -->
 
 ```vir
-option.and(opt: Option(T), next: Option(U)) -> Option(U)
+option.and(opt: Option of (T), next: Option of (U)) -> Option of (U)
 ```
 
 | Case | Result |
@@ -504,7 +504,7 @@ previous: map
 -->
 
 ```vir
-option.map(opt: Option(T), f: …) -> Option(U)
+option.map(opt: Option of (T), f: …) -> Option of (U)
 ```
 
 | Case | Result |
@@ -541,7 +541,7 @@ previous: flat_map
 -->
 
 ```vir
-option.flatMap(opt: Option(T), f: …) -> Option(U)
+option.flatMap(opt: Option of (T), f: …) -> Option of (U)
 ```
 
 | Case | Result |
@@ -574,7 +574,7 @@ previous: filter
 -->
 
 ```vir
-option.filter(opt: Option(T), predicate: …) -> Option(T)
+option.filter(opt: Option of (T), predicate: …) -> Option of (T)
 ```
 
 | Case | Result |
@@ -607,7 +607,7 @@ previous: zip
 -->
 
 ```vir
-option.zip(a: Option(T), b: Option(U)) -> Option
+option.zip(a: Option of (T), b: Option of (U)) -> Option
 ```
 
 | Case | Result |
@@ -623,7 +623,7 @@ tuple type name ahead of the language.
 
 ### Status
 
-`deferred` — **out of public core** until `Pair(T, U)` (O1). Source may still have `zip`; not canonical.
+`deferred` — **out of public core** until `Pair of (T, U)` (O1). Source may still have `zip`; not canonical.
 
 ### Implementation mapping
 
@@ -646,7 +646,7 @@ previous: option_to_result
 -->
 
 ```vir
-option.toResult(opt: Option(T), error: E) -> Result(T, E)
+option.toResult(opt: Option of (T), error: E) -> Result of (T, E)
 ```
 
 | Case | Result |
@@ -684,5 +684,5 @@ lifecycle / semantics reflected. Implementation may proceed against this map
 1. Namespace renames (`unwrapOr` / `unwrapOrElse` / `otherwise`).
 2. Add `and` when convenient; not a design blocker.
 3. Callable HOF remain `planned` until ABI confirmed — then may become proposed/stable.
-4. Do **not** reintroduce public `zip` before `Pair(T, U)`.
+4. Do **not** reintroduce public `zip` before `Pair of (T, U)`.
 5. Keep constructors language-level (`Some` / `None`).
