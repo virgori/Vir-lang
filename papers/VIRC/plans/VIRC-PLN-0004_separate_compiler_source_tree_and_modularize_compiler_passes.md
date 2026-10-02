@@ -23,6 +23,7 @@ related:
   plans: []
   reports:
     - "VIRC-RPT-0002"
+    - "VIRC-RPT-0003"
 supersedes: null
 superseded_by: null
 tags:
