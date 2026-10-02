@@ -29390,357 +29390,20 @@ export pass6_count_callable_params, pass6_callable_param_type, pass6_callable_re
        pass6CaptureIdeMember, pass6_type_kind_to_str, pass6_get_actual_type_str,
        pass6_report_return_type_mismatch, pass6_report_field_type_mismatch,
        pass6_report_type_mismatch
-# @vir_source compiler/src/semantic/sem_pass6_typecheck.vri 1
+# @vir_source compiler/src/semantic/typecheck/compat_state.vri 1
 ##
- * vir/compiler/sem_pass6_typecheck.vri
- * ==============================================================
- * Pass 6: Complete Type Checking for Vir v2.0
- * Validates type compatibility for operators, assignments, calls,
- * returns, entity field accesses, and array indexing.
+ * compiler/src/semantic/typecheck/compat_state.vri — Compatibility, Scopes & Container State
+ * =========================================================================================
+ * VIRC-PLN-0004 Section 5: Type compatibility, call argument validation,
+ * entity collection and field queries, packed definitions, scoped variables,
+ * and dictionary/array element types.
+ *
+ * Implements:
+ * - pass6_call_arg_types_compatible: argument type checking
+ * - pass6_collect_entities, pass6_find_entity_ast: entity registry & search
+ * - pass6_scope_enter, pass6_scope_exit, pass6_set_var_type, pass6_get_var_type: scoped var types
+ * - pass6_dict_*_type, pass6_array_var_elem_type: container type helpers
  ##
-
-
-# Hash ONLY global scope.  Orphan Func/Block nodes from prior passes would
-# make a dense per-scope 256-bucket table allocate millions of vecs.
-const PASS6_BUCKETS: int = 256
-var g_pass6_symbols: i64 = 0
-var g_pass6_scopes: i64 = 0
-var g_pass6_diag: i64 = 0
-var g_pass6_global_buckets: i64 = 0
-var g_pass6_suffix_buckets: i64 = 0
-var g_pass6_scope_buckets: i64 = 0
-const PASS6_SCOPE_BUCKETS_COUNT: int = 1024
-var g_pass6_extern_names: i64 = 0
-var g_pass6_extern_nodes: i64 = 0
-var g_pass6_extern_buckets: i64 = 0
-var g_pass6_ai_mode: int = 0 # 0=normal, 1=infer, 2=train
-var g_pass6_infer_values: i64 = 0
-var g_pass6_train_values: i64 = 0
-var g_pass6_entity_names: i64 = 0
-var g_pass6_entity_nodes: i64 = 0
-var g_pass6_entity_buckets: i64 = 0
-var g_pass6_enum_buckets: i64 = 0
-var g_pass6_func_names: i64 = 0
-var g_pass6_func_nodes: i64 = 0
-var g_pass6_func_canonical_names: i64 = 0
-var g_pass6_func_buckets: i64 = 0
-var g_pass6_func_canon_buckets: i64 = 0
-var g_pass6_func_canon_by_node: i64 = 0
-var g_pass6_ret_stmt_buckets: i64 = 0
-var g_pass6_visiting_symbols: i64 = 0
-var g_pass6_sym_types: i64 = 0
-var g_pass6_scoped_var_names: i64 = 0
-var g_pass6_scoped_var_types: i64 = 0
-var g_pass6_scope_watermarks: i64 = 0
-var g_pass6_current_entity_name: i64 = 0
-var g_pass6_current_func_name: i64 = 0
-var g_pass6_current_func_ret_type: i64 = 0
-var g_pass6_var_names: i64 = 0
-var g_pass6_var_types: i64 = 0
-var g_pass6_assigned_vars: i64 = 0
-var g_pass6_quantized_tensor_type: i64 = fat_str_new("QuantizedTensor") as i64
-var g_pass6_cur_module: string = ""
-var g_pass6_current_generic_params: string = ""
-var g_pass6_fn_ret_cache_keys: i64 = 0
-var g_pass6_fn_ret_cache_vals: i64 = 0
-var g_pass6_visiting_funcs: i64 = 0
-var g_pass6_visiting_local_exprs: i64 = 0
-
-# TypeCompatKind is imported from virc.semantic.typecheck.compatibility
-
-func is_user_module(name: &string) -> int:
-    let s = name as int
-    if s == 0 do out 0 end
-    let slen = native_read_i64(s, 8) as int
-    if slen == 0 do out 0 end
-    let cstr_ptr = native_read_i64(s, 0) as int
-    if cstr_ptr == 0 do out 0 end
-    if slen == 4 and native_read_u8(cstr_ptr, 0) == 114 and native_read_u8(cstr_ptr, 1) == 111 and native_read_u8(cstr_ptr, 2) == 111 and native_read_u8(cstr_ptr, 3) == 116 do
-        out 0
-    end
-    if slen >= 4 and native_read_u8(cstr_ptr, 0) == 118 and native_read_u8(cstr_ptr, 1) == 105 and native_read_u8(cstr_ptr, 2) == 114 and native_read_u8(cstr_ptr, 3) == 46 do
-        out 0
-    end
-    out 1
-end.
-
-func pass6_hash_name(name: &string) -> int:
-    out typecheck_hash_name(name)
-end.
-
-func pass6_global_map_new():
-    buckets = vec_new_rt()
-    var bi = 0
-    when bi < PASS6_BUCKETS loop
-        buckets = vec_push_rt(buckets, vec_new_rt())
-        bi = bi + 1
-    end
-    out buckets
-end.
-
-func pass6_get_short_name(name: &string) -> string:
-    out typecheck_get_short_name(name)
-end.
-
-func pass6_index_global(name: &string, sym_id: int):
-    if fat_str_len(name) == 0 do
-        out 0
-    end
-    if g_pass6_global_buckets == 0 do
-        g_pass6_global_buckets = pass6_global_map_new()
-    end
-    bid = pass6_hash_name(name)
-    bucket = vec_get_rt(g_pass6_global_buckets, bid)
-    bucket = vec_push_rt(bucket, sym_id)
-    vec_set_rt(g_pass6_global_buckets, bid, bucket)
-
-    let short_name = pass6_get_short_name(name)
-    if fat_str_len(short_name) > 0 do
-        if g_pass6_suffix_buckets == 0 do
-            g_pass6_suffix_buckets = pass6_global_map_new()
-        end
-        let sbid = pass6_hash_name(short_name)
-        var sbucket = vec_get_rt(g_pass6_suffix_buckets, sbid)
-        sbucket = vec_push_rt(sbucket, sym_id)
-        vec_set_rt(g_pass6_suffix_buckets, sbid, sbucket)
-    end
-    out 0
-end.
-
-func pass6_scope_buckets_new():
-    buckets = vec_new_rt()
-    var bi = 0
-    when bi < PASS6_SCOPE_BUCKETS_COUNT loop
-        buckets = vec_push_rt(buckets, vec_new_rt())
-        bi = bi + 1
-    end
-    out buckets
-end.
-
-func pass6_index_scope_symbol(scope_id: int, name: &string, sym_id: int):
-    if fat_str_len(name) == 0 do out 0 end
-    if g_pass6_scope_buckets == 0 do
-        g_pass6_scope_buckets = pass6_scope_buckets_new()
-    end
-    var h = (scope_id * 37 + pass6_hash_name(name)) and 1023
-    if h < 0 do h = 0 - h end
-    h = h and 1023
-    var bucket = vec_get_rt(g_pass6_scope_buckets, h)
-    bucket = vec_push_rt(bucket, sym_id)
-    vec_set_rt(g_pass6_scope_buckets, h, bucket)
-    out 0
-end.
-
-func pass6_lookup_scope_indexed(ref symbols: SymbolTable, scope_id: int, name: &string) -> int:
-    if scope_id <= 0 or g_pass6_scope_buckets == 0 do out -1 end
-    var h = (scope_id * 37 + pass6_hash_name(name)) and 1023
-    if h < 0 do h = 0 - h end
-    h = h and 1023
-    let bucket = vec_get_rt(g_pass6_scope_buckets, h)
-    let count = vec_len_rt(bucket)
-    if count == 0 do out -1 end
-    let syms_vec = native_read_i64(symbols as i64, 0)
-    var i = 0
-    when i < count loop
-        let sym_id = vec_get_rt(bucket, i) as int
-        let sym = vec_get_rt(syms_vec, sym_id)
-        if (sym as i64) != 0 do
-            if sym.scope_id == scope_id do
-                let sym_name_ptr = native_read_i64(sym as i64, 8)
-                if sym_name_ptr != 0 do
-                    if fat_str_eq(sym_name_ptr as string, name) == 1 do
-                        out sym_id
-                    end
-                end
-            end
-        end
-        i = i + 1
-    end
-    out -1
-end.
-
-func pass6_rebuild_index(ref symbols: SymbolTable, ref scopes: ScopeTree):
-    g_pass6_global_buckets = pass6_global_map_new()
-    g_pass6_suffix_buckets = pass6_global_map_new()
-    g_pass6_scope_buckets = pass6_scope_buckets_new()
-    scopes_vec = native_read_i64(scopes as i64, 0)
-    syms_vec = native_read_i64(symbols as i64, 0)
-    let n_scopes = vec_len_rt(scopes_vec)
-    var s = 0
-    when s < n_scopes loop
-        let scope_node = vec_get_rt(scopes_vec, s)
-        let sym_list = native_read_i64(scope_node as i64, 16)
-        let count = vec_len_rt(sym_list)
-        var i = 0
-        when i < count loop
-            let sym_id = vec_get_rt(sym_list, i) as int
-            let sym = vec_get_rt(syms_vec, sym_id)
-            let sym_name_ptr = native_read_i64(sym as i64, 8)
-            if sym_name_ptr != 0 do
-                let sym_name = sym_name_ptr as string
-                if s == 0 do
-                    pass6_index_global(sym_name, sym_id)
-                else
-                    pass6_index_scope_symbol(s, sym_name, sym_id)
-                end
-            end
-            i = i + 1
-        end
-        s = s + 1
-    end
-    out 0
-end.
-
-func pass6_typecheck(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode):
-    g_pass6_symbols = symbols as i64
-    g_pass6_scopes = scopes as i64
-    g_pass6_diag = diag as i64
-    pass6_rebuild_index(symbols, scopes)
-    g_pass6_extern_names = vec_new_rt()
-    g_pass6_extern_nodes = vec_new_rt()
-    g_pass6_extern_buckets = pass6_global_map_new()
-    g_pass6_entity_names = vec_new_rt()
-    g_pass6_entity_nodes = vec_new_rt()
-    g_pass6_entity_buckets = pass6_global_map_new()
-    g_pass6_enum_buckets = pass6_global_map_new()
-    g_pass6_func_names = vec_new_rt()
-    g_pass6_func_nodes = vec_new_rt()
-    g_pass6_func_canonical_names = vec_new_rt()
-    g_pass6_func_buckets = pass6_global_map_new()
-    g_pass6_func_canon_buckets = pass6_global_map_new()
-    g_pass6_func_canon_by_node = pass6_global_map_new()
-    g_pass6_ret_stmt_buckets = pass6_global_map_new()
-    g_pass6_visiting_symbols = vec_new_rt()
-    g_pass6_fn_ret_cache_keys = vec_new_rt()
-    g_pass6_fn_ret_cache_vals = vec_new_rt()
-    g_pass6_visiting_funcs = vec_new_rt()
-    g_pass6_visiting_local_exprs = vec_new_rt()
-    g_pass6_sym_types = vec_new_rt()
-    g_pass6_scoped_var_names = vec_new_rt()
-    g_pass6_scoped_var_types = vec_new_rt()
-    g_pass6_scope_watermarks = vec_new_rt()
-    g_pass6_var_names = vec_new_rt()
-    g_pass6_var_types = vec_new_rt()
-    g_pass6_current_entity_name = 0
-    g_pass6_ai_mode = 0
-    g_pass6_infer_values = vec_new_rt()
-    g_pass6_train_values = vec_new_rt()
-    g_pass6_assigned_vars = vec_new_rt()
-    pass6_collect_externs(node)
-    pass6_collect_entities(node)
-    pass6_collect_free_functions(node)
-    pass6_walk(symbols, scopes, diag, node)
-end.
-
-func pass6_collect_free_functions(node: &AstNode):
-    g_pass6_func_buckets = pass6_global_map_new()
-    g_pass6_func_canon_buckets = pass6_global_map_new()
-    g_pass6_func_canon_by_node = pass6_global_map_new()
-    var cur_mod = fat_str_new("")
-    let n_children = vec_len_rt(node.children)
-    var i = 0
-    when i < n_children loop
-        let candidate = vec_get_rt(node.children, i)
-        if candidate.node_type == AstType.ModuleStmt and fat_str_len(candidate.name) > 0 do
-            cur_mod = candidate.name
-        end
-        var fn_c = candidate
-        if (fn_c.node_type == AstType.BindAttr or fn_c.node_type == AstType.ExposeAttr) and vec_len_rt(fn_c.children) > 0 do
-            fn_c = vec_get_rt(fn_c.children, 0)
-        end
-        if fn_c.node_type == AstType.FuncDef and fat_str_len(fn_c.name) > 0 do
-            var canonical_name = fn_c.name
-            if is_user_module(cur_mod) == 1 and fat_cstr_eq(fn_c.name, "main") == 0 do
-                canonical_name = fat_str_concat(fat_str_concat(cur_mod, fat_str_new(".")), fn_c.name)
-            end
-            let k = vec_len_rt(g_pass6_func_nodes)
-            g_pass6_func_names = vec_push_rt(g_pass6_func_names, fn_c.name)
-            g_pass6_func_nodes = vec_push_rt(g_pass6_func_nodes, fn_c)
-            g_pass6_func_canonical_names = vec_push_rt(g_pass6_func_canonical_names, canonical_name)
-
-            let fbid = pass6_hash_name(fn_c.name)
-            var fbucket = vec_get_rt(g_pass6_func_buckets, fbid)
-            fbucket = vec_push_rt(fbucket, k)
-            vec_set_rt(g_pass6_func_buckets, fbid, fbucket)
-
-            let cbid = pass6_hash_name(canonical_name)
-            var cbucket = vec_get_rt(g_pass6_func_canon_buckets, cbid)
-            cbucket = vec_push_rt(cbucket, k)
-            vec_set_rt(g_pass6_func_canon_buckets, cbid, cbucket)
-
-            let nbid = (((fn_c as i64) shr 4) and 255) as int
-            var nbucket = vec_get_rt(g_pass6_func_canon_by_node, nbid)
-            nbucket = vec_push_rt(nbucket, k)
-            vec_set_rt(g_pass6_func_canon_by_node, nbid, nbucket)
-        end
-        i = i + 1
-    end
-    out 0
-end.
-
-func pass6_find_free_function(name: &string):
-    out typecheck_find_free_function_raw(g_pass6_func_buckets, g_pass6_func_names, g_pass6_func_nodes, name)
-end.
-
-func pass6_find_canonical_identity(fn_node: &AstNode):
-    if (fn_node as i64) == 0 do out fat_str_new("") end
-    if g_pass6_func_canon_by_node != 0 do
-        let bid = (((fn_node as i64) shr 4) and 255) as int
-        let bucket = vec_get_rt(g_pass6_func_canon_by_node, bid)
-        let count = vec_len_rt(bucket)
-        var i = 0
-        when i < count loop
-            let k = vec_get_rt(bucket, i)
-            if (vec_get_rt(g_pass6_func_nodes, k) as i64) == (fn_node as i64) do
-                out vec_get_rt(g_pass6_func_canonical_names, k) as string
-            end
-            i = i + 1
-        end
-    end
-    out fn_node.name
-end.
-
-func pass6_find_func_by_canonical_identity(id: &string):
-    out typecheck_find_func_by_canonical_identity_raw(g_pass6_func_canon_buckets, g_pass6_func_canonical_names, g_pass6_func_nodes, id)
-end.
-
-func pass6_collect_externs(node: &AstNode):
-    if node as i64 == 0 do out 0 end
-    if node.node_type == AstType.ExternFunc and fat_str_len(node.name) > 0 do
-        g_pass6_extern_names = vec_push_rt(g_pass6_extern_names, node.name as i64)
-        g_pass6_extern_nodes = vec_push_rt(g_pass6_extern_nodes, node as i64)
-        if g_pass6_extern_buckets == 0 do
-            g_pass6_extern_buckets = pass6_global_map_new()
-        end
-        let bid = pass6_hash_name(node.name)
-        var bucket = vec_get_rt(g_pass6_extern_buckets, bid)
-        bucket = vec_push_rt(bucket, node as i64)
-        vec_set_rt(g_pass6_extern_buckets, bid, bucket)
-        out 0
-    end
-    child_count = vec_len_rt(node.children)
-    var i = 0
-    when i < child_count loop
-        pass6_collect_externs(vec_get_rt(node.children, i))
-        i = i + 1
-    end
-    out 0
-end.
-
-func pass6_find_extern(name: &string):
-    let ext = typecheck_find_extern_node(g_pass6_extern_buckets, name)
-    out ext as i64
-end.
-
-
-func pass6_symbol_at(ref symbols: SymbolTable, id: int):
-    # Avoid ambiguous nested entity-field lowering in native self-host code.
-    if (symbols as i64) == 0 or id < 0 do out 0 end
-    syms_vec = native_read_i64(symbols as i64, 0)
-    if syms_vec == 0 do out 0 end
-    if id >= vec_len_rt(syms_vec) do out 0 end
-    out vec_get_rt(syms_vec, id)
-end.
 
 
 func pass6_unwrap_type_name(name: &string) -> string:
@@ -30129,6 +29792,373 @@ func pass6_array_var_elem_type(ref symbols: SymbolTable, ref scopes: ScopeTree, 
         end
     end
     out TypeKind.Void
+end.
+
+export pass6_unwrap_type_name, pass6_resolve_ffi_type, pass6_is_integer_like,
+       pass6_check_compatibility, pass6_types_compatible, pass6_ufcs_types_compatible,
+       pass6_param_types_compatible, pass6_is_lowlevel_call_or_param,
+       pass6_call_arg_types_compatible, pass6_is_logic_bit_operand,
+       pass6_name_in_vec, pass6_tensor_type_name,
+       pass6_collect_entities, pass6_find_entity_ast, pass6_entity_has_field,
+       pass6_find_best_entity_ast, pass6_is_valid_packed_primitive,
+       pass6_register_base_bits, pass6_packed_has_cycle, pass6_check_packed_def,
+       pass6_set_sym_type, pass6_get_sym_type,
+       pass6_scope_enter, pass6_scope_exit,
+       pass6_get_scoped_name_type, pass6_set_scoped_name_type,
+       pass6_set_var_type, pass6_get_var_type,
+       pass6_dict_key_expr_type, pass6_dict_literal_key_type,
+       pass6_dict_var_key_type, pass6_dict_literal_value_type,
+       pass6_dict_var_value_type, pass6_array_var_elem_type
+# @vir_source compiler/src/semantic/sem_pass6_typecheck.vri 1
+##
+ * vir/compiler/sem_pass6_typecheck.vri
+ * ==============================================================
+ * Pass 6: Complete Type Checking for Vir v2.0
+ * Validates type compatibility for operators, assignments, calls,
+ * returns, entity field accesses, and array indexing.
+ ##
+
+
+# Hash ONLY global scope.  Orphan Func/Block nodes from prior passes would
+# make a dense per-scope 256-bucket table allocate millions of vecs.
+const PASS6_BUCKETS: int = 256
+var g_pass6_symbols: i64 = 0
+var g_pass6_scopes: i64 = 0
+var g_pass6_diag: i64 = 0
+var g_pass6_global_buckets: i64 = 0
+var g_pass6_suffix_buckets: i64 = 0
+var g_pass6_scope_buckets: i64 = 0
+const PASS6_SCOPE_BUCKETS_COUNT: int = 1024
+var g_pass6_extern_names: i64 = 0
+var g_pass6_extern_nodes: i64 = 0
+var g_pass6_extern_buckets: i64 = 0
+var g_pass6_ai_mode: int = 0 # 0=normal, 1=infer, 2=train
+var g_pass6_infer_values: i64 = 0
+var g_pass6_train_values: i64 = 0
+var g_pass6_entity_names: i64 = 0
+var g_pass6_entity_nodes: i64 = 0
+var g_pass6_entity_buckets: i64 = 0
+var g_pass6_enum_buckets: i64 = 0
+var g_pass6_func_names: i64 = 0
+var g_pass6_func_nodes: i64 = 0
+var g_pass6_func_canonical_names: i64 = 0
+var g_pass6_func_buckets: i64 = 0
+var g_pass6_func_canon_buckets: i64 = 0
+var g_pass6_func_canon_by_node: i64 = 0
+var g_pass6_ret_stmt_buckets: i64 = 0
+var g_pass6_visiting_symbols: i64 = 0
+var g_pass6_sym_types: i64 = 0
+var g_pass6_scoped_var_names: i64 = 0
+var g_pass6_scoped_var_types: i64 = 0
+var g_pass6_scope_watermarks: i64 = 0
+var g_pass6_current_entity_name: i64 = 0
+var g_pass6_current_func_name: i64 = 0
+var g_pass6_current_func_ret_type: i64 = 0
+var g_pass6_var_names: i64 = 0
+var g_pass6_var_types: i64 = 0
+var g_pass6_assigned_vars: i64 = 0
+var g_pass6_quantized_tensor_type: i64 = fat_str_new("QuantizedTensor") as i64
+var g_pass6_cur_module: string = ""
+var g_pass6_current_generic_params: string = ""
+var g_pass6_fn_ret_cache_keys: i64 = 0
+var g_pass6_fn_ret_cache_vals: i64 = 0
+var g_pass6_visiting_funcs: i64 = 0
+var g_pass6_visiting_local_exprs: i64 = 0
+
+# TypeCompatKind is imported from virc.semantic.typecheck.compatibility
+
+func is_user_module(name: &string) -> int:
+    let s = name as int
+    if s == 0 do out 0 end
+    let slen = native_read_i64(s, 8) as int
+    if slen == 0 do out 0 end
+    let cstr_ptr = native_read_i64(s, 0) as int
+    if cstr_ptr == 0 do out 0 end
+    if slen == 4 and native_read_u8(cstr_ptr, 0) == 114 and native_read_u8(cstr_ptr, 1) == 111 and native_read_u8(cstr_ptr, 2) == 111 and native_read_u8(cstr_ptr, 3) == 116 do
+        out 0
+    end
+    if slen >= 4 and native_read_u8(cstr_ptr, 0) == 118 and native_read_u8(cstr_ptr, 1) == 105 and native_read_u8(cstr_ptr, 2) == 114 and native_read_u8(cstr_ptr, 3) == 46 do
+        out 0
+    end
+    out 1
+end.
+
+func pass6_hash_name(name: &string) -> int:
+    out typecheck_hash_name(name)
+end.
+
+func pass6_global_map_new():
+    buckets = vec_new_rt()
+    var bi = 0
+    when bi < PASS6_BUCKETS loop
+        buckets = vec_push_rt(buckets, vec_new_rt())
+        bi = bi + 1
+    end
+    out buckets
+end.
+
+func pass6_get_short_name(name: &string) -> string:
+    out typecheck_get_short_name(name)
+end.
+
+func pass6_index_global(name: &string, sym_id: int):
+    if fat_str_len(name) == 0 do
+        out 0
+    end
+    if g_pass6_global_buckets == 0 do
+        g_pass6_global_buckets = pass6_global_map_new()
+    end
+    bid = pass6_hash_name(name)
+    bucket = vec_get_rt(g_pass6_global_buckets, bid)
+    bucket = vec_push_rt(bucket, sym_id)
+    vec_set_rt(g_pass6_global_buckets, bid, bucket)
+
+    let short_name = pass6_get_short_name(name)
+    if fat_str_len(short_name) > 0 do
+        if g_pass6_suffix_buckets == 0 do
+            g_pass6_suffix_buckets = pass6_global_map_new()
+        end
+        let sbid = pass6_hash_name(short_name)
+        var sbucket = vec_get_rt(g_pass6_suffix_buckets, sbid)
+        sbucket = vec_push_rt(sbucket, sym_id)
+        vec_set_rt(g_pass6_suffix_buckets, sbid, sbucket)
+    end
+    out 0
+end.
+
+func pass6_scope_buckets_new():
+    buckets = vec_new_rt()
+    var bi = 0
+    when bi < PASS6_SCOPE_BUCKETS_COUNT loop
+        buckets = vec_push_rt(buckets, vec_new_rt())
+        bi = bi + 1
+    end
+    out buckets
+end.
+
+func pass6_index_scope_symbol(scope_id: int, name: &string, sym_id: int):
+    if fat_str_len(name) == 0 do out 0 end
+    if g_pass6_scope_buckets == 0 do
+        g_pass6_scope_buckets = pass6_scope_buckets_new()
+    end
+    var h = (scope_id * 37 + pass6_hash_name(name)) and 1023
+    if h < 0 do h = 0 - h end
+    h = h and 1023
+    var bucket = vec_get_rt(g_pass6_scope_buckets, h)
+    bucket = vec_push_rt(bucket, sym_id)
+    vec_set_rt(g_pass6_scope_buckets, h, bucket)
+    out 0
+end.
+
+func pass6_lookup_scope_indexed(ref symbols: SymbolTable, scope_id: int, name: &string) -> int:
+    if scope_id <= 0 or g_pass6_scope_buckets == 0 do out -1 end
+    var h = (scope_id * 37 + pass6_hash_name(name)) and 1023
+    if h < 0 do h = 0 - h end
+    h = h and 1023
+    let bucket = vec_get_rt(g_pass6_scope_buckets, h)
+    let count = vec_len_rt(bucket)
+    if count == 0 do out -1 end
+    let syms_vec = native_read_i64(symbols as i64, 0)
+    var i = 0
+    when i < count loop
+        let sym_id = vec_get_rt(bucket, i) as int
+        let sym = vec_get_rt(syms_vec, sym_id)
+        if (sym as i64) != 0 do
+            if sym.scope_id == scope_id do
+                let sym_name_ptr = native_read_i64(sym as i64, 8)
+                if sym_name_ptr != 0 do
+                    if fat_str_eq(sym_name_ptr as string, name) == 1 do
+                        out sym_id
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    out -1
+end.
+
+func pass6_rebuild_index(ref symbols: SymbolTable, ref scopes: ScopeTree):
+    g_pass6_global_buckets = pass6_global_map_new()
+    g_pass6_suffix_buckets = pass6_global_map_new()
+    g_pass6_scope_buckets = pass6_scope_buckets_new()
+    scopes_vec = native_read_i64(scopes as i64, 0)
+    syms_vec = native_read_i64(symbols as i64, 0)
+    let n_scopes = vec_len_rt(scopes_vec)
+    var s = 0
+    when s < n_scopes loop
+        let scope_node = vec_get_rt(scopes_vec, s)
+        let sym_list = native_read_i64(scope_node as i64, 16)
+        let count = vec_len_rt(sym_list)
+        var i = 0
+        when i < count loop
+            let sym_id = vec_get_rt(sym_list, i) as int
+            let sym = vec_get_rt(syms_vec, sym_id)
+            let sym_name_ptr = native_read_i64(sym as i64, 8)
+            if sym_name_ptr != 0 do
+                let sym_name = sym_name_ptr as string
+                if s == 0 do
+                    pass6_index_global(sym_name, sym_id)
+                else
+                    pass6_index_scope_symbol(s, sym_name, sym_id)
+                end
+            end
+            i = i + 1
+        end
+        s = s + 1
+    end
+    out 0
+end.
+
+func pass6_typecheck(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode):
+    g_pass6_symbols = symbols as i64
+    g_pass6_scopes = scopes as i64
+    g_pass6_diag = diag as i64
+    pass6_rebuild_index(symbols, scopes)
+    g_pass6_extern_names = vec_new_rt()
+    g_pass6_extern_nodes = vec_new_rt()
+    g_pass6_extern_buckets = pass6_global_map_new()
+    g_pass6_entity_names = vec_new_rt()
+    g_pass6_entity_nodes = vec_new_rt()
+    g_pass6_entity_buckets = pass6_global_map_new()
+    g_pass6_enum_buckets = pass6_global_map_new()
+    g_pass6_func_names = vec_new_rt()
+    g_pass6_func_nodes = vec_new_rt()
+    g_pass6_func_canonical_names = vec_new_rt()
+    g_pass6_func_buckets = pass6_global_map_new()
+    g_pass6_func_canon_buckets = pass6_global_map_new()
+    g_pass6_func_canon_by_node = pass6_global_map_new()
+    g_pass6_ret_stmt_buckets = pass6_global_map_new()
+    g_pass6_visiting_symbols = vec_new_rt()
+    g_pass6_fn_ret_cache_keys = vec_new_rt()
+    g_pass6_fn_ret_cache_vals = vec_new_rt()
+    g_pass6_visiting_funcs = vec_new_rt()
+    g_pass6_visiting_local_exprs = vec_new_rt()
+    g_pass6_sym_types = vec_new_rt()
+    g_pass6_scoped_var_names = vec_new_rt()
+    g_pass6_scoped_var_types = vec_new_rt()
+    g_pass6_scope_watermarks = vec_new_rt()
+    g_pass6_var_names = vec_new_rt()
+    g_pass6_var_types = vec_new_rt()
+    g_pass6_current_entity_name = 0
+    g_pass6_ai_mode = 0
+    g_pass6_infer_values = vec_new_rt()
+    g_pass6_train_values = vec_new_rt()
+    g_pass6_assigned_vars = vec_new_rt()
+    pass6_collect_externs(node)
+    pass6_collect_entities(node)
+    pass6_collect_free_functions(node)
+    pass6_walk(symbols, scopes, diag, node)
+end.
+
+func pass6_collect_free_functions(node: &AstNode):
+    g_pass6_func_buckets = pass6_global_map_new()
+    g_pass6_func_canon_buckets = pass6_global_map_new()
+    g_pass6_func_canon_by_node = pass6_global_map_new()
+    var cur_mod = fat_str_new("")
+    let n_children = vec_len_rt(node.children)
+    var i = 0
+    when i < n_children loop
+        let candidate = vec_get_rt(node.children, i)
+        if candidate.node_type == AstType.ModuleStmt and fat_str_len(candidate.name) > 0 do
+            cur_mod = candidate.name
+        end
+        var fn_c = candidate
+        if (fn_c.node_type == AstType.BindAttr or fn_c.node_type == AstType.ExposeAttr) and vec_len_rt(fn_c.children) > 0 do
+            fn_c = vec_get_rt(fn_c.children, 0)
+        end
+        if fn_c.node_type == AstType.FuncDef and fat_str_len(fn_c.name) > 0 do
+            var canonical_name = fn_c.name
+            if is_user_module(cur_mod) == 1 and fat_cstr_eq(fn_c.name, "main") == 0 do
+                canonical_name = fat_str_concat(fat_str_concat(cur_mod, fat_str_new(".")), fn_c.name)
+            end
+            let k = vec_len_rt(g_pass6_func_nodes)
+            g_pass6_func_names = vec_push_rt(g_pass6_func_names, fn_c.name)
+            g_pass6_func_nodes = vec_push_rt(g_pass6_func_nodes, fn_c)
+            g_pass6_func_canonical_names = vec_push_rt(g_pass6_func_canonical_names, canonical_name)
+
+            let fbid = pass6_hash_name(fn_c.name)
+            var fbucket = vec_get_rt(g_pass6_func_buckets, fbid)
+            fbucket = vec_push_rt(fbucket, k)
+            vec_set_rt(g_pass6_func_buckets, fbid, fbucket)
+
+            let cbid = pass6_hash_name(canonical_name)
+            var cbucket = vec_get_rt(g_pass6_func_canon_buckets, cbid)
+            cbucket = vec_push_rt(cbucket, k)
+            vec_set_rt(g_pass6_func_canon_buckets, cbid, cbucket)
+
+            let nbid = (((fn_c as i64) shr 4) and 255) as int
+            var nbucket = vec_get_rt(g_pass6_func_canon_by_node, nbid)
+            nbucket = vec_push_rt(nbucket, k)
+            vec_set_rt(g_pass6_func_canon_by_node, nbid, nbucket)
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass6_find_free_function(name: &string):
+    out typecheck_find_free_function_raw(g_pass6_func_buckets, g_pass6_func_names, g_pass6_func_nodes, name)
+end.
+
+func pass6_find_canonical_identity(fn_node: &AstNode):
+    if (fn_node as i64) == 0 do out fat_str_new("") end
+    if g_pass6_func_canon_by_node != 0 do
+        let bid = (((fn_node as i64) shr 4) and 255) as int
+        let bucket = vec_get_rt(g_pass6_func_canon_by_node, bid)
+        let count = vec_len_rt(bucket)
+        var i = 0
+        when i < count loop
+            let k = vec_get_rt(bucket, i)
+            if (vec_get_rt(g_pass6_func_nodes, k) as i64) == (fn_node as i64) do
+                out vec_get_rt(g_pass6_func_canonical_names, k) as string
+            end
+            i = i + 1
+        end
+    end
+    out fn_node.name
+end.
+
+func pass6_find_func_by_canonical_identity(id: &string):
+    out typecheck_find_func_by_canonical_identity_raw(g_pass6_func_canon_buckets, g_pass6_func_canonical_names, g_pass6_func_nodes, id)
+end.
+
+func pass6_collect_externs(node: &AstNode):
+    if node as i64 == 0 do out 0 end
+    if node.node_type == AstType.ExternFunc and fat_str_len(node.name) > 0 do
+        g_pass6_extern_names = vec_push_rt(g_pass6_extern_names, node.name as i64)
+        g_pass6_extern_nodes = vec_push_rt(g_pass6_extern_nodes, node as i64)
+        if g_pass6_extern_buckets == 0 do
+            g_pass6_extern_buckets = pass6_global_map_new()
+        end
+        let bid = pass6_hash_name(node.name)
+        var bucket = vec_get_rt(g_pass6_extern_buckets, bid)
+        bucket = vec_push_rt(bucket, node as i64)
+        vec_set_rt(g_pass6_extern_buckets, bid, bucket)
+        out 0
+    end
+    child_count = vec_len_rt(node.children)
+    var i = 0
+    when i < child_count loop
+        pass6_collect_externs(vec_get_rt(node.children, i))
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass6_find_extern(name: &string):
+    let ext = typecheck_find_extern_node(g_pass6_extern_buckets, name)
+    out ext as i64
+end.
+
+
+func pass6_symbol_at(ref symbols: SymbolTable, id: int):
+    # Avoid ambiguous nested entity-field lowering in native self-host code.
+    if (symbols as i64) == 0 or id < 0 do out 0 end
+    syms_vec = native_read_i64(symbols as i64, 0)
+    if syms_vec == 0 do out 0 end
+    if id >= vec_len_rt(syms_vec) do out 0 end
+    out vec_get_rt(syms_vec, id)
 end.
 
 func pass6_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode):
