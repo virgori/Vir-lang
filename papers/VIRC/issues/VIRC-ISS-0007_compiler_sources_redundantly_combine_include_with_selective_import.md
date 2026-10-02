@@ -18,7 +18,8 @@ related:
   issues:
     - "VIRC-ISS-0006"
     - "VIRC-ISS-0008"
-  plans: []
+  plans:
+    - "VIRC-PLN-0005"
   reports: []
 supersedes: null
 superseded_by: null
@@ -225,3 +226,4 @@ final module graph now.
 | 2026-10-02 | Opened from source inventory, active resolver inspection, and an include-only compiler fixture |
 | 2026-10-02 | Linked VIRC-ISS-0008 |
 | 2026-10-02 | Linked VIRC-ISS-0006 |
+| 2026-10-02 | Linked VIRC-PLN-0005 |
