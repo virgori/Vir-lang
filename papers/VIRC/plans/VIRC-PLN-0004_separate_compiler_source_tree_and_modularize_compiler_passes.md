@@ -21,7 +21,8 @@ related:
   issues:
     - "VIRC-ISS-0006"
   plans: []
-  reports: []
+  reports:
+    - "VIRC-RPT-0002"
 supersedes: null
 superseded_by: null
 tags:
@@ -1300,3 +1301,4 @@ the selected baseline or skip later regression comparison.
 | 2026-10-02 | Added manifest-driven copy migration into sibling `/Users/gengyang/Vir-3.0`, excluding `docs/_legacy` and carrying VPS paper skill, complete tests, and audited runner dependencies |
 | 2026-10-02 | Added commit-pinned migration of native `vir-lsp` and `vscode-vir`, with separate ownership, source-only copy rules, generated-artifact exclusions and integration gates |
 | 2026-10-02 | Rebased preparation on current Vir 4.0.0 source snapshot `fd0064ea`; baseline failures are recorded rather than required to be green, and later phases must not add unexplained regressions |
+| 2026-10-02 | Linked VIRC-RPT-0002 |
