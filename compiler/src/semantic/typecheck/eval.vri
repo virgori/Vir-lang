@@ -1,0 +1,621 @@
+##
+ * compiler/src/semantic/typecheck/eval.vri — Constant Evaluation & Type Inference
+ * ===============================================================================
+ * VIRC-PLN-0004 Section 5: Type inference, constant integer evaluation,
+ * return statement discovery, and call return resolution.
+ *
+ * Implements:
+ * - pass6_eval_const_int: compile-time constant integer evaluation
+ * - pass6_call_returns_first_arg: builtin first-arg returns check
+ * - pass6_find_return_stmt_uncached, pass6_find_return_stmt: return statement search
+ * - pass6_find_param_entity, pass6_find_local_decl_in_node
+ * - pass6_infer_unannotated_fn_return: infer unannotated function returns
+ * - pass6_infer_local_expr, pass6_infer_local_expr_inner: local expression inference
+ * - pass6_infer_call_return: return type inference for calls & methods
+ * - pass6_infer_type: primary expression type inference
+ * - pass6_infer_interp_type: string interpolation type inference
+ ##
+
+include typecheck_context
+include typecheck_compatibility
+include typecheck_inference
+include typecheck_operators
+include typecheck_ffi
+include typecheck_lookup
+
+func pass6_eval_const_int(ref symbols: SymbolTable, ref scopes: ScopeTree, node: &AstNode, depth: int):
+    if node as i64 == 0 or depth > 32 do out (0, 0) end
+    if node.node_type == AstType.LiteralInt do out (1, node.int_val) end
+    if node.node_type == AstType.Identifier do
+        found = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        if found != -1 do
+            sym = pass6_symbol_at(symbols, found)
+            if not sym.is_mutable and sym.ast_id != 0 do
+                decl = sym.ast_id as AstNode
+                if decl.node_type == AstType.ConstDecl and vec_len_rt(decl.children) > 0 do
+                    out pass6_eval_const_int(symbols, scopes, vec_get_rt(decl.children, 0), depth + 1)
+                end
+            end
+        end
+        out (0, 0)
+    end
+    if node.node_type == AstType.BinOp and vec_len_rt(node.children) >= 2 do
+        var (lok, lv) = pass6_eval_const_int(symbols, scopes, vec_get_rt(node.children, 0), depth + 1)
+        var (rok, rv) = pass6_eval_const_int(symbols, scopes, vec_get_rt(node.children, 1), depth + 1)
+        if lok == 0 or rok == 0 do out (0, 0) end
+        var (eval_ok, eval_val) = typecheck_eval_const_binop(node.op as int, lv, rv)
+        out (eval_ok, eval_val)
+    end
+    out (0, 0)
+end.
+
+func pass6_call_returns_first_arg(name: i64):
+    out typecheck_call_returns_first_arg(name)
+end.
+
+func pass6_find_return_stmt_uncached(node: &AstNode) -> AstNode:
+    out typecheck_find_return_stmt_uncached(node)
+end.
+
+func pass6_find_return_stmt(node: &AstNode) -> AstNode:
+    if (node as i64) == 0 do out 0 as AstNode end
+    if g_pass6_ret_stmt_buckets == 0 do
+        g_pass6_ret_stmt_buckets = pass6_global_map_new()
+    end
+    let bid = (((node as i64) shr 4) and 255) as int
+    let bucket = vec_get_rt(g_pass6_ret_stmt_buckets, bid)
+    let count = vec_len_rt(bucket)
+    var i = 0
+    when i < count loop
+        let entry_node = vec_get_rt(bucket, i) as i64
+        if entry_node == (node as i64) do
+            out vec_get_rt(bucket, i + 1) as AstNode
+        end
+        i = i + 2
+    end
+    let ret_s = pass6_find_return_stmt_uncached(node)
+    var new_bucket = bucket
+    new_bucket = vec_push_rt(new_bucket, node as i64)
+    new_bucket = vec_push_rt(new_bucket, ret_s as i64)
+    vec_set_rt(g_pass6_ret_stmt_buckets, bid, new_bucket)
+    out ret_s
+end.
+
+func pass6_find_param_entity(fn_node: &AstNode, param_name: &string):
+    out typecheck_find_param_type_name(fn_node, param_name)
+end.
+
+func pass6_find_local_decl_in_node(node: &AstNode, name: int) -> AstNode:
+    out typecheck_find_local_decl_in_node(node, name)
+end.
+
+func pass6_infer_unannotated_fn_return(ref symbols: SymbolTable, fn_node: &AstNode) -> TypeKind:
+    if (fn_node as i64) == 0 do out TypeKind.Void end
+    let fn_key = fn_node as i64
+    if g_pass6_fn_ret_cache_keys != 0 do
+        var ci = 0
+        let n_c = vec_len_rt(g_pass6_fn_ret_cache_keys)
+        when ci < n_c loop
+            if vec_get_rt(g_pass6_fn_ret_cache_keys, ci) == fn_key do
+                out vec_get_rt(g_pass6_fn_ret_cache_vals, ci) as TypeKind
+            end
+            ci = ci + 1
+        end
+    end
+    if g_pass6_visiting_funcs != 0 do
+        var vi = 0
+        let n_v = vec_len_rt(g_pass6_visiting_funcs)
+        when vi < n_v loop
+            if vec_get_rt(g_pass6_visiting_funcs, vi) == fn_key do
+                out TypeKind.Void
+            end
+            vi = vi + 1
+        end
+    end
+    g_pass6_visiting_funcs = vec_push_rt(g_pass6_visiting_funcs, fn_key)
+
+    var res_kind = TypeKind.Void
+    let ret_stmt = pass6_find_return_stmt(fn_node)
+    if (ret_stmt as i64) != 0 do
+        if vec_len_rt(ret_stmt.children) > 0 do
+            let ret_expr = vec_get_rt(ret_stmt.children, 0) as AstNode
+            res_kind = pass6_infer_local_expr(symbols, fn_node, ret_expr)
+        end
+    end
+
+    let v_len = vec_len_rt(g_pass6_visiting_funcs)
+    if g_pass6_visiting_funcs != 0 and v_len > 0 do
+        native_write_i64(g_pass6_visiting_funcs - 8, 0, v_len - 1)
+    end
+
+    if g_pass6_fn_ret_cache_keys != 0 do
+        g_pass6_fn_ret_cache_keys = vec_push_rt(g_pass6_fn_ret_cache_keys, fn_key)
+        g_pass6_fn_ret_cache_vals = vec_push_rt(g_pass6_fn_ret_cache_vals, res_kind as i64)
+    end
+    out res_kind
+end.
+
+func pass6_infer_local_expr(ref symbols: SymbolTable, fn_node: &AstNode, expr: &AstNode) -> TypeKind:
+    if (expr as i64) == 0 do out TypeKind.Void end
+    let expr_key = expr as i64
+    if g_pass6_visiting_local_exprs != 0 do
+        var vi = 0
+        let n_v = vec_len_rt(g_pass6_visiting_local_exprs)
+        when vi < n_v loop
+            if vec_get_rt(g_pass6_visiting_local_exprs, vi) == expr_key do
+                out TypeKind.Void
+            end
+            vi = vi + 1
+        end
+    end
+    g_pass6_visiting_local_exprs = vec_push_rt(g_pass6_visiting_local_exprs, expr_key)
+    let res = pass6_infer_local_expr_inner(symbols, fn_node, expr)
+    let v_len = vec_len_rt(g_pass6_visiting_local_exprs)
+    if g_pass6_visiting_local_exprs != 0 and v_len > 0 do
+        native_write_i64(g_pass6_visiting_local_exprs - 8, 0, v_len - 1)
+    end
+    out res
+end.
+
+func pass6_infer_local_expr_inner(ref symbols: SymbolTable, fn_node: &AstNode, expr: &AstNode) -> TypeKind:
+    if (expr as i64) == 0 do out TypeKind.Void end
+    let lit_k = typecheck_infer_literal(expr)
+    if lit_k != TypeKind.Void do out lit_k end
+    if expr.node_type == AstType.BinOp do
+        let n_ch = vec_len_rt(expr.children)
+        if n_ch >= 2 do
+            if fat_cstr_eq(expr.name, "==") == 1 or fat_cstr_eq(expr.name, "!=") == 1 or fat_cstr_eq(expr.name, "<") == 1 or fat_cstr_eq(expr.name, "<=") == 1 or fat_cstr_eq(expr.name, ">") == 1 or fat_cstr_eq(expr.name, ">=") == 1 or fat_cstr_eq(expr.name, "and") == 1 or fat_cstr_eq(expr.name, "or") == 1 do
+                out TypeKind.Bool
+            end
+            let l_expr = vec_get_rt(expr.children, 0) as AstNode
+            let r_expr = vec_get_rt(expr.children, 1) as AstNode
+            let lk = pass6_infer_local_expr(symbols, fn_node, l_expr)
+            let rk = pass6_infer_local_expr(symbols, fn_node, r_expr)
+            if lk == TypeKind.Float or rk == TypeKind.Float do out TypeKind.Float end
+            if lk == TypeKind.Int or rk == TypeKind.Int do out TypeKind.Int end
+            if lk != TypeKind.Void do out lk end
+            if rk != TypeKind.Void do out rk end
+        end
+        out TypeKind.Void
+    end
+    if expr.node_type == AstType.UnaryNot do out TypeKind.Bool end
+    if expr.node_type == AstType.UnaryMinus do out TypeKind.Int end
+    if expr.node_type == AstType.Identifier do
+        let n_fn_ch = vec_len_rt(fn_node.children)
+        var pi = 0
+        var is_param = false
+        var param_kind = TypeKind.Void
+        when pi < n_fn_ch loop
+            let p_ch = vec_get_rt(fn_node.children, pi) as AstNode
+            if p_ch.node_type != AstType.Block do
+                if fat_str_eq(p_ch.name, expr.name) == 1 do
+                    is_param = true
+                    if fat_str_len(p_ch.name2) > 0 do
+                        let pk = pass6_resolve_ffi_type(p_ch.name2)
+                        if pk != TypeKind.Void do param_kind = pk end
+                    end
+                end
+            end
+            pi = pi + 1
+        end
+        if is_param do
+            if param_kind != TypeKind.Void do out param_kind end
+            out TypeKind.Int
+        end
+        let decl = pass6_find_local_decl_in_node(fn_node, expr.name)
+        if (decl as i64) != 0 do
+            if fat_str_len(decl.name2) > 0 do
+                let dk = pass6_resolve_ffi_type(decl.name2)
+                if dk != TypeKind.Void do out dk end
+            end
+            if vec_len_rt(decl.children) > 0 do
+                let init_expr = vec_get_rt(decl.children, 0) as AstNode
+                out pass6_infer_local_expr(symbols, fn_node, init_expr)
+            end
+        end
+        let gid = pass6_lookup_global(symbols, expr.name)
+        if gid != -1 do
+            let gsym = pass6_symbol_at(symbols, gid)
+            if gsym.type_id != 0 do
+                out gsym.type_id as TypeKind
+            end
+        end
+        out TypeKind.Void
+    end
+    if expr.node_type == AstType.CastExpr do
+        let c_k = pass6_resolve_ffi_type(expr.name)
+        if c_k != TypeKind.Void do out c_k end
+        let c_base = pass6_extract_base_name(expr.name)
+        let c_sid = pass6_lookup_global(symbols, c_base)
+        if c_sid != -1 do
+            let c_sym = pass6_symbol_at(symbols, c_sid)
+            if c_sym.kind == SymbolKind.Entity do out TypeKind.Entity end
+            if c_sym.kind == SymbolKind.Enum do out TypeKind.Enum end
+        end
+        if pass6_is_array_type_str(expr.name) do
+            out TypeKind.Array
+        end
+        out TypeKind.Int
+    end
+    if expr.node_type == AstType.Call do
+        let builtin_ret = typecheck_infer_builtin_call_return(expr.name)
+        if builtin_ret != TypeKind.Void do
+            out builtin_ret
+        end
+        let c_ast = pass6_find_free_function(expr.name)
+        if (c_ast as i64) != 0 do
+            if fat_str_len(c_ast.name2) > 0 do
+                let c_ret_k = pass6_resolve_ffi_type(c_ast.name2)
+                if c_ret_k != TypeKind.Void do out c_ret_k end
+            else
+                out pass6_infer_unannotated_fn_return(symbols, c_ast)
+            end
+        else
+            let ext_p = pass6_find_extern(expr.name)
+            if ext_p != 0 do
+                let ext_ast = ext_p as AstNode
+                if fat_str_len(ext_ast.name2) > 0 do
+                    let ext_k = pass6_resolve_ffi_type(ext_ast.name2)
+                    if ext_k != TypeKind.Void do out ext_k end
+                end
+            end
+        end
+    end
+    out TypeKind.Void
+end.
+
+func pass6_infer_call_return(ref symbols: SymbolTable, ref scopes: ScopeTree, node: &AstNode):
+    if node.node_type != AstType.Call and node.node_type != AstType.MethodCall do
+        out TypeKind.Void
+    end
+    found = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+    if found != -1 do
+        sym = pass6_symbol_at(symbols, found)
+        if (sym as i64) != 0 do
+            if sym.return_type != 0 and (sym.return_type as TypeKind) != TypeKind.Entity do
+                out sym.return_type as TypeKind
+            end
+        end
+    end
+    if pass6_call_returns_first_arg(node.name as i64) == 1 do
+        child_count = vec_len_rt(node.children)
+        if child_count > 0 do
+            arg0 = vec_get_rt(node.children, 0)
+            arg0_ty = pass6_infer_type(symbols, scopes, arg0)
+            if arg0_ty != TypeKind.Void do
+                out arg0_ty
+            end
+        end
+    end
+    if node.node_type == AstType.MethodCall and vec_len_rt(node.children) > 0 do
+        let m_recv = vec_get_rt(node.children, 0) as AstNode
+        let m_recv_ent = pass6_get_receiver_entity_name(symbols, scopes, m_recv)
+        if fat_str_len(m_recv_ent) > 0 do
+            let m_ent_ast = pass6_find_entity_ast(symbols, scopes, m_recv_ent)
+            if (m_ent_ast as i64) != 0 do
+                let n_ech = vec_len_rt(m_ent_ast.children)
+                var mi = 0
+                when mi < n_ech loop
+                    let m_child = vec_get_rt(m_ent_ast.children, mi) as AstNode
+                    if m_child.node_type == AstType.FuncDef and fat_str_eq(m_child.name, node.name) == 1 do
+                        if fat_str_len(m_child.name2) > 0 do
+                            let m_ret_k = pass6_resolve_ffi_type(m_child.name2)
+                            if m_ret_k != TypeKind.Void do out m_ret_k end
+                            if (pass6_find_entity_ast(symbols, scopes, pass6_extract_base_name(m_child.name2)) as i64) != 0 do
+                                out TypeKind.Entity
+                            end
+                        end
+                        mi = n_ech
+                    else
+                        mi = mi + 1
+                    end
+                end
+            end
+        end
+        if m_recv.node_type == AstType.Identifier do
+            let mod_mname = fat_str_concat(fat_str_concat(m_recv.name, fat_str_new(".")), node.name)
+            let mod_fn = pass6_find_func_by_canonical_identity(mod_mname)
+            if (mod_fn as i64) != 0 do
+                if fat_str_len(mod_fn.name2) > 0 do
+                    let mod_ret_k = pass6_resolve_ffi_type(mod_fn.name2)
+                    if mod_ret_k != TypeKind.Void do out mod_ret_k end
+                    if (pass6_find_entity_ast(symbols, scopes, pass6_extract_base_name(mod_fn.name2)) as i64) != 0 do
+                        out TypeKind.Entity
+                    end
+                end
+            end
+        end
+    end
+    call_fn = pass6_find_free_function(node.name)
+    if (call_fn as i64) == 0 do
+        if is_user_module(g_pass6_cur_module) == 1 do
+            let mod_call_name = fat_str_concat(fat_str_concat(g_pass6_cur_module, fat_str_new(".")), node.name)
+            call_fn = pass6_find_func_by_canonical_identity(mod_call_name)
+        end
+    end
+    if (call_fn as i64) == 0 do
+        let ext_p = pass6_find_extern(node.name)
+        if ext_p != 0 do
+            call_fn = ext_p as AstNode
+        end
+    end
+    let builtin_ret = typecheck_infer_builtin_call_return(node.name)
+    if builtin_ret != TypeKind.Void do
+        out builtin_ret
+    end
+    if (call_fn as i64) != 0 do
+        if fat_str_len(call_fn.name2) > 0 do
+            ret_k = pass6_resolve_ffi_type(call_fn.name2)
+            if ret_k != TypeKind.Void do
+                out ret_k
+            end
+            let ent = pass6_find_entity_ast(symbols, scopes, pass6_extract_base_name(call_fn.name2))
+            if (ent as i64) != 0 do
+                out TypeKind.Entity
+            end
+            if call_fn.builtin_id != 0 do
+                if fat_str_len(node.name2) > 0 do
+                    let gen_ret_k = pass6_resolve_ffi_type(node.name2)
+                    if gen_ret_k != TypeKind.Void do
+                        out gen_ret_k
+                    end
+                end
+            end
+        end
+        if fat_str_len(call_fn.name2) == 0 do
+            if fat_cstr_eq(node.name, "fat_str_new") == 1 or fat_cstr_eq(node.name, "fat_str_concat") == 1 or fat_cstr_eq(node.name, "fat_char_to_str") == 1 or fat_cstr_eq(node.name, "str_from_cstr") == 1 or fat_cstr_eq(node.name, "str_concat") == 1 or fat_cstr_eq(node.name, "str_slice") == 1 or fat_cstr_eq(node.name, "fat_str_slice") == 1 or fat_cstr_eq(node.name, "rt_strcat") == 1 or fat_cstr_eq(node.name, "rt_itoa") == 1 or fat_cstr_eq(node.name, "str_trim") == 1 or fat_cstr_eq(node.name, "str_to_lower") == 1 or fat_cstr_eq(node.name, "str_to_upper") == 1 or fat_cstr_eq(node.name, "str_repeat") == 1 or fat_cstr_eq(node.name, "str_replace") == 1 do
+                out TypeKind.String
+            end
+            let inferred_ret = pass6_infer_unannotated_fn_return(symbols, call_fn)
+            if inferred_ret != TypeKind.Void do
+                out inferred_ret
+            end
+            out TypeKind.Void
+        end
+    end
+    out TypeKind.Void
+end.
+
+func pass6_infer_type(ref symbols: SymbolTable, ref scopes: ScopeTree, node: &AstNode):
+    let lit_k = typecheck_infer_literal(node)
+    if lit_k != TypeKind.Void do
+        out lit_k
+    end
+    if node.node_type == AstType.Identifier do
+        found = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        if found != -1 do
+            sym = pass6_symbol_at(symbols, found)
+            if (sym as i64) != 0 do
+                if sym.type_id != 0 do
+                    out sym.type_id as TypeKind
+                end
+                if sym.ast_id != 0 do
+                    decl = sym.ast_id as AstNode
+                    if (decl.node_type == AstType.VarDecl or decl.node_type == AstType.ConstDecl) and vec_len_rt(decl.children) > 0 do
+                        var vi = 0
+                        var n_vis = vec_len_rt(g_pass6_visiting_symbols)
+                        var in_cycle = false
+                        when vi < n_vis loop
+                            if vec_get_rt(g_pass6_visiting_symbols, vi) == (found as i64) do
+                                in_cycle = true
+                                vi = n_vis
+                            else
+                                vi = vi + 1
+                            end
+                        end
+                        if in_cycle do
+                            if g_pass6_diag != 0 do
+                                report_error(g_pass6_diag as DiagnosticEngine, 3097, decl.line, 0)
+                            end
+                            out TypeKind.Void
+                        end
+                        g_pass6_visiting_symbols = vec_push_rt(g_pass6_visiting_symbols, found as i64)
+                        init_node = vec_get_rt(decl.children, 0)
+                        inferred_init = pass6_infer_type(symbols, scopes, init_node)
+                        let v_len = vec_len_rt(g_pass6_visiting_symbols)
+                        if v_len > 0 do
+                            native_write_i64(g_pass6_visiting_symbols - 8, 0, v_len - 1)
+                        end
+                        if inferred_init != TypeKind.Void do
+                            native_write_i64(sym as i64, 16, inferred_init as i64)
+                            out inferred_init
+                        end
+                    end
+                end
+                out sym.type_id as TypeKind
+            end
+        end
+        out TypeKind.Void
+    end
+    if node.node_type == AstType.BinOp do
+        child_count = vec_len_rt(node.children)
+        if child_count >= 2 do
+            left = vec_get_rt(node.children, 0)
+            right = vec_get_rt(node.children, 1)
+            lt = pass6_infer_type(symbols, scopes, left)
+            rt_type = pass6_infer_type(symbols, scopes, right)
+            out typecheck_infer_binop(lt, rt_type, node.op as int, node.int_val)
+        end
+    end
+    if node.node_type == AstType.Compare do
+        out TypeKind.Bool
+    end
+    if node.node_type == AstType.EnumConstruct do
+        out TypeKind.Enum
+    end
+    if node.node_type == AstType.Call and fat_cstr_eq(node.name, "flux") do
+        out TypeKind.Flux
+    end
+    if node.node_type == AstType.SwizzleExpr do
+        out TypeKind.Flux
+    end
+    if node.node_type == AstType.Call or node.node_type == AstType.MethodCall do
+        out pass6_infer_call_return(symbols, scopes, node)
+    end
+    if node.node_type == AstType.BuiltinCall do
+        if node.builtin_id == 11 or node.builtin_id == 19 do
+            out TypeKind.String
+        end
+        if node.builtin_id == 12 do
+            out TypeKind.Bool
+        end
+        if fat_cstr_eq(node.name, "str_concat") == 1 or fat_cstr_eq(node.name, "str_cat") == 1 or fat_cstr_eq(node.name, "fat_str_concat") == 1 or fat_cstr_eq(node.name, "fat_str_new") == 1 or fat_cstr_eq(node.name, "str_slice") == 1 or fat_cstr_eq(node.name, "fat_str_slice") == 1 or fat_cstr_eq(node.name, "rt_strcat") == 1 or fat_cstr_eq(node.name, "rt_itoa") == 1 or fat_cstr_eq(node.name, "str_trim") == 1 or fat_cstr_eq(node.name, "str_to_lower") == 1 or fat_cstr_eq(node.name, "str_to_upper") == 1 or fat_cstr_eq(node.name, "str_repeat") == 1 or fat_cstr_eq(node.name, "str_replace") == 1 do
+            out TypeKind.String
+        end
+        if fat_cstr_eq(node.name, "str_eq") == 1 or fat_cstr_eq(node.name, "fat_str_eq") == 1 or fat_cstr_eq(node.name, "str_contains") == 1 or fat_cstr_eq(node.name, "str_starts_with") == 1 or fat_cstr_eq(node.name, "str_ends_with") == 1 or fat_cstr_eq(node.name, "dict_has_key") == 1 do
+            out TypeKind.Bool
+        end
+        out TypeKind.Int
+    end
+    if node.node_type == AstType.QuantizeExpr do
+        out TypeKind.QuantizedTensor
+    end
+    if node.node_type == AstType.PrecompBlock do
+        if vec_len_rt(node.children) > 0 do
+            out pass6_infer_type(symbols, scopes, vec_get_rt(node.children, 0) as AstNode)
+        end
+        out TypeKind.Int
+    end
+    if node.node_type == AstType.CastExpr do
+        let cty = pass6_resolve_ffi_type(node.name)
+        if cty != TypeKind.Void do out cty end
+        let c_ent = pass6_find_entity_ast(symbols, scopes, pass6_extract_base_name(node.name))
+        if (c_ent as i64) != 0 do out TypeKind.Entity end
+        let c_enum = pass6_find_enum_ast(symbols, scopes, node.name)
+        if (c_enum as i64) != 0 do out TypeKind.Enum end
+        out TypeKind.Void
+    end
+    if node.node_type == AstType.Assign do
+        if vec_len_rt(node.children) > 0 do
+            out pass6_infer_type(symbols, scopes, vec_get_rt(node.children, 0))
+        end
+        out TypeKind.Void
+    end
+    if node.node_type == AstType.IndexAccess do
+        base_id = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        if base_id != -1 do
+            base_sym = pass6_symbol_at(symbols, base_id)
+            if base_sym.ast_id != 0 do
+                base_decl = base_sym.ast_id as AstNode
+                if fat_str_len(base_decl.name2) > 0 do
+                    let b_elem_str = pass6_extract_generic_or_array_elem(base_decl.name2)
+                    if fat_str_len(b_elem_str) > 0 do
+                        let b_elem_k = pass6_resolve_ffi_type(b_elem_str)
+                        if b_elem_k != TypeKind.Void do
+                            out b_elem_k
+                        end
+                        let b_ent = pass6_find_entity_ast(symbols, scopes, pass6_extract_base_name(b_elem_str))
+                        if (b_ent as i64) != 0 do
+                            out TypeKind.Entity
+                        end
+                    end
+                end
+                if vec_len_rt(base_decl.children) > 0 do
+                    base_init = vec_get_rt(base_decl.children, 0)
+                    if base_init.node_type == AstType.ArrayLiteral and vec_len_rt(base_init.children) > 0 do
+                        out pass6_infer_type(symbols, scopes, vec_get_rt(base_init.children, 0))
+                    end
+                end
+            end
+        end
+        out TypeKind.Void
+    end
+    if node.node_type == AstType.FieldAccess do
+        field_type_name = pass6_get_receiver_entity_name(symbols, scopes, node)
+        if fat_str_len(field_type_name) > 0 do
+            field_kind = pass6_resolve_ffi_type(field_type_name)
+            if field_kind != TypeKind.Void do out field_kind end
+            let f_ent = pass6_find_entity_ast(symbols, scopes, pass6_extract_base_name(field_type_name))
+            if (f_ent as i64) != 0 do out TypeKind.Entity end
+        end
+        out TypeKind.Void
+    end
+    if node.node_type == AstType.UnaryMinus do
+        out TypeKind.Int
+    end
+    if node.node_type == AstType.UnaryNot do
+        out TypeKind.Bool
+    end
+    out TypeKind.Void
+end.
+
+# Deep inference is intentionally interpolation-local. Applying entity field
+# and method return inference to all assignments changes legacy self-host type
+# compatibility; interpolation needs the precision only to select stringify.
+func pass6_infer_interp_type(ref symbols: SymbolTable, ref scopes: ScopeTree, node: &AstNode):
+    if node.node_type == AstType.Identifier do
+        ident_id = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        if ident_id != -1 do
+            ident_sym = pass6_symbol_at(symbols, ident_id)
+            if ident_sym.ast_id != 0 do
+                ident_decl = ident_sym.ast_id as AstNode
+                explicit_kind = pass6_resolve_ffi_type(ident_decl.name2)
+                if explicit_kind != TypeKind.Void do out explicit_kind end
+                if (ident_decl.node_type == AstType.VarDecl or ident_decl.node_type == AstType.ConstDecl or ident_decl.node_type == AstType.AtomicVarDecl) and vec_len_rt(ident_decl.children) > 0 do
+                    ident_init = vec_get_rt(ident_decl.children, 0)
+                    if ident_init.node_type != AstType.Identifier or fat_str_eq(ident_init.name, node.name) == 0 do
+                        out pass6_infer_interp_type(symbols, scopes, ident_init)
+                    end
+                end
+            end
+        end
+        out pass6_infer_type(symbols, scopes, node)
+    end
+    if node.node_type == AstType.IndexAccess do
+        base_id = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        if base_id != -1 do
+            base_sym = pass6_symbol_at(symbols, base_id)
+            if base_sym.ast_id != 0 do
+                base_decl = base_sym.ast_id as AstNode
+                if vec_len_rt(base_decl.children) > 0 do
+                    base_init = vec_get_rt(base_decl.children, 0)
+                    if base_init.node_type == AstType.ArrayLiteral and vec_len_rt(base_init.children) > 0 do
+                        out pass6_infer_interp_type(symbols, scopes, vec_get_rt(base_init.children, 0))
+                    end
+                end
+            end
+        end
+        # Preserve the existing integer-array default when element metadata is
+        # unavailable (parameters, extern buffers, and dynamically built arrays).
+        out TypeKind.Int
+    end
+    if node.node_type == AstType.FieldAccess do
+        field_type_name = pass6_get_receiver_entity_name(symbols, scopes, node)
+        field_kind = pass6_resolve_ffi_type(field_type_name)
+        if field_kind != TypeKind.Void do out field_kind end
+        if pass6_find_entity_ast(symbols, scopes, field_type_name) != 0 do out TypeKind.Entity end
+        out TypeKind.Void
+    end
+    if node.node_type == AstType.MethodCall and fat_str_len(node.name2) > 0 do
+        owner_ast = pass6_find_entity_ast(symbols, scopes, node.name2)
+        if owner_ast != 0 do
+            owner_children = vec_len_rt(owner_ast.children)
+            var owner_i = 0
+            when owner_i < owner_children loop
+                owner_child = vec_get_rt(owner_ast.children, owner_i)
+                if node.builtin_id == 201 and owner_child.node_type == AstType.FuncDef and fat_str_eq(owner_child.name, node.name) == 1 do
+                    method_ret_kind = pass6_resolve_ffi_type(owner_child.name2)
+                    if method_ret_kind != TypeKind.Void do out method_ret_kind end
+                    if pass6_find_entity_ast(symbols, scopes, owner_child.name2) != 0 do out TypeKind.Entity end
+                    out TypeKind.Void
+                end
+                if node.builtin_id == 202 and (owner_child.node_type == AstType.Identifier or owner_child.node_type == AstType.VarDecl) and fat_str_eq(owner_child.name, node.name) == 1 do
+                    callable_ret_name = pass6_callable_return_type(owner_child.name2)
+                    callable_ret_kind = pass6_resolve_ffi_type(callable_ret_name)
+                    if callable_ret_kind != TypeKind.Void do out callable_ret_kind end
+                    if pass6_find_entity_ast(symbols, scopes, callable_ret_name) != 0 do out TypeKind.Entity end
+                    out TypeKind.Void
+                end
+                owner_i = owner_i + 1
+            end
+        end
+    end
+    out pass6_infer_type(symbols, scopes, node)
+end.
+
+export pass6_eval_const_int, pass6_call_returns_first_arg,
+       pass6_find_return_stmt_uncached, pass6_find_return_stmt,
+       pass6_find_param_entity, pass6_find_local_decl_in_node,
+       pass6_infer_unannotated_fn_return, pass6_infer_local_expr,
+       pass6_infer_local_expr_inner, pass6_infer_call_return,
+       pass6_infer_type, pass6_infer_interp_type
