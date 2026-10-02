@@ -1,0 +1,1710 @@
+##
+ * vir/compiler/sem_pass10_diagnostics.vri
+ * ==============================================================
+ * Pass 10: Diagnostics Emission.
+ * Formats and prints all collected diagnostics, returns error count.
+ ##
+
+include vec_rt
+include compiler.cli_ui
+import g_ui_mode, g_ui_failed, cliUiLine, cliUiAppendSafe, cliUiFailurePhase,
+       cliUiBuildResult, cliSessionFinish, cliSessionAppendJson, cliUiPhaseName,
+       g_ui_phase from compiler.cli_ui
+include compiler.opt_trace
+import optTraceAppendJson from compiler.opt_trace
+include compiler.ide_semantic
+import ide_reset, ide_append_json_block from compiler.ide_semantic
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt, vec_free_rt from vec_rt
+
+include string_rt
+import rt_streq, fat_str_eq, fat_str_len, fat_str_byte_at, fat_cstr_eq, rt_strcat, rt_itoa, rt_strlen, sb_append_char, native_write_i64 from string_rt
+
+include rt.alloc
+import vir_alloc, vir_free, alloc from rt.alloc
+
+include context
+import DiagnosticEngine, DiagnosticLevel, Diagnostic from context
+
+include source_manager
+import g_active_source_manager, sm_get_file_path, sm_get_span from source_manager
+
+include rt.syscall
+import sys_getrusage, sys_clock_gettime, sys_platform, Platform, sys_open, sys_read, sys_close, VIR_O_RDONLY from rt.syscall
+
+extern func syscall2(num: int, a1: int, a2: int) -> int
+extern func syscall3(num: int, a1: int, a2: int, a3: int) -> int
+
+var g_color_mode: int = 0
+var g_time_buf_start: int = 0
+var g_compile_timer_printed: int = 0
+var g_diag_json: int = 0
+var g_phase_timings: int = 0
+var g_phase_read_us: int = 0
+var g_phase_preprocess_us: int = 0
+var g_phase_lex_us: int = 0
+var g_phase_parse_us: int = 0
+var g_phase_semantic_us: int = 0
+var g_phase_semantic_start_us: int = 0
+var g_phase_lower_us: int = 0
+var g_phase_codegen_us: int = 0
+var g_phase_link_us: int = 0
+
+# The driver owns this bounded buffer outside semantic arenas. Records are
+# serialized while their source tables still live; only copied bytes survive.
+var g_diagSessionActive: int = 0
+var g_diagSessionBody: int = 0
+var g_diagSessionErrors: int = 0
+var g_diagSessionWarnings: int = 0
+var g_diagSessionCaptured: int = 0
+var g_diagSessionOverflow: int = 0
+var g_diagSessionEmitted: int = 0
+var g_diagSessionArrayStart: int = 0
+var g_diagRecordIndex: int = 0
+
+func pass10SessionReset():
+    ide_reset()
+    if g_diagSessionBody == 0 do g_diagSessionBody = vir_alloc(16777217) end
+    native_write_u8(g_diagSessionBody, 0, 0)
+    g_diagSessionActive = 1
+    g_diagSessionErrors = 0
+    g_diagSessionWarnings = 0
+    g_diagSessionCaptured = 0
+    g_diagSessionOverflow = 0
+    g_diagSessionEmitted = 0
+    g_diagSessionArrayStart = 0
+end.
+
+func pass10SessionCopy(value: int):
+    let length = rt_strlen(value)
+    if length > 16777216 do
+        g_diagSessionOverflow = 1
+        out
+    end
+    var index = 0
+    when index <= length loop
+        native_write_u8(g_diagSessionBody, index, native_read_u8(value, index))
+        index = index + 1
+    end
+    g_diagSessionCaptured = 1
+end.
+
+func pass10SessionSerialize(exitCode: int):
+    var text = sb_append(sb_new(), "{\"schema_version\":1,")
+    text = optTraceAppendJson(text)
+    if exitCode == 0 do text = sb_append(text, "\"success\":true,")
+    else text = sb_append(text, "\"success\":false,") end
+    if g_diagSessionOverflow == 1 do
+        text = sb_append(text, "\"diagnostics\":[],\"complete\":false,\"unavailableReason\":\"diagnostic payload exceeds 16 MiB\"")
+    eif g_diagSessionCaptured == 1 do
+        text = sb_append(text, g_diagSessionBody)
+    else
+        text = sb_append(text, "\"diagnostics\":[]")
+    end
+    text = sb_append(text, ",\"error_count\":")
+    text = sb_append_int(text, g_diagSessionErrors)
+    text = sb_append(text, ",\"warning_count\":")
+    text = sb_append_int(text, g_diagSessionWarnings)
+    text = sb_append(text, ",\"compile_time_ms\":")
+    text = sb_append_int(text, virc_elapsed_us() / 1000)
+    if g_diagSessionActive == 1 do text = cliSessionAppendJson(text) end
+    text = ide_append_json_block(text)
+    text = sb_append_char(text, 125)
+    out sb_to_string(text)
+end.
+
+func pass10SessionEmit(exitCode: int):
+    if g_diagSessionEmitted == 1 do out end
+    if g_diag_json != 1 do out end
+    g_diagSessionEmitted = 1
+    print_ln(pass10SessionSerialize(exitCode))
+    g_compile_timer_printed = 1
+end.
+
+func virc_timer_init():
+    if g_time_buf_start == 0 do
+        let plat = sys_platform()
+        if plat == Platform.MacOS_ARM64 or plat == Platform.MacOS_x86_64 do
+            g_time_buf_start = vir_alloc(144)
+            sys_getrusage(0, g_time_buf_start)
+        else
+            g_time_buf_start = vir_alloc(16)
+            sys_clock_gettime(1, g_time_buf_start)
+        end
+    end
+end.
+
+func virc_elapsed_us():
+    let plat = sys_platform()
+    if plat == Platform.MacOS_ARM64 or plat == Platform.MacOS_x86_64 do
+        let buf = vir_alloc(144)
+        sys_getrusage(0, buf)
+        let u_sec = native_read_i64(buf, 0)
+        let u_usec = native_read_i64(buf, 8)
+        let s_sec = native_read_i64(buf, 16)
+        let s_usec = native_read_i64(buf, 24)
+        var st_u_sec = 0
+        var st_u_usec = 0
+        var st_s_sec = 0
+        var st_s_usec = 0
+        if g_time_buf_start != 0 do
+            st_u_sec = native_read_i64(g_time_buf_start, 0)
+            st_u_usec = native_read_i64(g_time_buf_start, 8)
+            st_s_sec = native_read_i64(g_time_buf_start, 16)
+            st_s_usec = native_read_i64(g_time_buf_start, 24)
+        end
+        let cur_us = (u_sec + s_sec) * 1000000 + u_usec + s_usec
+        let start_us = (st_u_sec + st_s_sec) * 1000000 + st_u_usec + st_s_usec
+        var total = cur_us - start_us
+        if total < 0 do total = 0 end
+        out total
+    else
+        let buf = vir_alloc(16)
+        sys_clock_gettime(1, buf)
+        let sec = native_read_i64(buf, 0)
+        let nsec = native_read_i64(buf, 8)
+        var s_sec = 0
+        var s_nsec = 0
+        if g_time_buf_start != 0 do
+            s_sec = native_read_i64(g_time_buf_start, 0)
+            s_nsec = native_read_i64(g_time_buf_start, 8)
+        end
+        var d_sec = sec - s_sec
+        var d_nsec = nsec - s_nsec
+        if d_nsec < 0 do
+            d_sec = d_sec - 1
+            d_nsec = d_nsec + 1000000000
+        end
+        var total = d_sec * 1000000 + (d_nsec / 1000)
+        if total < 0 do total = 0 end
+        out total
+    end
+end.
+
+func virc_print_phase_timings():
+    if g_phase_timings == 0 do out 0 end
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "Phase timings (ms): read=")
+        sb = sb_append_int(sb, g_phase_read_us / 1000)
+        sb = sb_append(sb, " preprocess=")
+        sb = sb_append_int(sb, g_phase_preprocess_us / 1000)
+        sb = sb_append(sb, " lex=")
+        sb = sb_append_int(sb, g_phase_lex_us / 1000)
+        sb = sb_append(sb, " parse=")
+        sb = sb_append_int(sb, g_phase_parse_us / 1000)
+        sb = sb_append(sb, " semantic=")
+        sb = sb_append_int(sb, g_phase_semantic_us / 1000)
+        sb = sb_append(sb, " lower=")
+        sb = sb_append_int(sb, g_phase_lower_us / 1000)
+        sb = sb_append(sb, " codegen=")
+        sb = sb_append_int(sb, g_phase_codegen_us / 1000)
+        sb = sb_append(sb, " link=")
+        sb = sb_append_int(sb, g_phase_link_us / 1000)
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+    out 0
+end.
+
+func virc_print_compile_time():
+    if g_ui_mode == 1 do out 0 end
+    if g_compile_timer_printed == 1 do out 0 end
+    if g_diag_json == 1 do
+        if g_diagSessionActive == 1 do out 0 end
+        var diag = diagnostic_engine_new()
+        pass10_emit_json(diag)
+        out 0
+    end
+    g_compile_timer_printed = 1
+    let total_us = virc_elapsed_us()
+    var ms = total_us / 1000
+    var frac = (total_us mod 1000) / 10
+    virc_print_phase_timings()
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "Compile time: ")
+        sb = sb_append_int(sb, ms)
+        sb = sb_append(sb, ".")
+        if frac < 10 do
+            sb = sb_append(sb, "0")
+        end
+        sb = sb_append_int(sb, frac)
+        sb = sb_append(sb, " ms")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+    out 0
+end.
+
+func pass10_json_escape_buffer(sb: StringBuilder, data: int, slen: int):
+    if data == 0 or slen <= 0 do out sb end
+    var i = 0
+    when i < slen loop
+        let b = native_read_u8(data, i)
+        if b == 34 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 34)
+        eif b == 92 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 92)
+        eif b == 10 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 110)
+        eif b == 13 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 114)
+        eif b == 9 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 116)
+        eif b < 32 do
+            # JSON forbids all unescaped C0 controls, not only tab/CR/LF.
+            sb = sb_append(sb, "\\u00")
+            let digits = "0123456789abcdef" as int
+            sb = sb_append_char(sb, native_read_u8(digits, b / 16))
+            sb = sb_append_char(sb, native_read_u8(digits, b mod 16))
+        else
+            sb = sb_append_char(sb, b)
+        end
+        i = i + 1
+    end
+    out sb
+end.
+
+func pass10_json_escape_cstr(sb: StringBuilder, s: int):
+    if s == 0 do out sb end
+    out pass10_json_escape_buffer(sb, s, rt_strlen(s))
+end.
+
+func pass10_json_escape_str(sb: StringBuilder, s: string):
+    let saddr = s as i64
+    if saddr == 0 do out sb end
+    if saddr > 4096 and saddr < 281474976710656 do
+        let sdata = native_read_i64(saddr, 0)
+        let slen = native_read_i64(saddr, 8)
+        let scap = native_read_i64(saddr, 16)
+        if sdata > 4096 and sdata < 281474976710656 and slen >= 0 and scap >= slen and scap < 1048576 do
+            out pass10_json_escape_buffer(sb, sdata, slen)
+        end
+    end
+    out pass10_json_escape_buffer(sb, saddr, rt_strlen(saddr))
+end.
+
+func pass10_emit_json_one(sb: StringBuilder, d: Diagnostic):
+    let level = native_read_i64(d as i64, 0)
+    let code = native_read_i64(d as i64, 8)
+    let d_span_id = native_read_i64(d as i64, 72)
+    var line = native_read_i64(d as i64, 16)
+    var col = native_read_i64(d as i64, 24)
+    var end_line = line
+    var end_col = col + 1
+    var file_path = native_read_i64(d as i64, 80)
+    if d_span_id > 0 and g_active_source_manager != 0 do
+        let sp = sm_get_span(g_active_source_manager, d_span_id)
+        if sp != 0 do
+            line = native_read_i64(sp, 8)
+            col = native_read_i64(sp, 16)
+            end_line = native_read_i64(sp, 24)
+            end_col = native_read_i64(sp, 32)
+            let sp_fid = native_read_i64(sp, 0)
+            file_path = sm_get_file_path(g_active_source_manager, sp_fid)
+        end
+    end
+    let extra = native_read_i64(d as i64, 32) as string
+    let sec_line = native_read_i64(d as i64, 40)
+    var sec_col = native_read_i64(d as i64, 48)
+    let sec_note = native_read_i64(d as i64, 56) as string
+    if col <= 0 do col = 1 end
+    if end_col <= col do end_col = col + 1 end
+    if sec_col <= 0 and sec_line > 0 do sec_col = 1 end
+    if file_path == 0 and g_active_source_manager != 0 do
+        file_path = sm_get_file_path(g_active_source_manager, 0)
+    end
+    sb = sb_append(sb, "{\"code\":\"")
+    sb = sb_append(sb, pass10_code_to_prefix(level))
+    if code < 1000 do sb = sb_append(sb, "0") end
+    if code < 100 do sb = sb_append(sb, "0") end
+    if code < 10 do sb = sb_append(sb, "0") end
+    sb = sb_append_int(sb, code)
+    sb = sb_append(sb, "\",\"severity\":\"")
+    if level == DiagnosticLevel.Warning do
+        sb = sb_append(sb, "warning")
+    eif level == DiagnosticLevel.Info do
+        sb = sb_append(sb, "info")
+    else
+        sb = sb_append(sb, "error")
+    end
+    sb = sb_append(sb, "\",\"message\":\"")
+    let msg_str = pass10_code_to_msg(code, extra)
+    sb = pass10_json_escape_str(sb, msg_str)
+    sb = sb_append(sb, "\",\"primary_span\":{\"file\":\"")
+    sb = pass10_json_escape_cstr(sb, file_path)
+    sb = sb_append(sb, "\",\"start_line\":")
+    sb = sb_append_int(sb, line)
+    sb = sb_append(sb, ",\"start_column\":")
+    sb = sb_append_int(sb, col)
+    sb = sb_append(sb, ",\"end_line\":")
+    sb = sb_append_int(sb, end_line)
+    sb = sb_append(sb, ",\"end_column\":")
+    sb = sb_append_int(sb, end_col)
+    sb = sb_append(sb, "},\"related_locations\":")
+    var sec_file_path = native_read_i64(d as i64, 96)
+    if sec_file_path == 0 and g_active_source_manager != 0 do
+        let sec_fid = native_read_i64(d as i64, 88)
+        if sec_fid > 0 do
+            sec_file_path = sm_get_file_path(g_active_source_manager, sec_fid)
+        end
+    end
+    if sec_file_path == 0 do
+        sec_file_path = file_path
+    end
+    if sec_line > 0 do
+        sb = sb_append(sb, "[{\"file\":\"")
+        sb = pass10_json_escape_cstr(sb, sec_file_path)
+        sb = sb_append(sb, "\",\"line\":")
+        sb = sb_append_int(sb, sec_line)
+        sb = sb_append(sb, ",\"column\":")
+        sb = sb_append_int(sb, sec_col)
+        sb = sb_append(sb, ",\"message\":\"")
+        if (sec_note as i64) != 0 and rt_strlen(sec_note as i64) > 0 do
+            sb = pass10_json_escape_str(sb, sec_note)
+        else
+            sb = sb_append(sb, "related location")
+        end
+        sb = sb_append(sb, "\"}]")
+    else
+        sb = sb_append(sb, "[]")
+    end
+    sb = sb_append(sb, ",\"diagnosticId\":\"")
+    sb = sb_append_int(sb, g_diagRecordIndex)
+    sb = sb_append(sb, "\",\"phase\":\"")
+    sb = pass10_json_escape_cstr(sb, pass10_code_to_phase(code) as int)
+    sb = sb_append(sb, "\",\"subsystem\":\"Compiler\",\"stage\":\"Stage 1 (Vir Native)\"")
+    let fn_ctx = native_read_i64(d as i64, 104) as string
+    if (fn_ctx as i64) != 0 and fat_str_len(fn_ctx) > 0 do
+        sb = sb_append(sb, ",\"functionContext\":\"")
+        sb = pass10_json_escape_str(sb, fn_ctx)
+        sb = sb_append(sb, "\"")
+    else
+        sb = sb_append(sb, ",\"functionContext\":null")
+    end
+    let exp_typ = native_read_i64(d as i64, 112) as string
+    if (exp_typ as i64) != 0 and fat_str_len(exp_typ) > 0 do
+        sb = sb_append(sb, ",\"expectedType\":\"")
+        sb = pass10_json_escape_str(sb, exp_typ)
+        sb = sb_append(sb, "\"")
+    else
+        sb = sb_append(sb, ",\"expectedType\":null")
+    end
+    let act_typ = native_read_i64(d as i64, 120) as string
+    if (act_typ as i64) != 0 and fat_str_len(act_typ) > 0 do
+        sb = sb_append(sb, ",\"actualType\":\"")
+        sb = pass10_json_escape_str(sb, act_typ)
+        sb = sb_append(sb, "\"")
+    else
+        sb = sb_append(sb, ",\"actualType\":null")
+    end
+    sb = sb_append(sb, ",\"analysis\":\"")
+    sb = pass10_json_escape_str(sb, msg_str)
+    sb = sb_append(sb, "\",\"causes\":\"")
+    sb = pass10_json_escape_cstr(sb, pass10_code_to_causes(code) as int)
+    sb = sb_append(sb, "\",\"action\":\"")
+    sb = pass10_json_escape_cstr(sb, pass10_code_to_actions(code) as int)
+    sb = sb_append(sb, "\"}")
+    out sb
+end.
+
+func pass10CaptureDiagnostics(diag: &DiagnosticEngine):
+    if g_diagSessionBody == 0 do g_diagSessionBody = vir_alloc(16777217) end
+    let count = vec_len_rt(diag.diagnostics)
+    g_diagSessionErrors = diag.error_count
+    g_diagSessionWarnings = 0
+    arena:
+        var text = sb_new()
+        g_diagRecordIndex = 0
+        if count > 0 do
+            # Legacy top-level first-diagnosticRecord fields remain available. Use the
+            # same serializer as the array, so location and content cannot drift.
+            var first = pass10_emit_json_one(sb_new(), vec_get_rt(diag.diagnostics, 0))
+            let
+                data = sb_to_string(first)
+                length = rt_strlen(data)
+            var index = 1
+            when index + 1 < length loop
+                text = sb_append_char(text, native_read_u8(data, index))
+                index = index + 1
+            end
+            text = sb_append_char(text, 44)
+            sb_free(first)
+        end
+        text = sb_append(text, "\"diagnostics\":[")
+        g_diagSessionArrayStart = rt_strlen(sb_to_string(text))
+        var index = 0
+        when index < count loop
+            if index > 0 do text = sb_append_char(text, 44) end
+            let diagnosticRecord = vec_get_rt(diag.diagnostics, index)
+            if native_read_i64(diagnosticRecord, 0) == DiagnosticLevel.Warning do
+                g_diagSessionWarnings = g_diagSessionWarnings + 1
+            end
+            g_diagRecordIndex = index
+            text = pass10_emit_json_one(text, diagnosticRecord)
+            index = index + 1
+        end
+        text = sb_append_char(text, 93)
+        pass10SessionCopy(sb_to_string(text))
+        sb_free(text)
+    end
+end.
+
+func pass10_emit_json(diag: &DiagnosticEngine):
+    pass10CaptureDiagnostics(diag)
+    if g_diagSessionActive == 0 do
+        g_diagSessionEmitted = 0
+        pass10SessionEmit(diag.error_count)
+    end
+    out diag.error_count
+end.
+
+func compilerFailure:
+    in code: int
+       message: int
+       classicMessage: int
+    var diagnosticRecord = sb_append(sb_new(), "{\"code\":")
+    if code == 0 do
+        diagnosticRecord = sb_append(diagnosticRecord, "null")
+    else
+        diagnosticRecord = sb_append_char(diagnosticRecord, 34)
+        diagnosticRecord = pass10_json_escape_cstr(diagnosticRecord, code)
+        diagnosticRecord = sb_append_char(diagnosticRecord, 34)
+    end
+    diagnosticRecord = sb_append(diagnosticRecord, ",\"severity\":\"error\",\"message\":\"")
+    diagnosticRecord = pass10_json_escape_cstr(diagnosticRecord, message)
+    diagnosticRecord = sb_append(diagnosticRecord, "\",\"stage\":\"")
+    diagnosticRecord = sb_append(diagnosticRecord, cliUiPhaseName(g_ui_phase))
+    diagnosticRecord = sb_append(diagnosticRecord, "\",\"related_locations\":[]}")
+    let data = sb_to_string(diagnosticRecord)
+    var text = sb_new()
+    var index = 1
+    when index + 1 < rt_strlen(data) loop
+        text = sb_append_char(text, native_read_u8(data, index))
+        index = index + 1
+    end
+    text = sb_append(text, ",\"diagnostics\":[")
+    let arrayStart = rt_strlen(sb_to_string(text))
+    if g_diagSessionCaptured == 1 & g_diagSessionArrayStart > 0 do
+        index = g_diagSessionArrayStart
+        let length = rt_strlen(g_diagSessionBody)
+        when index + 1 < length loop
+            text = sb_append_char(text, native_read_u8(g_diagSessionBody, index))
+            index = index + 1
+        end
+        if g_diagSessionArrayStart + 1 < length do text = sb_append_char(text, 44) end
+    end
+    text = sb_append(text, data)
+    text = sb_append_char(text, 93)
+    pass10SessionCopy(sb_to_string(text))
+    g_diagSessionArrayStart = arrayStart
+    g_diagSessionErrors = g_diagSessionErrors + 1
+    if g_diag_json == 0 do
+        if g_ui_mode == 1 do
+            cliUiFailurePhase()
+            cliUiLine(classicMessage)
+            cliUiBuildResult(g_diagSessionErrors)
+        else
+            print_ln(classicMessage)
+        end
+    end
+    sb_free(text)
+    sb_free(diagnosticRecord)
+end.
+
+func compilerAbort():
+    cliSessionFinish(1)
+    pass10SessionEmit(1)
+    sys_exit(1)
+end.
+
+func virc_isatty(fd: int):
+    var buf = vir_alloc(128)
+    let plat = sys_platform()
+    var rc = 0 - 1
+    if plat == Platform.Linux_x86_64 do
+        rc = syscall3(16, fd, 0x5401, buf)
+    eif plat == Platform.Linux_ARM64 or plat == Platform.Linux_RISCV64 do
+        rc = syscall3(29, fd, 0x5401, buf)
+    else
+        rc = syscall3(0x2000036, fd, 0x40487413, buf)
+    end
+    vir_free(buf)
+    if rc == 0 do out 1 end
+    out 0
+end.
+
+func virc_has_no_color():
+    let plat = sys_platform()
+    if plat == Platform.Linux_ARM64 or plat == Platform.Linux_x86_64 or plat == Platform.Linux_RISCV64 do
+        let fd = sys_open("/proc/self/environ" as int, VIR_O_RDONLY, 0)
+        if fd >= 0 do
+            let buf_size = 4096
+            let buf = vir_alloc(buf_size)
+            let n = sys_read(fd, buf, buf_size)
+            sys_close(fd)
+            if n > 0 do
+                var i = 0
+                when i + 8 < n loop
+                    var at_start = 0
+                    if i == 0 do
+                        at_start = 1
+                    eif native_read_u8(buf, i - 1) == 0 do
+                        at_start = 1
+                    end
+                    if at_start == 1 do
+                        if native_read_u8(buf, i) == 78 and native_read_u8(buf, i + 1) == 79 and native_read_u8(buf, i + 2) == 95 and native_read_u8(buf, i + 3) == 67 and native_read_u8(buf, i + 4) == 79 and native_read_u8(buf, i + 5) == 76 and native_read_u8(buf, i + 6) == 79 and native_read_u8(buf, i + 7) == 82 and native_read_u8(buf, i + 8) == 61 do
+                            vir_free(buf)
+                            out 1
+                        end
+                    end
+                    i = i + 1
+                end
+            end
+            vir_free(buf)
+        end
+        out 0
+    end
+    out 0
+end.
+
+func virc_should_color():
+    if g_color_mode == 1 do out 1 end
+    if g_color_mode == 2 do out 0 end
+    if virc_has_no_color() == 1 do out 0 end
+    if virc_isatty(1) == 1 do out 1 end
+    out 0
+end.
+
+func pass10_emit_diagnostics(diag: &DiagnosticEngine):
+    if g_diagSessionActive == 1 do pass10CaptureDiagnostics(diag) end
+    count = vec_len_rt(diag.diagnostics)
+    if count == 0 do
+        out 0
+    end
+
+    if g_phase_timings == 1 and g_phase_semantic_start_us > 0 do
+        g_phase_semantic_us = virc_elapsed_us() - g_phase_semantic_start_us
+    end
+    if g_diag_json == 1 do
+        out pass10_emit_json(diag)
+    end
+
+    if g_ui_mode == 1 do out pass10EmitModern(diag) end
+
+    let use_color = virc_should_color()
+
+    if count <= 2 do
+        var i = 0
+        when i < count loop
+            d = vec_get_rt(diag.diagnostics, i)
+            pass10_print_one_detailed(d, use_color)
+            i = i + 1
+        end
+    else
+        var i = 0
+        when i < count loop
+            d = vec_get_rt(diag.diagnostics, i)
+            pass10_print_one_compact(d, use_color)
+            i = i + 1
+        end
+        print_ln("")
+    end
+
+    # Print summary
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: ")
+        sb = sb_append_int(sb, diag.error_count)
+        sb = sb_append(sb, " error(s), ")
+        var warn_count = count - diag.error_count
+        sb = sb_append_int(sb, warn_count)
+        sb = sb_append(sb, " warning(s)")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+
+    virc_print_compile_time()
+
+    out diag.error_count
+end.
+func pass10HumanLine(value: int):
+    if g_ui_mode == 1 do
+        cliUiLine(value)
+    else
+        print_ln(value)
+    end
+end.
+
+# Untrusted diagnostic fields may not inject layout, even in detailed reports.
+func pass10HumanValueLine(value: int):
+    if g_ui_mode == 1 do
+        var text = sb_new()
+        text = cliUiAppendSafe(text, value, 0)
+        cliUiLine(sb_to_string(text))
+        sb_free(text)
+    else
+        print_ln(value)
+    end
+end.
+
+func pass10AppendCode(builder: StringBuilder, level: int, code: int):
+    var text = sb_append(builder, pass10_code_to_prefix(level))
+    if code < 1000 do text = sb_append(text, "0") end
+    if code < 100 do text = sb_append(text, "0") end
+    if code < 10 do text = sb_append(text, "0") end
+    out sb_append_int(text, code)
+end.
+
+# Severity is part of identity. Only ordinary errors select detailed/compact.
+# Groups retain first occurrence order; all occurrences remain in collection order.
+func pass10FindGroup(groups: int, level: int, code: int):
+    var index = 0
+    when index < vec_len_rt(groups) loop
+        let group = vec_get_rt(groups, index)
+        if native_read_i64(group, 0) == level do
+            if native_read_i64(group, 8) == code do out group end
+        end
+        index = index + 1
+    end
+    out 0
+end.
+
+func pass10CollectGroups(records: int):
+    var
+        groups = vec_new_rt()
+        index = 0
+    when index < vec_len_rt(records) loop
+        let
+            item = vec_get_rt(records, index)
+            level = native_read_i64(item, 0)
+            code = native_read_i64(item, 8)
+            found = pass10FindGroup(groups, level, code)
+        if found == 0 do
+            let group = vir_alloc(24)
+            native_write_i64(group, 0, level)
+            native_write_i64(group, 8, code)
+            native_write_i64(group, 16, 1)
+            groups = vec_push_rt(groups, group)
+        else
+            native_write_i64(found, 16, native_read_i64(found, 16) + 1)
+        end
+        index = index + 1
+    end
+    out groups
+end.
+
+func pass10CountGroups(groups: int, level: int, occurrences: int):
+    var
+        count = 0
+        index = 0
+    when index < vec_len_rt(groups) loop
+        let group = vec_get_rt(groups, index)
+        if native_read_i64(group, 0) == level do
+            if occurrences == 1 do
+                count = count + native_read_i64(group, 16)
+            else
+                count = count + 1
+            end
+        end
+        index = index + 1
+    end
+    out count
+end.
+
+func pass10EmitModern(diag: &DiagnosticEngine):
+    let
+        count = vec_len_rt(diag.diagnostics)
+        groups = pass10CollectGroups(diag.diagnostics)
+        uniqueErrors = pass10CountGroups(groups, DiagnosticLevel.Error, 0)
+        warnings = pass10CountGroups(groups, DiagnosticLevel.Warning, 1)
+        notes = pass10CountGroups(groups, DiagnosticLevel.Info, 1)
+    var index = 0
+    if diag.error_count > 0 do cliUiFailurePhase() end
+    if uniqueErrors >= 2 do
+        var text = sb_new()
+        text = sb_append(text, "Summary: ")
+        index = 0
+        when index < vec_len_rt(groups) loop
+            let group = vec_get_rt(groups, index)
+            if index > 0 do text = sb_append(text, " · ") end
+            text = sb_append(text, "[")
+            text = pass10AppendCode(text, native_read_i64(group, 0), native_read_i64(group, 8))
+            text = sb_append(text, "] × ")
+            text = sb_append_int(text, native_read_i64(group, 16))
+            index = index + 1
+        end
+        cliUiLine(sb_to_string(text))
+        sb_free(text)
+    end
+    index = 0
+    when index < count loop
+        let
+            item = vec_get_rt(diag.diagnostics, index)
+            level = native_read_i64(item, 0)
+        if level == DiagnosticLevel.Error do
+            if uniqueErrors == 1 do
+                pass10_print_one_detailed(item as Diagnostic, 0)
+            else
+                pass10_print_one_compact(item as Diagnostic, 0)
+            end
+        else
+            pass10_print_one_compact(item as Diagnostic, 0)
+        end
+        index = index + 1
+    end
+    var text = sb_new()
+    text = sb_append_int(text, diag.error_count)
+    text = sb_append(text, " errors · ")
+    text = sb_append_int(text, warnings)
+    text = sb_append(text, " warnings · ")
+    text = sb_append_int(text, notes)
+    text = sb_append(text, " notes")
+    cliUiLine(sb_to_string(text))
+    sb_free(text)
+    if diag.error_count > 0 do cliUiBuildResult(diag.error_count) end
+    index = 0
+    when index < vec_len_rt(groups) loop
+        vir_free(vec_get_rt(groups, index))
+        index = index + 1
+    end
+    vec_free_rt(groups)
+    out diag.error_count
+end.
+
+func pass10_code_to_prefix(level: int):
+    if level == DiagnosticLevel.Warning do
+        out "W"
+    eif level == DiagnosticLevel.Info do
+        out "I"
+    end
+    out "E"
+end.
+
+func pass10_code_to_result(level: int):
+    if level == DiagnosticLevel.Warning do
+        out "WARNING"
+    eif level == DiagnosticLevel.Info do
+        out "INFO"
+    end
+    out "FAILED"
+end.
+
+func pass10_code_to_phase(code: int):
+    if code < 1000 do out "Lexer" end
+    if code < 2000 do out "Parser" end
+    if code >= 2100 and code < 2200 do out "ModuleResolver" end
+    if code < 4000 do out "Semantic" end
+    if code < 5000 do out "ControlFlow" end
+    if code < 6000 or (code >= 8000 and code < 9000) do out "BorrowChecker" end
+    if code >= 7000 and code < 8000 do out "ModuleResolver" end
+    out "Compiler"
+end.
+
+func pass10_code_to_msg(code: int, extra: string):
+    # Lexer errors (E0xxx)
+    if code == 1 or code == 101 do
+        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
+        out "Invalid character in source"
+    end
+    if code == 2 or code == 102 do
+        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
+        out "Unterminated string literal"
+    end
+    if code == 3 or code == 103 do
+        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
+        out "Invalid numeric literal format"
+    end
+
+    # Parser errors (E1xxx)
+    if code == 1001 do
+        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
+        out "Unexpected token in syntax rule"
+    end
+    if code == 1002 do out "Missing block delimiter 'end' or 'end.'" end
+    if code == 1003 do out "Missing colon ':' after condition or signature" end
+    if code == 1004 do
+        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
+        out "Invalid expression syntax"
+    end
+    if code == 1005 do out "Unexpected end of file (EOF)" end
+    if code == 1006 do out "Invalid function signature" end
+    if code == 1007 do out "Mismatched parentheses or brackets" end
+
+    # Semantic & Type errors (E2xxx / E3xxx)
+    if code == 2001 do out "Undefined variable in current scope" end
+    if code == 2002 do
+        if (extra as i64) != 0 do
+            let diag_len = fat_str_len(extra)
+            if diag_len > 0 do
+                arena:
+                    var sb = sb_new()
+                    sb = sb_append(sb, "Undefined function or symbol: '")
+                    var d_i = 0
+                    when d_i < diag_len loop
+                        sb = sb_append_char(sb, fat_str_byte_at(extra, d_i))
+                        d_i = d_i + 1
+                    end
+                    sb = sb_append(sb, "'")
+                    out sb_to_string(sb)
+                end
+            end
+        end
+        out "Undefined function or symbol"
+    end
+    if code == 2003 or code == 3001 do out "Type mismatch in expression or operation" end
+    if code == 2004 do out "Duplicate symbol definition in current scope" end
+    if code == 2005 or code == 3012 do out "Invalid assignment target (not an l-value)" end
+    if code == 2101 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "failed to parse include statement name: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "failed to parse include statement name"
+    end
+    if code == 2102 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "included source not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "included source not found"
+    end
+    if code == 2103 do out "invalid token '::'; use '.' for qualified names" end
+    if code == 2104 do out "maximum include depth exceeded" end
+    if code == 2105 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "circular dependency detected: ")
+                sb = sb_append(sb, extra)
+                out sb_to_string(sb)
+            end
+        end
+        out "circular dependency detected"
+    end
+    if code == 2111 do out "empty or invalid module name in import" end
+    if code == 2112 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "imported module not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "imported module not found"
+    end
+    if code == 2113 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "imported symbol not exported: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "imported symbol not exported"
+    end
+    if code == 2114 do out "maximum import depth exceeded" end
+    if code == 2120 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "failed to read stdlib registry: ")
+                sb = sb_append(sb, extra)
+                out sb_to_string(sb)
+            end
+        end
+        out "failed to read stdlib registry"
+    end
+    if code == 2121 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "duplicate module in stdlib registry: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "duplicate module in stdlib registry"
+    end
+    if code == 2122 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "stdlib target file not found for '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "stdlib target file not found"
+    end
+    if code == 2123 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "duplicate module in project registry: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "duplicate module in project registry"
+    end
+    if code == 2124 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "project module target file not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "project module target file not found"
+    end
+    if code == 2125 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "module resolution target not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "module resolution target not found"
+    end
+    if code == 2201 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "invalid UTF-8 in '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "invalid UTF-8 in source encoding"
+    end
+    if code == 3002 do out "Invalid operator for operand type" end
+    if code == 3003 do out "Assignment to immutable variable (declared with 'let')" end
+    if code == 3004 do out "Type mismatch in variable assignment" end
+    if code == 3005 do out "Wrong argument count in function invocation" end
+    if code == 3006 do out "Invalid operand types for and/or/xor/shl/shr" end
+    if code == 3007 do out "Assignment or return value type does not match declared type" end
+    if code == 3008 do
+        if (extra as i64) != 0 do
+            let diag_len = fat_str_len(extra)
+            if diag_len > 0 do
+                arena:
+                    var sb = sb_new()
+                    sb = sb_append(sb, "Unknown entity field access '")
+                    var d_i = 0
+                    when d_i < diag_len loop
+                        sb = sb_append_char(sb, fat_str_byte_at(extra, d_i))
+                        d_i = d_i + 1
+                    end
+                    sb = sb_append(sb, "'")
+                    out sb_to_string(sb)
+                end
+            end
+        end
+        out "Unknown entity field access"
+    end
+    if code == 3009 do out "Operation prohibited in 'infer:' block (e.g. calling .backward())" end
+    if code == 3010 do out "Duplicate field in entity initialization" end
+    if code == 3011 do out "Field type mismatch in entity instantiation" end
+    if code == 3013 do out "Tensor indexing rank mismatch" end
+    if code == 3014 do out "Matrix multiplication dimension mismatch" end
+    if code == 3015 do out "Tensor index must be integer" end
+    if code == 3016 do out "infer/train blocks cannot be nested" end
+    if code == 3017 do out ".backward() is only valid inside a train block" end
+    if code == 3018 do out "quantize input must be a floating-point tensor" end
+    if code == 3019 do out "quantize bits must be a compile-time constant in {4, 8, 16, 32}" end
+    if code == 3020 do out ".backward() receiver must be a floating-point train value with gradient state" end
+    if code == 3021 do out "Unresolved UFCS member: no entity method, callable field, or free function" end
+    if code == 3022 do out "Wrong argument count in UFCS invocation" end
+    if code == 3023 do out "Quantized tensor operations are only supported inside an 'infer:' block" end
+    if code == 3024 do out "Invalid tensor type; expected tensor[T; S...] with T in {f32, f16, f64, i8, u8, i32, int} and positive compile-time dimensions" end
+    if code == 3025 do out "Packed entity field missing type annotation" end
+    if code == 3026 do out "Invalid packed entity field type; must be compile-time fixed-size primitive or packed entity" end
+    if code == 3027 do out "Recursive packed entity layout cycle detected" end
+    if code == 3028 do out "Normal entity cannot be embedded inline in packed entity" end
+    if code == 3029 do out "Missing required field in entity initialization" end
+    if code == 3030 do out "Integer literal value out of range for packed field type" end
+    if code == 3031 do out "Wrong argument count in enum constructor invocation" end
+    if code == 3032 do out "Non-exhaustive case expression on enum" end
+    if code == 3033 do out "Unknown enum variant in pattern arm" end
+    if code == 3034 do out "Variant does not belong to target enum" end
+    if code == 3035 do out "Duplicate case pattern arm" end
+    if code == 3036 do out "Unreachable pattern arm after wildcard" end
+    if code == 3037 do out "Wrong binder count in enum pattern arm" end
+    if code == 3038 do out "Ambiguous unqualified enum variant; qualify with enum name" end
+    if code == 3039 do out "Duplicate explicit enum variant tag" end
+    if code == 3040 do out "Enum tag value out of range (must be u32: 0..4294967295)" end
+    if code == 3041 do out "Duplicate binder in case pattern arm" end
+    if code == 3042 do out "Incompatible generic argument type for enum constructor" end
+    if code == 3043 do out "Equality comparison '==' is not supported for payload enums; use case pattern matching" end
+    if code == 3044 do out "Parameter keyword 'in' is invalid in parenthesized parameter syntax; default parameters are passed by value (§14.1)" end
+    if code == 3045 do out "Parameter keyword 'out' is invalid in parenthesized parameter syntax; use parameter groups (§14.1)" end
+    if code == 3046 do out "Empty parameter group is not allowed (§14.2)" end
+    if code == 3047 do out "Parameter declaration without a group (§14.2)" end
+    if code == 3048 do out "Cannot pass a temporary value or expression as 'ref' or 'out' parameter (§14)" end
+    if code == 3049 do out "Cannot pass an uninitialized variable to 'ref' parameter (§14)" end
+    if code == 3050 do out "Cannot read 'out' parameter before it has been definitely assigned (§14)" end
+    if code == 3051 do out "'out' parameter is not definitely assigned on all normal return paths (§14)" end
+    if code == 3054 do out "Duplicate parameter name in function definition (§14)" end
+    if code == 3056 do out "ensure/revert are continuation clauses and must not use ':' (§13)" end
+    if code == 3057 do out "Duplicate ensure clause in function (§13.2)" end
+    if code == 3058 do out "Duplicate revert clause in function (§13.3)" end
+    if code == 3059 do out "throw value must have type int (§13.6)" end
+    if code == 3060 do out "erx is only available inside ensure/revert clauses (§13.5, §13.7)" end
+    if code == 3061 do out "resume is only valid inside a local try revert clause (§13.7)" end
+    if code == 3062 do out "resume must be followed by retry or revert (§13.7)" end
+    if code == 3063 do out "Duplicate timeout option in try (§13.7)" end
+    if code == 3064 do out "Expected ':' after timeout option (§13.7)" end
+    if code == 3065 do out "Duplicate isolate option in try (§13.7)" end
+    if code == 3066 do out "Expected ':' after isolate option (§13.7)" end
+    if code == 3067 do out "Unknown try option (§13.7)" end
+    if code == 3068 do out "Expected ':' after try header (§13.7)" end
+    if code == 3069 do out "try requires a local revert clause (§13.7)" end
+    if code == 3070 do out "try closes with end, not end. (§13.7)" end
+    if code == 3071 do out "try isolate list must contain unique mutable Copy variables declared outside the try (§13.7)" end
+    if code == 3072 do out "atomic retry variables must be mutable Copy values and cannot appear in isolate lists (§13.7)" end
+    if code == 3073 do out "emit requires a typed event constructor invocation (§13.7)" end
+    if code == 3074 do out "throw is only valid inside a function (§13.1)" end
+    if code == 3075 do out "try is only valid inside a function (§13.7)" end
+    if code == 3076 do out "Negative integer exponent is invalid for scalar power (§10)" end
+    if code == 3077 do out "Register/mold field width must be positive (§16)" end
+    if code == 3078 do out "Register/mold fields exceed the declared base width (§16)" end
+    if code == 3079 do out "Register/mold field value does not fit its bit width (§16)" end
+    if code == 3080 do out "precomp: I/O is forbidden during compile-time evaluation" end
+    if code == 3081 do out "precomp: division by zero during compile-time evaluation" end
+    if code == 3082 do out "precomp: strings, arrays, and allocations are forbidden during compile-time evaluation" end
+    if code == 3083 do
+        arena:
+            var sb = sb_new()
+            sb = sb_append(sb, "precomp: compile-time failure")
+            if g_precomp_throw_kind == 1 do
+                sb = sb_append(sb, " ")
+                sb = sb_append_int(sb, g_precomp_throw_val)
+            eif g_precomp_throw_kind == 2 do
+                if fat_str_len(g_precomp_throw_str) > 0 do
+                    sb = sb_append(sb, " ")
+                    sb = sb_append(sb, g_precomp_throw_str)
+                end
+            end
+            out sb_to_string(sb)
+        end
+    end
+    if code == 3084 do out "generic type mismatch: incompatible specialized return type" end
+    if code == 3085 do out "generic arity mismatch: wrong number of type arguments" end
+    if code == 3086 do
+        if (extra as i64) != 0 do
+            let diag_len = fat_str_len(extra)
+            if diag_len > 0 do
+                arena:
+                    var sb = sb_new()
+                    sb = sb_append(sb, "unresolved generic type parameter ")
+                    var d_i = 0
+                    when d_i < diag_len loop
+                        sb = sb_append_char(sb, fat_str_byte_at(extra, d_i))
+                        d_i = d_i + 1
+                    end
+                    out sb_to_string(sb)
+                end
+            end
+        end
+        out "unresolved generic type parameter"
+    end
+    if code == 3087 do out "duplicate swizzle lane in write-mask" end
+    if code == 3088 do out "swizzle width mismatch: write-mask width must match source width" end
+    if code == 3089 do out "swizzle lane out of range for vector width" end
+    if code == 3090 do out "flux width power of two: flux width must be a power of two" end
+    if code == 3095 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "bind(")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, ") requires parameter types")
+                out sb_to_string(sb)
+            end
+        end
+        out "bind(c) requires parameter types"
+    end
+    if code == 3097 do out "Cyclic type dependency or circular inference detected" end
+    if code == 302 do out "Retry may observe dirty state; reset it, isolate it, or declare a Copy counter atomic (§13.7)" end
+
+    # Control Flow errors (E4xxx)
+    if code == 4001 do out "Missing return statement on some code paths" end
+    if code == 4002 do out "Unreachable code detected" end
+    if code == 4003 do out "Dead code — condition is always constant" end
+    if code == 4004 do out "Loop control statement 'break' or 'skip' outside loop body" end
+
+    # Borrow Checker errors (E5xxx / E8xxx)
+    if code == 5001 or code == 8001 do out "Use of moved value" end
+    if code == 5002 or code == 8002 do out "Cannot borrow as mutable while shared borrow is active" end
+    if code == 5003 do out "Cannot borrow as mutable more than once (aliasing violation)" end
+    if code == 5004 do out "Borrow of moved value" end
+    if code == 5005 or code == 8004 do out "Arena-allocated value, reference, or borrow escapes its block scope" end
+    if code == 5006 do out "Cannot borrow as shared while mutable borrow is active" end
+    if code == 5007 do out "Reference to local variable escapes function scope" end
+    if code == 5008 do out "Cannot move value while active borrow exists" end
+    if code == 5009 do out "Cannot mutate variable while shared borrow is active" end
+    if code == 5010 do out "Cannot perform arena_reset while live borrow exists" end
+    if code == 5011 do out "Cannot hold borrow across await suspension boundary" end
+    if code == 5012 do out "Borrowed reference escapes its enclosing block scope" end
+    if code == 5013 do out "Use of uninitialized variable or reference" end
+
+    # Fallback
+    var sb = sb_new()
+    sb = sb_append(sb, "Compiler diagnostic code ")
+    sb = sb_append_int(sb, code)
+    out sb_to_string(sb)
+end.
+
+func pass10_code_to_causes(code: int):
+    if code == 2001 or code == 1002 do
+        out "• Variable was not declared in current or outer scope\n• Typo in variable identifier name"
+    end
+    if code == 2002 do
+        out "• Function name was misspelled\n• Missing 'import' statement from module"
+    end
+    if code == 3001 do
+        out "• Type mismatch in assignment or expression\n• Incompatible operand types for operator"
+    end
+    if code == 3002 do
+        out "• Function returned a value with a type different from its signature"
+    end
+    if code == 3003 do
+        out "• Variable was declared with 'let' (immutable binding)\n• Reassignment is only allowed for 'var' variables"
+    end
+    if code == 3004 do
+        out "• Number of arguments does not match function parameter count"
+    end
+    if code == 3008 do
+        out "• Field name does not exist on the target entity\n• Typo in entity field identifier\n• Field belongs to a different entity type"
+    end
+    if code == 3010 do
+        out "• Duplicate field in entity initialization\n• Each field may only be specified once"
+    end
+    if code == 3011 do
+        out "• Field type mismatch in entity instantiation\n• Value type does not match declared field type"
+    end
+    if code == 3029 do
+        out "• Missing required field in entity initialization\n• All declared fields must be provided"
+    end
+    if code == 3095 do
+        out "• FFI parameter type annotation is mandatory\n• Foreign function bindings must specify explicit parameter types"
+    end
+    if code == 3009 do
+        out "• Automatic differentiation (.backward()) was invoked inside 'infer:'\n• 'infer:' disables gradient tape recording for forward inference"
+    end
+    if code == 3021 do
+        out "• Receiver type has no matching method or callable field\n• No visible free function accepts the receiver as its first argument"
+    end
+    if code == 3022 do
+        out "• Explicit argument count does not match the resolved method\n• Free-function UFCS counts the receiver as argument zero"
+    end
+    if code == 3023 do
+        out "• Quantized tensor indexed or used outside 'infer:' block\n• Spec §26.5 requires quantized operations to reside in 'infer:' blocks"
+    end
+    if code == 5001 or code == 8001 do
+        out "• Value ownership was transferred to another variable or function\n• Attempted to read from an invalidated source"
+    end
+    if code == 5002 or code == 8002 do
+        out "• An active shared (read-only) borrow prevents acquiring a mutable reference"
+    end
+    if code == 5003 do
+        out "• Only one active mutable borrow allowed at any point (aliasing xor mutability)"
+    end
+    if code == 5004 do
+        out "• Cannot create a reference to a value whose ownership has been transferred"
+    end
+    if code == 5005 or code == 8004 do
+        out "• Reference allocated in 'arena:' block assigned to longer-lived variable\n• Pointer would dangle after arena destruction"
+    end
+    if code == 5006 do
+        out "• An active mutable borrow prevents creating any shared borrows"
+    end
+    if code == 5007 do
+        out "• Reference to stack-allocated local variable was returned from function\n• Stack frame is deallocated upon return, causing dangling pointer"
+    end
+    if code == 5008 do
+        out "• Variable ownership transfer attempted while an active reference (& or &mut) is held\n• Moving would invalidate the memory location referenced by the borrow"
+    end
+    if code == 5009 do
+        out "• Assignment or modification attempted while shared reference (&) is held\n• Violates shared borrow immutability guarantee"
+    end
+    if code == 5010 do
+        out "• Calling arena_reset while a live borrow reference is still held\n• Resetting the arena invalidates existing borrows"
+    end
+    if code == 5011 do
+        out "• Active borrow spans an await suspension point\n• Async suspension may outlive the borrowed reference or run across tasks"
+    end
+    if code == 5012 do
+        out "• Reference to block-local variable assigned to outer variable or returned\n• Inner scope variable is destroyed upon block exit, causing dangling pointer"
+    end
+    if code == 5013 do
+        out "• Variable or reference read before being definitely assigned on all execution paths\n• Declaration without initializer requires assignment before use"
+    end
+    if code == 4004 do
+        out "• 'break' or 'skip' placed outside 'loop' or 'when ... loop'"
+    end
+    if code == 3080 do
+        out "• Attempted to perform input/output inside precomp expression or function\n• precomp only allows pure computations without side effects"
+    end
+    if code == 3081 do
+        out "• Division or modulo by zero in constant/precomp evaluation\n• Evaluated divisor expression resulted in zero"
+    end
+    if code == 3082 do
+        out "• Heap allocations, strings, dynamic arrays, and pointers are not allowed during precomp evaluation\n• Dynamic memory allocation is not permitted at compile time"
+    end
+    if code == 3083 do
+        out "• precomp throw statement executed during compile-time evaluation\n• Compile-time assertion or condition check failed"
+    end
+    if code == 3084 do
+        out "• Specialized return type does not match variable annotation\n• Expected type is incompatible with generic specialization"
+    end
+    if code == 3085 do
+        out "• Type argument count does not match generic parameter declaration\n• Wrong number of generic arguments provided"
+    end
+    if code >= 2101 and code <= 2105 do
+        out "• Module or source include resolution failed\n• Path does not exist, syntax is invalid, or circular dependency detected"
+    end
+    if code >= 2111 and code <= 2114 do
+        out "• Selective import resolution failed\n• Symbol is not exported, module not found, or recursion limit exceeded"
+    end
+    if code >= 2120 and code <= 2125 do
+        out "• Stdlib or project module registry resolution error\n• Target file missing or duplicate module identifier registered"
+    end
+    out "• Violation of Vir language specification semantic constraints"
+end.
+
+func pass10_code_to_actions(code: int):
+    if code == 2001 or code == 1002 do
+        out "• Declare variable with 'var <name> = <val>' before use\n• Check identifier spelling"
+    end
+    if code == 2002 do
+        out "• Verify function definition exists or add import statement"
+    end
+    if code == 3001 do
+        out "• Align expression type with expected type\n• Use explicit type cast if types are compatible"
+    end
+    if code == 3002 do
+        out "• Adjust return expression to match function signature\n• Update function signature return type"
+    end
+    if code == 3003 do
+        out "• Change 'let' to 'var' at variable declaration site"
+    end
+    if code == 3004 do
+        out "• Provide the correct number of arguments matching function signature"
+    end
+    if code == 3008 do
+        out "• Check field name spelling in entity definition\n• Add the missing field to the entity declaration"
+    end
+    if code == 3010 do
+        out "• Remove redundant field assignment from constructor call"
+    end
+    if code == 3011 do
+        out "• Provide a value matching the declared field type"
+    end
+    if code == 3029 do
+        out "• Initialize all declared fields in constructor call"
+    end
+    if code == 3095 do
+        out "• Add explicit type annotations to all parameters of foreign function bindings"
+    end
+    if code == 3009 do
+        out "• Move .backward() call into a 'train:' block"
+    end
+    if code == 3021 do
+        out "• Define the method/callable field/free function or correct its name"
+    end
+    if code == 3022 do
+        out "• Pass exactly the parameters required by the resolved UFCS callee"
+    end
+    if code == 3023 do
+        out "• Move quantized tensor indexing or inference into an 'infer:' block"
+    end
+    if code == 5001 or code == 8001 do
+        out "• Borrow reference with '&' or clone value before move"
+    end
+    if code == 5002 or code == 8002 do
+        out "• Release shared borrow before taking a mutable borrow"
+    end
+    if code == 5003 do
+        out "• Ensure existing mutable borrow ends before creating another mutable borrow"
+    end
+    if code == 5004 do
+        out "• Borrow from value before moving it, or do not move while referencing"
+    end
+    if code == 5005 or code == 8004 do
+        out "• Copy data out of arena or expand arena block lifetime"
+    end
+    if code == 5006 do
+        out "• End mutable borrow before acquiring shared borrows"
+    end
+    if code == 5007 do
+        out "• Return value by ownership (move) or allocate in heap/arena"
+    end
+    if code == 5008 do
+        out "• Release or scope-limit the borrow before moving the owner value"
+    end
+    if code == 5009 do
+        out "• Complete reading through shared reference before mutating the owner"
+    end
+    if code == 5010 do
+        out "• Release or end the live borrow before calling arena_reset"
+    end
+    if code == 5011 do
+        out "• Scope-limit the borrow to complete before await, or pass owned data across await"
+    end
+    if code == 5012 do
+        out "• Declare owner variable in the outer scope, or clone value instead of borrowing"
+    end
+    if code == 5013 do
+        out "• Initialize variable at declaration or ensure assignment on all reachable branches"
+    end
+    if code == 4004 do
+        out "• Enclose statement within an active loop construct"
+    end
+    if code == 3080 do
+        out "• Remove I/O operations from compile-time functions\n• Move I/O to runtime main or normal functions"
+    end
+    if code == 3081 do
+        out "• Ensure divisor is non-zero in compile-time expressions"
+    end
+    if code == 3082 do
+        out "• Use primitive scalar integers/booleans in precomp evaluation\n• Move string operations and collection initialization to runtime"
+    end
+    if code == 3083 do
+        out "• Review compile-time condition or adjust values to avoid throw"
+    end
+    if code == 3084 do
+        out "• Align variable declaration type with generic specialization\n• Change type argument to match target variable"
+    end
+    if code == 3085 do
+        out "• Provide exact number of type arguments declared on generic entity or function"
+    end
+    if code >= 2101 and code <= 2105 do
+        out "• Verify module path and existence in stdlib or search paths\n• Break circular dependency or correct include syntax"
+    end
+    if code >= 2111 and code <= 2114 do
+        out "• Verify exported symbol name with 'export <symbol>'\n• Check imported module path and import syntax"
+    end
+    if code >= 2120 and code <= 2125 do
+        out "• Check stdlib.vri or module.list configuration\n• Ensure target source files exist on disk"
+    end
+    out "• Review source code against Vir language specification"
+end.
+
+func pass10_color_red(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1;31m")
+    out sb
+end.
+
+func pass10_color_yellow(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1;33m")
+    out sb
+end.
+
+func pass10_color_bold(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1m")
+    out sb
+end.
+
+func pass10_color_reset(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[0m")
+    out sb
+end.
+
+func pass10_print_one_detailed(d: Diagnostic, use_color: int):
+    let d_level = native_read_i64(d as i64, 0)
+    let d_message = native_read_i64(d as i64, 8)
+    let d_span_id = native_read_i64(d as i64, 72)
+    var d_line = native_read_i64(d as i64, 16)
+    var d_col = native_read_i64(d as i64, 24)
+    let d_extra = native_read_i64(d as i64, 32) as string
+    let d_secondary_line = native_read_i64(d as i64, 40)
+    let d_secondary_col = native_read_i64(d as i64, 48)
+    let d_secondary_note = native_read_i64(d as i64, 56) as string
+    var actual_file = native_read_i64(d as i64, 80)
+    if d_span_id > 0 and g_active_source_manager != 0 do
+        let sp = sm_get_span(g_active_source_manager, d_span_id)
+        if sp != 0 do
+            d_line = native_read_i64(sp, 8)
+            d_col = native_read_i64(sp, 16)
+            let sp_fid = native_read_i64(sp, 0)
+            actual_file = sm_get_file_path(g_active_source_manager, sp_fid)
+        end
+    end
+
+    if actual_file == 0 or rt_strlen(actual_file) == 0 do
+        if g_active_source_manager != 0 do
+            actual_file = sm_get_file_path(g_active_source_manager, 0)
+        end
+    end
+
+    arena:
+        pass10HumanLine("═══════════════════════════════════════════════" as int)
+        pass10HumanLine("EXECUTION REPORT" as int)
+        pass10HumanLine("═══════════════════════════════════════════════" as int)
+        pass10HumanLine("" as int)
+
+        var sb = sb_new()
+        sb = sb_append(sb, "Result      : ")
+        if use_color == 1 do
+            if d_level == DiagnosticLevel.Warning do
+                sb = pass10_color_yellow(sb)
+            else
+                sb = pass10_color_red(sb)
+            end
+        end
+        sb = sb_append(sb, pass10_code_to_result(d_level))
+        if use_color == 1 do
+            sb = pass10_color_reset(sb)
+        end
+        pass10HumanLine(sb_to_string(sb))
+        sb_free(sb)
+
+        var sb_code = sb_new()
+        sb_code = sb_append(sb_code, "Code        : [")
+        if use_color == 1 do
+            if d_level == DiagnosticLevel.Warning do
+                sb_code = pass10_color_yellow(sb_code)
+            else
+                sb_code = pass10_color_red(sb_code)
+            end
+        end
+        sb_code = sb_append(sb_code, pass10_code_to_prefix(d_level))
+        if d_message < 1000 do
+            sb_code = sb_append(sb_code, "0")
+        end
+        if d_message < 100 do
+            sb_code = sb_append(sb_code, "0")
+        end
+        if d_message < 10 do
+            sb_code = sb_append(sb_code, "0")
+        end
+        sb_code = sb_append_int(sb_code, d_message)
+        if use_color == 1 do
+            sb_code = pass10_color_reset(sb_code)
+        end
+        sb_code = sb_append(sb_code, "] ")
+        sb_code = sb_append(sb_code, pass10_code_to_phase(d_message))
+        pass10HumanLine(sb_to_string(sb_code))
+        sb_free(sb_code)
+
+        pass10HumanLine("Subsystem   : Compiler" as int)
+        pass10HumanLine("Stage       : Stage 1 (Vir Native)" as int)
+        pass10HumanLine("" as int)
+
+        pass10HumanLine("Location" as int)
+        pass10HumanLine("───────────────────────────────────────────────" as int)
+        var sb_loc = sb_new()
+        sb_loc = sb_append(sb_loc, "File        : ")
+        if g_ui_mode == 1 do
+            sb_loc = cliUiAppendSafe(sb_loc, actual_file as int, 0)
+        else
+            sb_loc = sb_append(sb_loc, actual_file)
+        end
+        pass10HumanLine(sb_to_string(sb_loc))
+        sb_free(sb_loc)
+
+        var sb_line = sb_new()
+        sb_line = sb_append(sb_line, "Line        : ")
+        sb_line = sb_append_int(sb_line, d_line)
+        pass10HumanLine(sb_to_string(sb_line))
+        sb_free(sb_line)
+
+        if d_col > 0 do
+            var sb_col = sb_new()
+            sb_col = sb_append(sb_col, "Column      : ")
+            sb_col = sb_append_int(sb_col, d_col)
+            pass10HumanLine(sb_to_string(sb_col))
+            sb_free(sb_col)
+        end
+        pass10HumanLine("" as int)
+
+        var related_line = d_secondary_line
+        if related_line <= 0 and d_col < 0 do
+            related_line = 0 - d_col
+        end
+        if related_line > 0 do
+            pass10HumanLine("Related Location" as int)
+            pass10HumanLine("───────────────────────────────────────────────" as int)
+            var sb_related = sb_new()
+            sb_related = sb_append(sb_related, "Line        : ")
+            sb_related = sb_append_int(sb_related, related_line)
+            if d_secondary_col > 0 do
+                sb_related = sb_append(sb_related, ", Column ")
+                sb_related = sb_append_int(sb_related, d_secondary_col)
+            end
+            pass10HumanLine(sb_to_string(sb_related))
+            sb_free(sb_related)
+            if d_message == 5001 do
+                pass10HumanLine("Value was moved here" as int)
+            eif d_message == 5012 do
+                pass10HumanLine("Owner declared here" as int)
+            eif d_message == 5013 do
+                pass10HumanLine("Variable declared here" as int)
+            else
+                pass10HumanLine("Borrow started here" as int)
+            end
+            pass10HumanLine("" as int)
+        end
+
+        pass10HumanLine("Analysis" as int)
+        pass10HumanLine("───────────────────────────────────────────────" as int)
+        pass10HumanValueLine(pass10_code_to_msg(d_message, d_extra) as int)
+        if d_message == 2102 or d_message == 2112 do
+            var sb_req = sb_new()
+            sb_req = sb_append(sb_req, "requested at ")
+            if g_ui_mode == 1 do
+                sb_req = cliUiAppendSafe(sb_req, actual_file as int, 0)
+            else
+                sb_req = sb_append(sb_req, actual_file)
+            end
+            sb_req = sb_append(sb_req, ":")
+            sb_req = sb_append_int(sb_req, d_line)
+            pass10HumanLine(sb_to_string(sb_req))
+            sb_free(sb_req)
+        end
+        pass10HumanLine("" as int)
+
+        pass10HumanLine("Possible Causes" as int)
+        pass10HumanLine("───────────────────────────────────────────────" as int)
+        pass10HumanLine(pass10_code_to_causes(d_message) as int)
+        pass10HumanLine("" as int)
+
+        pass10HumanLine("Action" as int)
+        pass10HumanLine("───────────────────────────────────────────────" as int)
+        pass10HumanLine(pass10_code_to_actions(d_message) as int)
+        pass10HumanLine("" as int)
+
+        pass10HumanLine("═══════════════════════════════════════════════" as int)
+    end
+end.
+
+func pass10_print_one_compact(d: Diagnostic, use_color: int):
+    let d_level = native_read_i64(d as i64, 0)
+    let d_message = native_read_i64(d as i64, 8)
+    let d_span_id = native_read_i64(d as i64, 72)
+    var d_line = native_read_i64(d as i64, 16)
+    var d_col = native_read_i64(d as i64, 24)
+    let d_extra = native_read_i64(d as i64, 32) as string
+    var actual_file = native_read_i64(d as i64, 80)
+    if d_span_id > 0 and g_active_source_manager != 0 do
+        let sp = sm_get_span(g_active_source_manager, d_span_id)
+        if sp != 0 do
+            d_line = native_read_i64(sp, 8)
+            d_col = native_read_i64(sp, 16)
+            let sp_fid = native_read_i64(sp, 0)
+            actual_file = sm_get_file_path(g_active_source_manager, sp_fid)
+        end
+    end
+
+    if actual_file == 0 or rt_strlen(actual_file) == 0 do
+        if g_active_source_manager != 0 do
+            actual_file = sm_get_file_path(g_active_source_manager, 0)
+        end
+    end
+
+    if g_ui_mode == 1 do
+        var text = sb_new()
+        text = sb_append(text, "[")
+        text = pass10AppendCode(text, d_level, d_message)
+        text = sb_append(text, "] ")
+        text = cliUiAppendSafe(text, actual_file, 0)
+        text = sb_append(text, ":")
+        text = sb_append_int(text, d_line)
+        text = sb_append(text, ":")
+        if d_col <= 0 do d_col = 1 end
+        text = sb_append_int(text, d_col)
+        text = sb_append(text, " · ")
+        text = cliUiAppendSafe(text, pass10_code_to_msg(d_message, d_extra) as int, 0)
+        cliUiLine(sb_to_string(text))
+        sb_free(text)
+        out
+    end
+
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "[")
+        if use_color == 1 do sb = pass10_color_bold(sb) end
+        sb = sb_append(sb, actual_file)
+        sb = sb_append(sb, ":")
+        sb = sb_append_int(sb, d_line)
+        sb = sb_append(sb, ":")
+        if d_col > 0 do
+            sb = sb_append_int(sb, d_col)
+        else
+            sb = sb_append_int(sb, 1)
+        end
+        if use_color == 1 do sb = pass10_color_reset(sb) end
+        sb = sb_append(sb, "] [")
+        if use_color == 1 do
+            if d_level == DiagnosticLevel.Warning do
+                sb = pass10_color_yellow(sb)
+            else
+                sb = pass10_color_red(sb)
+            end
+        end
+        sb = sb_append(sb, pass10_code_to_prefix(d_level))
+        if d_message < 1000 do sb = sb_append(sb, "0") end
+        if d_message < 100 do sb = sb_append(sb, "0") end
+        if d_message < 10 do sb = sb_append(sb, "0") end
+        sb = sb_append_int(sb, d_message)
+        if use_color == 1 do sb = pass10_color_reset(sb) end
+        sb = sb_append(sb, "] ")
+        sb = sb_append(sb, pass10_code_to_msg(d_message, d_extra))
+        if d_message == 2102 or d_message == 2112 do
+            sb = sb_append(sb, " requested at ")
+            sb = sb_append(sb, actual_file)
+            sb = sb_append(sb, ":")
+            sb = sb_append_int(sb, d_line)
+        end
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+end.
+
+func pass10_print_one(d: Diagnostic):
+    pass10_print_one_detailed(d, 0)
+end.
+
+export pass10_code_to_msg, pass10_emit_diagnostics, pass10_print_one, pass10_emit_json,
+       pass10HumanLine, pass10AppendCode, pass10EmitModern,
+       pass10SessionReset, pass10SessionEmit, pass10SessionSerialize, pass10CaptureDiagnostics,
+       compilerFailure, compilerAbort,
+       virc_timer_init, virc_elapsed_us, virc_print_compile_time, virc_print_phase_timings,
+       g_color_mode, g_diag_json, g_phase_timings, g_time_buf_start, g_compile_timer_printed,
+       g_phase_read_us, g_phase_preprocess_us, g_phase_lex_us, g_phase_parse_us,
+       g_phase_semantic_us, g_phase_semantic_start_us, g_phase_lower_us,
+       g_phase_codegen_us, g_phase_link_us
