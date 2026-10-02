@@ -1,0 +1,388 @@
+##
+ * vir/fs/fs.vri — Production-Grade Filesystem Operations (Pure Vir, Zero Libc)
+ * =========================================================================
+ * Full standard file system API:
+ *   - fs.read, fs.write, fs.write_atomic, fs.append
+ *   - fs.exists, fs.remove, fs.rename, fs.copy, fs.size
+ ##
+
+include types
+include option
+import Option, Some, None from option
+include result
+import Result, Ok, Err from result
+include path
+import Path from path
+include alloc
+import vir_alloc, vir_free, vir_realloc from alloc
+include vir.rt.syscall
+
+extern func native_read_u8(addr: int, offset: int) -> int
+extern func native_write_u8(addr: int, offset: int, val: int)
+
+const FS_MODE_MASK: 0xF000
+const FS_MODE_FILE: 0x8000
+const FS_MODE_DIR:  0x4000
+
+func fs_str_len(p: int) -> int:
+    if p == 0 do out 0 end
+    var i = 0
+    when native_read_u8(p, i) != 0 loop
+        i = i + 1
+    end
+    out i
+end.
+
+func fs_path_mode(path_value: Path) -> int:
+    path_string = path_value.raw
+    path_data = (path_string as ptr) as int
+    if path_data == 0 do out 0 end
+
+    fd = sys_open(path_data, VIR_O_RDONLY, 0)
+    if fd < 0 do out 0 end
+
+    stat_buf = vir_alloc(256)
+    rc = sys_fstat(fd, stat_buf)
+    sys_close(fd)
+    if rc < 0 do
+        vir_free(stat_buf)
+        out 0
+    end
+
+    platform = sys_platform()
+    mode_offset = 4
+    if platform == Platform.Linux_ARM64 or platform == Platform.Linux_RISCV64 do
+        mode_offset = 16
+    eif platform == Platform.Linux_x86_64 do
+        mode_offset = 24
+    end
+    mode = native_read_u16(stat_buf, mode_offset)
+    vir_free(stat_buf)
+    out mode
+end.
+
+func fs_is_file_impl(p: Path) -> bool:
+    out (fs_path_mode(p) bit_and FS_MODE_MASK) == FS_MODE_FILE
+end.
+
+func fs_is_dir_impl(p: Path) -> bool:
+    out (fs_path_mode(p) bit_and FS_MODE_MASK) == FS_MODE_DIR
+end.
+
+# Returns true if file exists and can be opened
+func fs_exists_impl(path: string) -> bool:
+    let p = path as int
+    if p == 0 do out false end
+    let fd = sys_open(p, VIR_O_RDONLY, 0)
+    if fd < 0 do
+        out false
+    end
+    sys_close(fd)
+    out true
+end.
+
+# Read entire file into string
+func fs_read_impl(path: string):
+    let p = path as int
+    if p == 0 do
+        out Result.Err("invalid path")
+    end
+    let fd = sys_open(p, VIR_O_RDONLY, 0)
+    if fd < 0 do
+        out Result.Err("cannot open file")
+    end
+
+    let sz = sys_lseek(fd, 0, 2)
+    sys_lseek(fd, 0, 0)
+
+    if sz <= 0 do
+        var cap = 4096
+        var buf = vir_alloc(cap)
+        var total = 0
+        var keep_reading = 1
+        when keep_reading == 1 loop
+            let n = sys_read(fd, buf + total, cap - total - 1)
+            if n <= 0 do
+                keep_reading = 0
+                skip
+            end
+            total = total + n
+            if total + 1 >= cap do
+                cap = cap * 2
+                buf = vir_realloc(buf, cap)
+            end
+        end
+        native_write_u8(buf, total, 0)
+        sys_close(fd)
+        out Result.Ok(buf as string)
+    end
+
+    let buf = vir_alloc(sz + 1)
+    var total = 0
+    var keep_reading = 1
+    when total < sz and keep_reading == 1 loop
+        var chunk = sz - total
+        if chunk > 65536 do chunk = 65536 end
+        let n = sys_read(fd, buf + total, chunk)
+        if n <= 0 do
+            keep_reading = 0
+            skip
+        end
+        total = total + n
+    end
+    native_write_u8(buf, total, 0)
+    sys_close(fd)
+    out Result.Ok(buf as string)
+end.
+
+# Write content to file with short-write handling
+func fs_write_impl(path: string, content: string):
+    let p = path as int
+    if p == 0 do out Result.Err("invalid path") end
+    let fd = sys_open(p, VIR_O_WRONLY bit_or VIR_O_CREAT bit_or VIR_O_TRUNC, 0o644)
+    if fd < 0 do
+        out Result.Err("cannot create file")
+    end
+
+    let c = content as int
+    let len = fs_str_len(c)
+    var written = 0
+    var keep_writing = 1
+    when written < len and keep_writing == 1 loop
+        let n = sys_write(fd, c + written, len - written)
+        if n <= 0 do
+            keep_writing = 0
+            skip
+        end
+        written = written + n
+    end
+
+    sys_close(fd)
+    if written < len do
+        out Result.Err("write incomplete")
+    end
+    out Result.Ok(void)
+end.
+
+# Append content to file
+func fs_append_impl(path: string, content: string):
+    let p = path as int
+    if p == 0 do out Result.Err("invalid path") end
+    let fd = sys_open(p, VIR_O_WRONLY bit_or VIR_O_CREAT bit_or VIR_O_APPEND, 0o644)
+    if fd < 0 do
+        out Result.Err("cannot open file for append")
+    end
+
+    let c = content as int
+    let len = fs_str_len(c)
+    var written = 0
+    var keep_writing = 1
+    when written < len and keep_writing == 1 loop
+        let n = sys_write(fd, c + written, len - written)
+        if n <= 0 do
+            keep_writing = 0
+            skip
+        end
+        written = written + n
+    end
+
+    sys_close(fd)
+    if written < len do
+        out Result.Err("append incomplete")
+    end
+    out Result.Ok(void)
+end.
+
+# Atomic write via temporary file + atomic rename
+func fs_write_atomic_impl(path: string, content: string):
+    let p = path as int
+    if p == 0 do out Result.Err("invalid path") end
+    let plen = fs_str_len(p)
+    let tmp_path = vir_alloc(plen + 5)
+    var i = 0
+    when i < plen loop
+        native_write_u8(tmp_path, i, native_read_u8(p, i))
+        i = i + 1
+    end
+    native_write_u8(tmp_path, plen, 46)     # .
+    native_write_u8(tmp_path, plen + 1, 116) # t
+    native_write_u8(tmp_path, plen + 2, 109) # m
+    native_write_u8(tmp_path, plen + 3, 112) # p
+    native_write_u8(tmp_path, plen + 4, 0)
+
+    let wr = fs_write_impl(tmp_path as string, content)
+    case wr
+        Result.Err(e):
+            sys_unlink(tmp_path)
+            out Result.Err(e)
+        Result.Ok(_):
+            let rc = sys_rename(tmp_path, p)
+            if rc != 0 do
+                sys_unlink(tmp_path)
+                out Result.Err("atomic rename failed")
+            end
+            out Result.Ok(void)
+    end
+end.
+
+# Remove file
+func fs_remove_impl(path: string):
+    let p = path as int
+    if p == 0 do out Result.Err("invalid path") end
+    let rc = sys_unlink(p)
+    if rc != 0 do
+        out Result.Err("cannot remove file")
+    end
+    out Result.Ok(void)
+end.
+
+# Rename file or directory
+func fs_rename_impl(old_path: string, new_path: string):
+    let op = old_path as int
+    let np = new_path as int
+    if op == 0 or np == 0 do out Result.Err("invalid path") end
+    let rc = sys_rename(op, np)
+    if rc != 0 do
+        out Result.Err("cannot rename path")
+    end
+    out Result.Ok(void)
+end.
+
+# Copy file
+func fs_copy_impl(src: string, dst: string):
+    let sp = src as int
+    let dp = dst as int
+    if sp == 0 or dp == 0 do out Result.Err("invalid path") end
+
+    let sfd = sys_open(sp, VIR_O_RDONLY, 0)
+    if sfd < 0 do
+        out Result.Err("cannot open source file")
+    end
+
+    let dfd = sys_open(dp, VIR_O_WRONLY bit_or VIR_O_CREAT bit_or VIR_O_TRUNC, 0o644)
+    if dfd < 0 do
+        sys_close(sfd)
+        out Result.Err("cannot create destination file")
+    end
+
+    let buf_sz = 65536
+    let buf = vir_alloc(buf_sz)
+    var copying = 1
+    var had_error = 0
+
+    when copying == 1 loop
+        let n = sys_read(sfd, buf, buf_sz)
+        if n <= 0 do
+            copying = 0
+            skip
+        end
+        var written = 0
+        when written < n loop
+            let w = sys_write(dfd, buf + written, n - written)
+            if w <= 0 do
+                copying = 0
+                had_error = 1
+                skip
+            end
+            written = written + w
+        end
+    end
+
+    sys_close(sfd)
+    sys_close(dfd)
+    vir_free(buf)
+
+    if had_error != 0 do
+        out Result.Err("copy failed during write")
+    end
+    out Result.Ok(void)
+end.
+
+func fs_size_impl(path: string):
+    let p = path as int
+    if p == 0 do out Result.Err("invalid path") end
+    let fd = sys_open(p, VIR_O_RDONLY, 0)
+    if fd < 0 do out Result.Err("cannot open file") end
+    let sz = sys_lseek(fd, 0, 2)
+    sys_close(fd)
+    if sz < 0 do out Result.Err("cannot determine size") end
+    out Result.Ok(sz)
+end.
+
+# ── Namespace-first Public API ──
+
+entity FsNamespace:
+    method exists(path: string) -> bool:
+        out fs_exists_impl(path)
+    end.
+    method isFile(p: Path) -> bool:
+        out fs_is_file_impl(p)
+    end.
+    method isDir(p: Path) -> bool:
+        out fs_is_dir_impl(p)
+    end.
+    method read(path: string):
+        out fs_read_impl(path)
+    end.
+    method write(path: string, content: string):
+        out fs_write_impl(path, content)
+    end.
+    method append(path: string, content: string):
+        out fs_append_impl(path, content)
+    end.
+    method write_atomic(path: string, content: string):
+        out fs_write_atomic_impl(path, content)
+    end.
+    method remove(path: string):
+        out fs_remove_impl(path)
+    end.
+    method rename(old_path: string, new_path: string):
+        out fs_rename_impl(old_path, new_path)
+    end.
+    method copy(src: string, dst: string):
+        out fs_copy_impl(src, dst)
+    end.
+    method size(path: string):
+        out fs_size_impl(path)
+    end.
+end.
+
+var fs: FsNamespace
+
+func exists(path: string) -> bool:
+    out fs_exists_impl(path)
+end.
+
+func read(path: string):
+    out fs_read_impl(path)
+end.
+
+func write(path: string, content: string):
+    out fs_write_impl(path, content)
+end.
+
+func append(path: string, content: string):
+    out fs_append_impl(path, content)
+end.
+
+func write_atomic(path: string, content: string):
+    out fs_write_atomic_impl(path, content)
+end.
+
+func remove(path: string):
+    out fs_remove_impl(path)
+end.
+
+func rename(old_path: string, new_path: string):
+    out fs_rename_impl(old_path, new_path)
+end.
+
+func copy(src: string, dst: string):
+    out fs_copy_impl(src, dst)
+end.
+
+func size(path: string):
+    out fs_size_impl(path)
+end.
+
+export FsNamespace, fs, exists, read, write, append, write_atomic, remove, rename, copy, size

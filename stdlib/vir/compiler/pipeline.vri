@@ -1,0 +1,453 @@
+##
+ * vir/compiler/pipeline.vri — Vir v2.0 Canonical Compiler Pipeline
+ * ================================================================
+ * Canonical lowering path per vir_language_spec_v2.0_vi.md:
+ *
+ *   source → lex → parse → semantic → AST→MIR → MIR SSA → MIR Opt → LIR Lower → RegAlloc Graph Coloring → Codegen
+ ##
+
+include rt.vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_len_rt, vec_free_rt from rt.vec_rt
+
+include compiler.parser
+import AstNode from compiler.parser
+
+include compiler.ast_to_mir
+import ast_lower_program, ast_lower_func, set_ast_lower_verbose from compiler.ast_to_mir
+import ast_lower_program, ast_lower_func, set_ast_lower_verbose, set_global_prog_ast from compiler.ast_to_mir
+
+include compiler.hir
+include compiler.ast_to_hir
+import ast_to_hir_program from compiler.ast_to_hir
+
+include compiler.hir_to_mir
+import hir_to_mir_program from compiler.hir_to_mir
+
+include compiler.mir
+import MirFunc, mir_func_new, mir_func_id, mir_func_name, mir_func_next_vreg, mir_func_def_uses, mir_func_next_block_id, mir_func_entry_block, mir_func_blocks, mir_func_strings, mir_func_var_buckets, MirOp, MirOperandType, MIR_MEM_MARK, MIR_MEM_RESET, MIR_INTR_ADDR_OF, mir_block_head, mir_block_replace_head, mir_instr_new, mir_instr_op, mir_instr_dst, mir_instr_src1, mir_instr_src2, mir_opnd_type, mir_opnd_imm, mir_opnd_vreg, mir_opnd_imm_val from compiler.mir
+
+include compiler.mir_cfg
+import mir_build_cfg, mir_compute_dominators from compiler.mir_cfg
+
+include compiler.mir_ssa
+import mir_insert_phi_nodes, mir_rename_variables from compiler.mir_ssa
+
+include compiler.context
+import print_str, print_int, print_ln from compiler.context
+
+include string_rt
+import sb_new, sb_append, sb_append_int, sb_to_string, sb_free, fat_str_new, native_read_i64 from string_rt
+
+include compiler.mir_opt
+import mir_opt_constant_folding, mir_opt_dce, mir_opt_set_program, mir_opt_set_current_func, mir_verify_memory_contract,
+       mir_verify_error_reason, mir_verify_error_block, mir_verify_error_instr, mir_verify_error_origin, set_mir_mutate_mode from compiler.mir_opt
+
+include compiler.mir_opt_pipeline
+include compiler.opt_trace
+import optTraceNote from compiler.opt_trace
+import mir_optimize_all, mir_opt_run_spec_pipeline, set_mir_opt_level, get_mir_opt_level from compiler.mir_opt_pipeline
+
+include compiler.target
+import get_codegen_target, TargetArch from compiler.target
+
+include compiler.opt_backend
+import opt_backend_run_mir_post, opt_backend_run_lir_post from compiler.opt_backend
+import opt_backend_run_mir_post, opt_backend_run_lir_pre, opt_backend_run_lir_post from compiler.opt_backend
+import optBackendRunLirPreLevel from compiler.opt_backend
+
+include compiler.lir_lower
+import lir_lower_program from compiler.lir_lower
+
+include compiler.lir_liveness
+import lir_compute_liveness from compiler.lir_liveness
+
+include compiler.lir
+import LirFunc, LirBlock, lir_func_strings, lir_func_id from compiler.lir
+
+func lir_func_name(f: &LirFunc): out native_read_i64(f as i64, 8) as string end.
+func lir_func_blocks(f: i64): out native_read_i64(f as i64, 16) end.
+func lir_block_instrs(b: LirBlock): out native_read_i64(b as i64, 8) end.
+
+include compiler.lir_regalloc_color
+import lir_allocate_registers_color from compiler.lir_regalloc_color
+
+include compiler.ffi_imports
+import ffi_import_count, ffi_import_name from compiler.ffi_imports
+
+include compiler.mc_verify
+import mc_verify_register_symbol, mc_verify_register_symbol_cstr, mc_verify_reset from compiler.mc_verify
+
+include compiler.lir_to_mc
+import lir_mc_string_symbol from compiler.lir_to_mc
+
+include compiler.cli_ui
+import cliUiPhaseBegin, cliUiPhaseEnd, cliUiPhaseItem from compiler.cli_ui
+
+var g_use_hir_pipeline: int = 0
+var g_mir_full_opt: int = 0
+var g_mir_opt_level: int = 1
+
+func pipeline_report_mir_verify_failure(stage: string):
+    print_str("virc: error [E6001]: MIR memory contract verification failed; stage=")
+    print_str(stage)
+    print_str("; invariant=")
+    print_str(mir_verify_error_reason())
+    print_str("; block=")
+    print_int(mir_verify_error_block())
+    print_str("; instruction=")
+    print_int(mir_verify_error_instr())
+    print_str("; source_origin=")
+    print_int(mir_verify_error_origin())
+    print_str("\n")
+end.
+
+func set_pipeline_hir_mode(mode: int):
+    g_use_hir_pipeline = mode
+end.
+
+func set_pipeline_mir_full(mode: int):
+    if mode == 1 do
+        set_pipeline_opt_level(3)
+    else
+        set_pipeline_opt_level(1)
+    end
+end.
+
+func set_pipeline_opt_level(level: int):
+    if level < 0 do
+        g_mir_opt_level = 0
+    eif level > 3 do
+        g_mir_opt_level = 3
+    else
+        g_mir_opt_level = level
+    end
+    set_mir_opt_level(g_mir_opt_level)
+    # Compatibility mirror only: it never overrides the resolved level.
+    g_mir_full_opt = 0
+    if g_mir_opt_level >= 2 do g_mir_full_opt = 1 end
+end.
+
+func get_pipeline_opt_level:
+    out g_mir_opt_level
+end.
+
+var g_pipeline_mutate_mir: int = 0
+
+func set_pipeline_mutate_mir(mode: int):
+    g_pipeline_mutate_mir = mode
+    set_mir_mutate_mode(mode)
+end.
+
+func get_pipeline_mutate_mir:
+    out g_pipeline_mutate_mir
+end.
+
+func mir_apply_mutation(mf: &MirFunc, blocks: i64, mode: int) -> i64:
+    if mode <= 0 do out blocks end
+    let n_blocks = vec_len_rt(blocks)
+    var b_idx = 0
+    var mutated = 0
+    when b_idx < n_blocks loop
+        let blk = vec_get_rt(blocks, b_idx)
+        let instrs = mir_block_head(blk)
+        if instrs >= 0 and mutated == 0 do
+            let ni = vec_len_rt(instrs)
+            var new_instrs = vec_new_rt()
+            var ii = 0
+            when ii < ni loop
+                let ins = vec_get_rt(instrs, ii)
+                var is_reset = 0
+                var is_mark = 0
+                if mir_instr_op(ins) == MirOp.Intrinsic do
+                    let kind = mir_instr_src2(ins)
+                    if mir_opnd_type(kind) == MirOperandType.Imm do
+                        let ik = mir_opnd_imm_val(kind)
+                        if ik == MIR_MEM_RESET do
+                            is_reset = 1
+                        eif ik == MIR_MEM_MARK do
+                            is_mark = 1
+                        end
+                    end
+                end
+
+                if mode == 1 do
+                    # missing_reset: omit the first MIR_MEM_RESET
+                    if is_reset == 1 and mutated == 0 do
+                        mutated = 1
+                    else
+                        new_instrs = vec_push_rt(new_instrs, ins)
+                    end
+                eif mode == 2 do
+                    # duplicate_reset: duplicate the first MIR_MEM_RESET
+                    new_instrs = vec_push_rt(new_instrs, ins)
+                    if is_reset == 1 and mutated == 0 do
+                        new_instrs = vec_push_rt(new_instrs, ins)
+                        mutated = 1
+                    end
+                eif mode == 3 do
+                    # misordered_reset: move MIR_MEM_RESET to precede MIR_MEM_MARK
+                    if is_mark == 1 and mutated == 0 do
+                        var r_ins = 0 as i64
+                        var fi = ii + 1
+                        when fi < ni loop
+                            let cand = vec_get_rt(instrs, fi)
+                            if mir_instr_op(cand) == MirOp.Intrinsic do
+                                let k = mir_instr_src2(cand)
+                                if mir_opnd_type(k) == MirOperandType.Imm and mir_opnd_imm_val(k) == MIR_MEM_RESET do
+                                    r_ins = cand
+                                    fi = ni
+                                end
+                            end
+                            fi = fi + 1
+                        end
+                        if r_ins != 0 do
+                            new_instrs = vec_push_rt(new_instrs, r_ins)
+                            mutated = 1
+                        end
+                        new_instrs = vec_push_rt(new_instrs, ins)
+                    else
+                        new_instrs = vec_push_rt(new_instrs, ins)
+                    end
+                eif mode == 6 do
+                    # unresolved_direct_call: replace first call target with unresolved callee
+                    if mir_instr_op(ins) == MirOp.Call and mutated == 0 do
+                        var f_strs = mir_func_strings(mf)
+                        let bad_str = fat_str_new("__unresolved_callee__")
+                        let bad_cid = vec_len_rt(f_strs)
+                        f_strs = vec_push_rt(f_strs, bad_str as i64)
+                        native_write_i64(mf as i64, 56, f_strs as i64)
+                        let new_call = mir_instr_new(MirOp.Call, mir_instr_dst(ins), mir_instr_src1(ins), mir_opnd_imm(bad_cid))
+                        new_instrs = vec_push_rt(new_instrs, new_call)
+                        mutated = 1
+                    else
+                        new_instrs = vec_push_rt(new_instrs, ins)
+                    end
+                eif mode == 7 do
+                    # unresolved_addr_of: insert MIR_INTR_ADDR_OF with unresolved callee
+                    if mutated == 0 do
+                        var f_strs = mir_func_strings(mf)
+                        let bad_str = fat_str_new("__unresolved_callee__")
+                        let bad_cid = vec_len_rt(f_strs)
+                        f_strs = vec_push_rt(f_strs, bad_str as i64)
+                        native_write_i64(mf as i64, 56, f_strs as i64)
+                        let bad_addr = mir_instr_new(MirOp.Intrinsic, mir_opnd_vreg(999), mir_opnd_imm(bad_cid), mir_opnd_imm(MIR_INTR_ADDR_OF))
+                        new_instrs = vec_push_rt(new_instrs, bad_addr)
+                        new_instrs = vec_push_rt(new_instrs, ins)
+                        mutated = 1
+                    else
+                        new_instrs = vec_push_rt(new_instrs, ins)
+                    end
+                else
+                    new_instrs = vec_push_rt(new_instrs, ins)
+                end
+                ii = ii + 1
+            end
+            mir_block_replace_head(blk, new_instrs)
+        end
+        b_idx = b_idx + 1
+    end
+    out blocks
+end.
+
+func pipeline_print_progress(verbose: int, label: string, cur: i64, total: i64):
+    if verbose != 1 do out end
+    if cur != 1 & (cur mod 25) != 0 & cur != total do out end
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: pipeline — ")
+        sb = sb_append(sb, label)
+        sb = sb_append(sb, " ")
+        sb = sb_append_int(sb, cur)
+        sb = sb_append(sb, "/")
+        sb = sb_append_int(sb, total)
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+end.
+
+func compile_pipeline(source_path: string, ast: AstNode, verbose: int):
+    cliUiPhaseBegin(6)
+    mc_verify_reset()
+    var mir_funcs = vec_new_rt()
+    if g_use_hir_pipeline == 1 do
+        if verbose == 1 do
+            print_ln("virc: pipeline — canonical lowering AST -> HIR -> MIR...")
+        end
+        set_global_prog_ast(ast)
+        let hir_funcs = ast_to_hir_program(ast)
+        mir_funcs = hir_to_mir_program(hir_funcs)
+    else
+        if verbose == 1 do
+            print_ln("virc: pipeline — lowering AST to MIR...")
+        end
+        set_ast_lower_verbose(verbose)
+        mir_funcs = ast_lower_program(ast)
+        set_ast_lower_verbose(0)
+    end
+
+    # 2. CFG & Dominator Tree & SSA Phi Insertion & Optimization for each function
+    mir_opt_set_program(mir_funcs)
+    let func_count = vec_len_rt(mir_funcs)
+    cliUiPhaseEnd(6, func_count, "funcs" as int)
+    cliUiPhaseBegin(7)
+    if verbose == 1 do
+        arena:
+            var sb0 = sb_new()
+            sb0 = sb_append(sb0, "virc: pipeline — SSA + MIR opts on ")
+            sb0 = sb_append_int(sb0, func_count)
+            sb0 = sb_append(sb0, " function(s)...")
+            print_ln(sb_to_string(sb0))
+            sb_free(sb0)
+        end
+    end
+    var i = 0
+    when i < func_count loop
+        pipeline_print_progress(verbose, "MIR func", i + 1, func_count)
+        let mf = vec_get_rt(mir_funcs, i)
+        cliUiPhaseItem(i, func_count, mir_func_name(mf))
+        let blocks1 = mir_build_cfg(mir_func_blocks(mf))
+        # CFG dominance and SSA renaming must agree on the same entry block.
+        # Most frontend-built functions start at 0, but imported/generated MIR
+        # may retain a different valid entry index.
+        var entry_idx = mir_func_entry_block(mf)
+        if entry_idx < 0 or entry_idx >= vec_len_rt(blocks1) do
+            entry_idx = 0
+        end
+        let blocks2 = mir_compute_dominators(blocks1, entry_idx)
+        let blocks3 = mir_insert_phi_nodes(mf, blocks2)
+        var (mf2, blocks4) = mir_rename_variables(mf, blocks3)
+        if g_pipeline_mutate_mir != 0 do
+            blocks4 = mir_apply_mutation(mf2, blocks4, g_pipeline_mutate_mir)
+        end
+        if mir_verify_memory_contract(blocks4) == false do
+            extern func sys_exit(code: int)
+            pipeline_report_mir_verify_failure("before optimizer")
+            sys_exit(1)
+        end
+        mir_opt_set_current_func(mf2)
+        var blocks5 = blocks4
+        opt_level = g_mir_opt_level
+        if opt_level >= 1 do
+            blocks5 = mir_opt_run_spec_pipeline(blocks4, opt_level)
+            blocks5 = opt_backend_run_mir_post(blocks5, get_codegen_target(), opt_level)
+        end
+        if mir_verify_memory_contract(blocks5) == false do
+            extern func sys_exit(code: int)
+            pipeline_report_mir_verify_failure("after optimizer")
+            sys_exit(1)
+        end
+        mf_new = mir_func_new(
+            mir_func_id(mf2),
+            mir_func_name(mf2),
+            mir_func_next_vreg(mf2),
+            mir_func_def_uses(mf2),
+            mir_func_next_block_id(mf2),
+            mir_func_entry_block(mf2),
+            blocks5,
+            mir_func_strings(mf2),
+            mir_func_var_buckets(mf2)
+        )
+        vec_set_rt(mir_funcs, i, mf_new)
+        i = i + 1
+    end
+
+    if verbose == 1 do
+        print_ln("virc: pipeline — MIR spec opts complete, lowering to LIR...")
+    end
+
+    # 3. MIR -> LIR Lowering
+    cliUiPhaseEnd(7, func_count, "funcs" as int)
+    cliUiPhaseBegin(8)
+    let lir_funcs = lir_lower_program(mir_funcs)
+    cliUiPhaseEnd(8, vec_len_rt(lir_funcs), "funcs" as int)
+    cliUiPhaseBegin(9)
+
+    if verbose == 1 do
+        print_ln("virc: pipeline — Chaitin-Briggs regalloc + George-Appel coalescing...")
+    end
+
+    # 4. Liveness Analysis & Graph Coloring Register Allocation
+    # Policy: LIR clean first; Briggs assigns/spills; George-Appel IRC coalescing
+    # eliminates redundant Mov(Rd, Rs) where Rd == Rs after coloring.
+    i = 0
+    let lir_count = vec_len_rt(lir_funcs)
+    when i < lir_count loop
+        pipeline_print_progress(verbose, "regalloc func", i + 1, lir_count)
+        var lf = vec_get_rt(lir_funcs, i)
+        cliUiPhaseItem(i, lir_count, lir_func_name(lf))
+        let target_arch = get_codegen_target()
+
+        # Pre-RA LIR hook: branch by target before register allocation
+        lf = optBackendRunLirPreLevel(lf, target_arch, g_mir_opt_level)
+
+        var lf2 = lf
+        if target_arch != TargetArch.Wasm32 and target_arch != 4 do
+            let intervals = lir_compute_liveness(lf)
+            var (colored_lf, phys_map, stack_map) = lir_allocate_registers_color(lf, intervals)
+            lf2 = colored_lf
+            if phys_map > 0 do vec_free_rt(phys_map) end
+            if stack_map > 0 do vec_free_rt(stack_map) end
+            if intervals > 0 do vec_free_rt(intervals) end
+        end
+
+        # Post-RA LIR hook: completely independent optimizations per target
+        lf2 = opt_backend_run_lir_post(lf2, target_arch, g_mir_opt_level)
+        vec_set_rt(lir_funcs, i, lf2)
+        i = i + 1
+    end
+
+    if verbose == 1 do
+        print_ln("virc: pipeline — LIR lowering complete (Q-IR fallback bypassed)")
+    end
+
+    # Fix 3: Register all LIR function names and FFI symbols as valid MC symbols so mc_verify_function
+    # can validate symbol operands without a bypass. The emission loop in virc.vri calls
+    # mc_verify_function after pipeline returns, so we register here before returning.
+    let reg_count = vec_len_rt(lir_funcs)
+    var reg_i = 0
+    when reg_i < reg_count loop
+        let f_obj = vec_get_rt(lir_funcs, reg_i)
+        let f_fat = native_read_i64(f_obj as i64, 8)
+        if f_fat != 0 do
+            mc_verify_register_symbol(f_fat as string)
+            let f_cstr = native_read_i64(f_fat, 0) as int
+            if f_cstr != 0 do
+                mc_verify_register_symbol_cstr(f_cstr)
+            end
+        end
+        let f_strs = lir_func_strings(f_obj)
+        if f_strs != 0 do
+            let n_strs = vec_len_rt(f_strs)
+            var s_i = 0
+            let fid = lir_func_id(f_obj)
+            when s_i < n_strs loop
+                let str_sym = lir_mc_string_symbol(fid, s_i)
+                if str_sym != 0 do
+                    mc_verify_register_symbol_cstr(str_sym)
+                end
+                s_i = s_i + 1
+            end
+        end
+        reg_i = reg_i + 1
+    end
+    let ffi_count = ffi_import_count()
+    var ffi_i = 0
+    when ffi_i < ffi_count loop
+        let ffi_n = ffi_import_name(ffi_i)
+        mc_verify_register_symbol(ffi_n)
+        let ffi_fat = ffi_n as int
+        if ffi_fat != 0 do
+            let ffi_cstr = native_read_i64(ffi_fat, 0) as int
+            if ffi_cstr != 0 do
+                mc_verify_register_symbol_cstr(ffi_cstr)
+            end
+        end
+        ffi_i = ffi_i + 1
+    end
+
+    cliUiPhaseEnd(9, lir_count, "funcs" as int)
+    out lir_funcs
+end.
+
+
+export compile_pipeline, set_pipeline_hir_mode, set_pipeline_mir_full, set_pipeline_opt_level, get_pipeline_opt_level, set_pipeline_mutate_mir, get_pipeline_mutate_mir

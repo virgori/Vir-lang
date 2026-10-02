@@ -1,0 +1,438 @@
+##
+ * vir/collections/map.vri — Hash Map
+ * =====================================
+ * Inspired by Python: dict
+ * Inspired by Rust: HashMap
+ * Triển khai: Open addressing + Linear probing + Tombstone deletion
+ *
+ * Compiler use: symbol table, type registry, string interning.
+ ##
+
+include types
+include option
+import Option, Some, None from option
+include alloc
+import alloc, alloc_zeroed, free from alloc
+include copy
+import mem_set, mem_cmp from copy
+
+func _next_pow2(n: int) -> int:
+    v = n
+    if v == 0 do out 1 end
+    v = v - 1
+    v = v | (v  shr  1)
+    v = v | (v  shr  2)
+    v = v | (v  shr  4)
+    v = v | (v  shr  8)
+    v = v | (v  shr  16)
+    v = v | (v  shr  32)
+    out v + 1
+end.
+
+func _map_cstr_len(data: int) -> int:
+    if data == 0 do out 0 end
+    n = 0
+    when native_read_u8(data, n) != 0 loop
+        n = n + 1
+    end
+    out n
+end.
+
+func _map_read_u64_le(data: ptr, off: int) -> int:
+    base = (data as int) + off
+    out native_read_u8(base, 0) bit_or
+        (native_read_u8(base, 1) shl 8) bit_or
+        (native_read_u8(base, 2) shl 16) bit_or
+        (native_read_u8(base, 3) shl 24) bit_or
+        (native_read_u8(base, 4) shl 32) bit_or
+        (native_read_u8(base, 5) shl 40) bit_or
+        (native_read_u8(base, 6) shl 48) bit_or
+        (native_read_u8(base, 7) shl 56)
+end.
+
+func int_eq(a: int, b: int) -> bool:
+    out a == b
+end.
+
+# ═══════════════════════════════════════════════════════
+# Hash Function — SipHash-2-4 (HashDoS-resistant)
+# ═══════════════════════════════════════════════════════
+# FNV-1a is fast but trivially collision-attackable.
+# SipHash-2-4 is the standard for hash tables (Rust, Python 3.4+).
+
+# Per-process random seed — initialized once from OS entropy
+var _sip_k0: int = 0
+var _sip_k1: int = 0
+var _sip_seeded: bool = false
+
+extern func native_random_u64() -> int;  # OS entropy (getrandom/getentropy)
+
+func _sip_init_seed:
+    if _sip_seeded do out end
+    # C-core has no native_random_u64; use fixed keys for bootstrap determinism.
+    _sip_k0 = 0x0123456789ABCDEF
+    _sip_k1 = 0xFEDCBA9876543210
+    _sip_seeded = true
+end.
+func _rotl64(x: int, n: int):
+    var shift_l = x shl n; var shift_r = x shr (64 - n); var mask = (1 shl n) - 1; out shift_l or (shift_r and mask)
+end.
+func _sip_round:
+    in  v0: int
+        v1: int
+        v2: int
+        v3: int
+    v0 = v0 + v1;  v1 = _rotl64(v1, 13);  v1 = v1 xor v0;  v0 = _rotl64(v0, 32)
+    v2 = v2 + v3;  v3 = _rotl64(v3, 16);  v3 = v3 xor v2
+    v0 = v0 + v3;  v3 = _rotl64(v3, 21);  v3 = v3 xor v0
+    v2 = v2 + v1;  v1 = _rotl64(v1, 17);  v1 = v1 xor v2;  v2 = _rotl64(v2, 32)
+    out (v0, v1, v2, v3)
+end.
+func hash_bytes(data: ptr, len: int):
+    _sip_init_seed()
+    v0 = _sip_k0 xor 0x736f6d6570736575
+    v1 = _sip_k1 xor 0x646f72616e646f6d
+    v2 = _sip_k0 xor 0x6c7967656e657261
+    v3 = _sip_k1 xor 0x7465646279746573
+
+    # Process 8-byte blocks
+    nblocks = len / 8
+    i = 0
+    when i < nblocks loop
+        m = _map_read_u64_le(data, i * 8)
+        v3 = v3 xor m
+        var tup1 = _sip_round(v0, v1, v2, v3)
+        v0 = tup1.0; v1 = tup1.1; v2 = tup1.2; v3 = tup1.3
+        var tup2 = _sip_round(v0, v1, v2, v3)
+        v0 = tup2.0; v1 = tup2.1; v2 = tup2.2; v3 = tup2.3
+        v0 = v0 xor m
+        i = i + 1
+    end
+
+    # Tail bytes + length tag
+    tail = 0
+    remaining = len and 7
+    off = nblocks * 8
+    j = 0
+    when j < remaining loop
+        b = native_read_u8((data as int), off + j)
+        tail = tail or (b shl (j * 8))
+        j = j + 1
+    end
+    tail = tail or (len shl 56)
+    v3 = v3 xor tail
+    var tup1 = _sip_round(v0, v1, v2, v3)
+    v0 = tup1.0; v1 = tup1.1; v2 = tup1.2; v3 = tup1.3
+    var tup2 = _sip_round(v0, v1, v2, v3)
+    v0 = tup2.0; v1 = tup2.1; v2 = tup2.2; v3 = tup2.3
+    v0 = v0 xor tail
+
+    # Finalization
+    v2 = v2 xor 0xFF
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    out v0 xor v1 xor v2 xor v3
+end.
+func hash_i64(val: int):
+    _sip_init_seed()
+    # Inline SipHash for a single 8-byte word
+    v0 = _sip_k0 xor 0x736f6d6570736575
+    v1 = _sip_k1 xor 0x646f72616e646f6d
+    v2 = _sip_k0 xor 0x6c7967656e657261
+    v3 = _sip_k1 xor 0x7465646279746573
+    v3 = v3 xor val
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    v0 = v0 xor val
+    # Length tag: 8 bytes
+    tail = 8 shl 56
+    v3 = v3 xor tail
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    v0 = v0 xor tail
+    v2 = v2 xor 0xFF
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    var tup_tmp = _sip_round(v0, v1, v2, v3)
+    v0 = tup_tmp.0; v1 = tup_tmp.1; v2 = tup_tmp.2; v3 = tup_tmp.3
+    out v0 xor v1 xor v2 xor v3
+end.
+func hash_string(s: string) -> int:
+    data = (s as ptr) as int
+    out hash_bytes(data as ptr, _map_cstr_len(data))
+end.
+func map_str_eq(a: string, b: string) -> bool:
+    ad = (a as ptr) as int
+    bd = (b as ptr) as int
+    alen = _map_cstr_len(ad)
+    blen = _map_cstr_len(bd)
+    if alen != blen do out false end
+    out mem_cmp(ad as ptr, bd as ptr, alen) == 0
+end.
+# ═══════════════════════════════════════════════════════
+# Entry State
+# ═══════════════════════════════════════════════════════
+
+const ENTRY_EMPTY: 0
+const ENTRY_OCCUPIED: 1
+const ENTRY_TOMBSTONE: 2
+
+entity MapEntry:
+    state: int,
+    hash: int,
+    key: int,
+    value: int
+end.
+
+entity Map:
+    entries: ptr,
+    cap: int,
+    len: int,
+    tombstones: int,
+    hash_fn: ptr,
+    eq_fn: ptr
+end.
+
+const MAP_ENTRY_BYTES: 32
+const INT_BYTES: 8
+const MAP_LOAD_FACTOR_NUM: 3
+const MAP_LOAD_FACTOR_DEN: 4
+
+func map_new(hash_fn: ptr, eq_fn: ptr):
+    out Map (
+        entries: 0 as ptr,
+        cap: 0, len: 0, tombstones: 0,
+        hash_fn: hash_fn, eq_fn: eq_fn
+    )
+end.
+
+func map_with_cap(cap: int, hash_fn: ptr, eq_fn: ptr):
+    real_cap = _next_pow2(cap)
+    if real_cap < 16 do real_cap = 16 end
+    entry_size = MAP_ENTRY_BYTES
+    out Map (
+        entries: alloc_zeroed(real_cap * entry_size),
+        cap: real_cap, len: 0, tombstones: 0,
+        hash_fn: hash_fn, eq_fn: eq_fn
+    )
+end.
+
+func _map_entry_base(entries: ptr, idx: int) -> int:
+    out (entries as int) + idx * MAP_ENTRY_BYTES
+end.
+
+func _map_read_state(entries: ptr, idx: int) -> int:
+    out native_read_i64(_map_entry_base(entries, idx), 0)
+end.
+
+func _map_read_hash(entries: ptr, idx: int) -> int:
+    out native_read_i64(_map_entry_base(entries, idx), 8)
+end.
+
+func _map_read_key(entries: ptr, idx: int) -> int:
+    out native_read_i64(_map_entry_base(entries, idx), 16)
+end.
+
+func _map_read_value(entries: ptr, idx: int) -> int:
+    out native_read_i64(_map_entry_base(entries, idx), 24)
+end.
+
+func _map_write_entry(entries: ptr, idx: int, state: int, hash: int, key: int, value: int):
+    base = _map_entry_base(entries, idx)
+    let _s0 = native_write_i64(base, 0, state)
+    let _s1 = native_write_i64(base, 8, hash)
+    let _s2 = native_write_i64(base, 16, key)
+    let _s3 = native_write_i64(base, 24, value)
+end.
+
+func _map_needs_grow(m: Map) -> bool:
+    if m.cap == 0 do out true end
+    out (m.len + m.tombstones) * MAP_LOAD_FACTOR_DEN >= m.cap * MAP_LOAD_FACTOR_NUM
+end.
+
+func _map_grow:
+    ref m: Map
+    old_entries = m.entries
+    old_cap = m.cap
+    new_cap = m.cap * 2
+    if new_cap < 16 do new_cap = 16 end
+    entry_size = MAP_ENTRY_BYTES
+    m.entries = alloc_zeroed(new_cap * entry_size)
+    m.cap = new_cap
+    m.len = 0
+    m.tombstones = 0
+    if old_entries != 0 as ptr do
+        i = 0
+        when i < old_cap loop
+            if _map_read_state(old_entries, i) == ENTRY_OCCUPIED do
+                _map_insert_internal(m, _map_read_hash(old_entries, i), _map_read_key(old_entries, i), _map_read_value(old_entries, i))
+            end
+            i = i + 1
+        end
+        free(old_entries)
+    end
+end.
+
+func _map_insert_internal:
+    ref m: Map
+    in h: int
+        key: int
+        val: int
+    mask = m.cap - 1
+    idx = h and mask
+    probes = 0
+    when probes < m.cap loop
+        st = _map_read_state(m.entries, idx)
+        if st != ENTRY_OCCUPIED do
+            _map_write_entry(m.entries, idx, ENTRY_OCCUPIED, h, key, val)
+            m.len = m.len + 1
+            out
+        end
+        idx = (idx + 1) and mask
+        probes = probes + 1
+    end
+    out
+end.
+
+func map_insert:
+    ref m: Map
+    in key: int
+        val: int
+    if m.cap == 0 do
+        init = map_with_cap(16, m.hash_fn, m.eq_fn)
+        m.entries = init.entries
+        m.cap = init.cap
+        m.hash_fn = init.hash_fn
+        m.eq_fn = init.eq_fn
+    end
+    if _map_needs_grow(m) do _map_grow(m) end
+    hf = m.hash_fn
+    ef = m.eq_fn
+    h = hf(key)
+    mask = m.cap - 1
+    idx = h and mask
+    probes = 0
+    when probes < m.cap loop
+        st = _map_read_state(m.entries, idx)
+        if st == ENTRY_EMPTY or st == ENTRY_TOMBSTONE do
+            _map_write_entry(m.entries, idx, ENTRY_OCCUPIED, h, key, val)
+            if st == ENTRY_TOMBSTONE do
+                m.tombstones = m.tombstones - 1
+            end
+            m.len = m.len + 1
+            out None
+        end
+        eh = _map_read_hash(m.entries, idx)
+        ek = _map_read_key(m.entries, idx)
+        if eh == h and ef(ek, key) do
+            old_val = _map_read_value(m.entries, idx)
+            _map_write_entry(m.entries, idx, ENTRY_OCCUPIED, h, key, val)
+            out Some(old_val)
+        end
+        idx = (idx + 1) and mask
+        probes = probes + 1
+    end
+    out None
+end.
+
+func map_get(m: Map, key: int):
+    if m.cap == 0 do out None end
+    hf = m.hash_fn
+    ef = m.eq_fn
+    h = hf(key)
+    mask = m.cap - 1
+    idx = h and mask
+    probes = 0
+    when probes < m.cap loop
+        st = _map_read_state(m.entries, idx)
+        if st == ENTRY_EMPTY do out None end
+        eh = _map_read_hash(m.entries, idx)
+        ek = _map_read_key(m.entries, idx)
+        if st == ENTRY_OCCUPIED and eh == h and ef(ek, key) do
+            out Some(_map_read_value(m.entries, idx))
+        end
+        idx = (idx + 1) and mask
+        probes = probes + 1
+    end
+    out None
+end.
+
+func map_contains(m: Map, key: int):
+    out is_some(map_get(m, key))
+end.
+
+func map_remove:
+    ref m: Map
+    in key: int
+    if m.cap == 0 do out None end
+    hf = m.hash_fn
+    ef = m.eq_fn
+    h = hf(key)
+    mask = m.cap - 1
+    idx = h and mask
+    probes = 0
+    when probes < m.cap loop
+        st = _map_read_state(m.entries, idx)
+        if st == ENTRY_EMPTY do out None end
+        eh = _map_read_hash(m.entries, idx)
+        ek = _map_read_key(m.entries, idx)
+        if st == ENTRY_OCCUPIED and eh == h and ef(ek, key) do
+            old_val = _map_read_value(m.entries, idx)
+            _map_write_entry(m.entries, idx, ENTRY_TOMBSTONE, 0, ek, old_val)
+            m.len = m.len - 1
+            m.tombstones = m.tombstones + 1
+            out Some(old_val)
+        end
+        idx = (idx + 1) and mask
+        probes = probes + 1
+    end
+    out None
+end.
+
+func map_len(m: Map):
+    out m.len
+end.
+
+func map_is_empty(m: Map):
+    out m.len == 0
+end.
+
+func map_clear:
+    ref m: Map
+    if m.entries != 0 as ptr do
+        mem_set(m.entries, 0, m.cap * MAP_ENTRY_BYTES)
+    end
+    m.len = 0
+    m.tombstones = 0
+end.
+
+func map_free:
+    ref m: Map
+    if m.entries != 0 as ptr do free(m.entries) end
+    m.entries = 0 as ptr
+    m.cap = 0
+    m.len = 0
+    m.tombstones = 0
+end.
+
+func map_int():
+    out map_with_cap(16, hash_i64, int_eq)
+end.
+
+export Map, MapEntry, map_new, map_with_cap, map_insert, map_get, map_contains, map_remove
+export map_len, map_is_empty, map_clear, map_free, map_int
+export hash_bytes, hash_i64, hash_string, map_str_eq, int_eq

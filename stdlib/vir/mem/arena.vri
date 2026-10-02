@@ -1,0 +1,243 @@
+##
+ * vir/mem/arena.vri — Arena Allocator (Bump Allocator)
+ * =====================================================
+ * Cấp phát O(1), deallocate tất cả cùng lúc.
+ * Cực kỳ hữu ích cho compiler: AST nodes, token list, IR instructions.
+ * Hỗ trợ scalar O(1) allocation và bulk fast path (reserve, zero, copy, fill).
+ ##
+
+include types
+include alloc
+import alloc, free from alloc
+include copy
+import mem_copy, mem_set, mem_zero, mem_move from copy
+
+entity Arena:
+    base: int       # Vùng nhớ root
+    capacity: int   # Tổng capacity
+    offset: int     # Vị trí hiện tại (bump pointer)
+end.
+
+func arena_new(size: int):
+    var real_size = size
+    if size < 4096 do real_size = 4096 end
+    out Arena (
+        base: alloc(real_size),
+        capacity: real_size,
+        offset: 0
+    )
+end.
+
+func arena_reserve(a: Arena, bytes: int, align: int):
+    # Batch/Scalar checked allocation with guaranteed alignment
+    if align <= 0 or (align & (align - 1)) != 0 do
+        out null
+    end
+    if bytes < 0 or a.offset < 0 or bytes > 9223372036854771712 do
+        out null
+    end
+    if a.base == null or a.capacity <= 0 do
+        let init_cap = 4096
+        let init_buf = alloc(init_cap)
+        if init_buf == null do out null end
+        a.base = init_buf
+        a.capacity = init_cap
+        a.offset = 0
+    end
+    var a_align = align
+    if a_align < 8 do a_align = 8 end
+    let mask = a_align - 1
+    if a.offset > 9223372036854775807 - mask do
+        out null
+    end
+    let aligned_offset = (a.offset + mask) & ~mask
+    if aligned_offset < a.offset or aligned_offset > 9223372036854771712 do
+        out null
+    end
+    if bytes == 0 do
+        out a.base + aligned_offset
+    end
+    if aligned_offset > 9223372036854775807 - bytes do
+        out null
+    end
+    let next_off = aligned_offset + bytes
+    if next_off < aligned_offset do
+        out null
+    end
+    if next_off > a.capacity do
+        if next_off > 9223372036854771712 do
+            out null
+        end
+        var new_cap = a.capacity * 2
+        if a.capacity > 4611686018427387903 or new_cap < a.capacity do
+            new_cap = next_off
+        end
+        if new_cap < next_off do
+            new_cap = next_off
+        end
+        if new_cap > 9223372036854771712 do
+            out null
+        end
+        new_cap = (new_cap + 4095) & ~4095
+        let new_buf = alloc(new_cap)
+        if new_buf == null do out null end
+        if a.offset > 0 do
+            mem_copy(new_buf, a.base, a.offset)
+        end
+        free(a.base)
+        a.base = new_buf
+        a.capacity = new_cap
+    end
+    let p = a.base + aligned_offset
+    a.offset = next_off
+    out p
+end.
+
+func arena_alloc(a: Arena, size: int):
+    # Cấp phát `size` bytes từ arena. O(1) amortized. Auto-grows if needed.
+    if size <= 0 or a.offset < 0 or a.offset > 9223372036854775800 do
+        out null
+    end
+    # Checked pre-condition: ensure additions cannot overflow and fit within capacity
+    if a.base != null and a.capacity >= a.offset and size <= a.capacity - a.offset do
+        let aligned_offset = (a.offset + 7) & ~7
+        if aligned_offset <= a.capacity - size do
+            let next_off = aligned_offset + size
+            let p = a.base + aligned_offset
+            a.offset = next_off
+            out p
+        end
+    end
+    out arena_reserve(a, size, 8)
+end.
+
+func arena_alloc_aligned(a: Arena, size: int, align: int):
+    out arena_reserve(a, size, align)
+end.
+
+func arena_alloc_zeroed(a: Arena, size: int):
+    let p = arena_alloc(a, size)
+    if p != null and size > 0 do
+        mem_zero(p, size)
+    end
+    out p
+end.
+
+func arena_bulk_zero(a: Arena, p: ptr, bytes: int):
+    if p != null and bytes > 0 do
+        mem_zero(p, bytes)
+    end
+end.
+
+func arena_bulk_fill(a: Arena, p: ptr, byte_val: int, bytes: int):
+    if p != null and bytes > 0 do
+        mem_set(p, byte_val, bytes)
+    end
+end.
+
+func arena_bulk_copy(dst: ptr, src: ptr, bytes: int):
+    if dst != null and src != null and bytes > 0 do
+        mem_move(dst, src, bytes)
+    end
+end.
+
+func arena_reset(a: Arena):
+    # Giải phóng tất cả allocation — reset về vị trí đầu.
+    a.offset = 0
+end.
+
+func arena_free(a: Arena):
+    # Giải phóng toàn bộ arena.
+    if a.base != null do
+        free(a.base)
+        a.base = null
+    end
+    a.offset = 0
+    a.capacity = 0
+end.
+
+func arena_remaining(a: Arena):
+    out a.capacity - a.offset
+end.
+
+func arena_used(a: Arena):
+    out a.offset
+end.
+
+func arena_save(a: Arena):
+    # Lưu checkpoint — có thể restore sau.
+    out a.offset
+end.
+
+func arena_restore(a: Arena, checkpoint: int):
+    # Quay về checkpoint (free mọi thứ allocate sau checkpoint).
+    if checkpoint >= 0 and checkpoint <= a.offset do
+        a.offset = checkpoint
+    end
+end.
+
+entity ArenaBatchLayout:
+    base: int
+    off0: int
+    off1: int
+    total_bytes: int
+    valid: int
+end.
+
+func arena_batch_reserve2(a: Arena, sz0: int, align0: int, sz1: int, align1: int):
+    if align0 == 8 and align1 == 8 and sz0 >= 0 and sz1 >= 0 and sz0 <= 1073741824 and sz1 <= 1073741824 do
+        let off1 = (sz0 + 7) & ~7
+        let total = off1 + sz1
+        if a.offset >= 0 and a.offset <= 9223372036854775799 do
+            let aligned_offset = (a.offset + 7) & ~7
+            let next_off = aligned_offset + total
+            if next_off <= a.capacity and next_off >= aligned_offset and a.base != null do
+                let base = a.base + aligned_offset
+                a.offset = next_off
+                out ArenaBatchLayout ( base: base, off0: 0, off1: off1, total_bytes: total, valid: 1 )
+            end
+        end
+    end
+    if sz0 < 0 or sz1 < 0 do
+        out ArenaBatchLayout ( base: null, off0: 0, off1: 0, total_bytes: 0, valid: 0 )
+    end
+    if align0 <= 0 or (align0 & (align0 - 1)) != 0 do
+        out ArenaBatchLayout ( base: null, off0: 0, off1: 0, total_bytes: 0, valid: 0 )
+    end
+    if align1 <= 0 or (align1 & (align1 - 1)) != 0 do
+        out ArenaBatchLayout ( base: null, off0: 0, off1: 0, total_bytes: 0, valid: 0 )
+    end
+    var a0 = align0
+    if a0 < 8 do a0 = 8 end
+    var a1 = align1
+    if a1 < 8 do a1 = 8 end
+    var max_align = a0
+    if a1 > max_align do max_align = a1 end
+
+    let m1 = a1 - 1
+    let off1 = (sz0 + m1) & ~m1
+    if off1 < sz0 do
+        out ArenaBatchLayout ( base: null, off0: 0, off1: 0, total_bytes: 0, valid: 0 )
+    end
+    let total = off1 + sz1
+    if total < off1 or total > 9223372036854771712 do
+        out ArenaBatchLayout ( base: null, off0: 0, off1: 0, total_bytes: 0, valid: 0 )
+    end
+    var a_align = max_align
+    if a_align < 8 do a_align = 8 end
+    let mask = a_align - 1
+    if a.offset >= 0 and a.offset <= 9223372036854775799 do
+        let aligned_offset = (a.offset + mask) & ~mask
+        let next_off = aligned_offset + total
+        if next_off <= a.capacity and next_off >= aligned_offset and a.base != null do
+            let base = a.base + aligned_offset
+            a.offset = next_off
+            out ArenaBatchLayout ( base: base, off0: 0, off1: off1, total_bytes: total, valid: 1 )
+        end
+    end
+    let base = arena_reserve(a, total, max_align)
+    if base == null do
+        out ArenaBatchLayout ( base: null, off0: 0, off1: 0, total_bytes: 0, valid: 0 )
+    end
+    out ArenaBatchLayout ( base: base, off0: 0, off1: off1, total_bytes: total, valid: 1 )
+end.

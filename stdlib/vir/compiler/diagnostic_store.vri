@@ -1,0 +1,838 @@
+# Immutable project-local diagnostic snapshots and the shared read-only query.
+# This module has no lexer/parser/semantic/codegen dependencies. Record JSON is
+# copied into storage-owned buffers before the semantic arena is reclaimed.
+# Identity: physical entry path; nearest ancestor module.list or .git marker,
+# otherwise the physical entry directory. External entries select their own root.
+# Retention: eight committed builds per entry, under an advisory cache lock.
+
+include compiler.cli_storage
+include compiler.tool_json
+include compiler.cli_ui
+include rt.alloc
+include rt.string_rt
+include rt.vec_rt
+import cliStoreOpenCache, cliStoreHexKey, cliStoreBuildId, cliStorePublish,
+       cliStoreReadFile, cliStoreOpenAt, cliStoreReadFlags, cliStoreNumber,
+       cliStoreWriteExclusive, cliStoreUnlink, cliStoreSync from compiler.cli_storage
+import toolJsonParse, toolJsonFree, toolJsonNode, toolJsonField,
+       toolJsonString, toolJsonInteger from compiler.tool_json
+import cliClockReset, cliClockNowNs, cliElapsedNs, cliUiAppendSafe from compiler.cli_ui
+import cliIsDarwinPlatform from compiler.cli_environment
+import sys_platform, Platform, sys_getcwd, sys_fstat, sys_open, sys_close,
+       sys_read, sys_write, sys_clock_gettime, VIR_O_RDONLY from rt.syscall
+import vir_alloc, vir_free from rt.alloc
+import native_read_u8, native_write_u8, native_read_i64, native_write_i64,
+       rt_strlen, rt_streq, rt_strdup, rt_itoa, sb_new, sb_append, sb_append_int,
+       sb_append_char, sb_to_string, sb_free from rt.string_rt
+import vec_len_rt, vec_get_rt from rt.vec_rt
+
+extern func syscall2(number: int, first: int, second: int) -> int
+extern func syscall3(number: int, first: int, second: int, third: int) -> int
+extern func syscall4(number: int, first: int, second: int, third: int, fourth: int) -> int
+
+var g_diagnosticStoreSession: int = 0
+var g_diagnosticStoreRecords: int = 0
+var g_diagnosticStoreSources: int = 0
+var g_diagnosticStoreMetadata: int = 0
+var g_diagnosticStoreCapacity: int = 16777216
+var g_diagnosticStoreCaptureFailed: int = 0
+var g_diagnosticStoreQueryExit: int = 0
+
+# SHA-256 over raw bytes, including NUL; state is local and caller-owned.
+func diagnosticShaRotate(value: int, count: int):
+    out ((value shr count) or (value shl (32 - count))) and 0xffffffff
+end.
+
+func diagnosticShaConstant(i: int):
+    if i == 0 do out 0x428a2f98 end
+    if i == 1 do out 0x71374491 end
+    if i == 2 do out 0xb5c0fbcf end
+    if i == 3 do out 0xe9b5dba5 end
+    if i == 4 do out 0x3956c25b end
+    if i == 5 do out 0x59f111f1 end
+    if i == 6 do out 0x923f82a4 end
+    if i == 7 do out 0xab1c5ed5 end
+    if i == 8 do out 0xd807aa98 end
+    if i == 9 do out 0x12835b01 end
+    if i == 10 do out 0x243185be end
+    if i == 11 do out 0x550c7dc3 end
+    if i == 12 do out 0x72be5d74 end
+    if i == 13 do out 0x80deb1fe end
+    if i == 14 do out 0x9bdc06a7 end
+    if i == 15 do out 0xc19bf174 end
+    if i == 16 do out 0xe49b69c1 end
+    if i == 17 do out 0xefbe4786 end
+    if i == 18 do out 0x0fc19dc6 end
+    if i == 19 do out 0x240ca1cc end
+    if i == 20 do out 0x2de92c6f end
+    if i == 21 do out 0x4a7484aa end
+    if i == 22 do out 0x5cb0a9dc end
+    if i == 23 do out 0x76f988da end
+    if i == 24 do out 0x983e5152 end
+    if i == 25 do out 0xa831c66d end
+    if i == 26 do out 0xb00327c8 end
+    if i == 27 do out 0xbf597fc7 end
+    if i == 28 do out 0xc6e00bf3 end
+    if i == 29 do out 0xd5a79147 end
+    if i == 30 do out 0x06ca6351 end
+    if i == 31 do out 0x14292967 end
+    if i == 32 do out 0x27b70a85 end
+    if i == 33 do out 0x2e1b2138 end
+    if i == 34 do out 0x4d2c6dfc end
+    if i == 35 do out 0x53380d13 end
+    if i == 36 do out 0x650a7354 end
+    if i == 37 do out 0x766a0abb end
+    if i == 38 do out 0x81c2c92e end
+    if i == 39 do out 0x92722c85 end
+    if i == 40 do out 0xa2bfe8a1 end
+    if i == 41 do out 0xa81a664b end
+    if i == 42 do out 0xc24b8b70 end
+    if i == 43 do out 0xc76c51a3 end
+    if i == 44 do out 0xd192e819 end
+    if i == 45 do out 0xd6990624 end
+    if i == 46 do out 0xf40e3585 end
+    if i == 47 do out 0x106aa070 end
+    if i == 48 do out 0x19a4c116 end
+    if i == 49 do out 0x1e376c08 end
+    if i == 50 do out 0x2748774c end
+    if i == 51 do out 0x34b0bcb5 end
+    if i == 52 do out 0x391c0cb3 end
+    if i == 53 do out 0x4ed8aa4a end
+    if i == 54 do out 0x5b9cca4f end
+    if i == 55 do out 0x682e6ff3 end
+    if i == 56 do out 0x748f82ee end
+    if i == 57 do out 0x78a5636f end
+    if i == 58 do out 0x84c87814 end
+    if i == 59 do out 0x8cc70208 end
+    if i == 60 do out 0x90befffa end
+    if i == 61 do out 0xa4506ceb end
+    if i == 62 do out 0xbef9a3f7 end
+    if i == 63 do out 0xc67178f2 end
+    out 0
+end.
+
+func diagnosticShaBlock(state: int, block: int, schedule: int):
+    var index = 0
+    when index < 16 loop
+        var word = 0
+        var byte = 0
+        when byte < 4 loop
+            word = (word shl 8) or native_read_u8(block, index * 4 + byte)
+            byte = byte + 1
+        end
+        native_write_i64(schedule, index * 8, word)
+        index = index + 1
+    end
+    when index < 64 loop
+        let
+            left = native_read_i64(schedule, (index - 15) * 8)
+            right = native_read_i64(schedule, (index - 2) * 8)
+            small0 = diagnosticShaRotate(left, 7) xor diagnosticShaRotate(left, 18) xor (left shr 3)
+            small1 = diagnosticShaRotate(right, 17) xor diagnosticShaRotate(right, 19) xor (right shr 10)
+        native_write_i64(schedule, index * 8, (native_read_i64(schedule, (index - 16) * 8) + small0 + native_read_i64(schedule, (index - 7) * 8) + small1) and 0xffffffff)
+        index = index + 1
+    end
+    var
+        a = native_read_i64(state, 0)
+        b = native_read_i64(state, 8)
+        c = native_read_i64(state, 16)
+        d = native_read_i64(state, 24)
+        e = native_read_i64(state, 32)
+        f = native_read_i64(state, 40)
+        g = native_read_i64(state, 48)
+        h = native_read_i64(state, 56)
+    index = 0
+    when index < 64 loop
+        let
+            sigma1 = diagnosticShaRotate(e, 6) xor diagnosticShaRotate(e, 11) xor diagnosticShaRotate(e, 25)
+            choose = (e and f) xor ((e xor 0xffffffff) and g)
+            first = (h + sigma1 + choose + diagnosticShaConstant(index) + native_read_i64(schedule, index * 8)) and 0xffffffff
+            sigma0 = diagnosticShaRotate(a, 2) xor diagnosticShaRotate(a, 13) xor diagnosticShaRotate(a, 22)
+            majority = (a and b) xor (a and c) xor (b and c)
+            second = (sigma0 + majority) and 0xffffffff
+        h = g
+        g = f
+        f = e
+        e = (d + first) and 0xffffffff
+        d = c
+        c = b
+        b = a
+        a = (first + second) and 0xffffffff
+        index = index + 1
+    end
+    native_write_i64(state, 0, (native_read_i64(state, 0) + a) and 0xffffffff)
+    native_write_i64(state, 8, (native_read_i64(state, 8) + b) and 0xffffffff)
+    native_write_i64(state, 16, (native_read_i64(state, 16) + c) and 0xffffffff)
+    native_write_i64(state, 24, (native_read_i64(state, 24) + d) and 0xffffffff)
+    native_write_i64(state, 32, (native_read_i64(state, 32) + e) and 0xffffffff)
+    native_write_i64(state, 40, (native_read_i64(state, 40) + f) and 0xffffffff)
+    native_write_i64(state, 48, (native_read_i64(state, 48) + g) and 0xffffffff)
+    native_write_i64(state, 56, (native_read_i64(state, 56) + h) and 0xffffffff)
+end.
+
+func diagnosticShaStart():
+    let state = vir_alloc(64)
+    native_write_i64(state, 0, 0x6a09e667)
+    native_write_i64(state, 8, 0xbb67ae85)
+    native_write_i64(state, 16, 0x3c6ef372)
+    native_write_i64(state, 24, 0xa54ff53a)
+    native_write_i64(state, 32, 0x510e527f)
+    native_write_i64(state, 40, 0x9b05688c)
+    native_write_i64(state, 48, 0x1f83d9ab)
+    native_write_i64(state, 56, 0x5be0cd19)
+    out state
+end.
+
+func diagnosticShaFinish:
+    in state: int
+       tail: int
+       length: int
+       total: int
+       schedule: int
+    let buffer = vir_alloc(128)
+    var index = 0
+    when index < 128 loop
+        native_write_u8(buffer, index, 0)
+        index = index + 1
+    end
+    index = 0
+    when index < length loop
+        native_write_u8(buffer, index, native_read_u8(tail, index))
+        index = index + 1
+    end
+    native_write_u8(buffer, length, 128)
+    var padded = 64
+    if length >= 56 do padded = 128 end
+    index = 0
+    when index < 8 loop
+        native_write_u8(buffer, padded - 1 - index, (total * 8 shr (index * 8)) and 255)
+        index = index + 1
+    end
+    diagnosticShaBlock(state, buffer, schedule)
+    if padded == 128 do diagnosticShaBlock(state, buffer + 64, schedule) end
+    let
+        digits = "0123456789abcdef" as int
+        result = vir_alloc(65)
+    index = 0
+    when index < 64 loop
+        let word = native_read_i64(state, (index / 8) * 8)
+        native_write_u8(result, index, native_read_u8(digits, (word shr ((7 - (index mod 8)) * 4)) and 15))
+        index = index + 1
+    end
+    native_write_u8(result, 64, 0)
+    vir_free(buffer)
+    out result
+end.
+
+func diagnosticHash(data: int, length: int):
+    let
+        state = diagnosticShaStart()
+        schedule = vir_alloc(512)
+    var offset = 0
+    when offset + 64 <= length loop
+        diagnosticShaBlock(state, data + offset, schedule)
+        offset = offset + 64
+    end
+    let result = diagnosticShaFinish(state, data + offset, length - offset, length, schedule)
+    vir_free(schedule)
+    vir_free(state)
+    out result
+end.
+
+# SHA and physical identity are captured from one open file descriptor.
+# Return JSON fragment; unavailable files remain explicit and stale at query.
+func diagnosticFingerprint(path: int):
+    let descriptor = sys_open(path, VIR_O_RDONLY, 0)
+    if descriptor < 0 do out rt_strdup("{\"status\":\"missing\"}" as int) end
+    let
+        state = diagnosticShaStart()
+        schedule = vir_alloc(512)
+        buffer = vir_alloc(65536)
+        stat = vir_alloc(256)
+    var
+        total = 0
+        pending = 0
+        failed = 0
+    if sys_fstat(descriptor, stat) != 0 do failed = 1 end
+    let
+        device = native_read_i64(stat, 0)
+        inode = native_read_i64(stat, 8)
+    loop
+        let count = sys_read(descriptor, buffer + pending, 65536 - pending)
+        if count < 0 do failed = 1; break end
+        if count == 0 do break end
+        total = total + count
+        pending = pending + count
+        var offset = 0
+        when offset + 64 <= pending loop
+            diagnosticShaBlock(state, buffer + offset, schedule)
+            offset = offset + 64
+        end
+        pending = pending - offset
+        var index = 0
+        when index < pending loop
+            native_write_u8(buffer, index, native_read_u8(buffer, offset + index))
+            index = index + 1
+        end
+    end
+    sys_close(descriptor)
+    let digest = diagnosticShaFinish(state, buffer, pending, total, schedule)
+    var text = sb_new()
+    if failed == 1 do
+        text = sb_append(text, "{\"status\":\"unavailable\"}")
+    else
+        text = sb_append(text, "{\"status\":\"present\",\"sha256\":\"")
+        text = sb_append(text, digest)
+        text = sb_append(text, "\",\"device\":\"")
+        text = sb_append_int(text, device)
+        text = sb_append(text, "\",\"inode\":\"")
+        text = sb_append_int(text, inode)
+        text = sb_append(text, "\",\"bytes\":")
+        text = sb_append_int(text, total)
+        text = sb_append_char(text, 125)
+    end
+    vir_free(digest)
+    vir_free(state)
+    vir_free(schedule)
+    vir_free(buffer)
+    vir_free(stat)
+    out sb_to_string(text)
+end.
+
+# C-string JSON quoting. Escapes all control bytes; never emits terminal ANSI.
+func diagnosticQuote(builder: StringBuilder, value: int):
+    var text = sb_append_char(builder, 34)
+    var index = 0
+    let digits = "0123456789abcdef" as int
+    if value != 0 do
+        when native_read_u8(value, index) != 0 loop
+            let byte = native_read_u8(value, index)
+            if byte == 34 || byte == 92 do
+                text = sb_append_char(text, 92)
+                text = sb_append_char(text, byte)
+            eif byte < 32 do
+                text = sb_append(text, "\\u00")
+                text = sb_append_char(text, native_read_u8(digits, byte / 16))
+                text = sb_append_char(text, native_read_u8(digits, byte mod 16))
+            else
+                text = sb_append_char(text, byte)
+            end
+            index = index + 1
+        end
+    end
+    out sb_append_char(text, 34)
+end.
+
+func diagnosticJoin(directory: int, name: int):
+    var text = sb_append(sb_new(), directory)
+    if rt_strlen(directory) > 1 do text = sb_append_char(text, 47) end
+    text = sb_append(text, name)
+    out sb_to_string(text)
+end.
+
+func diagnosticParent(path: int):
+    var index = rt_strlen(path) - 1
+    when index > 0 & native_read_u8(path, index) != 47 loop
+        index = index - 1
+    end
+    if index == 0 do index = 1 end
+    let result = vir_alloc(index + 1)
+    var cursor = 0
+    when cursor < index loop
+        native_write_u8(result, cursor, native_read_u8(path, cursor))
+        cursor = cursor + 1
+    end
+    native_write_u8(result, index, 0)
+    out result
+end.
+
+# Resolve through the opened inode. Darwin F_GETPATH=50 from the SDK;
+# Linux uses readlinkat(/proc/self/fd/N), asm-generic 78 / x86_64 267.
+func diagnosticPhysicalPath(path: int):
+    let descriptor = sys_open(path, VIR_O_RDONLY, 0)
+    if descriptor < 0 do out 0 end
+    let buffer = vir_alloc(4097)
+    var status = 0 - 1
+    if cliIsDarwinPlatform(sys_platform()) == 1 do
+        status = syscall3(0x200005C, descriptor, 50, buffer)
+    else
+        let name = sb_to_string(sb_append_int(sb_append(sb_new(), "/proc/self/fd/"), descriptor))
+        let number = cliStoreNumber(0, 78, 267)
+        if number != 0 do
+            let size = syscall4(number, 0 - 100, name, buffer, 4096)
+            if size > 0 & size < 4096 do
+                native_write_u8(buffer, size, 0)
+                status = 0
+            end
+        end
+    end
+    sys_close(descriptor)
+    if status != 0 do vir_free(buffer); out 0 end
+    out buffer
+end.
+
+# A deleted entry still maps to its former snapshot via its physical parent.
+func diagnosticEntryPath(path: int):
+    let existing = diagnosticPhysicalPath(path)
+    if existing != 0 do out existing end
+    var absolute = path
+    if native_read_u8(path, 0) != 47 do
+        let cwd = diagnosticPhysicalPath("." as int)
+        if cwd == 0 do out 0 end
+        absolute = diagnosticJoin(cwd, path)
+    end
+    let parent = diagnosticPhysicalPath(diagnosticParent(absolute))
+    if parent == 0 do out 0 end
+    var index = rt_strlen(absolute) - 1
+    when index >= 0 & native_read_u8(absolute, index) != 47 loop
+        index = index - 1
+    end
+    out diagnosticJoin(parent, absolute + index + 1)
+end.
+
+func diagnosticProject(entry: int):
+    let fallback = diagnosticParent(entry)
+    var current = rt_strdup(fallback)
+    loop
+        let marker = diagnosticJoin(current, "module.list" as int)
+        var descriptor = sys_open(marker, VIR_O_RDONLY, 0)
+        if descriptor >= 0 do sys_close(descriptor); out current end
+        let gitMarker = diagnosticJoin(current, ".git" as int)
+        descriptor = sys_open(gitMarker, VIR_O_RDONLY, 0)
+        if descriptor >= 0 do sys_close(descriptor); out current end
+        if rt_streq(current, "/" as int) do break end
+        current = diagnosticParent(current)
+    end
+    out fallback
+end.
+
+# Session words: root, entry, key, build, cache fd. Metadata/sources are owned
+# serializations created before the semantic arena; reset releases them.
+func diagnosticStoreBegin(entry: int, metadata: int):
+    if g_diagnosticStoreSession != 0 do
+        var index = 0
+        when index < 4 loop
+            vir_free(native_read_i64(g_diagnosticStoreSession, index * 8))
+            index = index + 1
+        end
+        vir_free(g_diagnosticStoreSession)
+        vir_free(g_diagnosticStoreMetadata)
+        vir_free(g_diagnosticStoreSources)
+    end
+    g_diagnosticStoreSession = 0
+    g_diagnosticStoreCaptureFailed = 0
+    let canonical = diagnosticEntryPath(entry)
+    if canonical == 0 do g_diagnosticStoreCaptureFailed = 1; out end
+    let
+        project = diagnosticProject(canonical)
+        key = diagnosticHash(canonical, rt_strlen(canonical))
+        build = cliStoreBuildId()
+    if build == 0 do g_diagnosticStoreCaptureFailed = 1; out end
+    g_diagnosticStoreSession = vir_alloc(40)
+    native_write_i64(g_diagnosticStoreSession, 0, project)
+    native_write_i64(g_diagnosticStoreSession, 8, canonical)
+    native_write_i64(g_diagnosticStoreSession, 16, key)
+    native_write_i64(g_diagnosticStoreSession, 24, build)
+    native_write_i64(g_diagnosticStoreSession, 32, 0 - 1)
+    g_diagnosticStoreMetadata = rt_strdup(metadata)
+    g_diagnosticStoreSources = rt_strdup("[]" as int)
+end.
+
+func diagnosticStoreSourcePath(sm: int, fileId: int):
+    if sm == 0 do out 0 end
+    let files = native_read_i64(sm, 0)
+    let n = vec_len_rt(files)
+    if fileId < 0 || fileId >= n do out 0 end
+    let f = vec_get_rt(files, fileId)
+    let fat = native_read_i64(f, 8)
+    if fat == 0 do out 0 end
+    out native_read_i64(fat, 0)
+end.
+
+func diagnosticStoreCaptureSources(manager: int):
+    if g_diagnosticStoreSession == 0 do out end
+    var text = sb_append_char(sb_new(), 91)
+    let entry = native_read_i64(g_diagnosticStoreSession, 8)
+    text = sb_append(text, "{\"path\":")
+    text = diagnosticQuote(text, entry)
+    text = sb_append(text, ",\"fingerprint\":")
+    let entryFp = diagnosticFingerprint(entry)
+    text = sb_append(text, entryFp)
+    vir_free(entryFp)
+    text = sb_append_char(text, 125)
+    if manager != 0 do
+        let files = native_read_i64(manager, 0)
+        var index = 0
+        when index < vec_len_rt(files) loop
+            let sourcePath = diagnosticStoreSourcePath(manager, index)
+            let physical = diagnosticEntryPath(sourcePath)
+            if physical != 0 do
+                if !rt_streq(physical, entry) do
+                    text = sb_append(text, ",{\"path\":")
+                    text = diagnosticQuote(text, physical)
+                    text = sb_append(text, ",\"fingerprint\":")
+                    let srcFp = diagnosticFingerprint(physical)
+                    text = sb_append(text, srcFp)
+                    vir_free(srcFp)
+                    text = sb_append_char(text, 125)
+                end
+            end
+            index = index + 1
+        end
+    end
+    text = sb_append_char(text, 93)
+    vir_free(g_diagnosticStoreSources)
+    g_diagnosticStoreSources = rt_strdup(sb_to_string(text))
+    sb_free(text)
+end.
+
+# Directory locks serialize publication + retention and protect readers. A
+# failed lock is a storage failure, never permission to write unlocked.
+func diagnosticStoreLock(directory: int, operation: int):
+    let number = cliStoreNumber(0x2000083, 32, 73)
+    if number == 0 do out 0 - 1 end
+    out syscall2(number, directory, operation)
+end.
+
+func diagnosticStoreHistory(directory: int, key: int, build: int):
+    let
+        historyName = sb_to_string(sb_append(sb_append(sb_new(), key), ".history"))
+        previous = cliStoreReadFile(directory, historyName, 32768)
+    var history = sb_append(sb_new(), build)
+    history = sb_append_char(history, 10)
+    var retained = 1
+    var offset = 0
+    if previous != 0 do
+        let length = rt_strlen(previous)
+        when offset + 33 <= length loop
+            let oldBuild = vir_alloc(33)
+            var index = 0
+            when index < 32 loop
+                native_write_u8(oldBuild, index, native_read_u8(previous, offset + index))
+                index = index + 1
+            end
+            native_write_u8(oldBuild, 32, 0)
+            if native_read_u8(previous, offset + 32) != 10 do break end
+            if cliStoreHexKey(oldBuild, 32) != 1 do break end
+            if !rt_streq(oldBuild, build) do
+                if retained < 8 do
+                    history = sb_append(history, oldBuild)
+                    history = sb_append_char(history, 10)
+                    retained = retained + 1
+                else
+                    let oldName = sb_to_string(sb_append(sb_append(sb_new(), oldBuild), ".json"))
+                    cliStoreUnlink(directory, oldName)
+                end
+            end
+            vir_free(oldBuild)
+            offset = offset + 33
+        end
+        vir_free(previous)
+    end
+    let temporary = sb_to_string(sb_append(sb_append(sb_new(), build), ".history.tmp"))
+    if cliStoreWriteExclusive(directory, temporary, sb_to_string(history)) == 0 do
+        let number = cliStoreNumber(0x20001D1, 38, 264)
+        if number != 0 do syscall4(number, directory, temporary, directory, historyName) end
+        cliStoreUnlink(directory, temporary)
+    end
+    sb_free(history)
+end.
+
+func diagnosticStoreFinish(result: int, artifact: int):
+    if g_diagnosticStoreSession == 0 do out 0 - 1 end
+    let
+        project = native_read_i64(g_diagnosticStoreSession, 0)
+        entry = native_read_i64(g_diagnosticStoreSession, 8)
+        key = native_read_i64(g_diagnosticStoreSession, 16)
+        build = native_read_i64(g_diagnosticStoreSession, 24)
+    var text = sb_append(sb_new(), "{\"schemaVersion\":1,\"projectRoot\":")
+    text = diagnosticQuote(text, project)
+    text = sb_append(text, ",\"entry\":")
+    text = diagnosticQuote(text, entry)
+    text = sb_append(text, ",\"buildId\":")
+    text = diagnosticQuote(text, build)
+    text = sb_append(text, ",\"metadata\":")
+    text = sb_append(text, g_diagnosticStoreMetadata)
+    text = sb_append(text, ",\"sources\":")
+    text = sb_append(text, g_diagnosticStoreSources)
+    text = sb_append(text, ",\"result\":")
+    text = sb_append(text, result)
+    text = sb_append(text, ",\"artifact\":")
+    if artifact == 0 do
+        text = sb_append(text, "null")
+    else
+        text = sb_append(text, "{\"path\":")
+        text = diagnosticQuote(text, artifact)
+        text = sb_append(text, ",\"fingerprint\":")
+        text = sb_append(text, diagnosticFingerprint(artifact))
+        text = sb_append_char(text, 125)
+    end
+    text = sb_append_char(text, 125)
+    let directory = cliStoreOpenCache(project, 1)
+    if directory < 0 do sb_free(text); out 0 - 1 end
+    if diagnosticStoreLock(directory, 2) != 0 do
+        sys_close(directory)
+        sb_free(text)
+        out 0 - 1
+    end
+    let status = cliStorePublish(directory, build, key, sb_to_string(text))
+    if status == 0 do diagnosticStoreHistory(directory, key, build) end
+    diagnosticStoreLock(directory, 8)
+    sys_close(directory)
+    sb_free(text)
+    out status
+end.
+
+export diagnosticHash, diagnosticFingerprint, diagnosticQuote,
+       diagnosticEntryPath, diagnosticProject, diagnosticStoreBegin,
+       diagnosticStoreCaptureSources, diagnosticStoreFinish
+
+func diagnosticJsonField(document: int, object: int, key: int):
+    out toolJsonString(document, toolJsonField(document, object, key))
+end.
+
+func diagnosticAppendNode(builder: StringBuilder, document: int, index: int):
+    if index <= 0 do out sb_append(builder, "null") end
+    let node = toolJsonNode(document, index)
+    let source = native_read_i64(document, 0)
+    var offset = native_read_i64(node, 8)
+    let finish = native_read_i64(node, 16)
+    var text = builder
+    when offset < finish loop
+        text = sb_append_char(text, native_read_u8(source, offset))
+        offset = offset + 1
+    end
+    out text
+end.
+
+func diagnosticQueryFailure(status: int, message: int):
+    g_diagnosticStoreQueryExit = 1
+    var text = sb_append(sb_new(), "{\"schemaVersion\":1,\"status\":")
+    text = diagnosticQuote(text, status)
+    text = sb_append(text, ",\"message\":")
+    text = diagnosticQuote(text, message)
+    out sb_to_string(sb_append(text, ",\"diagnostics\":[]}"))
+end.
+
+func diagnosticNormalizeCode(code: int):
+    if code == 0 do out rt_strdup("all" as int) end
+    if rt_streq(code, "all" as int) do out rt_strdup(code) end
+    let length = rt_strlen(code)
+    if length < 5 || length > 96 do out 0 end
+    let result = rt_strdup(code)
+    var index = 0
+    when index < length loop
+        var byte = native_read_u8(result, index)
+        if byte >= 97 & byte <= 122 do byte = byte - 32 end
+        if !(byte >= 65 & byte <= 90) & !(byte >= 48 & byte <= 57) & byte != 45 do
+            vir_free(result)
+            out 0
+        end
+        native_write_u8(result, index, byte)
+        index = index + 1
+    end
+    let first = native_read_u8(result, 0)
+    if first != 69 & first != 87 & first != 73 do vir_free(result); out 0 end
+    out result
+end.
+
+# No compilation operations are reachable here. Only recorded paths are hashed;
+# all human text comes from the immutable build, including Analysis/Causes/Action.
+func diagnosticStoreQuery(entry: int, code: int, requestedBuild: int):
+    g_diagnosticStoreQueryExit = 0
+    let filter = diagnosticNormalizeCode(code)
+    if filter == 0 do out diagnosticQueryFailure("invalid" as int, "invalid diagnostic code" as int) end
+    if requestedBuild != 0 do
+        if cliStoreHexKey(requestedBuild, 32) != 1 do
+            out diagnosticQueryFailure("invalid" as int, "invalid build ID" as int)
+        end
+    end
+    let canonical = diagnosticEntryPath(entry)
+    if canonical == 0 do out diagnosticQueryFailure("missing" as int, "cannot resolve entry identity" as int) end
+    let
+        project = diagnosticProject(canonical)
+        key = diagnosticHash(canonical, rt_strlen(canonical))
+        directory = cliStoreOpenCache(project, 0)
+    if directory < 0 do out diagnosticQueryFailure("missing" as int, "no diagnostic snapshot for entry" as int) end
+    if diagnosticStoreLock(directory, 1) != 0 do
+        sys_close(directory)
+        out diagnosticQueryFailure("unavailable" as int, "cannot lock diagnostic cache" as int)
+    end
+    var build = requestedBuild
+    if build == 0 do
+        let latest = sb_to_string(sb_append(sb_append(sb_new(), key), ".latest"))
+        build = cliStoreReadFile(directory, latest, 32)
+    end
+    if build == 0 do
+        sys_close(directory)
+        out diagnosticQueryFailure("missing" as int, "no diagnostic snapshot for entry" as int)
+    end
+    if cliStoreHexKey(build, 32) != 1 do
+        sys_close(directory)
+        out diagnosticQueryFailure("corrupt" as int, "invalid latest build index" as int)
+    end
+    let name = sb_to_string(sb_append(sb_append(sb_new(), build), ".json"))
+    let payload = cliStoreReadFile(directory, name, 16777216)
+    # Reading into an owned buffer completes before releasing the shared lock.
+    sys_close(directory)
+    if payload == 0 do out diagnosticQueryFailure("corrupt" as int, "snapshot missing or unreadable" as int) end
+    let document = toolJsonParse(payload, rt_strlen(payload))
+    if document == 0 do out diagnosticQueryFailure("corrupt" as int, "malformed diagnostic snapshot" as int) end
+    let schema = toolJsonInteger(document, toolJsonField(document, 1, "schemaVersion" as int), 0)
+    if schema != 1 do
+        toolJsonFree(document)
+        out diagnosticQueryFailure("unsupported" as int, "unsupported diagnostic schema" as int)
+    end
+    let
+        storedEntry = diagnosticJsonField(document, 1, "entry" as int)
+        storedProject = diagnosticJsonField(document, 1, "projectRoot" as int)
+        storedBuild = diagnosticJsonField(document, 1, "buildId" as int)
+    if storedEntry == 0 || storedProject == 0 || storedBuild == 0 do
+        toolJsonFree(document)
+        out diagnosticQueryFailure("corrupt" as int, "snapshot identity missing" as int)
+    end
+    if !rt_streq(storedEntry, canonical) || !rt_streq(storedProject, project) || !rt_streq(storedBuild, build) do
+        toolJsonFree(document)
+        out diagnosticQueryFailure("corrupt" as int, "snapshot identity mismatch" as int)
+    end
+    let
+        result = toolJsonField(document, 1, "result" as int)
+        diagnostics = toolJsonField(document, result, "diagnostics" as int)
+        sources = toolJsonField(document, 1, "sources" as int)
+    if result == 0 || diagnostics == 0 || sources == 0 do
+        toolJsonFree(document)
+        out diagnosticQueryFailure("corrupt" as int, "snapshot records missing" as int)
+    end
+    if native_read_i64(toolJsonNode(document, diagnostics), 0) != 4 || native_read_i64(toolJsonNode(document, sources), 0) != 4 do
+        toolJsonFree(document)
+        out diagnosticQueryFailure("corrupt" as int, "snapshot arrays invalid" as int)
+    end
+    var stale = 0
+    var source = native_read_i64(toolJsonNode(document, sources), 24)
+    if source == 0 do stale = 1 end
+    when source != 0 loop
+        let
+            path = diagnosticJsonField(document, source, "path" as int)
+            fingerprint = toolJsonField(document, source, "fingerprint" as int)
+        if path == 0 || fingerprint == 0 do
+            toolJsonFree(document)
+            out diagnosticQueryFailure("corrupt" as int, "source fingerprint missing" as int)
+        end
+        if native_read_u8(path, 0) != 47 do
+            toolJsonFree(document)
+            out diagnosticQueryFailure("corrupt" as int, "source path must be absolute" as int)
+        end
+        let previous = sb_to_string(diagnosticAppendNode(sb_new(), document, fingerprint))
+        let current = diagnosticFingerprint(path)
+        if !rt_streq(previous, current) do stale = 1 end
+        let state = diagnosticJsonField(document, fingerprint, "status" as int)
+        if state == 0 do stale = 1
+        eif !rt_streq(state, "present" as int) do stale = 1 end
+        vir_free(current)
+        source = native_read_i64(toolJsonNode(document, source), 32)
+    end
+    var text = sb_append(sb_new(), "{\"schemaVersion\":1,\"status\":\"")
+    if stale == 1 do text = sb_append(text, "stale")
+    else text = sb_append(text, "fresh") end
+    text = sb_append(text, "\",\"snapshot\":")
+    text = sb_append(text, payload)
+    text = sb_append(text, ",\"diagnostics\":[")
+    var item = native_read_i64(toolJsonNode(document, diagnostics), 24)
+    var emitted = 0
+    when item != 0 loop
+        let itemCode = diagnosticJsonField(document, item, "code" as int)
+        var selected = rt_streq(filter, "all" as int)
+        if itemCode != 0 do
+            if rt_streq(itemCode, filter) do selected = true end
+        end
+        if selected do
+            if emitted != 0 do text = sb_append_char(text, 44) end
+            text = diagnosticAppendNode(text, document, item)
+            emitted = emitted + 1
+        end
+        item = native_read_i64(toolJsonNode(document, item), 32)
+    end
+    text = sb_append(text, "]}")
+    toolJsonFree(document)
+    if emitted == 0 & !rt_streq(filter, "all" as int) do
+        out diagnosticQueryFailure("missingCode" as int, "diagnostic code has no occurrence in this build" as int)
+    end
+    out sb_to_string(text)
+end.
+
+func diagnosticShowLine(value: int):
+    var text = cliUiAppendSafe(sb_new(), value, 1)
+    text = sb_append_char(text, 10)
+    let data = sb_to_string(text)
+    var written = 0
+    let length = rt_strlen(data)
+    when written < length loop
+        let count = sys_write(1, data + written, length - written)
+        if count <= 0 do break end
+        written = written + count
+    end
+    sb_free(text)
+end.
+
+func diagnosticShowField(document: int, item: int, key: int, title: int):
+    let value = diagnosticJsonField(document, item, key)
+    if value != 0 do
+        diagnosticShowLine(title)
+        diagnosticShowLine(value)
+    end
+end.
+
+func diagnosticStoreShow(entry: int, code: int, jsonMode: int):
+    let payload = diagnosticStoreQuery(entry, code, 0)
+    if jsonMode == 1 do diagnosticShowLine(payload); out g_diagnosticStoreQueryExit end
+    let document = toolJsonParse(payload, rt_strlen(payload))
+    if document == 0 do diagnosticShowLine("corrupt diagnostic query" as int); out 1 end
+    let status = diagnosticJsonField(document, 1, "status" as int)
+    if g_diagnosticStoreQueryExit != 0 do
+        diagnosticShowLine(diagnosticJsonField(document, 1, "message" as int))
+        toolJsonFree(document)
+        out g_diagnosticStoreQueryExit
+    end
+    if rt_streq(status, "stale" as int) do
+        diagnosticShowLine("Warning: stale report; showing the stored build without recompiling." as int)
+    end
+    let snapshot = toolJsonField(document, 1, "snapshot" as int)
+    diagnosticShowField(document, snapshot, "buildId" as int, "Build" as int)
+    diagnosticShowField(document, snapshot, "entry" as int, "Entry" as int)
+    let result = toolJsonField(document, snapshot, "result" as int)
+    var summary = sb_append(sb_new(), "Errors: ")
+    summary = sb_append_int(summary, toolJsonInteger(document, toolJsonField(document, result, "error_count" as int), 0))
+    summary = sb_append(summary, " | Warnings: ")
+    summary = sb_append_int(summary, toolJsonInteger(document, toolJsonField(document, result, "warning_count" as int), 0))
+    diagnosticShowLine(sb_to_string(summary))
+    let diagnostics = toolJsonField(document, 1, "diagnostics" as int)
+    var item = native_read_i64(toolJsonNode(document, diagnostics), 24)
+    when item != 0 loop
+        var text = sb_new()
+        let span = toolJsonField(document, item, "primary_span" as int)
+        if span != 0 do
+            text = cliUiAppendSafe(text, diagnosticJsonField(document, span, "file" as int), 0)
+            text = sb_append_char(text, 58)
+            text = sb_append_int(text, toolJsonInteger(document, toolJsonField(document, span, "start_line" as int), 0))
+            text = sb_append_char(text, 58)
+            text = sb_append_int(text, toolJsonInteger(document, toolJsonField(document, span, "start_column" as int), 0))
+            text = sb_append_char(text, 32)
+        end
+        text = sb_append_char(text, 91)
+        text = cliUiAppendSafe(text, diagnosticJsonField(document, item, "code" as int), 0)
+        text = sb_append(text, "] ")
+        text = cliUiAppendSafe(text, diagnosticJsonField(document, item, "message" as int), 0)
+        diagnosticShowLine(sb_to_string(text))
+        if code != 0 do
+            diagnosticShowField(document, item, "stage" as int, "Stage" as int)
+            diagnosticShowField(document, item, "analysis" as int, "Analysis" as int)
+            diagnosticShowField(document, item, "causes" as int, "Possible Causes" as int)
+            diagnosticShowField(document, item, "action" as int, "Action" as int)
+        end
+        item = native_read_i64(toolJsonNode(document, item), 32)
+    end
+    toolJsonFree(document)
+    out 0
+end.
+
+export diagnosticStoreQuery, diagnosticStoreShow

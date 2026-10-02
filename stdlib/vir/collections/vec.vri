@@ -1,0 +1,603 @@
+##
+ * vir/collections/vec.vri — Vec of (T) (owned growable typed collection)
+ * ==================================================================
+ * Canonical public module: collections.vec
+ *
+ * Contract (registry/vec.md):
+ *   - grow / address by element T: stride = size_of of (T)()
+ *   - len / cap measured in elements, never bytes
+ *   - no 8-byte slot assumptions
+ *   - Vec of (u8) is NOT Buffer
+ *
+ * Callables today are `vec_*` (generic free functions). Registry names are
+ * `vec.*` (namespace form). Do not add generic entity methods until the
+ * language supports them.
+ *
+ * Bootstrap/runtime copies (compiler/vec_prelude, rt/vec_rt) are not this API.
+ ##
+
+include types
+include option
+import Option, Some, None from option
+include result
+import Result, Ok, Err from result
+include rt.alloc
+import vir_alloc, vir_realloc, vir_free from rt.alloc
+include copy
+import mem_copy, mem_move, mem_set from copy
+include slice
+import Slice from slice
+
+# ═══════════════════════════════════════════════════════
+# Vec of (T) — Growable Array
+# ═══════════════════════════════════════════════════════
+#
+# Layout: [data: ptr] [len: int] [cap: int]
+#   data → contiguous T * cap
+#   len  = initialized elements
+#   cap  = element slots allocated
+#
+# Growth: geometric doubling (min 8 elements when growing)
+# Invariant: 0 <= len <= cap; data == null iff cap == 0
+#
+# ZST (size_of of (T)() == 0): unsupported — panic
+
+entity Vec of (T):
+    data: ptr
+        len:  int
+        cap:  int
+end.
+
+# ─── Internal sizing / overflow ───────────────────────
+
+func vec_elem_size of (T)():
+    let esz = size_of of (T)()
+    if esz <= 0 do
+        panic(str_new("vec: zero-sized T unsupported"))
+    end
+    out esz
+end.
+
+func vec_bytes_for_cap of (T)(cap: int):
+    # allocationBytes = capacity * size_of of (T)(), overflow-safe
+    if cap < 0 do
+        panic(str_new("vec: negative capacity"))
+    end
+    if cap == 0 do out 0 end
+    let esz = vec_elem_size of (T)()
+    let bytes = cap * esz
+    if bytes / esz != cap do
+        panic(str_new("vec: capacity byte-size overflow"))
+    end
+    out bytes
+end.
+
+func vec_add_len_additional(len: int, additional: int):
+    # len + additional with overflow / negative guard
+    if additional < 0 do
+        panic(str_new("vec: negative additional"))
+    end
+    let need = len + additional
+    if need < len do
+        panic(str_new("vec: len + additional overflow"))
+    end
+    out need
+end.
+
+func vec_grow_target(cap: int, need: int):
+    # geometric growth to at least `need` elements; min 8 when growing
+    var target = cap * 2
+    if cap > 0 do
+        if target / 2 != cap do
+            # doubling overflowed — fall back to exact need
+            target = need
+        end
+    else
+        target = need
+    end
+    if target < need do target = need end
+    if target < 8 do target = 8 end
+    out target
+end.
+
+func vec_ptr_at of (T)(data: ptr, idx: int):
+    out data + idx * vec_elem_size of (T)()
+end.
+
+func vec_store of (T)(data: ptr, idx: int, val: T):
+    # Keep store as expression — bare native_store stmts can be dropped by HIR
+    let _s = native_store of (T)(data, idx, val)
+end.
+
+func vec_load of (T)(data: ptr, idx: int):
+    out native_load of (T)(data, idx)
+end.
+
+# ─── Constructor ──────────────────────────────────────
+
+func vec_new of (T):
+    out Vec of (T) ( data = null, len = 0, cap = 0 )
+end.
+
+func vec_with_cap of (T)(cap: int):
+    if cap < 0 do
+        panic(str_new("vec.withCap: negative capacity"))
+    end
+    if cap == 0 do out vec_new of (T)() end
+    let bytes = vec_bytes_for_cap of (T)(cap)
+    out Vec of (T) ( data = vir_alloc(bytes), len = 0, cap = cap )
+end.
+
+func vec_from_slice of (T)(src: ptr, count: int):
+    # INTERNAL — raw pointer construction; not canonical public API
+    let v = vec_with_cap of (T)(count)
+    if count > 0 do
+        mem_copy(v.data, src, vec_bytes_for_cap of (T)(count))
+        v.len = count
+    end
+    out v
+end.
+
+func vec_filled of (T)(val: T, count: int):
+    if count < 0 do
+        panic(str_new("vec.filled: negative count"))
+    end
+    let v = vec_with_cap of (T)(count)
+    var i = 0
+    when i < count loop
+        vec_store of (T)(v.data, i, val)
+        i = i + 1
+    end
+    v.len = count
+    out v
+end.
+
+# ─── Capacity Management ─────────────────────────────
+
+func vec_len of (T)(v: Vec of (T)):
+    out v.len
+end.
+
+func vec_cap of (T)(v: Vec of (T)):
+    out v.cap
+end.
+
+func vec_is_empty of (T)(v: Vec of (T)):
+    out v.len == 0
+end.
+
+func vec_reserve of (T)(v: Vec of (T), additional: int):
+    # Postcondition: cap >= len + additional  (elements, not bytes / not target cap)
+    let need = vec_add_len_additional(v.len, additional)
+    if need <= v.cap do out end
+
+    let target = vec_grow_target(v.cap, need)
+    let new_size = vec_bytes_for_cap of (T)(target)
+    let old_n = v.len
+    let old_ptr = v.data
+
+    if old_ptr == null do
+        v.data = vir_alloc(new_size)
+    else
+        # Assign alloc directly (avoid NLL auto-free of a temporary owner)
+        v.data = vir_alloc(new_size)
+        if old_n > 0 do
+            mem_copy(v.data, old_ptr, old_n * vec_elem_size of (T)())
+        end
+        vir_free(old_ptr)
+    end
+    v.cap = target
+end.
+
+func vec_shrink_to_fit of (T)(v: Vec of (T)):
+    if v.len == v.cap do out end
+    if v.len == 0 do
+        if v.data != null do
+            vir_free(v.data)
+        end
+        v.data = null
+        v.cap = 0
+        out
+    end
+    let bytes = vec_bytes_for_cap of (T)(v.len)
+    v.data = vir_realloc(v.data, bytes)
+    v.cap = v.len
+end.
+
+# ─── Access ───────────────────────────────────────────
+
+func vec_get of (T)(v: Vec of (T), idx: int):
+    if idx < 0 or idx >= v.len do
+        panic(str_new("vec.get: index out of bounds"))
+    end
+    out vec_load of (T)(v.data, idx)
+end.
+
+func vec_try_get of (T)(v: Vec of (T), idx: int):
+    if idx < 0 or idx >= v.len do out None end
+    out Some(vec_load of (T)(v.data, idx))
+end.
+
+func vec_set of (T):
+    in  v: Vec of (T)
+        idx: int
+        val: T
+    if idx < 0 or idx >= v.len do
+        panic(str_new("vec.set: index out of bounds"))
+    end
+    vec_store of (T)(v.data, idx, val)
+end.
+
+func vec_first of (T)(v: Vec of (T)):
+    if v.len == 0 do out None end
+    out Some(vec_load of (T)(v.data, 0))
+end.
+
+func vec_last of (T)(v: Vec of (T)):
+    if v.len == 0 do out None end
+    out Some(vec_load of (T)(v.data, v.len - 1))
+end.
+
+# ─── Mutation ─────────────────────────────────────────
+
+func vec_push of (T)(v: Vec of (T), val: T):
+    # May reallocate → invalidates prior raw views into old storage
+    vec_reserve of (T)(v, 1)
+    let slot = v.len
+    vec_store of (T)(v.data, slot, val)
+    v.len = slot + 1
+    out v
+end.
+
+func vec_pop of (T)(v: Vec of (T)):
+    if v.len == 0 do out None end
+    v.len = v.len - 1
+    out Some(vec_load of (T)(v.data, v.len))
+end.
+
+func vec_insert of (T):
+    in  v: Vec of (T)
+        idx: int
+        val: T
+    if idx < 0 or idx > v.len do
+        panic(str_new("vec.insert: index out of bounds"))
+    end
+    vec_reserve of (T)(v, 1)
+    let esz = vec_elem_size of (T)()
+    if idx < v.len do
+        let src = v.data + idx * esz
+        let dst = src + esz
+        mem_move(dst, src, (v.len - idx) * esz)
+    end
+    vec_store of (T)(v.data, idx, val)
+    v.len = v.len + 1
+end.
+
+func vec_remove of (T)(v: Vec of (T), idx: int):
+    # Order-preserving; O(n) tail shift
+    if idx < 0 or idx >= v.len do
+        panic(str_new("vec.remove: index out of bounds"))
+    end
+    let val = vec_load of (T)(v.data, idx)
+    let remaining = v.len - idx - 1
+    if remaining > 0 do
+        let esz = vec_elem_size of (T)()
+        let dst = v.data + idx * esz
+        let src = dst + esz
+        mem_move(dst, src, remaining * esz)
+    end
+    v.len = v.len - 1
+    out val
+end.
+
+func vec_swap_remove of (T)(v: Vec of (T), idx: int):
+    # O(1); order not preserved
+    if idx < 0 or idx >= v.len do
+        panic(str_new("vec.swapRemove: index out of bounds"))
+    end
+    let val = vec_load of (T)(v.data, idx)
+    v.len = v.len - 1
+    if idx < v.len do
+        let last = vec_load of (T)(v.data, v.len)
+        vec_store of (T)(v.data, idx, last)
+    end
+    out val
+end.
+
+func vec_clear of (T)(v: Vec of (T)):
+    # len = 0; capacity retained. No element destructors today.
+    v.len = 0
+end.
+
+func vec_truncate of (T)(v: Vec of (T), new_len: int):
+    # Shrink-only; new_len >= len → no-op. No element destructors today.
+    if new_len < v.len do
+        v.len = new_len
+    end
+end.
+
+# ─── Extend & Append ─────────────────────────────────
+
+func vec_extend of (T)(v: Vec of (T), other: Vec of (T)):
+    # Self-extension vec.extend(v, v) is supported.
+    # Snapshot before reserve: after realloc, a by-value `other` may hold a
+    # freed data pointer — never read other.data after reserve when aliased.
+    if other.len == 0 do out end
+    let n = other.len
+    let self_alias = other.data == v.data
+    let old_len = v.len
+    let esz = vec_elem_size of (T)()
+    vec_reserve of (T)(v, n)
+    if self_alias do
+        # Prefix [0, n) is intact in (possibly new) v.data; append at old_len.
+        mem_copy(v.data + old_len * esz, v.data, n * esz)
+    else
+        mem_copy(v.data + old_len * esz, other.data, n * esz)
+    end
+    v.len = old_len + n
+end.
+
+func vec_extend_from_slice of (T):
+    # INTERNAL — raw pointer bulk append
+    in  v: Vec of (T)
+        src: ptr
+        count: int
+    if count == 0 do out end
+    if count < 0 do
+        panic(str_new("vec: negative extend count"))
+    end
+    vec_reserve of (T)(v, count)
+    let esz = vec_elem_size of (T)()
+    mem_copy(v.data + v.len * esz, src, count * esz)
+    v.len = v.len + count
+end.
+
+# ─── Search (requires T ==) ───────────────────────────
+
+func vec_contains of (T)(v: Vec of (T), val: T):
+    var i = 0
+    when i < v.len loop
+        if vec_load of (T)(v.data, i) == val do
+            out true
+        end
+        i = i + 1
+    end
+    out false
+end.
+
+func vec_find of (T)(v: Vec of (T), val: T):
+    # Returns Option of index
+    var i = 0
+    when i < v.len loop
+        if vec_load of (T)(v.data, i) == val do
+            out Some(i)
+        end
+        i = i + 1
+    end
+    out None
+end.
+
+func vec_count of (T)(v: Vec of (T), val: T):
+    var count = 0
+    var i = 0
+    when i < v.len loop
+        if vec_load of (T)(v.data, i) == val do
+            count = count + 1
+        end
+        i = i + 1
+    end
+    out count
+end.
+
+# ─── Transform ────────────────────────────────────────
+
+func vec_swap of (T)(v: Vec of (T), a: int, b: int):
+    if a < 0 or a >= v.len or b < 0 or b >= v.len do
+        panic(str_new("vec.swap: index out of bounds"))
+    end
+    if a == b do out end
+    let tmp = vec_load of (T)(v.data, a)
+    vec_store of (T)(v.data, a, vec_load of (T)(v.data, b))
+    vec_store of (T)(v.data, b, tmp)
+end.
+
+func vec_reverse of (T)(v: Vec of (T)):
+    if v.len <= 1 do out end
+    var lo = 0
+    var hi = v.len - 1
+    when lo < hi loop
+        vec_swap of (T)(v, lo, hi)
+        lo = lo + 1
+        hi = hi - 1
+    end
+end.
+
+func vec_clone of (T)(v: Vec of (T)):
+    # Deep w.r.t. Vec storage; shallow w.r.t. T
+    if v.len == 0 do out vec_new of (T)() end
+    let nv = vec_with_cap of (T)(v.len)
+    mem_copy(nv.data, v.data, v.len * vec_elem_size of (T)())
+    nv.len = v.len
+    out nv
+end.
+
+func vec_copy_range of (T):
+    # Canonical: vec.copyRange — owned copy of [start, end)
+    # Not borrowed Slice; not full clone.
+    in  v: Vec of (T)
+        start: int
+        end_idx: int
+    if start < 0 or end_idx < 0 or start > end_idx or end_idx > v.len do
+        panic(str_new("vec.copyRange: range out of bounds"))
+    end
+    let count = end_idx - start
+    let nv = vec_with_cap of (T)(count)
+    if count > 0 do
+        mem_copy(nv.data, vec_ptr_at of (T)(v.data, start), count * vec_elem_size of (T)())
+        nv.len = count
+    end
+    out nv
+end.
+
+func vec_slice of (T):
+    # Compatibility alias → vec_copy_range (do not use as borrowed slice)
+    in  v: Vec of (T)
+        start: int
+        end_idx: int
+    out vec_copy_range of (T)(v, start, end_idx)
+end.
+
+# ─── Equality ─────────────────────────────────────────
+
+func vec_eq of (T)(a: Vec of (T), b: Vec of (T)):
+    if a.len != b.len do out false end
+    var i = 0
+    when i < a.len loop
+        if vec_load of (T)(a.data, i) != vec_load of (T)(b.data, i) do
+            out false
+        end
+        i = i + 1
+    end
+    out true
+end.
+
+# ─── Memory ───────────────────────────────────────────
+
+func vec_free of (T)(v: Vec of (T)):
+    if v.data != null do
+        vir_free(v.data)
+        v.data = null
+    end
+    v.len = 0
+    v.cap = 0
+end.
+
+func vec_as_ptr of (T)(v: Vec of (T)):
+    # INTERNAL
+    out v.data
+end.
+
+func vec_as_slice of (T)(v: Vec of (T)):
+    # INTERNAL — byte Slice of representation, not typed borrow / not vec.slice
+    out Slice ( data = v.data, len = v.len * vec_elem_size of (T)() )
+end.
+
+# ─── Iteration Helpers (uncurated / experimental) ─────
+# Not part of closed core surface — depend on callable ABI.
+
+func vec_for_each of (T)(v: Vec of (T), f: ptr):
+    var i = 0
+    when i < v.len loop
+        f(vec_load of (T)(v.data, i))
+        i = i + 1
+    end
+end.
+
+func vec_map of (T, U)(v: Vec of (T), f: ptr) out(Vec):
+    var out_vec = vec_with_cap of (U)(v.len)
+    var i = 0
+    when i < v.len loop
+        vec_push of (U)(&out_vec, f(vec_load of (T)(v.data, i)))
+        i = i + 1
+    end
+    out out_vec
+end.
+
+func vec_filter of (T)(v: Vec of (T), pred: ptr):
+    var out_vec = vec_new of (T)()
+    var i = 0
+    when i < v.len loop
+        let elem = vec_load of (T)(v.data, i)
+        if pred(elem) do
+            vec_push of (T)(&out_vec, elem)
+        end
+        i = i + 1
+    end
+    out out_vec
+end.
+
+func vec_any of (T)(v: Vec of (T), pred: ptr):
+    var i = 0
+    when i < v.len loop
+        if pred(vec_load of (T)(v.data, i)) do out true end
+        i = i + 1
+    end
+    out false
+end.
+
+func vec_all of (T)(v: Vec of (T), pred: ptr):
+    var i = 0
+    when i < v.len loop
+        if !pred(vec_load of (T)(v.data, i)) do out false end
+        i = i + 1
+    end
+    out true
+end.
+
+func vec_fold of (T, U)(v: Vec of (T), init: U, f: func(U, T) -> U) -> U:
+    var acc = init
+    var i = 0
+    when i < v.len loop
+        acc = f(acc, vec_load of (T)(v.data, i))
+        i = i + 1
+    end
+    out acc
+end.
+
+entity Pair of (A, B):
+    first: A,
+        second: B
+end.
+
+func vec_zip of (A, B)(a: Vec of (A), b: Vec of (B)) out(Vec):
+    var n: int
+    if a.len < b.len do n = a.len else n = b.len end
+    var result = vec_with_cap of (Pair of (A,B))(n)
+    var i = 0
+    when i < n loop
+        vec_push of (Pair of (A,B))(&result, Pair of (A, B) ( first: vec_load of (A)(a.data, i), second: vec_load of (B)(b.data, i) ))
+        i = i + 1
+    end
+    out result
+end.
+
+func vec_enumerate of (T)(v: Vec of (T)) out(Vec):
+    var result = vec_with_cap of (Pair of (int,T))(v.len)
+    var i = 0
+    when i < v.len loop
+        vec_push of (Pair of (int,T))(&result, Pair of (int, T) ( first: i, second: vec_load of (T)(v.data, i) ))
+        i = i + 1
+    end
+    out result
+end.
+
+func vec_flatten of (T)(nested: ptr) out(Vec):
+    var result = vec_new of (T)()
+    var i = 0
+    when i < nested.len loop
+        let inner = native_load of (Vec of (T))(nested.data, i)
+        var j = 0
+        when j < inner.len loop
+            vec_push of (T)(&result, vec_load of (T)(inner.data, j))
+            j = j + 1
+        end
+        i = i + 1
+    end
+    out result
+end.
+
+func vec_dedup of (T)(v: Vec of (T), eq: ptr) out(Vec):
+    var result = vec_new of (T)()
+    if v.len == 0 do out result end
+    vec_push of (T)(&result, vec_load of (T)(v.data, 0))
+    var i = 1
+    when i < v.len loop
+        let cur = vec_load of (T)(v.data, i)
+        let prev = vec_load of (T)(v.data, i - 1)
+        if !eq(cur, prev) do
+            vec_push of (T)(&result, cur)
+        end
+        i = i + 1
+    end
+    out result
+end.
