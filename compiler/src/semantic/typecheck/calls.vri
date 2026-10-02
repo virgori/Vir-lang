@@ -1,0 +1,271 @@
+##
+ * compiler/src/semantic/typecheck/calls.vri — Call Signature and Resolution Service
+ * ==============================================================================
+ * VIRC-PLN-0003 Section 5.5: Call Signature and Resolution Service.
+ *
+ * Implements callable signature parsing, low-level call recognition,
+ * free function and extern lookup in AST bucket caches, and call argument
+ * compatibility checks.
+ ##
+
+include vec_rt
+import vec_len_rt, vec_get_rt, vec_push_rt, vec_set_rt, vec_new_rt from vec_rt
+
+include string_rt
+import fat_str_len, fat_str_byte_at, fat_str_eq, fat_str_new, fat_str_slice, fat_cstr_eq, fat_str_concat from string_rt
+
+include virc.frontend.parser
+
+include virc.semantic.type_table
+import TypeKind, TYPE_VOID, TYPE_INT, TYPE_FLOAT, TYPE_BOOL, TYPE_STRING from virc.semantic.type_table
+
+include virc.semantic.symbol_table
+import SymbolTable, SymbolKind, SymbolNode from virc.semantic.symbol_table
+
+include virc.semantic.scope_tree
+import ScopeTree, scope_current_id from virc.semantic.scope_tree
+
+include virc.semantic.typecheck.context
+import TypecheckContext from virc.semantic.typecheck.context
+
+include virc.semantic.typecheck.index
+import typecheck_hash_name, typecheck_lookup_scope_indexed from virc.semantic.typecheck.index
+
+include virc.semantic.typecheck.compatibility
+import typecheck_unwrap_type_name, typecheck_is_integer_like,
+       typecheck_param_types_compatible, typecheck_types_compatible from virc.semantic.typecheck.compatibility
+
+func typecheck_count_callable_params(type_str: &string) -> int:
+    let slen = fat_str_len(type_str)
+    if slen <= 0 do out 0 - 1 end
+    var lparen = 0 - 1
+    var rparen = 0 - 1
+    var i = 0
+    when i < slen loop
+        let b = fat_str_byte_at(type_str, i)
+        if b == 40 and lparen < 0 do
+            lparen = i
+        eif b == 41 and rparen < 0 do
+            rparen = i
+            i = slen
+        end
+        i = i + 1
+    end
+    if lparen < 0 or rparen < 0 or rparen <= lparen do
+        out 0 - 1
+    end
+    var has_content = 0
+    var commas = 0
+    var j = lparen + 1
+    when j < rparen loop
+        let cb = fat_str_byte_at(type_str, j)
+        if cb != 32 and cb != 9 and cb != 10 and cb != 13 do
+            has_content = 1
+        end
+        if cb == 44 do
+            commas = commas + 1
+        end
+        j = j + 1
+    end
+    if has_content == 0 do
+        out 0
+    end
+    out commas + 1
+end.
+
+func typecheck_callable_param_type(type_str: &string, wanted: int) -> string:
+    let slen = fat_str_len(type_str)
+    var lparen = 0 - 1
+    var i = 0
+    when i < slen loop
+        if fat_str_byte_at(type_str, i) == 40 do
+            lparen = i
+            i = slen
+        else
+            i = i + 1
+        end
+    end
+    if lparen < 0 do out fat_str_new("") end
+
+    var current = 0
+    var start = lparen + 1
+    var pos = start
+    when pos < slen loop
+        let ch = fat_str_byte_at(type_str, pos)
+        if ch == 44 or ch == 41 do
+            if current == wanted do
+                var trim_start = start
+                var trim_end = pos
+                when trim_start < trim_end and (fat_str_byte_at(type_str, trim_start) == 32 or fat_str_byte_at(type_str, trim_start) == 9) loop
+                    trim_start = trim_start + 1
+                end
+                when trim_end > trim_start and (fat_str_byte_at(type_str, trim_end - 1) == 32 or fat_str_byte_at(type_str, trim_end - 1) == 9) loop
+                    trim_end = trim_end - 1
+                end
+                out fat_str_slice(type_str as i64, trim_start, trim_end - trim_start) as string
+            end
+            if ch == 41 do out fat_str_new("") end
+            current = current + 1
+            start = pos + 1
+        end
+        pos = pos + 1
+    end
+    out fat_str_new("")
+end.
+
+func typecheck_callable_return_type(type_str: &string) -> string:
+    let slen = fat_str_len(type_str)
+    var pos = 0
+    when pos < slen and fat_str_byte_at(type_str, pos) != 41 loop
+        pos = pos + 1
+    end
+    if pos >= slen do out fat_str_new("") end
+    pos = pos + 1
+    when pos < slen and (fat_str_byte_at(type_str, pos) == 32 or fat_str_byte_at(type_str, pos) == 9) loop
+        pos = pos + 1
+    end
+    # The self-host token spelling currently compacts func(int) -> Box as func(int)Box;
+    # accept an explicit arrow too for parser compatibility.
+    if pos + 1 < slen and fat_str_byte_at(type_str, pos) == 45 and fat_str_byte_at(type_str, pos + 1) == 62 do
+        pos = pos + 2
+    end
+    when pos < slen and (fat_str_byte_at(type_str, pos) == 32 or fat_str_byte_at(type_str, pos) == 9) loop
+        pos = pos + 1
+    end
+    if pos >= slen do out fat_str_new("") end
+    out fat_str_slice(type_str as i64, pos, slen - pos) as string
+end.
+
+func typecheck_is_lowlevel_call_or_param(call_name: &string, param_name: &string) -> int:
+    if fat_str_len(call_name) >= 3 do
+        if fat_str_byte_at(call_name, 0) == 114 and fat_str_byte_at(call_name, 1) == 116 and fat_str_byte_at(call_name, 2) == 95 do # rt_
+            out 1
+        end
+        if fat_str_byte_at(call_name, 0) == 115 and fat_str_byte_at(call_name, 1) == 98 and fat_str_byte_at(call_name, 2) == 95 do # sb_
+            out 1
+        end
+    end
+    if fat_str_len(call_name) >= 4 do
+        if fat_str_byte_at(call_name, 0) == 115 and fat_str_byte_at(call_name, 1) == 121 and fat_str_byte_at(call_name, 2) == 115 and fat_str_byte_at(call_name, 3) == 95 do # sys_
+            out 1
+        end
+        if fat_str_byte_at(call_name, 0) == 102 and fat_str_byte_at(call_name, 1) == 97 and fat_str_byte_at(call_name, 2) == 116 and fat_str_byte_at(call_name, 3) == 95 do # fat_
+            out 1
+        end
+        if fat_str_byte_at(call_name, 0) == 105 and fat_str_byte_at(call_name, 1) == 110 and fat_str_byte_at(call_name, 2) == 99 and fat_str_byte_at(call_name, 3) == 95 do # inc_
+            out 1
+        end
+        if fat_str_byte_at(call_name, 0) == 109 and fat_str_byte_at(call_name, 1) == 105 and fat_str_byte_at(call_name, 2) == 114 and fat_str_byte_at(call_name, 3) == 95 do # mir_
+            out 1
+        end
+        if fat_str_byte_at(call_name, 0) == 108 and fat_str_byte_at(call_name, 1) == 105 and fat_str_byte_at(call_name, 2) == 114 and fat_str_byte_at(call_name, 3) == 95 do # lir_
+            out 1
+        end
+        if fat_str_byte_at(call_name, 0) == 118 and fat_str_byte_at(call_name, 1) == 101 and fat_str_byte_at(call_name, 2) == 99 and fat_str_byte_at(call_name, 3) == 95 do # vec_
+            out 1
+        end
+    end
+    if fat_str_len(call_name) >= 5 do
+        if fat_str_byte_at(call_name, 0) == 98 and fat_str_byte_at(call_name, 1) == 118 and fat_str_byte_at(call_name, 2) == 101 and fat_str_byte_at(call_name, 3) == 99 and fat_str_byte_at(call_name, 4) == 95 do # bvec_
+            out 1
+        end
+        if fat_str_byte_at(call_name, 0) == 101 and fat_str_byte_at(call_name, 1) == 109 and fat_str_byte_at(call_name, 2) == 105 and fat_str_byte_at(call_name, 3) == 116 and fat_str_byte_at(call_name, 4) == 95 do # emit_
+            out 1
+        end
+    end
+    if fat_str_len(call_name) >= 6 do
+        if fat_str_byte_at(call_name, 0) == 112 and fat_str_byte_at(call_name, 1) == 97 and fat_str_byte_at(call_name, 2) == 115 and fat_str_byte_at(call_name, 3) == 115 and fat_str_byte_at(call_name, 4) == 54 and fat_str_byte_at(call_name, 5) == 95 do # pass6_
+            out 1
+        end
+        if fat_str_byte_at(call_name, 0) == 112 and fat_str_byte_at(call_name, 1) == 97 and fat_str_byte_at(call_name, 2) == 115 and fat_str_byte_at(call_name, 3) == 115 and fat_str_byte_at(call_name, 4) == 56 and fat_str_byte_at(call_name, 5) == 95 do # pass8_
+            out 1
+        end
+    end
+    if fat_str_len(call_name) >= 7 do
+        if fat_str_byte_at(call_name, 0) == 110 and fat_str_byte_at(call_name, 1) == 97 and fat_str_byte_at(call_name, 2) == 116 and fat_str_byte_at(call_name, 3) == 105 and fat_str_byte_at(call_name, 4) == 118 and fat_str_byte_at(call_name, 5) == 101 and fat_str_byte_at(call_name, 6) == 95 do # native_
+            out 1
+        end
+        if fat_str_byte_at(call_name, 0) == 99 and fat_str_byte_at(call_name, 1) == 111 and fat_str_byte_at(call_name, 2) == 100 and fat_str_byte_at(call_name, 3) == 101 and fat_str_byte_at(call_name, 4) == 98 and fat_str_byte_at(call_name, 5) == 117 and fat_str_byte_at(call_name, 6) == 102 do # codebuf
+            out 1
+        end
+    end
+    if fat_cstr_eq(param_name, "buf") == 1 or fat_cstr_eq(param_name, "ptr") == 1 or fat_cstr_eq(param_name, "data") == 1 or fat_cstr_eq(param_name, "addr") == 1 do
+        out 1
+    end
+    if fat_cstr_eq(param_name, "fat") == 1 or fat_cstr_eq(param_name, "cstr") == 1 or fat_cstr_eq(param_name, "str") == 1 or fat_cstr_eq(param_name, "s") == 1 do
+        out 1
+    end
+    if fat_cstr_eq(param_name, "name") == 1 or fat_cstr_eq(param_name, "source") == 1 or fat_cstr_eq(param_name, "type_str") == 1 or fat_cstr_eq(param_name, "func_name") == 1 or fat_cstr_eq(param_name, "fname") == 1 or fat_cstr_eq(param_name, "lhs") == 1 do
+        out 1
+    end
+    if fat_cstr_eq(param_name, "a") == 1 or fat_cstr_eq(param_name, "b") == 1 or fat_cstr_eq(param_name, "p") == 1 or fat_cstr_eq(param_name, "val") == 1 or fat_cstr_eq(param_name, "dst") == 1 or fat_cstr_eq(param_name, "src") == 1 or fat_cstr_eq(param_name, "src1") == 1 or fat_cstr_eq(param_name, "src2") == 1 or fat_cstr_eq(param_name, "opnd") == 1 or fat_cstr_eq(param_name, "ins") == 1 do
+        out 1
+    end
+    out 0
+end.
+
+func typecheck_find_free_function_raw(func_buckets: i64, func_names: i64, func_nodes: i64, name: &string) -> AstNode:
+    if func_buckets == 0 or fat_str_len(name) == 0 do out 0 as AstNode end
+    let bid = typecheck_hash_name(name)
+    let bucket = vec_get_rt(func_buckets, bid)
+    let count = vec_len_rt(bucket)
+    var i = 0
+    when i < count loop
+        let k = vec_get_rt(bucket, i)
+        if fat_str_eq(vec_get_rt(func_names, k) as string, name) == 1 do
+            out vec_get_rt(func_nodes, k) as AstNode
+        end
+        i = i + 1
+    end
+    out 0 as AstNode
+end.
+
+func typecheck_find_func_by_canonical_identity_raw(canon_buckets: i64, canon_names: i64, func_nodes: i64, id: &string) -> AstNode:
+    if canon_buckets == 0 or fat_str_len(id) == 0 do out 0 as AstNode end
+    let bid = typecheck_hash_name(id)
+    let bucket = vec_get_rt(canon_buckets, bid)
+    let count = vec_len_rt(bucket)
+    var i = 0
+    when i < count loop
+        let k = vec_get_rt(bucket, i)
+        if fat_str_eq(vec_get_rt(canon_names, k) as string, id) == 1 do
+            out vec_get_rt(func_nodes, k) as AstNode
+        end
+        i = i + 1
+    end
+    out 0 as AstNode
+end.
+
+func typecheck_find_extern_raw(extern_buckets: i64, name: &string) -> AstNode:
+    if extern_buckets == 0 or fat_str_len(name) == 0 do out 0 as AstNode end
+    let bid = typecheck_hash_name(name)
+    let bucket = vec_get_rt(extern_buckets, bid)
+    let count = vec_len_rt(bucket)
+    var i = 0
+    when i < count loop
+        let ext_node = vec_get_rt(bucket, i) as AstNode
+        if fat_str_eq(ext_node.name, name) == 1 do
+            out ext_node
+        end
+        i = i + 1
+    end
+    out 0 as AstNode
+end.
+
+func typecheck_find_free_function(ref ctx: TypecheckContext, name: &string) -> AstNode:
+    out typecheck_find_free_function_raw(ctx.func_buckets, ctx.func_names, ctx.func_nodes, name)
+end.
+
+func typecheck_find_func_by_canonical_identity(ref ctx: TypecheckContext, id: &string) -> AstNode:
+    out typecheck_find_func_by_canonical_identity_raw(ctx.func_canon_buckets, ctx.func_canonical_names, ctx.func_nodes, id)
+end.
+
+func typecheck_find_extern(ref ctx: TypecheckContext, name: &string) -> AstNode:
+    out typecheck_find_extern_raw(ctx.extern_buckets, name)
+end.
+
+export typecheck_count_callable_params, typecheck_callable_param_type,
+       typecheck_callable_return_type, typecheck_is_lowlevel_call_or_param,
+       typecheck_find_free_function_raw, typecheck_find_func_by_canonical_identity_raw,
+       typecheck_find_extern_raw, typecheck_find_free_function,
+       typecheck_find_func_by_canonical_identity, typecheck_find_extern
