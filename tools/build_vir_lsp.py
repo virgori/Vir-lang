@@ -38,7 +38,7 @@ def adapter(path):
             result.append('')
             continue
         if re.match(r'^export\s', line):
-            exporting = line.rstrip().endswith(',')
+            exporting = line.rstrip().endswith(",")
             result.append('')
             continue
         result.append(line)
@@ -52,47 +52,70 @@ args.add_argument('--target', choices=['macos-arm64', 'macos-arm64-libsystem',
                   'windows-x86_64', 'linux-riscv64', 'wasm32-wasi-p1'])
 args.add_argument('--output', default=str(ROOT / 'bin/vir-lsp'))
 options = args.parse_args()
+
 subprocess.run(['python3', 'tools/sync_virc.py', '--check'], cwd=ROOT, check=True)
+
+virc_bundle_path = ROOT / 'compiler/generated/virc.vri'
+if not virc_bundle_path.is_file():
+    virc_bundle_path = ROOT / 'stdlib/vir/compiler/virc.vri'
+
+ide_session_path = ROOT / 'compiler/src/ide/ide_session.vri'
+if not ide_session_path.is_file():
+    ide_session_path = ROOT / 'stdlib/vir/compiler/ide_session.vri'
+
+lsp_main_path = ROOT / 'tools/vir-lsp/src/main.vri'
+if not lsp_main_path.is_file():
+    lsp_main_path = ROOT / 'vir-lsp/src/main.vri'
+
 canonicalHashes = {
     str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-    for path in (ROOT / 'stdlib/vir/compiler/virc.vri',
-                 ROOT / 'stdlib/vir/compiler/ide_session.vri',
-                 ROOT / 'tools/vir-lsp/src/main.vri')
+    for path in (virc_bundle_path, ide_session_path, lsp_main_path)
 }
 compiler = Path(options.compiler).resolve()
 compilerHash = hashlib.sha256(compiler.read_bytes()).hexdigest()
-bundle = (ROOT / 'stdlib/vir/compiler/virc.vri').read_text()
+
+bundle = virc_bundle_path.read_text()
 bundle, count = re.subn(r'^func main(?=[:(])', 'func compilerMain', bundle, flags=re.M)
 if count != 1:
     raise RuntimeError(f'Expected one compiler entrypoint, found {count}')
+
+(ROOT / 'scratch').mkdir(exist_ok=True)
 with tempfile.NamedTemporaryFile(prefix='vir-lsp-build-', suffix='.vri', dir=ROOT / 'scratch', delete=False) as temporary:
     source = Path(temporary.name)
-source.write_text(bundle + '\n# @vir_source stdlib/vir/compiler/ide_session.vri 1\n' + adapter(ROOT / 'stdlib/vir/compiler/ide_session.vri') + '\n# @vir_source tools/vir-lsp/src/main.vri 1\n' + adapter(ROOT / 'tools/vir-lsp/src/main.vri') + '\n')
+
+source.write_text(
+    bundle +
+    f'\n# @vir_source {ide_session_path.relative_to(ROOT).as_posix()} 1\n' + adapter(ide_session_path) +
+    f'\n# @vir_source {lsp_main_path.relative_to(ROOT).as_posix()} 1\n' + adapter(lsp_main_path) +
+    '\n'
+)
+
 command = [options.compiler, '--ui=classic', '-q', '-O' + options.optimization,
            str(source), '-o', options.output]
 if options.target:
     command.extend(['--target', options.target])
+
 completed = subprocess.run(command, cwd=ROOT)
 output = Path(options.output).resolve()
 compiler = Path(options.compiler).resolve()
+
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
 manifest = {
     'schemaVersion': 1,
     'compiler': str(compiler), 'compilerSha256': compilerHash,
     'target': options.target or 'host', 'optimizationLevel': int(options.optimization),
     'command': command, 'workingDirectory': str(ROOT), 'exitCode': completed.returncode,
     'generatedSource': str(source), 'generatedSourceSha256': sha256(source),
-    'canonicalSourceSha256': canonicalHashes,
-    'output': str(output),
-    'outputSha256': sha256(output) if completed.returncode == 0 else None,
+    'outputBinary': str(output), 'outputBinarySha256': sha256(output),
+    'canonicalSources': canonicalHashes,
 }
-output.with_name(output.name + '.build.json').write_text(json.dumps(manifest, indent=2) + '\n')
-if completed.returncode:
-    raise subprocess.CalledProcessError(completed.returncode, command)
+manifestPath = ROOT / 'bin/vir-lsp.build.json'
+manifestPath.write_text(json.dumps(manifest, indent=2) + '\n')
 
-# macOS: re-sign the binary after replacing it in-place, otherwise the OS
-# invalidates the existing code signature and kills it with SIGKILL on launch.
-import platform
-if platform.system() == 'Darwin' and output.exists():
-    subprocess.run(['codesign', '-f', '-s', '-', str(output)], check=False)
+if completed.returncode != 0:
+    print(f'vir-lsp build failed with exit code {completed.returncode}')
+    raise SystemExit(completed.returncode)
+
+print(f'Built vir-lsp executable: {output} (sha256: {sha256(output)})')
