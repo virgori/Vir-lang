@@ -1,5 +1,5 @@
 ---
-id: "VIRC-PLN-0003"
+id: "VIRC-PLN-0004"
 type: "PLAN"
 domain: "VIRC"
 title: "Separate compiler source tree and modularize compiler passes"
@@ -19,7 +19,7 @@ components:
   - "vscode-extension"
 related:
   issues:
-    - "VIRC-ISS-0005"
+    - "VIRC-ISS-0006"
   plans: []
   reports: []
 supersedes: null
@@ -33,7 +33,7 @@ tags:
   - "editor-tooling"
 ---
 
-# VIRC-PLN-0003 — Separate compiler source tree and modularize compiler passes
+# VIRC-PLN-0004 — Separate compiler source tree and modularize compiler passes
 
 ## 1. Objective
 
@@ -53,23 +53,25 @@ rõ ràng, dependency một chiều, module identity ổn định, generated bun
 tạo được, và verification đủ mạnh để một lần tách file không âm thầm đổi ngữ
 nghĩa compiler.
 
-Baseline của plan là commit:
+Baseline của plan là snapshot source hiện tại:
 
 ```text
-2e59f6a00c09a94505974391c6e7aa831b00f814
-feat(virc): checkpoint compiler pipeline and contract hardening
+snapshot commit: fd0064ea516c132b57cd9dec8acf827ed4361555
+snapshot tree:   521698301f57ebe84a62ae690e2ac8d48b2be419
+parent commit:   58b8b39a4c65b00a7bb98df6fe40a1480bdf3e0e
+source label:    Vir 4.0.0 working source
 ```
 
-Worktree của plan được tạo trực tiếp từ baseline này. Các thay đổi ở checkout
-ban đầu và commit LSP kế tiếp không thuộc migration, ngoại trừ
-`.agents/skills/vir-paper-management/**` được user chỉ định rõ ở revision này
-và các payload LSP/editor được user bổ sung rõ ở revision này. Mọi ngoại lệ phải
-được pin theo commit, path allowlist và checksum; dirty/untracked parent
-working-tree content vẫn bị cấm.
+Snapshot lấy source đang có trong working tree theo chỉ định của user, gồm các
+tracked modifications và source-like untracked files, nhưng loại cache,
+diagnostic state, packaged editor artifacts, untracked executables và nested Git
+metadata. Worktree tiền xử lý được tạo trực tiếp từ snapshot này. Plan không yêu
+cầu snapshot ban đầu phải xanh; lỗi sẵn có và lỗi do module hoá phải được ghi
+nhận, cô lập và xử lý tuần tự theo phase thay vì đổi lại baseline cũ.
 
 ## 2. Source Issues
 
-- `VIRC-ISS-0005` — compiler source đang lẫn trong stdlib và nhiều pass file
+- `VIRC-ISS-0006` — compiler source đang lẫn trong stdlib và nhiều pass file
   vượt quá một responsibility có thể audit độc lập.
 
 Các issue `VIRC-ISS-0001`, `VIRC-ISS-0002`, và `VIR-ISS-0002` cung cấp context
@@ -88,8 +90,7 @@ dùng việc đổi file để tuyên bố các thuật toán trong những issu
   transitive helper files mà các runner gọi;
 - copy tracked source của native `vir-lsp` repository vào `tools/vir-lsp/` và
   copy canonical source/config/test/assets của `tools/vscode-vir/`;
-- nhập path-scoped LSP build/test integration cần thiết, không blanket-merge
-  commit sau baseline;
+- giữ LSP build/test integration đang có trong source snapshot;
 - tạo top-level `compiler/` làm owner của self-hosted compiler source;
 - tạo và kiểm tra `compiler/module.list`;
 - chuyển compiler-internal include/import sang một canonical project namespace;
@@ -110,8 +111,8 @@ dùng việc đổi file để tuyên bố các thuật toán trong những issu
 - copy `.git/**`, `docs/_legacy/**`, `frozen/**`, build output, scratch,
   caches, compiled binaries hoặc editor-local state sang `Vir-3.0`;
 - overwrite/merge vào một destination `Vir-3.0` đã tồn tại hoặc không rỗng;
-- copy dirty/untracked changes hiện tại từ `/Users/gengyang/Vir`; chỉ các
-  clean, commit-pinned external payload được liệt kê rõ trong plan là ngoại lệ;
+- copy cache, diagnostic state, local package, untracked executable hoặc editor
+  state không thuộc source snapshot;
 - thay đổi Vir syntax, language semantics, module grammar, hoặc public stdlib API;
 - triển khai PRE/loop transform/register allocation còn thiếu chỉ vì file đã
   được tách;
@@ -120,8 +121,8 @@ dùng việc đổi file để tuyên bố các thuật toán trong những issu
 - đưa package installation, network access, hash/signature, hoặc Viron lifecycle
   vào compiler resolver;
 - chỉnh sửa language/stdlib specifications;
-- blanket-merge commit LSP sau baseline hoặc mang theo thay đổi compiler ngoài
-  path allowlist LSP/editor;
+- trộn thêm thay đổi mới phát sinh ở source checkout sau snapshot mà không tạo
+  snapshot/revision mới;
 - copy `.vir/**`, `node_modules/**`, `out/**`, `*.vsix`, `bin/vir-lsp`,
   `dist/vir-lsp` hoặc nested `.git/**` như canonical source;
 - đổi tên hàng loạt public/ABI symbols chỉ để đạt camelCase.
@@ -150,25 +151,21 @@ Các claim dưới đây được audit trực tiếp ở baseline ngày 2026-10
   `mir_opt.vri`, nhưng không xuất hiện như module active trong generated marker
   sequence được audit; trạng thái này phải được phân loại trước khi di chuyển.
 - `/Users/gengyang/Vir-3.0` chưa tồn tại tại thời điểm audit;
-- baseline có 1,986 tracked files dưới `tests/`, 74 tracked files dưới `papers/`,
-  và 112 tracked legacy-doc files dưới `docs/_legacy/`; preparation worktree có
-  thêm ISSUE/PLAN này nên paper payload dự kiến là 76 files;
+- snapshot mang theo test suite, paper registry và source/tool changes hiện có;
+  `docs/_legacy/**` vẫn bị loại ở bước seed `Vir-3.0`;
 - root `run_tests.sh` gọi trực tiếp `tools/gap_contract_runner.py`; runner
   migration vì vậy phải copy dependency closure, không chỉ file có prefix `run`;
-- baseline Git tree không chứa `.agents/skills/vir-paper-management/SKILL.md`
-  dù `tools/paper.py` yêu cầu nó khi validate; active skill được user yêu cầu
-  copy hiện nằm ở `/Users/gengyang/Vir/.agents/skills/vir-paper-management/`.
-- baseline có tracked `tools/vscode-vir/`, nhưng gồm cả TypeScript canonical
+- snapshot chứa `.agents/skills/vir-paper-management/**` cùng paper tool và
+  registry đang dùng.
+- snapshot có tracked `tools/vscode-vir/`, nhưng gồm cả TypeScript canonical
   source, generated `out/**` và packaged `*.vsix`; hai nhóm sau không phải
   source-of-truth để seed.
-- baseline và commit `58b8b39a4c65b00a7bb98df6fe40a1480bdf3e0e`
-  không chứa standalone `vir-lsp/` trong parent Git tree. Native server là một
+- snapshot parent không chứa standalone `vir-lsp/` trong parent Git tree.
+  Native server là một
   clean nested repository riêng tại `/Users/gengyang/Vir/vir-lsp`, pin ở commit
   `55e964a3664fb703731c59aa85f3f546e44b1b03`, với 6 tracked source/doc files.
-- commit `58b8b39a4c65b00a7bb98df6fe40a1480bdf3e0e` là checkpoint
-  compiler-backed editor integration; nó thêm LSP runner/tests/build script và
-  cập nhật `tools/vscode-vir`. Payload này phải được nhập theo exact path, không
-  kéo toàn bộ commit hoặc parent working tree.
+- compiler-backed editor integration, LSP runner/tests/build script và
+  `tools/vscode-vir` được lấy trực tiếp từ snapshot source hiện tại.
 
 ## 5. Proposed Architecture
 
@@ -494,7 +491,7 @@ algorithm, mutation authority và test surface.
 
 ### 5.9 Vir-3.0 seed and copy policy
 
-Seed operation MUST copy, không move, từ pinned preparation worktree sang
+Seed operation MUST copy, không move, từ snapshot preparation worktree sang
 `/Users/gengyang/Vir-3.0`. Source tree tiếp tục tồn tại nguyên vẹn.
 
 Payload bắt buộc:
@@ -502,9 +499,7 @@ Payload bắt buộc:
 - `docs/**`, với explicit exclude `docs/_legacy/**` và mọi descendant;
 - toàn bộ `papers/**`, root `paper`, `tools/paper.py`, paper schemas/templates
   và file dependency mà paper tool import;
-- `.agents/skills/vir-paper-management/**`, lấy từ active source
-  `/Users/gengyang/Vir/.agents/skills/vir-paper-management/` vì baseline commit
-  không chứa skill này;
+- `.agents/skills/vir-paper-management/**` đã nằm trong snapshot source;
 - toàn bộ `tests/**`, giữ fixture names, symlinks và executable modes;
 - root `run_tests.sh`;
 - các active runner/checker/audit entry points dưới `tools/` và transitive
@@ -516,7 +511,7 @@ Payload bị cấm trong seed:
 - `.git/**`, `docs/_legacy/**`, `frozen/**`;
 - `scratch/**`, `build/**`, `dist/**`, caches, logs, coverage, temporary files;
 - prebuilt compiler binaries và benchmark executables;
-- unrelated dirty/untracked files từ checkout `/Users/gengyang/Vir`;
+- file mới phát sinh ở checkout `/Users/gengyang/Vir` sau snapshot;
 - absolute symlinks trỏ ngược về source tree.
 
 Trước copy, implementation MUST:
@@ -524,8 +519,8 @@ Trước copy, implementation MUST:
 1. fail closed nếu `/Users/gengyang/Vir-3.0` đã tồn tại và không rỗng;
 2. tạo dry-run inventory gồm relative path, source class, file type, mode,
    symlink target, byte size và SHA-256 cho regular files;
-3. ghi rõ source provenance: baseline commit, preparation-worktree paper diff,
-   và external paper-skill hash;
+3. ghi rõ source provenance: snapshot commit/tree, parent commit,
+   preparation-worktree paper diff và nested `vir-lsp` commit;
 4. resolve runner dependency closure; missing dependency là hard error;
 5. kiểm tra exclude set để không có legacy/build/cache payload.
 
@@ -536,13 +531,13 @@ package lock hoặc đưa hash verification vào compiler resolver.
 Source `.git` MUST NOT được copy. Sau khi seed validation xanh, implementation
 MAY khởi tạo Git repository local mới trong `Vir-3.0` để các phase sau có commit
 boundary; repository mới không có remote và không được push nếu chưa có user
-authorization riêng. Initial import commit phải ghi baseline commit và seed
+authorization riêng. Initial import commit phải ghi snapshot commit/tree và seed
 manifest, nhờ đó `git mv` ở các compiler phase sau không phụ thuộc Git metadata
 của source repository.
 
-Paper skill là ngoại lệ được user cho phép rõ ràng đối với rule “không lấy
-current checkout changes”. Nó MUST được copy như một payload riêng, ghi source
-path và checksum; không được dùng ngoại lệ này để kéo theo skill hoặc file khác.
+Source snapshot là điểm cắt duy nhất của parent repository. Mọi thay đổi source
+phát sinh sau `fd0064ea` chỉ được nhập bằng một snapshot revision mới có manifest;
+không đọc lại working tree sống trong lúc migration.
 
 ### 5.10 LSP and editor-tooling migration policy
 
@@ -570,9 +565,8 @@ binary và mọi untracked file MUST NOT được copy. Source path đổi từ
 `vir-lsp/src/main.vri` sang `tools/vir-lsp/src/main.vri`; build/test tooling phải
 đổi đường dẫn trong một mechanical batch riêng.
 
-`tools/vscode-vir/` lấy canonical source/config/test/assets tại parent commit
-`58b8b39a4c65b00a7bb98df6fe40a1480bdf3e0e`, cùng đúng các LSP runner/tests và
-`tools/build_vir_lsp.py` được commit đó thêm. Không cherry-pick/merge toàn commit.
+`tools/vscode-vir/`, LSP runner/tests và `tools/build_vir_lsp.py` lấy từ snapshot
+`fd0064ea516c132b57cd9dec8acf827ed4361555`.
 `out/**`, source maps, `*.vsix`, `node_modules/**` và package cache bị loại khỏi
 copy manifest; chúng phải được tái tạo từ `src/**`, `package-lock.json` và
 documented package scripts sau migration.
@@ -782,9 +776,9 @@ cleanup hoặc optimizer barrier regression.
 
 ### Decision 7 — Seed a clean sibling tree by manifest-driven copy
 
-**Decision:** Tạo `/Users/gengyang/Vir-3.0` bằng copy allowlist trước khi sửa
-resolver hoặc compiler source. Không dùng source checkout hiện tại làm blanket
-input; paper skill là external input duy nhất được user chỉ định.
+**Decision:** Tạo `/Users/gengyang/Vir-3.0` bằng copy allowlist từ snapshot
+source 4.0.0 trước khi sửa resolver hoặc compiler source. Không đọc lại live
+checkout sau điểm cắt snapshot.
 
 **Rationale:** tree mới phải bắt đầu từ baseline có thể truy nguyên nhưng vẫn có
 đủ docs, VPS governance, tests và runners để mọi phase sau tự kiểm chứng.
@@ -792,20 +786,18 @@ input; paper skill là external input duy nhất được user chỉ định.
 **Alternatives considered:** làm trực tiếp trong old repository; copy toàn bộ
 working tree; clone cả Git history; chỉ copy compiler rồi bổ sung tests sau.
 
-**Trade-offs:** cần manifest/dependency audit và hai provenance roots; đổi lại
-destination không mang legacy, build artifacts hoặc unrelated current changes.
+**Trade-offs:** snapshot có thể chứa lỗi đang tồn tại; đổi lại destination phản
+ánh đúng source user chọn và không mang thêm drift sau thời điểm chụp.
 
 ### Decision 8 — Import editor tooling by pinned path, not working tree
 
 **Decision:** Native server được nhập từ nested repository commit `55e964a`; VS
-Code extension và LSP integration tests được nhập theo path từ parent commit
-`58b8b39`. Không dùng untracked checkout state và không blanket-merge commit sau
-baseline.
+Code extension và LSP integration tests dùng nội dung đã pin trong snapshot
+`fd0064ea`. Generated/package artifacts không trở thành canonical source.
 
-**Rationale:** baseline `2e59f6a` không chứa standalone server, trong khi editor
-client và integration checkpoint có provenance khác nhau. Pin từng source root
-giữ được yêu cầu fork compiler từ baseline nhưng vẫn chuyển đúng tooling user
-đã bổ sung.
+**Rationale:** native server là nested repository có provenance riêng, trong khi
+editor client/integration đã thuộc source snapshot. Hai source root cần manifest
+riêng nhưng không cần quay lại commit 3.8.5.
 
 **Alternatives considered:** bỏ LSP khỏi Vir-3.0; copy toàn working tree; giữ
 nested Git repository; mang theo binary, generated JavaScript và VSIX.
@@ -815,9 +807,11 @@ artifacts; đổi lại tree đích không chứa Git lồng, cache hoặc sourc
 
 ## 8. Implementation Plan
 
-Các phase MUST chạy tuần tự. Phase N+1 không bắt đầu khi gate của Phase N chưa
-xanh và diff của Phase N chưa được review. Mỗi phase tạo một reviewable commit
-hoặc một chuỗi commit nhỏ có cùng rollback boundary.
+Các phase MUST chạy tuần tự. Snapshot ban đầu không bắt buộc xanh. Phase N+1
+chỉ bắt đầu khi lỗi mới do Phase N đã được cô lập/khắc phục và các lỗi có sẵn
+được ghi baseline rõ ràng; không được dùng “source vốn đã lỗi” để bỏ qua
+regression mới. Mỗi phase tạo một reviewable commit hoặc một chuỗi commit nhỏ có
+cùng rollback boundary.
 
 ### Phase 0 — Pin baseline and measure invariants
 
@@ -830,10 +824,12 @@ hoặc một chuỗi commit nhỏ có cùng rollback boundary.
   - add/identify executable architecture checks and baseline test commands;
   - verify camelCase module segments; if unsupported, record lowercase naming
     fallback without spec change;
-- dependencies: baseline commit only;
-- expected result: reproducible before-state and zero unknown canonical source;
-- gate: current sync/check, registry tests, representative strict/type/memory/
-  optimizer/CLI suites and self-host baseline results are recorded.
+- dependencies: snapshot `fd0064ea` and nested LSP commit `55e964a` only;
+- expected result: reproducible before-state, known-failure ledger và zero
+  unknown canonical source;
+- gate: record current sync/check, registry, representative strict/type/memory/
+  optimizer/CLI and self-host outcomes; failures may remain but must have stable
+  reproduction before source movement.
 
 ### Phase 1 — Seed sibling repository Vir-3.0
 
@@ -841,8 +837,7 @@ hoặc một chuỗi commit nhỏ có cùng rollback boundary.
 - files/modules:
   - `docs/**` excluding `docs/_legacy/**`;
   - `papers/**`, `paper`, `tools/paper.py`, paper dependencies;
-  - `.agents/skills/vir-paper-management/**` from its explicitly recorded
-    active-source path;
+  - `.agents/skills/vir-paper-management/**` from the snapshot;
   - `tests/**`, `run_tests.sh`, audited runner/checker/audit scripts and their
     dependency closure;
 - changes:
@@ -855,14 +850,14 @@ hoặc một chuỗi commit nhỏ có cùng rollback boundary.
   - rewrite no documentation or test content during this copy-only phase;
   - after verification only, initialize a fresh local Git repository without a
     remote and record the manifest-backed import boundary;
-- dependencies: Phase 0 evidence and user-authorized paper-skill exception;
+- dependencies: Phase 0 snapshot evidence;
 - expected result: clean governance/test seed exists at sibling `Vir-3.0`;
 - gate:
   - source/destination allowlisted hashes and modes match;
   - `docs/_legacy` count in destination is zero;
-  - all 1,986 baseline test files are present before later planned additions;
-- paper tool and skill paths are internally complete;
-- 74 baseline paper files plus the new ISSUE/PLAN are present as 76 paper files;
+  - every allowlisted snapshot test file is present;
+  - paper tool and skill paths are internally complete;
+  - snapshot papers plus the new ISSUE/PLAN are present and registry-consistent;
   - runner dependency audit reports zero missing files;
   - no compiler behavior claim is made yet because compiler payload has not been
     migrated.
@@ -871,12 +866,12 @@ hoặc một chuỗi commit nhỏ có cùng rollback boundary.
 
 - files/modules:
   - tracked `vir-lsp` repository files at `55e964a` → `tools/vir-lsp/**`;
-  - canonical `tools/vscode-vir/**` files at `58b8b39`, excluding generated and
-    packaged output;
-  - `tools/build_vir_lsp.py`, `tests/run_lsp_tests.py` and committed
-    `tests/test_lsp_*.py` at `58b8b39`;
+  - canonical `tools/vscode-vir/**` files from snapshot `fd0064ea`, excluding
+    generated and packaged output;
+  - snapshot `tools/build_vir_lsp.py`, `tests/run_lsp_tests.py` and
+    `tests/test_lsp_*.py`;
 - changes:
-  - create separate manifest sections for nested-repo and parent-commit inputs;
+  - create separate manifest sections for nested-repo and snapshot inputs;
   - mechanically update `vir-lsp/src/main.vri` references to
     `tools/vir-lsp/src/main.vri`;
   - make build/test paths destination-relative and CWD-independent;
@@ -885,7 +880,8 @@ hoặc một chuỗi commit nhỏ có cùng rollback boundary.
     verification artifacts after canonical source is present;
   - keep compiler semantics in compiler modules; remove no fallback or feature
     in this migration-only phase;
-- dependencies: verified Phase 1 destination and both clean pinned commits;
+- dependencies: verified Phase 1 destination, source snapshot and nested LSP
+  commit;
 - expected result: both tooling packages are canonical source members of
   Vir-3.0 without nested Git metadata or prebuilt/generated payload;
 - gate:
@@ -1039,7 +1035,7 @@ hoặc một chuỗi commit nhỏ có cùng rollback boundary.
 
 ### Phase 12 — Verification report and lifecycle update
 
-- create VIRC REPORT linked to `VIRC-ISS-0005` and this plan;
+- create VIRC REPORT linked to `VIRC-ISS-0006` and this plan;
 - map evidence to every acceptance and exit criterion;
 - record deviations, retained compatibility names, size exceptions and follow-up
   issues without rewriting this plan;
@@ -1070,14 +1066,13 @@ Migration is incremental and mapping-driven:
 1. Preflight `/Users/gengyang/Vir-3.0`; do not overwrite or merge an existing
    non-empty directory.
 2. Build copy allowlist, exclude set, runner dependency closure, modes and
-   checksums from the pinned preparation worktree plus the explicitly
-   authorized paper-skill, native-LSP and editor-integration sources.
+   checksums from snapshot preparation worktree plus native-LSP source.
 3. Copy docs without `docs/_legacy`, VPS papers/tool/skill, complete tests and
    runner dependencies; verify destination manifest before compiler work.
 4. Copy six tracked native-LSP files from commit `55e964a` into
    `tools/vir-lsp/`; never copy its nested `.git`, `.vir` or binary output.
-5. Export allowlisted `vscode-vir`, LSP runner/test and build-tool paths from
-   parent commit `58b8b39`; exclude `out`, source maps, VSIX and caches.
+5. Copy allowlisted `vscode-vir`, LSP runner/test and build-tool paths from
+   snapshot `fd0064ea`; exclude `out`, source maps, VSIX and caches.
 6. Update only destination-relative tooling paths, rebuild derived artifacts and
    pass LSP/client contracts before compiler movement.
 7. Inventory every old compiler module spelling and physical target.
@@ -1120,17 +1115,15 @@ callers migrated | compatibility expiry | verification evidence
   `/Users/gengyang/Vir` or the preparation worktree;
 - `docs/_legacy` has zero destination entries while source legacy remains
   untouched;
-- expected test-file baseline count is 1,986 and every copied runner dependency
-  exists;
+- every allowlisted snapshot test file and copied runner dependency exists;
 - `paper`, `tools/paper.py`, `papers/**` and
   `.agents/skills/vir-paper-management/**` are present;
-- 74 baseline papers plus `VIRC-ISS-0005` and `VIRC-PLN-0003` produce the
-  expected 76-file paper payload before generated reports;
-- paper skill checksum/provenance identifies its external active-source input;
+- snapshot papers plus `VIRC-ISS-0006` and `VIRC-PLN-0004` are registry-valid;
+- paper skill checksum/provenance identifies the snapshot input;
 - native server manifest identifies clean commit `55e964a`, contains its six
   tracked files under `tools/vir-lsp/`, and contains no nested Git/diagnostic
   state;
-- editor/LSP integration manifest identifies parent commit `58b8b39` and only
+- editor/LSP integration manifest identifies snapshot `fd0064ea` and only
   the approved `tools/vscode-vir`, build script and LSP test paths;
 - destination contains no copied `tools/vscode-vir/out`, source map, VSIX,
   `node_modules`, `bin/vir-lsp` or `dist/vir-lsp` source payload;
@@ -1204,19 +1197,20 @@ callers migrated | compatibility expiry | verification evidence
 - stage 2 and stage 3 satisfy repository fixed-point contract;
 - registry and representative stdlib smoke tests run with the new compiler.
 
-Exact commands are established and recorded in Phase 0 because this plan must
-not invent a test command that is not active at the pinned baseline.
+Exact commands are established and recorded in Phase 0 from the source snapshot.
+Their initial failures become the known-failure ledger, not a reason to abandon
+the selected baseline or skip later regression comparison.
 
 ## 12. Risks
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | `Vir-3.0` already exists or contains user data | Low | Critical | Fail closed; never merge, delete or overwrite |
-| Copy accidentally imports current dirty changes | Medium | High | Allowlist, pinned source root, manifest; paper skill is the only explicit exception |
-| Paper skill differs from baseline because baseline lacks it | Certain | Medium | Record external source path/hash and validate as separate payload |
+| Live checkout changes after snapshot and silently drift into migration | Medium | High | Use only snapshot `fd0064ea`; require a new recorded snapshot to import later source |
+| Snapshot already has failing tests or incomplete work | Certain | High | Record a known-failure ledger; require each phase to introduce no unexplained new failure |
 | Native LSP is a nested repository outside baseline | Certain | High | Import only six tracked files from clean commit `55e964a`; exclude nested Git and state |
 | VS Code package mixes source with generated/package artifacts | High | Medium | Copy source/config/assets only; rebuild `out` and VSIX from lockfile/scripts |
-| LSP/editor checkpoint pulls unrelated post-baseline compiler changes | Medium | High | Export exact path allowlist from `58b8b39`; never merge/cherry-pick the commit |
+| LSP/editor copy accidentally includes generated/package state | Medium | High | Copy exact snapshot source allowlist; rebuild `out`, VSIX and server binaries |
 | Client/server/compiler schemas drift during module moves | Medium | High | Versioned contracts plus compiler-fact, snapshot and stdio integration gates |
 | Runner copied without transitive helper | Medium | High | Static dependency closure plus zero-missing gate |
 | Legacy/build/cache payload leaks into clean tree | Medium | Medium | Explicit excludes and forbidden-path scan |
@@ -1258,7 +1252,7 @@ not invent a test command that is not active at the pinned baseline.
 
 ## 14. Exit Criteria
 
-- [ ] All acceptance criteria of `VIRC-ISS-0005` have direct evidence.
+- [ ] All acceptance criteria of `VIRC-ISS-0006` have direct evidence.
 - [ ] `/Users/gengyang/Vir-3.0` is the verified implementation root.
 - [ ] Docs were copied without `docs/_legacy`; source legacy was not modified.
 - [ ] VPS papers/tool/skill, all baseline tests and audited runner dependency
@@ -1290,7 +1284,7 @@ not invent a test command that is not active at the pinned baseline.
 
 ## 15. Related Papers
 
-- `VIRC-ISS-0005` — source issue;
+- `VIRC-ISS-0006` — source issue;
 - `VIRC-SPC-0004` — self-hosting requirements;
 - `VIRC-SPC-0007` — strict compiler E2E contract;
 - `VIRC-SPC-0008` — optimizer specification;
@@ -1302,6 +1296,7 @@ not invent a test command that is not active at the pinned baseline.
 
 | Date | Change |
 |---|---|
-| 2026-10-02 | Initial draft from structural audit of baseline `2e59f6a`; defined compiler/stdlib separation, module policy, pass-only orchestration, one-transform-per-file design, and sequential gated migration |
+| 2026-10-02 | Initial draft defined compiler/stdlib separation, module policy, pass-only orchestration, one-transform-per-file design, and sequential gated migration |
 | 2026-10-02 | Added manifest-driven copy migration into sibling `/Users/gengyang/Vir-3.0`, excluding `docs/_legacy` and carrying VPS paper skill, complete tests, and audited runner dependencies |
 | 2026-10-02 | Added commit-pinned migration of native `vir-lsp` and `vscode-vir`, with separate ownership, source-only copy rules, generated-artifact exclusions and integration gates |
+| 2026-10-02 | Rebased preparation on current Vir 4.0.0 source snapshot `fd0064ea`; baseline failures are recorded rather than required to be green, and later phases must not add unexplained regressions |

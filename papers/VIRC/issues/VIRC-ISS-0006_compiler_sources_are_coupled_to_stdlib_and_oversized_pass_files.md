@@ -1,5 +1,5 @@
 ---
-id: "VIRC-ISS-0005"
+id: "VIRC-ISS-0006"
 type: "ISSUE"
 domain: "VIRC"
 title: "Compiler sources are coupled to stdlib and oversized pass files"
@@ -22,7 +22,7 @@ components:
 related:
   issues: []
   plans:
-    - "VIRC-PLN-0003"
+    - "VIRC-PLN-0004"
   reports: []
 supersedes: null
 superseded_by: null
@@ -34,14 +34,15 @@ tags:
   - "editor-tooling"
 ---
 
-# VIRC-ISS-0005 — Compiler sources are coupled to stdlib and oversized pass files
+# VIRC-ISS-0006 — Compiler sources are coupled to stdlib and oversized pass files
 
 ## 1. Summary
 
-At baseline commit `2e59f6a00c09a94505974391c6e7aa831b00f814`, the
-canonical self-hosted compiler sources, compiler-only compatibility preludes,
-and generated compiler bundle live under `stdlib/vir/compiler/`. The standard
-library registry consequently publishes a large compiler-internal namespace.
+At Vir 4.0.0 source snapshot
+`fd0064ea516c132b57cd9dec8acf827ed4361555`, the canonical self-hosted compiler
+sources, compiler-only compatibility preludes, and generated compiler bundle
+live under `stdlib/vir/compiler/`. The standard-library registry consequently
+publishes a large compiler-internal namespace.
 
 Several semantic, lowering, parser, code-generation, and optimization files
 also combine pass orchestration, mutable state, shared utilities, rules, and
@@ -58,7 +59,7 @@ language-semantics defect.
 
 The audit is intentionally structural and bounded. It inspected the active
 registry, module resolver, modular compiler sources, generated-source tools,
-and the largest pass files at the pinned baseline. It did not perform a full
+and the largest pass files at the pinned source snapshot. It did not perform a full
 semantic review of all compiler functions.
 
 ## 3. Expected Behavior
@@ -68,8 +69,8 @@ semantic review of all compiler functions.
   tests and their runner dependencies.
 - The seed operation does not copy `docs/_legacy`, Git metadata, frozen trees,
   build/cache/scratch output, prebuilt binaries or unrelated current changes.
-- Native `vir-lsp` and `vscode-vir` canonical source are copied from explicit
-  clean commits into separate `tools/` packages; nested Git state, generated
+- Native `vir-lsp` and `vscode-vir` canonical source are copied from the current
+  source snapshot into separate `tools/` packages; nested Git state, generated
   JavaScript, VSIX packages and server binaries are rebuilt rather than seeded.
 - Canonical compiler sources live in a top-level compiler-owned tree, separate
   from the standard-library source tree.
@@ -118,23 +119,19 @@ semantic review of all compiler functions.
 - Compiler files use a mixture of short include names and `compiler.*` names,
   so the physical location and registry alias often leak into dependencies.
 - No sibling `/Users/gengyang/Vir-3.0` exists at the audit point.
-- The pinned baseline contains 1,986 tracked test files, 74 tracked paper files,
-  and 112 tracked files under the `docs/_legacy` tree to exclude. The new
-  ISSUE/PLAN bring the expected preparation paper payload to 76 files.
-- The pinned baseline omits `.agents/skills/vir-paper-management/SKILL.md`, but
-  its paper validator requires that path. The user explicitly requires copying
-  the active paper skill as a separately checksummed external seed input.
-- The pinned baseline contains `tools/vscode-vir`, including canonical
+- The snapshot contains the current test suite, paper registry/tool/skill and
+  source/tool changes. `docs/_legacy/**` remains explicitly excluded from the
+  Vir-3.0 seed.
+- The snapshot contains `tools/vscode-vir`, including canonical
   TypeScript/assets/config plus generated `out/**` and packaged `*.vsix` files.
-- Standalone `vir-lsp` is not tracked by the parent baseline. It is a separate,
+- Standalone `vir-lsp` is not tracked by the parent repository snapshot. It is a separate,
   clean repository at commit `55e964a3664fb703731c59aa85f3f546e44b1b03`
-  with six tracked source/doc files. Parent commit
-  `58b8b39a4c65b00a7bb98df6fe40a1480bdf3e0e` contains the corresponding
-  extension integration, build script and LSP tests.
+  with six tracked source/doc files. The corresponding extension integration,
+  build script and LSP tests are already present in snapshot `fd0064ea`.
 
 ## 5. Reproduction
 
-Run from baseline `2e59f6a00c09a94505974391c6e7aa831b00f814`:
+Run from source snapshot `fd0064ea516c132b57cd9dec8acf827ed4361555`:
 
 ```sh
 find stdlib/vir/compiler -maxdepth 1 -name '*.vri' | wc -l
@@ -250,19 +247,18 @@ work should not continue on top of the coupled layout.
   mode, symlink target, size and SHA-256 for copied regular files.
 - [ ] `docs/**` is copied with zero `docs/_legacy/**` entries in the destination;
   the source legacy tree remains untouched.
-- [ ] `papers/**`, `paper`, `tools/paper.py`, schemas/templates and the explicit
-  `.agents/skills/vir-paper-management/**` external input validate in Vir-3.0.
-- [ ] All 1,986 baseline test files plus audited runner/checker dependency
+- [ ] `papers/**`, `paper`, `tools/paper.py`, schemas/templates and
+  `.agents/skills/vir-paper-management/**` from the snapshot validate in Vir-3.0.
+- [ ] All allowlisted snapshot test files plus audited runner/checker dependency
   closure are present with matching modes and hashes.
 - [ ] `tools/vir-lsp` contains only tracked source/docs from commit `55e964a`;
-  `tools/vscode-vir` plus LSP build/tests come only from the approved path set at
-  commit `58b8b39`.
+  `tools/vscode-vir` plus LSP build/tests come from snapshot `fd0064ea`.
 - [ ] Nested `.git`, `.vir`, `out`, source maps, VSIX, `node_modules` and native
   binaries are absent from canonical seed payload and are reproducibly rebuilt.
 - [ ] Native LSP and extension contract tests prove compiler-owned semantics,
   version-compatible facts/snapshots and CWD-independent startup.
 - [ ] Source `.git`, frozen, build/dist/scratch/cache/log payload, prebuilt
-  compiler binary, absolute source-backlink symlink or unrelated dirty file is
+  compiler binary, absolute source-backlink symlink or post-snapshot drift is
   not copied; any destination Git repository is initialized fresh, locally,
   without a remote, and records the seed manifest/provenance.
 - [ ] Canonical compiler sources and generated compiler artifacts no longer
@@ -307,7 +303,7 @@ issue does not implement their algorithms.
 
 ### Plans
 
-- `VIRC-PLN-0003` — compiler tree separation and sequential pass
+- `VIRC-PLN-0004` — compiler tree separation and sequential pass
   modularization.
 
 ### Reports
@@ -318,7 +314,8 @@ issue does not implement their algorithms.
 
 | Date | Change |
 |---|---|
-| 2026-10-02 | Created from structural audit of baseline `2e59f6a`; triaged scope, evidence, impact, and acceptance criteria |
-| 2026-10-02 | Linked `VIRC-PLN-0003` |
+| 2026-10-02 | Created from structural audit; triaged scope, evidence, impact, and acceptance criteria |
+| 2026-10-02 | Linked `VIRC-PLN-0004` |
 | 2026-10-02 | Added verified copy migration requirements for sibling `Vir-3.0`, excluding legacy docs and including VPS/test runner foundations |
 | 2026-10-02 | Added commit-pinned source migration and ownership boundaries for native `vir-lsp` and `vscode-vir` |
+| 2026-10-02 | Rebased the issue on current Vir 4.0.0 source snapshot `fd0064ea`; initial failures may be ledgered while unexplained new regressions remain prohibited |

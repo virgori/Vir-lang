@@ -3,7 +3,7 @@ id: "VIRC-ISS-0003"
 type: "ISSUE"
 domain: "VIRC"
 title: "Gemma Q8_0 tensor path lacks production storage and optimized kernels"
-status: "TRIAGED"
+status: "IMPLEMENTING"
 severity: "S2"
 priority: "P1"
 created: "2026-10-02"
@@ -20,10 +20,12 @@ components:
   - "memory-mapping"
   - "tests"
 related:
-  issues: []
+  issues:
+    - "VIRC-ISS-0005"
   plans:
     - "VIRC-PLN-0002"
-  reports: []
+  reports:
+    - "VIRC-RPT-0001"
 supersedes: null
 superseded_by: null
 tags:
@@ -63,8 +65,9 @@ stdlib implementation.
   malformed dimensions, offsets, lengths, and alignment.
 - Decode dispatches Q8_0 weight × dense activation to an optimized macOS ARM64
   GEMV; prefill has an optimized GEMM/batched path, both with scalar oracles.
-- `infer:` operations lower through typed tensor/Q-IR dispatch rather than a
-  consumer-only scalar pointer loop.
+- `infer:` can invoke the typed stdlib Q8_0 path rather than a consumer-only
+  scalar pointer loop. First-class packed-tensor IR metadata and automatic
+  dispatch are tracked separately by VIRC-ISS-0005.
 - Model bytes remain mmap-backed without full-model unpack/repack, and mapping
   lifetime outlives every view.
 
@@ -126,10 +129,11 @@ Q8 tensor kernel. Consumer source shows scalar byte loops and the conflicting
 ### Affected
 
 - external-storage tensor/view ABI and lifetime validation needed by mmap;
-- authoritative Q8_0 codec/storage descriptor and typed dispatch;
+- authoritative Q8_0 codec/storage descriptor and typed stdlib dispatch;
 - scalar reference plus optimized ARM64 GEMV/GEMM;
-- `infer:`/Q-IR integration, feature gating, parity, mutation, and benchmark
-  evidence on Gemma dimensions.
+- typed `infer:` integration, feature gating, parity, mutation, and benchmark
+  evidence on Gemma dimensions. First-class packed metadata and compiler
+  dispatch are assigned to VIRC-ISS-0005.
 
 ### Not affected / Already complete
 
@@ -171,8 +175,9 @@ is classified S2/P1 rather than a broad compiler correctness failure.
   Gemma-shaped inputs without unpacking the full model.
 - [ ] macOS ARM64 optimized GEMV and prefill GEMM are invoked through production
   typed dispatch; disassembly and mutation controls prove vector hot loops.
-- [ ] `infer:`/Q-IR retains dtype/storage/shape metadata and cannot bypass into
-  an untyped scalar fallback silently.
+- [x] `infer:` can execute the typed stdlib Q8_0 path. Persistent compiler
+  dtype/storage/shape metadata and automatic packed dispatch are follow-up
+  scope in VIRC-ISS-0005, not a closure criterion for this ISSUE.
 - [ ] Feature-disabled and unsupported targets use verified scalar fallback or
   stable diagnostics according to the support matrix.
 - [ ] End-to-end Gemma layer/logit/token parity, RSS, throughput, and artifact
@@ -185,11 +190,13 @@ is classified S2/P1 rather than a broad compiler correctness failure.
 
 ### Issues
 
-- None.
+- VIRC-ISS-0005 — first-class quantized format, shape, storage metadata, and
+  compiler-directed packed dispatch split from this stdlib/integration ISSUE.
 
 ### Plans
 
-- None yet.
+- VIRC-PLN-0002 — Implement production Q8_0 external tensor views and packed
+  kernels.
 
 ### Reports
 
@@ -201,3 +208,7 @@ is classified S2/P1 rather than a broad compiler correctness failure.
 |---|---|
 | 2026-10-02 | Created and triaged from Vir plus Gemma-Vir audit; excluded completed dense tensor and consumer prototype work |
 | 2026-10-02 | Linked VIRC-PLN-0002 |
+| 2026-10-02 | Entered implementation under VIRC-PLN-0002 |
+| 2026-10-02 | Linked VIRC-RPT-0001 |
+| 2026-10-02 | Linked VIRC-ISS-0005 |
+| 2026-10-02 | Split first-class quantized IR metadata and automatic dispatch into VIRC-ISS-0005 |
