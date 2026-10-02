@@ -151,13 +151,19 @@ class CliContract(unittest.TestCase):
     def test_gvn_commutative_and_ordered_operand_comparisons(self):
         # Compile the actual helper bodies without pulling unrelated MIR passes
         # into this structural runtime test.
-        canonical = (ROOT / "stdlib/vir/compiler/mir_opt.vri").read_text()
+        canonical_path = ROOT / "compiler/src/ir/mir/mir_opt.vri"
+        if not canonical_path.is_file():
+            canonical_path = ROOT / "stdlib/vir/compiler/mir_opt.vri"
+        canonical = canonical_path.read_text()
         helpers = []
         for name in ("mir_gvn_expr_same", "mir_gvn_commutative", "mir_opnd_is_same"):
             start = canonical.index("func " + name + "(")
             end = canonical.index("\nend.", start) + len("\nend.")
             helpers.append(canonical[start:end])
-        mir = (ROOT / "stdlib/vir/compiler/mir.vri").read_text()
+        mir_path = ROOT / "compiler/src/ir/mir/mir.vri"
+        if not mir_path.is_file():
+            mir_path = ROOT / "stdlib/vir/compiler/mir.vri"
+        mir = mir_path.read_text()
         for declaration in ("enum MirOp:", "enum MirOperandType:", "entity MirOperand:", "entity MirInstr:"):
             start = mir.index(declaration)
             end = mir.index("\nend.", start) + len("\nend.")
@@ -357,11 +363,11 @@ class CliContract(unittest.TestCase):
 
     def test_modern_warning_does_not_change_error_grouping(self):
         fixture = Path(self.temp.name) / "warning_group.vri"
-        fixture.write_text("""include compiler.sem_pass10_diagnostics
+        fixture.write_text("""include virc.semantic.sem_pass10_diagnostics
 include rt.io
-import diagnostic_engine_new, report_error_loc, report_warning_loc from context
-import pass10_emit_diagnostics from compiler.sem_pass10_diagnostics
-import cliUiReset, cliUiPhaseBegin from compiler.cli_ui
+import diagnostic_engine_new, report_error_loc, report_warning_loc from virc.diagnostic.context
+import pass10_emit_diagnostics from virc.semantic.sem_pass10_diagnostics
+import cliUiReset, cliUiPhaseBegin from virc.cli.cli_ui
 func main:
     cliUiReset(1, 1)
     cliUiPhaseBegin(5)
@@ -384,11 +390,11 @@ end.
 
     def test_modern_grouping_grows_without_losing_occurrences(self):
         fixture = Path(self.temp.name) / "large_groups.vri"
-        fixture.write_text("""include compiler.sem_pass10_diagnostics
+        fixture.write_text("""include virc.semantic.sem_pass10_diagnostics
 include rt.io
-import diagnostic_engine_new, report_error_loc from context
-import pass10_emit_diagnostics from compiler.sem_pass10_diagnostics
-import cliUiReset, cliUiPhaseBegin from compiler.cli_ui
+import diagnostic_engine_new, report_error_loc from virc.diagnostic.context
+import pass10_emit_diagnostics from virc.semantic.sem_pass10_diagnostics
+import cliUiReset, cliUiPhaseBegin from virc.cli.cli_ui
 func main:
     cliUiReset(1, 1)
     cliUiPhaseBegin(5)
@@ -787,9 +793,9 @@ end.
 
     def test_environment_parser_is_bounded_and_preserves_empty_value(self):
         fixture = Path(self.temp.name) / "environment_bounds.vri"
-        fixture.write_text("""include compiler.cli_environment
+        fixture.write_text("""include virc.cli.cli_environment
 include string_rt
-import cliFindEnvironment from compiler.cli_environment
+import cliFindEnvironment from virc.cli.cli_environment
 import rt_strlen, rt_streq, native_read_u8 from string_rt
 import vir_free from alloc
 func main:
@@ -926,7 +932,10 @@ end.
                         self.assertIn(entry["name"].split(".")[0], (prefix, "generic"))
 
     def test_same_process_optimizer_reset(self):
-        pipeline = (ROOT / "stdlib/vir/compiler/pipeline.vri").read_text()
+        pipeline_path = ROOT / "compiler/src/pipeline.vri"
+        if not pipeline_path.is_file():
+            pipeline_path = ROOT / "stdlib/vir/compiler/pipeline.vri"
+        pipeline = pipeline_path.read_text()
         functions = []
         for name in ("set_pipeline_mir_full", "set_pipeline_opt_level", "get_pipeline_opt_level"):
             match = re.search(rf"^func {name}\b.*?^end\.", pipeline, re.M | re.S)
@@ -961,7 +970,10 @@ end.
         self.assertEqual(subprocess.check_output([self.output]).split(), [b"3", b"0", b"0", b"0", b"1", b"0", b"1"])
 
     def test_driver_session_boundary_resets_state(self):
-        driver = (ROOT / "stdlib/vir/compiler/virc.vri").read_text()
+        driver_path = ROOT / "compiler/generated/virc.vri"
+        if not driver_path.is_file():
+            driver_path = ROOT / "stdlib/vir/compiler/virc.vri"
+        driver = driver_path.read_text()
         reset = re.search(r"^func vircResetCompileSession\b.*?^end\.", driver, re.M | re.S).group()
         getter = re.search(r"^func cfgOptimizationLevel\b.*?^end\.", driver, re.M | re.S).group()
         self.assertRegex(driver, r"func virc_compile\(cfg: CompilerConfig\):\s+vircResetCompileSession\(cfg\)")
