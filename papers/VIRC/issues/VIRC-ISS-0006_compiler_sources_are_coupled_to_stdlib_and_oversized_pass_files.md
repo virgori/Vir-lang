@@ -20,7 +20,8 @@ components:
   - "language-server"
   - "vscode-extension"
 related:
-  issues: []
+  issues:
+    - "VIRC-ISS-0007"
   plans:
     - "VIRC-PLN-0004"
   reports: []
@@ -319,3 +320,4 @@ issue does not implement their algorithms.
 | 2026-10-02 | Added verified copy migration requirements for sibling `Vir-3.0`, excluding legacy docs and including VPS/test runner foundations |
 | 2026-10-02 | Added commit-pinned source migration and ownership boundaries for native `vir-lsp` and `vscode-vir` |
 | 2026-10-02 | Rebased the issue on current Vir 4.0.0 source snapshot `fd0064ea`; initial failures may be ledgered while unexplained new regressions remain prohibited |
+| 2026-10-02 | Linked VIRC-ISS-0007 |
