@@ -1,0 +1,504 @@
+##
+ * compiler/src/frontend/lexer/numbers.vri — Number Parsing & BigInt Decimal Conversion
+ * ==============================================================================
+ ##
+
+include types
+include result
+import Result, Ok, Err from result
+include rt.string_rt
+import fat_str_new, fat_str_concat, fat_str_len, fat_str_byte_at, fat_str_eq, fat_str_eq_span, fat_str_slice,
+    fat_str_sentinel_pad, fat_char_to_str, rt_streq, str_from_cstr, sb_new, sb_append_char, sb_to_string, sb_len,
+    StringBuilder, native_read_u8, native_write_u8, native_read_i64, native_write_i64, rt_memcpy from rt.string_rt
+include alloc
+include vec
+include source_manager
+import g_active_source_manager, sm_file_from_line, sm_line_from_expanded, sm_add_span, sm_col_from_byte_offset from source_manager
+include lexer_tokens
+include lexer_cursor
+
+func lex_consume_number_suffix(ref lex: Lexer):
+    # Keep parity with core/src/lexer.c: typed literals such as 5_u32 and
+    # 0xFFF_u64 are a single numeric token, not Int + Identifier.
+    when not is_eof(lex) and is_word_char(lex_peek(lex)) loop
+        var (lex2, _) = lex_advance(lex)
+        lex = lex2
+    end
+    out lex
+end.
+
+# Decimal floating literals are parsed by the self-hosted compiler itself.
+# `native_parse_float` used to be an undeclared runtime hook: on a compiler
+# built by virc it resolved to the unresolved-call stub and every token became
+# 0.0.  Keep the value as raw IEEE-754 bits from this point on so no target
+# ABI float register convention is involved in lexing/parsing.
+#
+# FloatBig is a small unsigned bigint stored as base-2^30 limbs.  Decimal
+# source is an exact rational C * 10^e; conversion below computes the nearest
+# binary64 value (round-to-nearest, ties-to-even), including subnormals.
+const FLOAT_BIG_BASE: int = 1073741824
+const FLOAT_BIG_LIMB_BITS: int = 30
+const FLOAT_BIG_CAP: int = 512
+
+func float_big_new():
+    p = vir_alloc(16 + FLOAT_BIG_CAP * 8)
+    native_write_i64(p, 0, 1)
+    native_write_i64(p, 8, FLOAT_BIG_CAP)
+    native_write_i64(p, 16, 0)
+    out p
+end.
+
+func float_big_len(p: int): out native_read_i64(p, 0) end.
+func float_big_limb(p: int, i: int): out native_read_i64(p, 16 + i * 8) end.
+func float_big_set_limb(p: int, i: int, v: int): native_write_i64(p, 16 + i * 8, v) end.
+
+func float_big_trim(p: int):
+    n = float_big_len(p)
+    when n > 1 and float_big_limb(p, n - 1) == 0 loop
+        n = n - 1
+    end
+    native_write_i64(p, 0, n)
+end.
+
+func float_big_clone(src: int):
+    dst = float_big_new()
+    n = float_big_len(src)
+    native_write_i64(dst, 0, n)
+    var i = 0
+    when i < n loop
+        float_big_set_limb(dst, i, float_big_limb(src, i))
+        i = i + 1
+    end
+    out dst
+end.
+
+func float_big_is_zero(p: int):
+    out float_big_len(p) == 1 and float_big_limb(p, 0) == 0
+end.
+
+func float_big_mul_small(p: int, m: int):
+    n = float_big_len(p)
+    carry = 0
+    var i = 0
+    when i < n loop
+        x = float_big_limb(p, i) * m + carry
+        float_big_set_limb(p, i, x mod FLOAT_BIG_BASE)
+        carry = x / FLOAT_BIG_BASE
+        i = i + 1
+    end
+    if carry != 0 do
+        float_big_set_limb(p, n, carry)
+        native_write_i64(p, 0, n + 1)
+    end
+end.
+
+func float_big_add_small(p: int, v: int):
+    n = float_big_len(p)
+    x = float_big_limb(p, 0) + v
+    float_big_set_limb(p, 0, x mod FLOAT_BIG_BASE)
+    carry = x / FLOAT_BIG_BASE
+    i = 1
+    when carry != 0 and i < n loop
+        x = float_big_limb(p, i) + carry
+        float_big_set_limb(p, i, x mod FLOAT_BIG_BASE)
+        carry = x / FLOAT_BIG_BASE
+        i = i + 1
+    end
+    if carry != 0 do
+        float_big_set_limb(p, n, carry)
+        native_write_i64(p, 0, n + 1)
+    end
+end.
+
+func float_big_shl1(p: int):
+    n = float_big_len(p)
+    carry = 0
+    var i = 0
+    when i < n loop
+        x = float_big_limb(p, i) * 2 + carry
+        float_big_set_limb(p, i, x mod FLOAT_BIG_BASE)
+        carry = x / FLOAT_BIG_BASE
+        i = i + 1
+    end
+    if carry != 0 do
+        float_big_set_limb(p, n, carry)
+        native_write_i64(p, 0, n + 1)
+    end
+end.
+
+func float_big_shl(p: int, count: int):
+    var i = 0
+    when i < count loop
+        float_big_shl1(p)
+        i = i + 1
+    end
+end.
+
+func float_big_cmp(a: int, b: int):
+    an = float_big_len(a)
+    bn = float_big_len(b)
+    if an < bn do out 0 - 1 end
+    if an > bn do out 1 end
+    i = an - 1
+    when i >= 0 loop
+        av = float_big_limb(a, i)
+        bv = float_big_limb(b, i)
+        if av < bv do out 0 - 1 end
+        if av > bv do out 1 end
+        i = i - 1
+    end
+    out 0
+end.
+
+func float_big_sub(a: int, b: int):
+    # Precondition: a >= b.
+    an = float_big_len(a)
+    bn = float_big_len(b)
+    borrow = 0
+    var i = 0
+    when i < an loop
+        av = float_big_limb(a, i) - borrow
+        bv = 0
+        if i < bn do bv = float_big_limb(b, i) end
+        if av < bv do
+            av = av + FLOAT_BIG_BASE
+            borrow = 1
+        else
+            borrow = 0
+        end
+        float_big_set_limb(a, i, av - bv)
+        i = i + 1
+    end
+    float_big_trim(a)
+end.
+
+func float_big_bit_len(p: int):
+    n = float_big_len(p)
+    top = float_big_limb(p, n - 1)
+    if top == 0 do out 0 end
+    bits = 0
+    when top > 0 loop
+        top = top / 2
+        bits = bits + 1
+    end
+    out (n - 1) * FLOAT_BIG_LIMB_BITS + bits
+end.
+
+func float_big_bit_at(p: int, bit: int):
+    if bit < 0 do out 0 end
+    li = bit / FLOAT_BIG_LIMB_BITS
+    if li >= float_big_len(p) do out 0 end
+    x = float_big_limb(p, li)
+    shift = bit mod FLOAT_BIG_LIMB_BITS
+    var i = 0
+    when i < shift loop
+        x = x / 2
+        i = i + 1
+    end
+    out x mod 2
+end.
+
+func float_big_div_i64(num: int, den: int):
+    # The caller scales num/den to at most 54 quotient bits.  The remainder
+    # stays exact, which is what makes the final IEEE rounding deterministic.
+    rem = float_big_new()
+    q = 0
+    bit = float_big_bit_len(num) - 1
+    when bit >= 0 loop
+        float_big_shl1(rem)
+        if float_big_bit_at(num, bit) != 0 do float_big_add_small(rem, 1) end
+        q = q * 2
+        if float_big_cmp(rem, den) >= 0 do
+            float_big_sub(rem, den)
+            q = q + 1
+        end
+        bit = bit - 1
+    end
+    # Return quotient and remainder through a two-word pair.  This avoids a
+    # generic Vec tuple in the bootstrap compiler's hot lexer path.
+    pair = vir_alloc(16)
+    native_write_i64(pair, 0, q)
+    native_write_i64(pair, 8, rem)
+    out pair
+end.
+
+func float_decimal_bits(start_pos: int, text_len: int):
+    coeff = float_big_new()
+    dot_seen = 0
+    frac_digits = 0
+    exp10 = 0
+    exp_sign = 1
+    in_exp = 0
+    var i = 0
+    when i < text_len loop
+        c = native_read_u8(g_lexer_source_data, start_pos + i)
+        if c >= 48 and c <= 57 do
+            if in_exp == 0 do
+                float_big_mul_small(coeff, 10)
+                float_big_add_small(coeff, c - 48)
+                if dot_seen == 1 do frac_digits = frac_digits + 1 end
+            else
+                # Saturate only the textual exponent; values beyond the
+                # binary64 domain are handled below without allocating huge
+                # powers of five.
+                if exp10 < 100000 do exp10 = exp10 * 10 + (c - 48) end
+            end
+        eif c == 46 do
+            dot_seen = 1
+        eif c == 101 or c == 69 do
+            in_exp = 1
+        eif in_exp == 1 and c == 45 do
+            exp_sign = 0 - 1
+        end
+        i = i + 1
+    end
+    if float_big_is_zero(coeff) do out 0 end
+    exp10 = exp10 * exp_sign - frac_digits
+
+    # Decimal exponent outside this band cannot round back into binary64.
+    # Keeping this guard also bounds bigint work for malicious source input.
+    if exp10 > 400 do out 0x7ff0000000000000 end
+    if exp10 < 0 - 400 do out 0 end
+
+    num = float_big_clone(coeff)
+    den = float_big_new()
+    float_big_add_small(den, 1)
+    if exp10 >= 0 do
+        var p = 0
+        when p < exp10 loop
+            float_big_mul_small(num, 5)
+            p = p + 1
+        end
+    else
+        var p = 0
+        when p < 0 - exp10 loop
+            float_big_mul_small(den, 5)
+            p = p + 1
+        end
+    end
+
+    # value = num * 2^exp10 / den.  Find floor(log2(value)) exactly.
+    k = float_big_bit_len(num) - float_big_bit_len(den)
+    probe = 0
+    if k >= 0 do
+        probe = float_big_clone(den)
+        float_big_shl(probe, k)
+        if float_big_cmp(num, probe) >= 0 do
+            k = k + exp10
+        else
+            k = k + exp10 - 1
+        end
+    else
+        probe = float_big_clone(num)
+        float_big_shl(probe, 0 - k)
+        if float_big_cmp(probe, den) >= 0 do
+            k = k + exp10
+        else
+            k = k + exp10 - 1
+        end
+    end
+
+    # Normal binary64: quotient is the 53-bit hidden-significand integer.
+    if k >= 0 - 1022 do
+        shift = exp10 + 52 - k
+        scaled_num = float_big_clone(num)
+        scaled_den = float_big_clone(den)
+        if shift >= 0 do float_big_shl(scaled_num, shift) else float_big_shl(scaled_den, 0 - shift) end
+        pair = float_big_div_i64(scaled_num, scaled_den)
+        q = native_read_i64(pair, 0)
+        rem = native_read_i64(pair, 8)
+        twice_rem = float_big_clone(rem)
+        float_big_shl1(twice_rem)
+        cmp = float_big_cmp(twice_rem, scaled_den)
+        if cmp > 0 or (cmp == 0 and (q mod 2) != 0) do q = q + 1 end
+        if q >= 9007199254740992 do
+            q = q / 2
+            k = k + 1
+        end
+        if k > 1023 do out 0x7ff0000000000000 end
+        out ((k + 1023) shl 52) + (q - 4503599627370496)
+    end
+
+    # Subnormal binary64: round value * 2^1074 directly.
+    shift = exp10 + 1074
+    scaled_num = float_big_clone(num)
+    scaled_den = float_big_clone(den)
+    if shift >= 0 do float_big_shl(scaled_num, shift) else float_big_shl(scaled_den, 0 - shift) end
+    pair = float_big_div_i64(scaled_num, scaled_den)
+    q = native_read_i64(pair, 0)
+    rem = native_read_i64(pair, 8)
+    twice_rem = float_big_clone(rem)
+    float_big_shl1(twice_rem)
+    cmp = float_big_cmp(twice_rem, scaled_den)
+    if cmp > 0 or (cmp == 0 and (q mod 2) != 0) do q = q + 1 end
+    if q >= 4503599627370496 do out 0x0010000000000000 end
+    out q
+end.
+
+func lex_number(ref lex: Lexer):
+
+    tok = token_new(TokType.Int, lex.line, lex.col)
+    num = 0
+    is_float = false
+    start_pos = lex.pos
+
+    # Hex literal
+    if lex_peek(lex) == 48 and (lex_peek_at(lex, 1) == 120 or lex_peek_at(lex, 1) == 88) do
+        var (lex2, _) = lex_advance(lex)    # 0
+        var (lex3, _) = lex_advance(lex2)   # x
+        lex = lex3
+        hex_digits = 0
+        when not is_eof(lex) and is_hex_digit(lex_peek(lex)) loop
+            c = lex_peek(lex)
+            digit = 0
+            if c >= 48 and c <= 57 do
+                digit = c - 48
+            end
+            if c >= 65 and c <= 70 do
+                digit = c - 55
+            end
+            if c >= 97 and c <= 102 do
+                digit = c - 87
+            end
+            num = num * 16 + digit
+            hex_digits = hex_digits + 1
+            var (lex4, _) = lex_advance(lex)
+            lex = lex4
+        end
+        if hex_digits == 0 do
+            tok = token_new(TokType.Error, tok.line, tok.col)
+            tok.str_val = fat_str_new("empty hex literal")
+            lex.error_msg = tok.str_val
+            out (lex, tok)
+        end
+        tok.int_val = num
+        lex = lex_consume_number_suffix(lex)
+        out (lex, tok)
+    end
+
+    # Binary literal (0b...)
+    if lex_peek(lex) == 48 and (lex_peek_at(lex, 1) == 98 or lex_peek_at(lex, 1) == 66) do
+        var (lex2, _) = lex_advance(lex);    # 0
+        var (lex3, _) = lex_advance(lex2);   # b
+        lex = lex3
+        bin_digits = 0
+        when not is_eof(lex) and (lex_peek(lex) == 48 or lex_peek(lex) == 49) loop
+            c = lex_peek(lex)
+            digit = c - 48
+            num = num * 2 + digit
+            bin_digits = bin_digits + 1
+            var (lex4, _) = lex_advance(lex)
+            lex = lex4
+        end
+        if bin_digits == 0 do
+            tok = token_new(TokType.Error, tok.line, tok.col)
+            tok.str_val = fat_str_new("empty binary literal")
+            lex.error_msg = tok.str_val
+            out (lex, tok)
+        end
+        tok.int_val = num
+        lex = lex_consume_number_suffix(lex)
+        out (lex, tok)
+    end
+
+    # Octal literal (0o...) — only digits 0-7; stop before 8/9 (C parity)
+    if lex_peek(lex) == 48 and (lex_peek_at(lex, 1) == 111 or lex_peek_at(lex, 1) == 79) do
+        var (lex2, _) = lex_advance(lex)    # 0
+        var (lex3, _) = lex_advance(lex2)   # o
+        lex = lex3
+        oct_digits = 0
+        when not is_eof(lex) and lex_peek(lex) >= 48 and lex_peek(lex) <= 55 loop
+            c = lex_peek(lex)
+            digit = c - 48
+            num = num * 8 + digit
+            oct_digits = oct_digits + 1
+            var (lex4, _) = lex_advance(lex)
+            lex = lex4
+        end
+        if oct_digits == 0 do
+            tok = token_new(TokType.Error, tok.line, tok.col)
+            tok.str_val = fat_str_new("empty octal literal")
+            lex.error_msg = tok.str_val
+            out (lex, tok)
+        end
+        tok.int_val = num
+        lex = lex_consume_number_suffix(lex)
+        out (lex, tok)
+    end
+
+    # Decimal literal (integer or float)
+    overflowed = false
+    when not is_eof(lex) and (is_digit(lex_peek(lex)) or lex_peek(lex) == 46) loop
+        c = lex_peek(lex)
+        if c == 46 do # '.'
+            if is_float do
+                # Second dot — stop
+                tok.int_val = num
+                out (lex, tok)
+            end
+            # Check for .. range operator
+            if lex_peek_at(lex, 1) == 46 do
+                tok.int_val = num
+                out (lex, tok)
+            end
+            # UFCS: 10.foo — don't swallow '.' before identifier (C parity)
+            nx = lex_peek_at(lex, 1)
+            if (nx >= 65 and nx <= 90) or (nx >= 97 and nx <= 122) or nx == 95 do
+                tok.int_val = num
+                out (lex, tok)
+            end
+            is_float = true
+            var (lex2, _) = lex_advance(lex)
+            lex = lex2
+        else
+            digit = c - 48
+            # P2: keep truncated i64; still consume remaining digits
+            if not is_float and not overflowed do
+                if num > 922337203685477580 or (num == 922337203685477580 and digit > 7) do
+                    overflowed = true
+                else
+                    num = num * 10 + digit
+                end
+            end
+            var (lex3, _) = lex_advance(lex)
+            lex = lex3
+        end
+    end
+
+    # Scientific notation exponent (e.g. 1e9, 1.5e-3)
+    if not is_eof(lex) and (lex_peek(lex) == 101 or lex_peek(lex) == 69) do
+        is_float = true
+        var (lex_e, _) = lex_advance(lex)
+        lex = lex_e
+        if lex_peek(lex) == 45 or lex_peek(lex) == 43 do # '+' or '-'
+            var (lex_s, _) = lex_advance(lex)
+            lex = lex_s
+        end
+        when not is_eof(lex) and is_digit(lex_peek(lex)) loop
+            var (lex_d, _) = lex_advance(lex)
+            lex = lex_d
+        end
+    end
+
+    if is_float do
+        tok.tok_type = TokType.Float
+        let flt_len = lex.pos - start_pos
+        # Token.float_val is at byte offset 56.  Write the bit pattern rather
+        # than assigning through the compiler host's incomplete float ABI.
+        native_write_i64(tok as int, 56, float_decimal_bits(start_pos, flt_len))
+        tok.int_val = 0
+        tok.start = start_pos
+        tok.len = flt_len
+        lex = lex_consume_number_suffix(lex)
+        out (lex, tok)
+    end
+    tok.int_val = num
+    tok.start = start_pos
+    tok.len = lex.pos - start_pos
+    lex = lex_consume_number_suffix(lex)
+    out (lex, tok)
+end.
+# ═══════════════════════════════════════════════════════
+# String & String Interpolation Lexing (Spec v2.0 §12)
+# ═══════════════════════════════════════════════════════
+

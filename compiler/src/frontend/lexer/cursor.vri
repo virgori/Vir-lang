@@ -1,0 +1,350 @@
+##
+ * compiler/src/frontend/lexer/cursor.vri — Scanner State, Trivia & Cursor Navigation
+ * ==============================================================================
+ ##
+
+include types
+include result
+import Result, Ok, Err from result
+include rt.string_rt
+import fat_str_new, fat_str_concat, fat_str_len, fat_str_byte_at, fat_str_eq, fat_str_eq_span, fat_str_slice,
+    fat_str_sentinel_pad, fat_char_to_str, rt_streq, str_from_cstr, sb_new, sb_append_char, sb_to_string, sb_len,
+    StringBuilder, native_read_u8, native_write_u8, native_read_i64, native_write_i64, rt_memcpy from rt.string_rt
+include alloc
+include vec
+include source_manager
+import g_active_source_manager, sm_file_from_line, sm_line_from_expanded, sm_add_span, sm_col_from_byte_offset from source_manager
+include lexer_tokens
+
+func ident_intern_reset():
+    g_ident_intern = 0
+end.
+
+# Materialize identifier from source span.  Do NOT linear-scan a growing
+# intern table here: on large inputs (parser.vri ~50k tokens) that is O(n²)
+# string compares and looks like a silent hang in C-VM.
+func ident_intern_span(source: int, start: int, span_len: int):
+    out fat_str_slice(source, start, span_len)
+end.
+
+# ASCII class flags for single-pass lexer hot path (256-byte lookup).
+const LEX_C_SPACE: int = 1
+const LEX_C_DIGIT: int = 2
+const LEX_C_ID_START: int = 4
+const LEX_C_ID_CONT: int = 8
+
+var g_lex_ascii: i64 = 0
+var g_lex_single: i64 = 0
+
+func lex_single_store(c: int, tok: TokType):
+    native_write_i64(g_lex_single, c * 8, tok as int)
+end.
+
+func lex_single_init():
+    if g_lex_single != 0 do out end
+    if g_lex_ascii == 0 do lex_ascii_init() end
+    g_lex_single = vir_alloc(256 * 8)
+    var c = 0
+    when c < 256 loop
+        native_write_i64(g_lex_single, c * 8, 0)
+        c = c + 1
+    end
+    lex_single_store(43, TokType.Plus)
+    lex_single_store(45, TokType.Minus)
+    lex_single_store(42, TokType.Star)
+    lex_single_store(47, TokType.Slash)
+    lex_single_store(37, TokType.Percent)
+    lex_single_store(94, TokType.Power)
+    lex_single_store(61, TokType.Assign)
+    lex_single_store(62, TokType.Gt)
+    lex_single_store(60, TokType.Lt)
+    lex_single_store(33, TokType.Not)
+    lex_single_store(63, TokType.Exist)
+    lex_single_store(38, TokType.BitAnd)
+    lex_single_store(124, TokType.BitOr)
+    lex_single_store(126, TokType.BitNot)
+    lex_single_store(40, TokType.LParen)
+    lex_single_store(41, TokType.RParen)
+    lex_single_store(91, TokType.LBracket)
+    lex_single_store(93, TokType.RBracket)
+    lex_single_store(123, TokType.LBrace)
+    lex_single_store(125, TokType.RBrace)
+    lex_single_store(58, TokType.Colon)
+    lex_single_store(44, TokType.Comma)
+    lex_single_store(59, TokType.Semicolon)
+    lex_single_store(64, TokType.AtSign)
+    lex_single_store(46, TokType.Dot)
+end.
+
+# Materialize token text: zero-copy span for keywords, intern pool for idents.
+func token_lexeme(tok: Token):
+    # String spans include delimiters and escapes. Their decoded payload is
+    # authoritative even when empty; never intern the quoted source instead.
+    if tok.tok_type == TokType.Str do out tok.str_val end
+    if tok.len <= 0 do out tok.str_val end
+    if fat_str_len(tok.str_val) == tok.len and fat_str_len(tok.str_val) > 0 do
+        out tok.str_val
+    end
+    if g_lexer_source == 0 do out tok.str_val end
+    out ident_intern_span(g_lexer_source, tok.start, tok.len)
+end.
+
+func lex_char_flags(c: int):
+    flags = 0
+    if c == 32 or c == 9 or c == 13 do flags = flags | LEX_C_SPACE end
+    if c >= 48 and c <= 57 do flags = flags | LEX_C_DIGIT | LEX_C_ID_CONT end
+    if (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 do
+        flags = flags | LEX_C_ID_START | LEX_C_ID_CONT
+    end
+    if c >= 128 do flags = flags | LEX_C_ID_CONT end
+    out flags
+end.
+
+func lex_ascii_init():
+    if g_lex_ascii != 0 do out end
+    g_lex_ascii = vir_alloc(256)
+    var c = 0
+    when c < 256 loop
+        native_write_u8(g_lex_ascii, c, lex_char_flags(c))
+        c = c + 1
+    end
+end.
+
+func lex_flags(c: int):
+    if c < 0 or c > 255 do out 0 end
+    if g_lex_ascii == 0 do lex_ascii_init() end
+    out native_read_u8(g_lex_ascii, c)
+end.
+
+func lex_skip_whitespace(ref lex: Lexer):
+    # This runs inside the C-VM, where constructing and inspecting a fake
+    # 64-bit SIMD word costs more than a direct byte loop. Newlines are not
+    # whitespace here because the parser needs them as separator tokens.
+    source_data = g_lexer_source_data
+    if source_data == 0 do
+        source_data = native_read_i64(lex.source as i64, 0)
+    end
+    when lex.pos < lex.source_len loop
+        c = native_read_u8(source_data, lex.pos)
+        if c != 32 and c != 9 and c != 13 do out lex end
+        lex.pos = lex.pos + 1
+    end
+    out lex
+end.
+
+func lex_is_digit_fast(c: int):
+    out (lex_flags(c) & LEX_C_DIGIT) != 0
+end.
+
+func lex_is_ident_start_fast(c: int):
+    out (lex_flags(c) & LEX_C_ID_START) != 0
+end.
+
+func lex_is_ident_continue_fast(c: int):
+    out (lex_flags(c) & LEX_C_ID_CONT) != 0
+end.
+
+func lexer_token_count:
+    if g_lexer_tokens == 0 do
+        out 0
+    end
+    out native_read_i64(g_lexer_tokens, 8)
+end.
+
+func lexer_token_get(index: int):
+    if g_lexer_tokens == 0 do
+        out 0
+    end
+    data = native_read_i64(g_lexer_tokens, 0)
+    val = native_read_i64(data, index * 8)
+    out val
+end.
+
+# Tooling and diagnostic renderers consume a C-string; token payloads remain fat.
+func lexer_error_message:
+    if g_lexer_error == 0 do out 0 end
+    out native_read_i64(g_lexer_error, 0)
+end.
+
+# §28.3 — Runtime keyword registration API (after Lexer entity).
+func register_keyword:
+    in  lex: Lexer
+        word: string
+        tok: TokType
+
+    let keywords = vec_push(lex.keywords, KeywordEntry ( word: word, tok: tok ))
+    keyword_bucket_build(keywords)
+    lex.keywords = keywords
+    out lex
+end.
+func lexer_new(source: string):
+
+    # The native backend treats CALLs as clobbering argument registers.  Keep
+    # the fat-string pointer in a local before building the keyword table
+    # otherwise the `source` used by the entity literal below can become the
+    # result of a later call and the lexer observes an empty/corrupt input.
+    # See the matching safeguard in parser_new.
+    lex_ascii_init()
+    lex_single_init()
+    held_source = fat_str_sentinel_pad(source)
+    slen = fat_str_len(held_source)
+    g_lexer_source_data = native_read_i64(held_source as i64, 0)
+    toks = vec_new()
+    est_toks = 64
+    if slen >= 4 do
+        est_toks = slen / 4
+    end
+    if est_toks < 64 do est_toks = 64 end
+    vec_reserve(toks, est_toks)
+    kws = build_keyword_table()
+    err = fat_str_new("")
+    # Publish the reserved Vec object before tokenization starts. vec_push
+    # mutates this object's data/len/cap fields in place, so readers do not
+    # depend on tokenize reaching one particular native return epilogue.
+    g_lexer_tokens = toks as i64
+    g_lexer_error = 0
+    g_lexer_error_offset = 0
+    out Lexer (
+        source: held_source,
+        source_len: slen,
+        pos: 0,
+        line: 1,
+        col: 1,
+        tokens: toks,
+        paren_depth: 0,
+        keywords: kws,
+        error_msg: err
+    )
+end.
+# ═══════════════════════════════════════════════════════
+# Character Helpers
+# ═══════════════════════════════════════════════════════
+
+func is_eof(ref lex: Lexer):
+
+    out lex.pos >= lex.source_len
+end.
+func lex_peek(ref lex: Lexer):
+
+    if lex.pos < lex.source_len do
+        out native_read_u8(g_lexer_source_data, lex.pos)
+    end
+    out 0
+end.
+func lex_peek_at(ref lex: Lexer, offset: int):
+
+    p = lex.pos + offset
+    if p < lex.source_len do
+        out native_read_u8(g_lexer_source_data, p)
+    end
+    out 0
+end.
+func lex_advance(ref lex: Lexer):
+
+    c = lex_peek(lex)
+    if c == 10 do # '\n'
+        lex.line = lex.line + 1
+    end
+    # Do not write `lex.col` here.  The bootstrap field mapper currently
+    # aliases Lexer.col to the same slot as Lexer.pos; updating both advanced
+    # the input cursor twice per byte.  In a leading ## comment that can miss
+    # the closing delimiter forever and make tokenize return zero tokens.
+    lex.pos = lex.pos + 1
+    out (lex, c)
+end.
+func is_alpha(c: int):
+
+    out (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95
+end.
+func is_digit(c: int):
+
+    out c >= 48 and c <= 57
+end.
+func is_hex_digit(c: int):
+
+    out is_digit(c) or (c >= 65 and c <= 70) or (c >= 97 and c <= 102)
+end.
+func is_word_char(c: int):
+
+    out is_alpha(c) or is_digit(c) or c >= 128
+end.
+# ═══════════════════════════════════════════════════════
+# Skip Whitespace & Comments
+# ═══════════════════════════════════════════════════════
+
+func skip_whitespace(ref lex: Lexer):
+    out lex_skip_whitespace(lex)
+end.
+
+# Bulk skip: whitespace + line/block comments in one tight loop (no per-byte dispatcher).
+func skip_trivia(ref lex: Lexer):
+    when not is_eof(lex) loop
+        c = lex_peek(lex)
+        if c == 32 or c == 9 or c == 13 do
+            lex = lex_skip_whitespace(lex)
+        eif c == 35 do
+            if lex_peek_at(lex, 1) == 35 or (lex_peek_at(lex, 1) == 42 and lex_peek_at(lex, 2) == 35) do
+                lex = skip_block_comment(lex)
+            else
+                lex = skip_comment(lex)
+            end
+        else
+            out lex
+        end
+    end
+    out lex
+end.
+func skip_comment(ref lex: Lexer):
+
+    # Single-line comment: # ... until \n
+    when not is_eof(lex) and lex_peek(lex) != 10 loop
+        # This path discards the consumed byte.  Avoid the C-VM's unstable
+        # `(Lexer, int)` multi-return after a large number of calls; only a
+        # cursor increment is required because the loop stops before newline.
+        lex.pos = lex.pos + 1
+    end
+    out lex
+end.
+func skip_block_comment(ref lex: Lexer):
+
+    # Preferred #*# ... #*#; retain legacy ## ... ## compatibility.
+    # Advance the cursor directly here.  The bootstrap C-VM's generic field
+    # mapper aliases Lexer.col with Lexer.pos, and its `(Lexer, int)` return
+    # path is not stable under the number of calls made while scanning the
+    # expanded compiler.  A comment only needs pos/line bookkeeping.
+    framed = lex_peek_at(lex, 1) == 42 and lex_peek_at(lex, 2) == 35
+    if framed do
+        lex.pos = lex.pos + 3
+    else
+        lex.pos = lex.pos + 2
+    end
+    when not is_eof(lex) loop
+        framed_close = framed and lex_peek(lex) == 35 and lex_peek_at(lex, 1) == 42 and lex_peek_at(lex, 2) == 35
+        legacy_close = not framed and lex_peek(lex) == 35 and lex_peek_at(lex, 1) == 35
+        if framed_close or legacy_close do
+            if framed do
+                lex.pos = lex.pos + 3
+            else
+                lex.pos = lex.pos + 2
+            end
+            out lex
+        end
+        if lex_peek(lex) == 10 do
+            lex.line = lex.line + 1
+        end
+        lex.pos = lex.pos + 1
+    end
+    out lex
+end.
+# ═══════════════════════════════════════════════════════
+# Number Lexing
+# ═══════════════════════════════════════════════════════
+
+func lex_is_id_start(c: int):
+    if c < 0 do out 0 end
+    if c >= 128 do out 1 end
+    flags = native_read_u8(g_lex_ascii, c)
+    if (flags & LEX_C_ID_START) != 0 do out 1 end
+    out 0
+end.
+
