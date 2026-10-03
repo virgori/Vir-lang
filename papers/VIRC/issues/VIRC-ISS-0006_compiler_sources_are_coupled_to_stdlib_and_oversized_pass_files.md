@@ -33,6 +33,7 @@ related:
     - "VIRC-RPT-0007"
     - "VIRC-RPT-0008"
     - "VIRC-RPT-0009"
+    - "VIRC-RPT-0010"
 supersedes: null
 superseded_by: null
 tags:
