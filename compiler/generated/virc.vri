@@ -35515,19 +35515,17 @@ export pass9_const_fold
 # @vir_source compiler/src/semantic/semantic.vri 61
 
 import pass10_emit_diagnostics from compiler.sem_pass10_diagnostics
-# @vir_source compiler/src/semantic/sem_pass10_diagnostics.vri 1
+# @vir_source compiler/src/semantic/diagnostics/session.vri 1
 ##
- * vir/compiler/sem_pass10_diagnostics.vri
+ * vir/compiler/semantic/diagnostics/session.vri
  * ==============================================================
- * Pass 10: Diagnostics Emission.
- * Formats and prints all collected diagnostics, returns error count.
+ * Diagnostic session tracking, execution timers, and phase timings.
  ##
 
 import optTraceAppendJson from virc.backend.opt_trace
 
 
 import vir_alloc, vir_free, alloc from rt.alloc
-
 
 
 import sys_getrusage, sys_clock_gettime, sys_platform, Platform, sys_open, sys_read, sys_close, VIR_O_RDONLY from rt.syscall
@@ -35736,6 +35734,718 @@ func virc_print_compile_time():
     end
     out 0
 end.
+
+export g_color_mode, g_time_buf_start, g_compile_timer_printed, g_diag_json,
+       g_phase_timings, g_phase_read_us, g_phase_preprocess_us, g_phase_lex_us,
+       g_phase_parse_us, g_phase_semantic_us, g_phase_semantic_start_us,
+       g_phase_lower_us, g_phase_codegen_us, g_phase_link_us,
+       g_diagSessionActive, g_diagSessionBody, g_diagSessionErrors,
+       g_diagSessionWarnings, g_diagSessionCaptured, g_diagSessionOverflow,
+       g_diagSessionEmitted, g_diagSessionArrayStart, g_diagRecordIndex,
+       pass10SessionReset, pass10SessionCopy, pass10SessionSerialize, pass10SessionEmit,
+       virc_timer_init, virc_elapsed_us, virc_print_phase_timings, virc_print_compile_time
+# @vir_source compiler/src/semantic/diagnostics/msg_frontend.vri 1
+##
+ * vir/compiler/semantic/diagnostics/msg_frontend.vri
+ * ==============================================================
+ * Diagnostic message formatting for lexer, parser, and module resolution phases.
+ ##
+
+
+func pass10_code_to_prefix(level: int):
+    if level == DiagnosticLevel.Warning do
+        out "W"
+    eif level == DiagnosticLevel.Info do
+        out "I"
+    end
+    out "E"
+end.
+
+func pass10_code_to_result(level: int):
+    if level == DiagnosticLevel.Warning do
+        out "WARNING"
+    eif level == DiagnosticLevel.Info do
+        out "INFO"
+    end
+    out "FAILED"
+end.
+
+func pass10_code_to_phase(code: int):
+    if code < 1000 do out "Lexer" end
+    if code < 2000 do out "Parser" end
+    if code >= 2100 and code < 2200 do out "ModuleResolver" end
+    if code < 4000 do out "Semantic" end
+    if code < 5000 do out "ControlFlow" end
+    if code < 6000 or (code >= 8000 and code < 9000) do out "BorrowChecker" end
+    if code >= 7000 and code < 8000 do out "ModuleResolver" end
+    out "Compiler"
+end.
+
+func pass10_msg_frontend(code: int, extra: string):
+    # Lexer errors (E0xxx)
+    if code == 1 or code == 101 do
+        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
+        out "Invalid character in source"
+    end
+    if code == 2 or code == 102 do
+        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
+        out "Unterminated string literal"
+    end
+    if code == 3 or code == 103 do
+        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
+        out "Invalid numeric literal format"
+    end
+
+    # Parser errors (E1xxx)
+    if code == 1001 do
+        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
+        out "Unexpected token in syntax rule"
+    end
+    if code == 1002 do out "Missing block delimiter 'end' or 'end.'" end
+    if code == 1003 do out "Missing colon ':' after condition or signature" end
+    if code == 1004 do
+        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
+        out "Invalid expression syntax"
+    end
+    if code == 1005 do out "Unexpected end of file (EOF)" end
+    if code == 1006 do out "Invalid function signature" end
+    if code == 1007 do out "Mismatched parentheses or brackets" end
+
+    # Semantic & Type errors (E2xxx / E3xxx)
+    if code == 2001 do out "Undefined variable in current scope" end
+    if code == 2002 do
+        if (extra as i64) != 0 do
+            let diag_len = fat_str_len(extra)
+            if diag_len > 0 do
+                arena:
+                    var sb = sb_new()
+                    sb = sb_append(sb, "Undefined function or symbol: '")
+                    var d_i = 0
+                    when d_i < diag_len loop
+                        sb = sb_append_char(sb, fat_str_byte_at(extra, d_i))
+                        d_i = d_i + 1
+                    end
+                    sb = sb_append(sb, "'")
+                    out sb_to_string(sb)
+                end
+            end
+        end
+        out "Undefined function or symbol"
+    end
+    if code == 2003 or code == 3001 do out "Type mismatch in expression or operation" end
+    if code == 2004 do out "Duplicate symbol definition in current scope" end
+    if code == 2005 or code == 3012 do out "Invalid assignment target (not an l-value)" end
+    if code == 2101 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "failed to parse include statement name: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "failed to parse include statement name"
+    end
+    if code == 2102 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "included source not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "included source not found"
+    end
+    if code == 2103 do out "invalid token '::'; use '.' for qualified names" end
+    if code == 2104 do out "maximum include depth exceeded" end
+    if code == 2105 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "circular dependency detected: ")
+                sb = sb_append(sb, extra)
+                out sb_to_string(sb)
+            end
+        end
+        out "circular dependency detected"
+    end
+    if code == 2111 do out "empty or invalid module name in import" end
+    if code == 2112 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "imported module not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "imported module not found"
+    end
+    if code == 2113 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "imported symbol not exported: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "imported symbol not exported"
+    end
+    if code == 2114 do out "maximum import depth exceeded" end
+    if code == 2120 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "failed to read stdlib registry: ")
+                sb = sb_append(sb, extra)
+                out sb_to_string(sb)
+            end
+        end
+        out "failed to read stdlib registry"
+    end
+    if code == 2121 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "duplicate module in stdlib registry: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "duplicate module in stdlib registry"
+    end
+    if code == 2122 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "stdlib target file not found for '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "stdlib target file not found"
+    end
+    if code == 2123 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "duplicate module in project registry: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "duplicate module in project registry"
+    end
+    if code == 2124 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "project module target file not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "project module target file not found"
+    end
+    if code == 2125 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "module resolution target not found: '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "module resolution target not found"
+    end
+    if code == 2201 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "invalid UTF-8 in '")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, "'")
+                out sb_to_string(sb)
+            end
+        end
+        out "invalid UTF-8 in source encoding"
+    end
+    out ""
+end.
+
+export pass10_code_to_prefix, pass10_code_to_result, pass10_code_to_phase, pass10_msg_frontend
+# @vir_source compiler/src/semantic/diagnostics/msg_semantic.vri 1
+##
+ * vir/compiler/semantic/diagnostics/msg_semantic.vri
+ * ==============================================================
+ * Diagnostic message formatting for semantic, type, control flow, and borrow phases.
+ ##
+
+
+func pass10_msg_semantic(code: int, extra: string):
+    if code == 2003 or code == 3001 do out "Type mismatch in expression or operation" end
+    if code == 2005 or code == 3012 do out "Invalid assignment target (not an l-value)" end
+    if code == 3002 do out "Invalid operator for operand type" end
+    if code == 3003 do out "Assignment to immutable variable (declared with 'let')" end
+    if code == 3004 do out "Type mismatch in variable assignment" end
+    if code == 3005 do out "Wrong argument count in function invocation" end
+    if code == 3006 do out "Invalid operand types for and/or/xor/shl/shr" end
+    if code == 3007 do out "Assignment or return value type does not match declared type" end
+    if code == 3008 do
+        if (extra as i64) != 0 do
+            let diag_len = fat_str_len(extra)
+            if diag_len > 0 do
+                arena:
+                    var sb = sb_new()
+                    sb = sb_append(sb, "Unknown entity field access '")
+                    var d_i = 0
+                    when d_i < diag_len loop
+                        sb = sb_append_char(sb, fat_str_byte_at(extra, d_i))
+                        d_i = d_i + 1
+                    end
+                    sb = sb_append(sb, "'")
+                    out sb_to_string(sb)
+                end
+            end
+        end
+        out "Unknown entity field access"
+    end
+    if code == 3009 do out "Operation prohibited in 'infer:' block (e.g. calling .backward())" end
+    if code == 3010 do out "Duplicate field in entity initialization" end
+    if code == 3011 do out "Field type mismatch in entity instantiation" end
+    if code == 3013 do out "Tensor indexing rank mismatch" end
+    if code == 3014 do out "Matrix multiplication dimension mismatch" end
+    if code == 3015 do out "Tensor index must be integer" end
+    if code == 3016 do out "infer/train blocks cannot be nested" end
+    if code == 3017 do out ".backward() is only valid inside a train block" end
+    if code == 3018 do out "quantize input must be a floating-point tensor" end
+    if code == 3019 do out "quantize bits must be a compile-time constant in {4, 8, 16, 32}" end
+    if code == 3020 do out ".backward() receiver must be a floating-point train value with gradient state" end
+    if code == 3021 do out "Unresolved UFCS member: no entity method, callable field, or free function" end
+    if code == 3022 do out "Wrong argument count in UFCS invocation" end
+    if code == 3023 do out "Quantized tensor operations are only supported inside an 'infer:' block" end
+    if code == 3024 do out "Invalid tensor type; expected tensor[T; S...] with T in {f32, f16, f64, i8, u8, i32, int} and positive compile-time dimensions" end
+    if code == 3025 do out "Packed entity field missing type annotation" end
+    if code == 3026 do out "Invalid packed entity field type; must be compile-time fixed-size primitive or packed entity" end
+    if code == 3027 do out "Recursive packed entity layout cycle detected" end
+    if code == 3028 do out "Normal entity cannot be embedded inline in packed entity" end
+    if code == 3029 do out "Missing required field in entity initialization" end
+    if code == 3030 do out "Integer literal value out of range for packed field type" end
+    if code == 3031 do out "Wrong argument count in enum constructor invocation" end
+    if code == 3032 do out "Non-exhaustive case expression on enum" end
+    if code == 3033 do out "Unknown enum variant in pattern arm" end
+    if code == 3034 do out "Variant does not belong to target enum" end
+    if code == 3035 do out "Duplicate case pattern arm" end
+    if code == 3036 do out "Unreachable pattern arm after wildcard" end
+    if code == 3037 do out "Wrong binder count in enum pattern arm" end
+    if code == 3038 do out "Ambiguous unqualified enum variant; qualify with enum name" end
+    if code == 3039 do out "Duplicate explicit enum variant tag" end
+    if code == 3040 do out "Enum tag value out of range (must be u32: 0..4294967295)" end
+    if code == 3041 do out "Duplicate binder in case pattern arm" end
+    if code == 3042 do out "Incompatible generic argument type for enum constructor" end
+    if code == 3043 do out "Equality comparison '==' is not supported for payload enums; use case pattern matching" end
+    if code == 3044 do out "Parameter keyword 'in' is invalid in parenthesized parameter syntax; default parameters are passed by value (§14.1)" end
+    if code == 3045 do out "Parameter keyword 'out' is invalid in parenthesized parameter syntax; use parameter groups (§14.1)" end
+    if code == 3046 do out "Empty parameter group is not allowed (§14.2)" end
+    if code == 3047 do out "Parameter declaration without a group (§14.2)" end
+    if code == 3048 do out "Cannot pass a temporary value or expression as 'ref' or 'out' parameter (§14)" end
+    if code == 3049 do out "Cannot pass an uninitialized variable to 'ref' parameter (§14)" end
+    if code == 3050 do out "Cannot read 'out' parameter before it has been definitely assigned (§14)" end
+    if code == 3051 do out "'out' parameter is not definitely assigned on all normal return paths (§14)" end
+    if code == 3054 do out "Duplicate parameter name in function definition (§14)" end
+    if code == 3056 do out "ensure/revert are continuation clauses and must not use ':' (§13)" end
+    if code == 3057 do out "Duplicate ensure clause in function (§13.2)" end
+    if code == 3058 do out "Duplicate revert clause in function (§13.3)" end
+    if code == 3059 do out "throw value must have type int (§13.6)" end
+    if code == 3060 do out "erx is only available inside ensure/revert clauses (§13.5, §13.7)" end
+    if code == 3061 do out "resume is only valid inside a local try revert clause (§13.7)" end
+    if code == 3062 do out "resume must be followed by retry or revert (§13.7)" end
+    if code == 3063 do out "Duplicate timeout option in try (§13.7)" end
+    if code == 3064 do out "Expected ':' after timeout option (§13.7)" end
+    if code == 3065 do out "Duplicate isolate option in try (§13.7)" end
+    if code == 3066 do out "Expected ':' after isolate option (§13.7)" end
+    if code == 3067 do out "Unknown try option (§13.7)" end
+    if code == 3068 do out "Expected ':' after try header (§13.7)" end
+    if code == 3069 do out "try requires a local revert clause (§13.7)" end
+    if code == 3070 do out "try closes with end, not end. (§13.7)" end
+    if code == 3071 do out "try isolate list must contain unique mutable Copy variables declared outside the try (§13.7)" end
+    if code == 3072 do out "atomic retry variables must be mutable Copy values and cannot appear in isolate lists (§13.7)" end
+    if code == 3073 do out "emit requires a typed event constructor invocation (§13.7)" end
+    if code == 3074 do out "throw is only valid inside a function (§13.1)" end
+    if code == 3075 do out "try is only valid inside a function (§13.7)" end
+    if code == 3076 do out "Negative integer exponent is invalid for scalar power (§10)" end
+    if code == 3077 do out "Register/mold field width must be positive (§16)" end
+    if code == 3078 do out "Register/mold fields exceed the declared base width (§16)" end
+    if code == 3079 do out "Register/mold field value does not fit its bit width (§16)" end
+    if code == 3080 do out "precomp: I/O is forbidden during compile-time evaluation" end
+    if code == 3081 do out "precomp: division by zero during compile-time evaluation" end
+    if code == 3082 do out "precomp: strings, arrays, and allocations are forbidden during compile-time evaluation" end
+    if code == 3083 do
+        arena:
+            var sb = sb_new()
+            sb = sb_append(sb, "precomp: compile-time failure")
+            if g_precomp_throw_kind == 1 do
+                sb = sb_append(sb, " ")
+                sb = sb_append_int(sb, g_precomp_throw_val)
+            eif g_precomp_throw_kind == 2 do
+                if fat_str_len(g_precomp_throw_str) > 0 do
+                    sb = sb_append(sb, " ")
+                    sb = sb_append(sb, g_precomp_throw_str)
+                end
+            end
+            out sb_to_string(sb)
+        end
+    end
+    if code == 3084 do out "generic type mismatch: incompatible specialized return type" end
+    if code == 3085 do out "generic arity mismatch: wrong number of type arguments" end
+    if code == 3086 do
+        if (extra as i64) != 0 do
+            let diag_len = fat_str_len(extra)
+            if diag_len > 0 do
+                arena:
+                    var sb = sb_new()
+                    sb = sb_append(sb, "unresolved generic type parameter ")
+                    var d_i = 0
+                    when d_i < diag_len loop
+                        sb = sb_append_char(sb, fat_str_byte_at(extra, d_i))
+                        d_i = d_i + 1
+                    end
+                    out sb_to_string(sb)
+                end
+            end
+        end
+        out "unresolved generic type parameter"
+    end
+    if code == 3087 do out "duplicate swizzle lane in write-mask" end
+    if code == 3088 do out "swizzle width mismatch: write-mask width must match source width" end
+    if code == 3089 do out "swizzle lane out of range for vector width" end
+    if code == 3090 do out "flux width power of two: flux width must be a power of two" end
+    if code == 3095 do
+        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
+            arena:
+                var sb = sb_new()
+                sb = sb_append(sb, "bind(")
+                sb = sb_append(sb, extra)
+                sb = sb_append(sb, ") requires parameter types")
+                out sb_to_string(sb)
+            end
+        end
+        out "bind(c) requires parameter types"
+    end
+    if code == 3097 do out "Cyclic type dependency or circular inference detected" end
+    if code == 302 do out "Retry may observe dirty state; reset it, isolate it, or declare a Copy counter atomic (§13.7)" end
+    out ""
+end.
+
+func pass10_msg_backend(code: int, extra: string):
+    # Control Flow errors (E4xxx)
+    if code == 4001 do out "Missing return statement on some code paths" end
+    if code == 4002 do out "Unreachable code detected" end
+    if code == 4003 do out "Dead code — condition is always constant" end
+    if code == 4004 do out "Loop control statement 'break' or 'skip' outside loop body" end
+
+    # Borrow Checker errors (E5xxx / E8xxx)
+    if code == 5001 or code == 8001 do out "Use of moved value" end
+    if code == 5002 or code == 8002 do out "Cannot borrow as mutable while shared borrow is active" end
+    if code == 5003 do out "Cannot borrow as mutable more than once (aliasing violation)" end
+    if code == 5004 do out "Borrow of moved value" end
+    if code == 5005 or code == 8004 do out "Arena-allocated value, reference, or borrow escapes its block scope" end
+    if code == 5006 do out "Cannot borrow as shared while mutable borrow is active" end
+    if code == 5007 do out "Reference to local variable escapes function scope" end
+    if code == 5008 do out "Cannot move value while active borrow exists" end
+    if code == 5009 do out "Cannot mutate variable while shared borrow is active" end
+    if code == 5010 do out "Cannot perform arena_reset while live borrow exists" end
+    if code == 5011 do out "Cannot hold borrow across await suspension boundary" end
+    if code == 5012 do out "Borrowed reference escapes its enclosing block scope" end
+    if code == 5013 do out "Use of uninitialized variable or reference" end
+    out ""
+end.
+
+func pass10_code_to_msg(code: int, extra: string):
+    if code < 3000 do
+        let msg_front = pass10_msg_frontend(code, extra)
+        if fat_str_len(msg_front) > 0 do out msg_front end
+    eif code < 4000 do
+        let msg_sem = pass10_msg_semantic(code, extra)
+        if fat_str_len(msg_sem) > 0 do out msg_sem end
+    else
+        let msg_be = pass10_msg_backend(code, extra)
+        if fat_str_len(msg_be) > 0 do out msg_be end
+    end
+
+    # Fallback
+    var sb = sb_new()
+    sb = sb_append(sb, "Compiler diagnostic code ")
+    sb = sb_append_int(sb, code)
+    out sb_to_string(sb)
+end.
+
+export pass10_msg_semantic, pass10_msg_backend, pass10_code_to_msg
+# @vir_source compiler/src/semantic/diagnostics/actions.vri 1
+##
+ * vir/compiler/semantic/diagnostics/actions.vri
+ * ==============================================================
+ * Mapping from diagnostic codes to possible causes and recommended actions.
+ ##
+
+func pass10_code_to_causes(code: int):
+    if code == 2001 or code == 1002 do
+        out "• Variable was not declared in current or outer scope\n• Typo in variable identifier name"
+    end
+    if code == 2002 do
+        out "• Function name was misspelled\n• Missing 'import' statement from module"
+    end
+    if code == 3001 do
+        out "• Type mismatch in assignment or expression\n• Incompatible operand types for operator"
+    end
+    if code == 3002 do
+        out "• Function returned a value with a type different from its signature"
+    end
+    if code == 3003 do
+        out "• Variable was declared with 'let' (immutable binding)\n• Reassignment is only allowed for 'var' variables"
+    end
+    if code == 3004 do
+        out "• Number of arguments does not match function parameter count"
+    end
+    if code == 3008 do
+        out "• Field name does not exist on the target entity\n• Typo in entity field identifier\n• Field belongs to a different entity type"
+    end
+    if code == 3010 do
+        out "• Duplicate field in entity initialization\n• Each field may only be specified once"
+    end
+    if code == 3011 do
+        out "• Field type mismatch in entity instantiation\n• Value type does not match declared field type"
+    end
+    if code == 3029 do
+        out "• Missing required field in entity initialization\n• All declared fields must be provided"
+    end
+    if code == 3095 do
+        out "• FFI parameter type annotation is mandatory\n• Foreign function bindings must specify explicit parameter types"
+    end
+    if code == 3009 do
+        out "• Automatic differentiation (.backward()) was invoked inside 'infer:'\n• 'infer:' disables gradient tape recording for forward inference"
+    end
+    if code == 3021 do
+        out "• Receiver type has no matching method or callable field\n• No visible free function accepts the receiver as its first argument"
+    end
+    if code == 3022 do
+        out "• Explicit argument count does not match the resolved method\n• Free-function UFCS counts the receiver as argument zero"
+    end
+    if code == 3023 do
+        out "• Quantized tensor indexed or used outside 'infer:' block\n• Spec §26.5 requires quantized operations to reside in 'infer:' blocks"
+    end
+    if code == 5001 or code == 8001 do
+        out "• Value ownership was transferred to another variable or function\n• Attempted to read from an invalidated source"
+    end
+    if code == 5002 or code == 8002 do
+        out "• An active shared (read-only) borrow prevents acquiring a mutable reference"
+    end
+    if code == 5003 do
+        out "• Only one active mutable borrow allowed at any point (aliasing xor mutability)"
+    end
+    if code == 5004 do
+        out "• Cannot create a reference to a value whose ownership has been transferred"
+    end
+    if code == 5005 or code == 8004 do
+        out "• Reference allocated in 'arena:' block assigned to longer-lived variable\n• Pointer would dangle after arena destruction"
+    end
+    if code == 5006 do
+        out "• An active mutable borrow prevents creating any shared borrows"
+    end
+    if code == 5007 do
+        out "• Reference to stack-allocated local variable was returned from function\n• Stack frame is deallocated upon return, causing dangling pointer"
+    end
+    if code == 5008 do
+        out "• Variable ownership transfer attempted while an active reference (& or &mut) is held\n• Moving would invalidate the memory location referenced by the borrow"
+    end
+    if code == 5009 do
+        out "• Assignment or modification attempted while shared reference (&) is held\n• Violates shared borrow immutability guarantee"
+    end
+    if code == 5010 do
+        out "• Calling arena_reset while a live borrow reference is still held\n• Resetting the arena invalidates existing borrows"
+    end
+    if code == 5011 do
+        out "• Active borrow spans an await suspension point\n• Async suspension may outlive the borrowed reference or run across tasks"
+    end
+    if code == 5012 do
+        out "• Reference to block-local variable assigned to outer variable or returned\n• Inner scope variable is destroyed upon block exit, causing dangling pointer"
+    end
+    if code == 5013 do
+        out "• Variable or reference read before being definitely assigned on all execution paths\n• Declaration without initializer requires assignment before use"
+    end
+    if code == 4004 do
+        out "• 'break' or 'skip' placed outside 'loop' or 'when ... loop'"
+    end
+    if code == 3080 do
+        out "• Attempted to perform input/output inside precomp expression or function\n• precomp only allows pure computations without side effects"
+    end
+    if code == 3081 do
+        out "• Division or modulo by zero in constant/precomp evaluation\n• Evaluated divisor expression resulted in zero"
+    end
+    if code == 3082 do
+        out "• Heap allocations, strings, dynamic arrays, and pointers are not allowed during precomp evaluation\n• Dynamic memory allocation is not permitted at compile time"
+    end
+    if code == 3083 do
+        out "• precomp throw statement executed during compile-time evaluation\n• Compile-time assertion or condition check failed"
+    end
+    if code == 3084 do
+        out "• Specialized return type does not match variable annotation\n• Expected type is incompatible with generic specialization"
+    end
+    if code == 3085 do
+        out "• Type argument count does not match generic parameter declaration\n• Wrong number of generic arguments provided"
+    end
+    if code >= 2101 and code <= 2105 do
+        out "• Module or source include resolution failed\n• Path does not exist, syntax is invalid, or circular dependency detected"
+    end
+    if code >= 2111 and code <= 2114 do
+        out "• Selective import resolution failed\n• Symbol is not exported, module not found, or recursion limit exceeded"
+    end
+    if code >= 2120 and code <= 2125 do
+        out "• Stdlib or project module registry resolution error\n• Target file missing or duplicate module identifier registered"
+    end
+    out "• Violation of Vir language specification semantic constraints"
+end.
+
+func pass10_code_to_actions(code: int):
+    if code == 2001 or code == 1002 do
+        out "• Declare variable with 'var <name> = <val>' before use\n• Check identifier spelling"
+    end
+    if code == 2002 do
+        out "• Verify function definition exists or add import statement"
+    end
+    if code == 3001 do
+        out "• Align expression type with expected type\n• Use explicit type cast if types are compatible"
+    end
+    if code == 3002 do
+        out "• Adjust return expression to match function signature\n• Update function signature return type"
+    end
+    if code == 3003 do
+        out "• Change 'let' to 'var' at variable declaration site"
+    end
+    if code == 3004 do
+        out "• Provide the correct number of arguments matching function signature"
+    end
+    if code == 3008 do
+        out "• Check field name spelling in entity definition\n• Add the missing field to the entity declaration"
+    end
+    if code == 3010 do
+        out "• Remove redundant field assignment from constructor call"
+    end
+    if code == 3011 do
+        out "• Provide a value matching the declared field type"
+    end
+    if code == 3029 do
+        out "• Initialize all declared fields in constructor call"
+    end
+    if code == 3095 do
+        out "• Add explicit type annotations to all parameters of foreign function bindings"
+    end
+    if code == 3009 do
+        out "• Move .backward() call into a 'train:' block"
+    end
+    if code == 3021 do
+        out "• Define the method/callable field/free function or correct its name"
+    end
+    if code == 3022 do
+        out "• Pass exactly the parameters required by the resolved UFCS callee"
+    end
+    if code == 3023 do
+        out "• Move quantized tensor indexing or inference into an 'infer:' block"
+    end
+    if code == 5001 or code == 8001 do
+        out "• Borrow reference with '&' or clone value before move"
+    end
+    if code == 5002 or code == 8002 do
+        out "• Release shared borrow before taking a mutable borrow"
+    end
+    if code == 5003 do
+        out "• Ensure existing mutable borrow ends before creating another mutable borrow"
+    end
+    if code == 5004 do
+        out "• Borrow from value before moving it, or do not move while referencing"
+    end
+    if code == 5005 or code == 8004 do
+        out "• Copy data out of arena or expand arena block lifetime"
+    end
+    if code == 5006 do
+        out "• End mutable borrow before acquiring shared borrows"
+    end
+    if code == 5007 do
+        out "• Return value by ownership (move) or allocate in heap/arena"
+    end
+    if code == 5008 do
+        out "• Release or scope-limit the borrow before moving the owner value"
+    end
+    if code == 5009 do
+        out "• Complete reading through shared reference before mutating the owner"
+    end
+    if code == 5010 do
+        out "• Release or end the live borrow before calling arena_reset"
+    end
+    if code == 5011 do
+        out "• Scope-limit the borrow to complete before await, or pass owned data across await"
+    end
+    if code == 5012 do
+        out "• Declare owner variable in the outer scope, or clone value instead of borrowing"
+    end
+    if code == 5013 do
+        out "• Initialize variable at declaration or ensure assignment on all reachable branches"
+    end
+    if code == 4004 do
+        out "• Enclose statement within an active loop construct"
+    end
+    if code == 3080 do
+        out "• Remove I/O operations from compile-time functions\n• Move I/O to runtime main or normal functions"
+    end
+    if code == 3081 do
+        out "• Ensure divisor is non-zero in compile-time expressions"
+    end
+    if code == 3082 do
+        out "• Use primitive scalar integers/booleans in precomp evaluation\n• Move string operations and collection initialization to runtime"
+    end
+    if code == 3083 do
+        out "• Review compile-time condition or adjust values to avoid throw"
+    end
+    if code == 3084 do
+        out "• Align variable declaration type with generic specialization\n• Change type argument to match target variable"
+    end
+    if code == 3085 do
+        out "• Provide exact number of type arguments declared on generic entity or function"
+    end
+    if code >= 2101 and code <= 2105 do
+        out "• Verify module path and existence in stdlib or search paths\n• Break circular dependency or correct include syntax"
+    end
+    if code >= 2111 and code <= 2114 do
+        out "• Verify exported symbol name with 'export <symbol>'\n• Check imported module path and import syntax"
+    end
+    if code >= 2120 and code <= 2125 do
+        out "• Check stdlib.vri or module.list configuration\n• Ensure target source files exist on disk"
+    end
+    out "• Review source code against Vir language specification"
+end.
+
+export pass10_code_to_causes, pass10_code_to_actions
+# @vir_source compiler/src/semantic/diagnostics/json.vri 1
+##
+ * vir/compiler/semantic/diagnostics/json.vri
+ * ==============================================================
+ * Diagnostic JSON serialization, machine-readable formatting, and compiler aborts.
+ ##
+
+import vir_alloc, vir_free, alloc from rt.alloc
+import sys_exit from rt.syscall
+
 
 func pass10_json_escape_buffer(sb: StringBuilder, data: int, slen: int):
     if data == 0 or slen <= 0 do out sb end
@@ -36024,6 +36734,24 @@ func compilerAbort():
     sys_exit(1)
 end.
 
+export pass10_json_escape_buffer, pass10_json_escape_cstr, pass10_json_escape_str,
+       pass10_emit_json_one, pass10CaptureDiagnostics, pass10_emit_json,
+       compilerFailure, compilerAbort
+# @vir_source compiler/src/semantic/diagnostics/modern.vri 1
+##
+ * vir/compiler/semantic/diagnostics/modern.vri
+ * ==============================================================
+ * Terminal color detection, ANSI formatting, and modern UI diagnostic reporting.
+ ##
+
+
+import vir_alloc, vir_free, alloc from rt.alloc
+
+import sys_platform, Platform, sys_open, sys_read, sys_close, VIR_O_RDONLY from rt.syscall
+
+extern func syscall3(num: int, a1: int, a2: int, a3: int) -> int
+
+
 func virc_isatty(fd: int):
     var buf = vir_alloc(128)
     let plat = sys_platform()
@@ -36082,58 +36810,30 @@ func virc_should_color():
     out 0
 end.
 
-func pass10_emit_diagnostics(diag: &DiagnosticEngine):
-    if g_diagSessionActive == 1 do pass10CaptureDiagnostics(diag) end
-    count = vec_len_rt(diag.diagnostics)
-    if count == 0 do
-        out 0
-    end
-
-    if g_phase_timings == 1 and g_phase_semantic_start_us > 0 do
-        g_phase_semantic_us = virc_elapsed_us() - g_phase_semantic_start_us
-    end
-    if g_diag_json == 1 do
-        out pass10_emit_json(diag)
-    end
-
-    if g_ui_mode == 1 do out pass10EmitModern(diag) end
-
-    let use_color = virc_should_color()
-
-    if count <= 2 do
-        var i = 0
-        when i < count loop
-            d = vec_get_rt(diag.diagnostics, i)
-            pass10_print_one_detailed(d, use_color)
-            i = i + 1
-        end
-    else
-        var i = 0
-        when i < count loop
-            d = vec_get_rt(diag.diagnostics, i)
-            pass10_print_one_compact(d, use_color)
-            i = i + 1
-        end
-        print_ln("")
-    end
-
-    # Print summary
-    arena:
-        var sb = sb_new()
-        sb = sb_append(sb, "virc: ")
-        sb = sb_append_int(sb, diag.error_count)
-        sb = sb_append(sb, " error(s), ")
-        var warn_count = count - diag.error_count
-        sb = sb_append_int(sb, warn_count)
-        sb = sb_append(sb, " warning(s)")
-        print_ln(sb_to_string(sb))
-        sb_free(sb)
-    end
-
-    virc_print_compile_time()
-
-    out diag.error_count
+func pass10_color_red(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1;31m")
+    out sb
 end.
+
+func pass10_color_yellow(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1;33m")
+    out sb
+end.
+
+func pass10_color_bold(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[1m")
+    out sb
+end.
+
+func pass10_color_reset(sb: StringBuilder):
+    sb = sb_append_char(sb, 27)
+    sb = sb_append(sb, "[0m")
+    out sb
+end.
+
 func pass10HumanLine(value: int):
     if g_ui_mode == 1 do
         cliUiLine(value)
@@ -36278,672 +36978,18 @@ func pass10EmitModern(diag: &DiagnosticEngine):
     out diag.error_count
 end.
 
-func pass10_code_to_prefix(level: int):
-    if level == DiagnosticLevel.Warning do
-        out "W"
-    eif level == DiagnosticLevel.Info do
-        out "I"
-    end
-    out "E"
-end.
+export virc_isatty, virc_has_no_color, virc_should_color,
+       pass10_color_red, pass10_color_yellow, pass10_color_bold, pass10_color_reset,
+       pass10HumanLine, pass10HumanValueLine, pass10AppendCode,
+       pass10FindGroup, pass10CollectGroups, pass10CountGroups, pass10EmitModern
+# @vir_source compiler/src/semantic/diagnostics/render.vri 1
+##
+ * vir/compiler/semantic/diagnostics/render.vri
+ * ==============================================================
+ * Diagnostic text formatting (detailed execution report and compact one-liner).
+ ##
 
-func pass10_code_to_result(level: int):
-    if level == DiagnosticLevel.Warning do
-        out "WARNING"
-    eif level == DiagnosticLevel.Info do
-        out "INFO"
-    end
-    out "FAILED"
-end.
 
-func pass10_code_to_phase(code: int):
-    if code < 1000 do out "Lexer" end
-    if code < 2000 do out "Parser" end
-    if code >= 2100 and code < 2200 do out "ModuleResolver" end
-    if code < 4000 do out "Semantic" end
-    if code < 5000 do out "ControlFlow" end
-    if code < 6000 or (code >= 8000 and code < 9000) do out "BorrowChecker" end
-    if code >= 7000 and code < 8000 do out "ModuleResolver" end
-    out "Compiler"
-end.
-
-func pass10_code_to_msg(code: int, extra: string):
-    # Lexer errors (E0xxx)
-    if code == 1 or code == 101 do
-        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
-        out "Invalid character in source"
-    end
-    if code == 2 or code == 102 do
-        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
-        out "Unterminated string literal"
-    end
-    if code == 3 or code == 103 do
-        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
-        out "Invalid numeric literal format"
-    end
-
-    # Parser errors (E1xxx)
-    if code == 1001 do
-        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
-        out "Unexpected token in syntax rule"
-    end
-    if code == 1002 do out "Missing block delimiter 'end' or 'end.'" end
-    if code == 1003 do out "Missing colon ':' after condition or signature" end
-    if code == 1004 do
-        if (extra as i64) != 0 and rt_strlen(extra as i64) > 0 do out extra end
-        out "Invalid expression syntax"
-    end
-    if code == 1005 do out "Unexpected end of file (EOF)" end
-    if code == 1006 do out "Invalid function signature" end
-    if code == 1007 do out "Mismatched parentheses or brackets" end
-
-    # Semantic & Type errors (E2xxx / E3xxx)
-    if code == 2001 do out "Undefined variable in current scope" end
-    if code == 2002 do
-        if (extra as i64) != 0 do
-            let diag_len = fat_str_len(extra)
-            if diag_len > 0 do
-                arena:
-                    var sb = sb_new()
-                    sb = sb_append(sb, "Undefined function or symbol: '")
-                    var d_i = 0
-                    when d_i < diag_len loop
-                        sb = sb_append_char(sb, fat_str_byte_at(extra, d_i))
-                        d_i = d_i + 1
-                    end
-                    sb = sb_append(sb, "'")
-                    out sb_to_string(sb)
-                end
-            end
-        end
-        out "Undefined function or symbol"
-    end
-    if code == 2003 or code == 3001 do out "Type mismatch in expression or operation" end
-    if code == 2004 do out "Duplicate symbol definition in current scope" end
-    if code == 2005 or code == 3012 do out "Invalid assignment target (not an l-value)" end
-    if code == 2101 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "failed to parse include statement name: '")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, "'")
-                out sb_to_string(sb)
-            end
-        end
-        out "failed to parse include statement name"
-    end
-    if code == 2102 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "included source not found: '")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, "'")
-                out sb_to_string(sb)
-            end
-        end
-        out "included source not found"
-    end
-    if code == 2103 do out "invalid token '::'; use '.' for qualified names" end
-    if code == 2104 do out "maximum include depth exceeded" end
-    if code == 2105 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "circular dependency detected: ")
-                sb = sb_append(sb, extra)
-                out sb_to_string(sb)
-            end
-        end
-        out "circular dependency detected"
-    end
-    if code == 2111 do out "empty or invalid module name in import" end
-    if code == 2112 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "imported module not found: '")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, "'")
-                out sb_to_string(sb)
-            end
-        end
-        out "imported module not found"
-    end
-    if code == 2113 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "imported symbol not exported: '")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, "'")
-                out sb_to_string(sb)
-            end
-        end
-        out "imported symbol not exported"
-    end
-    if code == 2114 do out "maximum import depth exceeded" end
-    if code == 2120 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "failed to read stdlib registry: ")
-                sb = sb_append(sb, extra)
-                out sb_to_string(sb)
-            end
-        end
-        out "failed to read stdlib registry"
-    end
-    if code == 2121 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "duplicate module in stdlib registry: '")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, "'")
-                out sb_to_string(sb)
-            end
-        end
-        out "duplicate module in stdlib registry"
-    end
-    if code == 2122 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "stdlib target file not found for '")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, "'")
-                out sb_to_string(sb)
-            end
-        end
-        out "stdlib target file not found"
-    end
-    if code == 2123 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "duplicate module in project registry: '")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, "'")
-                out sb_to_string(sb)
-            end
-        end
-        out "duplicate module in project registry"
-    end
-    if code == 2124 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "project module target file not found: '")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, "'")
-                out sb_to_string(sb)
-            end
-        end
-        out "project module target file not found"
-    end
-    if code == 2125 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "module resolution target not found: '")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, "'")
-                out sb_to_string(sb)
-            end
-        end
-        out "module resolution target not found"
-    end
-    if code == 2201 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "invalid UTF-8 in '")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, "'")
-                out sb_to_string(sb)
-            end
-        end
-        out "invalid UTF-8 in source encoding"
-    end
-    if code == 3002 do out "Invalid operator for operand type" end
-    if code == 3003 do out "Assignment to immutable variable (declared with 'let')" end
-    if code == 3004 do out "Type mismatch in variable assignment" end
-    if code == 3005 do out "Wrong argument count in function invocation" end
-    if code == 3006 do out "Invalid operand types for and/or/xor/shl/shr" end
-    if code == 3007 do out "Assignment or return value type does not match declared type" end
-    if code == 3008 do
-        if (extra as i64) != 0 do
-            let diag_len = fat_str_len(extra)
-            if diag_len > 0 do
-                arena:
-                    var sb = sb_new()
-                    sb = sb_append(sb, "Unknown entity field access '")
-                    var d_i = 0
-                    when d_i < diag_len loop
-                        sb = sb_append_char(sb, fat_str_byte_at(extra, d_i))
-                        d_i = d_i + 1
-                    end
-                    sb = sb_append(sb, "'")
-                    out sb_to_string(sb)
-                end
-            end
-        end
-        out "Unknown entity field access"
-    end
-    if code == 3009 do out "Operation prohibited in 'infer:' block (e.g. calling .backward())" end
-    if code == 3010 do out "Duplicate field in entity initialization" end
-    if code == 3011 do out "Field type mismatch in entity instantiation" end
-    if code == 3013 do out "Tensor indexing rank mismatch" end
-    if code == 3014 do out "Matrix multiplication dimension mismatch" end
-    if code == 3015 do out "Tensor index must be integer" end
-    if code == 3016 do out "infer/train blocks cannot be nested" end
-    if code == 3017 do out ".backward() is only valid inside a train block" end
-    if code == 3018 do out "quantize input must be a floating-point tensor" end
-    if code == 3019 do out "quantize bits must be a compile-time constant in {4, 8, 16, 32}" end
-    if code == 3020 do out ".backward() receiver must be a floating-point train value with gradient state" end
-    if code == 3021 do out "Unresolved UFCS member: no entity method, callable field, or free function" end
-    if code == 3022 do out "Wrong argument count in UFCS invocation" end
-    if code == 3023 do out "Quantized tensor operations are only supported inside an 'infer:' block" end
-    if code == 3024 do out "Invalid tensor type; expected tensor[T; S...] with T in {f32, f16, f64, i8, u8, i32, int} and positive compile-time dimensions" end
-    if code == 3025 do out "Packed entity field missing type annotation" end
-    if code == 3026 do out "Invalid packed entity field type; must be compile-time fixed-size primitive or packed entity" end
-    if code == 3027 do out "Recursive packed entity layout cycle detected" end
-    if code == 3028 do out "Normal entity cannot be embedded inline in packed entity" end
-    if code == 3029 do out "Missing required field in entity initialization" end
-    if code == 3030 do out "Integer literal value out of range for packed field type" end
-    if code == 3031 do out "Wrong argument count in enum constructor invocation" end
-    if code == 3032 do out "Non-exhaustive case expression on enum" end
-    if code == 3033 do out "Unknown enum variant in pattern arm" end
-    if code == 3034 do out "Variant does not belong to target enum" end
-    if code == 3035 do out "Duplicate case pattern arm" end
-    if code == 3036 do out "Unreachable pattern arm after wildcard" end
-    if code == 3037 do out "Wrong binder count in enum pattern arm" end
-    if code == 3038 do out "Ambiguous unqualified enum variant; qualify with enum name" end
-    if code == 3039 do out "Duplicate explicit enum variant tag" end
-    if code == 3040 do out "Enum tag value out of range (must be u32: 0..4294967295)" end
-    if code == 3041 do out "Duplicate binder in case pattern arm" end
-    if code == 3042 do out "Incompatible generic argument type for enum constructor" end
-    if code == 3043 do out "Equality comparison '==' is not supported for payload enums; use case pattern matching" end
-    if code == 3044 do out "Parameter keyword 'in' is invalid in parenthesized parameter syntax; default parameters are passed by value (§14.1)" end
-    if code == 3045 do out "Parameter keyword 'out' is invalid in parenthesized parameter syntax; use parameter groups (§14.1)" end
-    if code == 3046 do out "Empty parameter group is not allowed (§14.2)" end
-    if code == 3047 do out "Parameter declaration without a group (§14.2)" end
-    if code == 3048 do out "Cannot pass a temporary value or expression as 'ref' or 'out' parameter (§14)" end
-    if code == 3049 do out "Cannot pass an uninitialized variable to 'ref' parameter (§14)" end
-    if code == 3050 do out "Cannot read 'out' parameter before it has been definitely assigned (§14)" end
-    if code == 3051 do out "'out' parameter is not definitely assigned on all normal return paths (§14)" end
-    if code == 3054 do out "Duplicate parameter name in function definition (§14)" end
-    if code == 3056 do out "ensure/revert are continuation clauses and must not use ':' (§13)" end
-    if code == 3057 do out "Duplicate ensure clause in function (§13.2)" end
-    if code == 3058 do out "Duplicate revert clause in function (§13.3)" end
-    if code == 3059 do out "throw value must have type int (§13.6)" end
-    if code == 3060 do out "erx is only available inside ensure/revert clauses (§13.5, §13.7)" end
-    if code == 3061 do out "resume is only valid inside a local try revert clause (§13.7)" end
-    if code == 3062 do out "resume must be followed by retry or revert (§13.7)" end
-    if code == 3063 do out "Duplicate timeout option in try (§13.7)" end
-    if code == 3064 do out "Expected ':' after timeout option (§13.7)" end
-    if code == 3065 do out "Duplicate isolate option in try (§13.7)" end
-    if code == 3066 do out "Expected ':' after isolate option (§13.7)" end
-    if code == 3067 do out "Unknown try option (§13.7)" end
-    if code == 3068 do out "Expected ':' after try header (§13.7)" end
-    if code == 3069 do out "try requires a local revert clause (§13.7)" end
-    if code == 3070 do out "try closes with end, not end. (§13.7)" end
-    if code == 3071 do out "try isolate list must contain unique mutable Copy variables declared outside the try (§13.7)" end
-    if code == 3072 do out "atomic retry variables must be mutable Copy values and cannot appear in isolate lists (§13.7)" end
-    if code == 3073 do out "emit requires a typed event constructor invocation (§13.7)" end
-    if code == 3074 do out "throw is only valid inside a function (§13.1)" end
-    if code == 3075 do out "try is only valid inside a function (§13.7)" end
-    if code == 3076 do out "Negative integer exponent is invalid for scalar power (§10)" end
-    if code == 3077 do out "Register/mold field width must be positive (§16)" end
-    if code == 3078 do out "Register/mold fields exceed the declared base width (§16)" end
-    if code == 3079 do out "Register/mold field value does not fit its bit width (§16)" end
-    if code == 3080 do out "precomp: I/O is forbidden during compile-time evaluation" end
-    if code == 3081 do out "precomp: division by zero during compile-time evaluation" end
-    if code == 3082 do out "precomp: strings, arrays, and allocations are forbidden during compile-time evaluation" end
-    if code == 3083 do
-        arena:
-            var sb = sb_new()
-            sb = sb_append(sb, "precomp: compile-time failure")
-            if g_precomp_throw_kind == 1 do
-                sb = sb_append(sb, " ")
-                sb = sb_append_int(sb, g_precomp_throw_val)
-            eif g_precomp_throw_kind == 2 do
-                if fat_str_len(g_precomp_throw_str) > 0 do
-                    sb = sb_append(sb, " ")
-                    sb = sb_append(sb, g_precomp_throw_str)
-                end
-            end
-            out sb_to_string(sb)
-        end
-    end
-    if code == 3084 do out "generic type mismatch: incompatible specialized return type" end
-    if code == 3085 do out "generic arity mismatch: wrong number of type arguments" end
-    if code == 3086 do
-        if (extra as i64) != 0 do
-            let diag_len = fat_str_len(extra)
-            if diag_len > 0 do
-                arena:
-                    var sb = sb_new()
-                    sb = sb_append(sb, "unresolved generic type parameter ")
-                    var d_i = 0
-                    when d_i < diag_len loop
-                        sb = sb_append_char(sb, fat_str_byte_at(extra, d_i))
-                        d_i = d_i + 1
-                    end
-                    out sb_to_string(sb)
-                end
-            end
-        end
-        out "unresolved generic type parameter"
-    end
-    if code == 3087 do out "duplicate swizzle lane in write-mask" end
-    if code == 3088 do out "swizzle width mismatch: write-mask width must match source width" end
-    if code == 3089 do out "swizzle lane out of range for vector width" end
-    if code == 3090 do out "flux width power of two: flux width must be a power of two" end
-    if code == 3095 do
-        if (extra as i64) != 0 and fat_str_len(extra) > 0 do
-            arena:
-                var sb = sb_new()
-                sb = sb_append(sb, "bind(")
-                sb = sb_append(sb, extra)
-                sb = sb_append(sb, ") requires parameter types")
-                out sb_to_string(sb)
-            end
-        end
-        out "bind(c) requires parameter types"
-    end
-    if code == 3097 do out "Cyclic type dependency or circular inference detected" end
-    if code == 302 do out "Retry may observe dirty state; reset it, isolate it, or declare a Copy counter atomic (§13.7)" end
-
-    # Control Flow errors (E4xxx)
-    if code == 4001 do out "Missing return statement on some code paths" end
-    if code == 4002 do out "Unreachable code detected" end
-    if code == 4003 do out "Dead code — condition is always constant" end
-    if code == 4004 do out "Loop control statement 'break' or 'skip' outside loop body" end
-
-    # Borrow Checker errors (E5xxx / E8xxx)
-    if code == 5001 or code == 8001 do out "Use of moved value" end
-    if code == 5002 or code == 8002 do out "Cannot borrow as mutable while shared borrow is active" end
-    if code == 5003 do out "Cannot borrow as mutable more than once (aliasing violation)" end
-    if code == 5004 do out "Borrow of moved value" end
-    if code == 5005 or code == 8004 do out "Arena-allocated value, reference, or borrow escapes its block scope" end
-    if code == 5006 do out "Cannot borrow as shared while mutable borrow is active" end
-    if code == 5007 do out "Reference to local variable escapes function scope" end
-    if code == 5008 do out "Cannot move value while active borrow exists" end
-    if code == 5009 do out "Cannot mutate variable while shared borrow is active" end
-    if code == 5010 do out "Cannot perform arena_reset while live borrow exists" end
-    if code == 5011 do out "Cannot hold borrow across await suspension boundary" end
-    if code == 5012 do out "Borrowed reference escapes its enclosing block scope" end
-    if code == 5013 do out "Use of uninitialized variable or reference" end
-
-    # Fallback
-    var sb = sb_new()
-    sb = sb_append(sb, "Compiler diagnostic code ")
-    sb = sb_append_int(sb, code)
-    out sb_to_string(sb)
-end.
-
-func pass10_code_to_causes(code: int):
-    if code == 2001 or code == 1002 do
-        out "• Variable was not declared in current or outer scope\n• Typo in variable identifier name"
-    end
-    if code == 2002 do
-        out "• Function name was misspelled\n• Missing 'import' statement from module"
-    end
-    if code == 3001 do
-        out "• Type mismatch in assignment or expression\n• Incompatible operand types for operator"
-    end
-    if code == 3002 do
-        out "• Function returned a value with a type different from its signature"
-    end
-    if code == 3003 do
-        out "• Variable was declared with 'let' (immutable binding)\n• Reassignment is only allowed for 'var' variables"
-    end
-    if code == 3004 do
-        out "• Number of arguments does not match function parameter count"
-    end
-    if code == 3008 do
-        out "• Field name does not exist on the target entity\n• Typo in entity field identifier\n• Field belongs to a different entity type"
-    end
-    if code == 3010 do
-        out "• Duplicate field in entity initialization\n• Each field may only be specified once"
-    end
-    if code == 3011 do
-        out "• Field type mismatch in entity instantiation\n• Value type does not match declared field type"
-    end
-    if code == 3029 do
-        out "• Missing required field in entity initialization\n• All declared fields must be provided"
-    end
-    if code == 3095 do
-        out "• FFI parameter type annotation is mandatory\n• Foreign function bindings must specify explicit parameter types"
-    end
-    if code == 3009 do
-        out "• Automatic differentiation (.backward()) was invoked inside 'infer:'\n• 'infer:' disables gradient tape recording for forward inference"
-    end
-    if code == 3021 do
-        out "• Receiver type has no matching method or callable field\n• No visible free function accepts the receiver as its first argument"
-    end
-    if code == 3022 do
-        out "• Explicit argument count does not match the resolved method\n• Free-function UFCS counts the receiver as argument zero"
-    end
-    if code == 3023 do
-        out "• Quantized tensor indexed or used outside 'infer:' block\n• Spec §26.5 requires quantized operations to reside in 'infer:' blocks"
-    end
-    if code == 5001 or code == 8001 do
-        out "• Value ownership was transferred to another variable or function\n• Attempted to read from an invalidated source"
-    end
-    if code == 5002 or code == 8002 do
-        out "• An active shared (read-only) borrow prevents acquiring a mutable reference"
-    end
-    if code == 5003 do
-        out "• Only one active mutable borrow allowed at any point (aliasing xor mutability)"
-    end
-    if code == 5004 do
-        out "• Cannot create a reference to a value whose ownership has been transferred"
-    end
-    if code == 5005 or code == 8004 do
-        out "• Reference allocated in 'arena:' block assigned to longer-lived variable\n• Pointer would dangle after arena destruction"
-    end
-    if code == 5006 do
-        out "• An active mutable borrow prevents creating any shared borrows"
-    end
-    if code == 5007 do
-        out "• Reference to stack-allocated local variable was returned from function\n• Stack frame is deallocated upon return, causing dangling pointer"
-    end
-    if code == 5008 do
-        out "• Variable ownership transfer attempted while an active reference (& or &mut) is held\n• Moving would invalidate the memory location referenced by the borrow"
-    end
-    if code == 5009 do
-        out "• Assignment or modification attempted while shared reference (&) is held\n• Violates shared borrow immutability guarantee"
-    end
-    if code == 5010 do
-        out "• Calling arena_reset while a live borrow reference is still held\n• Resetting the arena invalidates existing borrows"
-    end
-    if code == 5011 do
-        out "• Active borrow spans an await suspension point\n• Async suspension may outlive the borrowed reference or run across tasks"
-    end
-    if code == 5012 do
-        out "• Reference to block-local variable assigned to outer variable or returned\n• Inner scope variable is destroyed upon block exit, causing dangling pointer"
-    end
-    if code == 5013 do
-        out "• Variable or reference read before being definitely assigned on all execution paths\n• Declaration without initializer requires assignment before use"
-    end
-    if code == 4004 do
-        out "• 'break' or 'skip' placed outside 'loop' or 'when ... loop'"
-    end
-    if code == 3080 do
-        out "• Attempted to perform input/output inside precomp expression or function\n• precomp only allows pure computations without side effects"
-    end
-    if code == 3081 do
-        out "• Division or modulo by zero in constant/precomp evaluation\n• Evaluated divisor expression resulted in zero"
-    end
-    if code == 3082 do
-        out "• Heap allocations, strings, dynamic arrays, and pointers are not allowed during precomp evaluation\n• Dynamic memory allocation is not permitted at compile time"
-    end
-    if code == 3083 do
-        out "• precomp throw statement executed during compile-time evaluation\n• Compile-time assertion or condition check failed"
-    end
-    if code == 3084 do
-        out "• Specialized return type does not match variable annotation\n• Expected type is incompatible with generic specialization"
-    end
-    if code == 3085 do
-        out "• Type argument count does not match generic parameter declaration\n• Wrong number of generic arguments provided"
-    end
-    if code >= 2101 and code <= 2105 do
-        out "• Module or source include resolution failed\n• Path does not exist, syntax is invalid, or circular dependency detected"
-    end
-    if code >= 2111 and code <= 2114 do
-        out "• Selective import resolution failed\n• Symbol is not exported, module not found, or recursion limit exceeded"
-    end
-    if code >= 2120 and code <= 2125 do
-        out "• Stdlib or project module registry resolution error\n• Target file missing or duplicate module identifier registered"
-    end
-    out "• Violation of Vir language specification semantic constraints"
-end.
-
-func pass10_code_to_actions(code: int):
-    if code == 2001 or code == 1002 do
-        out "• Declare variable with 'var <name> = <val>' before use\n• Check identifier spelling"
-    end
-    if code == 2002 do
-        out "• Verify function definition exists or add import statement"
-    end
-    if code == 3001 do
-        out "• Align expression type with expected type\n• Use explicit type cast if types are compatible"
-    end
-    if code == 3002 do
-        out "• Adjust return expression to match function signature\n• Update function signature return type"
-    end
-    if code == 3003 do
-        out "• Change 'let' to 'var' at variable declaration site"
-    end
-    if code == 3004 do
-        out "• Provide the correct number of arguments matching function signature"
-    end
-    if code == 3008 do
-        out "• Check field name spelling in entity definition\n• Add the missing field to the entity declaration"
-    end
-    if code == 3010 do
-        out "• Remove redundant field assignment from constructor call"
-    end
-    if code == 3011 do
-        out "• Provide a value matching the declared field type"
-    end
-    if code == 3029 do
-        out "• Initialize all declared fields in constructor call"
-    end
-    if code == 3095 do
-        out "• Add explicit type annotations to all parameters of foreign function bindings"
-    end
-    if code == 3009 do
-        out "• Move .backward() call into a 'train:' block"
-    end
-    if code == 3021 do
-        out "• Define the method/callable field/free function or correct its name"
-    end
-    if code == 3022 do
-        out "• Pass exactly the parameters required by the resolved UFCS callee"
-    end
-    if code == 3023 do
-        out "• Move quantized tensor indexing or inference into an 'infer:' block"
-    end
-    if code == 5001 or code == 8001 do
-        out "• Borrow reference with '&' or clone value before move"
-    end
-    if code == 5002 or code == 8002 do
-        out "• Release shared borrow before taking a mutable borrow"
-    end
-    if code == 5003 do
-        out "• Ensure existing mutable borrow ends before creating another mutable borrow"
-    end
-    if code == 5004 do
-        out "• Borrow from value before moving it, or do not move while referencing"
-    end
-    if code == 5005 or code == 8004 do
-        out "• Copy data out of arena or expand arena block lifetime"
-    end
-    if code == 5006 do
-        out "• End mutable borrow before acquiring shared borrows"
-    end
-    if code == 5007 do
-        out "• Return value by ownership (move) or allocate in heap/arena"
-    end
-    if code == 5008 do
-        out "• Release or scope-limit the borrow before moving the owner value"
-    end
-    if code == 5009 do
-        out "• Complete reading through shared reference before mutating the owner"
-    end
-    if code == 5010 do
-        out "• Release or end the live borrow before calling arena_reset"
-    end
-    if code == 5011 do
-        out "• Scope-limit the borrow to complete before await, or pass owned data across await"
-    end
-    if code == 5012 do
-        out "• Declare owner variable in the outer scope, or clone value instead of borrowing"
-    end
-    if code == 5013 do
-        out "• Initialize variable at declaration or ensure assignment on all reachable branches"
-    end
-    if code == 4004 do
-        out "• Enclose statement within an active loop construct"
-    end
-    if code == 3080 do
-        out "• Remove I/O operations from compile-time functions\n• Move I/O to runtime main or normal functions"
-    end
-    if code == 3081 do
-        out "• Ensure divisor is non-zero in compile-time expressions"
-    end
-    if code == 3082 do
-        out "• Use primitive scalar integers/booleans in precomp evaluation\n• Move string operations and collection initialization to runtime"
-    end
-    if code == 3083 do
-        out "• Review compile-time condition or adjust values to avoid throw"
-    end
-    if code == 3084 do
-        out "• Align variable declaration type with generic specialization\n• Change type argument to match target variable"
-    end
-    if code == 3085 do
-        out "• Provide exact number of type arguments declared on generic entity or function"
-    end
-    if code >= 2101 and code <= 2105 do
-        out "• Verify module path and existence in stdlib or search paths\n• Break circular dependency or correct include syntax"
-    end
-    if code >= 2111 and code <= 2114 do
-        out "• Verify exported symbol name with 'export <symbol>'\n• Check imported module path and import syntax"
-    end
-    if code >= 2120 and code <= 2125 do
-        out "• Check stdlib.vri or module.list configuration\n• Ensure target source files exist on disk"
-    end
-    out "• Review source code against Vir language specification"
-end.
-
-func pass10_color_red(sb: StringBuilder):
-    sb = sb_append_char(sb, 27)
-    sb = sb_append(sb, "[1;31m")
-    out sb
-end.
-
-func pass10_color_yellow(sb: StringBuilder):
-    sb = sb_append_char(sb, 27)
-    sb = sb_append(sb, "[1;33m")
-    out sb
-end.
-
-func pass10_color_bold(sb: StringBuilder):
-    sb = sb_append_char(sb, 27)
-    sb = sb_append(sb, "[1m")
-    out sb
-end.
-
-func pass10_color_reset(sb: StringBuilder):
-    sb = sb_append_char(sb, 27)
-    sb = sb_append(sb, "[0m")
-    out sb
-end.
 
 func pass10_print_one_detailed(d: Diagnostic, use_color: int):
     let d_level = native_read_i64(d as i64, 0)
@@ -37198,6 +37244,77 @@ end.
 
 func pass10_print_one(d: Diagnostic):
     pass10_print_one_detailed(d, 0)
+end.
+
+export pass10_print_one_detailed, pass10_print_one_compact, pass10_print_one
+# @vir_source compiler/src/semantic/sem_pass10_diagnostics.vri 1
+##
+ * vir/compiler/sem_pass10_diagnostics.vri
+ * ==============================================================
+ * Pass 10: Diagnostics Emission.
+ * Formats and prints all collected diagnostics, returns error count.
+ ##
+
+import optTraceAppendJson from virc.backend.opt_trace
+
+
+import vir_alloc, vir_free, alloc from rt.alloc
+
+
+import sys_getrusage, sys_clock_gettime, sys_platform, Platform, sys_open, sys_read, sys_close, VIR_O_RDONLY from rt.syscall
+
+
+func pass10_emit_diagnostics(diag: &DiagnosticEngine):
+    if g_diagSessionActive == 1 do pass10CaptureDiagnostics(diag) end
+    count = vec_len_rt(diag.diagnostics)
+    if count == 0 do
+        out 0
+    end
+
+    if g_phase_timings == 1 and g_phase_semantic_start_us > 0 do
+        g_phase_semantic_us = virc_elapsed_us() - g_phase_semantic_start_us
+    end
+    if g_diag_json == 1 do
+        out pass10_emit_json(diag)
+    end
+
+    if g_ui_mode == 1 do out pass10EmitModern(diag) end
+
+    let use_color = virc_should_color()
+
+    if count <= 2 do
+        var i = 0
+        when i < count loop
+            d = vec_get_rt(diag.diagnostics, i)
+            pass10_print_one_detailed(d, use_color)
+            i = i + 1
+        end
+    else
+        var i = 0
+        when i < count loop
+            d = vec_get_rt(diag.diagnostics, i)
+            pass10_print_one_compact(d, use_color)
+            i = i + 1
+        end
+        print_ln("")
+    end
+
+    # Print summary
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "virc: ")
+        sb = sb_append_int(sb, diag.error_count)
+        sb = sb_append(sb, " error(s), ")
+        var warn_count = count - diag.error_count
+        sb = sb_append_int(sb, warn_count)
+        sb = sb_append(sb, " warning(s)")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+
+    virc_print_compile_time()
+
+    out diag.error_count
 end.
 
 export pass10_code_to_msg, pass10_emit_diagnostics, pass10_print_one, pass10_emit_json,

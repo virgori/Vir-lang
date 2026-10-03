@@ -1,0 +1,310 @@
+##
+ * vir/compiler/semantic/diagnostics/json.vri
+ * ==============================================================
+ * Diagnostic JSON serialization, machine-readable formatting, and compiler aborts.
+ ##
+
+include string_rt
+include context
+include source_manager
+include cli_ui
+include rt.alloc
+import vir_alloc, vir_free, alloc from rt.alloc
+include rt.syscall
+import sys_exit from rt.syscall
+
+include sem_diag_session
+include sem_diag_msg_frontend
+include sem_diag_msg_semantic
+include sem_diag_actions
+
+func pass10_json_escape_buffer(sb: StringBuilder, data: int, slen: int):
+    if data == 0 or slen <= 0 do out sb end
+    var i = 0
+    when i < slen loop
+        let b = native_read_u8(data, i)
+        if b == 34 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 34)
+        eif b == 92 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 92)
+        eif b == 10 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 110)
+        eif b == 13 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 114)
+        eif b == 9 do
+            sb = sb_append_char(sb, 92)
+            sb = sb_append_char(sb, 116)
+        eif b < 32 do
+            # JSON forbids all unescaped C0 controls, not only tab/CR/LF.
+            sb = sb_append(sb, "\\u00")
+            let digits = "0123456789abcdef" as int
+            sb = sb_append_char(sb, native_read_u8(digits, b / 16))
+            sb = sb_append_char(sb, native_read_u8(digits, b mod 16))
+        else
+            sb = sb_append_char(sb, b)
+        end
+        i = i + 1
+    end
+    out sb
+end.
+
+func pass10_json_escape_cstr(sb: StringBuilder, s: int):
+    if s == 0 do out sb end
+    out pass10_json_escape_buffer(sb, s, rt_strlen(s))
+end.
+
+func pass10_json_escape_str(sb: StringBuilder, s: string):
+    let saddr = s as i64
+    if saddr == 0 do out sb end
+    if saddr > 4096 and saddr < 281474976710656 do
+        let sdata = native_read_i64(saddr, 0)
+        let slen = native_read_i64(saddr, 8)
+        let scap = native_read_i64(saddr, 16)
+        if sdata > 4096 and sdata < 281474976710656 and slen >= 0 and scap >= slen and scap < 1048576 do
+            out pass10_json_escape_buffer(sb, sdata, slen)
+        end
+    end
+    out pass10_json_escape_buffer(sb, saddr, rt_strlen(saddr))
+end.
+
+func pass10_emit_json_one(sb: StringBuilder, d: Diagnostic):
+    let level = native_read_i64(d as i64, 0)
+    let code = native_read_i64(d as i64, 8)
+    let d_span_id = native_read_i64(d as i64, 72)
+    var line = native_read_i64(d as i64, 16)
+    var col = native_read_i64(d as i64, 24)
+    var end_line = line
+    var end_col = col + 1
+    var file_path = native_read_i64(d as i64, 80)
+    if d_span_id > 0 and g_active_source_manager != 0 do
+        let sp = sm_get_span(g_active_source_manager, d_span_id)
+        if sp != 0 do
+            line = native_read_i64(sp, 8)
+            col = native_read_i64(sp, 16)
+            end_line = native_read_i64(sp, 24)
+            end_col = native_read_i64(sp, 32)
+            let sp_fid = native_read_i64(sp, 0)
+            file_path = sm_get_file_path(g_active_source_manager, sp_fid)
+        end
+    end
+    let extra = native_read_i64(d as i64, 32) as string
+    let sec_line = native_read_i64(d as i64, 40)
+    var sec_col = native_read_i64(d as i64, 48)
+    let sec_note = native_read_i64(d as i64, 56) as string
+    if col <= 0 do col = 1 end
+    if end_col <= col do end_col = col + 1 end
+    if sec_col <= 0 and sec_line > 0 do sec_col = 1 end
+    if file_path == 0 and g_active_source_manager != 0 do
+        file_path = sm_get_file_path(g_active_source_manager, 0)
+    end
+    sb = sb_append(sb, "{\"code\":\"")
+    sb = sb_append(sb, pass10_code_to_prefix(level))
+    if code < 1000 do sb = sb_append(sb, "0") end
+    if code < 100 do sb = sb_append(sb, "0") end
+    if code < 10 do sb = sb_append(sb, "0") end
+    sb = sb_append_int(sb, code)
+    sb = sb_append(sb, "\",\"severity\":\"")
+    if level == DiagnosticLevel.Warning do
+        sb = sb_append(sb, "warning")
+    eif level == DiagnosticLevel.Info do
+        sb = sb_append(sb, "info")
+    else
+        sb = sb_append(sb, "error")
+    end
+    sb = sb_append(sb, "\",\"message\":\"")
+    let msg_str = pass10_code_to_msg(code, extra)
+    sb = pass10_json_escape_str(sb, msg_str)
+    sb = sb_append(sb, "\",\"primary_span\":{\"file\":\"")
+    sb = pass10_json_escape_cstr(sb, file_path)
+    sb = sb_append(sb, "\",\"start_line\":")
+    sb = sb_append_int(sb, line)
+    sb = sb_append(sb, ",\"start_column\":")
+    sb = sb_append_int(sb, col)
+    sb = sb_append(sb, ",\"end_line\":")
+    sb = sb_append_int(sb, end_line)
+    sb = sb_append(sb, ",\"end_column\":")
+    sb = sb_append_int(sb, end_col)
+    sb = sb_append(sb, "},\"related_locations\":")
+    var sec_file_path = native_read_i64(d as i64, 96)
+    if sec_file_path == 0 and g_active_source_manager != 0 do
+        let sec_fid = native_read_i64(d as i64, 88)
+        if sec_fid > 0 do
+            sec_file_path = sm_get_file_path(g_active_source_manager, sec_fid)
+        end
+    end
+    if sec_file_path == 0 do
+        sec_file_path = file_path
+    end
+    if sec_line > 0 do
+        sb = sb_append(sb, "[{\"file\":\"")
+        sb = pass10_json_escape_cstr(sb, sec_file_path)
+        sb = sb_append(sb, "\",\"line\":")
+        sb = sb_append_int(sb, sec_line)
+        sb = sb_append(sb, ",\"column\":")
+        sb = sb_append_int(sb, sec_col)
+        sb = sb_append(sb, ",\"message\":\"")
+        if (sec_note as i64) != 0 and rt_strlen(sec_note as i64) > 0 do
+            sb = pass10_json_escape_str(sb, sec_note)
+        else
+            sb = sb_append(sb, "related location")
+        end
+        sb = sb_append(sb, "\"}]")
+    else
+        sb = sb_append(sb, "[]")
+    end
+    sb = sb_append(sb, ",\"diagnosticId\":\"")
+    sb = sb_append_int(sb, g_diagRecordIndex)
+    sb = sb_append(sb, "\",\"phase\":\"")
+    sb = pass10_json_escape_cstr(sb, pass10_code_to_phase(code) as int)
+    sb = sb_append(sb, "\",\"subsystem\":\"Compiler\",\"stage\":\"Stage 1 (Vir Native)\"")
+    let fn_ctx = native_read_i64(d as i64, 104) as string
+    if (fn_ctx as i64) != 0 and fat_str_len(fn_ctx) > 0 do
+        sb = sb_append(sb, ",\"functionContext\":\"")
+        sb = pass10_json_escape_str(sb, fn_ctx)
+        sb = sb_append(sb, "\"")
+    else
+        sb = sb_append(sb, ",\"functionContext\":null")
+    end
+    let exp_typ = native_read_i64(d as i64, 112) as string
+    if (exp_typ as i64) != 0 and fat_str_len(exp_typ) > 0 do
+        sb = sb_append(sb, ",\"expectedType\":\"")
+        sb = pass10_json_escape_str(sb, exp_typ)
+        sb = sb_append(sb, "\"")
+    else
+        sb = sb_append(sb, ",\"expectedType\":null")
+    end
+    let act_typ = native_read_i64(d as i64, 120) as string
+    if (act_typ as i64) != 0 and fat_str_len(act_typ) > 0 do
+        sb = sb_append(sb, ",\"actualType\":\"")
+        sb = pass10_json_escape_str(sb, act_typ)
+        sb = sb_append(sb, "\"")
+    else
+        sb = sb_append(sb, ",\"actualType\":null")
+    end
+    sb = sb_append(sb, ",\"analysis\":\"")
+    sb = pass10_json_escape_str(sb, msg_str)
+    sb = sb_append(sb, "\",\"causes\":\"")
+    sb = pass10_json_escape_cstr(sb, pass10_code_to_causes(code) as int)
+    sb = sb_append(sb, "\",\"action\":\"")
+    sb = pass10_json_escape_cstr(sb, pass10_code_to_actions(code) as int)
+    sb = sb_append(sb, "\"}")
+    out sb
+end.
+
+func pass10CaptureDiagnostics(diag: &DiagnosticEngine):
+    if g_diagSessionBody == 0 do g_diagSessionBody = vir_alloc(16777217) end
+    let count = vec_len_rt(diag.diagnostics)
+    g_diagSessionErrors = diag.error_count
+    g_diagSessionWarnings = 0
+    arena:
+        var text = sb_new()
+        g_diagRecordIndex = 0
+        if count > 0 do
+            # Legacy top-level first-diagnosticRecord fields remain available. Use the
+            # same serializer as the array, so location and content cannot drift.
+            var first = pass10_emit_json_one(sb_new(), vec_get_rt(diag.diagnostics, 0))
+            let
+                data = sb_to_string(first)
+                length = rt_strlen(data)
+            var index = 1
+            when index + 1 < length loop
+                text = sb_append_char(text, native_read_u8(data, index))
+                index = index + 1
+            end
+            text = sb_append_char(text, 44)
+            sb_free(first)
+        end
+        text = sb_append(text, "\"diagnostics\":[")
+        g_diagSessionArrayStart = rt_strlen(sb_to_string(text))
+        var index = 0
+        when index < count loop
+            if index > 0 do text = sb_append_char(text, 44) end
+            let diagnosticRecord = vec_get_rt(diag.diagnostics, index)
+            if native_read_i64(diagnosticRecord, 0) == DiagnosticLevel.Warning do
+                g_diagSessionWarnings = g_diagSessionWarnings + 1
+            end
+            g_diagRecordIndex = index
+            text = pass10_emit_json_one(text, diagnosticRecord)
+            index = index + 1
+        end
+        text = sb_append_char(text, 93)
+        pass10SessionCopy(sb_to_string(text))
+        sb_free(text)
+    end
+end.
+
+func pass10_emit_json(diag: &DiagnosticEngine):
+    pass10CaptureDiagnostics(diag)
+    if g_diagSessionActive == 0 do
+        g_diagSessionEmitted = 0
+        pass10SessionEmit(diag.error_count)
+    end
+    out diag.error_count
+end.
+
+func compilerFailure:
+    in code: int
+       message: int
+       classicMessage: int
+    var diagnosticRecord = sb_append(sb_new(), "{\"code\":")
+    if code == 0 do
+        diagnosticRecord = sb_append(diagnosticRecord, "null")
+    else
+        diagnosticRecord = sb_append_char(diagnosticRecord, 34)
+        diagnosticRecord = pass10_json_escape_cstr(diagnosticRecord, code)
+        diagnosticRecord = sb_append_char(diagnosticRecord, 34)
+    end
+    diagnosticRecord = sb_append(diagnosticRecord, ",\"severity\":\"error\",\"message\":\"")
+    diagnosticRecord = pass10_json_escape_cstr(diagnosticRecord, message)
+    diagnosticRecord = sb_append(diagnosticRecord, "\",\"stage\":\"")
+    diagnosticRecord = sb_append(diagnosticRecord, cliUiPhaseName(g_ui_phase))
+    diagnosticRecord = sb_append(diagnosticRecord, "\",\"related_locations\":[]}")
+    let data = sb_to_string(diagnosticRecord)
+    var text = sb_new()
+    var index = 1
+    when index + 1 < rt_strlen(data) loop
+        text = sb_append_char(text, native_read_u8(data, index))
+        index = index + 1
+    end
+    text = sb_append(text, ",\"diagnostics\":[")
+    let arrayStart = rt_strlen(sb_to_string(text))
+    if g_diagSessionCaptured == 1 & g_diagSessionArrayStart > 0 do
+        index = g_diagSessionArrayStart
+        let length = rt_strlen(g_diagSessionBody)
+        when index + 1 < length loop
+            text = sb_append_char(text, native_read_u8(g_diagSessionBody, index))
+            index = index + 1
+        end
+        if g_diagSessionArrayStart + 1 < length do text = sb_append_char(text, 44) end
+    end
+    text = sb_append(text, data)
+    text = sb_append_char(text, 93)
+    pass10SessionCopy(sb_to_string(text))
+    g_diagSessionArrayStart = arrayStart
+    g_diagSessionErrors = g_diagSessionErrors + 1
+    if g_diag_json == 0 do
+        if g_ui_mode == 1 do
+            cliUiFailurePhase()
+            cliUiLine(classicMessage)
+            cliUiBuildResult(g_diagSessionErrors)
+        else
+            print_ln(classicMessage)
+        end
+    end
+    sb_free(text)
+    sb_free(diagnosticRecord)
+end.
+
+func compilerAbort():
+    cliSessionFinish(1)
+    pass10SessionEmit(1)
+    sys_exit(1)
+end.
+
+export pass10_json_escape_buffer, pass10_json_escape_cstr, pass10_json_escape_str,
+       pass10_emit_json_one, pass10CaptureDiagnostics, pass10_emit_json,
+       compilerFailure, compilerAbort
