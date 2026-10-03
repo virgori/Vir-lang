@@ -34,6 +34,7 @@ related:
     - "VIRC-RPT-0011"
     - "VIRC-RPT-0012"
     - "VIRC-RPT-0013"
+    - "VIRC-RPT-0014"
 supersedes: null
 superseded_by: null
 tags:
@@ -1314,3 +1315,4 @@ the selected baseline or skip later regression comparison.
 | 2026-10-02 | Rebased preparation on current Vir 4.0.0 source snapshot `fd0064ea`; baseline failures are recorded rather than required to be green, and later phases must not add unexplained regressions |
 | 2026-10-02 | Linked VIRC-RPT-0002 |
 | 2026-10-03 | Linked VIRC-RPT-0013 |
+| 2026-10-03 | Linked VIRC-RPT-0014 |
