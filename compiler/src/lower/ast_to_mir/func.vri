@@ -1,0 +1,464 @@
+##
+ * compiler/src/lower/ast_to_mir/func.vri — Function Lowering & AST Cloning
+ * =========================================================================
+ ##
+
+include types
+include vec_rt
+include string_rt
+include parser
+include mir
+include ast_to_mir_context
+include ast_to_mir_layout
+include ast_to_mir_builder
+include ast_to_mir_calls
+include ast_to_mir_expr_ops
+include ast_to_mir_expr
+include ast_to_mir_stmt_control
+include ast_to_mir_stmt
+
+func ast_build_global_init_func():
+    b = builder_new(0 - 1, fat_str_new("__vir_global_init"))
+    n = vec_len_rt(g_lower_global_names)
+    var i = 0
+    when i < n loop
+        init_value = vec_get_rt(g_lower_global_values, i)
+        init_node = vec_get_rt(g_lower_global_init_nodes, i) as AstNode
+        # For entity/array/tuple literals or any non-constant init, lower the AST node.
+        needs_lower = 0
+        if init_node != 0 do
+            node_t = ast_node_type_of(init_node)
+            if node_t == AstType.EntityLiteral or node_t == AstType.ArrayLiteral or node_t == AstType.TupleExpr or node_t == AstType.EnumConstruct do
+                needs_lower = 1
+            end
+        end
+        if needs_lower == 1 do
+            var b2 = lower_expr(b, init_node)
+            var val_opnd = g_lower_expr_result_opnd as MirOperand
+            b2 = emit_intrinsic(b2, MIR_INTR_GLOBAL_STORE, mir_opnd_imm(i), val_opnd)
+            b = b2
+        else
+            b = emit_intrinsic(b, MIR_INTR_GLOBAL_STORE, mir_opnd_imm(i), mir_opnd_imm(init_value))
+        end
+        i = i + 1
+    end
+    b = builder_add_instr(b, mir_instr_new(MirOp.Return, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+    out builder_func(b)
+end.
+func lower_stmt(b: &MirBuilder, stmt: &AstNode):
+	# MirBuilder is mutated in place. In native self-host output the large
+	# lower_stmt_impl return CFG can occasionally leave an AstType/boolean in
+	# X0 instead of the builder pointer (for example 2 after a terminated
+	# function body). Preserve the input handle in that case; all mutations
+	# performed by the lowering call are already visible through it.
+	lowered_b = lower_stmt_impl(b, stmt)
+	out b
+end.
+
+func ast_lower_func(func_id: int, ast_func: &AstNode):
+    g_scope_stack = vec_new_rt()
+    fname = ast_node_name(ast_func)
+    fname2 = ast_node_name2(ast_func)
+	b = builder_new(func_id, fname)
+	f = builder_func(b)
+	g_current_func_buckets = native_read_i64(f as i64, 64)
+    # Modifiers carried in name2: async / precomp / method
+	if fat_cstr_eq(fname2, "async") do
+		b = emit_intrinsic(b, MIR_INTR_ASYNC, mir_opnd_none(), mir_opnd_none())
+	end
+	is_method = 0
+	if fat_cstr_eq(fname2, "method") == 1 do
+		b = emit_intrinsic(b, MIR_INTR_DECL, mir_opnd_none(), mir_opnd_imm(AstType.MethodCall as i64))
+		is_method = 1
+	end
+	child_count = ast_node_child_count(ast_func)
+
+	var param_idx = 0
+	if is_method == 1 do
+		var has_this = 0
+		if child_count > 0 do
+			first_ch = ast_node_child(ast_func, 0)
+			fcnt = ast_node_type_of(first_ch)
+			if fcnt == AstType.Identifier or fcnt == AstType.RefParam or fcnt == AstType.ParamDef or fcnt == AstType.OutParam do
+				if fat_cstr_eq(ast_node_name(first_ch), "this") == 1 do
+					has_this = 1
+				end
+			end
+		end
+		if g_current_entity_name != 0 do
+			set_var_type(fat_str_new("this"), g_current_entity_name as string)
+		end
+		if has_this == 0 do
+			if ast_node_int_val(ast_func) == 0 do
+				var (b_th, pv_th) = builder_new_vreg(b)
+				b_th = emit_intrinsic(b_th, MIR_INTR_PARAM, mir_opnd_vreg(pv_th), mir_opnd_imm(0))
+				b = set_var_vreg(b_th, fat_str_new("this"), pv_th)
+				param_idx = 1
+			end
+		end
+	end
+
+	g_func_ref_param_names = vec_new_rt()
+	g_func_ref_param_vregs = vec_new_rt()
+	g_func_ref_param_modes = vec_new_rt()
+	g_func_ref_param_hash = hash_table_new()
+	g_arena_mark_stack = vec_new_rt()
+
+	# Separate the executable body from function-level cleanup clauses.  Cleanup
+	# gets dedicated CFG blocks so early `out` and `throw` cannot bypass it.
+	var body_node = 0 as AstNode
+	var ensure_node = 0 as AstNode
+	var revert_node = 0 as AstNode
+	var scan_i = 0
+	when scan_i < child_count loop
+		scan_ch = ast_node_child(ast_func, scan_i)
+		scan_nt = ast_node_type_of(scan_ch)
+		if scan_nt == AstType.Block and (body_node as i64) == 0 do
+			body_node = scan_ch
+		eif scan_nt == AstType.EnsureBlock do
+			ensure_node = scan_ch
+		eif scan_nt == AstType.RevertBlock do
+			revert_node = scan_ch
+		end
+		scan_i = scan_i + 1
+	end
+
+	if child_count > 0 do
+		var pi = 0
+		when pi < child_count loop
+			ch = ast_node_child(ast_func, pi)
+			cnt = ast_node_type_of(ch)
+			if cnt == AstType.Identifier or cnt == AstType.RefParam or cnt == AstType.ParamDef or cnt == AstType.OutParam do
+				var (b2, pv) = builder_new_vreg(b)
+				b2 = emit_intrinsic(b2, MIR_INTR_PARAM, mir_opnd_vreg(pv), mir_opnd_imm(param_idx))
+				pname = ast_node_name(ch)
+				b = set_var_vreg(b2, pname, pv)
+				if ast_node_name2(ch) != 0 and fat_str_len(ast_node_name2(ch)) > 0 do
+					set_var_type(pname, ast_node_name2(ch))
+				end
+				var pmode = 0
+				if cnt == AstType.RefParam or (cnt == AstType.ParamDef and ast_node_int_val(ch) == 1) do
+					pmode = 1
+				eif cnt == AstType.OutParam or (cnt == AstType.ParamDef and ast_node_int_val(ch) == 2) do
+					pmode = 2
+				end
+				if pmode != 0 do
+					let r_idx = vec_len_rt(g_func_ref_param_names)
+					g_func_ref_param_names = vec_push_rt(g_func_ref_param_names, pname as i64)
+					g_func_ref_param_vregs = vec_push_rt(g_func_ref_param_vregs, pv)
+					g_func_ref_param_modes = vec_push_rt(g_func_ref_param_modes, pmode)
+					hash_table_insert(g_func_ref_param_hash, g_func_ref_param_names, pname, r_idx)
+				end
+				param_idx = param_idx + 1
+			end
+			pi = pi + 1
+		end
+	end
+
+	# Stable return/error slots survive every cleanup edge.
+	var (b_ret_slot, ret_vreg) = builder_new_vreg(b)
+	b = emit_move(b_ret_slot, ret_vreg, mir_opnd_imm(0))
+	var (b_err_slot, func_err_vreg) = builder_new_vreg(b)
+	b = emit_move(b_err_slot, func_err_vreg, mir_opnd_imm(0))
+
+	var (b_return, return_id) = builder_add_block(b)
+	b = b_return
+	var (b_error_return, error_return_id) = builder_add_block(b)
+	b = b_error_return
+	var normal_ensure_id = 0 - 1
+	var error_ensure_id = 0 - 1
+	var func_revert_id = 0 - 1
+	if (ensure_node as i64) != 0 do
+		var (b_ne, ne_id) = builder_add_block(b)
+		b = b_ne
+		normal_ensure_id = ne_id
+		var (b_ee, ee_id) = builder_add_block(b)
+		b = b_ee
+		error_ensure_id = ee_id
+	end
+	if (revert_node as i64) != 0 do
+		var (b_fr, fr_id) = builder_add_block(b)
+		b = b_fr
+		func_revert_id = fr_id
+	end
+
+	saved_func_return = g_func_return_block
+	saved_func_ensure = g_func_normal_ensure_block
+	saved_func_ret = g_func_ret_vreg
+	saved_cleanup = g_in_func_cleanup
+	saved_try_revert = g_try_revert_block
+	saved_try_retry = g_try_retry_block
+	saved_try_err = g_try_err_vreg
+	saved_try_parent_err = g_try_parent_err_vreg
+	let saved_func_try_arena_depth = g_try_arena_depth
+	g_try_arena_depth = 0
+	g_func_return_block = return_id
+	g_func_normal_ensure_block = normal_ensure_id
+	g_func_ret_vreg = ret_vreg
+	g_in_func_cleanup = 0
+	g_try_retry_block = 0 - 1
+	g_try_err_vreg = func_err_vreg
+	g_try_parent_err_vreg = 0 - 1
+	if func_revert_id >= 0 do
+		g_try_revert_block = func_revert_id
+	eif error_ensure_id >= 0 do
+		g_try_revert_block = error_ensure_id
+	else
+		g_try_revert_block = error_return_id
+	end
+
+	if (body_node as i64) != 0 do b = lower_stmt(b, body_node) end
+	if not builder_current_block_terminated(b) do
+		if normal_ensure_id >= 0 do b = emit_jump(b, normal_ensure_id) else b = emit_jump(b, return_id) end
+	end
+
+	# A handled throw runs function revert first, then normal ensure.
+	if func_revert_id >= 0 do
+		b = builder_set_current_block(b, func_revert_id)
+		g_in_func_cleanup = 1
+		if error_ensure_id >= 0 do g_try_revert_block = error_ensure_id else g_try_revert_block = error_return_id end
+		b = lower_stmt(b, revert_node)
+		if not builder_current_block_terminated(b) do
+			if normal_ensure_id >= 0 do b = emit_jump(b, normal_ensure_id) else b = emit_jump(b, return_id) end
+		end
+	end
+
+	if normal_ensure_id >= 0 do
+		b = builder_set_current_block(b, normal_ensure_id)
+		g_in_func_cleanup = 1
+		g_try_revert_block = 0 - 1
+		b = lower_stmt(b, ensure_node)
+		if not builder_current_block_terminated(b) do b = emit_jump(b, return_id) end
+
+		# Unhandled throw still executes ensure, then propagates the original erx.
+		b = builder_set_current_block(b, error_ensure_id)
+		b = lower_stmt(b, ensure_node)
+		if not builder_current_block_terminated(b) do
+			b = emit_jump(b, error_return_id)
+		end
+	end
+
+	b = builder_set_current_block(b, return_id)
+	b = emit_intrinsic(b, MIR_INTR_ERX, mir_opnd_none(), mir_opnd_imm(0))
+	ins_ret = mir_instr_new(MirOp.Return, mir_opnd_none(), mir_opnd_vreg(ret_vreg), mir_opnd_none())
+	b = builder_add_instr(b, ins_ret)
+
+	b = builder_set_current_block(b, error_return_id)
+	if fat_cstr_eq(fname, "main") == 1 do
+		b = emit_intrinsic(b, MIR_INTR_THROW, mir_opnd_none(), mir_opnd_vreg(func_err_vreg))
+	else
+		b = emit_intrinsic(b, MIR_INTR_ERX, mir_opnd_none(), mir_opnd_vreg(func_err_vreg))
+		err_ret = mir_instr_new(MirOp.Return, mir_opnd_none(), mir_opnd_imm(0), mir_opnd_none())
+		b = builder_add_instr(b, err_ret)
+	end
+
+	g_func_return_block = saved_func_return
+	g_func_normal_ensure_block = saved_func_ensure
+	g_func_ret_vreg = saved_func_ret
+	g_in_func_cleanup = saved_cleanup
+	g_try_revert_block = saved_try_revert
+	g_try_retry_block = saved_try_retry
+	g_try_err_vreg = saved_try_err
+	g_try_parent_err_vreg = saved_try_parent_err
+	g_try_arena_depth = saved_func_try_arena_depth
+	f = builder_func(b)
+    vc = native_read_i64(b as i64, 8)
+    native_write_i64(f as i64, 16, vc)
+	out f
+end.
+func lower_decl_marker(b: MirBuilder, node: &AstNode):
+    # Decl-only nodes: Intrinsic DECL so later MIR_/linker sees the name.
+	var (b1, nid) = builder_intern(b, ast_node_name(node))
+	b1 = emit_set_arg(b1, 0, mir_opnd_imm(nid))
+	out emit_intrinsic(b1, MIR_INTR_DECL, mir_opnd_none(), mir_opnd_imm(ast_node_type_of(node) as i64))
+end.
+
+func canonical_type_hash(s: string):
+    slen = fat_str_len(s)
+    var h: i64 = 5381
+    var i = 0
+    when i < slen loop
+        b = fat_str_byte_at(s, i)
+        if b != 32 do
+            h = ((h * 33) xor (b as i64))
+        end
+        i = i + 1
+    end
+    if h < 0 do h = 0 - h end
+    out h
+end.
+
+func hash_to_hex8(val: i64):
+    var res = fat_str_new("")
+    var v = val
+    var i = 0
+    when i < 8 loop
+        nib = (v and 15) as int
+        var ch = 48 + nib
+        if nib >= 10 do
+            ch = 87 + nib
+        end
+        res = fat_str_concat(fat_char_to_str(ch), res)
+        v = v shr 4
+        i = i + 1
+    end
+    out res
+end.
+
+func escape_type_arg(arg: string):
+    slen = fat_str_len(arg)
+    var res = fat_str_new("")
+    var i = 0
+    when i < slen loop
+        b = fat_str_byte_at(arg, i)
+        if b == 95 do                                  # '_' -> '_u'
+            res = fat_str_concat(res, fat_str_new("_u"))
+        eif b == 60 do                                 # '<' -> '_L'
+            res = fat_str_concat(res, fat_str_new("_L"))
+        eif b == 62 do                                 # '>' -> '_G'
+            res = fat_str_concat(res, fat_str_new("_G"))
+        eif b == 44 do                                 # ',' -> '_C'
+            res = fat_str_concat(res, fat_str_new("_C"))
+        eif b == 40 do                                 # '(' -> '_P'
+            res = fat_str_concat(res, fat_str_new("_P"))
+        eif b == 41 do                                 # ')' -> '_p'
+            res = fat_str_concat(res, fat_str_new("_p"))
+        eif b == 91 do                                 # '[' -> '_B'
+            res = fat_str_concat(res, fat_str_new("_B"))
+        eif b == 93 do                                 # ']' -> '_b'
+            res = fat_str_concat(res, fat_str_new("_b"))
+        eif b == 38 do                                 # '&' -> '_r'
+            res = fat_str_concat(res, fat_str_new("_r"))
+        eif b == 42 do                                 # '*' -> '_t'
+            res = fat_str_concat(res, fat_str_new("_t"))
+        eif b == 45 and i + 1 < slen and fat_str_byte_at(arg, i + 1) == 62 do  # '->' -> '_to'
+            res = fat_str_concat(res, fat_str_new("_to"))
+            i = i + 1
+        eif b == 32 do
+            # skip spaces
+        else
+            res = fat_str_concat(res, fat_str_slice(arg, i, 1))
+        end
+        i = i + 1
+    end
+    out res
+end.
+
+func build_specialized_func_name(callee_name: &string, gen_args: &string):
+    h = canonical_type_hash(gen_args as string)
+    hex_str = hash_to_hex8(h)
+    var res = fat_str_concat(callee_name as string, fat_str_new("__spec__"))
+    res = fat_str_concat(res, hex_str)
+    res = fat_str_concat(res, fat_str_new("_"))
+    n_args = count_list_items(gen_args as string)
+    var k = 0
+    when k < n_args loop
+        raw_arg = get_list_item(gen_args as string, k)
+        esc_arg = escape_type_arg(raw_arg)
+        esc_len = fat_str_len(esc_arg)
+        var prefix = fat_str_concat(fat_str_new("_N"), fat_str_new(rt_itoa(esc_len)))
+        prefix = fat_str_concat(prefix, fat_str_new("_"))
+        res = fat_str_concat(res, prefix)
+        res = fat_str_concat(res, esc_arg)
+        k = k + 1
+    end
+    out res
+end.
+
+func clone_ast_with_subst(node: &AstNode, gen_params: &string, gen_args: &string):
+    if (node as i64) == 0 do out 0 as AstNode end
+    let n_ptr = node as i64
+    cnt = native_read_i64(n_ptr, 16) as AstType
+    var c = ast_new(cnt)
+    let c_ptr = c as i64
+    native_write_i64(c_ptr, 0, native_read_i64(n_ptr, 0))
+    n2 = native_read_i64(n_ptr, 8) as string
+    if (n2 as i64) != 0 do
+        if fat_str_len(n2) > 0 do
+            subst_n2 = generic_substitute_type(gen_params, gen_args, n2 as i64)
+            native_write_i64(c_ptr, 8, subst_n2 as i64)
+        end
+    end
+    native_write_i64(c_ptr, 24, native_read_i64(n_ptr, 24))
+    native_write_i64(c_ptr, 32, native_read_i64(n_ptr, 32))
+    native_write_i64(c_ptr, 40, native_read_i64(n_ptr, 40))
+    native_write_i64(c_ptr, 48, native_read_i64(n_ptr, 48))
+    native_write_i64(c_ptr, 56, native_read_i64(n_ptr, 56))
+    n_kids = ast_node_child_count(node)
+    var i = 0
+    when i < n_kids loop
+        kid = ast_node_child(node, i)
+        c = ast_add_child(c, clone_ast_with_subst(kid, gen_params, gen_args))
+        i = i + 1
+    end
+    out c
+end.
+
+func specialize_func_def(orig_fn: &AstNode, spec_name: &string, gen_params: &string, gen_args: &string):
+    var spec_fn = ast_new(AstType.FuncDef)
+    let s_ptr = spec_fn as i64
+    let o_ptr = orig_fn as i64
+    native_write_i64(s_ptr, 0, spec_name as i64)
+    orig_ret = native_read_i64(o_ptr, 8) as string
+    if (orig_ret as i64) != 0 do
+        if fat_str_len(orig_ret) > 0 do
+            subst_ret = generic_substitute_type(gen_params, gen_args, orig_ret as i64)
+            native_write_i64(s_ptr, 8, subst_ret as i64)
+        end
+    end
+    native_write_i64(s_ptr, 24, native_read_i64(o_ptr, 24))
+    native_write_i64(s_ptr, 32, native_read_i64(o_ptr, 32))
+    native_write_i64(s_ptr, 40, native_read_i64(o_ptr, 40))
+    native_write_i64(s_ptr, 48, native_read_i64(o_ptr, 48))
+    native_write_i64(s_ptr, 56, 0)
+    n_kids = ast_node_child_count(orig_fn)
+    var i = 0
+    when i < n_kids loop
+        kid = ast_node_child(orig_fn, i)
+        spec_fn = ast_add_child(spec_fn, clone_ast_with_subst(kid, gen_params, gen_args))
+        i = i + 1
+    end
+    out spec_fn
+end.
+
+func monomorphize_walk(prog: &AstNode, node: &AstNode):
+    if (node as i64) == 0 do out 0 end
+    nt = ast_node_type_of(node)
+    if nt == AstType.Call do
+        gen_args = ast_node_name2(node)
+        if (gen_args as i64) != 0 do
+            if fat_str_len(gen_args) > 0 do
+                callee_name = ast_node_name(node)
+                fn_ast = find_func_ast(callee_name as i64)
+                if (fn_ast as i64) != 0 do
+                    if fn_ast.builtin_id != 0 do
+                        gen_params = fn_ast.builtin_id as string
+                        spec_name = build_specialized_func_name(callee_name, gen_args)
+                        existing = find_func_ast(spec_name as i64)
+                        if (existing as i64) == 0 do
+                            spec_fn = specialize_func_def(fn_ast, spec_name, gen_params, gen_args)
+                            fn_idx = vec_len_rt(g_func_ast_names)
+                            g_func_ast_names = vec_push_rt(g_func_ast_names, spec_name as i64)
+                            g_func_ast_nodes = vec_push_rt(g_func_ast_nodes, spec_fn as i64)
+                            hash_table_insert(g_func_ast_hash, g_func_ast_names, spec_name, fn_idx)
+
+                            prog = ast_add_child(prog, spec_fn)
+                            monomorphize_walk(prog, spec_fn)
+                        end
+                        native_write_i64(node as i64, 0, spec_name as i64)
+                        native_write_i64(node as i64, 8, fat_str_new("") as i64)
+                    end
+                end
+            end
+        end
+    end
+    n_kids = ast_node_child_count(node)
+    var i = 0
+    when i < n_kids loop
+        kid = ast_node_child(node, i)
+        monomorphize_walk(prog, kid)
+        i = i + 1
+    end
+    out 0
+end.
+

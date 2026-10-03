@@ -43303,30 +43303,14 @@ export mir_opt_set_program, mir_opt_set_current_func, set_mir_mutate_mode,
        mir_opt_sweep_dead_phis, mir_opt_cfg_simplification, mir_opt_arc_trial_deletion,
        mir_opt_reset_counters, mir_opt_get_last_changes, mir_opt_get_total_changes
 # @vir_source compiler/generated/virc.vri 60
-# @vir_source compiler/src/lower/ast_to_mir.vri 1
-#*#
- * vir/compiler/ast_to_mir.vri — AST to MIR Lowering
- * ==============================================================
- * Flattens AST into MIR basic blocks + CFG. Locals map to vregs.
- * Phi insertion is deferred to mir_ssa.vri (this phase emits non-SSA MIR).
- * Coverage / status: MUST_READ_CONTEXT/AST_TO_MIR_LOWERING_CHECKLIST.md
- #*#
-
-
-
-# Local fail-fast exit: avoids importing sys_exit (avoid include chain crash).
-# On macOS ARM64: X16=0x2000001, SVC #0x80. On Linux ARM64: X8=93, SVC #0.
-# We call syscall1 from rt.syscall if available, otherwise use direct native.
-# Simpler: just reference sys_exit which is always in scope when ast_to_mir is
-# expanded as part of virc.vri (which already includes rt.syscall).
-
-
-
+# @vir_source compiler/src/lower/ast_to_mir/context.vri 1
+##
+ * compiler/src/lower/ast_to_mir/context.vri — Lowering Context, Globals & Maps
+ * =============================================================================
+ ##
 
 import print_str, print_ln, g_disable_specialization from compiler.context
 
-# Map OpType → MirOp code.
-# Special: Land=-2, Lor=-3, PatternOp=-4 (Intrinsic PATTERN). Unknown=-1.
 var g_ast_lower_verbose: int = 0
 var g_lower_expr_result_opnd: i64 = 0
 var g_ast_to_mir_cur_module: string = ""
@@ -43583,6 +43567,655 @@ func is_known_dict_var(var_name: &string):
     end
     out 0
 end.
+
+
+func name_hash_256(name: &string):
+    n = fat_str_len(name as int) as i64
+    h = n * 17
+    var i = 0
+    when i < n loop
+        h = h * 131 + (fat_str_byte_at(name as int, i) as i64)
+        i = i + 1
+    end
+    if h < 0 do h = 0 - h end
+    out h mod 256
+end.
+
+func hash_table_new():
+    tab = vec_new_rt()
+    var i = 0
+    when i < 256 loop
+        tab = vec_push_rt(tab, 0)
+        i = i + 1
+    end
+    out tab
+end.
+
+func hash_table_lookup(hash_tab: i64, names: i64, name: &string):
+    if hash_tab == 0 or names == 0 do out 0 - 1 end
+    bid = name_hash_256(name)
+    bucket = vec_get_rt(hash_tab, bid)
+    if bucket == 0 do out 0 - 1 end
+    n = vec_len_rt(bucket)
+    var i = 0
+    when i < n loop
+        idx = vec_get_rt(bucket, i)
+        if fat_str_eq(vec_get_rt(names, idx) as string, name as string) == 1 do
+            out idx
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func hash_table_insert(hash_tab: i64, names: i64, name: &string, idx: i64):
+    if hash_tab == 0 do out 0 end
+    bid = name_hash_256(name)
+    bucket = vec_get_rt(hash_tab, bid)
+    if bucket == 0 do
+        bucket = vec_new_rt()
+    end
+    bucket = vec_push_rt(bucket, idx)
+    vec_set_rt(hash_tab, bid, bucket)
+    out 0
+end.
+
+func lookup_cached_name(names: i64, name: &string):
+    if names == 0 do out 0 - 1 end
+    if names == g_field_names and g_field_hash != 0 do
+        out hash_table_lookup(g_field_hash, names, name)
+    end
+    if names == g_scoped_field_names and g_scoped_field_hash != 0 do
+        out hash_table_lookup(g_scoped_field_hash, names, name)
+    end
+    if names == g_entity_names and g_entity_hash != 0 do
+        out hash_table_lookup(g_entity_hash, names, name)
+    end
+    if names == g_import_aliases and g_import_hash != 0 do
+        out hash_table_lookup(g_import_hash, names, name)
+    end
+    if names == g_register_field_names and g_regfield_hash != 0 do
+        out hash_table_lookup(g_regfield_hash, names, name)
+    end
+    n = vec_len_rt(names)
+    var i = 0
+    when i < n loop
+        if fat_str_eq(vec_get_rt(names, i) as string, name as string) == 1 do out i end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+
+func is_packed_entity(type_name: &string):
+    if g_entity_hash != 0 and type_name != 0 and fat_str_len(type_name as string) > 0 do
+        var idx = hash_table_lookup(g_entity_hash, g_entity_names, type_name)
+        if idx >= 0 and idx < vec_len_rt(g_entity_is_packed) do
+            out vec_get_rt(g_entity_is_packed, idx) == 1
+        end
+    end
+    out false
+end.
+
+func is_signed_type(t: string):
+    if t == 0 or fat_str_len(t) == 0 do out 0 end
+    if fat_cstr_eq(t, "i8") == 1 or fat_cstr_eq(t, "i16") == 1 or fat_cstr_eq(t, "i32") == 1 or fat_cstr_eq(t, "i64") == 1 do
+        out 1
+    end
+    out 0
+end.
+
+func get_type_byte_size(type_name: string):
+    if type_name == 0 or fat_str_len(type_name) == 0 do out 8 end
+    if fat_cstr_eq(type_name, "u8") == 1 or fat_cstr_eq(type_name, "i8") == 1 or fat_cstr_eq(type_name, "bool") == 1 do
+        out 1
+    end
+    if fat_cstr_eq(type_name, "u16") == 1 or fat_cstr_eq(type_name, "i16") == 1 do
+        out 2
+    end
+    if fat_cstr_eq(type_name, "u32") == 1 or fat_cstr_eq(type_name, "i32") == 1 do
+        out 4
+    end
+    if fat_cstr_eq(type_name, "u64") == 1 or fat_cstr_eq(type_name, "i64") == 1 or fat_cstr_eq(type_name, "int") == 1 or fat_cstr_eq(type_name, "float") == 1 or fat_cstr_eq(type_name, "ptr") == 1 or fat_cstr_eq(type_name, "usize") == 1 or fat_cstr_eq(type_name, "isize") == 1 do
+        out 8
+    end
+    if g_entity_hash != 0 do
+        var idx = hash_table_lookup(g_entity_hash, g_entity_names, type_name)
+        if idx >= 0 and idx < vec_len_rt(g_entity_sizes) do
+            var sz = vec_get_rt(g_entity_sizes, idx)
+            if sz > 0 do out sz end
+        end
+    end
+    out 8
+end.
+
+
+func eval_const_expr(node: &AstNode):
+    if node == 0 do out 0 end
+    nt = ast_node_type_of(node)
+    if nt == AstType.SizeofExpr do
+        out get_type_byte_size(ast_node_name(node))
+    end
+    if nt == AstType.LiteralInt do
+        out ast_node_int_val(node)
+    end
+    if nt == AstType.PrecompBlock do
+        out ast_node_int_val(node)
+    end
+    if nt == AstType.LiteralFloat do
+        # Float constants travel through the integer MIR immediate lane as their
+        # IEEE-754 payload. `int_val` is a distinct AST field and is zero for a
+        # float token, so using it silently rewrites every float const to 0.0.
+        out native_read_i64(node as i64, 48)
+    end
+    if nt == AstType.UnaryMinus do
+        if ast_node_child_count(node) > 0 do
+            out 0 - eval_const_expr(ast_node_child(node, 0))
+            let c = ast_node_child(node, 0)
+            if ast_node_type_of(c) == AstType.LiteralFloat do
+                out eval_const_expr(c) xor (1 shl 63)
+            end
+            out 0 - eval_const_expr(c)
+        end
+        out 0
+    end
+    if nt == AstType.Identifier do
+        cname = ast_node_name(node)
+        if fat_cstr_eq(cname, "true") == 1 do out 1 end
+        if fat_cstr_eq(cname, "false") == 1 do out 0 end
+        if fat_cstr_eq(cname, "null") == 1 do out 0 end
+        if fat_cstr_eq(cname, "void") == 1 do out 0 end
+        if g_const_hash > 0 do
+            c_idx = hash_table_lookup(g_const_hash, g_const_names, cname)
+            if c_idx >= 0 do
+                out vec_get_rt(g_const_values, c_idx)
+            end
+        end
+        out 0
+    end
+    if nt == AstType.FieldAccess do
+        if ast_node_child_count(node) > 0 do
+            base = ast_node_child(node, 0)
+            if ast_node_type_of(base) == AstType.Identifier do
+                key = fat_str_concat(fat_str_concat(ast_node_name(base), fat_str_new(".")), ast_node_name(node))
+                if g_const_hash > 0 do
+                    c_idx = hash_table_lookup(g_const_hash, g_const_names, key)
+                    if c_idx >= 0 do
+                        out vec_get_rt(g_const_values, c_idx)
+                    end
+                end
+            end
+        end
+        out 0
+    end
+    if nt == AstType.EnumAccess do
+        key = fat_str_concat(fat_str_concat(ast_node_name(node), fat_str_new(".")), ast_node_name2(node))
+        if g_const_hash > 0 do
+            c_idx = hash_table_lookup(g_const_hash, g_const_names, key)
+            if c_idx >= 0 do
+                out vec_get_rt(g_const_values, c_idx)
+            end
+        end
+        out 0
+    end
+    if nt == AstType.BinOp or nt == AstType.Compare do
+        if ast_node_child_count(node) >= 2 do
+            lval = eval_const_expr(ast_node_child(node, 0))
+            rval = eval_const_expr(ast_node_child(node, 1))
+            op = ast_node_op_of(node)
+            if op == OpType.Add do out lval + rval end
+            if op == OpType.Sub do out lval - rval end
+            if op == OpType.Mul do out lval * rval end
+            if op == OpType.Div do
+                if rval != 0 do out lval / rval end
+                out 0
+            end
+            if op == OpType.ModOp do
+                if rval != 0 do out lval mod rval end
+                out 0
+            end
+            if op == OpType.OrOp or op == OpType.Lor do out lval or rval end
+            if op == OpType.AndOp or op == OpType.Land do out lval and rval end
+            if op == OpType.XorOp do out lval xor rval end
+            if op == OpType.ShlOp do out lval shl rval end
+            if op == OpType.ShrOp do out lval shr rval end
+        end
+        out 0
+    end
+    out 0
+end.
+
+
+func set_global_prog_ast(ast: &AstNode):
+    g_entity_names = vec_new_rt()
+    g_import_aliases = vec_new_rt()
+    g_import_targets = vec_new_rt()
+    g_field_names = vec_new_rt()
+    g_field_indices = vec_new_rt()
+    g_register_field_names = vec_new_rt()
+    g_register_field_starts = vec_new_rt()
+    g_register_field_widths = vec_new_rt()
+
+    g_entity_hash = hash_table_new()
+    g_import_hash = hash_table_new()
+    g_field_hash = hash_table_new()
+    g_regfield_hash = hash_table_new()
+
+    g_const_names = vec_new_rt()
+    g_const_values = vec_new_rt()
+    g_const_hash = hash_table_new()
+
+    g_enum_names = vec_new_rt()
+    g_enum_nodes = vec_new_rt()
+    g_enum_is_tagged = vec_new_rt()
+    g_enum_sizes = vec_new_rt()
+    g_enum_hash = hash_table_new()
+    g_enum_variant_keys = vec_new_rt()
+    g_enum_variant_names = vec_new_rt()
+    g_enum_variant_enum_indices = vec_new_rt()
+    g_enum_variant_tags = vec_new_rt()
+    g_enum_variant_arities = vec_new_rt()
+    g_enum_variant_hash = hash_table_new()
+    g_enum_variant_nodes = vec_new_rt()
+
+    g_scoped_field_names = vec_new_rt()
+    g_scoped_field_indices = vec_new_rt()
+    g_scoped_field_types = vec_new_rt()
+    g_scoped_field_offsets = vec_new_rt()
+    g_scoped_field_sizes = vec_new_rt()
+    g_scoped_field_signed = vec_new_rt()
+    g_scoped_field_is_nested = vec_new_rt()
+    g_scoped_field_hash = hash_table_new()
+    g_scoped_method_names = vec_new_rt()
+    g_scoped_method_nodes = vec_new_rt()
+    g_scoped_method_hash = hash_table_new()
+
+    g_func_ast_names = vec_new_rt()
+    g_func_ast_nodes = vec_new_rt()
+    g_func_ast_hash = hash_table_new()
+
+    g_entity_is_packed = vec_new_rt()
+    g_entity_sizes = vec_new_rt()
+    g_entity_nodes = vec_new_rt()
+
+    g_var_type_names = vec_new_rt()
+    g_var_type_values = vec_new_rt()
+    g_var_type_hash = hash_table_new()
+    g_dict_var_names = vec_new_rt()
+    g_dict_var_hash = hash_table_new()
+
+    g_current_entity_name = 0
+
+    # Native code needs real cross-function storage for top-level `var`s.
+    # Assign each declaration a stable heap-header slot before lowering funcs.
+    g_lower_global_names = vec_new_rt()
+    g_lower_global_values = vec_new_rt()
+    g_lower_global_hash = hash_table_new()
+    g_lower_global_init_nodes = vec_new_rt()
+
+    var cur_module = fat_str_new("")
+    n = ast_node_child_count(ast)
+    var i = 0
+    when i < n loop
+        child = ast_node_child(ast, i)
+        child_type = ast_node_type_of(child)
+        if child_type == AstType.ModuleStmt do
+            if fat_str_len(ast_node_name(child)) > 0 do
+                cur_module = ast_node_name(child)
+            end
+        end
+        if child_type == AstType.FuncDef do
+            fn_name = ast_node_name(child)
+            var canonical_name = fn_name
+            if is_user_module(cur_module) == 1 and fat_cstr_eq(fn_name, "main") == 0 do
+                canonical_name = fat_str_concat(fat_str_concat(cur_module, fat_str_new(".")), fn_name)
+            end
+            if hash_table_lookup(g_func_ast_hash, g_func_ast_names, canonical_name) < 0 do
+                fn_idx = vec_len_rt(g_func_ast_names)
+                g_func_ast_names = vec_push_rt(g_func_ast_names, canonical_name as i64)
+                g_func_ast_nodes = vec_push_rt(g_func_ast_nodes, child as i64)
+                hash_table_insert(g_func_ast_hash, g_func_ast_names, canonical_name, fn_idx)
+            end
+            if is_user_module(cur_module) == 0 and hash_table_lookup(g_func_ast_hash, g_func_ast_names, fn_name) < 0 do
+                fn_idx = vec_len_rt(g_func_ast_names)
+                g_func_ast_names = vec_push_rt(g_func_ast_names, fn_name as i64)
+                g_func_ast_nodes = vec_push_rt(g_func_ast_nodes, child as i64)
+                hash_table_insert(g_func_ast_hash, g_func_ast_names, fn_name, fn_idx)
+            end
+        end
+        if child_type == AstType.ImportStmt do
+            child_count = ast_node_child_count(child)
+            var j = 0
+            when j < child_count loop
+                sym = ast_node_child(child, j)
+                alias = ast_node_name2(sym)
+                target = ast_node_name(sym)
+                if fat_str_len(alias) == 0 do
+                    alias = target
+                end
+                if hash_table_lookup(g_import_hash, g_import_aliases, alias) < 0 do
+                    idx = vec_len_rt(g_import_aliases)
+                    g_import_aliases = vec_push_rt(g_import_aliases, alias as i64)
+                    g_import_targets = vec_push_rt(g_import_targets, target as i64)
+                    hash_table_insert(g_import_hash, g_import_aliases, alias, idx)
+                end
+                j = j + 1
+            end
+        end
+        if child_type == AstType.EnumDef do
+            enum_name = ast_node_name(child)
+            var vcount = ast_node_child_count(child)
+            enum_idx = hash_table_lookup(g_enum_hash, g_enum_names, enum_name)
+            if enum_idx < 0 do
+                enum_idx = vec_len_rt(g_enum_names)
+                max_payloads = 0
+                var scan_i = 0
+                when scan_i < vcount loop
+                    scan_variant = ast_node_child(child, scan_i)
+                    scan_arity = ast_node_child_count(scan_variant)
+                    if scan_arity > max_payloads do max_payloads = scan_arity end
+                    scan_i = scan_i + 1
+                end
+                tagged = 0
+                layout_size = ENUM_TAG_SLOT_SIZE
+                if max_payloads > 0 do
+                    tagged = 1
+                    layout_size = ENUM_TAG_SLOT_SIZE + max_payloads * ENUM_PAYLOAD_SLOT_SIZE
+                end
+                g_enum_names = vec_push_rt(g_enum_names, enum_name as i64)
+                g_enum_nodes = vec_push_rt(g_enum_nodes, child as i64)
+                g_enum_is_tagged = vec_push_rt(g_enum_is_tagged, tagged)
+                g_enum_sizes = vec_push_rt(g_enum_sizes, layout_size)
+                hash_table_insert(g_enum_hash, g_enum_names, enum_name, enum_idx)
+            end
+            var vi = 0
+            when vi < vcount loop
+                vnode = ast_node_child(child, vi)
+                vname = ast_node_name(vnode)
+                vval = ast_node_int_val(vnode)
+                dot_str = fat_str_new(".")
+                key = fat_str_concat(fat_str_concat(enum_name, dot_str), vname)
+                if hash_table_lookup(g_enum_variant_hash, g_enum_variant_keys, key) < 0 do
+                    variant_idx = vec_len_rt(g_enum_variant_keys)
+                    g_enum_variant_keys = vec_push_rt(g_enum_variant_keys, key as i64)
+                    g_enum_variant_names = vec_push_rt(g_enum_variant_names, vname as i64)
+                    g_enum_variant_enum_indices = vec_push_rt(g_enum_variant_enum_indices, enum_idx)
+                    g_enum_variant_tags = vec_push_rt(g_enum_variant_tags, vval)
+                    g_enum_variant_arities = vec_push_rt(g_enum_variant_arities, ast_node_child_count(vnode))
+                    g_enum_variant_nodes = vec_push_rt(g_enum_variant_nodes, vnode as i64)
+                    hash_table_insert(g_enum_variant_hash, g_enum_variant_keys, key, variant_idx)
+                end
+                if hash_table_lookup(g_const_hash, g_const_names, key) < 0 do
+                    idx = vec_len_rt(g_const_names)
+                    g_const_names = vec_push_rt(g_const_names, key as i64)
+                    g_const_values = vec_push_rt(g_const_values, vval)
+                    hash_table_insert(g_const_hash, g_const_names, key, idx)
+                end
+                vi = vi + 1
+            end
+        end
+        if child_type == AstType.ConstDecl do
+            const_name = ast_node_name(child)
+            if ast_node_child_count(child) > 0 do
+                init_expr = ast_node_child(child, 0)
+                val = eval_const_expr(init_expr)
+                if hash_table_lookup(g_const_hash, g_const_names, const_name) < 0 do
+                    idx = vec_len_rt(g_const_names)
+                    g_const_names = vec_push_rt(g_const_names, const_name as i64)
+                    g_const_values = vec_push_rt(g_const_values, val)
+                    hash_table_insert(g_const_hash, g_const_names, const_name, idx)
+                end
+            end
+        end
+        if child_type == AstType.BundleExpr do
+            const_name = ast_node_name(child)
+            if fat_str_len(const_name) > 0 do
+                val = 0
+                if ast_node_child_count(child) > 0 do
+                    val = eval_const_expr(ast_node_child(child, 0))
+                end
+                if hash_table_lookup(g_const_hash, g_const_names, const_name) < 0 do
+                    idx = vec_len_rt(g_const_names)
+                    g_const_names = vec_push_rt(g_const_names, const_name as i64)
+                    g_const_values = vec_push_rt(g_const_values, val)
+                    hash_table_insert(g_const_hash, g_const_names, const_name, idx)
+                end
+            end
+        end
+        if child_type == AstType.EntityDef or child_type == AstType.PackedDef or child_type == AstType.RegisterDef do
+            entity_name = ast_node_name(child)
+            var is_packed = 0
+            if child_type == AstType.PackedDef do is_packed = 1 end
+            if hash_table_lookup(g_entity_hash, g_entity_names, entity_name) < 0 do
+                idx = vec_len_rt(g_entity_names)
+                g_entity_names = vec_push_rt(g_entity_names, entity_name as i64)
+                g_entity_is_packed = vec_push_rt(g_entity_is_packed, is_packed)
+                g_entity_sizes = vec_push_rt(g_entity_sizes, 0)
+                g_entity_nodes = vec_push_rt(g_entity_nodes, child as i64)
+                hash_table_insert(g_entity_hash, g_entity_names, entity_name, idx)
+            end
+            field_count = ast_node_child_count(child)
+            var j = 0
+            var actual_field_idx = 0
+            when j < field_count loop
+                field = ast_node_child(child, j)
+                if ast_node_type_of(field) == AstType.FuncDef do
+                    method_key = qualified_member_name(entity_name, ast_node_name(field))
+                    if hash_table_lookup(g_scoped_method_hash, g_scoped_method_names, method_key) < 0 do
+                        method_idx = vec_len_rt(g_scoped_method_names)
+                        g_scoped_method_names = vec_push_rt(g_scoped_method_names, method_key as i64)
+                        g_scoped_method_nodes = vec_push_rt(g_scoped_method_nodes, field as i64)
+                        hash_table_insert(g_scoped_method_hash, g_scoped_method_names, method_key, method_idx)
+                    end
+                else
+                    field_name = ast_node_name(field)
+                    dot_str = fat_str_new(".")
+                    scoped_key = fat_str_concat(fat_str_concat(entity_name, dot_str), field_name)
+                    if hash_table_lookup(g_scoped_field_hash, g_scoped_field_names, scoped_key) < 0 do
+                        idx_s = vec_len_rt(g_scoped_field_names)
+                        g_scoped_field_names = vec_push_rt(g_scoped_field_names, scoped_key as i64)
+                        g_scoped_field_indices = vec_push_rt(g_scoped_field_indices, actual_field_idx)
+                        var ft_decl = ast_node_name2(field)
+                        if ft_decl == 0 do ft_decl = fat_str_new("") end
+                        g_scoped_field_types = vec_push_rt(g_scoped_field_types, ft_decl as i64)
+                        g_scoped_field_offsets = vec_push_rt(g_scoped_field_offsets, 0)
+                        g_scoped_field_sizes = vec_push_rt(g_scoped_field_sizes, 0)
+                        g_scoped_field_signed = vec_push_rt(g_scoped_field_signed, 0)
+                        g_scoped_field_is_nested = vec_push_rt(g_scoped_field_is_nested, 0)
+                        hash_table_insert(g_scoped_field_hash, g_scoped_field_names, scoped_key, idx_s)
+                    end
+                    field_t = ast_node_name2(field)
+                    if field_t != 0 and fat_str_len(field_t) > 0 do
+                        set_var_type(field_name, field_t)
+                    end
+                    if hash_table_lookup(g_field_hash, g_field_names, field_name) < 0 do
+                        idx = vec_len_rt(g_field_names)
+                        g_field_names = vec_push_rt(g_field_names, field_name as i64)
+                        g_field_indices = vec_push_rt(g_field_indices, actual_field_idx)
+                        hash_table_insert(g_field_hash, g_field_names, field_name, idx)
+                    end
+                    if child_type == AstType.RegisterDef and hash_table_lookup(g_regfield_hash, g_register_field_names, field_name) < 0 do
+                        width = ast_node_builtin_id(field)
+                        if width <= 0 do width = 1 end
+                        idx = vec_len_rt(g_register_field_names)
+                        g_register_field_names = vec_push_rt(g_register_field_names, field_name as i64)
+                        g_register_field_starts = vec_push_rt(g_register_field_starts, ast_node_int_val(field))
+                        g_register_field_widths = vec_push_rt(g_register_field_widths, width)
+                        hash_table_insert(g_regfield_hash, g_register_field_names, field_name, idx)
+                    end
+                    actual_field_idx = actual_field_idx + 1
+                end
+                j = j + 1
+            end
+        end
+        i = i + 1
+    end
+
+    var pk_i = 0
+    when pk_i < n loop
+        pk_child = ast_node_child(ast, pk_i)
+        if ast_node_type_of(pk_child) == AstType.PackedDef do
+            compute_packed_layout(pk_child)
+        end
+        pk_i = pk_i + 1
+    end
+
+    global_n = ast_node_child_count(ast)
+    var global_i = 0
+    when global_i < global_n loop
+        global_node = ast_node_child(ast, global_i)
+        g_node_type = ast_node_type_of(global_node)
+        if g_node_type == AstType.VarDecl or g_node_type == AstType.ReactiveDecl or g_node_type == AstType.MorphDecl do
+            global_name = ast_node_name(global_node)
+            if hash_table_lookup(g_lower_global_hash, g_lower_global_names, global_name) < 0 do
+                global_slot = vec_len_rt(g_lower_global_names)
+                global_value = 0
+                init_node = 0
+                if ast_node_child_count(global_node) > 0 do
+                    init_node = ast_node_child(global_node, 0) as i64
+                    global_value = eval_const_expr(ast_node_child(global_node, 0))
+                end
+                g_lower_global_names = vec_push_rt(g_lower_global_names, global_name as i64)
+                g_lower_global_values = vec_push_rt(g_lower_global_values, global_value)
+                g_lower_global_init_nodes = vec_push_rt(g_lower_global_init_nodes, init_node)
+                hash_table_insert(g_lower_global_hash, g_lower_global_names, global_name, global_slot)
+            end
+        end
+        global_i = global_i + 1
+    end
+    g_prog_ast = ast
+end.
+
+func global_slot_lookup(name: string):
+    out hash_table_lookup(g_lower_global_hash, g_lower_global_names, name)
+end.
+
+func find_func_ast(fn_name: &string):
+    if g_func_ast_hash != 0 and fn_name != 0 do
+        let idx = hash_table_lookup(g_func_ast_hash, g_func_ast_names, fn_name)
+        if idx >= 0 do
+            out vec_get_rt(g_func_ast_nodes, idx) as AstNode
+        end
+        if is_user_module(g_ast_to_mir_cur_module) == 1 do
+            let mod_fn = fat_str_concat(fat_str_concat(g_ast_to_mir_cur_module, fat_str_new(".")), fn_name as string)
+            let idx_mod = hash_table_lookup(g_func_ast_hash, g_func_ast_names, mod_fn)
+            if idx_mod >= 0 do
+                out vec_get_rt(g_func_ast_nodes, idx_mod) as AstNode
+            end
+        end
+        let s_ptr = fn_name as int
+        if s_ptr != 0 and g_func_ast_names != 0 do
+            let c_len = native_read_i64(s_ptr, 8) as int
+            let c_cstr = native_read_i64(s_ptr, 0) as int
+            let n_fn = vec_len_rt(g_func_ast_names)
+            var k_fn = 0
+            when k_fn < n_fn loop
+                let cand_ptr = vec_get_rt(g_func_ast_names, k_fn) as int
+                if cand_ptr != 0 do
+                    let cand_len = native_read_i64(cand_ptr, 8) as int
+                    let cand_cstr = native_read_i64(cand_ptr, 0) as int
+                    if cand_len > c_len + 1 and c_cstr != 0 and cand_cstr != 0 do
+                        if native_read_u8(cand_cstr, cand_len - c_len - 1) == 46 do
+                            var match = 1
+                            var ci = 0
+                            when ci < c_len loop
+                                if native_read_u8(cand_cstr, cand_len - c_len + ci) != native_read_u8(c_cstr, ci) do
+                                    match = 0
+                                end
+                                ci = ci + 1
+                            end
+                            if match == 1 do
+                                out vec_get_rt(g_func_ast_nodes, k_fn) as AstNode
+                            end
+                        end
+                    end
+                end
+                k_fn = k_fn + 1
+            end
+        end
+    end
+    if g_scoped_method_hash != 0 and fn_name != 0 do
+        let idx_m = hash_table_lookup(g_scoped_method_hash, g_scoped_method_names, fn_name)
+        if idx_m >= 0 do
+            out vec_get_rt(g_scoped_method_nodes, idx_m) as AstNode
+        end
+    end
+    out 0 as AstNode
+end.
+
+func find_func_return_tuple_elem_type(callee: string, elem_idx: int):
+    if fat_cstr_eq(callee, "advance") == 1 do
+        if elem_idx == 0 do out fat_str_new("Parser") end
+        if elem_idx == 1 do out fat_str_new("Token") end
+    end
+    if fat_cstr_eq(callee, "match_tok") == 1 do
+        if elem_idx == 0 do out fat_str_new("Parser") end
+        if elem_idx == 1 do out fat_str_new("bool") end
+    end
+    if fat_cstr_eq(callee, "expect_tok") == 1 do
+        if elem_idx == 0 do out fat_str_new("Parser") end
+        if elem_idx == 1 do out fat_str_new("Token") end
+        if elem_idx == 2 do out fat_str_new("bool") end
+    end
+    if fat_cstr_eq(callee, "expect_name_tok") == 1 do
+        if elem_idx == 0 do out fat_str_new("Parser") end
+        if elem_idx == 1 do out fat_str_new("Token") end
+        if elem_idx == 2 do out fat_str_new("bool") end
+    end
+    if fat_str_len(callee) == 0 do out fat_str_new("") end
+    let fn_ast = find_func_ast(callee)
+    if (fn_ast as i64) == 0 do out fat_str_new("") end
+    let n_children = ast_node_child_count(fn_ast)
+    if n_children == 0 do out fat_str_new("") end
+    let body = ast_node_child(fn_ast, n_children - 1)
+    if (body as i64) == 0 do out fat_str_new("") end
+    let body_children = ast_node_child_count(body)
+    var bi = 0
+    when bi < body_children loop
+        let bch = ast_node_child(body, bi)
+        if ast_node_type_of(bch) == AstType.ReturnStmt and ast_node_child_count(bch) > 0 do
+            let ret_expr = ast_node_child(bch, 0)
+            if ast_node_type_of(ret_expr) == AstType.TupleExpr and elem_idx < ast_node_child_count(ret_expr) do
+                let elem_node = ast_node_child(ret_expr, elem_idx)
+                out infer_expr_type_name(elem_node)
+            end
+        end
+        bi = bi + 1
+    end
+    out fat_str_new("")
+end.
+
+func get_func_param_mode(fn_ast: &AstNode, p_idx: i64):
+    if (fn_ast as i64) == 0 do out 0 end
+    var cur_p = 0
+    let n_ch = ast_node_child_count(fn_ast)
+    var ci = 0
+    when ci < n_ch loop
+        let ch = ast_node_child(fn_ast, ci)
+        let cnt = ast_node_type_of(ch)
+        if cnt == AstType.Identifier or cnt == AstType.RefParam or cnt == AstType.ParamDef or cnt == AstType.OutParam do
+            if cur_p == p_idx do
+                if cnt == AstType.RefParam or (cnt == AstType.ParamDef and ast_node_int_val(ch) == 1) do
+                    out 1
+                eif cnt == AstType.OutParam or (cnt == AstType.ParamDef and ast_node_int_val(ch) == 2) do
+                    out 2
+                else
+                    out 0
+                end
+            end
+            cur_p = cur_p + 1
+        end
+        ci = ci + 1
+    end
+    out 0
+end.
+
+# @vir_source compiler/src/lower/ast_to_mir/layout.vri 1
+##
+ * compiler/src/lower/ast_to_mir/layout.vri — Layout, Types & Field Queries
+ * ==========================================================================
+ ##
+
 
 func enum_index_from_type_name(type_name: string):
     if type_name == 0 or g_enum_names == 0 do out 0 - 1 end
@@ -44154,644 +44787,6 @@ func infer_expr_type_name(node: &AstNode):
     out fat_str_new("")
 end.
 
-func name_hash_256(name: &string):
-    n = fat_str_len(name as int) as i64
-    h = n * 17
-    var i = 0
-    when i < n loop
-        h = h * 131 + (fat_str_byte_at(name as int, i) as i64)
-        i = i + 1
-    end
-    if h < 0 do h = 0 - h end
-    out h mod 256
-end.
-
-func hash_table_new():
-    tab = vec_new_rt()
-    var i = 0
-    when i < 256 loop
-        tab = vec_push_rt(tab, 0)
-        i = i + 1
-    end
-    out tab
-end.
-
-func hash_table_lookup(hash_tab: i64, names: i64, name: &string):
-    if hash_tab == 0 or names == 0 do out 0 - 1 end
-    bid = name_hash_256(name)
-    bucket = vec_get_rt(hash_tab, bid)
-    if bucket == 0 do out 0 - 1 end
-    n = vec_len_rt(bucket)
-    var i = 0
-    when i < n loop
-        idx = vec_get_rt(bucket, i)
-        if fat_str_eq(vec_get_rt(names, idx) as string, name as string) == 1 do
-            out idx
-        end
-        i = i + 1
-    end
-    out 0 - 1
-end.
-
-func hash_table_insert(hash_tab: i64, names: i64, name: &string, idx: i64):
-    if hash_tab == 0 do out 0 end
-    bid = name_hash_256(name)
-    bucket = vec_get_rt(hash_tab, bid)
-    if bucket == 0 do
-        bucket = vec_new_rt()
-    end
-    bucket = vec_push_rt(bucket, idx)
-    vec_set_rt(hash_tab, bid, bucket)
-    out 0
-end.
-
-func lookup_cached_name(names: i64, name: &string):
-    if names == 0 do out 0 - 1 end
-    if names == g_field_names and g_field_hash != 0 do
-        out hash_table_lookup(g_field_hash, names, name)
-    end
-    if names == g_scoped_field_names and g_scoped_field_hash != 0 do
-        out hash_table_lookup(g_scoped_field_hash, names, name)
-    end
-    if names == g_entity_names and g_entity_hash != 0 do
-        out hash_table_lookup(g_entity_hash, names, name)
-    end
-    if names == g_import_aliases and g_import_hash != 0 do
-        out hash_table_lookup(g_import_hash, names, name)
-    end
-    if names == g_register_field_names and g_regfield_hash != 0 do
-        out hash_table_lookup(g_regfield_hash, names, name)
-    end
-    n = vec_len_rt(names)
-    var i = 0
-    when i < n loop
-        if fat_str_eq(vec_get_rt(names, i) as string, name as string) == 1 do out i end
-        i = i + 1
-    end
-    out 0 - 1
-end.
-
-func is_packed_entity(type_name: &string):
-    if g_entity_hash != 0 and type_name != 0 and fat_str_len(type_name as string) > 0 do
-        var idx = hash_table_lookup(g_entity_hash, g_entity_names, type_name)
-        if idx >= 0 and idx < vec_len_rt(g_entity_is_packed) do
-            out vec_get_rt(g_entity_is_packed, idx) == 1
-        end
-    end
-    out false
-end.
-
-func is_signed_type(t: string):
-    if t == 0 or fat_str_len(t) == 0 do out 0 end
-    if fat_cstr_eq(t, "i8") == 1 or fat_cstr_eq(t, "i16") == 1 or fat_cstr_eq(t, "i32") == 1 or fat_cstr_eq(t, "i64") == 1 do
-        out 1
-    end
-    out 0
-end.
-
-func get_type_byte_size(type_name: string):
-    if type_name == 0 or fat_str_len(type_name) == 0 do out 8 end
-    if fat_cstr_eq(type_name, "u8") == 1 or fat_cstr_eq(type_name, "i8") == 1 or fat_cstr_eq(type_name, "bool") == 1 do
-        out 1
-    end
-    if fat_cstr_eq(type_name, "u16") == 1 or fat_cstr_eq(type_name, "i16") == 1 do
-        out 2
-    end
-    if fat_cstr_eq(type_name, "u32") == 1 or fat_cstr_eq(type_name, "i32") == 1 do
-        out 4
-    end
-    if fat_cstr_eq(type_name, "u64") == 1 or fat_cstr_eq(type_name, "i64") == 1 or fat_cstr_eq(type_name, "int") == 1 or fat_cstr_eq(type_name, "float") == 1 or fat_cstr_eq(type_name, "ptr") == 1 or fat_cstr_eq(type_name, "usize") == 1 or fat_cstr_eq(type_name, "isize") == 1 do
-        out 8
-    end
-    if g_entity_hash != 0 do
-        var idx = hash_table_lookup(g_entity_hash, g_entity_names, type_name)
-        if idx >= 0 and idx < vec_len_rt(g_entity_sizes) do
-            var sz = vec_get_rt(g_entity_sizes, idx)
-            if sz > 0 do out sz end
-        end
-    end
-    out 8
-end.
-
-func eval_const_expr(node: &AstNode):
-    if node == 0 do out 0 end
-    nt = ast_node_type_of(node)
-    if nt == AstType.SizeofExpr do
-        out get_type_byte_size(ast_node_name(node))
-    end
-    if nt == AstType.LiteralInt do
-        out ast_node_int_val(node)
-    end
-    if nt == AstType.PrecompBlock do
-        out ast_node_int_val(node)
-    end
-    if nt == AstType.LiteralFloat do
-        # Float constants travel through the integer MIR immediate lane as their
-        # IEEE-754 payload. `int_val` is a distinct AST field and is zero for a
-        # float token, so using it silently rewrites every float const to 0.0.
-        out native_read_i64(node as i64, 48)
-    end
-    if nt == AstType.UnaryMinus do
-        if ast_node_child_count(node) > 0 do
-            out 0 - eval_const_expr(ast_node_child(node, 0))
-            let c = ast_node_child(node, 0)
-            if ast_node_type_of(c) == AstType.LiteralFloat do
-                out eval_const_expr(c) xor (1 shl 63)
-            end
-            out 0 - eval_const_expr(c)
-        end
-        out 0
-    end
-    if nt == AstType.Identifier do
-        cname = ast_node_name(node)
-        if fat_cstr_eq(cname, "true") == 1 do out 1 end
-        if fat_cstr_eq(cname, "false") == 1 do out 0 end
-        if fat_cstr_eq(cname, "null") == 1 do out 0 end
-        if fat_cstr_eq(cname, "void") == 1 do out 0 end
-        if g_const_hash > 0 do
-            c_idx = hash_table_lookup(g_const_hash, g_const_names, cname)
-            if c_idx >= 0 do
-                out vec_get_rt(g_const_values, c_idx)
-            end
-        end
-        out 0
-    end
-    if nt == AstType.FieldAccess do
-        if ast_node_child_count(node) > 0 do
-            base = ast_node_child(node, 0)
-            if ast_node_type_of(base) == AstType.Identifier do
-                key = fat_str_concat(fat_str_concat(ast_node_name(base), fat_str_new(".")), ast_node_name(node))
-                if g_const_hash > 0 do
-                    c_idx = hash_table_lookup(g_const_hash, g_const_names, key)
-                    if c_idx >= 0 do
-                        out vec_get_rt(g_const_values, c_idx)
-                    end
-                end
-            end
-        end
-        out 0
-    end
-    if nt == AstType.EnumAccess do
-        key = fat_str_concat(fat_str_concat(ast_node_name(node), fat_str_new(".")), ast_node_name2(node))
-        if g_const_hash > 0 do
-            c_idx = hash_table_lookup(g_const_hash, g_const_names, key)
-            if c_idx >= 0 do
-                out vec_get_rt(g_const_values, c_idx)
-            end
-        end
-        out 0
-    end
-    if nt == AstType.BinOp or nt == AstType.Compare do
-        if ast_node_child_count(node) >= 2 do
-            lval = eval_const_expr(ast_node_child(node, 0))
-            rval = eval_const_expr(ast_node_child(node, 1))
-            op = ast_node_op_of(node)
-            if op == OpType.Add do out lval + rval end
-            if op == OpType.Sub do out lval - rval end
-            if op == OpType.Mul do out lval * rval end
-            if op == OpType.Div do
-                if rval != 0 do out lval / rval end
-                out 0
-            end
-            if op == OpType.ModOp do
-                if rval != 0 do out lval mod rval end
-                out 0
-            end
-            if op == OpType.OrOp or op == OpType.Lor do out lval or rval end
-            if op == OpType.AndOp or op == OpType.Land do out lval and rval end
-            if op == OpType.XorOp do out lval xor rval end
-            if op == OpType.ShlOp do out lval shl rval end
-            if op == OpType.ShrOp do out lval shr rval end
-        end
-        out 0
-    end
-    out 0
-end.
-
-
-func set_global_prog_ast(ast: &AstNode):
-    g_entity_names = vec_new_rt()
-    g_import_aliases = vec_new_rt()
-    g_import_targets = vec_new_rt()
-    g_field_names = vec_new_rt()
-    g_field_indices = vec_new_rt()
-    g_register_field_names = vec_new_rt()
-    g_register_field_starts = vec_new_rt()
-    g_register_field_widths = vec_new_rt()
-
-    g_entity_hash = hash_table_new()
-    g_import_hash = hash_table_new()
-    g_field_hash = hash_table_new()
-    g_regfield_hash = hash_table_new()
-
-    g_const_names = vec_new_rt()
-    g_const_values = vec_new_rt()
-    g_const_hash = hash_table_new()
-
-    g_enum_names = vec_new_rt()
-    g_enum_nodes = vec_new_rt()
-    g_enum_is_tagged = vec_new_rt()
-    g_enum_sizes = vec_new_rt()
-    g_enum_hash = hash_table_new()
-    g_enum_variant_keys = vec_new_rt()
-    g_enum_variant_names = vec_new_rt()
-    g_enum_variant_enum_indices = vec_new_rt()
-    g_enum_variant_tags = vec_new_rt()
-    g_enum_variant_arities = vec_new_rt()
-    g_enum_variant_hash = hash_table_new()
-    g_enum_variant_nodes = vec_new_rt()
-
-    g_scoped_field_names = vec_new_rt()
-    g_scoped_field_indices = vec_new_rt()
-    g_scoped_field_types = vec_new_rt()
-    g_scoped_field_offsets = vec_new_rt()
-    g_scoped_field_sizes = vec_new_rt()
-    g_scoped_field_signed = vec_new_rt()
-    g_scoped_field_is_nested = vec_new_rt()
-    g_scoped_field_hash = hash_table_new()
-    g_scoped_method_names = vec_new_rt()
-    g_scoped_method_nodes = vec_new_rt()
-    g_scoped_method_hash = hash_table_new()
-
-    g_func_ast_names = vec_new_rt()
-    g_func_ast_nodes = vec_new_rt()
-    g_func_ast_hash = hash_table_new()
-
-    g_entity_is_packed = vec_new_rt()
-    g_entity_sizes = vec_new_rt()
-    g_entity_nodes = vec_new_rt()
-
-    g_var_type_names = vec_new_rt()
-    g_var_type_values = vec_new_rt()
-    g_var_type_hash = hash_table_new()
-    g_dict_var_names = vec_new_rt()
-    g_dict_var_hash = hash_table_new()
-
-    g_current_entity_name = 0
-
-    # Native code needs real cross-function storage for top-level `var`s.
-    # Assign each declaration a stable heap-header slot before lowering funcs.
-    g_lower_global_names = vec_new_rt()
-    g_lower_global_values = vec_new_rt()
-    g_lower_global_hash = hash_table_new()
-    g_lower_global_init_nodes = vec_new_rt()
-
-    var cur_module = fat_str_new("")
-    n = ast_node_child_count(ast)
-    var i = 0
-    when i < n loop
-        child = ast_node_child(ast, i)
-        child_type = ast_node_type_of(child)
-        if child_type == AstType.ModuleStmt do
-            if fat_str_len(ast_node_name(child)) > 0 do
-                cur_module = ast_node_name(child)
-            end
-        end
-        if child_type == AstType.FuncDef do
-            fn_name = ast_node_name(child)
-            var canonical_name = fn_name
-            if is_user_module(cur_module) == 1 and fat_cstr_eq(fn_name, "main") == 0 do
-                canonical_name = fat_str_concat(fat_str_concat(cur_module, fat_str_new(".")), fn_name)
-            end
-            if hash_table_lookup(g_func_ast_hash, g_func_ast_names, canonical_name) < 0 do
-                fn_idx = vec_len_rt(g_func_ast_names)
-                g_func_ast_names = vec_push_rt(g_func_ast_names, canonical_name as i64)
-                g_func_ast_nodes = vec_push_rt(g_func_ast_nodes, child as i64)
-                hash_table_insert(g_func_ast_hash, g_func_ast_names, canonical_name, fn_idx)
-            end
-            if is_user_module(cur_module) == 0 and hash_table_lookup(g_func_ast_hash, g_func_ast_names, fn_name) < 0 do
-                fn_idx = vec_len_rt(g_func_ast_names)
-                g_func_ast_names = vec_push_rt(g_func_ast_names, fn_name as i64)
-                g_func_ast_nodes = vec_push_rt(g_func_ast_nodes, child as i64)
-                hash_table_insert(g_func_ast_hash, g_func_ast_names, fn_name, fn_idx)
-            end
-        end
-        if child_type == AstType.ImportStmt do
-            child_count = ast_node_child_count(child)
-            var j = 0
-            when j < child_count loop
-                sym = ast_node_child(child, j)
-                alias = ast_node_name2(sym)
-                target = ast_node_name(sym)
-                if fat_str_len(alias) == 0 do
-                    alias = target
-                end
-                if hash_table_lookup(g_import_hash, g_import_aliases, alias) < 0 do
-                    idx = vec_len_rt(g_import_aliases)
-                    g_import_aliases = vec_push_rt(g_import_aliases, alias as i64)
-                    g_import_targets = vec_push_rt(g_import_targets, target as i64)
-                    hash_table_insert(g_import_hash, g_import_aliases, alias, idx)
-                end
-                j = j + 1
-            end
-        end
-        if child_type == AstType.EnumDef do
-            enum_name = ast_node_name(child)
-            var vcount = ast_node_child_count(child)
-            enum_idx = hash_table_lookup(g_enum_hash, g_enum_names, enum_name)
-            if enum_idx < 0 do
-                enum_idx = vec_len_rt(g_enum_names)
-                max_payloads = 0
-                var scan_i = 0
-                when scan_i < vcount loop
-                    scan_variant = ast_node_child(child, scan_i)
-                    scan_arity = ast_node_child_count(scan_variant)
-                    if scan_arity > max_payloads do max_payloads = scan_arity end
-                    scan_i = scan_i + 1
-                end
-                tagged = 0
-                layout_size = ENUM_TAG_SLOT_SIZE
-                if max_payloads > 0 do
-                    tagged = 1
-                    layout_size = ENUM_TAG_SLOT_SIZE + max_payloads * ENUM_PAYLOAD_SLOT_SIZE
-                end
-                g_enum_names = vec_push_rt(g_enum_names, enum_name as i64)
-                g_enum_nodes = vec_push_rt(g_enum_nodes, child as i64)
-                g_enum_is_tagged = vec_push_rt(g_enum_is_tagged, tagged)
-                g_enum_sizes = vec_push_rt(g_enum_sizes, layout_size)
-                hash_table_insert(g_enum_hash, g_enum_names, enum_name, enum_idx)
-            end
-            var vi = 0
-            when vi < vcount loop
-                vnode = ast_node_child(child, vi)
-                vname = ast_node_name(vnode)
-                vval = ast_node_int_val(vnode)
-                dot_str = fat_str_new(".")
-                key = fat_str_concat(fat_str_concat(enum_name, dot_str), vname)
-                if hash_table_lookup(g_enum_variant_hash, g_enum_variant_keys, key) < 0 do
-                    variant_idx = vec_len_rt(g_enum_variant_keys)
-                    g_enum_variant_keys = vec_push_rt(g_enum_variant_keys, key as i64)
-                    g_enum_variant_names = vec_push_rt(g_enum_variant_names, vname as i64)
-                    g_enum_variant_enum_indices = vec_push_rt(g_enum_variant_enum_indices, enum_idx)
-                    g_enum_variant_tags = vec_push_rt(g_enum_variant_tags, vval)
-                    g_enum_variant_arities = vec_push_rt(g_enum_variant_arities, ast_node_child_count(vnode))
-                    g_enum_variant_nodes = vec_push_rt(g_enum_variant_nodes, vnode as i64)
-                    hash_table_insert(g_enum_variant_hash, g_enum_variant_keys, key, variant_idx)
-                end
-                if hash_table_lookup(g_const_hash, g_const_names, key) < 0 do
-                    idx = vec_len_rt(g_const_names)
-                    g_const_names = vec_push_rt(g_const_names, key as i64)
-                    g_const_values = vec_push_rt(g_const_values, vval)
-                    hash_table_insert(g_const_hash, g_const_names, key, idx)
-                end
-                vi = vi + 1
-            end
-        end
-        if child_type == AstType.ConstDecl do
-            const_name = ast_node_name(child)
-            if ast_node_child_count(child) > 0 do
-                init_expr = ast_node_child(child, 0)
-                val = eval_const_expr(init_expr)
-                if hash_table_lookup(g_const_hash, g_const_names, const_name) < 0 do
-                    idx = vec_len_rt(g_const_names)
-                    g_const_names = vec_push_rt(g_const_names, const_name as i64)
-                    g_const_values = vec_push_rt(g_const_values, val)
-                    hash_table_insert(g_const_hash, g_const_names, const_name, idx)
-                end
-            end
-        end
-        if child_type == AstType.BundleExpr do
-            const_name = ast_node_name(child)
-            if fat_str_len(const_name) > 0 do
-                val = 0
-                if ast_node_child_count(child) > 0 do
-                    val = eval_const_expr(ast_node_child(child, 0))
-                end
-                if hash_table_lookup(g_const_hash, g_const_names, const_name) < 0 do
-                    idx = vec_len_rt(g_const_names)
-                    g_const_names = vec_push_rt(g_const_names, const_name as i64)
-                    g_const_values = vec_push_rt(g_const_values, val)
-                    hash_table_insert(g_const_hash, g_const_names, const_name, idx)
-                end
-            end
-        end
-        if child_type == AstType.EntityDef or child_type == AstType.PackedDef or child_type == AstType.RegisterDef do
-            entity_name = ast_node_name(child)
-            var is_packed = 0
-            if child_type == AstType.PackedDef do is_packed = 1 end
-            if hash_table_lookup(g_entity_hash, g_entity_names, entity_name) < 0 do
-                idx = vec_len_rt(g_entity_names)
-                g_entity_names = vec_push_rt(g_entity_names, entity_name as i64)
-                g_entity_is_packed = vec_push_rt(g_entity_is_packed, is_packed)
-                g_entity_sizes = vec_push_rt(g_entity_sizes, 0)
-                g_entity_nodes = vec_push_rt(g_entity_nodes, child as i64)
-                hash_table_insert(g_entity_hash, g_entity_names, entity_name, idx)
-            end
-            field_count = ast_node_child_count(child)
-            var j = 0
-            var actual_field_idx = 0
-            when j < field_count loop
-                field = ast_node_child(child, j)
-                if ast_node_type_of(field) == AstType.FuncDef do
-                    method_key = qualified_member_name(entity_name, ast_node_name(field))
-                    if hash_table_lookup(g_scoped_method_hash, g_scoped_method_names, method_key) < 0 do
-                        method_idx = vec_len_rt(g_scoped_method_names)
-                        g_scoped_method_names = vec_push_rt(g_scoped_method_names, method_key as i64)
-                        g_scoped_method_nodes = vec_push_rt(g_scoped_method_nodes, field as i64)
-                        hash_table_insert(g_scoped_method_hash, g_scoped_method_names, method_key, method_idx)
-                    end
-                else
-                    field_name = ast_node_name(field)
-                    dot_str = fat_str_new(".")
-                    scoped_key = fat_str_concat(fat_str_concat(entity_name, dot_str), field_name)
-                    if hash_table_lookup(g_scoped_field_hash, g_scoped_field_names, scoped_key) < 0 do
-                        idx_s = vec_len_rt(g_scoped_field_names)
-                        g_scoped_field_names = vec_push_rt(g_scoped_field_names, scoped_key as i64)
-                        g_scoped_field_indices = vec_push_rt(g_scoped_field_indices, actual_field_idx)
-                        var ft_decl = ast_node_name2(field)
-                        if ft_decl == 0 do ft_decl = fat_str_new("") end
-                        g_scoped_field_types = vec_push_rt(g_scoped_field_types, ft_decl as i64)
-                        g_scoped_field_offsets = vec_push_rt(g_scoped_field_offsets, 0)
-                        g_scoped_field_sizes = vec_push_rt(g_scoped_field_sizes, 0)
-                        g_scoped_field_signed = vec_push_rt(g_scoped_field_signed, 0)
-                        g_scoped_field_is_nested = vec_push_rt(g_scoped_field_is_nested, 0)
-                        hash_table_insert(g_scoped_field_hash, g_scoped_field_names, scoped_key, idx_s)
-                    end
-                    field_t = ast_node_name2(field)
-                    if field_t != 0 and fat_str_len(field_t) > 0 do
-                        set_var_type(field_name, field_t)
-                    end
-                    if hash_table_lookup(g_field_hash, g_field_names, field_name) < 0 do
-                        idx = vec_len_rt(g_field_names)
-                        g_field_names = vec_push_rt(g_field_names, field_name as i64)
-                        g_field_indices = vec_push_rt(g_field_indices, actual_field_idx)
-                        hash_table_insert(g_field_hash, g_field_names, field_name, idx)
-                    end
-                    if child_type == AstType.RegisterDef and hash_table_lookup(g_regfield_hash, g_register_field_names, field_name) < 0 do
-                        width = ast_node_builtin_id(field)
-                        if width <= 0 do width = 1 end
-                        idx = vec_len_rt(g_register_field_names)
-                        g_register_field_names = vec_push_rt(g_register_field_names, field_name as i64)
-                        g_register_field_starts = vec_push_rt(g_register_field_starts, ast_node_int_val(field))
-                        g_register_field_widths = vec_push_rt(g_register_field_widths, width)
-                        hash_table_insert(g_regfield_hash, g_register_field_names, field_name, idx)
-                    end
-                    actual_field_idx = actual_field_idx + 1
-                end
-                j = j + 1
-            end
-        end
-        i = i + 1
-    end
-
-    var pk_i = 0
-    when pk_i < n loop
-        pk_child = ast_node_child(ast, pk_i)
-        if ast_node_type_of(pk_child) == AstType.PackedDef do
-            compute_packed_layout(pk_child)
-        end
-        pk_i = pk_i + 1
-    end
-
-    global_n = ast_node_child_count(ast)
-    var global_i = 0
-    when global_i < global_n loop
-        global_node = ast_node_child(ast, global_i)
-        g_node_type = ast_node_type_of(global_node)
-        if g_node_type == AstType.VarDecl or g_node_type == AstType.ReactiveDecl or g_node_type == AstType.MorphDecl do
-            global_name = ast_node_name(global_node)
-            if hash_table_lookup(g_lower_global_hash, g_lower_global_names, global_name) < 0 do
-                global_slot = vec_len_rt(g_lower_global_names)
-                global_value = 0
-                init_node = 0
-                if ast_node_child_count(global_node) > 0 do
-                    init_node = ast_node_child(global_node, 0) as i64
-                    global_value = eval_const_expr(ast_node_child(global_node, 0))
-                end
-                g_lower_global_names = vec_push_rt(g_lower_global_names, global_name as i64)
-                g_lower_global_values = vec_push_rt(g_lower_global_values, global_value)
-                g_lower_global_init_nodes = vec_push_rt(g_lower_global_init_nodes, init_node)
-                hash_table_insert(g_lower_global_hash, g_lower_global_names, global_name, global_slot)
-            end
-        end
-        global_i = global_i + 1
-    end
-    g_prog_ast = ast
-end.
-
-func global_slot_lookup(name: string):
-    out hash_table_lookup(g_lower_global_hash, g_lower_global_names, name)
-end.
-
-func find_func_ast(fn_name: &string):
-    if g_func_ast_hash != 0 and fn_name != 0 do
-        let idx = hash_table_lookup(g_func_ast_hash, g_func_ast_names, fn_name)
-        if idx >= 0 do
-            out vec_get_rt(g_func_ast_nodes, idx) as AstNode
-        end
-        if is_user_module(g_ast_to_mir_cur_module) == 1 do
-            let mod_fn = fat_str_concat(fat_str_concat(g_ast_to_mir_cur_module, fat_str_new(".")), fn_name as string)
-            let idx_mod = hash_table_lookup(g_func_ast_hash, g_func_ast_names, mod_fn)
-            if idx_mod >= 0 do
-                out vec_get_rt(g_func_ast_nodes, idx_mod) as AstNode
-            end
-        end
-        let s_ptr = fn_name as int
-        if s_ptr != 0 and g_func_ast_names != 0 do
-            let c_len = native_read_i64(s_ptr, 8) as int
-            let c_cstr = native_read_i64(s_ptr, 0) as int
-            let n_fn = vec_len_rt(g_func_ast_names)
-            var k_fn = 0
-            when k_fn < n_fn loop
-                let cand_ptr = vec_get_rt(g_func_ast_names, k_fn) as int
-                if cand_ptr != 0 do
-                    let cand_len = native_read_i64(cand_ptr, 8) as int
-                    let cand_cstr = native_read_i64(cand_ptr, 0) as int
-                    if cand_len > c_len + 1 and c_cstr != 0 and cand_cstr != 0 do
-                        if native_read_u8(cand_cstr, cand_len - c_len - 1) == 46 do
-                            var match = 1
-                            var ci = 0
-                            when ci < c_len loop
-                                if native_read_u8(cand_cstr, cand_len - c_len + ci) != native_read_u8(c_cstr, ci) do
-                                    match = 0
-                                end
-                                ci = ci + 1
-                            end
-                            if match == 1 do
-                                out vec_get_rt(g_func_ast_nodes, k_fn) as AstNode
-                            end
-                        end
-                    end
-                end
-                k_fn = k_fn + 1
-            end
-        end
-    end
-    if g_scoped_method_hash != 0 and fn_name != 0 do
-        let idx_m = hash_table_lookup(g_scoped_method_hash, g_scoped_method_names, fn_name)
-        if idx_m >= 0 do
-            out vec_get_rt(g_scoped_method_nodes, idx_m) as AstNode
-        end
-    end
-    out 0 as AstNode
-end.
-
-func find_func_return_tuple_elem_type(callee: string, elem_idx: int):
-    if fat_cstr_eq(callee, "advance") == 1 do
-        if elem_idx == 0 do out fat_str_new("Parser") end
-        if elem_idx == 1 do out fat_str_new("Token") end
-    end
-    if fat_cstr_eq(callee, "match_tok") == 1 do
-        if elem_idx == 0 do out fat_str_new("Parser") end
-        if elem_idx == 1 do out fat_str_new("bool") end
-    end
-    if fat_cstr_eq(callee, "expect_tok") == 1 do
-        if elem_idx == 0 do out fat_str_new("Parser") end
-        if elem_idx == 1 do out fat_str_new("Token") end
-        if elem_idx == 2 do out fat_str_new("bool") end
-    end
-    if fat_cstr_eq(callee, "expect_name_tok") == 1 do
-        if elem_idx == 0 do out fat_str_new("Parser") end
-        if elem_idx == 1 do out fat_str_new("Token") end
-        if elem_idx == 2 do out fat_str_new("bool") end
-    end
-    if fat_str_len(callee) == 0 do out fat_str_new("") end
-    let fn_ast = find_func_ast(callee)
-    if (fn_ast as i64) == 0 do out fat_str_new("") end
-    let n_children = ast_node_child_count(fn_ast)
-    if n_children == 0 do out fat_str_new("") end
-    let body = ast_node_child(fn_ast, n_children - 1)
-    if (body as i64) == 0 do out fat_str_new("") end
-    let body_children = ast_node_child_count(body)
-    var bi = 0
-    when bi < body_children loop
-        let bch = ast_node_child(body, bi)
-        if ast_node_type_of(bch) == AstType.ReturnStmt and ast_node_child_count(bch) > 0 do
-            let ret_expr = ast_node_child(bch, 0)
-            if ast_node_type_of(ret_expr) == AstType.TupleExpr and elem_idx < ast_node_child_count(ret_expr) do
-                let elem_node = ast_node_child(ret_expr, elem_idx)
-                out infer_expr_type_name(elem_node)
-            end
-        end
-        bi = bi + 1
-    end
-    out fat_str_new("")
-end.
-
-func get_func_param_mode(fn_ast: &AstNode, p_idx: i64):
-    if (fn_ast as i64) == 0 do out 0 end
-    var cur_p = 0
-    let n_ch = ast_node_child_count(fn_ast)
-    var ci = 0
-    when ci < n_ch loop
-        let ch = ast_node_child(fn_ast, ci)
-        let cnt = ast_node_type_of(ch)
-        if cnt == AstType.Identifier or cnt == AstType.RefParam or cnt == AstType.ParamDef or cnt == AstType.OutParam do
-            if cur_p == p_idx do
-                if cnt == AstType.RefParam or (cnt == AstType.ParamDef and ast_node_int_val(ch) == 1) do
-                    out 1
-                eif cnt == AstType.OutParam or (cnt == AstType.ParamDef and ast_node_int_val(ch) == 2) do
-                    out 2
-                else
-                    out 0
-                end
-            end
-            cur_p = cur_p + 1
-        end
-        ci = ci + 1
-    end
-    out 0
-end.
 
 func get_callable_param_mode(fn_type_str: &string, p_idx: i64) -> int:
     if (fn_type_str as i64) == 0 do out 0 end
@@ -45384,6 +45379,13 @@ end.
 func get_register_field_width_scoped(base_type: &string, field_name: &string):
     out get_register_field_width(field_name)
 end.
+
+# @vir_source compiler/src/lower/ast_to_mir/builder.vri 1
+##
+ * compiler/src/lower/ast_to_mir/builder.vri — MirBuilder Primitives & Emitters
+ * =============================================================================
+ ##
+
 
 func as_mir_func(f: &MirFunc):
 	out f
@@ -46052,6 +46054,7 @@ func lower_enum_construct(b: &MirBuilder, expr: &AstNode, enum_name: string, var
     out expr_result(b_mut, mir_opnd_vreg(base))
 end.
 
+
 # NOTE: Do NOT pre-declare function stubs.
 
 func as_ast_node(n: &AstNode):
@@ -46212,6 +46215,13 @@ func ast_node_child_count(n: &AstNode):
     kids = native_read_i64(n as i64, 64)
 	out vec_len_rt(kids)
 end.
+
+# @vir_source compiler/src/lower/ast_to_mir/calls.vri 1
+##
+ * compiler/src/lower/ast_to_mir/calls.vri — Function & Method Call Lowering
+ * ==========================================================================
+ ##
+
 
 func lower_call_args(b: &MirBuilder, expr: &AstNode, start_child: i64, arg_base: i64):
     # Stage into fresh vregs first — a nested call clobbers X0..Xn / prior SetArgs.
@@ -46513,531 +46523,11 @@ func lower_call_with_ref_support(b: MirBuilder, expr: &AstNode, callee: string, 
     out lower_call_with_ref_support_ast(b, expr, callee, cid, callee_vreg, fn_ast, fn_type_str, 0)
 end.
 
-func lower_expr_impl(b: MirBuilder, expr: &AstNode):
-	expr_type = ast_node_type_of(expr)
 
-	if expr_type == AstType.Assign do
-		var b_stmt = lower_stmt(b, expr)
-		var v_res = get_var_vreg(b_stmt, ast_node_name(expr))
-		if v_res >= 0 do
-			out expr_result(b_stmt, mir_opnd_vreg(v_res))
-		end
-		out expr_result(b_stmt, g_lower_expr_result_opnd as MirOperand)
-	end
-
-    # Enum constructors are resolved by semantic pass 3.  They never become
-    # ordinary function calls and require no runtime/prelude helper.
-    if expr_type == AstType.EnumConstruct do
-        out lower_enum_construct(b, expr, ast_node_name2(expr), ast_node_name(expr))
-    end
-
-    # 1. Literal Int
-	if expr_type == AstType.LiteralInt do
-		var (b2, v) = builder_new_vreg(b)
-		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(ast_node_int_val(expr)), mir_opnd_none())
-		b2 = builder_add_instr(b2, ins)
-		out expr_result(b2, mir_opnd_vreg(v))
-	end
-
-	if expr_type == AstType.PrecompBlock do
-		var (b2, v) = builder_new_vreg(b)
-		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(ast_node_int_val(expr)), mir_opnd_none())
-		b2 = builder_add_instr(b2, ins)
-		out expr_result(b2, mir_opnd_vreg(v))
-	end
-
-    # 2. Literal Float (raw 64-bit IEEE 754 bits from offset 48)
-	if expr_type == AstType.LiteralFloat do
-		var (b2, v) = builder_new_vreg(b)
-		f_bits = native_read_i64(expr as i64, 48)
-		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(f_bits), mir_opnd_none())
-		mir_instr_set_type(ins, MirType.F64 as i64)
-		b2 = builder_add_instr(b2, ins)
-		out expr_result(b2, mir_opnd_vreg(v))
-	end
-
-    # 2b. Literal Bool
-	if expr_type == AstType.LiteralBool do
-		var (b2, v) = builder_new_vreg(b)
-		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(ast_node_int_val(expr)), mir_opnd_none())
-		b2 = builder_add_instr(b2, ins)
-		out expr_result(b2, mir_opnd_vreg(v))
-	end
-
-    # 2c. Literal None
-	if expr_type == AstType.LiteralNone do
-		var (b2, v) = builder_new_vreg(b)
-		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(0), mir_opnd_none())
-		b2 = builder_add_instr(b2, ins)
-		out expr_result(b2, mir_opnd_vreg(v))
-	end
-
-    # 3. Literal Str — src1 = string-pool id (100% static, zero runtime alloc)
-	if expr_type == AstType.LiteralStr do
-		var (b1, sid) = builder_intern(b, ast_node_name(expr))
-		var (b2, v) = builder_new_vreg(b1)
-		b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
-		out expr_result(b2, mir_opnd_vreg(v))
-	end
-
-    # 3b. InterpExpr — lowered to str_cat (bid 11) and int_to_str (bid 19) in Arena
-	if expr_type == AstType.InterpExpr do
-		n_segs = ast_node_child_count(expr)
-		if n_segs == 0 do
-			var (b1, sid) = builder_intern(b, fat_str_new(""))
-			var (b2, v) = builder_new_vreg(b1)
-			b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
-			out expr_result(b2, mir_opnd_vreg(v))
-		end
-
-		# Lower first segment and convert non-string values deterministically.
-		first_child = ast_node_child(expr, 0)
-		var b_cur = lower_interp_segment(b, first_child)
-		var cur_opnd = g_lower_expr_result_opnd as MirOperand
-
-		# If only 1 segment and already evaluated:
-		if n_segs == 1 do
-			out expr_result(b_cur, cur_opnd)
-		end
-
-		# Concatenate subsequent segments using str_cat (bid 11)
-		var si = 1
-		when si < n_segs loop
-			seg_child = ast_node_child(expr, si)
-			b_cur = lower_interp_segment(b_cur, seg_child)
-			var seg_opnd = g_lower_expr_result_opnd as MirOperand
-
-			# Call str_cat(cur_opnd, seg_opnd) (bid 11)
-			b_cur = emit_set_arg(b_cur, 0, cur_opnd)
-			b_cur = emit_set_arg(b_cur, 1, seg_opnd)
-			var (b_cat, res_v) = builder_new_vreg(b_cur)
-			b_cur = emit_intrinsic(b_cat, MIR_INTR_BUILTIN, mir_opnd_vreg(res_v), mir_opnd_imm(11))
-			cur_opnd = mir_opnd_vreg(res_v)
-			si = si + 1
-		end
-		out expr_result(b_cur, cur_opnd)
-	end
-
-    # 4. Identifier
-	if expr_type == AstType.Identifier do
-		fname = ast_node_name(expr)
-		if g_func_ref_param_hash != 0 do
-			ref_idx = hash_table_lookup(g_func_ref_param_hash, g_func_ref_param_names, fname)
-			if ref_idx >= 0 do
-				ptr_vreg = vec_get_rt(g_func_ref_param_vregs, ref_idx)
-				var (b_load, val_vreg) = builder_new_vreg(b)
-				b_load = emit_load(b_load, val_vreg, mir_opnd_vreg(ptr_vreg))
-				out expr_result(b_load, mir_opnd_vreg(val_vreg))
-			end
-		end
-		v = get_var_vreg(b, fname)
-		if v >= 0 do
-			out expr_result(b, mir_opnd_vreg(v))
-		else
-            if fat_cstr_eq(fname, "true") == 1 do
-                out expr_result(b, mir_opnd_imm(1))
-            end
-            if fat_cstr_eq(fname, "false") == 1 do
-                out expr_result(b, mir_opnd_imm(0))
-            end
-            if fat_cstr_eq(fname, "null") == 1 do
-                out expr_result(b, mir_opnd_imm(0))
-            end
-            if fat_cstr_eq(fname, "void") == 1 do
-                out expr_result(b, mir_opnd_imm(0))
-            end
-            if g_const_hash > 0 do
-                c_idx = hash_table_lookup(g_const_hash, g_const_names, fname)
-                if c_idx >= 0 do
-                    c_val = vec_get_rt(g_const_values, c_idx)
-                    out expr_result(b, mir_opnd_imm(c_val))
-                end
-            end
-			global_slot = global_slot_lookup(fname)
-			if global_slot >= 0 do
-				var (b_global, global_vreg) = builder_new_vreg(b)
-				b_global = emit_intrinsic(b_global, MIR_INTR_GLOBAL_LOAD, mir_opnd_vreg(global_vreg), mir_opnd_imm(global_slot))
-				out expr_result(b_global, mir_opnd_vreg(global_vreg))
-			end
-			let resolved_fn = resolve_callee_alias(fname)
-			let is_fn = (find_func_ast(resolved_fn as i64) as i64 != 0) or (find_func_ast(fname as i64) as i64 != 0)
-			let is_ffi = (ffi_import_find(resolved_fn) >= 0) or (ffi_import_find(fname) >= 0)
-			if not is_fn and not is_ffi do
-				var sb_err = sb_new()
-				sb_err = sb_append(sb_err, "virc: error: lowering unresolved identifier: ")
-				var f_len = fat_str_len(fname)
-				var fi = 0
-				when fi < f_len loop
-					sb_err = sb_append_char(sb_err, fat_str_byte_at(fname, fi))
-					fi = fi + 1
-				end
-				print_ln(sb_to_string(sb_err))
-				sb_free(sb_err)
-				sys_exit(1)
-			end
-			var (b1, cid) = builder_intern(b, resolved_fn)
-			var (b2, dst) = builder_new_vreg(b1)
-			b2 = emit_intrinsic(b2, MIR_INTR_ADDR_OF, mir_opnd_vreg(dst), mir_opnd_imm(cid))
-			out expr_result(b2, mir_opnd_vreg(dst))
-		end
-	end
-
-    # 5. BinOp & Compare — full OpType→MirOp; Land/Lor → CFG (no silent Add)
-	if expr_type == AstType.BinOp or expr_type == AstType.Compare do
-		child_count = ast_node_child_count(expr)
-		if child_count >= 2 do
-			left = ast_node_child(expr, 0)
-			right = ast_node_child(expr, 1)
-			mop_i = mir_op_from_optype(ast_node_op_of(expr))
-
-            # Land: if !lhs → 0 else rhs
-			if mop_i == -2 do
-				var b1 = lower_expr(b, left)
-				var opnd_l = g_lower_expr_result_opnd as MirOperand
-				var (b2, dst) = builder_new_vreg(b1)
-				var (b3, rhs_id) = builder_add_block(b2)
-				var (b4, end_id) = builder_add_block(b3)
-				b4 = emit_move(b4, dst, mir_opnd_imm(0))
-				b4 = emit_jump_if_not(b4, opnd_l, end_id, rhs_id)
-				b4 = builder_set_current_block(b4, rhs_id)
-				var b5 = lower_expr(b4, right)
-				var opnd_r = g_lower_expr_result_opnd as MirOperand
-				b5 = emit_move(b5, dst, opnd_r)
-				b5 = emit_jump(b5, end_id)
-				b5 = builder_set_current_block(b5, end_id)
-				out expr_result(b5, mir_opnd_vreg(dst))
-			end
-
-            # Lor: if lhs → 1 else rhs
-			if mop_i == -3 do
-				var b1 = lower_expr(b, left)
-				var opnd_l = g_lower_expr_result_opnd as MirOperand
-				var (b2, dst) = builder_new_vreg(b1)
-				var (b3, rhs_id) = builder_add_block(b2)
-				var (b4, end_id) = builder_add_block(b3)
-				b4 = emit_move(b4, dst, mir_opnd_imm(1))
-				b4 = emit_jump_if(b4, opnd_l, end_id, rhs_id)
-				b4 = builder_set_current_block(b4, rhs_id)
-				var b5 = lower_expr(b4, right)
-				var opnd_r = g_lower_expr_result_opnd as MirOperand
-				b5 = emit_move(b5, dst, opnd_r)
-				b5 = emit_jump(b5, end_id)
-				b5 = builder_set_current_block(b5, end_id)
-				out expr_result(b5, mir_opnd_vreg(dst))
-			end
-
-            # PatternOp `:~` → MIR_INTR_PATTERN
-			if mop_i == -4 do
-				var b3 = lower_expr(b, left)
-				var opnd_l = g_lower_expr_result_opnd as MirOperand
-				var b4 = lower_expr(b3, right)
-				var opnd_r = g_lower_expr_result_opnd as MirOperand
-				var (b5, dst) = builder_new_vreg(b4)
-				b5 = emit_set_arg(b5, 0, opnd_l)
-				b5 = emit_set_arg(b5, 1, opnd_r)
-				out expr_result(emit_intrinsic(b5, MIR_INTR_PATTERN, mir_opnd_vreg(dst), opnd_l), mir_opnd_vreg(dst))
-			end
-
-			if mop_i < 0 do
-                # Unknown OpType — emit Nop marker, return 0 (never default Add)
-				var (b1, dst) = builder_new_vreg(b)
-				b1 = emit_intrinsic(b1, MIR_INTR_NOP_MARKER, mir_opnd_vreg(dst), mir_opnd_imm(ast_node_op_of(expr) as i64))
-				out expr_result(b1, mir_opnd_vreg(dst))
-			end
-
-			var b3 = lower_expr(b, left)
-			var opnd_l = g_lower_expr_result_opnd as MirOperand
-			var b4 = lower_expr(b3, right)
-			var opnd_r = g_lower_expr_result_opnd as MirOperand
-			var (b5, dst) = builder_new_vreg(b4)
-			var m_op = MirOp.Add
-			if mop_i == 5 do m_op = MirOp.Sub end
-			if mop_i == 6 do m_op = MirOp.Mul end
-			if mop_i == 7 do m_op = MirOp.Div end
-			if mop_i == 19 do m_op = MirOp.Mod end
-			if mop_i == 13 do m_op = MirOp.CmpEq end
-			if mop_i == 14 do m_op = MirOp.CmpNe end
-			if mop_i == 15 do m_op = MirOp.CmpGt end
-			if mop_i == 16 do m_op = MirOp.CmpLt end
-			if mop_i == 17 do m_op = MirOp.CmpGe end
-			if mop_i == 18 do m_op = MirOp.CmpLe end
-			if mop_i == 22 do m_op = MirOp.And end
-			if mop_i == 23 do m_op = MirOp.Or end
-			if mop_i == 24 do m_op = MirOp.Xor end
-			if mop_i == 25 do m_op = MirOp.Shl end
-			if mop_i == 26 do m_op = MirOp.Shr end
-			if mop_i == 28 do m_op = MirOp.Pow end
-			if mop_i == 29 do m_op = MirOp.MatMul end
-			if mop_i == 30 do m_op = MirOp.Fma end
-			var bin_lt = fat_str_new("")
-			var bin_rt = fat_str_new("")
-			if (mop_i >= 4 and mop_i <= 8) or mop_i == 19 do
-				bin_lt = infer_expr_type_name(left)
-				bin_rt = infer_expr_type_name(right)
-			end
-			if mop_i == 4 and (fat_cstr_eq(bin_lt, "string") == 1 or fat_cstr_eq(bin_rt, "string") == 1) do
-				b5 = emit_set_arg(b5, 0, opnd_l)
-				b5 = emit_set_arg(b5, 1, opnd_r)
-				var (b_cat, res_v) = builder_new_vreg(b5)
-				b_cat = emit_intrinsic(b_cat, MIR_INTR_BUILTIN, mir_opnd_vreg(res_v), mir_opnd_imm(11))
-				out expr_result(b_cat, mir_opnd_vreg(res_v))
-			end
-			if is_flux_type_str(bin_lt) or is_flux_type_str(bin_rt) do
-				var f_lanes = 4
-				if is_flux_type_str(bin_lt) do
-					f_lanes = parse_flux_lanes(bin_lt)
-				else
-					f_lanes = parse_flux_lanes(bin_rt)
-				end
-				if f_lanes <= 0 do f_lanes = 4 end
-				# Shape and element-type compatibility check [E3001]
-				if is_flux_type_str(bin_lt) and is_flux_type_str(bin_rt) do
-					let r_lanes = parse_flux_lanes(bin_rt)
-					let l_elem = parse_flux_elem_type(bin_lt) as int
-					let r_elem = parse_flux_elem_type(bin_rt) as int
-					if r_lanes > 0 and r_lanes != f_lanes do
-						print_str("virc: error: [E3001] flux lane count mismatch in binary op\n")
-						sys_exit(1)
-					end
-					if l_elem != r_elem do
-						print_str("virc: error: [E3001] flux element type mismatch in binary op\n")
-						sys_exit(1)
-					end
-				end
-				if is_flux_type_str(bin_lt) and not is_flux_type_str(bin_rt) do
-					let l_elem = parse_flux_elem_type(bin_lt) as int
-					let r_is_float = fat_cstr_eq(bin_rt, "float") == 1 or fat_cstr_eq(bin_rt, "f64") == 1 or fat_cstr_eq(bin_rt, "f32") == 1
-					if (l_elem == (TypeKind.Int as int) and r_is_float) or (l_elem == (TypeKind.Float as int) and not r_is_float) do
-						print_str("virc: error: [E3001] flux element and scalar operand type mismatch in binary op\n")
-						sys_exit(1)
-					end
-				end
-				if not is_flux_type_str(bin_lt) and is_flux_type_str(bin_rt) do
-					let r_elem = parse_flux_elem_type(bin_rt) as int
-					let l_is_float = fat_cstr_eq(bin_lt, "float") == 1 or fat_cstr_eq(bin_lt, "f64") == 1 or fat_cstr_eq(bin_lt, "f32") == 1
-					if (r_elem == (TypeKind.Int as int) and l_is_float) or (r_elem == (TypeKind.Float as int) and not l_is_float) do
-						print_str("virc: error: [E3001] flux element and scalar operand type mismatch in binary op\n")
-						sys_exit(1)
-					end
-				end
-				var m_v_op = MirOp.VAdd
-				if mop_i == 4 do m_v_op = MirOp.VAdd end
-				if mop_i == 5 do m_v_op = MirOp.VSub end
-				if mop_i == 6 do m_v_op = MirOp.VMul end
-				let alloc_sz = 16 + f_lanes * 8
-				b5 = emit_set_arg(b5, 0, mir_opnd_imm(alloc_sz))
-				var (b_fres, f_base) = builder_new_vreg(b5)
-				ins_f_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(f_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
-				annotate_owned_alloc(ins_f_alloc, f_base, alloc_sz, 16, ast_node_line(expr))
-				b_fres = builder_add_instr(b_fres, ins_f_alloc)
-				b_fres = emit_set_arg(b_fres, 0, mir_opnd_vreg(f_base))
-				b_fres = emit_set_arg(b_fres, 1, mir_opnd_imm(0))
-				b_fres = emit_set_arg(b_fres, 2, mir_opnd_imm(f_lanes))
-				b_fres = emit_intrinsic(b_fres, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
-				b_fres = emit_set_arg(b_fres, 0, mir_opnd_vreg(f_base))
-				b_fres = emit_set_arg(b_fres, 1, mir_opnd_imm(8))
-				b_fres = emit_set_arg(b_fres, 2, mir_opnd_imm(f_lanes))
-				b_fres = emit_intrinsic(b_fres, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
-				var is_float_elem = false
-				if is_flux_type_str(bin_lt) do
-					is_float_elem = (parse_flux_elem_type(bin_lt) as int) == (TypeKind.Float as int)
-				eif is_flux_type_str(bin_rt) do
-					is_float_elem = (parse_flux_elem_type(bin_rt) as int) == (TypeKind.Float as int)
-				eif fat_cstr_eq(bin_lt, "float") == 1 or fat_cstr_eq(bin_lt, "f64") == 1 or fat_cstr_eq(bin_rt, "float") == 1 or fat_cstr_eq(bin_rt, "f64") == 1 do
-					is_float_elem = true
-				end
-				var is_l_scalar = 0
-				var is_r_scalar = 0
-				if not is_flux_type_str(bin_lt) do is_l_scalar = 1 end
-				if not is_flux_type_str(bin_rt) do is_r_scalar = 1 end
-				var elem_code = 1
-				if is_float_elem do elem_code = 2 end
-				var v_flags = (is_l_scalar) or (is_r_scalar shl 1)
-				let v_aux = vec_aux_pack(elem_code, f_lanes, 16, v_flags)
-				var v_ins = mir_instr_new(m_v_op as i64, mir_opnd_vreg(f_base) as i64, opnd_l, opnd_r)
-				mir_instr_set_type(v_ins, MirType.Vector as i64)
-				mir_instr_set_aux(v_ins, v_aux)
-				b_fres = builder_add_instr(b_fres, v_ins)
-				out expr_result(b_fres, mir_opnd_vreg(f_base))
-			end
-			if mop_i == 4 do m_op = MirOp.Add end
-			ins = mir_instr_new(m_op, mir_opnd_vreg(dst), opnd_l, opnd_r)
-			if fat_cstr_eq(bin_lt, "float") == 1 or fat_cstr_eq(bin_lt, "f64") == 1 or fat_cstr_eq(bin_rt, "float") == 1 or fat_cstr_eq(bin_rt, "f64") == 1 do
-				mir_instr_set_type(ins, MirType.F64 as i64)
-			end
-			if mop_i == 28 and ast_node_int_val(expr) == 1 do
-				mir_instr_set_type(ins, MirType.F64 as i64)
-			end
-			if mop_i == 29 or mop_i == 30 do
-				# Semantic pass 6 guarantees known rank-2 operands.  Zero is an
-				# invalid sentinel, never a guessed 2x2 shape.
-				var dim_m = 0
-				var dim_k = 0
-				var dim_n = 0
-				var left_t = ""
-				var right_t = ""
-				if ast_node_type_of(left) == AstType.Identifier do
-					left_t = get_var_type(ast_node_name(left))
-				end
-				if ast_node_type_of(right) == AstType.Identifier do
-					right_t = get_var_type(ast_node_name(right))
-				end
-				var is_quantized = 0
-				if (is_tensor_type_str(left_t) or is_quantized_type_str(left_t as int)) and is_tensor_type_str(right_t) do
-					var shape_a = 0
-					if is_quantized_type_str(left_t as int) do
-						is_quantized = 1
-						shape_a = parse_quantized_shape(left_t as int)
-					else
-						shape_a = parse_tensor_shape(left_t)
-					end
-					shape_b = parse_tensor_shape(right_t)
-					if vec_len_rt(shape_a) >= 2 and vec_len_rt(shape_b) >= 2 do
-						dim_m = vec_get_rt(shape_a, 0) as int
-						dim_k = vec_get_rt(shape_a, 1) as int
-						dim_n = vec_get_rt(shape_b, 1) as int
-					end
-				end
-				var is_32bit = 0
-				var is_float = 0
-				if is_quantized == 1 do
-					is_float = 1
-					is_32bit = 1
-				else
-					let elem_sz = tensor_elem_byte_size(left_t)
-					if elem_sz == 4 do
-						is_32bit = 1
-					end
-					let t_code = parse_tensor_elem_code(left_t)
-					if t_code == 1 or t_code == 2 or t_code == 7 do
-						is_float = 1
-					end
-				end
-				let aux_val = (is_quantized shl 50) + (is_32bit shl 49) + (is_float shl 48) + (dim_m shl 32) + (dim_k shl 16) + dim_n
-				mir_instr_set_aux(ins, aux_val)
-				if is_float == 1 do
-					mir_instr_set_type(ins, MirType.F64 as i64)
-				eif is_32bit == 1 do
-					mir_instr_set_type(ins, MirType.Int32 as i64)
-				else
-					mir_instr_set_type(ins, MirType.Int64 as i64)
-				end
-			end
-			b5 = builder_add_instr(b5, ins)
-			out expr_result(b5, mir_opnd_vreg(dst))
-		end
-	end
-
-    # 5b. UnaryNot → MirOp.Not
-	if expr_type == AstType.UnaryNot do
-		if ast_node_child_count(expr) > 0 do
-			var b2 = lower_expr(b, ast_node_child(expr, 0))
-			var opnd = g_lower_expr_result_opnd as MirOperand
-			var (b3, dst) = builder_new_vreg(b2)
-			ins = mir_instr_new(MirOp.Not, mir_opnd_vreg(dst), opnd, mir_opnd_none())
-			b3 = builder_add_instr(b3, ins)
-			out expr_result(b3, mir_opnd_vreg(dst))
-		end
-	end
-
-    # 5c. Swizzle / SafeAccess
-	if expr_type == AstType.SwizzleExpr do
-		if ast_node_child_count(expr) > 0 do
-			var b2 = lower_expr(b, ast_node_child(expr, 0))
-			var base = g_lower_expr_result_opnd as MirOperand
-			var mask = ast_node_name(expr)
-			var m_len = fat_str_len(mask)
-			let alloc_sz = 16 + m_len * 8
-			var b_mut = emit_set_arg(b2, 0, mir_opnd_imm(alloc_sz))
-			var (b_dst, dst_base) = builder_new_vreg(b_mut)
-			ins_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(dst_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
-			annotate_owned_alloc(ins_alloc, dst_base, alloc_sz, 16, ast_node_line(expr))
-			b_dst = builder_add_instr(b_dst, ins_alloc)
-			b_mut = b_dst
-			b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(dst_base))
-			b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(0))
-			b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(m_len))
-			b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
-			b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(dst_base))
-			b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(8))
-			b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(m_len))
-			b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
-			var mask_val: i64 = 0
-			var si = 0
-			when si < m_len loop
-				var sc = fat_str_byte_at(mask as int, si)
-				var src_lane = swizzle_char_to_lane(sc)
-				if src_lane < 0 do src_lane = 0 end
-				mask_val = mask_val or ((src_lane and 15) shl (si * 4))
-				si = si + 1
-			end
-			var sh_ins = mir_instr_new(MirOp.Shuffle as i64, mir_opnd_vreg(dst_base) as i64, base, mir_opnd_imm(mask_val))
-			mir_instr_set_type(sh_ins, MirType.Vector as i64)
-			var sh_elem = 1
-			let sh_c_t = infer_expr_type_name(ast_node_child(expr, 0))
-			if is_flux_type_str(sh_c_t) and (parse_flux_elem_type(sh_c_t) as int) == (TypeKind.Float as int) do
-				sh_elem = 2
-			end
-			let sh_aux = (vec_aux_pack(sh_elem, m_len, 16, 0) and 0xFFFFFFFF) or (mask_val shl 32)
-			mir_instr_set_aux(sh_ins, sh_aux)
-			b_mut = builder_add_instr(b_mut, sh_ins)
-			out expr_result(b_mut, mir_opnd_vreg(dst_base))
-		end
-	end
-	if expr_type == AstType.SafeAccessExpr do
-		var (b1, fid) = builder_intern(b, ast_node_name(expr))
-		if ast_node_child_count(expr) > 0 do
-			var b2 = lower_expr(b1, ast_node_child(expr, 0))
-			var base = g_lower_expr_result_opnd as MirOperand
-			var (b3, dst) = builder_new_vreg(b2)
-			b3 = emit_set_arg(b3, 0, base)
-			b3 = emit_set_arg(b3, 1, mir_opnd_imm(fid))
-			out expr_result(emit_intrinsic(b3, MIR_INTR_SAFE_ACCESS, mir_opnd_vreg(dst), mir_opnd_imm(fid)), mir_opnd_vreg(dst))
-		end
-	end
-
-    # 5d. Erx / Task / Wait / Quantize
-	if expr_type == AstType.ErxExpr do
-		if g_try_err_vreg >= 0 do
-			out expr_result(b, mir_opnd_vreg(g_try_err_vreg))
-		end
-		var (b1, dst) = builder_new_vreg(b)
-		out expr_result(emit_intrinsic(b1, MIR_INTR_ERX, mir_opnd_vreg(dst), mir_opnd_none()), mir_opnd_vreg(dst))
-	end
-	if expr_type == AstType.TaskExpr do
-		if ast_node_child_count(expr) > 0 do
-			var b2 = lower_expr(b, ast_node_child(expr, 0))
-			var v = g_lower_expr_result_opnd as MirOperand
-			var (b3, dst) = builder_new_vreg(b2)
-			out expr_result(emit_intrinsic(b3, MIR_INTR_TASK, mir_opnd_vreg(dst), v), mir_opnd_vreg(dst))
-		end
-	end
-	if expr_type == AstType.WaitExpr do
-		if ast_node_child_count(expr) > 0 do
-			var b2 = lower_expr(b, ast_node_child(expr, 0))
-			var v = g_lower_expr_result_opnd as MirOperand
-			var (b3, dst) = builder_new_vreg(b2)
-			out expr_result(emit_intrinsic(b3, MIR_INTR_WAIT, mir_opnd_vreg(dst), v), mir_opnd_vreg(dst))
-		end
-	end
-	if expr_type == AstType.QuantizeExpr do
-		if ast_node_child_count(expr) > 0 do
-			var b2 = lower_expr(b, ast_node_child(expr, 0))
-			var v = g_lower_expr_result_opnd as MirOperand
-			var q_bits: i64 = 8
-			if ast_node_child_count(expr) > 1 do
-				let b_node = ast_node_child(expr, 1)
-				if ast_node_type_of(b_node) == AstType.LiteralInt do
-					q_bits = ast_node_int_val(b_node)
-				end
-			end
-			b2 = emit_set_arg(b2, 0, mir_opnd_imm(q_bits))
-			var (b3, dst) = builder_new_vreg(b2)
-			out expr_result(emit_intrinsic(b3, MIR_INTR_QUANTIZE, mir_opnd_vreg(dst), v), mir_opnd_vreg(dst))
-		end
-	end
-
-    # 6. Call — SetArg* then Call(dst, nargs); src2 = callee string-pool id
+# ═══════════════════════════════════════════════════════
+# Call Expression Lowering Dispatcher
+# ═══════════════════════════════════════════════════════
+func lower_expr_calls(b: MirBuilder, expr: &AstNode, expr_type: AstType):
 	if expr_type == AstType.Call do
 		# Positional entity construction `Ent(v0, v1, ...)` parses as a Call
 		# reclassify to an aggregate when the callee names an entity type.
@@ -47446,67 +46936,374 @@ func lower_expr_impl(b: MirBuilder, expr: &AstNode):
 		end
 
     # 5e. PatternExpr / ExistExpr / Map / ArrCompact / Bundle / Error / Ptr
-	if expr_type == AstType.PatternExpr do
-		if ast_node_child_count(expr) >= 2 do
-			var b3 = lower_expr(b, ast_node_child(expr, 0))
+	out b
+end.
+# @vir_source compiler/src/lower/ast_to_mir/expr_ops.vri 1
+##
+ * compiler/src/lower/ast_to_mir/expr_ops.vri — Operators & Unary Expressions
+ * ===========================================================================
+ ##
+
+
+# ═══════════════════════════════════════════════════════
+# Operator Expression Lowering Dispatcher
+# ═══════════════════════════════════════════════════════
+func lower_expr_ops(b: MirBuilder, expr: &AstNode, expr_type: AstType):
+	if expr_type == AstType.BinOp or expr_type == AstType.Compare do
+		child_count = ast_node_child_count(expr)
+		if child_count >= 2 do
+			left = ast_node_child(expr, 0)
+			right = ast_node_child(expr, 1)
+			mop_i = mir_op_from_optype(ast_node_op_of(expr))
+
+            # Land: if !lhs → 0 else rhs
+			if mop_i == -2 do
+				var b1 = lower_expr(b, left)
+				var opnd_l = g_lower_expr_result_opnd as MirOperand
+				var (b2, dst) = builder_new_vreg(b1)
+				var (b3, rhs_id) = builder_add_block(b2)
+				var (b4, end_id) = builder_add_block(b3)
+				b4 = emit_move(b4, dst, mir_opnd_imm(0))
+				b4 = emit_jump_if_not(b4, opnd_l, end_id, rhs_id)
+				b4 = builder_set_current_block(b4, rhs_id)
+				var b5 = lower_expr(b4, right)
+				var opnd_r = g_lower_expr_result_opnd as MirOperand
+				b5 = emit_move(b5, dst, opnd_r)
+				b5 = emit_jump(b5, end_id)
+				b5 = builder_set_current_block(b5, end_id)
+				out expr_result(b5, mir_opnd_vreg(dst))
+			end
+
+            # Lor: if lhs → 1 else rhs
+			if mop_i == -3 do
+				var b1 = lower_expr(b, left)
+				var opnd_l = g_lower_expr_result_opnd as MirOperand
+				var (b2, dst) = builder_new_vreg(b1)
+				var (b3, rhs_id) = builder_add_block(b2)
+				var (b4, end_id) = builder_add_block(b3)
+				b4 = emit_move(b4, dst, mir_opnd_imm(1))
+				b4 = emit_jump_if(b4, opnd_l, end_id, rhs_id)
+				b4 = builder_set_current_block(b4, rhs_id)
+				var b5 = lower_expr(b4, right)
+				var opnd_r = g_lower_expr_result_opnd as MirOperand
+				b5 = emit_move(b5, dst, opnd_r)
+				b5 = emit_jump(b5, end_id)
+				b5 = builder_set_current_block(b5, end_id)
+				out expr_result(b5, mir_opnd_vreg(dst))
+			end
+
+            # PatternOp `:~` → MIR_INTR_PATTERN
+			if mop_i == -4 do
+				var b3 = lower_expr(b, left)
+				var opnd_l = g_lower_expr_result_opnd as MirOperand
+				var b4 = lower_expr(b3, right)
+				var opnd_r = g_lower_expr_result_opnd as MirOperand
+				var (b5, dst) = builder_new_vreg(b4)
+				b5 = emit_set_arg(b5, 0, opnd_l)
+				b5 = emit_set_arg(b5, 1, opnd_r)
+				out expr_result(emit_intrinsic(b5, MIR_INTR_PATTERN, mir_opnd_vreg(dst), opnd_l), mir_opnd_vreg(dst))
+			end
+
+			if mop_i < 0 do
+                # Unknown OpType — emit Nop marker, return 0 (never default Add)
+				var (b1, dst) = builder_new_vreg(b)
+				b1 = emit_intrinsic(b1, MIR_INTR_NOP_MARKER, mir_opnd_vreg(dst), mir_opnd_imm(ast_node_op_of(expr) as i64))
+				out expr_result(b1, mir_opnd_vreg(dst))
+			end
+
+			var b3 = lower_expr(b, left)
 			var opnd_l = g_lower_expr_result_opnd as MirOperand
-			var b4 = lower_expr(b3, ast_node_child(expr, 1))
+			var b4 = lower_expr(b3, right)
 			var opnd_r = g_lower_expr_result_opnd as MirOperand
 			var (b5, dst) = builder_new_vreg(b4)
-			b5 = emit_set_arg(b5, 0, opnd_l)
-			b5 = emit_set_arg(b5, 1, opnd_r)
-			out expr_result(emit_intrinsic(b5, MIR_INTR_PATTERN, mir_opnd_vreg(dst), opnd_l), mir_opnd_vreg(dst))
+			var m_op = MirOp.Add
+			if mop_i == 5 do m_op = MirOp.Sub end
+			if mop_i == 6 do m_op = MirOp.Mul end
+			if mop_i == 7 do m_op = MirOp.Div end
+			if mop_i == 19 do m_op = MirOp.Mod end
+			if mop_i == 13 do m_op = MirOp.CmpEq end
+			if mop_i == 14 do m_op = MirOp.CmpNe end
+			if mop_i == 15 do m_op = MirOp.CmpGt end
+			if mop_i == 16 do m_op = MirOp.CmpLt end
+			if mop_i == 17 do m_op = MirOp.CmpGe end
+			if mop_i == 18 do m_op = MirOp.CmpLe end
+			if mop_i == 22 do m_op = MirOp.And end
+			if mop_i == 23 do m_op = MirOp.Or end
+			if mop_i == 24 do m_op = MirOp.Xor end
+			if mop_i == 25 do m_op = MirOp.Shl end
+			if mop_i == 26 do m_op = MirOp.Shr end
+			if mop_i == 28 do m_op = MirOp.Pow end
+			if mop_i == 29 do m_op = MirOp.MatMul end
+			if mop_i == 30 do m_op = MirOp.Fma end
+			var bin_lt = fat_str_new("")
+			var bin_rt = fat_str_new("")
+			if (mop_i >= 4 and mop_i <= 8) or mop_i == 19 do
+				bin_lt = infer_expr_type_name(left)
+				bin_rt = infer_expr_type_name(right)
+			end
+			if mop_i == 4 and (fat_cstr_eq(bin_lt, "string") == 1 or fat_cstr_eq(bin_rt, "string") == 1) do
+				b5 = emit_set_arg(b5, 0, opnd_l)
+				b5 = emit_set_arg(b5, 1, opnd_r)
+				var (b_cat, res_v) = builder_new_vreg(b5)
+				b_cat = emit_intrinsic(b_cat, MIR_INTR_BUILTIN, mir_opnd_vreg(res_v), mir_opnd_imm(11))
+				out expr_result(b_cat, mir_opnd_vreg(res_v))
+			end
+			if is_flux_type_str(bin_lt) or is_flux_type_str(bin_rt) do
+				var f_lanes = 4
+				if is_flux_type_str(bin_lt) do
+					f_lanes = parse_flux_lanes(bin_lt)
+				else
+					f_lanes = parse_flux_lanes(bin_rt)
+				end
+				if f_lanes <= 0 do f_lanes = 4 end
+				# Shape and element-type compatibility check [E3001]
+				if is_flux_type_str(bin_lt) and is_flux_type_str(bin_rt) do
+					let r_lanes = parse_flux_lanes(bin_rt)
+					let l_elem = parse_flux_elem_type(bin_lt) as int
+					let r_elem = parse_flux_elem_type(bin_rt) as int
+					if r_lanes > 0 and r_lanes != f_lanes do
+						print_str("virc: error: [E3001] flux lane count mismatch in binary op\n")
+						sys_exit(1)
+					end
+					if l_elem != r_elem do
+						print_str("virc: error: [E3001] flux element type mismatch in binary op\n")
+						sys_exit(1)
+					end
+				end
+				if is_flux_type_str(bin_lt) and not is_flux_type_str(bin_rt) do
+					let l_elem = parse_flux_elem_type(bin_lt) as int
+					let r_is_float = fat_cstr_eq(bin_rt, "float") == 1 or fat_cstr_eq(bin_rt, "f64") == 1 or fat_cstr_eq(bin_rt, "f32") == 1
+					if (l_elem == (TypeKind.Int as int) and r_is_float) or (l_elem == (TypeKind.Float as int) and not r_is_float) do
+						print_str("virc: error: [E3001] flux element and scalar operand type mismatch in binary op\n")
+						sys_exit(1)
+					end
+				end
+				if not is_flux_type_str(bin_lt) and is_flux_type_str(bin_rt) do
+					let r_elem = parse_flux_elem_type(bin_rt) as int
+					let l_is_float = fat_cstr_eq(bin_lt, "float") == 1 or fat_cstr_eq(bin_lt, "f64") == 1 or fat_cstr_eq(bin_lt, "f32") == 1
+					if (r_elem == (TypeKind.Int as int) and l_is_float) or (r_elem == (TypeKind.Float as int) and not l_is_float) do
+						print_str("virc: error: [E3001] flux element and scalar operand type mismatch in binary op\n")
+						sys_exit(1)
+					end
+				end
+				var m_v_op = MirOp.VAdd
+				if mop_i == 4 do m_v_op = MirOp.VAdd end
+				if mop_i == 5 do m_v_op = MirOp.VSub end
+				if mop_i == 6 do m_v_op = MirOp.VMul end
+				let alloc_sz = 16 + f_lanes * 8
+				b5 = emit_set_arg(b5, 0, mir_opnd_imm(alloc_sz))
+				var (b_fres, f_base) = builder_new_vreg(b5)
+				ins_f_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(f_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+				annotate_owned_alloc(ins_f_alloc, f_base, alloc_sz, 16, ast_node_line(expr))
+				b_fres = builder_add_instr(b_fres, ins_f_alloc)
+				b_fres = emit_set_arg(b_fres, 0, mir_opnd_vreg(f_base))
+				b_fres = emit_set_arg(b_fres, 1, mir_opnd_imm(0))
+				b_fres = emit_set_arg(b_fres, 2, mir_opnd_imm(f_lanes))
+				b_fres = emit_intrinsic(b_fres, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+				b_fres = emit_set_arg(b_fres, 0, mir_opnd_vreg(f_base))
+				b_fres = emit_set_arg(b_fres, 1, mir_opnd_imm(8))
+				b_fres = emit_set_arg(b_fres, 2, mir_opnd_imm(f_lanes))
+				b_fres = emit_intrinsic(b_fres, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+				var is_float_elem = false
+				if is_flux_type_str(bin_lt) do
+					is_float_elem = (parse_flux_elem_type(bin_lt) as int) == (TypeKind.Float as int)
+				eif is_flux_type_str(bin_rt) do
+					is_float_elem = (parse_flux_elem_type(bin_rt) as int) == (TypeKind.Float as int)
+				eif fat_cstr_eq(bin_lt, "float") == 1 or fat_cstr_eq(bin_lt, "f64") == 1 or fat_cstr_eq(bin_rt, "float") == 1 or fat_cstr_eq(bin_rt, "f64") == 1 do
+					is_float_elem = true
+				end
+				var is_l_scalar = 0
+				var is_r_scalar = 0
+				if not is_flux_type_str(bin_lt) do is_l_scalar = 1 end
+				if not is_flux_type_str(bin_rt) do is_r_scalar = 1 end
+				var elem_code = 1
+				if is_float_elem do elem_code = 2 end
+				var v_flags = (is_l_scalar) or (is_r_scalar shl 1)
+				let v_aux = vec_aux_pack(elem_code, f_lanes, 16, v_flags)
+				var v_ins = mir_instr_new(m_v_op as i64, mir_opnd_vreg(f_base) as i64, opnd_l, opnd_r)
+				mir_instr_set_type(v_ins, MirType.Vector as i64)
+				mir_instr_set_aux(v_ins, v_aux)
+				b_fres = builder_add_instr(b_fres, v_ins)
+				out expr_result(b_fres, mir_opnd_vreg(f_base))
+			end
+			if mop_i == 4 do m_op = MirOp.Add end
+			ins = mir_instr_new(m_op, mir_opnd_vreg(dst), opnd_l, opnd_r)
+			if fat_cstr_eq(bin_lt, "float") == 1 or fat_cstr_eq(bin_lt, "f64") == 1 or fat_cstr_eq(bin_rt, "float") == 1 or fat_cstr_eq(bin_rt, "f64") == 1 do
+				mir_instr_set_type(ins, MirType.F64 as i64)
+			end
+			if mop_i == 28 and ast_node_int_val(expr) == 1 do
+				mir_instr_set_type(ins, MirType.F64 as i64)
+			end
+			if mop_i == 29 or mop_i == 30 do
+				# Semantic pass 6 guarantees known rank-2 operands.  Zero is an
+				# invalid sentinel, never a guessed 2x2 shape.
+				var dim_m = 0
+				var dim_k = 0
+				var dim_n = 0
+				var left_t = ""
+				var right_t = ""
+				if ast_node_type_of(left) == AstType.Identifier do
+					left_t = get_var_type(ast_node_name(left))
+				end
+				if ast_node_type_of(right) == AstType.Identifier do
+					right_t = get_var_type(ast_node_name(right))
+				end
+				var is_quantized = 0
+				if (is_tensor_type_str(left_t) or is_quantized_type_str(left_t as int)) and is_tensor_type_str(right_t) do
+					var shape_a = 0
+					if is_quantized_type_str(left_t as int) do
+						is_quantized = 1
+						shape_a = parse_quantized_shape(left_t as int)
+					else
+						shape_a = parse_tensor_shape(left_t)
+					end
+					shape_b = parse_tensor_shape(right_t)
+					if vec_len_rt(shape_a) >= 2 and vec_len_rt(shape_b) >= 2 do
+						dim_m = vec_get_rt(shape_a, 0) as int
+						dim_k = vec_get_rt(shape_a, 1) as int
+						dim_n = vec_get_rt(shape_b, 1) as int
+					end
+				end
+				var is_32bit = 0
+				var is_float = 0
+				if is_quantized == 1 do
+					is_float = 1
+					is_32bit = 1
+				else
+					let elem_sz = tensor_elem_byte_size(left_t)
+					if elem_sz == 4 do
+						is_32bit = 1
+					end
+					let t_code = parse_tensor_elem_code(left_t)
+					if t_code == 1 or t_code == 2 or t_code == 7 do
+						is_float = 1
+					end
+				end
+				let aux_val = (is_quantized shl 50) + (is_32bit shl 49) + (is_float shl 48) + (dim_m shl 32) + (dim_k shl 16) + dim_n
+				mir_instr_set_aux(ins, aux_val)
+				if is_float == 1 do
+					mir_instr_set_type(ins, MirType.F64 as i64)
+				eif is_32bit == 1 do
+					mir_instr_set_type(ins, MirType.Int32 as i64)
+				else
+					mir_instr_set_type(ins, MirType.Int64 as i64)
+				end
+			end
+			b5 = builder_add_instr(b5, ins)
+			out expr_result(b5, mir_opnd_vreg(dst))
 		end
 	end
-	if expr_type == AstType.ExistExpr do
+
+    # 5b. UnaryNot → MirOp.Not
+	if expr_type == AstType.UnaryNot do
+		if ast_node_child_count(expr) > 0 do
+			var b2 = lower_expr(b, ast_node_child(expr, 0))
+			var opnd = g_lower_expr_result_opnd as MirOperand
+			var (b3, dst) = builder_new_vreg(b2)
+			ins = mir_instr_new(MirOp.Not, mir_opnd_vreg(dst), opnd, mir_opnd_none())
+			b3 = builder_add_instr(b3, ins)
+			out expr_result(b3, mir_opnd_vreg(dst))
+		end
+	end
+
+    # 5c. Swizzle / SafeAccess
+	if expr_type == AstType.SwizzleExpr do
+		if ast_node_child_count(expr) > 0 do
+			var b2 = lower_expr(b, ast_node_child(expr, 0))
+			var base = g_lower_expr_result_opnd as MirOperand
+			var mask = ast_node_name(expr)
+			var m_len = fat_str_len(mask)
+			let alloc_sz = 16 + m_len * 8
+			var b_mut = emit_set_arg(b2, 0, mir_opnd_imm(alloc_sz))
+			var (b_dst, dst_base) = builder_new_vreg(b_mut)
+			ins_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(dst_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+			annotate_owned_alloc(ins_alloc, dst_base, alloc_sz, 16, ast_node_line(expr))
+			b_dst = builder_add_instr(b_dst, ins_alloc)
+			b_mut = b_dst
+			b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(dst_base))
+			b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(0))
+			b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(m_len))
+			b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+			b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(dst_base))
+			b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(8))
+			b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(m_len))
+			b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+			var mask_val: i64 = 0
+			var si = 0
+			when si < m_len loop
+				var sc = fat_str_byte_at(mask as int, si)
+				var src_lane = swizzle_char_to_lane(sc)
+				if src_lane < 0 do src_lane = 0 end
+				mask_val = mask_val or ((src_lane and 15) shl (si * 4))
+				si = si + 1
+			end
+			var sh_ins = mir_instr_new(MirOp.Shuffle as i64, mir_opnd_vreg(dst_base) as i64, base, mir_opnd_imm(mask_val))
+			mir_instr_set_type(sh_ins, MirType.Vector as i64)
+			var sh_elem = 1
+			let sh_c_t = infer_expr_type_name(ast_node_child(expr, 0))
+			if is_flux_type_str(sh_c_t) and (parse_flux_elem_type(sh_c_t) as int) == (TypeKind.Float as int) do
+				sh_elem = 2
+			end
+			let sh_aux = (vec_aux_pack(sh_elem, m_len, 16, 0) and 0xFFFFFFFF) or (mask_val shl 32)
+			mir_instr_set_aux(sh_ins, sh_aux)
+			b_mut = builder_add_instr(b_mut, sh_ins)
+			out expr_result(b_mut, mir_opnd_vreg(dst_base))
+		end
+	end
+	if expr_type == AstType.SafeAccessExpr do
+		var (b1, fid) = builder_intern(b, ast_node_name(expr))
+		if ast_node_child_count(expr) > 0 do
+			var b2 = lower_expr(b1, ast_node_child(expr, 0))
+			var base = g_lower_expr_result_opnd as MirOperand
+			var (b3, dst) = builder_new_vreg(b2)
+			b3 = emit_set_arg(b3, 0, base)
+			b3 = emit_set_arg(b3, 1, mir_opnd_imm(fid))
+			out expr_result(emit_intrinsic(b3, MIR_INTR_SAFE_ACCESS, mir_opnd_vreg(dst), mir_opnd_imm(fid)), mir_opnd_vreg(dst))
+		end
+	end
+
+    # 5d. Erx / Task / Wait / Quantize
+	if expr_type == AstType.ErxExpr do
+		if g_try_err_vreg >= 0 do
+			out expr_result(b, mir_opnd_vreg(g_try_err_vreg))
+		end
+		var (b1, dst) = builder_new_vreg(b)
+		out expr_result(emit_intrinsic(b1, MIR_INTR_ERX, mir_opnd_vreg(dst), mir_opnd_none()), mir_opnd_vreg(dst))
+	end
+	if expr_type == AstType.TaskExpr do
 		if ast_node_child_count(expr) > 0 do
 			var b2 = lower_expr(b, ast_node_child(expr, 0))
 			var v = g_lower_expr_result_opnd as MirOperand
 			var (b3, dst) = builder_new_vreg(b2)
-			out expr_result(emit_intrinsic(b3, MIR_INTR_EXIST, mir_opnd_vreg(dst), v), mir_opnd_vreg(dst))
+			out expr_result(emit_intrinsic(b3, MIR_INTR_TASK, mir_opnd_vreg(dst), v), mir_opnd_vreg(dst))
 		end
 	end
-	if expr_type == AstType.MapExpr do
-		if fat_str_len(ast_node_name(expr)) > 0 and fat_cstr_eq(ast_node_name(expr), "map") == 0 do
-			out lower_map_block_expr(b, expr)
+	if expr_type == AstType.WaitExpr do
+		if ast_node_child_count(expr) > 0 do
+			var b2 = lower_expr(b, ast_node_child(expr, 0))
+			var v = g_lower_expr_result_opnd as MirOperand
+			var (b3, dst) = builder_new_vreg(b2)
+			out expr_result(emit_intrinsic(b3, MIR_INTR_WAIT, mir_opnd_vreg(dst), v), mir_opnd_vreg(dst))
 		end
-		var (b2, nargs) = lower_call_args(b, expr, 0, 0)
-		var (b3, dst) = builder_new_vreg(b2)
-		out expr_result(emit_intrinsic(b3, MIR_INTR_MAP, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
 	end
-	if expr_type == AstType.ArrCompactExpr do
-		var (b2, nargs) = lower_call_args(b, expr, 0, 0)
-		var (b3, dst) = builder_new_vreg(b2)
-		out expr_result(emit_intrinsic(b3, MIR_INTR_ARR_COMPACT, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
-	end
-	if expr_type == AstType.BundleExpr do
-		child_count = ast_node_child_count(expr)
-		if child_count > 0 do
-			c0 = ast_node_child(expr, 0)
-			if ast_node_type_of(c0) == AstType.LiteralStr do
-				var (b1, sid) = builder_intern(b, ast_node_name(c0))
-				var (b2, dst) = builder_new_vreg(b1)
-				out expr_result(emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(dst), mir_opnd_imm(sid)), mir_opnd_vreg(dst))
+	if expr_type == AstType.QuantizeExpr do
+		if ast_node_child_count(expr) > 0 do
+			var b2 = lower_expr(b, ast_node_child(expr, 0))
+			var v = g_lower_expr_result_opnd as MirOperand
+			var q_bits: i64 = 8
+			if ast_node_child_count(expr) > 1 do
+				let b_node = ast_node_child(expr, 1)
+				if ast_node_type_of(b_node) == AstType.LiteralInt do
+					q_bits = ast_node_int_val(b_node)
+				end
 			end
+			b2 = emit_set_arg(b2, 0, mir_opnd_imm(q_bits))
+			var (b3, dst) = builder_new_vreg(b2)
+			out expr_result(emit_intrinsic(b3, MIR_INTR_QUANTIZE, mir_opnd_vreg(dst), v), mir_opnd_vreg(dst))
 		end
-		var (b2, nargs) = lower_call_args(b, expr, 0, 0)
-		var (b3, dst) = builder_new_vreg(b2)
-		out expr_result(emit_intrinsic(b3, MIR_INTR_BUNDLE, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
 	end
-	if expr_type == AstType.ErrorExpr do
-		var (b1, dst) = builder_new_vreg(b)
-		out expr_result(emit_intrinsic(b1, MIR_INTR_ERROR, mir_opnd_vreg(dst), mir_opnd_none()), mir_opnd_vreg(dst))
-	end
-	if expr_type == AstType.PtrTypeExpr do
-        fname = ast_node_name(expr)
-        v = get_var_vreg(b, fname)
-        if v >= 0 do
-            out expr_result(b, mir_opnd_vreg(v))
-        end
-		var (b1, pid) = builder_intern(b, fname)
-		var (b2, dst) = builder_new_vreg(b1)
-		out expr_result(emit_intrinsic(b2, MIR_INTR_PTR, mir_opnd_vreg(dst), mir_opnd_imm(pid)), mir_opnd_vreg(dst))
-	end
+
+    # 6. Call — SetArg* then Call(dst, nargs); src2 = callee string-pool id
 	if expr_type == AstType.PercentExpr do
 		if ast_node_child_count(expr) > 0 do
 			child = ast_node_child(expr, 0)
@@ -47583,6 +47380,254 @@ func lower_expr_impl(b: MirBuilder, expr: &AstNode):
 		end
 	end
 
+	out b
+end.
+# @vir_source compiler/src/lower/ast_to_mir/expr.vri 1
+##
+ * compiler/src/lower/ast_to_mir/expr.vri — Expressions & Literals Lowering
+ * ==========================================================================
+ ##
+
+
+func lower_expr_impl(b: MirBuilder, expr: &AstNode):
+	expr_type = ast_node_type_of(expr)
+
+	if expr_type == AstType.Call or expr_type == AstType.BuiltinCall or expr_type == AstType.MethodCall do
+		out lower_expr_calls(b, expr, expr_type)
+	end
+
+	if expr_type == AstType.BinOp or expr_type == AstType.Compare or expr_type == AstType.UnaryNot or expr_type == AstType.SwizzleExpr or expr_type == AstType.SafeAccessExpr or expr_type == AstType.ErxExpr or expr_type == AstType.TaskExpr or expr_type == AstType.WaitExpr or expr_type == AstType.QuantizeExpr or expr_type == AstType.PercentExpr or expr_type == AstType.UnaryMinus or expr_type == AstType.AddrOf do
+		out lower_expr_ops(b, expr, expr_type)
+	end
+
+	if expr_type == AstType.Assign do
+		var b_stmt = lower_stmt(b, expr)
+		var v_res = get_var_vreg(b_stmt, ast_node_name(expr))
+		if v_res >= 0 do
+			out expr_result(b_stmt, mir_opnd_vreg(v_res))
+		end
+		out expr_result(b_stmt, g_lower_expr_result_opnd as MirOperand)
+	end
+
+    # Enum constructors are resolved by semantic pass 3.  They never become
+    # ordinary function calls and require no runtime/prelude helper.
+    if expr_type == AstType.EnumConstruct do
+        out lower_enum_construct(b, expr, ast_node_name2(expr), ast_node_name(expr))
+    end
+
+    # 1. Literal Int
+	if expr_type == AstType.LiteralInt do
+		var (b2, v) = builder_new_vreg(b)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(ast_node_int_val(expr)), mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+	if expr_type == AstType.PrecompBlock do
+		var (b2, v) = builder_new_vreg(b)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(ast_node_int_val(expr)), mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+    # 2. Literal Float (raw 64-bit IEEE 754 bits from offset 48)
+	if expr_type == AstType.LiteralFloat do
+		var (b2, v) = builder_new_vreg(b)
+		f_bits = native_read_i64(expr as i64, 48)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(f_bits), mir_opnd_none())
+		mir_instr_set_type(ins, MirType.F64 as i64)
+		b2 = builder_add_instr(b2, ins)
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+    # 2b. Literal Bool
+	if expr_type == AstType.LiteralBool do
+		var (b2, v) = builder_new_vreg(b)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(ast_node_int_val(expr)), mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+    # 2c. Literal None
+	if expr_type == AstType.LiteralNone do
+		var (b2, v) = builder_new_vreg(b)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(0), mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+    # 3. Literal Str — src1 = string-pool id (100% static, zero runtime alloc)
+	if expr_type == AstType.LiteralStr do
+		var (b1, sid) = builder_intern(b, ast_node_name(expr))
+		var (b2, v) = builder_new_vreg(b1)
+		b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+    # 3b. InterpExpr — lowered to str_cat (bid 11) and int_to_str (bid 19) in Arena
+	if expr_type == AstType.InterpExpr do
+		n_segs = ast_node_child_count(expr)
+		if n_segs == 0 do
+			var (b1, sid) = builder_intern(b, fat_str_new(""))
+			var (b2, v) = builder_new_vreg(b1)
+			b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
+			out expr_result(b2, mir_opnd_vreg(v))
+		end
+
+		# Lower first segment and convert non-string values deterministically.
+		first_child = ast_node_child(expr, 0)
+		var b_cur = lower_interp_segment(b, first_child)
+		var cur_opnd = g_lower_expr_result_opnd as MirOperand
+
+		# If only 1 segment and already evaluated:
+		if n_segs == 1 do
+			out expr_result(b_cur, cur_opnd)
+		end
+
+		# Concatenate subsequent segments using str_cat (bid 11)
+		var si = 1
+		when si < n_segs loop
+			seg_child = ast_node_child(expr, si)
+			b_cur = lower_interp_segment(b_cur, seg_child)
+			var seg_opnd = g_lower_expr_result_opnd as MirOperand
+
+			# Call str_cat(cur_opnd, seg_opnd) (bid 11)
+			b_cur = emit_set_arg(b_cur, 0, cur_opnd)
+			b_cur = emit_set_arg(b_cur, 1, seg_opnd)
+			var (b_cat, res_v) = builder_new_vreg(b_cur)
+			b_cur = emit_intrinsic(b_cat, MIR_INTR_BUILTIN, mir_opnd_vreg(res_v), mir_opnd_imm(11))
+			cur_opnd = mir_opnd_vreg(res_v)
+			si = si + 1
+		end
+		out expr_result(b_cur, cur_opnd)
+	end
+
+    # 4. Identifier
+	if expr_type == AstType.Identifier do
+		fname = ast_node_name(expr)
+		if g_func_ref_param_hash != 0 do
+			ref_idx = hash_table_lookup(g_func_ref_param_hash, g_func_ref_param_names, fname)
+			if ref_idx >= 0 do
+				ptr_vreg = vec_get_rt(g_func_ref_param_vregs, ref_idx)
+				var (b_load, val_vreg) = builder_new_vreg(b)
+				b_load = emit_load(b_load, val_vreg, mir_opnd_vreg(ptr_vreg))
+				out expr_result(b_load, mir_opnd_vreg(val_vreg))
+			end
+		end
+		v = get_var_vreg(b, fname)
+		if v >= 0 do
+			out expr_result(b, mir_opnd_vreg(v))
+		else
+            if fat_cstr_eq(fname, "true") == 1 do
+                out expr_result(b, mir_opnd_imm(1))
+            end
+            if fat_cstr_eq(fname, "false") == 1 do
+                out expr_result(b, mir_opnd_imm(0))
+            end
+            if fat_cstr_eq(fname, "null") == 1 do
+                out expr_result(b, mir_opnd_imm(0))
+            end
+            if fat_cstr_eq(fname, "void") == 1 do
+                out expr_result(b, mir_opnd_imm(0))
+            end
+            if g_const_hash > 0 do
+                c_idx = hash_table_lookup(g_const_hash, g_const_names, fname)
+                if c_idx >= 0 do
+                    c_val = vec_get_rt(g_const_values, c_idx)
+                    out expr_result(b, mir_opnd_imm(c_val))
+                end
+            end
+			global_slot = global_slot_lookup(fname)
+			if global_slot >= 0 do
+				var (b_global, global_vreg) = builder_new_vreg(b)
+				b_global = emit_intrinsic(b_global, MIR_INTR_GLOBAL_LOAD, mir_opnd_vreg(global_vreg), mir_opnd_imm(global_slot))
+				out expr_result(b_global, mir_opnd_vreg(global_vreg))
+			end
+			let resolved_fn = resolve_callee_alias(fname)
+			let is_fn = (find_func_ast(resolved_fn as i64) as i64 != 0) or (find_func_ast(fname as i64) as i64 != 0)
+			let is_ffi = (ffi_import_find(resolved_fn) >= 0) or (ffi_import_find(fname) >= 0)
+			if not is_fn and not is_ffi do
+				var sb_err = sb_new()
+				sb_err = sb_append(sb_err, "virc: error: lowering unresolved identifier: ")
+				var f_len = fat_str_len(fname)
+				var fi = 0
+				when fi < f_len loop
+					sb_err = sb_append_char(sb_err, fat_str_byte_at(fname, fi))
+					fi = fi + 1
+				end
+				print_ln(sb_to_string(sb_err))
+				sb_free(sb_err)
+				sys_exit(1)
+			end
+			var (b1, cid) = builder_intern(b, resolved_fn)
+			var (b2, dst) = builder_new_vreg(b1)
+			b2 = emit_intrinsic(b2, MIR_INTR_ADDR_OF, mir_opnd_vreg(dst), mir_opnd_imm(cid))
+			out expr_result(b2, mir_opnd_vreg(dst))
+		end
+	end
+
+    # 5. BinOp & Compare — full OpType→MirOp; Land/Lor → CFG (no silent Add)
+	if expr_type == AstType.PatternExpr do
+		if ast_node_child_count(expr) >= 2 do
+			var b3 = lower_expr(b, ast_node_child(expr, 0))
+			var opnd_l = g_lower_expr_result_opnd as MirOperand
+			var b4 = lower_expr(b3, ast_node_child(expr, 1))
+			var opnd_r = g_lower_expr_result_opnd as MirOperand
+			var (b5, dst) = builder_new_vreg(b4)
+			b5 = emit_set_arg(b5, 0, opnd_l)
+			b5 = emit_set_arg(b5, 1, opnd_r)
+			out expr_result(emit_intrinsic(b5, MIR_INTR_PATTERN, mir_opnd_vreg(dst), opnd_l), mir_opnd_vreg(dst))
+		end
+	end
+	if expr_type == AstType.ExistExpr do
+		if ast_node_child_count(expr) > 0 do
+			var b2 = lower_expr(b, ast_node_child(expr, 0))
+			var v = g_lower_expr_result_opnd as MirOperand
+			var (b3, dst) = builder_new_vreg(b2)
+			out expr_result(emit_intrinsic(b3, MIR_INTR_EXIST, mir_opnd_vreg(dst), v), mir_opnd_vreg(dst))
+		end
+	end
+	if expr_type == AstType.MapExpr do
+		if fat_str_len(ast_node_name(expr)) > 0 and fat_cstr_eq(ast_node_name(expr), "map") == 0 do
+			out lower_map_block_expr(b, expr)
+		end
+		var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+		var (b3, dst) = builder_new_vreg(b2)
+		out expr_result(emit_intrinsic(b3, MIR_INTR_MAP, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
+	end
+	if expr_type == AstType.ArrCompactExpr do
+		var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+		var (b3, dst) = builder_new_vreg(b2)
+		out expr_result(emit_intrinsic(b3, MIR_INTR_ARR_COMPACT, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
+	end
+	if expr_type == AstType.BundleExpr do
+		child_count = ast_node_child_count(expr)
+		if child_count > 0 do
+			c0 = ast_node_child(expr, 0)
+			if ast_node_type_of(c0) == AstType.LiteralStr do
+				var (b1, sid) = builder_intern(b, ast_node_name(c0))
+				var (b2, dst) = builder_new_vreg(b1)
+				out expr_result(emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(dst), mir_opnd_imm(sid)), mir_opnd_vreg(dst))
+			end
+		end
+		var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+		var (b3, dst) = builder_new_vreg(b2)
+		out expr_result(emit_intrinsic(b3, MIR_INTR_BUNDLE, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
+	end
+	if expr_type == AstType.ErrorExpr do
+		var (b1, dst) = builder_new_vreg(b)
+		out expr_result(emit_intrinsic(b1, MIR_INTR_ERROR, mir_opnd_vreg(dst), mir_opnd_none()), mir_opnd_vreg(dst))
+	end
+	if expr_type == AstType.PtrTypeExpr do
+        fname = ast_node_name(expr)
+        v = get_var_vreg(b, fname)
+        if v >= 0 do
+            out expr_result(b, mir_opnd_vreg(v))
+        end
+		var (b1, pid) = builder_intern(b, fname)
+		var (b2, dst) = builder_new_vreg(b1)
+		out expr_result(emit_intrinsic(b2, MIR_INTR_PTR, mir_opnd_vreg(dst), mir_opnd_imm(pid)), mir_opnd_vreg(dst))
+	end
 	if expr_type == AstType.PrecompBlock do
 		if ast_node_child_count(expr) > 0 do
 			out lower_expr(b, ast_node_child(expr, 0))
@@ -47948,6 +47993,7 @@ func lower_expr_impl(b: MirBuilder, expr: &AstNode):
 	out expr_result(b, mir_opnd_none())
 end.
 
+
 func is_dict_type_name(type_name: string):
 	if type_name != 0 and fat_cstr_eq(type_name, "dict") == 1 do out 1 end
 	out 0
@@ -48301,6 +48347,13 @@ func scan_has_local_arena_alloc(node: &AstNode):
     out 0
 end.
 
+# @vir_source compiler/src/lower/ast_to_mir/stmt_control.vri 1
+##
+ * compiler/src/lower/ast_to_mir/stmt_control.vri — Control Flow & Error Blocks
+ * =============================================================================
+ ##
+
+
 func scan_arena_escaped_vars_into(node: &AstNode, list: i64) -> i64:
     if node == 0 do out list end
     let nt = ast_node_type_of(node)
@@ -48374,616 +48427,11 @@ func scan_arena_escaped_var(node: &AstNode):
     out fat_str_new("")
 end.
 
-func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
-	stmt_type = ast_node_type_of(stmt)
 
-	if stmt_type == AstType.VarDeclGroup do
-		child_count = ast_node_child_count(stmt)
-		var b_curr = b
-		var vi = 0
-		when vi < child_count loop
-			child = ast_node_child(stmt, vi)
-			b_curr = lower_stmt(b_curr, child)
-			vi = vi + 1
-		end
-		out b_curr
-	end
-
-    # 1. VarDecl & ConstDecl
-	if stmt_type == AstType.VarDecl or stmt_type == AstType.ConstDecl do
-		if ast_node_int_val(stmt) == 16384 do
-			child_count = ast_node_child_count(stmt)
-			if child_count > 1 do
-				init_expr = ast_node_child(stmt, child_count - 1)
-				var b2 = lower_expr(b, init_expr)
-				var base_opnd = g_lower_expr_result_opnd as MirOperand
-				var b_curr = b2
-				var i = 0
-				when i < child_count - 1 loop
-					var_ident = ast_node_child(stmt, i)
-					var_name = ast_node_name(var_ident)
-					# Tuples/entities are flat aggregates. MIR_INTR_INDEX is for Vec
-					# storage and adds a 16-byte capacity/length header, so using it
-					# here made `(a, b) = pair()` read beyond the returned object.
-					var (b_addr, elem_addr) = builder_new_vreg(b_curr)
-					b_addr = builder_add_instr(b_addr, mir_instr_new(MirOp.Add, mir_opnd_vreg(elem_addr), base_opnd, mir_opnd_imm(i * 8)))
-					var (b_elem, dst_v) = builder_new_vreg(b_addr)
-					b_elem = emit_load(b_elem, dst_v, mir_opnd_vreg(elem_addr))
-					record_var_declaration(var_name)
-					var elem_type_str = fat_str_new("")
-					if ast_node_type_of(init_expr) == AstType.TupleExpr and i < ast_node_child_count(init_expr) do
-						elem_type_str = infer_expr_type_name(ast_node_child(init_expr, i))
-					eif ast_node_type_of(init_expr) == AstType.Call do
-						elem_type_str = find_func_return_tuple_elem_type(ast_node_name(init_expr), i)
-					end
-					if fat_str_len(elem_type_str) > 0 do
-						set_var_type(var_name, elem_type_str)
-					end
-					b_elem = set_var_vreg(b_elem, var_name, dst_v)
-					b_curr = b_elem
-					i = i + 1
-				end
-				out b_curr
-			end
-			out b
-		end
-		child_count = ast_node_child_count(stmt)
-		if child_count > 0 do
-			expr = ast_node_child(stmt, 0)
-			var b2 = lower_expr(b, expr)
-			var val_opnd = g_lower_expr_result_opnd as MirOperand
-			# Typed declarations perform the numeric coercion promised by the
-			# source type instead of merely relabelling the source bit-pattern.
-			var declared_t = ast_node_name2(stmt)
-			var source_t = infer_expr_type_name(expr)
-			if declared_t != 0 and fat_str_len(declared_t) > 0 do
-				var source_is_float = fat_cstr_eq(source_t, "float") == 1 or fat_cstr_eq(source_t, "f64") == 1
-				var target_is_float = fat_cstr_eq(declared_t, "float") == 1 or fat_cstr_eq(declared_t, "f64") == 1
-				var source_is_int = fat_cstr_eq(source_t, "int") == 1 or fat_cstr_eq(source_t, "i64") == 1
-				var target_is_int = fat_cstr_eq(declared_t, "int") == 1 or fat_cstr_eq(declared_t, "i64") == 1
-				if (source_is_int and target_is_float) or (source_is_float and target_is_int) do
-					var (b_cast, cast_v) = builder_new_vreg(b2)
-					var cast_src_cat = 1
-					var cast_dst_cat = 1
-					var cast_typ = MirType.Int64 as i64
-					if source_is_float do cast_src_cat = 2 end
-					if target_is_float do cast_dst_cat = 2; cast_typ = MirType.F64 as i64 end
-					var cast_kind = MIR_INTR_CAST + (cast_src_cat shl 8) + (cast_dst_cat shl 16)
-					b2 = emit_intrinsic_typed(b_cast, cast_kind, mir_opnd_vreg(cast_v), val_opnd, cast_typ)
-					val_opnd = mir_opnd_vreg(cast_v)
-				end
-			end
-			# Flux copy semantics in VarDecl: deep-copy when source or declared type is flux
-			# and the initializer is not a freshly created vector value.
-			var vd_flux_type = declared_t
-			if (vd_flux_type as i64) == 0 or fat_str_len(vd_flux_type) == 0 do
-				vd_flux_type = infer_expr_type_name(expr)
-			end
-			var vd_expr_nt = ast_node_type_of(expr)
-			var vd_is_fresh = vd_expr_nt == AstType.BinOp or vd_expr_nt == AstType.UnaryMinus or vd_expr_nt == AstType.UnaryNot or vd_expr_nt == AstType.SwizzleExpr or vd_expr_nt == AstType.Call
-			if is_flux_type_str(vd_flux_type) and not vd_is_fresh do
-				var (b_vd_fdc, vd_cloned) = emit_flux_clone(b2, val_opnd, vd_flux_type)
-				val_opnd = vd_cloned
-				b2 = b_vd_fdc
-			end
-			var (b3, v) = builder_new_vreg(b2)
-			ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), val_opnd, mir_opnd_none())
-			b3 = builder_add_instr(b3, ins)
-			record_var_declaration(ast_node_name(stmt))
-			b3 = set_var_vreg(b3, ast_node_name(stmt), v)
-			var var_t = ast_node_name2(stmt)
-			if var_t != 0 and is_tensor_type_str(var_t) do
-				if ast_node_type_of(expr) == AstType.ArrayLiteral and ast_node_child_count(expr) > 0 do
-					let first_ch = ast_node_child(expr, 0)
-					let first_nt = ast_node_type_of(first_ch)
-					if first_nt == AstType.LiteralFloat or first_nt == AstType.LiteralInt do
-						let shape_init = parse_tensor_shape(var_t)
-						let rank_init = vec_len_rt(shape_init)
-						if rank_init > 0 do
-							var prefix = fat_str_new("tensor[int; ")
-							if first_nt == AstType.LiteralFloat do
-								prefix = fat_str_new("tensor[f64; ")
-							end
-							var new_vt = prefix
-							var si = 0
-							when si < rank_init loop
-								if si > 0 do new_vt = fat_str_concat(new_vt, fat_str_new(", ")) end
-								let d_val = vec_get_rt(shape_init, si) as int
-								new_vt = fat_str_concat(new_vt, fat_str_new(rt_itoa(d_val)))
-								si = si + 1
-							end
-							new_vt = fat_str_concat(new_vt, fat_str_new("]"))
-							var_t = new_vt
-						end
-					end
-				end
-			end
-			if var_t == 0 or fat_str_len(var_t) == 0 do
-				var expr_nt = ast_node_type_of(expr)
-				var_t = infer_expr_type_name(expr)
-				# Keep literal inference direct here: ConstDecl (`let`) nodes are
-				# pre-indexed before lowering, and older bootstrap binaries can
-				# otherwise retain their empty placeholder type.
-				if expr_nt == AstType.LiteralInt do var_t = fat_str_new("int") end
-				if expr_nt == AstType.LiteralFloat do var_t = fat_str_new("float") end
-				if expr_nt == AstType.LiteralBool do var_t = fat_str_new("bool") end
-				if expr_nt == AstType.LiteralNone do var_t = fat_str_new("none") end
-				if expr_nt == AstType.LiteralStr or expr_nt == AstType.InterpExpr do var_t = fat_str_new("string") end
-				if expr_nt == AstType.DictLiteral do var_t = fat_str_new("dict") end
-				if expr_nt == AstType.QuantizeExpr do
-					if fat_str_len(ast_node_name2(expr)) > 0 do
-						var_t = ast_node_name2(expr)
-					else
-						var_t = fat_str_new("QuantizedTensor")
-					end
-				end
-				if expr_nt == AstType.EnumConstruct do var_t = ast_node_name2(expr) end
-				if expr_nt == AstType.SwizzleExpr do
-					var_t = infer_expr_type_name(expr)
-				end
-				if expr_nt == AstType.Call and fat_cstr_eq(ast_node_name(expr), "flux") == 1 do
-					var flux_child_c = ast_node_child_count(expr)
-					var flux_vt_elem = fat_str_new("int")
-					if flux_child_c > 0 do
-						var flux_fc0 = ast_node_child(expr, 0)
-						var flux_nt0 = ast_node_type_of(flux_fc0)
-						if flux_nt0 == AstType.LiteralFloat do flux_vt_elem = fat_str_new("float") end
-						var flux_ft0 = infer_expr_type_name(flux_fc0)
-						if fat_cstr_eq(flux_ft0, "float") == 1 or fat_cstr_eq(flux_ft0, "f64") == 1 do flux_vt_elem = fat_str_new("float") end
-					end
-					var_t = fat_str_concat(fat_str_new("flux<"), fat_str_concat(flux_vt_elem, fat_str_concat(fat_str_new(", "), fat_str_concat(fat_str_new(rt_itoa(flux_child_c)), fat_str_new(">")))))
-				end
-				if expr_nt == AstType.EntityLiteral or expr_nt == AstType.Call do
-					var cname = resolve_callee_alias(ast_node_name(expr))
-					if is_entity_name(cname) == 1 do
-						var_t = cname
-						let gen_args_lit = ast_node_name2(expr)
-						if (gen_args_lit as i64) != 0 and fat_str_len(gen_args_lit) > 0 do
-							var_t = fat_str_concat(cname, fat_str_concat(fat_str_new("<"), fat_str_concat(gen_args_lit, fat_str_new(">"))))
-						end
-					else
-						let fn_ast = find_func_ast(cname)
-						if (fn_ast as i64) != 0 do
-							let fn_ret = ast_node_name2(fn_ast)
-							if (fn_ret as i64) != 0 and fat_str_len(fn_ret) > 0 do
-								let unwrapped_ret = unwrap_ref_type_name(fn_ret)
-								if is_entity_name(unwrapped_ret) == 1 do
-									var_t = unwrapped_ret
-								end
-							end
-						end
-					end
-				end
-				if expr_nt == AstType.BinOp and (ast_node_op_of(expr) == OpType.MatMulOp or ast_node_op_of(expr) == OpType.FmaOp) do
-					left_n = ast_node_child(expr, 0)
-					right_n = ast_node_child(expr, 1)
-					left_t = get_var_type(ast_node_name(left_n))
-					right_t = get_var_type(ast_node_name(right_n))
-					if (is_tensor_type_str(left_t) or is_quantized_type_str(left_t as int)) and is_tensor_type_str(right_t) do
-						var shape_a = 0
-						if is_quantized_type_str(left_t as int) do
-							shape_a = parse_quantized_shape(left_t as int)
-						else
-							shape_a = parse_tensor_shape(left_t)
-						end
-						shape_b = parse_tensor_shape(right_t)
-						if vec_len_rt(shape_a) >= 2 and vec_len_rt(shape_b) >= 2 do
-							dim_m = vec_get_rt(shape_a, 0) as i64
-							dim_n = vec_get_rt(shape_b, 1) as i64
-							var elem_prefix = fat_str_new("tensor[int; ")
-							if is_quantized_type_str(left_t as int) do
-								elem_prefix = fat_str_new("tensor[f32; ")
-							else
-								let l_code = parse_tensor_elem_code(left_t)
-								if l_code == 1 do elem_prefix = fat_str_new("tensor[f32; ") end
-								if l_code == 2 do elem_prefix = fat_str_new("tensor[f16; ") end
-								if l_code == 3 do elem_prefix = fat_str_new("tensor[i8; ") end
-								if l_code == 4 do elem_prefix = fat_str_new("tensor[u8; ") end
-								if l_code == 5 do elem_prefix = fat_str_new("tensor[i32; ") end
-								if l_code == 6 do elem_prefix = fat_str_new("tensor[int; ") end
-								if l_code == 7 do elem_prefix = fat_str_new("tensor[f64; ") end
-							end
-							var_t = fat_str_concat(elem_prefix, fat_str_new(rt_itoa(dim_m)))
-							var_t = fat_str_concat(var_t, fat_str_new(", "))
-							var_t = fat_str_concat(var_t, fat_str_new(rt_itoa(dim_n)))
-							var_t = fat_str_concat(var_t, fat_str_new("]"))
-						end
-					end
-				end
-			end
-			# `let` is a ConstDecl and may carry an internal non-empty placeholder
-			# in name2.  Literal inference must override that placeholder.
-			if ast_node_type_of(stmt) == AstType.ConstDecl do
-				expr_nt_const = ast_node_type_of(expr)
-				if expr_nt_const == AstType.LiteralInt do var_t = fat_str_new("int"); set_var_type(ast_node_name(stmt), var_t) end
-				if expr_nt_const == AstType.LiteralFloat do var_t = fat_str_new("float"); set_var_type(ast_node_name(stmt), var_t) end
-				if expr_nt_const == AstType.LiteralBool do var_t = fat_str_new("bool"); set_var_type(ast_node_name(stmt), var_t) end
-				if expr_nt_const == AstType.LiteralNone do var_t = fat_str_new("none"); set_var_type(ast_node_name(stmt), var_t) end
-				if expr_nt_const == AstType.LiteralStr or expr_nt_const == AstType.InterpExpr do var_t = fat_str_new("string"); set_var_type(ast_node_name(stmt), var_t) end
-				if expr_nt_const == AstType.DictLiteral do var_t = fat_str_new("dict"); set_var_type(ast_node_name(stmt), var_t) end
-			end
-			if var_t != 0 and fat_str_len(var_t) > 0 do
-				set_var_type(ast_node_name(stmt), var_t)
-			end
-			if ast_node_type_of(expr) == AstType.DictLiteral or is_dict_type_name(var_t) == 1 do
-				mark_dict_var(ast_node_name(stmt))
-			end
-			out b3
-		end
-		decl_name = ast_node_name(stmt)
-		var_t = ast_node_name2(stmt)
-		record_var_declaration(decl_name)
-		if var_t != 0 and is_tensor_type_str(var_t) do
-			numel = parse_tensor_numel(var_t)
-			if numel <= 0 do numel = 4 end
-			var elem_bytes = tensor_elem_byte_size(var_t)
-			let e_code = parse_tensor_elem_code(var_t)
-			if e_code == 1 or elem_bytes < 8 do
-				elem_bytes = 8
-			end
-			alloc_sz = 16 + numel * elem_bytes
-			alloc_sz = (alloc_sz + 15) / 16 * 16
-			b_mut = emit_set_arg(b, 0, mir_opnd_imm(alloc_sz))
-			var (b_base, base_vr) = builder_new_vreg(b_mut)
-			b_base = emit_intrinsic(b_base, MIR_INTR_BUILTIN, mir_opnd_vreg(base_vr), mir_opnd_imm(3))
-			b_base = emit_set_arg(b_base, 0, mir_opnd_vreg(base_vr))
-			b_base = emit_set_arg(b_base, 1, mir_opnd_imm(0))
-			b_base = emit_set_arg(b_base, 2, mir_opnd_imm(numel))
-			b_base = emit_intrinsic(b_base, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
-			b_base = emit_set_arg(b_base, 0, mir_opnd_vreg(base_vr))
-			b_base = emit_set_arg(b_base, 1, mir_opnd_imm(8))
-			b_base = emit_set_arg(b_base, 2, mir_opnd_imm(numel))
-			b_base = emit_intrinsic(b_base, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
-			b_base = set_var_vreg(b_base, decl_name, base_vr)
-			set_var_type(decl_name, var_t)
-			out b_base
-		end
-		out b
-	end
-
-	if stmt_type == AstType.Assign do
-		child_count = ast_node_child_count(stmt)
-		var expr = 0
-		var target_name = ast_node_name(stmt)
-		if child_count >= 2 do
-			target_name = ast_node_name(ast_node_child(stmt, 0))
-			expr = ast_node_child(stmt, 1)
-		else
-			expr = ast_node_child(stmt, 0)
-		end
-		if expr != 0 do
-			var expr_nt = ast_node_type_of(expr)
-			if expr_nt == AstType.EntityLiteral or expr_nt == AstType.Call do
-				var cname = resolve_callee_alias(ast_node_name(expr))
-				if is_entity_name(cname) == 1 do
-					set_var_type(target_name, cname)
-				else
-					let fn_ast = find_func_ast(cname)
-					if (fn_ast as i64) != 0 do
-						let fn_ret = ast_node_name2(fn_ast)
-						if (fn_ret as i64) != 0 and fat_str_len(fn_ret) > 0 do
-							let unwrapped_ret = unwrap_ref_type_name(fn_ret)
-							if is_entity_name(unwrapped_ret) == 1 do
-								set_var_type(target_name, unwrapped_ret)
-							end
-						end
-					end
-				end
-			end
-			if expr_nt == AstType.Identifier do
-				var src_var_t = get_var_type(ast_node_name(expr))
-				if is_entity_name(src_var_t) == 1 do
-					set_var_type(target_name, src_var_t)
-				end
-			end
-			if expr_nt == AstType.QuantizeExpr do
-				if fat_str_len(ast_node_name2(expr)) > 0 do
-					set_var_type(target_name, ast_node_name2(expr))
-				else
-					set_var_type(target_name, fat_str_new("QuantizedTensor"))
-				end
-			end
-			if expr_nt == AstType.DictLiteral do
-				set_var_type(target_name, fat_str_new("dict"))
-				mark_dict_var(target_name)
-			end
-			if expr_nt == AstType.BinOp and (ast_node_op_of(expr) == OpType.MatMulOp or ast_node_op_of(expr) == OpType.FmaOp) do
-				left_n = ast_node_child(expr, 0)
-				right_n = ast_node_child(expr, 1)
-				left_t = get_var_type(ast_node_name(left_n))
-				right_t = get_var_type(ast_node_name(right_n))
-				if (is_tensor_type_str(left_t) or is_quantized_type_str(left_t as int)) and is_tensor_type_str(right_t) do
-					var shape_a = 0
-					if is_quantized_type_str(left_t as int) do
-						shape_a = parse_quantized_shape(left_t as int)
-					else
-						shape_a = parse_tensor_shape(left_t)
-					end
-					shape_b = parse_tensor_shape(right_t)
-					if vec_len_rt(shape_a) >= 2 and vec_len_rt(shape_b) >= 2 do
-						dim_m = vec_get_rt(shape_a, 0) as i64
-						dim_n = vec_get_rt(shape_b, 1) as i64
-						var elem_prefix = fat_str_new("tensor[int; ")
-						if is_quantized_type_str(left_t as int) do
-							elem_prefix = fat_str_new("tensor[f32; ")
-						else
-							let l_code = parse_tensor_elem_code(left_t)
-							if l_code == 1 do elem_prefix = fat_str_new("tensor[f32; ") end
-							if l_code == 2 do elem_prefix = fat_str_new("tensor[f16; ") end
-							if l_code == 3 do elem_prefix = fat_str_new("tensor[i8; ") end
-							if l_code == 4 do elem_prefix = fat_str_new("tensor[u8; ") end
-							if l_code == 5 do elem_prefix = fat_str_new("tensor[i32; ") end
-							if l_code == 6 do elem_prefix = fat_str_new("tensor[int; ") end
-							if l_code == 7 do elem_prefix = fat_str_new("tensor[f64; ") end
-						end
-						var mm_type = fat_str_concat(elem_prefix, fat_str_new(rt_itoa(dim_m)))
-						mm_type = fat_str_concat(mm_type, fat_str_new(", "))
-						mm_type = fat_str_concat(mm_type, fat_str_new(rt_itoa(dim_n)))
-						mm_type = fat_str_concat(mm_type, fat_str_new("]"))
-						set_var_type(target_name, mm_type)
-					end
-				end
-			end
-		end
-		var b2 = lower_expr(b, expr)
-		var val_opnd = g_lower_expr_result_opnd as MirOperand
-		# Preserve the established type of an assignment target. A numeric
-		# assignment changes representation just like an explicit `as` cast.
-		var assign_target_t = get_var_type(target_name)
-		var assign_source_t = infer_expr_type_name(expr)
-		if assign_target_t != 0 and fat_str_len(assign_target_t) > 0 do
-			var assign_source_float = fat_cstr_eq(assign_source_t, "float") == 1 or fat_cstr_eq(assign_source_t, "f64") == 1
-			var assign_target_float = fat_cstr_eq(assign_target_t, "float") == 1 or fat_cstr_eq(assign_target_t, "f64") == 1
-			var assign_source_int = fat_cstr_eq(assign_source_t, "int") == 1 or fat_cstr_eq(assign_source_t, "i64") == 1
-			var assign_target_int = fat_cstr_eq(assign_target_t, "int") == 1 or fat_cstr_eq(assign_target_t, "i64") == 1
-			if (assign_source_int and assign_target_float) or (assign_source_float and assign_target_int) do
-				var (b_assign_cast, assign_cast_v) = builder_new_vreg(b2)
-				var assign_src_cat = 1
-				var assign_dst_cat = 1
-				var assign_cast_typ = MirType.Int64 as i64
-				if assign_source_float do assign_src_cat = 2 end
-				if assign_target_float do assign_dst_cat = 2; assign_cast_typ = MirType.F64 as i64 end
-				var assign_cast_kind = MIR_INTR_CAST + (assign_src_cat shl 8) + (assign_dst_cat shl 16)
-				b2 = emit_intrinsic_typed(b_assign_cast, assign_cast_kind, mir_opnd_vreg(assign_cast_v), val_opnd, assign_cast_typ)
-				val_opnd = mir_opnd_vreg(assign_cast_v)
-			end
-		end
-		if g_func_ref_param_hash != 0 do
-			ref_idx = hash_table_lookup(g_func_ref_param_hash, g_func_ref_param_names, target_name)
-			if ref_idx >= 0 do
-				ptr_vreg = vec_get_rt(g_func_ref_param_vregs, ref_idx)
-				b2 = emit_store(b2, mir_opnd_vreg(ptr_vreg), val_opnd)
-				out b2
-			end
-		end
-		# Flux copy semantics: assignment of flux<T,N> must deep-copy all N lanes
-		# so that mutating the copy does not affect the original.
-		var fc_flux_type = assign_target_t
-		if (fc_flux_type as i64) == 0 or fat_str_len(fc_flux_type) == 0 do
-			fc_flux_type = assign_source_t
-		end
-		var fc_expr_nt = ast_node_type_of(expr)
-		var fc_is_fresh = fc_expr_nt == AstType.BinOp or fc_expr_nt == AstType.UnaryMinus or fc_expr_nt == AstType.UnaryNot or fc_expr_nt == AstType.SwizzleExpr or fc_expr_nt == AstType.Call
-		if is_flux_type_str(fc_flux_type) and not fc_is_fresh and (mir_opnd_type(val_opnd) as int) != 0 do
-			var (b_fdc, fc_cloned) = emit_flux_clone(b2, val_opnd, fc_flux_type)
-			val_opnd = fc_cloned
-			b2 = b_fdc
-		end
-		v = get_var_vreg(b2, target_name)
-		if v >= 0 do
-			b2 = emit_move(b2, v, val_opnd)
-			out b2
-		end
-		global_slot = global_slot_lookup(target_name)
-		if global_slot >= 0 do
-			out emit_intrinsic(b2, MIR_INTR_GLOBAL_STORE, mir_opnd_imm(global_slot), val_opnd)
-		end
-		var (b3, v2) = builder_new_vreg(b2)
-		b3 = emit_move(b3, v2, val_opnd)
-		b3 = set_var_vreg(b3, target_name, v2)
-		out b3
-	end
-
-    # 2b. IndexAssign — name[idx, ...] = val → INDEX_STORE
-	if stmt_type == AstType.IndexAssign do
-		child_count = ast_node_child_count(stmt)
-		if child_count >= 2 do
-			vname = ast_node_name(stmt)
-			bv = get_var_vreg(b, vname)
-			var is_dict_container = is_known_dict_var(vname)
-			var vtype = fat_str_new("")
-			if is_dict_container == 0 do vtype = get_var_type(vname) end
-			val_expr = ast_node_child(stmt, child_count - 1)
-			if is_tensor_type_str(vtype) and parse_tensor_elem_code(vtype) == 1 do
-				var is_flt_val = false
-				if ast_node_type_of(val_expr) == AstType.LiteralFloat do is_flt_val = true end
-				if fat_cstr_eq(infer_expr_type_name(val_expr), "float") == 1 do is_flt_val = true end
-				let shape_v = parse_tensor_shape(vtype)
-				let rank_v = vec_len_rt(shape_v)
-				if rank_v > 0 do
-					var prefix = fat_str_new("tensor[int; ")
-					if is_flt_val do
-						prefix = fat_str_new("tensor[f64; ")
-					end
-					var new_t = prefix
-					var si = 0
-					when si < rank_v loop
-						if si > 0 do new_t = fat_str_concat(new_t, fat_str_new(", ")) end
-						let d_val = vec_get_rt(shape_v, si) as int
-						new_t = fat_str_concat(new_t, fat_str_new(rt_itoa(d_val)))
-						si = si + 1
-					end
-					new_t = fat_str_concat(new_t, fat_str_new("]"))
-					set_var_type(vname, new_t)
-					vtype = new_t
-				end
-			end
-			num_indices = child_count - 1
-			b_cur = b
-			flat_opnd = mir_opnd_none()
-			if num_indices == 1 do
-				var b2 = lower_expr(b_cur, ast_node_child(stmt, 0))
-				var idx = g_lower_expr_result_opnd as MirOperand
-				b_cur = b2
-				flat_opnd = idx
-			else
-				var k = 0
-				when k < num_indices loop
-					idx_ast = ast_node_child(stmt, k)
-					var b_next = lower_expr(b_cur, idx_ast)
-					var idx_op = g_lower_expr_result_opnd as MirOperand
-					b_cur = b_next
-					stride = 1
-					if is_tensor_type_str(vtype) do
-						stride = parse_tensor_stride(vtype, k)
-					end
-					term_op = idx_op
-					if stride > 1 do
-						var (b_mul, mul_v) = builder_new_vreg(b_cur)
-						ins_m = mir_instr_new(MirOp.Mul, mir_opnd_vreg(mul_v), idx_op, mir_opnd_imm(stride))
-						b_cur = builder_add_instr(b_mul, ins_m)
-						term_op = mir_opnd_vreg(mul_v)
-					end
-					if k == 0 do
-						flat_opnd = term_op
-					else
-						var (b_add, add_v) = builder_new_vreg(b_cur)
-						ins_a = mir_instr_new(MirOp.Add, mir_opnd_vreg(add_v), flat_opnd, term_op)
-						b_cur = builder_add_instr(b_add, ins_a)
-						flat_opnd = mir_opnd_vreg(add_v)
-					end
-					k = k + 1
-				end
-			end
-			var b3 = lower_expr(b_cur, val_expr)
-			var val = g_lower_expr_result_opnd as MirOperand
-			# `lower_expr` is a deep call under register pressure. Reload the
-			# declared container type instead of relying on a caller-held fat
-			# string surviving the call sequence.
-			if is_dict_container == 0 do vtype = get_var_type(vname) end
-			if bv >= 0 do
-				if is_dict_container == 1 do
-					out lower_dict_store(b3, mir_opnd_vreg(bv), flat_opnd, val, dict_key_is_string(ast_node_child(stmt, 0)))
-				end
-				b3 = emit_set_arg(b3, 0, flat_opnd)
-				b3 = emit_set_arg(b3, 1, val)
-				var elem_m_typ = MirType.Int64
-				if is_tensor_type_str(vtype) do
-					let code = parse_tensor_elem_code(vtype)
-					if code == 1 do elem_m_typ = MirType.F32 end
-					if code == 2 do elem_m_typ = MirType.F16 end
-					if code == 3 or code == 4 do elem_m_typ = MirType.Int8 end
-					if code == 5 do elem_m_typ = MirType.Int32 end
-				end
-				b3 = emit_intrinsic_typed(b3, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(bv), elem_m_typ)
-			end
-			out b3
-		end
-		out b
-	end
-
-	if stmt_type == AstType.SwizzleAssign do
-		var target_name = ast_node_name(stmt)
-		var mask_str = ast_node_name2(stmt)
-		var mask_len = fat_str_len(mask_str)
-		var bv = get_var_vreg(b, target_name)
-		if bv >= 0 and ast_node_child_count(stmt) > 0 do
-			var b2 = lower_expr(b, ast_node_child(stmt, 0))
-			var rhs_op = g_lower_expr_result_opnd as MirOperand
-			var b_cur = b2
-			var k = 0
-			when k < mask_len loop
-				var ch = fat_str_byte_at(mask_str as int, k)
-				var dst_lane = swizzle_char_to_lane(ch)
-				if dst_lane >= 0 do
-					b_cur = emit_set_arg(b_cur, 0, mir_opnd_imm(k))
-					var (b_load, elem_v) = builder_new_vreg(b_cur)
-					b_load = emit_intrinsic(b_load, MIR_INTR_INDEX, mir_opnd_vreg(elem_v), rhs_op)
-					b_load = emit_set_arg(b_load, 0, mir_opnd_imm(dst_lane))
-					b_load = emit_set_arg(b_load, 1, mir_opnd_vreg(elem_v))
-					b_load = emit_intrinsic(b_load, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(bv))
-					b_cur = b_load
-				end
-				k = k + 1
-			end
-			out b_cur
-		end
-		out b
-	end
-
-	if stmt_type == AstType.FieldAssign do
-		child_count = ast_node_child_count(stmt)
-		if child_count >= 1 do
-			var fld_name = ast_node_name2(stmt)
-			var base_name = ast_node_name(stmt)
-			if child_count >= 2 do
-				base_ast = ast_node_child(stmt, 1)
-				if ast_node_type_of(base_ast) == AstType.Identifier do
-					base_name = ast_node_name(base_ast)
-				end
-			end
-			var bv = get_var_vreg(b, base_name)
-			if is_register_field(fld_name) == 1 and bv >= 0 do
-				var b2 = lower_expr(b, ast_node_child(stmt, 0))
-				var val = g_lower_expr_result_opnd as MirOperand
-				start_bit = get_register_field_start(fld_name)
-				width = get_register_field_width(fld_name)
-				let pack_info = MIR_INTR_BIT_INSERT or (start_bit shl 8) or (width shl 16)
-				b2 = emit_set_arg(b2, 0, val)
-				var (b3, new_vreg) = builder_new_vreg(b2)
-				ins = mir_instr_new(MirOp.Intrinsic, mir_opnd_vreg(new_vreg), mir_opnd_vreg(bv), mir_opnd_imm(pack_info))
-				b3 = builder_add_instr(b3, ins)
-				out set_var_vreg(b3, base_name, new_vreg)
-			end
-			var b2 = lower_expr(b, ast_node_child(stmt, 0))
-			var val = g_lower_expr_result_opnd as MirOperand
-			var base_opnd = mir_opnd_none()
-			var base_type = fat_str_new("")
-			var b_curr = b2
-			if child_count >= 2 do
-				base_ast = ast_node_child(stmt, 1)
-				base_type = get_expr_entity_type(base_ast)
-				var b_b = lower_expr(b_curr, base_ast)
-				var b_op = g_lower_expr_result_opnd as MirOperand
-				b_curr = b_b
-				base_opnd = b_op
-			else
-				base_type = get_var_type(base_name)
-				if base_type != 0 do
-					base_type = unwrap_ref_type_name(base_type)
-				end
-				if bv >= 0 do
-					base_opnd = mir_opnd_vreg(bv)
-				end
-			end
-			if (base_opnd as i64) != 0 and native_read_i64(base_opnd as i64, 0) != MirOperandType.None do
-				if is_packed_entity(base_type) do
-					f_off = get_scoped_field_offset(base_type, fld_name)
-					f_sz = get_scoped_field_size(base_type, fld_name)
-					var (b3, addr) = builder_new_vreg(b_curr)
-					ins_a = mir_instr_new(MirOp.Add, mir_opnd_vreg(addr), base_opnd, mir_opnd_imm(f_off))
-					b3 = builder_add_instr(b3, ins_a)
-					out emit_store_typed(b3, mir_opnd_vreg(addr), val, f_sz)
-				end
-				var fid = 0 - 1
-				if fat_str_len(base_type) > 0 do
-					fid = get_scoped_field_index(base_type, fld_name)
-				end
-				if fid < 0 do
-					base_name = ast_node_name(stmt)
-					fid = find_field_index_for_base(base_name, fld_name)
-				end
-				var (b3, addr) = builder_new_vreg(b_curr)
-				ins_a = mir_instr_new(MirOp.Add, mir_opnd_vreg(addr), base_opnd, mir_opnd_imm(fid * 8))
-				b3 = builder_add_instr(b3, ins_a)
-				out emit_store(b3, mir_opnd_vreg(addr), val)
-			end
-			out b_curr
-		end
-		out b
-	end
-
-    # 3. IfStmt
+# ═══════════════════════════════════════════════════════
+# Control Flow Statement Lowering Dispatcher
+# ═══════════════════════════════════════════════════════
+func lower_stmt_control(b: &MirBuilder, stmt: &AstNode, stmt_type: AstType):
 	if stmt_type == AstType.IfStmt do
 		cond_expr = ast_node_child(stmt, 0)
 		then_block = ast_node_child(stmt, 1)
@@ -49981,6 +49429,652 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 		var (b1, rid) = builder_intern(b, rname)
 		out emit_intrinsic(b1, MIR_INTR_RESUME, mir_opnd_none(), mir_opnd_imm(rid))
 	end
+	out b
+end.
+# @vir_source compiler/src/lower/ast_to_mir/stmt.vri 1
+##
+ * compiler/src/lower/ast_to_mir/stmt.vri — Declarations & Assignment Statements
+ * ==============================================================================
+ ##
+
+
+func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
+	stmt_type = ast_node_type_of(stmt)
+
+	if stmt_type == AstType.IfStmt or stmt_type == AstType.WhileStmt or stmt_type == AstType.LoopStmt or stmt_type == AstType.Block or stmt_type == AstType.ReturnStmt or stmt_type == AstType.BreakStmt or stmt_type == AstType.ContinueStmt or stmt_type == AstType.CaseExpr or stmt_type == AstType.ForRange or stmt_type == AstType.EnsureBlock or stmt_type == AstType.RevertBlock or stmt_type == AstType.WhenStmt or stmt_type == AstType.ThrowStmt or stmt_type == AstType.CancelStmt or stmt_type == AstType.QuietStmt or stmt_type == AstType.ArenaBlock or stmt_type == AstType.EmitStmt or stmt_type == AstType.SelectStmt or stmt_type == AstType.TryStmt or stmt_type == AstType.TimeoutClause or stmt_type == AstType.IsolateClause or stmt_type == AstType.ResumeStmt do
+		lowered_ctl = lower_stmt_control(b, stmt, stmt_type)
+		out b
+	end
+
+	if stmt_type == AstType.VarDeclGroup do
+		child_count = ast_node_child_count(stmt)
+		var b_curr = b
+		var vi = 0
+		when vi < child_count loop
+			child = ast_node_child(stmt, vi)
+			b_curr = lower_stmt(b_curr, child)
+			vi = vi + 1
+		end
+		out b_curr
+	end
+
+    # 1. VarDecl & ConstDecl
+	if stmt_type == AstType.VarDecl or stmt_type == AstType.ConstDecl do
+		if ast_node_int_val(stmt) == 16384 do
+			child_count = ast_node_child_count(stmt)
+			if child_count > 1 do
+				init_expr = ast_node_child(stmt, child_count - 1)
+				var b2 = lower_expr(b, init_expr)
+				var base_opnd = g_lower_expr_result_opnd as MirOperand
+				var b_curr = b2
+				var i = 0
+				when i < child_count - 1 loop
+					var_ident = ast_node_child(stmt, i)
+					var_name = ast_node_name(var_ident)
+					# Tuples/entities are flat aggregates. MIR_INTR_INDEX is for Vec
+					# storage and adds a 16-byte capacity/length header, so using it
+					# here made `(a, b) = pair()` read beyond the returned object.
+					var (b_addr, elem_addr) = builder_new_vreg(b_curr)
+					b_addr = builder_add_instr(b_addr, mir_instr_new(MirOp.Add, mir_opnd_vreg(elem_addr), base_opnd, mir_opnd_imm(i * 8)))
+					var (b_elem, dst_v) = builder_new_vreg(b_addr)
+					b_elem = emit_load(b_elem, dst_v, mir_opnd_vreg(elem_addr))
+					record_var_declaration(var_name)
+					var elem_type_str = fat_str_new("")
+					if ast_node_type_of(init_expr) == AstType.TupleExpr and i < ast_node_child_count(init_expr) do
+						elem_type_str = infer_expr_type_name(ast_node_child(init_expr, i))
+					eif ast_node_type_of(init_expr) == AstType.Call do
+						elem_type_str = find_func_return_tuple_elem_type(ast_node_name(init_expr), i)
+					end
+					if fat_str_len(elem_type_str) > 0 do
+						set_var_type(var_name, elem_type_str)
+					end
+					b_elem = set_var_vreg(b_elem, var_name, dst_v)
+					b_curr = b_elem
+					i = i + 1
+				end
+				out b_curr
+			end
+			out b
+		end
+		child_count = ast_node_child_count(stmt)
+		if child_count > 0 do
+			expr = ast_node_child(stmt, 0)
+			var b2 = lower_expr(b, expr)
+			var val_opnd = g_lower_expr_result_opnd as MirOperand
+			# Typed declarations perform the numeric coercion promised by the
+			# source type instead of merely relabelling the source bit-pattern.
+			var declared_t = ast_node_name2(stmt)
+			var source_t = infer_expr_type_name(expr)
+			if declared_t != 0 and fat_str_len(declared_t) > 0 do
+				var source_is_float = fat_cstr_eq(source_t, "float") == 1 or fat_cstr_eq(source_t, "f64") == 1
+				var target_is_float = fat_cstr_eq(declared_t, "float") == 1 or fat_cstr_eq(declared_t, "f64") == 1
+				var source_is_int = fat_cstr_eq(source_t, "int") == 1 or fat_cstr_eq(source_t, "i64") == 1
+				var target_is_int = fat_cstr_eq(declared_t, "int") == 1 or fat_cstr_eq(declared_t, "i64") == 1
+				if (source_is_int and target_is_float) or (source_is_float and target_is_int) do
+					var (b_cast, cast_v) = builder_new_vreg(b2)
+					var cast_src_cat = 1
+					var cast_dst_cat = 1
+					var cast_typ = MirType.Int64 as i64
+					if source_is_float do cast_src_cat = 2 end
+					if target_is_float do cast_dst_cat = 2; cast_typ = MirType.F64 as i64 end
+					var cast_kind = MIR_INTR_CAST + (cast_src_cat shl 8) + (cast_dst_cat shl 16)
+					b2 = emit_intrinsic_typed(b_cast, cast_kind, mir_opnd_vreg(cast_v), val_opnd, cast_typ)
+					val_opnd = mir_opnd_vreg(cast_v)
+				end
+			end
+			# Flux copy semantics in VarDecl: deep-copy when source or declared type is flux
+			# and the initializer is not a freshly created vector value.
+			var vd_flux_type = declared_t
+			if (vd_flux_type as i64) == 0 or fat_str_len(vd_flux_type) == 0 do
+				vd_flux_type = infer_expr_type_name(expr)
+			end
+			var vd_expr_nt = ast_node_type_of(expr)
+			var vd_is_fresh = vd_expr_nt == AstType.BinOp or vd_expr_nt == AstType.UnaryMinus or vd_expr_nt == AstType.UnaryNot or vd_expr_nt == AstType.SwizzleExpr or vd_expr_nt == AstType.Call
+			if is_flux_type_str(vd_flux_type) and not vd_is_fresh do
+				var (b_vd_fdc, vd_cloned) = emit_flux_clone(b2, val_opnd, vd_flux_type)
+				val_opnd = vd_cloned
+				b2 = b_vd_fdc
+			end
+			var (b3, v) = builder_new_vreg(b2)
+			ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), val_opnd, mir_opnd_none())
+			b3 = builder_add_instr(b3, ins)
+			record_var_declaration(ast_node_name(stmt))
+			b3 = set_var_vreg(b3, ast_node_name(stmt), v)
+			var var_t = ast_node_name2(stmt)
+			if var_t != 0 and is_tensor_type_str(var_t) do
+				if ast_node_type_of(expr) == AstType.ArrayLiteral and ast_node_child_count(expr) > 0 do
+					let first_ch = ast_node_child(expr, 0)
+					let first_nt = ast_node_type_of(first_ch)
+					if first_nt == AstType.LiteralFloat or first_nt == AstType.LiteralInt do
+						let shape_init = parse_tensor_shape(var_t)
+						let rank_init = vec_len_rt(shape_init)
+						if rank_init > 0 do
+							var prefix = fat_str_new("tensor[int; ")
+							if first_nt == AstType.LiteralFloat do
+								prefix = fat_str_new("tensor[f64; ")
+							end
+							var new_vt = prefix
+							var si = 0
+							when si < rank_init loop
+								if si > 0 do new_vt = fat_str_concat(new_vt, fat_str_new(", ")) end
+								let d_val = vec_get_rt(shape_init, si) as int
+								new_vt = fat_str_concat(new_vt, fat_str_new(rt_itoa(d_val)))
+								si = si + 1
+							end
+							new_vt = fat_str_concat(new_vt, fat_str_new("]"))
+							var_t = new_vt
+						end
+					end
+				end
+			end
+			if var_t == 0 or fat_str_len(var_t) == 0 do
+				var expr_nt = ast_node_type_of(expr)
+				var_t = infer_expr_type_name(expr)
+				# Keep literal inference direct here: ConstDecl (`let`) nodes are
+				# pre-indexed before lowering, and older bootstrap binaries can
+				# otherwise retain their empty placeholder type.
+				if expr_nt == AstType.LiteralInt do var_t = fat_str_new("int") end
+				if expr_nt == AstType.LiteralFloat do var_t = fat_str_new("float") end
+				if expr_nt == AstType.LiteralBool do var_t = fat_str_new("bool") end
+				if expr_nt == AstType.LiteralNone do var_t = fat_str_new("none") end
+				if expr_nt == AstType.LiteralStr or expr_nt == AstType.InterpExpr do var_t = fat_str_new("string") end
+				if expr_nt == AstType.DictLiteral do var_t = fat_str_new("dict") end
+				if expr_nt == AstType.QuantizeExpr do
+					if fat_str_len(ast_node_name2(expr)) > 0 do
+						var_t = ast_node_name2(expr)
+					else
+						var_t = fat_str_new("QuantizedTensor")
+					end
+				end
+				if expr_nt == AstType.EnumConstruct do var_t = ast_node_name2(expr) end
+				if expr_nt == AstType.SwizzleExpr do
+					var_t = infer_expr_type_name(expr)
+				end
+				if expr_nt == AstType.Call and fat_cstr_eq(ast_node_name(expr), "flux") == 1 do
+					var flux_child_c = ast_node_child_count(expr)
+					var flux_vt_elem = fat_str_new("int")
+					if flux_child_c > 0 do
+						var flux_fc0 = ast_node_child(expr, 0)
+						var flux_nt0 = ast_node_type_of(flux_fc0)
+						if flux_nt0 == AstType.LiteralFloat do flux_vt_elem = fat_str_new("float") end
+						var flux_ft0 = infer_expr_type_name(flux_fc0)
+						if fat_cstr_eq(flux_ft0, "float") == 1 or fat_cstr_eq(flux_ft0, "f64") == 1 do flux_vt_elem = fat_str_new("float") end
+					end
+					var_t = fat_str_concat(fat_str_new("flux<"), fat_str_concat(flux_vt_elem, fat_str_concat(fat_str_new(", "), fat_str_concat(fat_str_new(rt_itoa(flux_child_c)), fat_str_new(">")))))
+				end
+				if expr_nt == AstType.EntityLiteral or expr_nt == AstType.Call do
+					var cname = resolve_callee_alias(ast_node_name(expr))
+					if is_entity_name(cname) == 1 do
+						var_t = cname
+						let gen_args_lit = ast_node_name2(expr)
+						if (gen_args_lit as i64) != 0 and fat_str_len(gen_args_lit) > 0 do
+							var_t = fat_str_concat(cname, fat_str_concat(fat_str_new("<"), fat_str_concat(gen_args_lit, fat_str_new(">"))))
+						end
+					else
+						let fn_ast = find_func_ast(cname)
+						if (fn_ast as i64) != 0 do
+							let fn_ret = ast_node_name2(fn_ast)
+							if (fn_ret as i64) != 0 and fat_str_len(fn_ret) > 0 do
+								let unwrapped_ret = unwrap_ref_type_name(fn_ret)
+								if is_entity_name(unwrapped_ret) == 1 do
+									var_t = unwrapped_ret
+								end
+							end
+						end
+					end
+				end
+				if expr_nt == AstType.BinOp and (ast_node_op_of(expr) == OpType.MatMulOp or ast_node_op_of(expr) == OpType.FmaOp) do
+					left_n = ast_node_child(expr, 0)
+					right_n = ast_node_child(expr, 1)
+					left_t = get_var_type(ast_node_name(left_n))
+					right_t = get_var_type(ast_node_name(right_n))
+					if (is_tensor_type_str(left_t) or is_quantized_type_str(left_t as int)) and is_tensor_type_str(right_t) do
+						var shape_a = 0
+						if is_quantized_type_str(left_t as int) do
+							shape_a = parse_quantized_shape(left_t as int)
+						else
+							shape_a = parse_tensor_shape(left_t)
+						end
+						shape_b = parse_tensor_shape(right_t)
+						if vec_len_rt(shape_a) >= 2 and vec_len_rt(shape_b) >= 2 do
+							dim_m = vec_get_rt(shape_a, 0) as i64
+							dim_n = vec_get_rt(shape_b, 1) as i64
+							var elem_prefix = fat_str_new("tensor[int; ")
+							if is_quantized_type_str(left_t as int) do
+								elem_prefix = fat_str_new("tensor[f32; ")
+							else
+								let l_code = parse_tensor_elem_code(left_t)
+								if l_code == 1 do elem_prefix = fat_str_new("tensor[f32; ") end
+								if l_code == 2 do elem_prefix = fat_str_new("tensor[f16; ") end
+								if l_code == 3 do elem_prefix = fat_str_new("tensor[i8; ") end
+								if l_code == 4 do elem_prefix = fat_str_new("tensor[u8; ") end
+								if l_code == 5 do elem_prefix = fat_str_new("tensor[i32; ") end
+								if l_code == 6 do elem_prefix = fat_str_new("tensor[int; ") end
+								if l_code == 7 do elem_prefix = fat_str_new("tensor[f64; ") end
+							end
+							var_t = fat_str_concat(elem_prefix, fat_str_new(rt_itoa(dim_m)))
+							var_t = fat_str_concat(var_t, fat_str_new(", "))
+							var_t = fat_str_concat(var_t, fat_str_new(rt_itoa(dim_n)))
+							var_t = fat_str_concat(var_t, fat_str_new("]"))
+						end
+					end
+				end
+			end
+			# `let` is a ConstDecl and may carry an internal non-empty placeholder
+			# in name2.  Literal inference must override that placeholder.
+			if ast_node_type_of(stmt) == AstType.ConstDecl do
+				expr_nt_const = ast_node_type_of(expr)
+				if expr_nt_const == AstType.LiteralInt do var_t = fat_str_new("int"); set_var_type(ast_node_name(stmt), var_t) end
+				if expr_nt_const == AstType.LiteralFloat do var_t = fat_str_new("float"); set_var_type(ast_node_name(stmt), var_t) end
+				if expr_nt_const == AstType.LiteralBool do var_t = fat_str_new("bool"); set_var_type(ast_node_name(stmt), var_t) end
+				if expr_nt_const == AstType.LiteralNone do var_t = fat_str_new("none"); set_var_type(ast_node_name(stmt), var_t) end
+				if expr_nt_const == AstType.LiteralStr or expr_nt_const == AstType.InterpExpr do var_t = fat_str_new("string"); set_var_type(ast_node_name(stmt), var_t) end
+				if expr_nt_const == AstType.DictLiteral do var_t = fat_str_new("dict"); set_var_type(ast_node_name(stmt), var_t) end
+			end
+			if var_t != 0 and fat_str_len(var_t) > 0 do
+				set_var_type(ast_node_name(stmt), var_t)
+			end
+			if ast_node_type_of(expr) == AstType.DictLiteral or is_dict_type_name(var_t) == 1 do
+				mark_dict_var(ast_node_name(stmt))
+			end
+			out b3
+		end
+		decl_name = ast_node_name(stmt)
+		var_t = ast_node_name2(stmt)
+		record_var_declaration(decl_name)
+		if var_t != 0 and is_tensor_type_str(var_t) do
+			numel = parse_tensor_numel(var_t)
+			if numel <= 0 do numel = 4 end
+			var elem_bytes = tensor_elem_byte_size(var_t)
+			let e_code = parse_tensor_elem_code(var_t)
+			if e_code == 1 or elem_bytes < 8 do
+				elem_bytes = 8
+			end
+			alloc_sz = 16 + numel * elem_bytes
+			alloc_sz = (alloc_sz + 15) / 16 * 16
+			b_mut = emit_set_arg(b, 0, mir_opnd_imm(alloc_sz))
+			var (b_base, base_vr) = builder_new_vreg(b_mut)
+			b_base = emit_intrinsic(b_base, MIR_INTR_BUILTIN, mir_opnd_vreg(base_vr), mir_opnd_imm(3))
+			b_base = emit_set_arg(b_base, 0, mir_opnd_vreg(base_vr))
+			b_base = emit_set_arg(b_base, 1, mir_opnd_imm(0))
+			b_base = emit_set_arg(b_base, 2, mir_opnd_imm(numel))
+			b_base = emit_intrinsic(b_base, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+			b_base = emit_set_arg(b_base, 0, mir_opnd_vreg(base_vr))
+			b_base = emit_set_arg(b_base, 1, mir_opnd_imm(8))
+			b_base = emit_set_arg(b_base, 2, mir_opnd_imm(numel))
+			b_base = emit_intrinsic(b_base, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+			b_base = set_var_vreg(b_base, decl_name, base_vr)
+			set_var_type(decl_name, var_t)
+			out b_base
+		end
+		out b
+	end
+
+	if stmt_type == AstType.Assign do
+		child_count = ast_node_child_count(stmt)
+		var expr = 0
+		var target_name = ast_node_name(stmt)
+		if child_count >= 2 do
+			target_name = ast_node_name(ast_node_child(stmt, 0))
+			expr = ast_node_child(stmt, 1)
+		else
+			expr = ast_node_child(stmt, 0)
+		end
+		if expr != 0 do
+			var expr_nt = ast_node_type_of(expr)
+			if expr_nt == AstType.EntityLiteral or expr_nt == AstType.Call do
+				var cname = resolve_callee_alias(ast_node_name(expr))
+				if is_entity_name(cname) == 1 do
+					set_var_type(target_name, cname)
+				else
+					let fn_ast = find_func_ast(cname)
+					if (fn_ast as i64) != 0 do
+						let fn_ret = ast_node_name2(fn_ast)
+						if (fn_ret as i64) != 0 and fat_str_len(fn_ret) > 0 do
+							let unwrapped_ret = unwrap_ref_type_name(fn_ret)
+							if is_entity_name(unwrapped_ret) == 1 do
+								set_var_type(target_name, unwrapped_ret)
+							end
+						end
+					end
+				end
+			end
+			if expr_nt == AstType.Identifier do
+				var src_var_t = get_var_type(ast_node_name(expr))
+				if is_entity_name(src_var_t) == 1 do
+					set_var_type(target_name, src_var_t)
+				end
+			end
+			if expr_nt == AstType.QuantizeExpr do
+				if fat_str_len(ast_node_name2(expr)) > 0 do
+					set_var_type(target_name, ast_node_name2(expr))
+				else
+					set_var_type(target_name, fat_str_new("QuantizedTensor"))
+				end
+			end
+			if expr_nt == AstType.DictLiteral do
+				set_var_type(target_name, fat_str_new("dict"))
+				mark_dict_var(target_name)
+			end
+			if expr_nt == AstType.BinOp and (ast_node_op_of(expr) == OpType.MatMulOp or ast_node_op_of(expr) == OpType.FmaOp) do
+				left_n = ast_node_child(expr, 0)
+				right_n = ast_node_child(expr, 1)
+				left_t = get_var_type(ast_node_name(left_n))
+				right_t = get_var_type(ast_node_name(right_n))
+				if (is_tensor_type_str(left_t) or is_quantized_type_str(left_t as int)) and is_tensor_type_str(right_t) do
+					var shape_a = 0
+					if is_quantized_type_str(left_t as int) do
+						shape_a = parse_quantized_shape(left_t as int)
+					else
+						shape_a = parse_tensor_shape(left_t)
+					end
+					shape_b = parse_tensor_shape(right_t)
+					if vec_len_rt(shape_a) >= 2 and vec_len_rt(shape_b) >= 2 do
+						dim_m = vec_get_rt(shape_a, 0) as i64
+						dim_n = vec_get_rt(shape_b, 1) as i64
+						var elem_prefix = fat_str_new("tensor[int; ")
+						if is_quantized_type_str(left_t as int) do
+							elem_prefix = fat_str_new("tensor[f32; ")
+						else
+							let l_code = parse_tensor_elem_code(left_t)
+							if l_code == 1 do elem_prefix = fat_str_new("tensor[f32; ") end
+							if l_code == 2 do elem_prefix = fat_str_new("tensor[f16; ") end
+							if l_code == 3 do elem_prefix = fat_str_new("tensor[i8; ") end
+							if l_code == 4 do elem_prefix = fat_str_new("tensor[u8; ") end
+							if l_code == 5 do elem_prefix = fat_str_new("tensor[i32; ") end
+							if l_code == 6 do elem_prefix = fat_str_new("tensor[int; ") end
+							if l_code == 7 do elem_prefix = fat_str_new("tensor[f64; ") end
+						end
+						var mm_type = fat_str_concat(elem_prefix, fat_str_new(rt_itoa(dim_m)))
+						mm_type = fat_str_concat(mm_type, fat_str_new(", "))
+						mm_type = fat_str_concat(mm_type, fat_str_new(rt_itoa(dim_n)))
+						mm_type = fat_str_concat(mm_type, fat_str_new("]"))
+						set_var_type(target_name, mm_type)
+					end
+				end
+			end
+		end
+		var b2 = lower_expr(b, expr)
+		var val_opnd = g_lower_expr_result_opnd as MirOperand
+		# Preserve the established type of an assignment target. A numeric
+		# assignment changes representation just like an explicit `as` cast.
+		var assign_target_t = get_var_type(target_name)
+		var assign_source_t = infer_expr_type_name(expr)
+		if assign_target_t != 0 and fat_str_len(assign_target_t) > 0 do
+			var assign_source_float = fat_cstr_eq(assign_source_t, "float") == 1 or fat_cstr_eq(assign_source_t, "f64") == 1
+			var assign_target_float = fat_cstr_eq(assign_target_t, "float") == 1 or fat_cstr_eq(assign_target_t, "f64") == 1
+			var assign_source_int = fat_cstr_eq(assign_source_t, "int") == 1 or fat_cstr_eq(assign_source_t, "i64") == 1
+			var assign_target_int = fat_cstr_eq(assign_target_t, "int") == 1 or fat_cstr_eq(assign_target_t, "i64") == 1
+			if (assign_source_int and assign_target_float) or (assign_source_float and assign_target_int) do
+				var (b_assign_cast, assign_cast_v) = builder_new_vreg(b2)
+				var assign_src_cat = 1
+				var assign_dst_cat = 1
+				var assign_cast_typ = MirType.Int64 as i64
+				if assign_source_float do assign_src_cat = 2 end
+				if assign_target_float do assign_dst_cat = 2; assign_cast_typ = MirType.F64 as i64 end
+				var assign_cast_kind = MIR_INTR_CAST + (assign_src_cat shl 8) + (assign_dst_cat shl 16)
+				b2 = emit_intrinsic_typed(b_assign_cast, assign_cast_kind, mir_opnd_vreg(assign_cast_v), val_opnd, assign_cast_typ)
+				val_opnd = mir_opnd_vreg(assign_cast_v)
+			end
+		end
+		if g_func_ref_param_hash != 0 do
+			ref_idx = hash_table_lookup(g_func_ref_param_hash, g_func_ref_param_names, target_name)
+			if ref_idx >= 0 do
+				ptr_vreg = vec_get_rt(g_func_ref_param_vregs, ref_idx)
+				b2 = emit_store(b2, mir_opnd_vreg(ptr_vreg), val_opnd)
+				out b2
+			end
+		end
+		# Flux copy semantics: assignment of flux<T,N> must deep-copy all N lanes
+		# so that mutating the copy does not affect the original.
+		var fc_flux_type = assign_target_t
+		if (fc_flux_type as i64) == 0 or fat_str_len(fc_flux_type) == 0 do
+			fc_flux_type = assign_source_t
+		end
+		var fc_expr_nt = ast_node_type_of(expr)
+		var fc_is_fresh = fc_expr_nt == AstType.BinOp or fc_expr_nt == AstType.UnaryMinus or fc_expr_nt == AstType.UnaryNot or fc_expr_nt == AstType.SwizzleExpr or fc_expr_nt == AstType.Call
+		if is_flux_type_str(fc_flux_type) and not fc_is_fresh and (mir_opnd_type(val_opnd) as int) != 0 do
+			var (b_fdc, fc_cloned) = emit_flux_clone(b2, val_opnd, fc_flux_type)
+			val_opnd = fc_cloned
+			b2 = b_fdc
+		end
+		v = get_var_vreg(b2, target_name)
+		if v >= 0 do
+			b2 = emit_move(b2, v, val_opnd)
+			out b2
+		end
+		global_slot = global_slot_lookup(target_name)
+		if global_slot >= 0 do
+			out emit_intrinsic(b2, MIR_INTR_GLOBAL_STORE, mir_opnd_imm(global_slot), val_opnd)
+		end
+		var (b3, v2) = builder_new_vreg(b2)
+		b3 = emit_move(b3, v2, val_opnd)
+		b3 = set_var_vreg(b3, target_name, v2)
+		out b3
+	end
+
+    # 2b. IndexAssign — name[idx, ...] = val → INDEX_STORE
+	if stmt_type == AstType.IndexAssign do
+		child_count = ast_node_child_count(stmt)
+		if child_count >= 2 do
+			vname = ast_node_name(stmt)
+			bv = get_var_vreg(b, vname)
+			var is_dict_container = is_known_dict_var(vname)
+			var vtype = fat_str_new("")
+			if is_dict_container == 0 do vtype = get_var_type(vname) end
+			val_expr = ast_node_child(stmt, child_count - 1)
+			if is_tensor_type_str(vtype) and parse_tensor_elem_code(vtype) == 1 do
+				var is_flt_val = false
+				if ast_node_type_of(val_expr) == AstType.LiteralFloat do is_flt_val = true end
+				if fat_cstr_eq(infer_expr_type_name(val_expr), "float") == 1 do is_flt_val = true end
+				let shape_v = parse_tensor_shape(vtype)
+				let rank_v = vec_len_rt(shape_v)
+				if rank_v > 0 do
+					var prefix = fat_str_new("tensor[int; ")
+					if is_flt_val do
+						prefix = fat_str_new("tensor[f64; ")
+					end
+					var new_t = prefix
+					var si = 0
+					when si < rank_v loop
+						if si > 0 do new_t = fat_str_concat(new_t, fat_str_new(", ")) end
+						let d_val = vec_get_rt(shape_v, si) as int
+						new_t = fat_str_concat(new_t, fat_str_new(rt_itoa(d_val)))
+						si = si + 1
+					end
+					new_t = fat_str_concat(new_t, fat_str_new("]"))
+					set_var_type(vname, new_t)
+					vtype = new_t
+				end
+			end
+			num_indices = child_count - 1
+			b_cur = b
+			flat_opnd = mir_opnd_none()
+			if num_indices == 1 do
+				var b2 = lower_expr(b_cur, ast_node_child(stmt, 0))
+				var idx = g_lower_expr_result_opnd as MirOperand
+				b_cur = b2
+				flat_opnd = idx
+			else
+				var k = 0
+				when k < num_indices loop
+					idx_ast = ast_node_child(stmt, k)
+					var b_next = lower_expr(b_cur, idx_ast)
+					var idx_op = g_lower_expr_result_opnd as MirOperand
+					b_cur = b_next
+					stride = 1
+					if is_tensor_type_str(vtype) do
+						stride = parse_tensor_stride(vtype, k)
+					end
+					term_op = idx_op
+					if stride > 1 do
+						var (b_mul, mul_v) = builder_new_vreg(b_cur)
+						ins_m = mir_instr_new(MirOp.Mul, mir_opnd_vreg(mul_v), idx_op, mir_opnd_imm(stride))
+						b_cur = builder_add_instr(b_mul, ins_m)
+						term_op = mir_opnd_vreg(mul_v)
+					end
+					if k == 0 do
+						flat_opnd = term_op
+					else
+						var (b_add, add_v) = builder_new_vreg(b_cur)
+						ins_a = mir_instr_new(MirOp.Add, mir_opnd_vreg(add_v), flat_opnd, term_op)
+						b_cur = builder_add_instr(b_add, ins_a)
+						flat_opnd = mir_opnd_vreg(add_v)
+					end
+					k = k + 1
+				end
+			end
+			var b3 = lower_expr(b_cur, val_expr)
+			var val = g_lower_expr_result_opnd as MirOperand
+			# `lower_expr` is a deep call under register pressure. Reload the
+			# declared container type instead of relying on a caller-held fat
+			# string surviving the call sequence.
+			if is_dict_container == 0 do vtype = get_var_type(vname) end
+			if bv >= 0 do
+				if is_dict_container == 1 do
+					out lower_dict_store(b3, mir_opnd_vreg(bv), flat_opnd, val, dict_key_is_string(ast_node_child(stmt, 0)))
+				end
+				b3 = emit_set_arg(b3, 0, flat_opnd)
+				b3 = emit_set_arg(b3, 1, val)
+				var elem_m_typ = MirType.Int64
+				if is_tensor_type_str(vtype) do
+					let code = parse_tensor_elem_code(vtype)
+					if code == 1 do elem_m_typ = MirType.F32 end
+					if code == 2 do elem_m_typ = MirType.F16 end
+					if code == 3 or code == 4 do elem_m_typ = MirType.Int8 end
+					if code == 5 do elem_m_typ = MirType.Int32 end
+				end
+				b3 = emit_intrinsic_typed(b3, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(bv), elem_m_typ)
+			end
+			out b3
+		end
+		out b
+	end
+
+	if stmt_type == AstType.SwizzleAssign do
+		var target_name = ast_node_name(stmt)
+		var mask_str = ast_node_name2(stmt)
+		var mask_len = fat_str_len(mask_str)
+		var bv = get_var_vreg(b, target_name)
+		if bv >= 0 and ast_node_child_count(stmt) > 0 do
+			var b2 = lower_expr(b, ast_node_child(stmt, 0))
+			var rhs_op = g_lower_expr_result_opnd as MirOperand
+			var b_cur = b2
+			var k = 0
+			when k < mask_len loop
+				var ch = fat_str_byte_at(mask_str as int, k)
+				var dst_lane = swizzle_char_to_lane(ch)
+				if dst_lane >= 0 do
+					b_cur = emit_set_arg(b_cur, 0, mir_opnd_imm(k))
+					var (b_load, elem_v) = builder_new_vreg(b_cur)
+					b_load = emit_intrinsic(b_load, MIR_INTR_INDEX, mir_opnd_vreg(elem_v), rhs_op)
+					b_load = emit_set_arg(b_load, 0, mir_opnd_imm(dst_lane))
+					b_load = emit_set_arg(b_load, 1, mir_opnd_vreg(elem_v))
+					b_load = emit_intrinsic(b_load, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(bv))
+					b_cur = b_load
+				end
+				k = k + 1
+			end
+			out b_cur
+		end
+		out b
+	end
+
+	if stmt_type == AstType.FieldAssign do
+		child_count = ast_node_child_count(stmt)
+		if child_count >= 1 do
+			var fld_name = ast_node_name2(stmt)
+			var base_name = ast_node_name(stmt)
+			if child_count >= 2 do
+				base_ast = ast_node_child(stmt, 1)
+				if ast_node_type_of(base_ast) == AstType.Identifier do
+					base_name = ast_node_name(base_ast)
+				end
+			end
+			var bv = get_var_vreg(b, base_name)
+			if is_register_field(fld_name) == 1 and bv >= 0 do
+				var b2 = lower_expr(b, ast_node_child(stmt, 0))
+				var val = g_lower_expr_result_opnd as MirOperand
+				start_bit = get_register_field_start(fld_name)
+				width = get_register_field_width(fld_name)
+				let pack_info = MIR_INTR_BIT_INSERT or (start_bit shl 8) or (width shl 16)
+				b2 = emit_set_arg(b2, 0, val)
+				var (b3, new_vreg) = builder_new_vreg(b2)
+				ins = mir_instr_new(MirOp.Intrinsic, mir_opnd_vreg(new_vreg), mir_opnd_vreg(bv), mir_opnd_imm(pack_info))
+				b3 = builder_add_instr(b3, ins)
+				out set_var_vreg(b3, base_name, new_vreg)
+			end
+			var b2 = lower_expr(b, ast_node_child(stmt, 0))
+			var val = g_lower_expr_result_opnd as MirOperand
+			var base_opnd = mir_opnd_none()
+			var base_type = fat_str_new("")
+			var b_curr = b2
+			if child_count >= 2 do
+				base_ast = ast_node_child(stmt, 1)
+				base_type = get_expr_entity_type(base_ast)
+				var b_b = lower_expr(b_curr, base_ast)
+				var b_op = g_lower_expr_result_opnd as MirOperand
+				b_curr = b_b
+				base_opnd = b_op
+			else
+				base_type = get_var_type(base_name)
+				if base_type != 0 do
+					base_type = unwrap_ref_type_name(base_type)
+				end
+				if bv >= 0 do
+					base_opnd = mir_opnd_vreg(bv)
+				end
+			end
+			if (base_opnd as i64) != 0 and native_read_i64(base_opnd as i64, 0) != MirOperandType.None do
+				if is_packed_entity(base_type) do
+					f_off = get_scoped_field_offset(base_type, fld_name)
+					f_sz = get_scoped_field_size(base_type, fld_name)
+					var (b3, addr) = builder_new_vreg(b_curr)
+					ins_a = mir_instr_new(MirOp.Add, mir_opnd_vreg(addr), base_opnd, mir_opnd_imm(f_off))
+					b3 = builder_add_instr(b3, ins_a)
+					out emit_store_typed(b3, mir_opnd_vreg(addr), val, f_sz)
+				end
+				var fid = 0 - 1
+				if fat_str_len(base_type) > 0 do
+					fid = get_scoped_field_index(base_type, fld_name)
+				end
+				if fid < 0 do
+					base_name = ast_node_name(stmt)
+					fid = find_field_index_for_base(base_name, fld_name)
+				end
+				var (b3, addr) = builder_new_vreg(b_curr)
+				ins_a = mir_instr_new(MirOp.Add, mir_opnd_vreg(addr), base_opnd, mir_opnd_imm(fid * 8))
+				b3 = builder_add_instr(b3, ins_a)
+				out emit_store(b3, mir_opnd_vreg(addr), val)
+			end
+			out b_curr
+		end
+		out b
+	end
+
+    # 3. IfStmt
+	if stmt_type == AstType.PrintStmt do
+		child_count = ast_node_child_count(stmt)
+		if child_count > 0 do
+			expr = ast_node_child(stmt, 0)
+			var b2 = lower_expr(b, expr)
+			var val_opnd = g_lower_expr_result_opnd as MirOperand
+			print_type = infer_expr_type_name(expr)
+			if ast_node_type_of(expr) == AstType.LiteralStr or ast_node_type_of(expr) == AstType.InterpExpr or fat_cstr_eq(print_type, "string") == 1 do
+				b2 = emit_intrinsic(b2, MIR_INTR_PRINT_STR, mir_opnd_none(), val_opnd)
+			eif ast_node_type_of(expr) == AstType.LiteralBool or fat_cstr_eq(print_type, "bool") == 1 do
+				b2 = emit_intrinsic(b2, MIR_INTR_PRINT_BOOL, mir_opnd_none(), val_opnd)
+			eif ast_node_type_of(expr) == AstType.LiteralFloat or fat_cstr_eq(print_type, "float") == 1 do
+				b2 = emit_intrinsic(b2, MIR_INTR_PRINT_FLOAT, mir_opnd_none(), val_opnd)
+			else
+				b2 = emit_intrinsic(b2, MIR_INTR_PRINT, mir_opnd_none(), val_opnd)
+			end
+			out b2
+		end
+		out b
+	end
+
+    # 8. Break / Continue
 	if stmt_type == AstType.InferBlock do
 		b = emit_intrinsic(b, MIR_INTR_INFER, mir_opnd_none(), mir_opnd_none())
 		if ast_node_child_count(stmt) > 0 do
@@ -50049,6 +50143,23 @@ func lower_stmt_impl(b: &MirBuilder, stmt: &AstNode):
 
 	out b
 end.
+
+
+func lower_stmt(b: &MirBuilder, stmt: &AstNode):
+	# MirBuilder is mutated in place. In native self-host output the large
+	# lower_stmt_impl return CFG can occasionally leave an AstType/boolean in
+	# X0 instead of the builder pointer (for example 2 after a terminated
+	# function body). Preserve the input handle in that case; all mutations
+	# performed by the lowering call are already visible through it.
+	lowered_b = lower_stmt_impl(b, stmt)
+	out b
+end.
+# @vir_source compiler/src/lower/ast_to_mir/func.vri 1
+##
+ * compiler/src/lower/ast_to_mir/func.vri — Function Lowering & AST Cloning
+ * =========================================================================
+ ##
+
 
 func ast_build_global_init_func():
     b = builder_new(0 - 1, fat_str_new("__vir_global_init"))
@@ -50494,6 +50605,16 @@ func monomorphize_walk(prog: &AstNode, node: &AstNode):
     end
     out 0
 end.
+
+# @vir_source compiler/src/lower/ast_to_mir.vri 1
+##
+ * compiler/src/lower/ast_to_mir.vri — AST-to-MIR Lowering Subsystem Orchestrator
+ * ==============================================================================
+ * VIRC-PLN-0004 Phase 10 / VIRC-ISS-0006: Modularized Lowering Subsystem.
+ ##
+
+import print_str, print_ln, g_disable_specialization from compiler.context
+
 
 func ast_lower_program(prog: &AstNode):
     set_global_prog_ast(prog)
