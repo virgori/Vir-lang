@@ -48,7 +48,13 @@ def sync_module_to_virc(target_modules: list[str] | None = None, check: bool = F
     if add_modules:
         if not before:
             raise ValueError("--add-module requires --before with an existing source module")
-        anchor = f"# @vir_source {before} 1\n"
+        if ":" in before:
+            b_path, b_line = before.split(":", 1)
+            anchor = f"# @vir_source {b_path} {b_line}\n"
+        elif " " in before:
+            anchor = f"# @vir_source {before}\n"
+        else:
+            anchor = f"# @vir_source {before} 1\n"
         if anchor not in virc_text:
             raise ValueError(f"Missing insertion source marker: {before}")
         additions = []
