@@ -1,0 +1,183 @@
+##
+ * vir/compiler/semantic/constfold/walk.vri
+ * ==============================================================
+ * Pass 9: Constant Folding AST Walker.
+ * Scans functions, declarations, and control flow to evaluate constants,
+ * run precomp statements, and emit dead-code condition warnings.
+ ##
+
+include vec_rt
+include string_rt
+include parser
+include symbol_table
+include scope_tree
+include context
+include alloc
+include constfold_context
+include constfold_eval_precomp
+include constfold_eval_expr
+
+func pass9_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode, const_map_box: int, root_node: &AstNode):
+    if (node as i64) == 0 do
+        out 0
+    end
+
+    # Local `let`/const values are not visible in the next function. Carry
+    # module-level constants into a private map, and discard function locals
+    # when the walk returns; otherwise unrelated dynamic conditions can be
+    # reported as dead code (W6002).
+    if node.node_type == AstType.FuncDef do
+        let local_box = vir_alloc(8)
+        native_write_i64(local_box, 0, vec_copy_rt(native_read_i64(const_map_box, 0)))
+        let child_count = vec_len_rt(node.children)
+        var fi = 0
+        when fi < child_count loop
+            pass9_walk(symbols, scopes, diag, vec_get_rt(node.children, fi), local_box, root_node)
+            fi = fi + 1
+        end
+        out 0
+    end
+
+    # Precomp block at statement level
+    if node.node_type == AstType.PrecompBlock do
+        if vec_len_rt(node.children) > 0 do
+            let child = vec_get_rt(node.children, 0) as AstNode
+            let ctx = pass9_ctx_new(root_node, diag, const_map_box)
+            let val = pass9_eval_precomp_node(ctx, child)
+            node.int_val = val
+        end
+        out 0
+    end
+
+    # Register const declarations for propagation
+    if node.node_type == AstType.ConstDecl do
+        let child_count = vec_len_rt(node.children)
+        if child_count > 0 do
+            let init = vec_get_rt(node.children, 0) as AstNode
+            if init.node_type == AstType.PrecompBlock do
+                let ctx = pass9_ctx_new(root_node, diag, const_map_box)
+                var val = 0
+                if vec_len_rt(init.children) > 0 do
+                    val = pass9_eval_precomp_node(ctx, vec_get_rt(init.children, 0) as AstNode)
+                end
+                init.int_val = val
+                node.int_val = val
+                pass9_add_const(const_map_box, node.name, val)
+            eif pass9_is_const_expr(init, const_map_box) do
+                let val = pass9_eval_int(init, const_map_box)
+                if val != (0 - 999999) do
+                    node.int_val = val
+                    pass9_add_const(const_map_box, node.name, val)
+                end
+            end
+        end
+        out 0
+    end
+
+    # Var declaration with precomp initializer
+    if node.node_type == AstType.VarDecl do
+        let child_count = vec_len_rt(node.children)
+        if child_count > 0 do
+            let init = vec_get_rt(node.children, 0) as AstNode
+            if (init as i64) != 0 and init.node_type == AstType.PrecompBlock do
+                let ctx = pass9_ctx_new(root_node, diag, const_map_box)
+                var val = 0
+                if vec_len_rt(init.children) > 0 do
+                    val = pass9_eval_precomp_node(ctx, vec_get_rt(init.children, 0) as AstNode)
+                end
+                init.int_val = val
+                node.int_val = val
+            end
+        end
+    end
+
+    # Check if-conditions for always-true/false
+    if node.node_type == AstType.IfStmt do
+        let child_count = vec_len_rt(node.children)
+        if child_count >= 1 do
+            let cond = vec_get_rt(node.children, 0)
+            let result = pass9_eval_bool_condition(cond, const_map_box)
+            if result == 1 do
+                # Condition is always true — warning: else branch is dead code
+                if child_count >= 3 do
+                    report_warning(diag, 6001, node.line, 0)
+                end
+            end
+            if result == 0 do
+                # Condition is always false — warning: if branch is dead code
+                report_warning(diag, 6002, node.line, 0)
+            end
+        end
+        # Walk children
+        var i = 0
+        when i < child_count loop
+            let child = vec_get_rt(node.children, i)
+            pass9_walk(symbols, scopes, diag, child, const_map_box, root_node)
+            i = i + 1
+        end
+        out 0
+    end
+
+    # Check while-conditions for always-false
+    if node.node_type == AstType.WhileStmt do
+        let child_count = vec_len_rt(node.children)
+        if child_count >= 1 do
+            let cond = vec_get_rt(node.children, 0)
+            let result = pass9_eval_bool_condition(cond, const_map_box)
+            if result == 0 do
+                # While condition is always false — loop body never executes
+                report_warning(diag, 6003, node.line, 0)
+            end
+        end
+        var i = 0
+        when i < child_count loop
+            let child = vec_get_rt(node.children, i)
+            pass9_walk(symbols, scopes, diag, child, const_map_box, root_node)
+            i = i + 1
+        end
+        out 0
+    end
+
+    if node.node_type == AstType.ExternFunc do
+        out 0
+    end
+
+    # Scoping for blocks / functions
+    if node.node_type == AstType.FuncDef do
+        scope_push(scopes, ScopeKind.Func)
+        let child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            let child = vec_get_rt(node.children, i)
+            pass9_walk(symbols, scopes, diag, child, const_map_box, root_node)
+            i = i + 1
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    if node.node_type == AstType.Block do
+        scope_push(scopes, ScopeKind.Block)
+        let child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            let child = vec_get_rt(node.children, i)
+            pass9_walk(symbols, scopes, diag, child, const_map_box, root_node)
+            i = i + 1
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    # Default: walk all children
+    let child_count = vec_len_rt(node.children)
+    var i = 0
+    when i < child_count loop
+        let child = vec_get_rt(node.children, i)
+        pass9_walk(symbols, scopes, diag, child, const_map_box, root_node)
+        i = i + 1
+    end
+    out 0
+end.
+
+export pass9_walk
