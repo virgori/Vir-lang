@@ -1,0 +1,254 @@
+##
+ * compiler/src/ir/mir/opt/target.vri — Target, ABI, and layout optimizations
+ * =========================================================================
+ * PRE, zero-cost ABI tuning, shrink-wrapping, dead argument elimination (DAE),
+ * devirtualization, and hot/cold block layout partitioning.
+ ##
+
+include types
+include mir_types
+include mir_ops
+include mir_builder
+include mir_opt_context
+include mir_opt_rewrite
+include mir_opt_loop_idiom
+
+func mir_opt_pre(blocks: i64):
+    # PRE is disabled until safe cross-predecessor insertion is implemented.
+    # Blindly hoisting from a successor into one predecessor starves all other predecessors.
+    out blocks
+end.
+
+func mir_opt_zero_cost_abi_and_semantics_tuning(blocks: i64):
+    n_blocks = vec_len_rt(blocks)
+    var b_idx = 0
+    when b_idx < n_blocks loop
+        b = vec_get_rt(blocks, b_idx)
+        instrs = mir_block_head(b)
+        if instrs >= 0 do
+            n_ins = vec_len_rt(instrs)
+            var i = 0
+            when i < n_ins loop
+                ins = vec_get_rt(instrs, i)
+                op = mir_instr_op(ins)
+                dst = mir_instr_dst(ins)
+                s1 = mir_instr_src1(ins)
+                s2 = mir_instr_src2(ins)
+                s1_t = mir_opnd_type(s1)
+                s2_t = mir_opnd_type(s2)
+
+                if op == MirOp.Move do
+                    if mir_opnd_is_same(dst, s1) do
+                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                        mir_opt_note_change()
+                    end
+                end
+
+                if op == MirOp.Add or op == MirOp.Sub do
+                    if s2_t == MirOperandType.Imm and mir_opnd_imm_val(s2) == 0 do
+                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, dst, s1, mir_opnd_none()))
+                        mir_opt_note_change()
+                    eif s1_t == MirOperandType.Imm and mir_opnd_imm_val(s1) == 0 and op == MirOp.Add do
+                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, dst, s2, mir_opnd_none()))
+                        mir_opt_note_change()
+                    end
+                end
+
+                if op == MirOp.Mul do
+                    if (s2_t == MirOperandType.Imm and mir_opnd_imm_val(s2) == 1) or (s1_t == MirOperandType.Imm and mir_opnd_imm_val(s1) == 1) do
+                        mv_src = s1
+                        if s2_t == MirOperandType.Imm and mir_opnd_imm_val(s2) == 1 do mv_src = s1 end
+                        if s1_t == MirOperandType.Imm and mir_opnd_imm_val(s1) == 1 do mv_src = s2 end
+                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, dst, mv_src, mir_opnd_none()))
+                        mir_opt_note_change()
+                    end
+                end
+
+                if op == MirOp.Div or op == MirOp.Mod do
+                    if s2_t == MirOperandType.Imm and mir_opnd_imm_val(s2) == 1 do
+                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, dst, s1, mir_opnd_none()))
+                        mir_opt_note_change()
+                    end
+                end
+
+                if op == MirOp.Shl or op == MirOp.Shr do
+                    if s2_t == MirOperandType.Imm and mir_opnd_imm_val(s2) == 0 do
+                        vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, dst, s1, mir_opnd_none()))
+                        mir_opt_note_change()
+                    end
+                end
+
+                i = i + 1
+            end
+        end
+        b_idx = b_idx + 1
+    end
+    out blocks
+end.
+
+func mir_opt_shrink_wrapping(blocks: i64):
+    n_blocks = vec_len_rt(blocks)
+    var b_idx = 0
+    when b_idx < n_blocks loop
+        b = vec_get_rt(blocks, b_idx)
+        instrs = mir_block_head(b)
+        if instrs >= 0 do
+            var has_call = 0
+            var i = 0
+            when i < vec_len_rt(instrs) loop
+                op = mir_instr_op(vec_get_rt(instrs, i))
+                if op == MirOp.Call or op == MirOp.Intrinsic do has_call = 1 end
+                i = i + 1
+            end
+            if has_call == 0 do
+                marker = mir_instr_new(MirOp.Intrinsic, mir_opnd_none(), mir_opnd_imm(MIR_SHRINK_WRAP_MARKER), mir_opnd_imm(MIR_INTR_PATCH_POINT))
+                instrs = mir_block_insert_before_terminator(instrs, marker)
+                vec_set_rt(blocks, b_idx, mir_block_replace_head(b, instrs))
+                mir_opt_note_change()
+            end
+        end
+        b_idx = b_idx + 1
+    end
+    out blocks
+end.
+
+func mir_opt_dae(blocks: i64):
+    n_blocks = vec_len_rt(blocks)
+    last_slot = vec_new_rt()
+    var b_idx = 0
+    when b_idx < n_blocks loop
+        instrs = mir_block_head(vec_get_rt(blocks, b_idx))
+        if instrs >= 0 do
+            var i = 0
+            when i < vec_len_rt(instrs) loop
+                if mir_instr_op(vec_get_rt(instrs, i)) == MirOp.Call do
+                    nargs = mir_opnd_imm_val(mir_instr_src1(vec_get_rt(instrs, i)))
+                    vec_clear_rt(last_slot)
+                    var ci = i - 1
+                    when ci >= 0 loop
+                        ins = vec_get_rt(instrs, ci)
+                        if mir_instr_op(ins) != MirOp.SetArg do
+                            ci = 0 - 1
+                        else
+                            slot = mir_opnd_imm_val(mir_instr_src1(ins))
+                            if slot >= nargs do
+                                native_write_i64(ins as i64, 0, MirOp.Nop as i64)
+                                mir_opt_note_change()
+                            else
+                                if slot < vec_len_rt(last_slot) do
+                                    if vec_get_rt(last_slot, slot) == 1 do
+                                        native_write_i64(ins as i64, 0, MirOp.Nop as i64)
+                                        mir_opt_note_change()
+                                    end
+                                end
+                                var grow2 = vec_len_rt(last_slot)
+                                when grow2 <= slot loop
+                                    last_slot = vec_push_rt(last_slot, 0)
+                                    grow2 = grow2 + 1
+                                end
+                                vec_set_rt(last_slot, slot, 1)
+                            end
+                            ci = ci - 1
+                        end
+                    end
+                end
+                i = i + 1
+            end
+        end
+        b_idx = b_idx + 1
+    end
+    vec_free_rt(last_slot)
+    out blocks
+end.
+
+func mir_opt_devirtualization(blocks: i64):
+    n_blocks = vec_len_rt(blocks)
+    var b_idx = 0
+    when b_idx < n_blocks loop
+        instrs = mir_block_head(vec_get_rt(blocks, b_idx))
+        if instrs >= 0 do
+            var i = 0
+            when i < vec_len_rt(instrs) loop
+                ins = vec_get_rt(instrs, i)
+                if mir_instr_op(ins) == MirOp.Call do
+                    callee = mir_instr_src2(ins)
+                    if mir_opnd_type(callee) == MirOperandType.VReg do
+                        traced = mir_trace_source_opnd(instrs, i, callee)
+                        if mir_opnd_type(traced) == MirOperandType.Imm do
+                            vec_set_rt(instrs, i, mir_instr_new(MirOp.Call, mir_instr_dst(ins), mir_instr_src1(ins), traced))
+                            mir_opt_note_change()
+                        end
+                    end
+                end
+                i = i + 1
+            end
+        end
+        b_idx = b_idx + 1
+    end
+    out blocks
+end.
+
+func mir_opt_hot_cold_layout_partitioning(blocks: i64):
+    if vec_len_rt(blocks) <= 0 do out blocks end
+    entry = vec_get_rt(blocks, 0)
+    entry_id = mir_block_id(entry)
+    hot = vec_new_rt()
+    var bi = 0
+    when bi < vec_len_rt(blocks) loop
+        hot = vec_push_rt(hot, 0)
+        bi = bi + 1
+    end
+    vec_set_rt(hot, 0, 1)
+    var changed = 1
+    var iter = 0
+    when changed == 1 and iter < vec_len_rt(blocks) loop
+        changed = 0
+        bi = 0
+        when bi < vec_len_rt(blocks) loop
+            if vec_get_rt(hot, bi) == 1 do
+                succs = mir_block_successors(vec_get_rt(blocks, bi))
+                if succs >= 0 do
+                    var si = 0
+                    when si < vec_len_rt(succs) loop
+                        sid = vec_get_rt(succs, si)
+                        sj = mir_find_block_index(blocks, sid)
+                        if sj >= 0 and vec_get_rt(hot, sj) == 0 do
+                            vec_set_rt(hot, sj, 1)
+                            changed = 1
+                        end
+                        si = si + 1
+                    end
+                end
+            end
+            bi = bi + 1
+        end
+        iter = iter + 1
+    end
+    bi = 0
+    when bi < vec_len_rt(blocks) loop
+        if vec_get_rt(hot, bi) == 0 do
+            b = vec_get_rt(blocks, bi)
+            instrs = mir_block_head(b)
+            if instrs >= 0 do
+                marker = mir_instr_new(MirOp.Intrinsic, mir_opnd_none(), mir_opnd_imm(MIR_COLD_BLOCK_MARKER), mir_opnd_imm(MIR_INTR_NOP_MARKER))
+                instrs = mir_block_insert_before_terminator(instrs, marker)
+                vec_set_rt(blocks, bi, mir_block_replace_head(b, instrs))
+                mir_opt_note_change()
+            end
+        else
+            instrs_h = mir_block_head(vec_get_rt(blocks, bi))
+            if instrs_h >= 0 do
+                marker_h = mir_instr_new(MirOp.Intrinsic, mir_opnd_none(), mir_opnd_imm(MIR_HOT_BLOCK_MARKER), mir_opnd_imm(MIR_INTR_NOP_MARKER))
+                instrs_h = mir_block_insert_before_terminator(instrs_h, marker_h)
+                vec_set_rt(blocks, bi, mir_block_replace_head(vec_get_rt(blocks, bi), instrs_h))
+                mir_opt_note_change()
+            end
+        end
+        bi = bi + 1
+    end
+    out blocks
+end.
+
+export mir_opt_pre, mir_opt_zero_cost_abi_and_semantics_tuning,
+       mir_opt_shrink_wrapping, mir_opt_dae, mir_opt_devirtualization,
+       mir_opt_hot_cold_layout_partitioning

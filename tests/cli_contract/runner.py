@@ -151,15 +151,20 @@ class CliContract(unittest.TestCase):
     def test_gvn_commutative_and_ordered_operand_comparisons(self):
         # Compile the actual helper bodies without pulling unrelated MIR passes
         # into this structural runtime test.
-        canonical_path = ROOT / "compiler/src/ir/mir/mir_opt.vri"
-        if not canonical_path.is_file():
-            canonical_path = ROOT / "stdlib/vir/compiler/mir_opt.vri"
-        canonical = canonical_path.read_text()
         helpers = []
-        for name in ("mir_gvn_expr_same", "mir_gvn_commutative", "mir_opnd_is_same"):
-            start = canonical.index("func " + name + "(")
-            end = canonical.index("\nend.", start) + len("\nend.")
-            helpers.append(canonical[start:end])
+        for name, candidate in (
+            ("mir_gvn_expr_same", ROOT / "compiler/src/ir/mir/opt/gvn.vri"),
+            ("mir_gvn_commutative", ROOT / "compiler/src/ir/mir/opt/gvn.vri"),
+            ("mir_opnd_is_same", ROOT / "compiler/src/ir/mir/opt/rewrite.vri"),
+        ):
+            if not candidate.is_file():
+                candidate = ROOT / "compiler/src/ir/mir/mir_opt.vri"
+            if not candidate.is_file():
+                candidate = ROOT / "stdlib/vir/compiler/mir_opt.vri"
+            content = candidate.read_text()
+            start = content.index("func " + name + "(")
+            end = content.index("\nend.", start) + len("\nend.")
+            helpers.append(content[start:end])
         mir_path = ROOT / "compiler/src/ir/mir/mir.vri"
         if not mir_path.is_file():
             mir_path = ROOT / "stdlib/vir/compiler/mir.vri"

@@ -1,0 +1,314 @@
+##
+ * compiler/src/ir/mir/opt/loops.vri — Loop transformations: LICM, IVSR, BCE
+ * =========================================================================
+ * Loop-invariant code motion (LICM), induction variable strength reduction (IVSR),
+ * and bounds check elimination (BCE).
+ ##
+
+include types
+include mir_types
+include mir_ops
+include mir_builder
+include mir_opt_context
+include mir_opt_rewrite
+
+func mir_find_loop_preheader(blocks: i64, hdr_idx: i64, back_edge_body_id: i64):
+    hdr = vec_get_rt(blocks, hdr_idx)
+    preds = mir_block_preds(hdr)
+    if preds < 0 do out 0 - 1 end
+    var pi = 0
+    when pi < vec_len_rt(preds) loop
+        pred_id = vec_get_rt(preds, pi)
+        if pred_id != back_edge_body_id do
+            out mir_find_block_index(blocks, pred_id)
+        end
+        pi = pi + 1
+    end
+    out 0 - 1
+end.
+
+func mir_vreg_defined_in_body(blocks: i64, body_idx: i64, v: i64, except_idx: i64):
+    instrs = mir_block_head(vec_get_rt(blocks, body_idx))
+    if instrs < 0 do out false end
+    var ji = 0
+    when ji < vec_len_rt(instrs) loop
+        if ji != except_idx do
+            ins = vec_get_rt(instrs, ji)
+            if mir_instr_defines_vreg(ins, v) do out true end
+        end
+        ji = ji + 1
+    end
+    out false
+end.
+
+func mir_opt_licm_hoistable(op: i64):
+    if is_pure_mir_op(op) do out true end
+    if op == MirOp.Load do out true end
+    out false
+end.
+
+func mir_opt_licm_operands_invariant(blocks: i64, body_idx: i64, op: i64, ins: &MirInstr, def_counts: i64):
+    s1 = mir_instr_src1(ins)
+    if op == MirOp.Not do
+        out mir_opt_operand_loop_invariant(blocks, body_idx, s1, def_counts)
+    end
+    if op == MirOp.Load do
+        s2 = mir_instr_src2(ins)
+        out mir_opt_operand_loop_invariant(blocks, body_idx, s1, def_counts) and mir_opt_operand_loop_invariant(blocks, body_idx, s2, def_counts)
+    end
+    s2 = mir_instr_src2(ins)
+    out mir_opt_operand_loop_invariant(blocks, body_idx, s1, def_counts) and mir_opt_operand_loop_invariant(blocks, body_idx, s2, def_counts)
+end.
+
+##
+ * mir_opt_licm — Loop-Invariant Code Motion.
+ * Hoists pure invariant ops to the loop preheader (or header before terminator).
+ ##
+func mir_opt_licm(blocks: i64):
+    def_counts = mir_build_vreg_def_counts(blocks)
+    n_blocks = vec_len_rt(blocks)
+    var hdr_idx = 0
+    when hdr_idx < n_blocks loop
+        hdr = vec_get_rt(blocks, hdr_idx)
+        hdr_id = mir_block_id(hdr)
+        succs = mir_block_successors(hdr)
+        if succs >= 0 do
+            ns = vec_len_rt(succs)
+            var si = 0
+            when si < ns loop
+                body_id = vec_get_rt(succs, si)
+                body_idx = mir_find_block_index(blocks, body_id)
+                if body_idx >= 0 do
+                    preds = mir_block_preds(vec_get_rt(blocks, body_idx))
+                    var is_back_edge = 0
+                    if preds >= 0 do
+                        var pi = 0
+                        when pi < vec_len_rt(preds) loop
+                            if vec_get_rt(preds, pi) == hdr_id do is_back_edge = 1 end
+                            pi = pi + 1
+                        end
+                    end
+                    if is_back_edge == 1 do
+                        pre_idx = mir_find_loop_preheader(blocks, hdr_idx, body_id)
+                        hoist_idx = pre_idx
+                        if hoist_idx < 0 do hoist_idx = hdr_idx end
+                        body = vec_get_rt(blocks, body_idx)
+                        instrs = mir_block_head(body)
+                        hoist_b = vec_get_rt(blocks, hoist_idx)
+                        hoist_instrs = mir_block_head(hoist_b)
+                        if instrs >= 0 and hoist_instrs >= 0 do
+                            n_ins = vec_len_rt(instrs)
+                            var ii = 0
+                            when ii < n_ins loop
+                                ins = vec_get_rt(instrs, ii)
+                                op = mir_instr_op(ins)
+                                if mir_opt_licm_hoistable(op) do
+                                    dst = mir_instr_dst(ins)
+                                    can_hoist = mir_opt_licm_operands_invariant(blocks, body_idx, op, ins, def_counts)
+                                    if can_hoist and mir_opnd_type(dst) == MirOperandType.VReg do
+                                        dv = mir_opnd_vreg_id(dst)
+                                        if not mir_vreg_defined_in_body(blocks, body_idx, dv, ii) do
+                                            hoisted = mir_instr_new(op, dst, mir_instr_src1(ins), mir_instr_src2(ins))
+                                            mir_instr_set_aux(hoisted, mir_instr_aux(ins))
+                                            mir_instr_set_type(hoisted, mir_instr_type(ins))
+                                            hoist_instrs = mir_block_insert_before_terminator(hoist_instrs, hoisted)
+                                            vec_set_rt(instrs, ii, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                            mir_opt_note_change()
+                                        end
+                                    end
+                                end
+                                ii = ii + 1
+                            end
+                            body = mir_block_replace_head(body, instrs)
+                            hoist_b = mir_block_replace_head(hoist_b, hoist_instrs)
+                            vec_set_rt(blocks, body_idx, body)
+                            vec_set_rt(blocks, hoist_idx, hoist_b)
+                        end
+                    end
+                end
+                si = si + 1
+            end
+        end
+        hdr_idx = hdr_idx + 1
+    end
+    vec_free_rt(def_counts)
+    out blocks
+end.
+
+func mir_opt_operand_loop_invariant(blocks: i64, loop_body_idx: i64, opnd: &MirOperand, def_counts: i64):
+    if mir_opnd_type(opnd) == MirOperandType.Imm do out true end
+    if mir_opnd_type(opnd) != MirOperandType.VReg do out false end
+    v = mir_opnd_vreg_id(opnd)
+    if mir_vreg_def_count(def_counts, v) != 1 do out false end
+    n_blocks = vec_len_rt(blocks)
+    var bi = 0
+    when bi < n_blocks loop
+        instrs = mir_block_head(vec_get_rt(blocks, bi))
+        if instrs >= 0 do
+            var ji = 0
+            when ji < vec_len_rt(instrs) loop
+                ins = vec_get_rt(instrs, ji)
+                if mir_instr_defines_vreg(ins, v) do
+                    if bi == loop_body_idx do out false end
+                    out true
+                end
+                ji = ji + 1
+            end
+        end
+        bi = bi + 1
+    end
+    out true
+end.
+
+func mir_vreg_is_induction_step(blocks: i64, body_idx: i64, v: i64):
+    instrs = mir_block_head(vec_get_rt(blocks, body_idx))
+    if instrs < 0 do out (false, 0) end
+    var ii = 0
+    when ii < vec_len_rt(instrs) loop
+        ins = vec_get_rt(instrs, ii)
+        if mir_instr_op(ins) == MirOp.Add do
+            dst = mir_instr_dst(ins)
+            if mir_opnd_type(dst) == MirOperandType.VReg and mir_opnd_vreg_id(dst) == v do
+                s1 = mir_instr_src1(ins)
+                s2 = mir_instr_src2(ins)
+                if mir_opnd_type(s2) == MirOperandType.Imm and mir_opnd_imm_val(s2) == 1 do
+                    if mir_opnd_type(s1) == MirOperandType.VReg and mir_opnd_vreg_id(s1) == v do
+                        out (true, 1)
+                    end
+                end
+                if mir_opnd_type(s1) == MirOperandType.Imm and mir_opnd_imm_val(s1) == 1 do
+                    if mir_opnd_type(s2) == MirOperandType.VReg and mir_opnd_vreg_id(s2) == v do
+                        out (true, 1)
+                    end
+                end
+            end
+        end
+        ii = ii + 1
+    end
+    out (false, 0)
+end.
+
+func mir_opt_ivsr(blocks: i64):
+    n_blocks = vec_len_rt(blocks)
+    var hdr_idx = 0
+    when hdr_idx < n_blocks loop
+        hdr = vec_get_rt(blocks, hdr_idx)
+        hdr_id = mir_block_id(hdr)
+        succs = mir_block_successors(hdr)
+        if succs >= 0 do
+            var si = 0
+            when si < vec_len_rt(succs) loop
+                body_id = vec_get_rt(succs, si)
+                body_idx = mir_find_block_index(blocks, body_id)
+                if body_idx >= 0 do
+                    preds = mir_block_preds(vec_get_rt(blocks, body_idx))
+                    var back = 0
+                    if preds >= 0 do
+                        var pi = 0
+                        when pi < vec_len_rt(preds) loop
+                            if vec_get_rt(preds, pi) == hdr_id do back = 1 end
+                            pi = pi + 1
+                        end
+                    end
+                    if back == 1 do
+                        body_instrs = mir_block_head(vec_get_rt(blocks, body_idx))
+                        if body_instrs >= 0 do
+                            var ii = 0
+                            when ii < vec_len_rt(body_instrs) loop
+                                ins = vec_get_rt(body_instrs, ii)
+                                if mir_instr_op(ins) == MirOp.Load or mir_instr_op(ins) == MirOp.Store do
+                                    off = mir_instr_src2(ins)
+                                    if mir_opnd_type(off) == MirOperandType.VReg do
+                                        ov = mir_opnd_vreg_id(off)
+                                        def_ins = mir_arm64_trace_vreg_def(body_instrs, ii, ov)
+                                        if mir_instr_op(def_ins) == MirOp.Mul do
+                                            ms1 = mir_instr_src1(def_ins)
+                                            ms2 = mir_instr_src2(def_ins)
+                                            iv = 0 - 1
+                                            es = 0
+                                            if mir_opnd_type(ms2) == MirOperandType.Imm do
+                                                iv = mir_opnd_vreg_id(ms1)
+                                                es = mir_opnd_imm_val(ms2)
+                                            eif mir_opnd_type(ms1) == MirOperandType.Imm do
+                                                iv = mir_opnd_vreg_id(ms2)
+                                                es = mir_opnd_imm_val(ms1)
+                                            end
+                                            var (is_iv, step) = mir_vreg_is_induction_step(blocks, body_idx, iv)
+                                            if is_iv and es > 0 do
+                                                ptr = mir_instr_src1(ins)
+                                                run = mir_instr_dst(def_ins)
+                                                if mir_instr_op(ins) == MirOp.Load do
+                                                    new_ins = mir_instr_new(MirOp.Load, mir_instr_dst(ins), run, mir_opnd_imm(0))
+                                                    mir_instr_set_aux(new_ins, mir_instr_aux(ins))
+                                                    mir_instr_set_type(new_ins, mir_instr_type(ins))
+                                                    vec_set_rt(body_instrs, ii, new_ins)
+                                                else
+                                                    new_ins = mir_instr_new(MirOp.Store, run, mir_opnd_imm(0), mir_instr_src2(ins))
+                                                    mir_instr_set_aux(new_ins, mir_instr_aux(ins))
+                                                    mir_instr_set_type(new_ins, mir_instr_type(ins))
+                                                    vec_set_rt(body_instrs, ii, new_ins)
+                                                end
+                                                vec_set_rt(body_instrs, ii + 1, mir_instr_new(MirOp.Add, run, run, mir_opnd_imm(es)))
+                                                mir_opt_note_change()
+                                            end
+                                        end
+                                    end
+                                end
+                                ii = ii + 1
+                            end
+                            vec_set_rt(blocks, body_idx, mir_block_replace_head(vec_get_rt(blocks, body_idx), body_instrs))
+                        end
+                    end
+                end
+                si = si + 1
+            end
+        end
+        hdr_idx = hdr_idx + 1
+    end
+    out blocks
+end.
+
+func mir_opt_bce(blocks: i64):
+    n_blocks = vec_len_rt(blocks)
+    var b_idx = 0
+    when b_idx < n_blocks loop
+        instrs = mir_block_head(vec_get_rt(blocks, b_idx))
+        if instrs >= 0 do
+            var i = 0
+            when i < vec_len_rt(instrs) loop
+                ins = vec_get_rt(instrs, i)
+                op = mir_instr_op(ins)
+                if op == MirOp.CmpLt or op == MirOp.CmpLe or op == MirOp.CmpGt or op == MirOp.CmpGe do
+                    if i > 0 do
+                        prev = vec_get_rt(instrs, i - 1)
+                        if mir_instr_op(prev) == op do
+                            if mir_opnd_is_same(mir_instr_src1(prev), mir_instr_src1(ins)) and mir_opnd_is_same(mir_instr_src2(prev), mir_instr_src2(ins)) do
+                                vec_set_rt(instrs, i, mir_instr_new(MirOp.Move, mir_instr_dst(ins), mir_opnd_imm(1), mir_opnd_none()))
+                                mir_opt_note_change()
+                            end
+                        end
+                    end
+                end
+                if op == MirOp.Intrinsic do
+                    s2k = mir_instr_src2(ins)
+                    if mir_opnd_type(s2k) == MirOperandType.Imm and mir_opnd_imm_val(s2k) == MIR_INTR_SAFE_ACCESS do
+                        if i > 0 do
+                            prev = vec_get_rt(instrs, i - 1)
+                            if mir_instr_op(prev) == MirOp.CmpLt or mir_instr_op(prev) == MirOp.CmpLe do
+                                vec_set_rt(instrs, i, mir_instr_new(MirOp.Intrinsic, mir_instr_dst(ins), mir_instr_src1(ins), mir_opnd_imm(MIR_INTR_INDEX)))
+                                mir_opt_note_change()
+                            end
+                        end
+                    end
+                end
+                i = i + 1
+            end
+        end
+        b_idx = b_idx + 1
+    end
+    out blocks
+end.
+
+export mir_find_loop_preheader, mir_vreg_defined_in_body, mir_opt_licm_hoistable,
+       mir_opt_licm_operands_invariant, mir_opt_licm, mir_opt_operand_loop_invariant,
+       mir_vreg_is_induction_step, mir_opt_ivsr, mir_opt_bce

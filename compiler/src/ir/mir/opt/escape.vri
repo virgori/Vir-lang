@@ -1,0 +1,280 @@
+##
+ * compiler/src/ir/mir/opt/escape.vri — Escape analysis and arena promotion
+ * ========================================================================
+ * Linear scan and phi-union escape analysis, promoting non-escaping allocations
+ * to stack / arena fastpaths.
+ ##
+
+include types
+include mir_types
+include mir_ops
+include mir_builder
+include mir_opt_context
+
+func mir_opt_inline_bump_arena_fastpath(blocks: i64):
+    n_blocks = vec_len_rt(blocks)
+    var b_idx = 0
+    when b_idx < n_blocks loop
+        b = vec_get_rt(blocks, b_idx)
+        instrs = mir_block_head(b)
+        if instrs >= 0 do
+            n_ins = vec_len_rt(instrs)
+            var i = 0
+            when i < n_ins loop
+                ins = vec_get_rt(instrs, i)
+                op = mir_instr_op(ins)
+                if op == MirOp.Intrinsic do
+                    s2 = mir_instr_src2(ins)
+                    if mir_opnd_type(s2) == MirOperandType.Imm and mir_opnd_imm_val(s2) == MIR_INTR_BUILTIN do
+                        s1 = mir_instr_src1(ins)
+                        if mir_opnd_type(s1) == MirOperandType.Imm do
+                            bid = mir_opnd_imm_val(s1)
+                            if bid == 3 or bid == 50 do
+                                if i > 0 do
+                                    p_ins = vec_get_rt(instrs, i - 1)
+                                    if mir_instr_op(p_ins) == MirOp.SetArg do
+                                        arg_val = mir_instr_src2(p_ins)
+                                        if mir_opnd_type(arg_val) == MirOperandType.Imm do
+                                            raw_sz = mir_opnd_imm_val(arg_val)
+                                            if raw_sz > 0 do
+                                                var req_align = mir_instr_align(ins)
+                                                if req_align < 8 do req_align = 8 end
+                                                aligned_sz = ((raw_sz + req_align - 1) / req_align) * req_align
+                                                vec_set_rt(instrs, i - 1, mir_instr_new(MirOp.SetArg, mir_instr_dst(p_ins), mir_instr_src1(p_ins), mir_opnd_imm(aligned_sz)))
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                i = i + 1
+            end
+        end
+        b_idx = b_idx + 1
+    end
+    out blocks
+end.
+
+func mir_escape_root(parent: i64, vreg: i64):
+    var root = vreg
+    when vec_get_rt(parent, root) != root loop
+        root = vec_get_rt(parent, root)
+    end
+    var current = vreg
+    when vec_get_rt(parent, current) != current loop
+        let next = vec_get_rt(parent, current)
+        vec_set_rt(parent, current, root)
+        current = next
+    end
+    out root
+end.
+
+func mir_escape_union(parent: i64, left: i64, right: i64):
+    let left_root = mir_escape_root(parent, left)
+    let right_root = mir_escape_root(parent, right)
+    if left_root != right_root do
+        if left_root < right_root do
+            vec_set_rt(parent, right_root, left_root)
+        else
+            vec_set_rt(parent, left_root, right_root)
+        end
+    end
+end.
+
+func mir_opt_build_escaped_vregs(blocks: i64):
+    n_vregs = max_vreg_mir(blocks)
+    escaped = vec_new_rt()
+    var vi = 0
+    when vi < n_vregs loop
+        escaped = vec_push_rt(escaped, 0)
+        vi = vi + 1
+    end
+    var b_idx = 0
+    when b_idx < vec_len_rt(blocks) loop
+        instrs = mir_block_head(vec_get_rt(blocks, b_idx))
+        if instrs >= 0 do
+            var i = 0
+            when i < vec_len_rt(instrs) loop
+                ins = vec_get_rt(instrs, i)
+                op = mir_instr_op(ins)
+                if op == MirOp.Call or op == MirOp.Return or op == MirOp.Store do
+                    s1 = mir_instr_src1(ins)
+                    s2 = mir_instr_src2(ins)
+                    if mir_opnd_type(s1) == MirOperandType.VReg do
+                        v = mir_opnd_vreg_id(s1)
+                        if v >= 0 and v < n_vregs do vec_set_rt(escaped, v, 1) end
+                    end
+                    if mir_opnd_type(s2) == MirOperandType.VReg do
+                        v2 = mir_opnd_vreg_id(s2)
+                        if v2 >= 0 and v2 < n_vregs do vec_set_rt(escaped, v2, 1) end
+                    end
+                end
+                if op == MirOp.Intrinsic do
+                    s2k = mir_instr_src2(ins)
+                    if mir_opnd_type(s2k) == MirOperandType.Imm and mir_opnd_imm_val(s2k) == MIR_INTR_ADDR_OF do
+                        s1k = mir_instr_src1(ins)
+                        if mir_opnd_type(s1k) == MirOperandType.VReg do
+                            v3 = mir_opnd_vreg_id(s1k)
+                            if v3 >= 0 and v3 < n_vregs do vec_set_rt(escaped, v3, 1) end
+                        end
+                    end
+                end
+                if op == MirOp.SetArg do
+                    sa = mir_instr_src2(ins)
+                    if mir_opnd_type(sa) == MirOperandType.VReg do
+                        v4 = mir_opnd_vreg_id(sa)
+                        if v4 >= 0 and v4 < n_vregs do vec_set_rt(escaped, v4, 1) end
+                    end
+                end
+                i = i + 1
+            end
+        end
+        b_idx = b_idx + 1
+    end
+    # Pass 2: build phi escape-equivalence classes in near-linear time.
+    var parent = vec_new_rt()
+    vi = 0
+    when vi < n_vregs loop
+        parent = vec_push_rt(parent, vi)
+        vi = vi + 1
+    end
+    var bp_idx = 0
+    when bp_idx < vec_len_rt(blocks) loop
+        let phis = mir_block_phis(vec_get_rt(blocks, bp_idx))
+        if phis >= 0 do
+            var pi = 0
+            when pi < vec_len_rt(phis) loop
+                let phi = vec_get_rt(phis, pi)
+                let phi_dst = mir_phi_dst(phi)
+                let inc_vals = mir_phi_incoming_values(phi)
+                var ii2 = 0
+                when ii2 < vec_len_rt(inc_vals) loop
+                    let inc_v = vec_get_rt(inc_vals, ii2) as MirOperand
+                    if phi_dst >= 0 & phi_dst < n_vregs & mir_opnd_type(inc_v) == MirOperandType.VReg do
+                        let src_vr = mir_opnd_vreg_id(inc_v)
+                        if src_vr >= 0 and src_vr < n_vregs do
+                            mir_escape_union(parent, phi_dst, src_vr)
+                        end
+                    end
+                    ii2 = ii2 + 1
+                end
+                pi = pi + 1
+            end
+        end
+        bp_idx = bp_idx + 1
+    end
+    var root_escaped = vec_new_rt()
+    vi = 0
+    when vi < n_vregs loop
+        root_escaped = vec_push_rt(root_escaped, 0)
+        vi = vi + 1
+    end
+    vi = 0
+    when vi < n_vregs loop
+        if vec_get_rt(escaped, vi) == 1 do
+            vec_set_rt(root_escaped, mir_escape_root(parent, vi), 1)
+        end
+        vi = vi + 1
+    end
+    vi = 0
+    when vi < n_vregs loop
+        if vec_get_rt(root_escaped, mir_escape_root(parent, vi)) == 1 do
+            vec_set_rt(escaped, vi, 1)
+        end
+        vi = vi + 1
+    end
+    out escaped
+end.
+
+func mir_opt_escape_analysis_and_arena_promotion(blocks: i64):
+    n_blocks = vec_len_rt(blocks)
+    escaped = mir_opt_build_escaped_vregs(blocks)
+    n_escaped = vec_len_rt(escaped)
+    var b_idx = 0
+    when b_idx < n_blocks loop
+        b = vec_get_rt(blocks, b_idx)
+        instrs = mir_block_head(b)
+        if instrs >= 0 do
+            n_ins = vec_len_rt(instrs)
+            var new_instrs = vec_new_rt()
+            var promoted = vec_new_rt()
+            var active_arena_vregs = vec_new_rt()
+            var in_arena = 0
+            var i = 0
+            when i < n_ins loop
+                ins = vec_get_rt(instrs, i)
+                op = mir_instr_op(ins)
+                if op == MirOp.Intrinsic do
+                    s2k = mir_instr_src2(ins)
+                    if mir_opnd_type(s2k) == MirOperandType.Imm do
+                        ik = mir_opnd_imm_val(s2k)
+                        if ik == MIR_MEM_MARK do
+                            in_arena = 1
+                            active_arena_vregs = vec_new_rt()
+                        eif ik == MIR_MEM_PROMOTE do
+                            s1 = mir_instr_src1(ins)
+                            if mir_opnd_type(s1) == MirOperandType.VReg do
+                                pv = mir_opnd_vreg_id(s1)
+                                promoted = vec_push_rt(promoted, pv)
+                            end
+                        eif ik == MIR_MEM_RESET do
+                            in_arena = 0
+                            let n_act = vec_len_rt(active_arena_vregs)
+                            var ai = 0
+                            when ai < n_act loop
+                                let pi = vec_get_rt(active_arena_vregs, ai)
+                                if pi >= 0 and pi < n_escaped and vec_get_rt(escaped, pi) == 1 do
+                                    var already = 0
+                                    var k = 0
+                                    let plen = vec_len_rt(promoted)
+                                    when k < plen loop
+                                        if vec_get_rt(promoted, k) == pi do
+                                            already = 1
+                                        end
+                                        k = k + 1
+                                    end
+                                    if already == 0 do
+                                        let setarg_ins = mir_instr_new(MirOp.SetArg as i64, mir_opnd_none() as i64, mir_opnd_imm(0) as i64, mir_opnd_vreg(pi) as i64)
+                                        new_instrs = vec_push_rt(new_instrs, setarg_ins)
+                                        let prom_ins = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_none() as i64, mir_opnd_vreg(pi) as i64, mir_opnd_imm(MIR_MEM_PROMOTE) as i64)
+                                        mir_instr_set_alloc_kind(prom_ins, 1)
+                                        new_instrs = vec_push_rt(new_instrs, prom_ins)
+                                        promoted = vec_push_rt(promoted, pi)
+                                        mir_opt_note_change()
+                                    end
+                                end
+                                ai = ai + 1
+                            end
+                            active_arena_vregs = vec_new_rt()
+                        eif ik == MIR_MEM_ALLOC or ik == MIR_INTR_ARRAY or ik == MIR_INTR_ENTITY or ik == MIR_INTR_TUPLE or ik == 3 do
+                            dst = mir_instr_dst(ins)
+                            if mir_opnd_type(dst) == MirOperandType.VReg do
+                                dv = mir_opnd_vreg_id(dst)
+                                if in_arena == 1 and dv >= 0 do
+                                    active_arena_vregs = vec_push_rt(active_arena_vregs, dv)
+                                end
+                                if dv >= 0 and dv < n_escaped do
+                                    if vec_get_rt(escaped, dv) == 0 do
+                                        mir_instr_set_alloc_kind(ins, 0)
+                                    else
+                                        mir_instr_set_alloc_kind(ins, 1)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                new_instrs = vec_push_rt(new_instrs, ins)
+                i = i + 1
+            end
+            mir_block_replace_head(b, new_instrs)
+        end
+        b_idx = b_idx + 1
+    end
+    out blocks
+end.
+
+export mir_opt_inline_bump_arena_fastpath, mir_escape_root, mir_escape_union,
+       mir_opt_build_escaped_vregs, mir_opt_escape_analysis_and_arena_promotion

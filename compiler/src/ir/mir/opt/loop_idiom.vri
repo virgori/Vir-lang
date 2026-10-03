@@ -1,0 +1,190 @@
+##
+ * compiler/src/ir/mir/opt/loop_idiom.vri — Loop idiom recognition
+ * ===============================================================
+ * Pattern match hot loop idioms and rewrite to optimized kernels (e.g. memset).
+ ##
+
+include types
+include mir_types
+include mir_ops
+include mir_builder
+include mir_opt_context
+include mir_opt_rewrite
+
+func mir_trace_source_opnd(instrs: i64, limit_idx: i64, opnd: &MirOperand):
+    var cur = opnd as i64
+    var keep_going = true
+    when keep_going loop
+        keep_going = false
+        if native_read_i64(cur, 0) == MirOperandType.VReg as int do
+            v = native_read_i64(cur, 8)
+            var k = limit_idx - 1
+            when k >= 0 and not keep_going loop
+                ins = vec_get_rt(instrs, k)
+                if mir_instr_op(ins) == MirOp.Move do
+                    dst = mir_instr_dst(ins)
+                    if mir_opnd_type(dst) == MirOperandType.VReg and mir_opnd_vreg_id(dst) == v do
+                        cur = mir_instr_src1(ins) as i64
+                        keep_going = true
+                    end
+                end
+                k = k - 1
+            end
+        end
+    end
+    out cur as MirOperand
+end.
+
+func mir_opt_loop_idiom_recognizer(blocks: i64):
+    n_blocks = vec_len_rt(blocks)
+    var i = 0
+    when i < (n_blocks - 1) loop
+        cond_b = vec_get_rt(blocks, i)
+        cond_id = mir_block_id(cond_b)
+        cond_instrs = mir_block_head(cond_b)
+        if cond_instrs >= 0 do
+            n_cond_ins = vec_len_rt(cond_instrs)
+            if n_cond_ins >= 3 do
+                ins_jump = vec_get_rt(cond_instrs, n_cond_ins - 1)
+                ins_jin = vec_get_rt(cond_instrs, n_cond_ins - 2)
+                ins_cmp = vec_get_rt(cond_instrs, n_cond_ins - 3)
+                if mir_instr_op(ins_jump) == MirOp.Jump and mir_instr_op(ins_jin) == MirOp.JumpIfNot do
+                    exit_opnd = mir_instr_src2(ins_jin)
+                    body_opnd = mir_instr_src1(ins_jump)
+                    body_id = mir_opnd_imm_val(body_opnd)
+                    op_cmp = mir_instr_op(ins_cmp)
+                    if (op_cmp == MirOp.CmpLe or op_cmp == MirOp.CmpLt) do
+                        s1_cmp = mir_instr_src1(ins_cmp)
+                        s2_cmp = mir_instr_src2(ins_cmp)
+                        body_b = vec_get_rt(blocks, i + 1)
+                        if mir_block_id(body_b) == body_id do
+                            body_instrs = mir_block_head(body_b)
+                            if body_instrs >= 0 do
+                                n_body_ins = vec_len_rt(body_instrs)
+                                if n_body_ins >= 4 do
+                                    ins_body_jump = vec_get_rt(body_instrs, n_body_ins - 1)
+                                    if mir_instr_op(ins_body_jump) == MirOp.Jump and mir_opnd_imm_val(mir_instr_src1(ins_body_jump)) == cond_id do
+                                        var has_write_byte = 0
+                                        var buf_opnd = mir_opnd_none()
+                                        var val_opnd = mir_opnd_none()
+                                        var bi_idx = 0
+                                        when bi_idx < (n_body_ins - 1) loop
+                                            b_ins = vec_get_rt(body_instrs, bi_idx)
+                                            if mir_instr_op(b_ins) == MirOp.Intrinsic do
+                                                s1_intr = mir_instr_src1(b_ins)
+                                                s2_intr = mir_instr_src2(b_ins)
+                                                if mir_opnd_type(s2_intr) == MirOperandType.Imm and mir_opnd_imm_val(s2_intr) == 8 do
+                                                    if mir_opnd_type(s1_intr) == MirOperandType.Imm and mir_opnd_imm_val(s1_intr) == 6 do
+                                                        if bi_idx >= 3 do
+                                                            sa0 = vec_get_rt(body_instrs, bi_idx - 3)
+                                                            sa1 = vec_get_rt(body_instrs, bi_idx - 2)
+                                                            sa2 = vec_get_rt(body_instrs, bi_idx - 1)
+                                                            if mir_instr_op(sa0) == MirOp.SetArg and mir_instr_op(sa1) == MirOp.SetArg and mir_instr_op(sa2) == MirOp.SetArg do
+                                                                buf_opnd = mir_trace_source_opnd(body_instrs, bi_idx - 3, mir_instr_src2(sa0))
+                                                                val_opnd = mir_trace_source_opnd(body_instrs, bi_idx - 1, mir_instr_src2(sa2))
+                                                                has_write_byte = 1
+                                                            end
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                            bi_idx = bi_idx + 1
+                                        end
+                                        var is_step_one = 0
+                                        var step_k = 0
+                                        when step_k < n_body_ins loop
+                                            ins_step = vec_get_rt(body_instrs, step_k)
+                                            if mir_instr_op(ins_step) == MirOp.Add do
+                                                s1_add = mir_trace_source_opnd(body_instrs, step_k, mir_instr_src1(ins_step))
+                                                s2_add = mir_trace_source_opnd(body_instrs, step_k, mir_instr_src2(ins_step))
+                                                if (mir_opnd_type(s1_add) == MirOperandType.Imm and mir_opnd_imm_val(s1_add) == 1) or (mir_opnd_type(s2_add) == MirOperandType.Imm and mir_opnd_imm_val(s2_add) == 1) do
+                                                    is_step_one = 1
+                                                end
+                                            end
+                                            step_k = step_k + 1
+                                        end
+                                        var val_is_invariant = 0
+                                        if mir_opnd_type(val_opnd) == MirOperandType.Imm do
+                                            val_is_invariant = 1
+                                        eif mir_opnd_type(val_opnd) == MirOperandType.VReg do
+                                            var v_def_in_body = 0
+                                            var vi = 0
+                                            let target_v = mir_opnd_vreg_id(val_opnd)
+                                            when vi < n_body_ins loop
+                                                let b_ins_chk = vec_get_rt(body_instrs, vi)
+                                                let dst_chk = mir_instr_dst(b_ins_chk)
+                                                if mir_opnd_type(dst_chk) == MirOperandType.VReg and mir_opnd_vreg_id(dst_chk) == target_v do
+                                                    v_def_in_body = 1
+                                                end
+                                                vi = vi + 1
+                                            end
+                                            if v_def_in_body == 0 do
+                                                val_is_invariant = 1
+                                            end
+                                        end
+                                        # Check that the buffer pointer is also loop-invariant
+                                        # (i.e. not defined inside the loop body). If buf_opnd is a VReg
+                                        # whose definition is inside body_instrs, the buffer changes every
+                                        # iteration (e.g. `let p = alloc(64)`) and must NOT be rewritten.
+                                        var buf_is_invariant = 0
+                                        if mir_opnd_type(buf_opnd) == MirOperandType.Imm do
+                                            buf_is_invariant = 1
+                                        eif mir_opnd_type(buf_opnd) == MirOperandType.VReg do
+                                            var buf_def_in_body = 0
+                                            let buf_vreg_id = mir_opnd_vreg_id(buf_opnd)
+                                            var bvi = 0
+                                            when bvi < n_body_ins loop
+                                                let b_chk2 = vec_get_rt(body_instrs, bvi)
+                                                let dst_b2 = mir_instr_dst(b_chk2)
+                                                if mir_opnd_type(dst_b2) == MirOperandType.VReg and mir_opnd_vreg_id(dst_b2) == buf_vreg_id do
+                                                    buf_def_in_body = 1
+                                                end
+                                                bvi = bvi + 1
+                                            end
+                                            if buf_def_in_body == 0 do
+                                                buf_is_invariant = 1
+                                            end
+                                        end
+                                        if has_write_byte == 1 and is_step_one == 1 and val_is_invariant == 1 and buf_is_invariant == 1 do
+                                            real_limit = mir_trace_source_opnd(cond_instrs, n_cond_ins - 3, s2_cmp)
+                                            len_opnd = real_limit
+                                            if op_cmp == MirOp.CmpLe do
+                                                if mir_opnd_type(real_limit) == MirOperandType.Imm do
+                                                    len_opnd = mir_opnd_imm(mir_opnd_imm_val(real_limit) + 1)
+                                                end
+                                            end
+                                            ins_sa0 = mir_instr_new(MirOp.SetArg, mir_opnd_none(), mir_opnd_imm(0), buf_opnd)
+                                            ins_sa1 = mir_instr_new(MirOp.SetArg, mir_opnd_none(), mir_opnd_imm(1), val_opnd)
+                                            ins_sa2 = mir_instr_new(MirOp.SetArg, mir_opnd_none(), mir_opnd_imm(2), len_opnd)
+                                            ins_memset = mir_instr_new(MirOp.Intrinsic, mir_opnd_none(), mir_opnd_imm(32), mir_opnd_imm(8))
+                                            ins_exit_jump = mir_instr_new(MirOp.Jump, mir_opnd_none(), exit_opnd, mir_opnd_none())
+                                            var ck = 0
+                                            when ck < (n_cond_ins - 3) loop
+                                                vec_set_rt(cond_instrs, ck, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                                ck = ck + 1
+                                            end
+                                            vec_set_rt(cond_instrs, n_cond_ins - 3, ins_sa0)
+                                            vec_set_rt(cond_instrs, n_cond_ins - 2, ins_sa1)
+                                            vec_set_rt(cond_instrs, n_cond_ins - 1, ins_sa2)
+                                            cond_instrs = vec_push_rt(cond_instrs, ins_memset)
+                                            cond_instrs = vec_push_rt(cond_instrs, ins_exit_jump)
+                                            var bk = 0
+                                            when bk < n_body_ins loop
+                                                vec_set_rt(body_instrs, bk, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                                bk = bk + 1
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    out blocks
+end.
+
+export mir_trace_source_opnd, mir_opt_loop_idiom_recognizer

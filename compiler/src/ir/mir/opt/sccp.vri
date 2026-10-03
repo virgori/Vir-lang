@@ -1,0 +1,239 @@
+##
+ * vir/compiler/ir/mir/opt/sccp.vri — Sparse Conditional Constant Propagation
+ * ===========================================================================
+ * Lattice-based constant propagation with phi meet and dead branch elimination.
+ ##
+
+include types
+include vec_rt
+include mir
+include mir_opt_context
+include mir_opt_rewrite
+include mir_opt_constfold
+
+const MIR_SCCP_TOP: i64 = 0
+const MIR_SCCP_CONST: i64 = 1
+const MIR_SCCP_OVER: i64 = 2
+
+func mir_sccp_lattice_meet(a_state: i64, a_val: i64, b_state: i64, b_val: i64):
+    if a_state == MIR_SCCP_OVER or b_state == MIR_SCCP_OVER do out (MIR_SCCP_OVER, 0) end
+    if a_state == MIR_SCCP_TOP do out (b_state, b_val) end
+    if b_state == MIR_SCCP_TOP do out (a_state, a_val) end
+    if a_state == MIR_SCCP_CONST and b_state == MIR_SCCP_CONST do
+        if a_val == b_val do out (MIR_SCCP_CONST, a_val) end
+        out (MIR_SCCP_OVER, 0)
+    end
+    out (MIR_SCCP_OVER, 0)
+end.
+
+func mir_sccp_operand_state(opnd: &MirOperand, states: i64, values: i64):
+    if mir_opnd_type(opnd) == MirOperandType.Imm do
+        out (MIR_SCCP_CONST, mir_opnd_imm_val(opnd))
+    end
+    if mir_opnd_type(opnd) == MirOperandType.VReg do
+        id = mir_opnd_vreg_id(opnd)
+        if id >= 0 and id < vec_len_rt(states) do
+            st = vec_get_rt(states, id)
+            if st == MIR_SCCP_CONST do out (MIR_SCCP_CONST, vec_get_rt(values, id)) end
+            out (st, 0)
+        end
+    end
+    out (MIR_SCCP_OVER, 0)
+end.
+
+func mir_sccp_try_set(states: i64, values: i64, v: i64, new_state: i64, new_val: i64):
+    if v < 0 or v >= vec_len_rt(states) do out false end
+    old_state = vec_get_rt(states, v)
+    if old_state == MIR_SCCP_OVER do out false end
+    old_val = vec_get_rt(values, v)
+    if old_state == new_state and (new_state != MIR_SCCP_CONST or old_val == new_val) do out false end
+    vec_set_rt(states, v, new_state)
+    if new_state == MIR_SCCP_CONST do vec_set_rt(values, v, new_val) end
+    out true
+end.
+
+func mir_op_defines_value(op: i64):
+    out op == MirOp.Move or op == MirOp.Load or op == MirOp.Add or op == MirOp.Sub or op == MirOp.Mul or op == MirOp.Div or op == MirOp.Mod or op == MirOp.And or op == MirOp.Or or op == MirOp.Xor or op == MirOp.Shl or op == MirOp.Shr or op == MirOp.Not or op == MirOp.CmpEq or op == MirOp.CmpNe or op == MirOp.CmpGt or op == MirOp.CmpLt or op == MirOp.CmpGe or op == MirOp.CmpLe
+end.
+
+func count_vreg_value_defs_mir(blocks: i64, target_vreg: i64):
+    n_blocks = vec_len_rt(blocks)
+    var defs = 0
+    var i = 0
+    when i < n_blocks loop
+        instrs = mir_block_head(vec_get_rt(blocks, i))
+        if instrs >= 0 do
+            var j = 0
+            when j < vec_len_rt(instrs) loop
+                ins = vec_get_rt(instrs, j)
+                if mir_op_defines_value(mir_instr_op(ins)) and mir_instr_defines_vreg(ins, target_vreg) do
+                    defs = defs + 1
+                end
+                j = j + 1
+            end
+        end
+        i = i + 1
+    end
+    out defs
+end.
+
+func mir_sccp_resolve_operand(opnd: &MirOperand, states: i64, values: i64):
+    if mir_opnd_type(opnd) == MirOperandType.VReg do
+        id = mir_opnd_vreg_id(opnd)
+        if id >= 0 and id < vec_len_rt(states) and vec_get_rt(states, id) == MIR_SCCP_CONST do
+            out mir_opnd_imm(vec_get_rt(values, id))
+        end
+    end
+    out opnd
+end.
+
+func mir_sccp_eval(op: i64, s1: &MirOperand, s2: &MirOperand, ins_t: i64):
+    if op == MirOp.Move and mir_opnd_type(s1) == MirOperandType.Imm do
+        out (true, mir_opnd_imm_val(s1))
+    end
+    if op == MirOp.Not and mir_opnd_type(s1) == MirOperandType.Imm do
+        out (true, mir_opnd_imm_val(s1) xor (0 - 1))
+    end
+    if mir_opnd_type(s1) != MirOperandType.Imm or mir_opnd_type(s2) != MirOperandType.Imm do
+        out (false, 0)
+    end
+    out mir_eval_const_binary_typed(op, mir_opnd_imm_val(s1), mir_opnd_imm_val(s2), ins_t)
+end.
+
+func mir_opt_sccp(blocks: i64):
+    n_vregs = max_vreg_mir(blocks)
+    states = vec_new_rt()
+    values = vec_new_rt()
+    var v = 0
+    when v < n_vregs loop
+        states = vec_push_rt(states, MIR_SCCP_TOP)
+        values = vec_push_rt(values, 0)
+        v = v + 1
+    end
+
+    changed = true
+    var iter = 0
+    n_blocks = vec_len_rt(blocks)
+    max_iter = (n_blocks + 1) * 8
+    if max_iter > 512 do max_iter = 512 end
+    when changed and iter < max_iter loop
+        changed = false
+        n_blocks = vec_len_rt(blocks)
+        var b_idx = 0
+        when b_idx < n_blocks loop
+            b = vec_get_rt(blocks, b_idx)
+            phis = mir_block_phis(b)
+            if phis >= 0 do
+                var p = 0
+                when p < vec_len_rt(phis) loop
+                    phi = vec_get_rt(phis, p)
+                    dst_v = mir_phi_dst(phi)
+                    inc_vals = mir_phi_incoming_values(phi)
+                    meet_state = MIR_SCCP_TOP
+                    meet_val = 0
+                    var k = 0
+                    when k < vec_len_rt(inc_vals) loop
+                        inc = vec_get_rt(inc_vals, k)
+                        var (ist, ival) = mir_sccp_operand_state(inc, states, values)
+                        var (mst, mval) = mir_sccp_lattice_meet(meet_state, meet_val, ist, ival)
+                        meet_state = mst
+                        meet_val = mval
+                        k = k + 1
+                    end
+                    if mir_sccp_try_set(states, values, dst_v, meet_state, meet_val) do
+                        changed = true
+                    end
+                    p = p + 1
+                end
+            end
+            instrs = mir_block_head(b)
+            if instrs >= 0 do
+                var i = 0
+                when i < vec_len_rt(instrs) loop
+                    ins = vec_get_rt(instrs, i)
+                    op = mir_instr_op(ins)
+                    dst = mir_instr_dst(ins)
+                    if mir_op_defines_value(op) and mir_opnd_type(dst) == MirOperandType.VReg do
+                        dst_v = mir_opnd_vreg_id(dst)
+                        s1 = mir_instr_src1(ins)
+                        s2 = mir_instr_src2(ins)
+                        var (s1_st, s1_val) = mir_sccp_operand_state(s1, states, values)
+                        var (s2_st, s2_val) = mir_sccp_operand_state(s2, states, values)
+                        if s1_st == MIR_SCCP_OVER or s2_st == MIR_SCCP_OVER do
+                            if mir_sccp_try_set(states, values, dst_v, MIR_SCCP_OVER, 0) do changed = true end
+                        eif s1_st == MIR_SCCP_TOP or s2_st == MIR_SCCP_TOP do
+                            # wait for operands
+                        else
+                            rs1_eval = s1
+                            rs2_eval = s2
+                            if s1_st == MIR_SCCP_CONST do rs1_eval = mir_opnd_imm(s1_val) end
+                            if s2_st == MIR_SCCP_CONST do rs2_eval = mir_opnd_imm(s2_val) end
+                            var (is_const, const_val) = mir_sccp_eval(op, rs1_eval, rs2_eval, mir_instr_type(ins))
+                            if is_const do
+                                if mir_sccp_try_set(states, values, dst_v, MIR_SCCP_CONST, const_val) do changed = true end
+                            else
+                                if mir_sccp_try_set(states, values, dst_v, MIR_SCCP_OVER, 0) do changed = true end
+                            end
+                        end
+                    eif mir_opnd_type(dst) == MirOperandType.VReg and not (op >= MirOp.VLoad as i64 and op <= MirOp.Shuffle as i64) do
+                        dst_v = mir_opnd_vreg_id(dst)
+                        if mir_sccp_try_set(states, values, dst_v, MIR_SCCP_OVER, 0) do changed = true end
+                    end
+                    i = i + 1
+                end
+            end
+            b_idx = b_idx + 1
+        end
+        iter = iter + 1
+    end
+
+    n_blocks2 = vec_len_rt(blocks)
+    var bi = 0
+    when bi < n_blocks2 loop
+        instrs2 = mir_block_head(vec_get_rt(blocks, bi))
+        if instrs2 >= 0 do
+            var ii = 0
+            when ii < vec_len_rt(instrs2) loop
+                ins2 = vec_get_rt(instrs2, ii)
+                op2 = mir_instr_op(ins2)
+                dst2 = mir_instr_dst(ins2)
+                rs1 = mir_sccp_resolve_operand(mir_instr_src1(ins2), states, values)
+                rs2 = mir_sccp_resolve_operand(mir_instr_src2(ins2), states, values)
+                if mir_op_defines_value(op2) and mir_opnd_type(dst2) == MirOperandType.VReg do
+                    dv = mir_opnd_vreg_id(dst2)
+                    if dv >= 0 and dv < n_vregs and vec_get_rt(states, dv) == MIR_SCCP_CONST do
+                        cval = vec_get_rt(values, dv)
+                        if op2 != MirOp.Move or mir_opnd_type(mir_instr_src1(ins2)) != MirOperandType.Imm or mir_opnd_imm_val(mir_instr_src1(ins2)) != cval do
+                            vec_set_rt(instrs2, ii, mir_instr_new(MirOp.Move, dst2, mir_opnd_imm(cval), mir_opnd_none()))
+                            mir_opt_note_change()
+                        end
+                    else
+                        if not mir_opnd_is_same(rs1, mir_instr_src1(ins2)) or not mir_opnd_is_same(rs2, mir_instr_src2(ins2)) do
+                            new_ins2 = mir_instr_new(op2, dst2, rs1, rs2)
+                            mir_copy_instr_metadata(ins2, new_ins2)
+                            vec_set_rt(instrs2, ii, new_ins2)
+                            mir_opt_note_change()
+                        end
+                    end
+                else
+                    if not mir_opnd_is_same(rs1, mir_instr_src1(ins2)) or not mir_opnd_is_same(rs2, mir_instr_src2(ins2)) do
+                        new_ins2 = mir_instr_new(op2, dst2, rs1, rs2)
+                        mir_copy_instr_metadata(ins2, new_ins2)
+                        vec_set_rt(instrs2, ii, new_ins2)
+                        mir_opt_note_change()
+                    end
+                end
+                ii = ii + 1
+            end
+        end
+        bi = bi + 1
+    end
+    vec_free_rt(states)
+    vec_free_rt(values)
+    out blocks
+end.
+
+export MIR_SCCP_TOP, MIR_SCCP_CONST, MIR_SCCP_OVER,
+       mir_sccp_lattice_meet, mir_sccp_operand_state, mir_sccp_try_set,
+       mir_op_defines_value, count_vreg_value_defs_mir,
+       mir_sccp_resolve_operand, mir_sccp_eval, mir_opt_sccp
