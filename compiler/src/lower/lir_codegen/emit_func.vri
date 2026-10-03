@@ -1,0 +1,950 @@
+##
+ * compiler/src/lower/lir_codegen/emit_func.vri — Function-level Code Generation
+ * =============================================================================
+ ##
+
+include types
+include vec_rt
+include string_rt
+include codegen
+include target
+include lir_codegen_types
+include lir_codegen_intrinsics
+include lir_codegen_calls
+include lir_codegen_rt_stubs_base
+include lir_codegen_rt_stubs_math
+include lir_codegen_emit_vector
+
+func emit_lir_arm64_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, lir_funcs: i64, call_fixups: i64, str_fixups: i64, is_linux: i64):
+    # Record function entry offset for TCO self-branch target.
+    func_entry_off = codebuf_offset(cb) as i64
+    g_codegen_func_obj = func_obj as i64
+    g_codegen_max_phys = lir_func_calc_max_phys(func_obj, assigned_phys)
+
+    cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+    cb = arm64_mov_from_sp(cb, 29)
+    cb = emit_callee_save(cb, g_codegen_max_phys)
+
+    var ssz = lir_func_required_stack_size(func_obj)
+    g_codegen_stack_size = ssz
+    cb = emit_stack_alloc_arm64(cb, g_codegen_stack_size)
+
+    g_codegen_blocks = native_read_i64(g_codegen_func_obj, 16)
+    n_blocks = vec_len_rt(g_codegen_blocks)
+    var max_bid = n_blocks
+    var bi = 0
+    when bi < n_blocks loop
+        b = vec_get_rt(g_codegen_blocks, bi)
+        bid = native_read_i64(b as i64, 0)
+        if bid >= max_bid do
+            max_bid = bid + 1
+        end
+        bi = bi + 1
+    end
+    block_off = vec_new_cap_rt(1024)
+    var bi2 = 0
+    when bi2 < max_bid loop
+        block_off = vec_push_rt(block_off, 0 - 1)
+        bi2 = bi2 + 1
+    end
+    fixups = vec_new_cap_rt(1024)
+    var pending_stk = 0
+    var pending_stack_args = vec_new_rt()
+    SCR = 9
+    SCR2 = 10
+    SCRQ = 11
+    SCRD = 12
+
+    var bi = 0
+    var last_cmp_pred = 0 - 1
+    var last_cmp_dst = 0
+    recent_setargs = vec_new_cap_rt(8)
+    recent_setargs = vec_push_rt(recent_setargs, 0)
+    recent_setargs = vec_push_rt(recent_setargs, 0)
+    recent_setargs = vec_push_rt(recent_setargs, 0)
+    recent_setargs = vec_push_rt(recent_setargs, 0)
+    reg_const_val = vec_new_cap_rt(32)
+    reg_shl_src = vec_new_cap_rt(32)
+    reg_shl_amt = vec_new_cap_rt(32)
+    reg_shr_src = vec_new_cap_rt(32)
+    reg_shr_amt = vec_new_cap_rt(32)
+    var rci = 0
+    when rci < 32 loop
+        reg_const_val = vec_push_rt(reg_const_val, 0 - 1)
+        reg_shl_src = vec_push_rt(reg_shl_src, 0 - 1)
+        reg_shl_amt = vec_push_rt(reg_shl_amt, 0)
+        reg_shr_src = vec_push_rt(reg_shr_src, 0 - 1)
+        reg_shr_amt = vec_push_rt(reg_shr_amt, 0)
+        rci = rci + 1
+    end
+    when bi < n_blocks loop
+        var rci2 = 0
+        when rci2 < 32 loop
+            vec_set_rt(reg_const_val, rci2, 0 - 1)
+            vec_set_rt(reg_shl_src, rci2, 0 - 1)
+            vec_set_rt(reg_shl_amt, rci2, 0)
+            vec_set_rt(reg_shr_src, rci2, 0 - 1)
+            vec_set_rt(reg_shr_amt, rci2, 0)
+            rci2 = rci2 + 1
+        end
+        g_codegen_cur_block = vec_get_rt(g_codegen_blocks, bi)
+        bid = native_read_i64(g_codegen_cur_block, 0)
+        vec_set_rt(block_off, bid, codebuf_offset(cb) as i64)
+        g_codegen_cur_instrs = native_read_i64(g_codegen_cur_block, 8)
+        n_instrs = vec_len_rt(g_codegen_cur_instrs)
+        var ii = 0
+        when ii < n_instrs loop
+            ins = vec_get_rt(g_codegen_cur_instrs, ii)
+            op = native_read_i64(ins as i64, 0)
+            ins_typ = native_read_i64(ins as i64, 8)
+            ins_dst = native_read_i64(ins as i64, 16)
+            ins_src1 = native_read_i64(ins as i64, 24)
+            ins_src2 = native_read_i64(ins as i64, 32)
+            ins_aux = native_read_i64(ins as i64, 40)
+            rd = resolve_reg(ins_dst, assigned_phys)
+            # Spilled destination: compute into SCRD, store to slot after the op.
+            rd_spill = lir_opnd_spill_off(ins_dst)
+            if rd_spill < 0 do
+                rd = SCRD
+            end
+            if lir_instr_has_def(ins) == 0 do
+                rd_spill = 0
+            end
+            # Spilled sources: reload into scratch so every consumer sees a reg.
+            # Use X14/X15 (not X9/X10) to avoid the temps used by INDEX/FIELD
+            # intrinsics and arithmetic operand materialization.
+            rs1 = robust_src_reg(cb, ins_src1, assigned_phys, 14)
+            rs2 = robust_src_reg(cb, ins_src2, assigned_phys, 15)
+
+            if op == LirOp.Nop do
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Mov do
+                is_mov_fused = 0
+                if (ins_src1 as i64) != 0 do
+                    src1_typ = native_read_i64(ins_src1 as i64, 0)
+                    if src1_typ == 5 do # Imm
+                        imm_val = native_read_i64(ins_src1 as i64, 32)
+                        if imm_val == 4294967295 and ii > 0 and (ii + 1) < n_instrs do
+                            p_ins = vec_get_rt(g_codegen_cur_instrs, ii - 1)
+                            nxt_ins = vec_get_rt(g_codegen_cur_instrs, ii + 1)
+                            if native_read_i64(p_ins as i64, 0) == (LirOp.Mul as i64) and native_read_i64(nxt_ins as i64, 0) == (LirOp.And as i64) do
+                                is_mov_fused = 1
+                            end
+                        end
+                        if rd >= 0 and rd < 32 do
+                            vec_set_rt(reg_const_val, rd, imm_val)
+                        end
+                        if is_mov_fused == 0 and rd >= 0 do
+                            cb = arm64_movz_imm64(cb, rd as int, imm_val as int)
+                        end
+                    eif rd >= 0 and rs1 >= 0 and rd != rs1 do
+                        if rd < 32 and rs1 < 32 do
+                            vec_set_rt(reg_const_val, rd, vec_get_rt(reg_const_val, rs1))
+                            vec_set_rt(reg_shl_src, rd, vec_get_rt(reg_shl_src, rs1))
+                            vec_set_rt(reg_shl_amt, rd, vec_get_rt(reg_shl_amt, rs1))
+                            vec_set_rt(reg_shr_src, rd, vec_get_rt(reg_shr_src, rs1))
+                            vec_set_rt(reg_shr_amt, rd, vec_get_rt(reg_shr_amt, rs1))
+                        end
+                        if rd != rs1 do
+                            cb = arm64_mov_rr(cb, rd as int, rs1 as int)
+                        end
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Add do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                if ins_typ == (LirType.F64 as i64) do
+                    breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_fmov_dx(cb, 0, a as int)
+                        cb = arm64_fmov_dx(cb, 1, breg as int)
+                        cb = arm64_fadd_ddd(cb, 0, 0, 1)
+                        cb = arm64_fmov_xd(cb, rd as int, 0)
+                    end
+                else
+                    is_imm_add = 0
+                    imm_v = 0 - 1
+                    if (ins_src2 as i64) != 0 do
+                        s2_typ = native_read_i64(ins_src2 as i64, 0)
+                        if s2_typ == 5 do # Imm
+                            imm_v = native_read_i64(ins_src2 as i64, 32)
+                        end
+                    end
+                    if imm_v >= 0 and imm_v <= 4095 and rd >= 0 and a >= 0 do
+                        cb = arm64_add_imm(cb, rd as int, a as int, imm_v as int)
+                        is_imm_add = 1
+                    end
+                    if is_imm_add == 0 do
+                        breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                        if rd >= 0 and a >= 0 and breg >= 0 do
+                            cb = arm64_add_rrr(cb, rd as int, a as int, breg as int)
+                        end
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Sub do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                if ins_typ == (LirType.F64 as i64) do
+                    breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_fmov_dx(cb, 0, a as int)
+                        cb = arm64_fmov_dx(cb, 1, breg as int)
+                        cb = arm64_fsub_ddd(cb, 0, 0, 1)
+                        cb = arm64_fmov_xd(cb, rd as int, 0)
+                    end
+                else
+                    is_imm_sub = 0
+                    imm_v = 0 - 1
+                    if (ins_src2 as i64) != 0 do
+                        s2_typ = native_read_i64(ins_src2 as i64, 0)
+                        if s2_typ == 5 do # Imm
+                            imm_v = native_read_i64(ins_src2 as i64, 32)
+                        end
+                    end
+                    if imm_v >= 0 and imm_v <= 4095 and rd >= 0 and a >= 0 do
+                        cb = arm64_sub_imm(cb, rd as int, a as int, imm_v as int)
+                        is_imm_sub = 1
+                    end
+                    if is_imm_sub == 0 do
+                        breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                        if rd >= 0 and a >= 0 and breg >= 0 do
+                            cb = arm64_sub_rrr(cb, rd as int, a as int, breg as int)
+                        end
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Mul do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if ins_typ == (LirType.F64 as i64) do
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_fmov_dx(cb, 0, a as int)
+                        cb = arm64_fmov_dx(cb, 1, breg as int)
+                        cb = arm64_fmul_ddd(cb, 0, 0, 1)
+                        cb = arm64_fmov_xd(cb, rd as int, 0)
+                    end
+                else
+                    is_fused_32bit_mul = 0
+                    if rd_spill == 0 and (ii + 2) < n_instrs do
+                        mov_ins = vec_get_rt(g_codegen_cur_instrs, ii + 1)
+                        and_ins = vec_get_rt(g_codegen_cur_instrs, ii + 2)
+                        if native_read_i64(mov_ins as i64, 0) == 1 and native_read_i64(and_ins as i64, 0) == (LirOp.And as i64) do
+                            m_src1 = native_read_i64(mov_ins as i64, 24)
+                            m_dst = native_read_i64(mov_ins as i64, 16)
+                            a_dst_guard = native_read_i64(and_ins as i64, 16)
+                            if (m_src1 as i64) != 0 do
+                                if native_read_i64(m_src1 as i64, 0) == 5 and native_read_i64(m_src1 as i64, 32) == 4294967295 and lir_opnd_spill_off(m_dst) == 0 and lir_opnd_spill_off(a_dst_guard) == 0 do
+                                    a_s1 = native_read_i64(and_ins as i64, 24)
+                                    a_s2 = native_read_i64(and_ins as i64, 32)
+                                    a_dst = native_read_i64(and_ins as i64, 16)
+                                    if (lir_opnd_matches(ins_dst, a_s1) == 1 and lir_opnd_matches(m_dst, a_s2) == 1) or (lir_opnd_matches(ins_dst, a_s2) == 1 and lir_opnd_matches(m_dst, a_s1) == 1) do
+                                        n_rd = -1
+                                        if a_dst != 0 do
+                                            if native_read_i64(a_dst, 0) == 1 do
+                                                v_id = native_read_i64(a_dst, 8)
+                                                if v_id >= 0 and v_id < vec_len_rt(assigned_phys) do
+                                                    p_c = vec_get_rt(assigned_phys, v_id)
+                                                    if p_c >= 0 do n_rd = color_to_phys(p_c, 0) end
+                                                end
+                                            eif native_read_i64(a_dst, 0) == 2 do
+                                                n_rd = native_read_i64(a_dst, 16)
+                                            end
+                                        end
+                                        target_rd = rd
+                                        if n_rd >= 0 do target_rd = n_rd end
+                                        if target_rd >= 0 and a >= 0 and breg >= 0 do
+                                            mul_w = 0x1B007C00 or ((breg as int and 0x1F) shl 16) or ((a as int and 0x1F) shl 5) or (target_rd as int and 0x1F)
+                                            cb = codebuf_emit_u32(cb, mul_w)
+                                            is_fused_32bit_mul = 1
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    if is_fused_32bit_mul == 0 and rd_spill == 0 and (ii + 1) < n_instrs do
+                        next_ins = vec_get_rt(g_codegen_cur_instrs, ii + 1)
+                        if native_read_i64(next_ins as i64, 0) == (LirOp.And as i64) do
+                            n_s1 = native_read_i64(next_ins as i64, 24)
+                            n_s2 = native_read_i64(next_ins as i64, 32)
+                            n_dst = native_read_i64(next_ins as i64, 16)
+                            var mask_val = 0 - 1
+                            if (n_s2 as i64) != 0 do
+                                if native_read_i64(n_s2 as i64, 0) == 5 do
+                                    mask_val = native_read_i64(n_s2 as i64, 32)
+                                end
+                            end
+                            if mask_val == 4294967295 and lir_opnd_matches(ins_dst, n_s1) == 1 and lir_opnd_spill_off(n_dst) == 0 do
+                                n_rd = -1
+                                if n_dst != 0 do
+                                    if native_read_i64(n_dst, 0) == 1 do
+                                        v_id = native_read_i64(n_dst, 8)
+                                        if v_id >= 0 and v_id < vec_len_rt(assigned_phys) do
+                                            p_c = vec_get_rt(assigned_phys, v_id)
+                                            if p_c >= 0 do n_rd = color_to_phys(p_c, 0) end
+                                        end
+                                    eif native_read_i64(n_dst, 0) == 2 do
+                                        n_rd = native_read_i64(n_dst, 16)
+                                    end
+                                end
+                                target_rd = rd
+                                if n_rd >= 0 do target_rd = n_rd end
+                                if target_rd >= 0 and a >= 0 and breg >= 0 do
+                                    mul_w = 0x1B007C00 or ((breg as int and 0x1F) shl 16) or ((a as int and 0x1F) shl 5) or (target_rd as int and 0x1F)
+                                    cb = codebuf_emit_u32(cb, mul_w)
+                                    is_fused_32bit_mul = 1
+                                end
+                            end
+                        end
+                    end
+                    if is_fused_32bit_mul == 0 do
+                        if rd >= 0 and a >= 0 and breg >= 0 do
+                            cb = arm64_mul_rrr(cb, rd as int, a as int, breg as int)
+                        end
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Div do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if ins_typ == (LirType.F64 as i64) do
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_fmov_dx(cb, 0, a as int)
+                        cb = arm64_fmov_dx(cb, 1, breg as int)
+                        cb = arm64_fdiv_ddd(cb, 0, 0, 1)
+                        cb = arm64_fmov_xd(cb, rd as int, 0)
+                    end
+                else
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_sdiv_rrr(cb, rd as int, a as int, breg as int)
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Rem do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_sdiv_rrr(cb, SCRQ, a as int, breg as int)
+                    cb = arm64_msub_rrrr(cb, rd as int, SCRQ, breg as int, a as int)
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.And do
+                is_prev_fused = 0
+                var is_32bit_mask = 0
+                if (ins_src2 as i64) != 0 do
+                    if native_read_i64(ins_src2 as i64, 0) == 5 and native_read_i64(ins_src2 as i64, 32) == 4294967295 do
+                        is_32bit_mask = 1
+                    end
+                end
+                if is_32bit_mask == 0 and rs2 >= 0 and rs2 < 32 do
+                    if vec_get_rt(reg_const_val, rs2) == 4294967295 do
+                        is_32bit_mask = 1
+                    end
+                end
+                if is_32bit_mask == 1 and rd_spill == 0 do
+                    if ii > 0 do
+                        prev_ins = vec_get_rt(g_codegen_cur_instrs, ii - 1)
+                        if native_read_i64(prev_ins as i64, 0) == (LirOp.Mul as i64) do
+                            is_prev_fused = 1
+                        end
+                    end
+                    if is_prev_fused == 0 and ii > 1 do
+                        prev2_ins = vec_get_rt(g_codegen_cur_instrs, ii - 2)
+                        if native_read_i64(prev2_ins as i64, 0) == (LirOp.Mul as i64) do
+                            is_prev_fused = 1
+                        end
+                    end
+                end
+                if is_prev_fused == 0 do
+                    is_mask_imm = 0
+                    mask_v = 0 - 1
+                    var var_opnd = ins_src1
+                    if (ins_src2 as i64) != 0 do
+                        s2_typ = native_read_i64(ins_src2 as i64, 0)
+                        if s2_typ == 5 do # Imm
+                            mask_v = native_read_i64(ins_src2 as i64, 32)
+                            var_opnd = ins_src1
+                        end
+                    end
+                    if mask_v < 0 and (ins_src1 as i64) != 0 do
+                        s1_typ = native_read_i64(ins_src1 as i64, 0)
+                        if s1_typ == 5 do # Imm
+                            mask_v = native_read_i64(ins_src1 as i64, 32)
+                            var_opnd = ins_src2
+                        end
+                    end
+                    if mask_v == 255 or mask_v == 4095 or mask_v == 65535 or mask_v == 4294967295 do
+                        vreg = resolve_or_imm_reg(cb, var_opnd, assigned_phys, SCR)
+                        if rd >= 0 and vreg >= 0 do
+                            cb = arm64_and_mask(cb, rd as int, vreg as int, mask_v)
+                            is_mask_imm = 1
+                        end
+                    end
+                    if is_mask_imm == 0 do
+                        a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                        breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                        if rd >= 0 and a >= 0 and breg >= 0 do
+                            cb = arm64_and_rrr(cb, rd as int, a as int, breg as int)
+                        end
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                    is_32bit_and = 0
+                    if mask_v == 4294967295 or mask_v == 0xFFFFFFFF do
+                        is_32bit_and = 1
+                    end
+                    if is_32bit_and == 0 and rs2 >= 0 and rs2 < 32 do
+                        if vec_get_rt(reg_const_val, rs2) == 4294967295 or vec_get_rt(reg_const_val, rs2) == 0xFFFFFFFF do
+                            is_32bit_and = 1
+                        end
+                    end
+                    if is_32bit_and == 1 and rs1 >= 0 and rs1 < 32 do
+                        vec_set_rt(reg_shl_src, rd, vec_get_rt(reg_shl_src, rs1))
+                        vec_set_rt(reg_shl_amt, rd, vec_get_rt(reg_shl_amt, rs1))
+                        vec_set_rt(reg_shr_src, rd, vec_get_rt(reg_shr_src, rs1))
+                        vec_set_rt(reg_shr_amt, rd, vec_get_rt(reg_shr_amt, rs1))
+                    else
+                        vec_set_rt(reg_shl_src, rd, 0 - 1)
+                        vec_set_rt(reg_shr_src, rd, 0 - 1)
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Or do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_orr_rrr(cb, rd as int, a as int, breg as int)
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                    vec_set_rt(reg_shl_src, rd, 0 - 1)
+                    vec_set_rt(reg_shr_src, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Xor do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if rd >= 0 and a >= 0 and breg >= 0 do
+                    cb = arm64_eor_rrr(cb, rd as int, a as int, breg as int)
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                    vec_set_rt(reg_shl_src, rd, 0 - 1)
+                    vec_set_rt(reg_shr_src, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Shl do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                shl_k = 0 - 1
+                if (ins_src2 as i64) != 0 do
+                    s2_typ = native_read_i64(ins_src2 as i64, 0)
+                    if s2_typ == 5 do
+                        shl_k = native_read_i64(ins_src2 as i64, 32)
+                    end
+                end
+                if shl_k < 0 and rs2 >= 0 and rs2 < 32 do
+                    shl_k = vec_get_rt(reg_const_val, rs2)
+                end
+                if shl_k >= 0 and shl_k <= 63 and rd >= 0 and a >= 0 do
+                    cb = arm64_lsl_imm(cb, rd as int, a as int, shl_k as int)
+                else
+                    breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_lsl_rrr(cb, rd as int, a as int, breg as int)
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                    if a >= 0 and shl_k > 0 and shl_k < 32 do
+                        vec_set_rt(reg_shl_src, rd, a)
+                        vec_set_rt(reg_shl_amt, rd, shl_k)
+                    else
+                        vec_set_rt(reg_shl_src, rd, 0 - 1)
+                    end
+                    vec_set_rt(reg_shr_src, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Shr do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                shr_m = 0 - 1
+                if (ins_src2 as i64) != 0 do
+                    s2_typ = native_read_i64(ins_src2 as i64, 0)
+                    if s2_typ == 5 do
+                        shr_m = native_read_i64(ins_src2 as i64, 32)
+                    end
+                end
+                if shr_m < 0 and rs2 >= 0 and rs2 < 32 do
+                    shr_m = vec_get_rt(reg_const_val, rs2)
+                end
+                if shr_m >= 0 and shr_m <= 63 and rd >= 0 and a >= 0 do
+                    cb = arm64_lsr_imm(cb, rd as int, a as int, shr_m as int)
+                else
+                    breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                    if rd >= 0 and a >= 0 and breg >= 0 do
+                        cb = arm64_lsr_rrr(cb, rd as int, a as int, breg as int)
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                    if a >= 0 and shr_m > 0 and shr_m < 32 do
+                        vec_set_rt(reg_shr_src, rd, a)
+                        vec_set_rt(reg_shr_amt, rd, shr_m)
+                    else
+                        vec_set_rt(reg_shr_src, rd, 0 - 1)
+                    end
+                    vec_set_rt(reg_shl_src, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Not do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                if rd >= 0 and a >= 0 do
+                    cb = arm64_mvn_rr(cb, rd as int, a as int)
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Pow do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                b_reg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if a == 1 and b_reg == 0 do
+                    cb = arm64_mov_rr(cb, SCR, 0)
+                    cb = arm64_mov_rr(cb, 0, 1)
+                    cb = arm64_mov_rr(cb, 1, SCR)
+                eif a == 1 do
+                    cb = arm64_mov_rr(cb, 0, 1)
+                    if b_reg >= 0 and b_reg != 1 do cb = arm64_mov_rr(cb, 1, b_reg as int) end
+                else
+                    if b_reg >= 0 and b_reg != 1 do cb = arm64_mov_rr(cb, 1, b_reg as int) end
+                    if a >= 0 and a != 0 do cb = arm64_mov_rr(cb, 0, a as int) end
+                end
+                cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_POW, rd)
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.MatMul do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                b_reg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if a == 1 and b_reg == 0 do
+                    cb = arm64_mov_rr(cb, SCR, 0)
+                    cb = arm64_mov_rr(cb, 0, 1)
+                    cb = arm64_mov_rr(cb, 1, SCR)
+                eif a == 1 do
+                    cb = arm64_mov_rr(cb, 0, 1)
+                    if b_reg >= 0 and b_reg != 1 do
+                        cb = arm64_mov_rr(cb, 1, b_reg as int)
+                    end
+                else
+                    if a >= 0 and a != 0 do
+                        cb = arm64_mov_rr(cb, 0, a as int)
+                    end
+                    if b_reg >= 0 and b_reg != 1 do
+                        cb = arm64_mov_rr(cb, 1, b_reg as int)
+                    end
+                end
+                ins_aux = native_read_i64(ins as i64, 40)
+                var mm_is_float = (ins_aux shr 48) and 1
+                var is_32bit = (ins_aux shr 49) and 1
+                var dim_m = (ins_aux shr 32) and 65535
+                var dim_k = (ins_aux shr 16) and 65535
+                var dim_n = ins_aux and 65535
+                cb = arm64_mov_imm16(cb, 2, dim_m as int)
+                cb = arm64_mov_imm16(cb, 3, dim_k as int)
+                cb = arm64_mov_imm16(cb, 4, dim_n as int)
+                cb = arm64_mov_imm16(cb, 5, is_32bit as int)
+                if mm_is_float == 1 do
+                    cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_MATMUL_F64, rd)
+                else
+                    cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_MATMUL, rd)
+                end
+                if rd < 0 and ins_dst != 0 do
+                    cb = emit_spill_store(cb, ins_dst as i64, 0)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Fma do
+                a_fma = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                b_fma = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                if a_fma == 1 and b_fma == 0 do
+                    cb = arm64_mov_rr(cb, SCR, 0)
+                    cb = arm64_mov_rr(cb, 0, 1)
+                    cb = arm64_mov_rr(cb, 1, SCR)
+                eif a_fma == 1 do
+                    cb = arm64_mov_rr(cb, 0, 1)
+                    if b_fma >= 0 and b_fma != 1 do cb = arm64_mov_rr(cb, 1, b_fma as int) end
+                else
+                    if a_fma >= 0 and a_fma != 0 do cb = arm64_mov_rr(cb, 0, a_fma as int) end
+                    if b_fma >= 0 and b_fma != 1 do cb = arm64_mov_rr(cb, 1, b_fma as int) end
+                end
+                fma_aux = native_read_i64(ins as i64, 40)
+                fma_is_float = (fma_aux shr 48) and 1
+                var fma_is_32bit = (fma_aux shr 49) and 1
+                fma_m = (fma_aux shr 32) and 65535
+                fma_k = (fma_aux shr 16) and 65535
+                fma_n = fma_aux and 65535
+                cb = arm64_mov_imm16(cb, 2, fma_m as int)
+                cb = arm64_mov_imm16(cb, 3, fma_k as int)
+                cb = arm64_mov_imm16(cb, 4, fma_n as int)
+                cb = arm64_mov_imm16(cb, 5, fma_is_32bit as int)
+                if fma_is_float == 1 do
+                    cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_FMA_F64, rd)
+                else
+                    cb = emit_bl_fixup(cb, call_fixups, 1, LIR_RT_FMA, rd)
+                end
+                if rd < 0 and ins_dst != 0 do cb = emit_spill_store(cb, ins_dst as i64, 0) end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.VAdd or op == LirOp.VSub or op == LirOp.VMul or op == LirOp.VFma or op == LirOp.Splat or op == LirOp.Shuffle or op == LirOp.VLoad or op == LirOp.VStore do
+                cb = emit_lir_arm64_vector(cb, op, ins as i64, rd, rs1, rs2, assigned_phys, recent_setargs, SCR, SCR2, SCRQ, SCRD)
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.TailCall do
+                # Restore stack pointer to pre-prologue state
+                cb = emit_stack_free_arm64(cb, g_codegen_stack_size)
+                cb = emit_callee_restore(cb, g_codegen_max_phys)
+                # Restore FP/LR that were saved in prologue
+                cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+                # Re-enter the function at its first instruction (after prologue saves).
+                # This is a guaranteed backward branch so offset is negative.
+                at_tco = codebuf_offset(cb) as i64
+                cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+                cb = arm64_mov_from_sp(cb, 29)
+                cb = emit_callee_save(cb, g_codegen_max_phys)
+                cb = emit_stack_alloc_arm64(cb, g_codegen_stack_size)
+                # Branch back to body start (first block after prologue), using a fixup.
+                at_jmp = codebuf_offset(cb) as i64
+                cb = arm64_b_imm26(cb, 0)
+                fixups = vec_push_rt(fixups, lir_fixup_new(at_jmp, 0, 0))
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Cmp do
+                if ins_typ == (LirType.F64 as i64) do
+                    a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                    b_val = resolve_or_imm_reg(cb, ins_src2, assigned_phys, 10)
+                    if a >= 0 and b_val >= 0 do
+                        cb = arm64_fmov_dx(cb, 0, a as int)
+                        cb = arm64_fmov_dx(cb, 1, b_val as int)
+                        cb = arm64_fcmp_dd(cb, 0, 1)
+                    end
+                else
+                    a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                    is_imm_cmp = 0
+                    imm_v = 0 - 1
+                    if (ins_src2 as i64) != 0 do
+                        s2_typ = native_read_i64(ins_src2 as i64, 0)
+                        if s2_typ == 5 do # Imm
+                            imm_v = native_read_i64(ins_src2 as i64, 32)
+                        end
+                    end
+                    if imm_v >= 0 and imm_v <= 4095 and a >= 0 do
+                        cb = arm64_cmp_imm(cb, a as int, imm_v as int)
+                        is_imm_cmp = 1
+                    end
+                    if is_imm_cmp == 0 do
+                        b_val = resolve_or_imm_reg(cb, ins_src2, assigned_phys, 10)
+                        if a >= 0 and b_val >= 0 do
+                            cb = arm64_cmp_rr(cb, a as int, b_val as int)
+                        end
+                    end
+                end
+                is_fused = 0
+                if (ii + 1) < n_instrs do
+                    next_ins = vec_get_rt(g_codegen_cur_instrs, ii + 1)
+                    if native_read_i64(next_ins as i64, 0) == (LirOp.JmpCond as i64) do
+                        next_src1 = native_read_i64(next_ins as i64, 24)
+                        if lir_opnd_matches(ins_dst, next_src1) == 1 do
+                            is_fused = 1
+                            last_cmp_pred = ins_aux
+                            last_cmp_dst = ins_dst
+                            rd_spill = 0
+                        end
+                    end
+                end
+                if is_fused == 0 do
+                    last_cmp_pred = 0 - 1
+                    if rd >= 0 do
+                        if ins_aux == LIR_CMP_EQ do
+                            cb = arm64_cset_eq(cb, rd as int)
+                        eif ins_aux == LIR_CMP_NE do
+                            cb = arm64_cset_ne(cb, rd as int)
+                        eif ins_aux == LIR_CMP_GT do
+                            cb = arm64_cset_gt(cb, rd as int)
+                        eif ins_aux == LIR_CMP_LT do
+                            cb = arm64_cset_lt(cb, rd as int)
+                        eif ins_aux == LIR_CMP_GE do
+                            cb = arm64_cset_ge(cb, rd as int)
+                        eif ins_aux == LIR_CMP_LE do
+                            cb = arm64_cset_le(cb, rd as int)
+                        end
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+            eif op == LirOp.Load do
+                if rd >= 0 and rs1 >= 0 do
+                    load_aux = native_read_i64(ins as i64, 40)
+                    if load_aux == 1 do
+                        cb = codebuf_emit_u32(cb, 0x39400000 or ((rs1 as int and 0x1F) shl 5) or (rd as int and 0x1F))
+                    eif load_aux == (0 - 1) do
+                        cb = codebuf_emit_u32(cb, 0x39800000 or ((rs1 as int and 0x1F) shl 5) or (rd as int and 0x1F))
+                    eif load_aux == 2 do
+                        cb = codebuf_emit_u32(cb, 0x79400000 or ((rs1 as int and 0x1F) shl 5) or (rd as int and 0x1F))
+                    eif load_aux == (0 - 2) do
+                        cb = codebuf_emit_u32(cb, 0x79800000 or ((rs1 as int and 0x1F) shl 5) or (rd as int and 0x1F))
+                    eif load_aux == 4 do
+                        cb = codebuf_emit_u32(cb, 0xB9400000 or ((rs1 as int and 0x1F) shl 5) or (rd as int and 0x1F))
+                    eif load_aux == (0 - 4) do
+                        cb = codebuf_emit_u32(cb, 0xB9800000 or ((rs1 as int and 0x1F) shl 5) or (rd as int and 0x1F))
+                    else
+                        cb = codebuf_emit_u32(cb, 0xF9400000 or ((rs1 as int and 0x1F) shl 5) or (rd as int and 0x1F))
+                    end
+                end
+                if rd >= 0 and rd < 32 do
+                    vec_set_rt(reg_const_val, rd, 0 - 1)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Store do
+                var r_addr = rs1
+                if r_addr < 0 and (ins_src1 as i64) != 0 do
+                    r_addr = resolve_or_imm_reg(cb, ins_src1 as LirOperand, assigned_phys, 14)
+                end
+                var r_val = rs2
+                if r_val < 0 and (ins_src2 as i64) != 0 do
+                    r_val = resolve_or_imm_reg(cb, ins_src2 as LirOperand, assigned_phys, 15)
+                end
+                if r_addr >= 0 and r_val >= 0 do
+                    store_aux = native_read_i64(ins as i64, 40)
+                    if store_aux == 1 or store_aux == (0 - 1) do
+                        cb = codebuf_emit_u32(cb, 0x39000000 or ((r_val as int and 0x1F) shl 5) or (r_addr as int and 0x1F))
+                    eif store_aux == 2 or store_aux == (0 - 2) do
+                        cb = codebuf_emit_u32(cb, 0x79000000 or ((r_val as int and 0x1F) shl 5) or (r_addr as int and 0x1F))
+                    eif store_aux == 4 or store_aux == (0 - 4) do
+                        cb = codebuf_emit_u32(cb, 0xB9000000 or ((r_val as int and 0x1F) shl 5) or (r_addr as int and 0x1F))
+                    else
+                        cb = codebuf_emit_u32(cb, 0xF9000000 or ((r_val as int and 0x1F) shl 5) or (r_addr as int and 0x1F))
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Push do
+                rval = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                if rval >= 0 do
+                    cb = arm64_str_pre(cb, rval as int, 31, 0 - 16)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.SetArg do
+                ai = native_read_i64(ins as i64, 40)
+                s1_arg = native_read_i64(ins as i64, 24)
+                if (s1_arg as i64) != 0 do
+                    if native_read_i64(s1_arg as i64, 0) == 5 do # Imm tag
+                        ai = native_read_i64(s1_arg as i64, 32)
+                    end
+                end
+                s2_arg = native_read_i64(ins as i64, 32)
+                if ai >= 0 and ai < 4 do
+                    vec_set_rt(recent_setargs, ai, s2_arg)
+                end
+                if ai < 8 do
+                    var (cb_sa, p_stk_sa) = emit_lir_setarg(cb, ins, assigned_phys, 0)
+                    cb = cb_sa
+                else
+                    pending_stack_args = vec_push_rt(pending_stack_args, ins)
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Pop do
+                if rd >= 0 do
+                    cb = arm64_ldr_post(cb, rd as int, 31, 16)
+                end
+            eif op == LirOp.Call do
+                n_stk = vec_len_rt(pending_stack_args)
+                stk_bytes = 0
+                if n_stk > 0 do
+                    stk_bytes = (n_stk * 8) + 15
+                    stk_bytes = stk_bytes - (stk_bytes mod 16)
+                    cb = emit_stack_alloc_arm64(cb, stk_bytes)
+                    var si = 0
+                    when si < n_stk loop
+                        stk_ins = vec_get_rt(pending_stack_args, si)
+                        stk_s2 = native_read_i64(stk_ins as i64, 32)
+                        var (cb_s, r_s) = lir_load_opnd_to_reg(cb, stk_s2, assigned_phys, SCR)
+                        cb = cb_s
+                        cb = arm64_str_uoff(cb, r_s as int, 31, (si * 8) as int)
+                        si = si + 1
+                    end
+                end
+                var (cb_cl, p_stk_cl) = emit_lir_call(cb, ins, rd, func_obj, lir_funcs, call_fixups, 0, assigned_phys)
+                cb = cb_cl
+                if stk_bytes > 0 do
+                    cb = emit_stack_free_arm64(cb, stk_bytes)
+                    pending_stack_args = vec_new_rt()
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Intrinsic do
+                pending_stack_args = vec_new_rt()
+                cb = emit_lir_intrinsic(cb, ins, rd, rs1, assigned_phys, call_fixups, func_obj, str_fixups, recent_setargs, lir_funcs, is_linux)
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Jmp do
+                tgt = 0 - 1
+                if (ins_src1 as i64) != 0 do
+                    src1_typ = native_read_i64(ins_src1 as i64, 0)
+                    if src1_typ == 6 do # Label
+                        tgt = native_read_i64(ins_src1 as i64, 40)
+                    eif src1_typ == 5 do # Imm
+                        tgt = native_read_i64(ins_src1 as i64, 32)
+                    end
+                end
+                if tgt >= 0 do
+                    next_bid = 0 - 1
+                    if bi + 1 < n_blocks do
+                        next_b = vec_get_rt(g_codegen_blocks, bi + 1)
+                        next_bid = native_read_i64(next_b as i64, 0)
+                    end
+                    if tgt != next_bid do
+                        at = codebuf_offset(cb) as i64
+                        cb = arm64_b_imm26(cb, 0)
+                        fixups = vec_push_rt(fixups, lir_fixup_new(at, tgt, 0))
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.JmpCond do
+                tgt = 0 - 1
+                if (ins_src2 as i64) != 0 do
+                    src2_typ = native_read_i64(ins_src2 as i64, 0)
+                    if src2_typ == 6 do # Label
+                        tgt = native_read_i64(ins_src2 as i64, 40)
+                    eif src2_typ == 5 do # Imm
+                        tgt = native_read_i64(ins_src2 as i64, 32)
+                    end
+                end
+                if last_cmp_pred >= 0 and lir_opnd_matches(last_cmp_dst, ins_src1) == 1 do
+                    # Fused Cmp + JmpCond: flags already in NZCV, branch directly to condition!
+                    if tgt >= 0 do
+                        is_ifnot = 0
+                        if ins_aux == LIR_JMP_IFNOT do
+                            is_ifnot = 1
+                        end
+                        cond = arm64_cond_code(last_cmp_pred, is_ifnot)
+                        inv_cond = (cond xor 1) and 0xF
+                        cb = codebuf_emit_u32(cb, 0x54000040 or (inv_cond as int))
+                        at = codebuf_offset(cb) as i64
+                        cb = arm64_b_imm26(cb, 0)
+                        fixups = vec_push_rt(fixups, lir_fixup_new(at, tgt, 0))
+                    end
+                    last_cmp_pred = 0 - 1
+                else
+                    a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                    if a >= 0 do
+                        cb = codebuf_emit_u32(cb, 0xF100001F or ((a as int and 0x1F) shl 5))
+                    end
+                    if tgt >= 0 do
+                        var inv_c = 0
+                        if ins_aux != LIR_JMP_IFNOT do
+                            inv_c = 0
+                        else
+                            inv_c = 1
+                        end
+                        cb = codebuf_emit_u32(cb, 0x54000040 or inv_c)
+                        at = codebuf_offset(cb) as i64
+                        cb = arm64_b_imm26(cb, 0)
+                        fixups = vec_push_rt(fixups, lir_fixup_new(at, tgt, 0))
+                    end
+                    last_cmp_pred = 0 - 1
+                end
+            eif op == LirOp.Ret do
+                if (ins_src1 as i64) != 0 do
+                    src1_typ = native_read_i64(ins_src1 as i64, 0)
+                    if src1_typ == 5 do # Imm
+                        imm_val = native_read_i64(ins_src1 as i64, 32)
+                        cb = arm64_movz_imm64(cb, 0, imm_val as int)
+                    eif src1_typ == 4 do # StackMem reload
+                        off = native_read_i64(ins_src1 as i64, 24)
+                        if off < 0 and off >= 0 - 255 do
+                            cb = arm64_ldur(cb, 0, 29, off as int)
+                        else
+                            if off < 0 do
+                                cb = emit_fp_sub_addr(cb, 9, 0 - off)
+                                cb = arm64_ldr_uoff(cb, 0, 9, 0)
+                            end
+                        end
+                    eif rs1 >= 0 and rs1 != 0 do
+                        cb = arm64_mov_rr(cb, 0, rs1 as int)
+                    eif src1_typ == 0 do
+                        cb = arm64_mov_imm16(cb, 0, 0)
+                    end
+                eif rs1 >= 0 and rs1 != 0 do
+                    cb = arm64_mov_rr(cb, 0, rs1 as int)
+                else
+                    cb = arm64_mov_imm16(cb, 0, 0)
+                end
+                cb = emit_stack_free_arm64(cb, g_codegen_stack_size)
+                cb = emit_callee_restore(cb, g_codegen_max_phys)
+                cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+                cb = arm64_ret(cb)
+                last_cmp_pred = 0 - 1
+            end
+            if rd_spill < 0 and lir_instr_has_def(ins) == 1 do
+                cb = emit_spill_store(cb, ins_dst, SCRD)
+            end
+            ii = ii + 1
+        end
+        bi = bi + 1
+    end
+
+    # Fall-through epilogue (when function has no explicit Ret)
+    cb = arm64_mov_imm16(cb, 0, 0)
+    cb = emit_stack_free_arm64(cb, g_codegen_stack_size)
+    cb = emit_callee_restore(cb, g_codegen_max_phys)
+    cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+    cb = arm64_ret(cb)
+
+    nf = vec_len_rt(fixups)
+    var fxi = 0
+    when fxi < nf loop
+        fx = vec_get_rt(fixups, fxi)
+        f_tgt = lir_fixup_target_block(fx)
+        f_kind = lir_fixup_kind(fx)
+        f_at = lir_fixup_at_off(fx)
+        if f_tgt >= 0 and f_tgt < max_bid do
+            dest = vec_get_rt(block_off, f_tgt)
+            if dest >= 0 do
+                rel = (dest - f_at) as int
+                if f_kind == 0 do
+                    imm26 = (rel shr 2) and 0x03FFFFFF
+                    word = 0x14000000 or imm26
+                    cb = codebuf_patch_u32(cb, f_at as int, word)
+                else
+                    # Conditional branch B.cond immediate range is ±1 MiB (-1048576 .. 1048572)
+                    if rel < -1048576 or rel > 1048572 do
+                        print_str("FATAL: ARM64 conditional branch out of range (+/-1MB)\n")
+                    end
+                    imm19 = (rel shr 2) and 0x7FFFF
+                    if f_kind == 1 do
+                        word = 0x54000000 or (imm19 shl 5)
+                        cb = codebuf_patch_u32(cb, f_at as int, word)
+                    eif f_kind == 2 do
+                        word = 0x54000001 or (imm19 shl 5)
+                        cb = codebuf_patch_u32(cb, f_at as int, word)
+                    eif f_kind >= 10 do
+                        cond = (f_kind - 10) and 0xF
+                        word = 0x54000000 or (imm19 shl 5) or cond
+                        cb = codebuf_patch_u32(cb, f_at as int, word)
+                    end
+                end
+            end
+        end
+        fxi = fxi + 1
+    end
+
+    out cb
+end.
+

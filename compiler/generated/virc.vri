@@ -57221,23 +57221,14 @@ import compile_pipeline, set_pipeline_hir_mode, set_pipeline_mir_full, set_pipel
 import set_codegen_target, get_codegen_target, set_codegen_spec, get_codegen_spec from compiler.target
 import TargetArch, CodeBuf, codebuf_new, codebuf_offset,
        codebuf_emit_u32, codebuf_patch_u32, codebuf_get_data, lir_emit_module from compiler.codegen
-# @vir_source compiler/src/lower/lir_codegen.vri 1
+# @vir_source compiler/src/lower/lir_codegen/types.vri 1
 ##
- * vir/compiler/lir_codegen.vri — LIR to Machine Code (ARM64)
- * ==============================================================
- * AAPCS64 soft ABI:
- *   SetArg 0..7 → MOV X0..X7
- *   SetArg ≥8  → push 16-byte slots; Call pops them
- *   Call       → BL patched to func offs / RT unresolved
- *   Intrinsic  → marker/payload inline; else BL → RT stub[kind]
- *   Pow/ML     → BL → RT stub[61..63]
- *
- * Module: emit_lir_module_arm64 — funcs + RT stubs + BL patch + _start.
+ * compiler/src/lower/lir_codegen/types.vri — LIR ARM64 ABI, Fixups & Frame Helpers
+ * ================================================================================
  ##
 
 import print_str, print_int from rt.io
 import sys_exit from rt.syscall
-
 
 func vec_new_cap_rt(cap: int):
     base = alloc(16 + cap * 8)
@@ -57855,6 +57846,13 @@ func emit_lir_setarg(cb: &CodeBuf, ins: LirInstr, assigned_phys: i64, pending_st
     cb = arm64_str_pre(cb, rval as int, 31, 0 - 16)
     out (cb, pending_stk + 1)
 end.
+
+# @vir_source compiler/src/lower/lir_codegen/intrinsics.vri 1
+##
+ * compiler/src/lower/lir_codegen/intrinsics.vri — LIR ARM64 Intrinsic Emitters
+ * ============================================================================
+ ##
+
 
 func emit_lir_intrinsic(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assigned_phys: i64, call_fixups: i64, func_obj: &LirFunc, str_fixups: i64, recent_setargs: i64, lir_funcs: i64, is_linux: i64):
     kind = native_read_i64(ins as i64, 40)
@@ -58810,6 +58808,13 @@ func lir_find_func_index(lir_funcs: i64, name: string):
     out 0 - 1
 end.
 
+# @vir_source compiler/src/lower/lir_codegen/calls.vri 1
+##
+ * compiler/src/lower/lir_codegen/calls.vri — Function Calls & Print/Alloc Stubs
+ * =============================================================================
+ ##
+
+
 func emit_lir_call(cb: &CodeBuf, ins: LirInstr, rd: i64, func_obj: &LirFunc, lir_funcs: i64, call_fixups: i64, pending_stk: i64, assigned_phys: i64):
     sid = native_read_i64(ins as i64, 40)
     ins_src2 = native_read_i64(ins as i64, 32) as LirOperand
@@ -59433,6 +59438,13 @@ func emit_lir_rt_free_stub(cb: &CodeBuf, vir_free_off: i64):
 
     out cb
 end.
+
+# @vir_source compiler/src/lower/lir_codegen/rt_stubs_base.vri 1
+##
+ * compiler/src/lower/lir_codegen/rt_stubs_base.vri — Memory & String Runtime Stubs
+ * =================================================================================
+ ##
+
 
 func emit_lir_rt_promote_stub(cb: &CodeBuf):
     let stub_entry_off = codebuf_offset(cb) as i64
@@ -60217,6 +60229,13 @@ func emit_lir_rt_slurp_file_stub(cb: &CodeBuf, is_linux: i64):
     cb = arm64_mov_imm16(cb, 0, 1)
     out arm64_ret(cb)
 end.
+
+# @vir_source compiler/src/lower/lir_codegen/rt_stubs_math.vri 1
+##
+ * compiler/src/lower/lir_codegen/rt_stubs_math.vri — Matrix, Quantize & ML Stubs
+ * ===============================================================================
+ ##
+
 
 func emit_lir_rt_matmul_stub(cb: &CodeBuf):
     # a ** b: general matrix multiplication (M x K times K x N -> M x N)
@@ -61378,6 +61397,337 @@ func lir_func_required_stack_size(func_obj: &LirFunc):
     out needed
 end.
 
+# @vir_source compiler/src/lower/lir_codegen/emit_vector.vri 1
+##
+ * compiler/src/lower/lir_codegen/emit_vector.vri — ARM64 Vector/SIMD Instructions
+ * ================================================================================
+ ##
+
+
+func emit_lir_arm64_vector(cb: &CodeBuf, op: i64, ins: i64, rd: i64, rs1: i64, rs2: i64, assigned_phys: i64, recent_setargs: i64, SCR: i64, SCR2: i64, SCRQ: i64, SCRD: i64):
+    let ins_typ = native_read_i64(ins, 8)
+    let ins_dst = native_read_i64(ins, 16)
+    let ins_src1 = native_read_i64(ins, 24)
+    let ins_src2 = native_read_i64(ins, 32)
+            if op == LirOp.VAdd or op == LirOp.VSub or op == LirOp.VMul or op == LirOp.VFma do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                v_aux = native_read_i64(ins as i64, 40)
+                var v_lanes = (v_aux shr 8) and 255
+                if v_lanes <= 0 do v_lanes = 4 end
+                var v_is_float = 0
+                if (v_aux and 255) == 2 or ins_typ == (LirType.F64 as i64) or ins_typ == (LirType.F32 as i64) do
+                    v_is_float = 1
+                end
+                let v_l_scalar = (v_aux shr 24) and 1
+                let v_r_scalar = (v_aux shr 25) and 1
+                let v_dyn_idx = (v_aux shr 26) and 1
+
+                var r_dst = rd
+                if r_dst < 0 and ins_dst != 0 do
+                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
+                end
+                if r_dst >= 0 and a >= 0 and breg >= 0 do
+                    var vi = 0
+                    if v_dyn_idx == 1 do
+                        let r_idx = resolve_or_imm_reg(cb, vec_get_rt(recent_setargs, 0), assigned_phys, 13)
+                        if target_has_neon() == 1 and (v_is_float == 1 or op == LirOp.VAdd or op == LirOp.VSub) and v_lanes == 2 do
+                            cb = arm64_lsl_imm(cb, 13, r_idx as int, 3)
+                            cb = arm64_add_imm(cb, 13, 13, 16)
+                            if v_l_scalar == 1 do
+                                cb = arm64_dup_2d(cb, 2, a as int)
+                            else
+                                cb = arm64_add_rrr(cb, 14, a as int, 13)
+                                cb = arm64_ldr_q_uoff(cb, 2, 14, 0)
+                            end
+                            if v_r_scalar == 1 do
+                                cb = arm64_dup_2d(cb, 3, breg as int)
+                            else
+                                cb = arm64_add_rrr(cb, 14, breg as int, 13)
+                                cb = arm64_ldr_q_uoff(cb, 3, 14, 0)
+                            end
+                            if v_is_float == 1 do
+                                if op == LirOp.VAdd do
+                                    cb = arm64_fadd_v2d(cb, 4, 2, 3)
+                                eif op == LirOp.VSub do
+                                    cb = arm64_fsub_v2d(cb, 4, 2, 3)
+                                eif op == LirOp.VMul do
+                                    cb = arm64_fmul_v2d(cb, 4, 2, 3)
+                                eif op == LirOp.VFma do
+                                    cb = arm64_add_rrr(cb, 14, r_dst as int, 13)
+                                    cb = arm64_ldr_q_uoff(cb, 4, 14, 0)
+                                    cb = arm64_fmla_v2d(cb, 4, 2, 3)
+                                end
+                            else
+                                if op == LirOp.VAdd do
+                                    cb = arm64_add_v2d(cb, 4, 2, 3)
+                                eif op == LirOp.VSub do
+                                    cb = arm64_sub_v2d(cb, 4, 2, 3)
+                                end
+                            end
+                            cb = arm64_add_rrr(cb, 14, r_dst as int, 13)
+                            cb = arm64_str_q_uoff(cb, 4, 14, 0)
+                            vi = 2
+                        end
+                        when vi < v_lanes loop
+                            cb = arm64_add_imm(cb, 13, r_idx as int, vi as int)
+                            cb = arm64_lsl_imm(cb, 13, 13, 3)
+                            cb = arm64_add_imm(cb, 13, 13, 16)
+                            if v_is_float == 1 do
+                                if v_l_scalar == 1 do
+                                    cb = arm64_fmov_dx(cb, 2, a as int)
+                                else
+                                    cb = arm64_add_rrr(cb, 14, a as int, 13)
+                                    cb = arm64_ldr_d_uoff(cb, 2, 14, 0)
+                                end
+                                if v_r_scalar == 1 do
+                                    cb = arm64_fmov_dx(cb, 3, breg as int)
+                                else
+                                    cb = arm64_add_rrr(cb, 14, breg as int, 13)
+                                    cb = arm64_ldr_d_uoff(cb, 3, 14, 0)
+                                end
+                                if op == LirOp.VAdd do
+                                    cb = arm64_fadd_ddd(cb, 4, 2, 3)
+                                eif op == LirOp.VSub do
+                                    cb = arm64_fsub_ddd(cb, 4, 2, 3)
+                                eif op == LirOp.VMul do
+                                    cb = arm64_fmul_ddd(cb, 4, 2, 3)
+                                eif op == LirOp.VFma do
+                                    cb = arm64_add_rrr(cb, 14, r_dst as int, 13)
+                                    cb = arm64_ldr_d_uoff(cb, 5, 14, 0)
+                                    cb = arm64_fmadd_dddd(cb, 4, 2, 3, 5)
+                                end
+                                cb = arm64_add_rrr(cb, 14, r_dst as int, 13)
+                                cb = arm64_str_d_uoff(cb, 4, 14, 0)
+                            else
+                                if v_l_scalar == 1 do
+                                    cb = arm64_mov_rr(cb, 14, a as int)
+                                else
+                                    cb = arm64_add_rrr(cb, 14, a as int, 13)
+                                    cb = arm64_ldr_uoff(cb, 14, 14, 0)
+                                end
+                                if v_r_scalar == 1 do
+                                    cb = arm64_mov_rr(cb, 15, breg as int)
+                                else
+                                    cb = arm64_add_rrr(cb, 15, breg as int, 13)
+                                    cb = arm64_ldr_uoff(cb, 15, 15, 0)
+                                end
+                                if op == LirOp.VAdd do
+                                    cb = arm64_add_rrr(cb, 14, 14, 15)
+                                eif op == LirOp.VSub do
+                                    cb = arm64_sub_rrr(cb, 14, 14, 15)
+                                eif op == LirOp.VMul do
+                                    cb = arm64_mul_rrr(cb, 14, 14, 15)
+                                end
+                                cb = arm64_add_rrr(cb, 15, r_dst as int, 13)
+                                cb = arm64_str_uoff(cb, 14, 15, 0)
+                            end
+                            vi = vi + 1
+                        end
+                    else
+                        if target_has_neon() == 1 and (v_is_float == 1 or op == LirOp.VAdd or op == LirOp.VSub) do
+                            when vi + 2 <= v_lanes loop
+                                let lane_off = (16 + vi * 8) as int
+                                if v_l_scalar == 1 do
+                                    cb = arm64_dup_2d(cb, 2, a as int)
+                                else
+                                    cb = arm64_ldr_q_uoff(cb, 2, a as int, lane_off)
+                                end
+                                if v_r_scalar == 1 do
+                                    cb = arm64_dup_2d(cb, 3, breg as int)
+                                else
+                                    cb = arm64_ldr_q_uoff(cb, 3, breg as int, lane_off)
+                                end
+                                if v_is_float == 1 do
+                                    if op == LirOp.VAdd do
+                                        cb = arm64_fadd_v2d(cb, 4, 2, 3)
+                                    eif op == LirOp.VSub do
+                                        cb = arm64_fsub_v2d(cb, 4, 2, 3)
+                                    eif op == LirOp.VMul do
+                                        cb = arm64_fmul_v2d(cb, 4, 2, 3)
+                                    eif op == LirOp.VFma do
+                                        cb = arm64_ldr_q_uoff(cb, 4, r_dst as int, lane_off)
+                                        cb = arm64_fmla_v2d(cb, 4, 2, 3)
+                                    end
+                                else
+                                    if op == LirOp.VAdd do
+                                        cb = arm64_add_v2d(cb, 4, 2, 3)
+                                    eif op == LirOp.VSub do
+                                        cb = arm64_sub_v2d(cb, 4, 2, 3)
+                                    end
+                                end
+                                cb = arm64_str_q_uoff(cb, 4, r_dst as int, lane_off)
+                                vi = vi + 2
+                            end
+                        end
+                        when vi < v_lanes loop
+                            let lane_off = 16 + vi * 8
+                            if v_is_float == 1 do
+                                if v_l_scalar == 1 do
+                                    cb = arm64_fmov_dx(cb, 2, a as int)
+                                else
+                                    cb = arm64_ldr_d_uoff(cb, 2, a as int, lane_off as int)
+                                end
+                                if v_r_scalar == 1 do
+                                    cb = arm64_fmov_dx(cb, 3, breg as int)
+                                else
+                                    cb = arm64_ldr_d_uoff(cb, 3, breg as int, lane_off as int)
+                                end
+                                if op == LirOp.VAdd do
+                                    cb = arm64_fadd_ddd(cb, 4, 2, 3)
+                                eif op == LirOp.VSub do
+                                    cb = arm64_fsub_ddd(cb, 4, 2, 3)
+                                eif op == LirOp.VMul do
+                                    cb = arm64_fmul_ddd(cb, 4, 2, 3)
+                                eif op == LirOp.VFma do
+                                    cb = arm64_ldr_d_uoff(cb, 5, r_dst as int, lane_off as int)
+                                    cb = arm64_fmadd_dddd(cb, 4, 2, 3, 5)
+                                end
+                                cb = arm64_str_d_uoff(cb, 4, r_dst as int, lane_off as int)
+                            else
+                                if v_l_scalar == 1 do
+                                    cb = arm64_mov_rr(cb, 13, a as int)
+                                else
+                                    cb = arm64_ldr_uoff(cb, 13, a as int, lane_off as int)
+                                end
+                                if v_r_scalar == 1 do
+                                    cb = arm64_mov_rr(cb, 14, breg as int)
+                                else
+                                    cb = arm64_ldr_uoff(cb, 14, breg as int, lane_off as int)
+                                end
+                                if op == LirOp.VAdd do
+                                    cb = arm64_add_rrr(cb, 15, 13, 14)
+                                eif op == LirOp.VSub do
+                                    cb = arm64_sub_rrr(cb, 15, 13, 14)
+                                eif op == LirOp.VMul do
+                                    cb = arm64_mul_rrr(cb, 15, 13, 14)
+                                end
+                                cb = arm64_str_uoff(cb, 15, r_dst as int, lane_off as int)
+                            end
+                            vi = vi + 1
+                        end
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Splat do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                var r_dst = rd
+                if r_dst < 0 and ins_dst != 0 do
+                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
+                end
+                s_aux = native_read_i64(ins as i64, 40)
+                var s_lanes = (s_aux shr 8) and 255
+                if s_lanes <= 0 do s_lanes = 4 end
+                if r_dst >= 0 and a >= 0 do
+                    var si = 0
+                    if target_has_neon() == 1 do
+                        cb = arm64_dup_2d(cb, 2, a as int)
+                        when si + 2 <= s_lanes loop
+                            cb = arm64_str_q_uoff(cb, 2, r_dst as int, (16 + si * 8) as int)
+                            si = si + 2
+                        end
+                    end
+                    when si < s_lanes loop
+                        cb = arm64_str_uoff(cb, a as int, r_dst as int, (16 + si * 8) as int)
+                        si = si + 1
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.Shuffle do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                var r_dst = rd
+                if r_dst < 0 and ins_dst != 0 do
+                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
+                end
+                sh_aux = native_read_i64(ins as i64, 40)
+                var sh_lanes = (sh_aux shr 8) and 255
+                if sh_lanes <= 0 do sh_lanes = 4 end
+                let sh_mask = (sh_aux shr 32)
+                if r_dst >= 0 and a >= 0 do
+                    if r_dst == a do
+                        cb = arm64_sub_imm(cb, 31, 31, 32)
+                        var ski = 0
+                        when ski < sh_lanes loop
+                            let src_lane = (sh_mask shr (ski * 4)) and 15
+                            cb = arm64_ldr_uoff(cb, 13, a as int, (16 + src_lane * 8) as int)
+                            cb = arm64_str_uoff(cb, 13, 31, (ski * 8) as int)
+                            ski = ski + 1
+                        end
+                        ski = 0
+                        when ski < sh_lanes loop
+                            cb = arm64_ldr_uoff(cb, 13, 31, (ski * 8) as int)
+                            cb = arm64_str_uoff(cb, 13, r_dst as int, (16 + ski * 8) as int)
+                            ski = ski + 1
+                        end
+                        cb = arm64_add_imm(cb, 31, 31, 32)
+                    else
+                        var shi = 0
+                        when shi < sh_lanes loop
+                            let src_lane = (sh_mask shr (shi * 4)) and 15
+                            cb = arm64_ldr_uoff(cb, 13, a as int, (16 + src_lane * 8) as int)
+                            cb = arm64_str_uoff(cb, 13, r_dst as int, (16 + shi * 8) as int)
+                            shi = shi + 1
+                        end
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.VLoad do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                var r_dst = rd
+                if r_dst < 0 and ins_dst != 0 do
+                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
+                end
+                vl_aux = native_read_i64(ins as i64, 40)
+                var vl_lanes = (vl_aux shr 8) and 255
+                if vl_lanes <= 0 do vl_lanes = 4 end
+                if r_dst >= 0 and a >= 0 do
+                    var vli = 0
+                    if target_has_neon() == 1 do
+                        when vli + 2 <= vl_lanes loop
+                            cb = arm64_ldr_q_uoff(cb, 2, a as int, (vli * 8) as int)
+                            cb = arm64_str_q_uoff(cb, 2, r_dst as int, (16 + vli * 8) as int)
+                            vli = vli + 2
+                        end
+                    end
+                    when vli < vl_lanes loop
+                        cb = arm64_ldr_uoff(cb, 13, a as int, (vli * 8) as int)
+                        cb = arm64_str_uoff(cb, 13, r_dst as int, (16 + vli * 8) as int)
+                        vli = vli + 1
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            eif op == LirOp.VStore do
+                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
+                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
+                vs_aux = native_read_i64(ins as i64, 40)
+                var vs_lanes = (vs_aux shr 8) and 255
+                if vs_lanes <= 0 do vs_lanes = 4 end
+                if a >= 0 and breg >= 0 do
+                    var vsi = 0
+                    if target_has_neon() == 1 do
+                        when vsi + 2 <= vs_lanes loop
+                            cb = arm64_ldr_q_uoff(cb, 2, breg as int, (16 + vsi * 8) as int)
+                            cb = arm64_str_q_uoff(cb, 2, a as int, (vsi * 8) as int)
+                            vsi = vsi + 2
+                        end
+                    end
+                    when vsi < vs_lanes loop
+                        cb = arm64_ldr_uoff(cb, 13, breg as int, (16 + vsi * 8) as int)
+                        cb = arm64_str_uoff(cb, 13, a as int, (vsi * 8) as int)
+                        vsi = vsi + 1
+                    end
+                end
+                last_cmp_pred = 0 - 1
+            end
+    out cb
+end.
+# @vir_source compiler/src/lower/lir_codegen/emit_func.vri 1
+##
+ * compiler/src/lower/lir_codegen/emit_func.vri — Function-level Code Generation
+ * =============================================================================
+ ##
+
+
 func emit_lir_arm64_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, lir_funcs: i64, call_fixups: i64, str_fixups: i64, is_linux: i64):
     # Record function entry offset for TCO self-branch target.
     func_entry_off = codebuf_offset(cb) as i64
@@ -61969,318 +62319,9 @@ func emit_lir_arm64_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, l
                 end
                 if rd < 0 and ins_dst != 0 do cb = emit_spill_store(cb, ins_dst as i64, 0) end
                 last_cmp_pred = 0 - 1
-            eif op == LirOp.VAdd or op == LirOp.VSub or op == LirOp.VMul or op == LirOp.VFma do
-                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
-                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
-                v_aux = native_read_i64(ins as i64, 40)
-                var v_lanes = (v_aux shr 8) and 255
-                if v_lanes <= 0 do v_lanes = 4 end
-                var v_is_float = 0
-                if (v_aux and 255) == 2 or ins_typ == (LirType.F64 as i64) or ins_typ == (LirType.F32 as i64) do
-                    v_is_float = 1
-                end
-                let v_l_scalar = (v_aux shr 24) and 1
-                let v_r_scalar = (v_aux shr 25) and 1
-                let v_dyn_idx = (v_aux shr 26) and 1
-
-                var r_dst = rd
-                if r_dst < 0 and ins_dst != 0 do
-                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
-                end
-                if r_dst >= 0 and a >= 0 and breg >= 0 do
-                    var vi = 0
-                    if v_dyn_idx == 1 do
-                        let r_idx = resolve_or_imm_reg(cb, vec_get_rt(recent_setargs, 0), assigned_phys, 13)
-                        if target_has_neon() == 1 and (v_is_float == 1 or op == LirOp.VAdd or op == LirOp.VSub) and v_lanes == 2 do
-                            cb = arm64_lsl_imm(cb, 13, r_idx as int, 3)
-                            cb = arm64_add_imm(cb, 13, 13, 16)
-                            if v_l_scalar == 1 do
-                                cb = arm64_dup_2d(cb, 2, a as int)
-                            else
-                                cb = arm64_add_rrr(cb, 14, a as int, 13)
-                                cb = arm64_ldr_q_uoff(cb, 2, 14, 0)
-                            end
-                            if v_r_scalar == 1 do
-                                cb = arm64_dup_2d(cb, 3, breg as int)
-                            else
-                                cb = arm64_add_rrr(cb, 14, breg as int, 13)
-                                cb = arm64_ldr_q_uoff(cb, 3, 14, 0)
-                            end
-                            if v_is_float == 1 do
-                                if op == LirOp.VAdd do
-                                    cb = arm64_fadd_v2d(cb, 4, 2, 3)
-                                eif op == LirOp.VSub do
-                                    cb = arm64_fsub_v2d(cb, 4, 2, 3)
-                                eif op == LirOp.VMul do
-                                    cb = arm64_fmul_v2d(cb, 4, 2, 3)
-                                eif op == LirOp.VFma do
-                                    cb = arm64_add_rrr(cb, 14, r_dst as int, 13)
-                                    cb = arm64_ldr_q_uoff(cb, 4, 14, 0)
-                                    cb = arm64_fmla_v2d(cb, 4, 2, 3)
-                                end
-                            else
-                                if op == LirOp.VAdd do
-                                    cb = arm64_add_v2d(cb, 4, 2, 3)
-                                eif op == LirOp.VSub do
-                                    cb = arm64_sub_v2d(cb, 4, 2, 3)
-                                end
-                            end
-                            cb = arm64_add_rrr(cb, 14, r_dst as int, 13)
-                            cb = arm64_str_q_uoff(cb, 4, 14, 0)
-                            vi = 2
-                        end
-                        when vi < v_lanes loop
-                            cb = arm64_add_imm(cb, 13, r_idx as int, vi as int)
-                            cb = arm64_lsl_imm(cb, 13, 13, 3)
-                            cb = arm64_add_imm(cb, 13, 13, 16)
-                            if v_is_float == 1 do
-                                if v_l_scalar == 1 do
-                                    cb = arm64_fmov_dx(cb, 2, a as int)
-                                else
-                                    cb = arm64_add_rrr(cb, 14, a as int, 13)
-                                    cb = arm64_ldr_d_uoff(cb, 2, 14, 0)
-                                end
-                                if v_r_scalar == 1 do
-                                    cb = arm64_fmov_dx(cb, 3, breg as int)
-                                else
-                                    cb = arm64_add_rrr(cb, 14, breg as int, 13)
-                                    cb = arm64_ldr_d_uoff(cb, 3, 14, 0)
-                                end
-                                if op == LirOp.VAdd do
-                                    cb = arm64_fadd_ddd(cb, 4, 2, 3)
-                                eif op == LirOp.VSub do
-                                    cb = arm64_fsub_ddd(cb, 4, 2, 3)
-                                eif op == LirOp.VMul do
-                                    cb = arm64_fmul_ddd(cb, 4, 2, 3)
-                                eif op == LirOp.VFma do
-                                    cb = arm64_add_rrr(cb, 14, r_dst as int, 13)
-                                    cb = arm64_ldr_d_uoff(cb, 5, 14, 0)
-                                    cb = arm64_fmadd_dddd(cb, 4, 2, 3, 5)
-                                end
-                                cb = arm64_add_rrr(cb, 14, r_dst as int, 13)
-                                cb = arm64_str_d_uoff(cb, 4, 14, 0)
-                            else
-                                if v_l_scalar == 1 do
-                                    cb = arm64_mov_rr(cb, 14, a as int)
-                                else
-                                    cb = arm64_add_rrr(cb, 14, a as int, 13)
-                                    cb = arm64_ldr_uoff(cb, 14, 14, 0)
-                                end
-                                if v_r_scalar == 1 do
-                                    cb = arm64_mov_rr(cb, 15, breg as int)
-                                else
-                                    cb = arm64_add_rrr(cb, 15, breg as int, 13)
-                                    cb = arm64_ldr_uoff(cb, 15, 15, 0)
-                                end
-                                if op == LirOp.VAdd do
-                                    cb = arm64_add_rrr(cb, 14, 14, 15)
-                                eif op == LirOp.VSub do
-                                    cb = arm64_sub_rrr(cb, 14, 14, 15)
-                                eif op == LirOp.VMul do
-                                    cb = arm64_mul_rrr(cb, 14, 14, 15)
-                                end
-                                cb = arm64_add_rrr(cb, 15, r_dst as int, 13)
-                                cb = arm64_str_uoff(cb, 14, 15, 0)
-                            end
-                            vi = vi + 1
-                        end
-                    else
-                        if target_has_neon() == 1 and (v_is_float == 1 or op == LirOp.VAdd or op == LirOp.VSub) do
-                            when vi + 2 <= v_lanes loop
-                                let lane_off = (16 + vi * 8) as int
-                                if v_l_scalar == 1 do
-                                    cb = arm64_dup_2d(cb, 2, a as int)
-                                else
-                                    cb = arm64_ldr_q_uoff(cb, 2, a as int, lane_off)
-                                end
-                                if v_r_scalar == 1 do
-                                    cb = arm64_dup_2d(cb, 3, breg as int)
-                                else
-                                    cb = arm64_ldr_q_uoff(cb, 3, breg as int, lane_off)
-                                end
-                                if v_is_float == 1 do
-                                    if op == LirOp.VAdd do
-                                        cb = arm64_fadd_v2d(cb, 4, 2, 3)
-                                    eif op == LirOp.VSub do
-                                        cb = arm64_fsub_v2d(cb, 4, 2, 3)
-                                    eif op == LirOp.VMul do
-                                        cb = arm64_fmul_v2d(cb, 4, 2, 3)
-                                    eif op == LirOp.VFma do
-                                        cb = arm64_ldr_q_uoff(cb, 4, r_dst as int, lane_off)
-                                        cb = arm64_fmla_v2d(cb, 4, 2, 3)
-                                    end
-                                else
-                                    if op == LirOp.VAdd do
-                                        cb = arm64_add_v2d(cb, 4, 2, 3)
-                                    eif op == LirOp.VSub do
-                                        cb = arm64_sub_v2d(cb, 4, 2, 3)
-                                    end
-                                end
-                                cb = arm64_str_q_uoff(cb, 4, r_dst as int, lane_off)
-                                vi = vi + 2
-                            end
-                        end
-                        when vi < v_lanes loop
-                            let lane_off = 16 + vi * 8
-                            if v_is_float == 1 do
-                                if v_l_scalar == 1 do
-                                    cb = arm64_fmov_dx(cb, 2, a as int)
-                                else
-                                    cb = arm64_ldr_d_uoff(cb, 2, a as int, lane_off as int)
-                                end
-                                if v_r_scalar == 1 do
-                                    cb = arm64_fmov_dx(cb, 3, breg as int)
-                                else
-                                    cb = arm64_ldr_d_uoff(cb, 3, breg as int, lane_off as int)
-                                end
-                                if op == LirOp.VAdd do
-                                    cb = arm64_fadd_ddd(cb, 4, 2, 3)
-                                eif op == LirOp.VSub do
-                                    cb = arm64_fsub_ddd(cb, 4, 2, 3)
-                                eif op == LirOp.VMul do
-                                    cb = arm64_fmul_ddd(cb, 4, 2, 3)
-                                eif op == LirOp.VFma do
-                                    cb = arm64_ldr_d_uoff(cb, 5, r_dst as int, lane_off as int)
-                                    cb = arm64_fmadd_dddd(cb, 4, 2, 3, 5)
-                                end
-                                cb = arm64_str_d_uoff(cb, 4, r_dst as int, lane_off as int)
-                            else
-                                if v_l_scalar == 1 do
-                                    cb = arm64_mov_rr(cb, 13, a as int)
-                                else
-                                    cb = arm64_ldr_uoff(cb, 13, a as int, lane_off as int)
-                                end
-                                if v_r_scalar == 1 do
-                                    cb = arm64_mov_rr(cb, 14, breg as int)
-                                else
-                                    cb = arm64_ldr_uoff(cb, 14, breg as int, lane_off as int)
-                                end
-                                if op == LirOp.VAdd do
-                                    cb = arm64_add_rrr(cb, 15, 13, 14)
-                                eif op == LirOp.VSub do
-                                    cb = arm64_sub_rrr(cb, 15, 13, 14)
-                                eif op == LirOp.VMul do
-                                    cb = arm64_mul_rrr(cb, 15, 13, 14)
-                                end
-                                cb = arm64_str_uoff(cb, 15, r_dst as int, lane_off as int)
-                            end
-                            vi = vi + 1
-                        end
-                    end
-                end
+            eif op == LirOp.VAdd or op == LirOp.VSub or op == LirOp.VMul or op == LirOp.VFma or op == LirOp.Splat or op == LirOp.Shuffle or op == LirOp.VLoad or op == LirOp.VStore do
+                cb = emit_lir_arm64_vector(cb, op, ins as i64, rd, rs1, rs2, assigned_phys, recent_setargs, SCR, SCR2, SCRQ, SCRD)
                 last_cmp_pred = 0 - 1
-            eif op == LirOp.Splat do
-                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
-                var r_dst = rd
-                if r_dst < 0 and ins_dst != 0 do
-                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
-                end
-                s_aux = native_read_i64(ins as i64, 40)
-                var s_lanes = (s_aux shr 8) and 255
-                if s_lanes <= 0 do s_lanes = 4 end
-                if r_dst >= 0 and a >= 0 do
-                    var si = 0
-                    if target_has_neon() == 1 do
-                        cb = arm64_dup_2d(cb, 2, a as int)
-                        when si + 2 <= s_lanes loop
-                            cb = arm64_str_q_uoff(cb, 2, r_dst as int, (16 + si * 8) as int)
-                            si = si + 2
-                        end
-                    end
-                    when si < s_lanes loop
-                        cb = arm64_str_uoff(cb, a as int, r_dst as int, (16 + si * 8) as int)
-                        si = si + 1
-                    end
-                end
-                last_cmp_pred = 0 - 1
-            eif op == LirOp.Shuffle do
-                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
-                var r_dst = rd
-                if r_dst < 0 and ins_dst != 0 do
-                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
-                end
-                sh_aux = native_read_i64(ins as i64, 40)
-                var sh_lanes = (sh_aux shr 8) and 255
-                if sh_lanes <= 0 do sh_lanes = 4 end
-                let sh_mask = (sh_aux shr 32)
-                if r_dst >= 0 and a >= 0 do
-                    if r_dst == a do
-                        cb = arm64_sub_imm(cb, 31, 31, 32)
-                        var ski = 0
-                        when ski < sh_lanes loop
-                            let src_lane = (sh_mask shr (ski * 4)) and 15
-                            cb = arm64_ldr_uoff(cb, 13, a as int, (16 + src_lane * 8) as int)
-                            cb = arm64_str_uoff(cb, 13, 31, (ski * 8) as int)
-                            ski = ski + 1
-                        end
-                        ski = 0
-                        when ski < sh_lanes loop
-                            cb = arm64_ldr_uoff(cb, 13, 31, (ski * 8) as int)
-                            cb = arm64_str_uoff(cb, 13, r_dst as int, (16 + ski * 8) as int)
-                            ski = ski + 1
-                        end
-                        cb = arm64_add_imm(cb, 31, 31, 32)
-                    else
-                        var shi = 0
-                        when shi < sh_lanes loop
-                            let src_lane = (sh_mask shr (shi * 4)) and 15
-                            cb = arm64_ldr_uoff(cb, 13, a as int, (16 + src_lane * 8) as int)
-                            cb = arm64_str_uoff(cb, 13, r_dst as int, (16 + shi * 8) as int)
-                            shi = shi + 1
-                        end
-                    end
-                end
-                last_cmp_pred = 0 - 1
-            eif op == LirOp.VLoad do
-                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
-                var r_dst = rd
-                if r_dst < 0 and ins_dst != 0 do
-                    r_dst = robust_src_reg(cb, ins_dst, assigned_phys, 12)
-                end
-                vl_aux = native_read_i64(ins as i64, 40)
-                var vl_lanes = (vl_aux shr 8) and 255
-                if vl_lanes <= 0 do vl_lanes = 4 end
-                if r_dst >= 0 and a >= 0 do
-                    var vli = 0
-                    if target_has_neon() == 1 do
-                        when vli + 2 <= vl_lanes loop
-                            cb = arm64_ldr_q_uoff(cb, 2, a as int, (vli * 8) as int)
-                            cb = arm64_str_q_uoff(cb, 2, r_dst as int, (16 + vli * 8) as int)
-                            vli = vli + 2
-                        end
-                    end
-                    when vli < vl_lanes loop
-                        cb = arm64_ldr_uoff(cb, 13, a as int, (vli * 8) as int)
-                        cb = arm64_str_uoff(cb, 13, r_dst as int, (16 + vli * 8) as int)
-                        vli = vli + 1
-                    end
-                end
-                last_cmp_pred = 0 - 1
-            eif op == LirOp.VStore do
-                a = resolve_or_imm_reg(cb, ins_src1, assigned_phys, SCR)
-                breg = resolve_or_imm_reg(cb, ins_src2, assigned_phys, SCR2)
-                vs_aux = native_read_i64(ins as i64, 40)
-                var vs_lanes = (vs_aux shr 8) and 255
-                if vs_lanes <= 0 do vs_lanes = 4 end
-                if a >= 0 and breg >= 0 do
-                    var vsi = 0
-                    if target_has_neon() == 1 do
-                        when vsi + 2 <= vs_lanes loop
-                            cb = arm64_ldr_q_uoff(cb, 2, breg as int, (16 + vsi * 8) as int)
-                            cb = arm64_str_q_uoff(cb, 2, a as int, (vsi * 8) as int)
-                            vsi = vsi + 2
-                        end
-                    end
-                    when vsi < vs_lanes loop
-                        cb = arm64_ldr_uoff(cb, 13, breg as int, (16 + vsi * 8) as int)
-                        cb = arm64_str_uoff(cb, 13, a as int, (vsi * 8) as int)
-                        vsi = vsi + 1
-                    end
-                end
-                last_cmp_pred = 0 - 1
-            # TCO: self-recursive tail-call — emit B <func_entry> instead of BL+RET.
-            # Arguments must already be in X0..X7 via preceding SetArg instructions.
-            # We restore the frame before branching so the callee sees a clean state.
             eif op == LirOp.TailCall do
                 # Restore stack pointer to pre-prologue state
                 cb = emit_stack_free_arm64(cb, g_codegen_stack_size)
@@ -62619,6 +62660,17 @@ func emit_lir_arm64_into(cb: &CodeBuf, func_obj: &LirFunc, assigned_phys: i64, l
 
     out cb
 end.
+
+# @vir_source compiler/src/lower/lir_codegen.vri 1
+##
+ * vir/compiler/lir_codegen.vri — LIR to Machine Code (ARM64)
+ * ==============================================================
+ * VIRC-PLN-0004 Phase 10 / VIRC-ISS-0006: Modularized LIR Codegen Subsystem.
+ ##
+
+import print_str, print_int from rt.io
+import sys_exit from rt.syscall
+
 
 func emit_lir_module_arm64(lir_funcs: i64, is_linux: i64):
     arm64_prepare_func_index(lir_funcs)
