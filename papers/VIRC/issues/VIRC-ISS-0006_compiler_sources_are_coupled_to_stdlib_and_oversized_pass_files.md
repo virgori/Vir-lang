@@ -27,6 +27,7 @@ related:
   reports:
     - "VIRC-RPT-0002"
     - "VIRC-RPT-0003"
+    - "VIRC-RPT-0004"
 supersedes: null
 superseded_by: null
 tags:
