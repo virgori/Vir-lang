@@ -35,6 +35,7 @@ related:
     - "VIRC-RPT-0012"
     - "VIRC-RPT-0013"
     - "VIRC-RPT-0014"
+    - "VIRC-RPT-0015"
 supersedes: null
 superseded_by: null
 tags:
@@ -1316,3 +1317,4 @@ the selected baseline or skip later regression comparison.
 | 2026-10-02 | Linked VIRC-RPT-0002 |
 | 2026-10-03 | Linked VIRC-RPT-0013 |
 | 2026-10-03 | Linked VIRC-RPT-0014 |
+| 2026-10-03 | Linked VIRC-RPT-0015 |
