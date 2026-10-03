@@ -7,7 +7,7 @@ status: "TRIAGED"
 severity: "S1"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-03"
 owners:
   - "VIRC"
 components:
@@ -20,7 +20,8 @@ components:
 related:
   issues: []
   plans: []
-  reports: []
+  reports:
+    - "VIRC-RPT-0013"
 supersedes: null
 superseded_by: null
 tags:
@@ -374,3 +375,4 @@ cost of later correction.
 |---|---|
 | 2026-10-02 | Created and triaged from ARM64/x86-64 codegen, target-dispatch, object-writer, generated-source, and focused artifact audit |
 | 2026-10-02 | Added focused Windows matrix evidence showing structurally valid artifacts remain BLOCKED_NO_RUNNER rather than failing ABI/runtime validation |
+| 2026-10-03 | Linked VIRC-RPT-0013 |

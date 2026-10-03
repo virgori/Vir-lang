@@ -7,7 +7,7 @@ status: "TRIAGED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-03"
 owners:
   - "VIRC"
 components:
@@ -36,6 +36,7 @@ related:
     - "VIRC-RPT-0010"
     - "VIRC-RPT-0011"
     - "VIRC-RPT-0012"
+    - "VIRC-RPT-0013"
 supersedes: null
 superseded_by: null
 tags:
@@ -333,3 +334,4 @@ issue does not implement their algorithms.
 | 2026-10-02 | Rebased the issue on current Vir 4.0.0 source snapshot `fd0064ea`; initial failures may be ledgered while unexplained new regressions remain prohibited |
 | 2026-10-02 | Linked VIRC-ISS-0007 |
 | 2026-10-02 | Linked VIRC-RPT-0002 |
+| 2026-10-03 | Linked VIRC-RPT-0013 |

@@ -5,7 +5,7 @@ domain: "VIRC"
 title: "Separate compiler source tree and modularize compiler passes"
 status: "DRAFT"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-03"
 owners:
   - "VIRC"
 components:
@@ -33,6 +33,7 @@ related:
     - "VIRC-RPT-0010"
     - "VIRC-RPT-0011"
     - "VIRC-RPT-0012"
+    - "VIRC-RPT-0013"
 supersedes: null
 superseded_by: null
 tags:
@@ -1312,3 +1313,4 @@ the selected baseline or skip later regression comparison.
 | 2026-10-02 | Added commit-pinned migration of native `vir-lsp` and `vscode-vir`, with separate ownership, source-only copy rules, generated-artifact exclusions and integration gates |
 | 2026-10-02 | Rebased preparation on current Vir 4.0.0 source snapshot `fd0064ea`; baseline failures are recorded rather than required to be green, and later phases must not add unexplained regressions |
 | 2026-10-02 | Linked VIRC-RPT-0002 |
+| 2026-10-03 | Linked VIRC-RPT-0013 |
