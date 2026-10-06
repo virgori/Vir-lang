@@ -309,9 +309,9 @@ def test_version_mismatch_fail_closed():
     assert res_abi.returncode == 1
     assert "E2120" in res_abi.stdout or "E2120" in res_abi.stderr
 
-    # 2. compiler_min mismatch (compiler_min = 99.0.0)
+    # 2. compiler_min mismatch (compiler_min = 9999.0.0)
     (scratch_dir / "stdlib" / "stdlib.vri").write_text(
-        "root = vir\nschema = 1\nversion = 2.0.0\nabi_version = 2\ncompiler_min = 99.0.0\n",
+        "root = vir\nschema = 1\nversion = 2.0.0\nabi_version = 2\ncompiler_min = 9999.0.0\n",
         encoding="utf-8",
     )
     res_min = run_cmd([str(VIRC), "--sysroot", str(scratch_dir), "--print-sysroot"])
@@ -407,9 +407,9 @@ def test_compatibility_higher_compiler_min_fail_closed():
     shutil.copy2(ROOT / "stdlib" / "vir" / "core" / "types.vri", scratch_dir / "stdlib" / "vir" / "core" / "types.vri")
     shutil.copy2(ROOT / "stdlib" / "vir" / "rt" / "alloc.vri", scratch_dir / "stdlib" / "vir" / "rt" / "alloc.vri")
 
-    # compiler_min patch is higher than actual compiler (e.g. 4.2.999 > 4.2.1)
+    # compiler_min patch is higher than the active internal patch (2026.1.999 > 2026.1.0)
     (scratch_dir / "stdlib" / "stdlib.vri").write_text(
-        "root = vir\nschema = 1\nversion = 2.0.0\nabi_version = 2\ncompiler_min = 4.2.999\n",
+        "root = vir\nschema = 1\nversion = 2.0.0\nabi_version = 2\ncompiler_min = 2026.1.999\n",
         encoding="utf-8",
     )
     res = run_cmd([str(VIRC), "--sysroot", str(scratch_dir), "--print-sysroot"])
@@ -953,6 +953,70 @@ def test_registry_trailing_tokens_and_module_validity_fail_closed():
     shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
+def test_module_directory_target_fail_closed():
+    scratch_dir = ROOT / "scratch" / "dir_target_fail_closed_test"
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+    (scratch_dir / "stdlib").mkdir(parents=True, exist_ok=True)
+    (scratch_dir / "stdlib" / "vir" / "core").mkdir(parents=True, exist_ok=True)
+    (scratch_dir / "stdlib" / "vir" / "rt").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "stdlib" / "vir" / "core" / "types.vri", scratch_dir / "stdlib" / "vir" / "core" / "types.vri")
+    shutil.copy2(ROOT / "stdlib" / "vir" / "rt" / "alloc.vri", scratch_dir / "stdlib" / "vir" / "rt" / "alloc.vri")
+
+    base = "schema = 1\nversion = 2.0.0\nabi_version = 2\ncompiler_min = 4.2.0\nroot = vir\n"
+
+    # Case 1: Target is an existing directory without .vri extension: bad = core
+    (scratch_dir / "stdlib" / "stdlib.vri").write_text(base + "bad = core\n", encoding="utf-8")
+    res1 = run_cmd([str(VIRC), "--sysroot", str(scratch_dir), "--print-sysroot"])
+    assert res1.returncode == 1, "Expected fail-closed for directory target without .vri"
+    assert "E2120" in res1.stdout or "E2120" in res1.stderr
+
+    # Case 2: Target is an existing directory ending with .vri: bad = fake_dir.vri
+    (scratch_dir / "stdlib" / "vir" / "fake_dir.vri").mkdir(parents=True, exist_ok=True)
+    (scratch_dir / "stdlib" / "stdlib.vri").write_text(base + "bad = fake_dir.vri\n", encoding="utf-8")
+    res2 = run_cmd([str(VIRC), "--sysroot", str(scratch_dir), "--print-sysroot"])
+    assert res2.returncode == 1, "Expected fail-closed for directory target named *.vri"
+    assert "E2120" in res2.stdout or "E2120" in res2.stderr
+
+    # Case 3: Compilation importing directory target fails
+    test_src = scratch_dir / "main.vri"
+    test_src.write_text("import bad from bad\nfunc main() -> int: out 0 end.\n", encoding="utf-8")
+    out_bin = scratch_dir / "main_bin"
+    res3 = run_cmd([str(VIRC), "--sysroot", str(scratch_dir), str(test_src), "-o", str(out_bin)])
+    assert res3.returncode == 1, "Expected compilation to fail when importing directory target"
+
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
+def test_registry_duplicate_beyond_4096_fail_closed():
+    scratch_dir = ROOT / "scratch" / "dup_beyond_4096_test"
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+    (scratch_dir / "stdlib").mkdir(parents=True, exist_ok=True)
+    (scratch_dir / "stdlib" / "vir" / "core").mkdir(parents=True, exist_ok=True)
+    (scratch_dir / "stdlib" / "vir" / "rt").mkdir(parents=True, exist_ok=True)
+    shutil.copy2(ROOT / "stdlib" / "vir" / "core" / "types.vri", scratch_dir / "stdlib" / "vir" / "core" / "types.vri")
+    shutil.copy2(ROOT / "stdlib" / "vir" / "rt" / "alloc.vri", scratch_dir / "stdlib" / "vir" / "rt" / "alloc.vri")
+
+    lines = [
+        "schema = 1",
+        "version = 2.0.0",
+        "abi_version = 2",
+        "compiler_min = 4.2.0",
+        "root = vir",
+    ]
+    # Generate 4100 unique valid module entries pointing to a regular file
+    for i in range(4100):
+        lines.append(f"mod_{i} = core/types.vri")
+    # Add duplicate of the 4100th key (mod_4099)
+    lines.append("mod_4099 = core/types.vri\n")
+
+    (scratch_dir / "stdlib" / "stdlib.vri").write_text("\n".join(lines), encoding="utf-8")
+    res = run_cmd([str(VIRC), "--sysroot", str(scratch_dir), "--print-sysroot"])
+    assert res.returncode == 1, "Expected fail-closed for duplicate key beyond 4096 entries"
+    assert "E2120" in res.stdout or "E2120" in res.stderr
+
+    shutil.rmtree(scratch_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_print_sysroot_text()
     print("PASS: test_print_sysroot_text")
@@ -1034,4 +1098,8 @@ if __name__ == "__main__":
     print("PASS: test_identifier_boundary_utf8_and_delimiters_fail_closed")
     test_registry_trailing_tokens_and_module_validity_fail_closed()
     print("PASS: test_registry_trailing_tokens_and_module_validity_fail_closed")
-    print("\nALL 40 SYSROOT CONTRACT TESTS PASSED!")
+    test_module_directory_target_fail_closed()
+    print("PASS: test_module_directory_target_fail_closed")
+    test_registry_duplicate_beyond_4096_fail_closed()
+    print("PASS: test_registry_duplicate_beyond_4096_fail_closed")
+    print("\nALL 42 SYSROOT CONTRACT TESTS PASSED!")

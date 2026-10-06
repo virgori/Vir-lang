@@ -224,7 +224,7 @@ Changes are isolated to compiler driver and module resolver. Can be reverted via
 - [x] CWD-relative stdlib searching eliminated;
 - [x] Compilation succeeds from arbitrary working directories without vendoring stdlib;
 - [x] Self-hosting fixed-point verified;
-- [x] Dedicated test suite passes 100% (including version mismatch, PATH, containment, exact ABI key, block comments, string stripping, duplicate metadata rejection, SemVer overflow, token declaration boundaries, and strict line grammar checks — 37/37 PASS);
+- [x] Dedicated test suite passes 100% (including version mismatch, PATH, containment, exact ABI key, block comments, string stripping, duplicate metadata rejection, SemVer overflow, token declaration boundaries, strict line grammar checks, module mapping escape rejection, UTF-8/delimiter decoys, directory target rejection, and dynamic key table growth — 42/42 PASS);
 - [ ] VPS Report `VIRC-RPT-0045` created and linked;
 - [ ] `VIRC-ISS-0043` closed with evidence.
 
@@ -247,3 +247,5 @@ Changes are isolated to compiler driver and module resolver. Can be reverted via
 | 2026-10-07 | Round 4 audit remediation: exact key matching via virc_sub_matches (fixing abi_v prefix leak), comment-stripping parser-aware structural prelude validation (virc_strip_comments), added 2 regression tests (30/30 PASS), reverted closure state to ACTIVE |
 | 2026-10-07 | Round 5 audit remediation: canonical block comments (#*#), string literal stripping, duplicate metadata rejection per VIR-SPC-0006:142, SemVer component overflow checks, expanded to 34 contract tests, kept active |
 | 2026-10-07 | Round 6 audit remediation: token-level prelude declaration matching with identifier boundaries, strict registry line parsing rejecting malformed lines and empty directives, expanded to 37 contract tests, kept active |
+| 2026-10-07 | Round 6 audit completion: per-entry canonical containment preventing module mapping escapes, lexer parity for UTF-8 continuation (ch >= 128) and dot delimiter rejection, strict trailing token checks, duplicate module key rejection, expanded to 40/40 contract tests, kept active |
+| 2026-10-07 | Round 7 audit remediation: directory target rejection (file_is_regular_cstr and .vri suffix), unbounded dynamic duplicate key detection (seen_keys array doubling), fail-closed registry capacity gate, expanded to 42 contract tests (42/42 PASS), kept active |

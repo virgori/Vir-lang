@@ -45,6 +45,6 @@ for name in (
 if os.environ.get('VIR_LSP_SKIP_NODE_CLIENT') == '1':
     print('SKIP: Node client contract delegated to an external host')
 else:
-    subprocess.run(['node', 'vscode-tool/test/lsp_contract.js'], cwd=root,
+    subprocess.run(['node', 'tools/vscode-vir/test/lsp_contract.js'], cwd=root,
                    check=True, timeout=30, env=environment)
 print('PASS: native LSP regression suite')

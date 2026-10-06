@@ -330,14 +330,14 @@ release toolchain.
   source-tree fallback phải explicit, observable và không được thắng CLI/env hoặc
   installed sysroot.
 - [ ] Compiler kiểm tra compatibility giữa binary, registry schema, stdlib và
-  compiler-coupled runtime; mismatch có diagnostic ổn định (Round 5 & Round 6 audits phát hiện các fail-open defects: block comment #*#, string literal stripping, duplicate metadata rejection per VIR-SPC-0006:142, SemVer component arithmetic overflow checks, decoy prelude declarations type i64_alias / include vir.rt.alloc.fake / fake_vir_alloc, và malformed/empty directives schema = / garbage / = value; đã remediate bằng token-level matchers với identifier boundary enforcement và strict line grammar parsing; bộ test mở rộng lên 37/37 PASS; giữ mở [ ] chờ audit độc lập chấp nhận).
+  compiler-coupled runtime; mismatch có diagnostic ổn định (Round 7 audit remediated: directory target rejection qua file_is_regular_cstr và .vri suffix, unbounded dynamic duplicate key detection qua seen_keys doubling, fail-closed gate khi vượt registry capacity; bộ test mở rộng lên 42/42 PASS; giữ mở [ ] chờ audit độc lập chấp nhận).
 - [x] Integration tests compile một project ngoài checkout từ unrelated CWD và
   kiểm tra explicit override, missing sysroot, malformed registry, version
-  mismatch, PATH/symlink invocation và hai toolchain versions song song (37/37 automated contract scenarios).
+  mismatch, PATH/symlink invocation và hai toolchain versions song song (42/42 automated contract scenarios).
 - [x] `vir-lsp` và `virc` dùng cùng resolved sysroot/stdlib identity hoặc có
   handoff contract rõ ràng; không tạo hai precedence algorithms khác nhau.
 - [ ] Existing module resolver, compiler project-ingestion, strict diagnostics,
-  CWD-independence và paper validation gates pass trước closure (gate `./run_tests.sh min` hiện ghi nhận 21 pre-existing failures chưa được cấp baseline exception).
+  CWD-independence và paper validation gates pass trước closure (gate `./run_tests.sh min` hiện ghi nhận 21 failures chưa được cấp baseline exception; không đưa ra tuyên bố pre-existing / zero-regression khi chưa đối chiếu baseline cha).
 - [ ] Một accepted REPORT ghi layout thực tế, before/after reproduction, tests
   đa platform khả dụng và các giới hạn chưa được hỗ trợ (`VIRC-RPT-0045` hiện ở `REVIEW` / `REQUIRES_FOLLOWUP`).
 
@@ -380,3 +380,5 @@ release toolchain.
 | 2026-10-07 | Reopened to VERIFYING per Round 4 audit remediation: exact key matching via virc_sub_matches (fixing abi_v prefix leak), comment-stripping parser-aware structural prelude validation (virc_strip_comments), expanded to 30 contract tests, keeping open criteria 7, 12, 13 pending VIRC-ISS-0047, regression gate baseline, and accepted report |
 | 2026-10-07 | Round 5 audit remediation: canonical block comments (#*#), string literal stripping, duplicate metadata rejection per VIR-SPC-0006:142, SemVer component overflow checks, expanded to 34 contract tests, kept criterion 9 open pending audit acceptance |
 | 2026-10-07 | Round 6 audit remediation: token-level declaration matching with identifier boundaries (rejecting type i64_alias, include vir.rt.alloc.fake, fake_vir_alloc), strict line parsing (rejecting schema =, garbage, = value), expanded to 37 contract tests, kept criterion 9 open pending audit acceptance |
+| 2026-10-07 | Round 6 audit completion: per-entry canonical containment preventing module mapping escapes, lexer parity for UTF-8 continuation (ch >= 128) and dot delimiter rejection, strict trailing token checks, duplicate module key rejection, expanded to 40/40 contract tests, kept criterion 9 open pending audit acceptance |
+| 2026-10-07 | Round 7 audit remediation: directory target rejection (file_is_regular_cstr và .vri suffix), unbounded dynamic duplicate key detection (seen_keys array doubling), fail-closed registry capacity gate, expanded to 42 contract tests (42/42 PASS), kept criteria 9 and 12 open |

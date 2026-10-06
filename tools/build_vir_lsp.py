@@ -54,6 +54,7 @@ args.add_argument('--output', default=str(ROOT / 'bin/vir-lsp'))
 options = args.parse_args()
 
 subprocess.run(['python3', 'tools/sync_virc.py', '--check'], cwd=ROOT, check=True)
+subprocess.run(['python3', 'tools/bump_vir_lsp_version.py', '--check'], cwd=ROOT, check=True)
 
 virc_bundle_path = ROOT / 'compiler/generated/virc.vri'
 if not virc_bundle_path.is_file():
@@ -63,7 +64,9 @@ ide_session_path = ROOT / 'compiler/src/ide/ide_session.vri'
 if not ide_session_path.is_file():
     ide_session_path = ROOT / 'stdlib/vir/compiler/ide_session.vri'
 
-lsp_main_path = ROOT / 'vir-lsp/src/main.vri'
+lsp_main_path = ROOT / 'tools/vir-lsp/src/main.vri'
+if not lsp_main_path.is_file():
+    lsp_main_path = ROOT / 'vir-lsp/src/main.vri'
 
 canonicalHashes = {
     str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()

@@ -80,6 +80,20 @@ Before emitting or changing Vir code:
 - Ordinary generics use `of (...)`; do not generate `Name<T>`.
 - Do not invent a `saga` keyword. Compensation uses `try` / `revert`.
 
+## Compiler version completion gate
+
+When a `VIR-ISS` or `VIRC-ISS` that changes the compiler is completed, read
+`compiler/VERSIONING.md` and bump the calendar version exactly once for that
+issue before reporting completion. Verify canonical metadata, generated-source
+sync, the rebuilt binary's `--version`, and the version-policy regression. An
+issue is not compiler-complete while those checks are missing or stale.
+
+When a `VLSP-ISS` changes the native language server, read
+`tools/vir-lsp/VERSIONING.md` and bump the independent LSP Semantic Version
+exactly once before reporting completion. Rebuild the server and verify both
+CLI output and `initialize.serverInfo.version`; never derive the LSP version
+from the compiler calendar version.
+
 ## Spec and generated-source guard
 
 Do not edit canonical SPEC papers or `docs/ai-spec/vir-lang/**` unless the user

@@ -29,6 +29,7 @@ VIRC = Path(os.environ.get("VIRC", ROOT / "bin/virc"))
 BASELINE = ROOT / "tests/cli_contract/classic_baseline.json"
 FAILURE = ROOT / "tests/cli_contract/failure.vri"
 FAILURE_BASELINE = ROOT / "tests/cli_contract/classic_failure_baseline.json"
+VIRC_VERSION = json.loads((ROOT / "compiler/version.json").read_text())["public_version"]
 
 
 def invoke(args, *, env=None, cwd=ROOT):
@@ -45,7 +46,12 @@ def invoke(args, *, env=None, cwd=ROOT):
 
 def normalized(data):
     # Only clock values and caller-owned output paths are nondeterministic.
-    return re.sub(rb"Compile time: [0-9.]+ ms", b"Compile time: <duration> ms", data)
+    data = re.sub(rb"Compile time: [0-9.]+ ms", b"Compile time: <duration> ms", data)
+    return re.sub(
+        rb"  v?[0-9]+\.[0-9]+(?:\.[0-9]+)? \xe2\x80\x94",
+        b"  <version> \xe2\x80\x94",
+        data,
+    )
 
 
 def invoke_pty(args, *, env=None, columns=80, executable=None):
@@ -205,16 +211,16 @@ class CliContract(unittest.TestCase):
         result = self.compile()
         self.assertEqual(result.returncode, reference["exitCode"])
         actual = result.stdout.replace(str(self.output).encode(), b"<artifact>")
-        self.assertEqual(normalized(actual).decode(), reference["stdoutNormalized"])
-        self.assertEqual(normalized(result.stderr).decode(), reference["stderrNormalized"])
+        self.assertEqual(normalized(actual).decode(), normalized(reference["stdoutNormalized"].encode()).decode())
+        self.assertEqual(normalized(result.stderr).decode(), normalized(reference["stderrNormalized"].encode()).decode())
 
     def test_classic_failure_baseline(self):
         reference = json.loads(FAILURE_BASELINE.read_text())
         result = invoke([FAILURE.relative_to(ROOT), "-o", self.output])
         self.assertEqual(result.returncode, reference["exitCode"])
         self.assertFalse(self.output.exists())
-        self.assertEqual(normalized(result.stdout).decode(), reference["stdoutNormalized"])
-        self.assertEqual(normalized(result.stderr).decode(), reference["stderrNormalized"])
+        self.assertEqual(normalized(result.stdout).decode(), normalized(reference["stdoutNormalized"].encode()).decode())
+        self.assertEqual(normalized(result.stderr).decode(), normalized(reference["stderrNormalized"].encode()).decode())
 
     def test_machine_output_does_not_change_artifact(self):
         classic = self.compile(["-q"])
@@ -310,7 +316,7 @@ class CliContract(unittest.TestCase):
             self.assertEqual(sum(line.startswith(f"✓ {phase}") for line in lines), 1, (phase, lines))
         # 6. Aligned metadata in banner
         self.assertEqual(sum("VIRC" in line for line in lines), 1)
-        self.assertTrue(any("Version      4.2.1" in line for line in lines))
+        self.assertTrue(any(f"Version      {VIRC_VERSION}" in line for line in lines))
         self.assertTrue(any("What's New   Native LSP Daemon" in line for line in lines))
         # 7. Final build summary separated from stages with indented path
         self.assertEqual(sum(line.startswith("✓ Build succeeded · ") for line in lines), 1)
