@@ -41,18 +41,21 @@ import cliClockReset, cliClockNowNs from compiler.cli_ui
 include compiler.ide_session
 import g_ideParseCode, g_ideParseFileId, g_ideSymbolNodes, g_ideHasImports, g_ideExpandedSource, ideSessionAnalyze, g_ideSessionErrors, g_ideSessionAst, g_ideScopeParents,
        g_ideSessionDiagnostics, g_ideParseLine, g_ideParseColumn, g_ideParseMessage from compiler.ide_session
-include compiler.sem.diagnostics
-import pass10_code_to_msg from compiler.sem.diagnostics
+include compiler.sem_pass10_diagnostics
+import pass10_code_to_msg from compiler.sem_pass10_diagnostics
 include compiler.ide_facts
 import g_ideFacts, ideFactFind from compiler.ide_facts
 include vec_rt
 import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt
+include vec_prelude
 include compiler.lexer
 import lexer_lex, lexer_token_count, lexer_token_get from compiler.lexer
 include source_manager
 import sm_get_span, sm_get_file_path, sm_file_from_line, sm_line_from_expanded, g_active_source_manager from source_manager
 include compiler.main
 import g_ideResolvedModules, g_ideStdlibRegistry, join_path_cstr, file_exists_cstr, g_ideImportOrigins, g_ideVirtualFiles, try_read_file, path_normalize_fat from compiler.main
+include driver_sysroot
+import virc_resolve_sysroot, virc_path_parent, virc_validate_registry_file, g_virc_stdlib_registry from driver_sysroot
 include rt.string_rt
 import fat_cstr_eq, fat_str_eq from rt.string_rt
 
@@ -85,6 +88,7 @@ func print_help():
     lsp_print_str("")
     lsp_print_str("Options:")
     lsp_print_str("  --stdio          Run Language Server daemon over stdio (JSON-RPC 2.0)")
+    lsp_print_str("  --sysroot PATH   Override toolchain sysroot path")
     lsp_print_str("  --stdlib-registry PATH  Use an explicit stdlib/stdlib.vri registry")
     lsp_print_str("  --version (-v)   Display version information")
     lsp_print_str("  --help (-h)      Display this help message")
@@ -2410,9 +2414,9 @@ func lsp_handle_rename(id_val: int, line: int, col: int, new_name: int):
     vir_free(buffer)
 end.
 
-func lspAppendRaw(buffer: int, position: int, text: int) -> int:
-    let length = rt_strlen(text)
-    rt_memcpy(buffer + position, text, length)
+func lspAppendRaw(buffer: int, position: int, text) -> int:
+    let length = rt_strlen(text as i64)
+    rt_memcpy(buffer + position, text as int, length)
     out position + length
 end.
 
@@ -3878,33 +3882,6 @@ end.
 # Entry Point
 # ═════════════════════════════════════════════════════════════════════
 
-func lspRegistryFromDirectory(directory: int) -> int:
-    var current = rt_strdup(directory)
-    when true loop
-        let candidate = join_path_cstr(current, "stdlib/stdlib.vri" as int)
-        if file_exists_cstr(candidate) == 1 do
-            vir_free(current)
-            out candidate
-        end
-        vir_free(candidate)
-        var lastSlash = -1
-        var index = 0
-        when native_read_u8(current, index) != 0 loop
-            if native_read_u8(current, index) == 47 do lastSlash = index end
-            index = index + 1
-        end
-        if lastSlash < 0 do break end
-        if lastSlash == 0 do
-            if native_read_u8(current, 1) == 0 do break end
-            native_write_u8(current, 1, 0)
-        else
-            native_write_u8(current, lastSlash, 0)
-        end
-    end
-    vir_free(current)
-    out 0
-end.
-
 func main():
     let argc = arg_count()
     if argc <= 1 do
@@ -3912,22 +3889,9 @@ func main():
         sys_exit(0)
     end
 
-    # Locate the shipped registry relative to the executable, independently of CWD.
-    let executable = get_arg(0)
-    var lastSlash = -1
-    var pathIndex = 0
-    when native_read_u8(executable, pathIndex) != 0 loop
-        if native_read_u8(executable, pathIndex) == 47 do lastSlash = pathIndex end
-        pathIndex = pathIndex + 1
-    end
-    if lastSlash >= 0 do
-        let directory = vir_alloc(lastSlash + 2)
-        rt_memcpy(directory, executable, lastSlash + 1)
-        native_write_u8(directory, lastSlash + 1, 0)
-        g_ideStdlibRegistry = lspRegistryFromDirectory(directory)
-        vir_free(directory)
-    end
     var is_stdio = 0
+    var cli_sysroot = 0
+    var explicit_registry = 0
     var argument = 1
     when argument < argc loop
         let a = get_arg(argument)
@@ -3936,7 +3900,11 @@ func main():
             argument = argument + 1
         eif rt_streq(a as i64, "--stdlib-registry" as i64) == 1 do
             if argument + 1 >= argc do sys_exit(1) end
-            g_ideStdlibRegistry = get_arg(argument + 1)
+            explicit_registry = get_arg(argument + 1)
+            argument = argument + 2
+        eif rt_streq(a as i64, "--sysroot" as i64) == 1 do
+            if argument + 1 >= argc do sys_exit(1) end
+            cli_sysroot = get_arg(argument + 1)
             argument = argument + 2
         eif rt_streq(a as i64, "help" as i64) == 1 or rt_streq(a as i64, "-h" as i64) == 1 or rt_streq(a as i64, "--help" as i64) == 1 do
             print_help()
@@ -3950,6 +3918,27 @@ func main():
             sys_exit(1)
         end
     end
+
+    # Shared toolchain sysroot discovery: Precedence 1 (--sysroot), Precedence 2 (VIR_SYSROOT), Precedence 3 (executable)
+    virc_resolve_sysroot(cli_sysroot)
+    if explicit_registry != 0 do
+        let parent_dir = virc_path_parent(explicit_registry)
+        if virc_validate_registry_file(explicit_registry, parent_dir) != 1 do
+            if parent_dir != 0 do vir_free(parent_dir) end
+            lsp_print_str("vir-lsp: error [E2120]: invalid or incompatible explicit stdlib registry")
+            sys_exit(1)
+        end
+        if parent_dir != 0 do vir_free(parent_dir) end
+        g_ideStdlibRegistry = explicit_registry
+    else
+        g_ideStdlibRegistry = g_virc_stdlib_registry
+    end
+
+    if g_ideStdlibRegistry == 0 do
+        lsp_print_str("vir-lsp: error [E2120]: failed to resolve toolchain sysroot and stdlib")
+        sys_exit(1)
+    end
+
     if is_stdio == 1 do
         lsp_stdio_server()
         sys_exit(0)

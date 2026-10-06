@@ -7,7 +7,7 @@ status: "TRIAGED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-06"
 owners:
   - "compiler"
 components:
@@ -19,6 +19,7 @@ components:
 related:
   issues:
     - "VIRC-ISS-0001"
+    - "VIRC-ISS-0041"
   plans:
     - "VIRC-PLN-0001"
   reports: []
@@ -196,3 +197,4 @@ interference or allocation regressions to escape algorithm-specific tests.
 |---|---|
 | 2026-10-02 | Created and triaged from direct allocator/test audit; linked VIRC-PLN-0001 |
 | 2026-10-02 | Linked VIRC-ISS-0001 |
+| 2026-10-06 | Linked VIRC-ISS-0041 |

@@ -3,9 +3,9 @@
  * ==========================================================================
  ##
 
-include types
-include vec_rt
-include string_rt
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
 include parser
 include mir
 include ast_to_mir_context
@@ -47,7 +47,14 @@ func lower_call_args(b: &MirBuilder, expr: &AstNode, start_child: i64, arg_base:
 	end
 	var j = 0
 	when j < ai loop
-		b_mut = emit_set_arg(b_mut, arg_base + j, vec_get_rt(g_mir_scratch_args, scratch_start + j))
+		let staged_arg = vec_get_rt(g_mir_scratch_args, scratch_start + j) as MirOperand
+		let staged_arg_node = ast_node_child(expr, start_child + j)
+		let staged_arg_type = infer_expr_type_name(staged_arg_node)
+		var s_typ: i64 = 0
+		if fat_cstr_eq(staged_arg_type, "float") == 1 or fat_cstr_eq(staged_arg_type, "f64") == 1 do
+			s_typ = MirType.F64 as i64
+		end
+		b_mut = emit_set_arg_typed(b_mut, arg_base + j, staged_arg, s_typ)
 		j = j + 1
 	end
 	g_mir_scratch_top = scratch_start
@@ -153,7 +160,6 @@ func lower_call_with_ref_support_ast(b: MirBuilder, expr: &AstNode, callee: stri
     writeback_vnames = vec_new_rt()
     writeback_addrs = vec_new_rt()
     var b_cur = b
-    var slot_idx = 0
     var arg_i = 0
     when arg_i < n_args loop
         arg = ast_node_child(expr, arg_start + arg_i)
@@ -189,8 +195,9 @@ func lower_call_with_ref_support_ast(b: MirBuilder, expr: &AstNode, callee: stri
                 end
                 if not is_forwarded do
                     var (b_s, addr_vr) = builder_new_vreg(b_cur)
-                    b_s = emit_intrinsic(b_s, MIR_INTR_LOAD_ADDR, mir_opnd_vreg(addr_vr), mir_opnd_imm(slot_idx))
-                    slot_idx = slot_idx + 1
+                    let ref_slot = g_next_ref_slot
+                    g_next_ref_slot = g_next_ref_slot + 1
+                    b_s = emit_intrinsic(b_s, MIR_INTR_LOAD_ADDR, mir_opnd_vreg(addr_vr), mir_opnd_imm(ref_slot))
                     b_cur = b_s
                     if pmode == 1 do
                         v_cur = get_var_vreg(b_cur, vname)
@@ -257,10 +264,26 @@ func lower_call_with_ref_support_ast(b: MirBuilder, expr: &AstNode, callee: stri
 
     # Keep the ABI call sequence contiguous: ERX-clear, SetArg*, Call.
     b_cur = lower_prepare_call_error(b_cur)
+    let setarg_ffi_id = ffi_import_find(callee)
+    var foreign_integer_index = 0
+    var foreign_float_index = 0
     var j = 0
     when j < n_args loop
         let a_opnd = vec_get_rt(staged_args, j) as MirOperand
-        b_cur = emit_set_arg(b_cur, j, a_opnd)
+        var abi_argument_index = j
+        var s_typ: i64 = 0
+        if setarg_ffi_id >= 0 do
+            let foreign_param_type = ffi_import_param_type(setarg_ffi_id, j)
+            if fat_cstr_eq(foreign_param_type, "float") == 1 or fat_cstr_eq(foreign_param_type, "f64") == 1 do
+                s_typ = MirType.F64 as i64
+                abi_argument_index = foreign_float_index
+                foreign_float_index = foreign_float_index + 1
+            else
+                abi_argument_index = foreign_integer_index
+                foreign_integer_index = foreign_integer_index + 1
+            end
+        end
+        b_cur = emit_set_arg_typed(b_cur, abi_argument_index, a_opnd, s_typ)
         j = j + 1
     end
 
@@ -271,8 +294,40 @@ func lower_call_with_ref_support_ast(b: MirBuilder, expr: &AstNode, callee: stri
     else
         ins_c = mir_instr_new(MirOp.Call, mir_opnd_vreg(dst_v), mir_opnd_imm(n_args), mir_opnd_imm(cid))
     end
+    var call_return_type = fn_type_str
+    let call_ffi_id = setarg_ffi_id
+    if call_ffi_id >= 0 do
+        call_return_type = ffi_import_return_type(call_ffi_id)
+    eif (fn_ast as i64) != 0 do
+        call_return_type = ast_node_name2(fn_ast)
+    end
+    if fat_cstr_eq(call_return_type, "float") == 1 or fat_cstr_eq(call_return_type, "f64") == 1 do
+        mir_instr_set_type(ins_c, MirType.F64 as i64)
+    end
+    if fat_cstr_eq(callee, "q80CreateView") == 1 or fat_cstr_eq(callee, "q80ValidateView") == 1 or fat_cstr_eq(callee, "q80Gemv") == 1 or fat_cstr_eq(callee, "q80Gemm") == 1 or fat_cstr_eq(callee, "q80GemvScalar") == 1 or fat_cstr_eq(callee, "q80GemvSimd") == 1 or fat_cstr_eq(callee, "q80GemvNeon") == 1 do
+        var q_type = ast_node_name2(expr)
+        if fat_cstr_eq(callee, "q80CreateView") == 0 and ast_node_child_count(expr) > 0 do
+            let view_arg = ast_node_child(expr, 0)
+            q_type = infer_expr_type_name(view_arg)
+            if ast_node_type_of(view_arg) == AstType.AddrOf and ast_node_child_count(view_arg) > 0 do
+                let view_target = ast_node_child(view_arg, 0)
+                if ast_node_type_of(view_target) == AstType.Identifier do
+                    q_type = get_var_type(ast_node_name(view_target))
+                end
+            end
+        end
+        if is_quantized_type_str(q_type as int) == false do
+            q_type = format_quantized_q80_unknown_type()
+        end
+        set_quantized_instr_metadata(ins_c, q_type)
+    end
     b_call = builder_add_instr(b_call, ins_c)
-    b_call = lower_check_call_error(b_call)
+    # External C/Wasm callees do not implement Vir's ERX return channel.
+    # The boundary was cleared before the call, so do not synthesize a
+    # fallible-call CFG after a target-neutral FFI import.
+    if setarg_ffi_id < 0 do
+        b_call = lower_check_call_error(b_call)
+    end
 
     var wb_i = 0
     let n_wb = vec_len_rt(writeback_vnames)

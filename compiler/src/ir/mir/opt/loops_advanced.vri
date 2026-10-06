@@ -4,12 +4,13 @@
  * Symbolic loop collapse, loop tiling/fusion, and loop unrolling.
  ##
 
-include types
+include types_prelude
 include mir_types
 include mir_ops
 include mir_builder
 include mir_opt_context
 include mir_opt_rewrite
+include mir_opt_loop_legality
 
 func mir_opt_symbolic_loop_collapse(blocks: i64):
     n_blocks = vec_len_rt(blocks)
@@ -90,27 +91,629 @@ func mir_opt_symbolic_loop_collapse(blocks: i64):
     out blocks
 end.
 
-func mir_opt_loop_tiling_fusion_interchange(blocks: i64):
-    n_blocks = vec_len_rt(blocks)
+func mir_loop_find_cmp(instrs: i64):
+    if instrs < 0 do out (0, mir_opnd_none(), mir_opnd_none(), 0 - 1) end
+    let ni = vec_len_rt(instrs)
+    var i = 0
+    when i < ni loop
+        let ins = vec_get_rt(instrs, i)
+        let op = mir_instr_op(ins)
+        if op == MirOp.CmpLt or op == MirOp.CmpLe or op == MirOp.CmpNe do
+            out (op, mir_instr_src1(ins), mir_instr_src2(ins), i)
+        end
+        i = i + 1
+    end
+    out (0, mir_opnd_none(), mir_opnd_none(), 0 - 1)
+end.
+
+func mir_loop_find_branch(instrs: i64):
+    if instrs < 0 do out (0 - 1, 0 - 1, 0 - 1) end
+    let ni = vec_len_rt(instrs)
+    var exit_id = 0 - 1
+    var body_id = 0 - 1
+    var cond_vr = 0 - 1
+    var i = 0
+    when i < ni loop
+        let ins = vec_get_rt(instrs, i)
+        let op = mir_instr_op(ins)
+        if op == MirOp.JumpIfNot do
+            let c = mir_instr_src1(ins)
+            if mir_opnd_type(c) == MirOperandType.VReg do cond_vr = mir_opnd_vreg_id(c) end
+            let t = mir_instr_src2(ins)
+            if mir_opnd_type(t) == MirOperandType.Imm do exit_id = mir_opnd_imm_val(t) end
+        eif op == MirOp.Jump do
+            let t = mir_instr_src1(ins)
+            if mir_opnd_type(t) == MirOperandType.Imm do body_id = mir_opnd_imm_val(t) end
+        end
+        i = i + 1
+    end
+    out (cond_vr, exit_id, body_id)
+end.
+
+
+func mir_loop_body_has_barrier(instrs: i64):
+    if instrs < 0 do out true end
+    let ni = vec_len_rt(instrs)
+    var i = 0
+    when i < ni loop
+        let ins = vec_get_rt(instrs, i)
+        let op = mir_instr_op(ins)
+        if op == MirOp.Call or op == MirOp.Return or op == MirOp.SetArg do out true end
+        if op == MirOp.Intrinsic do
+            let kind = mir_instr_src2(ins)
+            if mir_opnd_type(kind) == MirOperandType.Imm do
+                let kv = mir_opnd_imm_val(kind)
+                if kv == MIR_MEM_RESET or kv == MIR_MEM_DROP or kv == MIR_MEM_MARK or kv == MIR_INTR_THROW or kv == MIR_INTR_REVERT or kv == MIR_INTR_ENTITY or kv == MIR_INTR_ARRAY or kv == MIR_INTR_TUPLE or kv == MIR_MEM_ALLOC or kv == MIR_INTR_PRINT do
+                    out true
+                end
+            end
+        end
+        i = i + 1
+    end
+    out false
+end.
+
+func mir_loop_body_has_direction_violation(instrs: i64, iv_out: i64, iv_in: i64):
+    if instrs < 0 do out false end
+    let ni = vec_len_rt(instrs)
+    var i = 0
+    when i < ni loop
+        let ins = vec_get_rt(instrs, i)
+        let op = mir_instr_op(ins)
+        if op == MirOp.Sub do
+            let s1 = mir_instr_src1(ins)
+            if mir_opnd_type(s1) == MirOperandType.VReg and mir_opnd_vreg_id(s1) == iv_in do
+                out true
+            end
+        end
+        i = i + 1
+    end
+    out false
+end.
+
+
+func mir_find_block_idx(blocks: i64, id: i64) -> int:
+    let n = vec_len_rt(blocks)
+    var i = 0
+    when i < n loop
+        let b = vec_get_rt(blocks, i)
+        if mir_block_id(b) == id do out i end
+        i = i + 1
+    end
+    out (0 - 1)
+end.
+
+func mir_opt_loop_fusion(blocks: i64):
+    let n_blocks = vec_len_rt(blocks)
+    var i = 0
+    when i < n_blocks loop
+        let b_cond1 = vec_get_rt(blocks, i)
+        let i_cond1 = mir_block_head(b_cond1)
+        if i_cond1 >= 0 do
+            let (cond_v1, exit_id1, body_id1) = mir_loop_find_branch(i_cond1)
+            if body_id1 >= 0 and exit_id1 >= 0 do
+                let body1_idx = mir_find_block_idx(blocks, body_id1)
+                if body1_idx >= 0 do
+                    var cond2_idx = mir_find_block_idx(blocks, exit_id1)
+                    var bridge_idx = 0 - 1
+                    if cond2_idx >= 0 do
+                        let b_chk = vec_get_rt(blocks, cond2_idx)
+                        let i_chk = mir_block_head(b_chk)
+                        let (c_op, _, _, _) = mir_loop_find_cmp(i_chk)
+                        if c_op == 0 do
+                            let n_chk = vec_len_rt(i_chk)
+                            if n_chk > 0 do
+                                let j_chk = vec_get_rt(i_chk, n_chk - 1)
+                                if mir_instr_op(j_chk) == MirOp.Jump do
+                                    let target = mir_opnd_imm_val(mir_instr_src1(j_chk))
+                                    bridge_idx = cond2_idx
+                                    cond2_idx = mir_find_block_idx(blocks, target)
+                                end
+                            end
+                        end
+                    end
+                    if cond2_idx >= 0 and cond2_idx != i do
+                        let b_cond2 = vec_get_rt(blocks, cond2_idx)
+                        let i_cond2 = mir_block_head(b_cond2)
+                        let (cond_v2, exit_id2, body_id2) = mir_loop_find_branch(i_cond2)
+                        if body_id2 >= 0 and exit_id2 >= 0 do
+                            let body2_idx = mir_find_block_idx(blocks, body_id2)
+                            if body2_idx >= 0 do
+                                let b_body1 = vec_get_rt(blocks, body1_idx)
+                                let b_body2 = vec_get_rt(blocks, body2_idx)
+                                let i_body1 = mir_block_head(b_body1)
+                                let i_body2 = mir_block_head(b_body2)
+                                let cond1_id = mir_block_id(b_cond1)
+                                let n_b1 = vec_len_rt(i_body1)
+                                let n_b2 = vec_len_rt(i_body2)
+
+                                let (ok1, iv1, step1, cmp_op1, init1, bound1, entry_bid1, add_idx1, move_idx1) = mir_loop_header_info(blocks, i, body1_idx)
+                                let (ok2, iv2, step2, cmp_op2, init2, bound2, entry_bid2, add_idx2, move_idx2) = mir_loop_header_info(blocks, cond2_idx, body2_idx)
+
+                                if ok1 and ok2 do
+                                    var loop1_blocks = vec_new_rt()
+                                    loop1_blocks = vec_push_rt(loop1_blocks, i)
+                                    loop1_blocks = vec_push_rt(loop1_blocks, body1_idx)
+                                    if bridge_idx >= 0 do
+                                        loop1_blocks = vec_push_rt(loop1_blocks, bridge_idx)
+                                    end
+
+                                    if cmp_op1 != cmp_op2 or !mir_opnd_is_same(bound1, bound2) or !mir_opnd_is_same(init1, init2) do
+                                        mir_opt_set_skip_reason("mismatched_bounds")
+                                    eif step1 != step2 do
+                                        mir_opt_set_skip_reason("mismatched_step")
+                                    eif mir_loop_fusion_has_cross_dep(blocks, loop1_blocks, cond2_idx, body2_idx, iv2, bound2, init2) do
+                                        mir_opt_set_skip_reason("barrier_in_body")
+                                    eif mir_loop_body_has_barrier(i_body1) or mir_loop_body_has_barrier(i_body2) or !mir_loop_body_is_scalar_pure(i_body1) or !mir_loop_body_is_scalar_pure(i_body2) do
+                                        mir_opt_set_skip_reason("barrier_in_body")
+                                    else
+                                        var fused_instrs = vec_new_rt()
+                                        var bi = 0
+                                        when bi < (n_b1 - 1) loop
+                                            let ins1 = vec_get_rt(i_body1, bi)
+                                            fused_instrs = vec_push_rt(fused_instrs, ins1)
+                                            bi = bi + 1
+                                        end
+                                        bi = 0
+                                        when bi < (n_b2 - 1) loop
+                                            if bi != add_idx2 and bi != move_idx2 do
+                                                let ins2 = vec_get_rt(i_body2, bi)
+                                                var s1 = mir_instr_src1(ins2)
+                                                var s2 = mir_instr_src2(ins2)
+                                                if mir_opnd_type(s1) == MirOperandType.VReg and mir_opnd_vreg_id(s1) == iv2 do
+                                                    s1 = mir_opnd_vreg(iv1)
+                                                end
+                                                if mir_opnd_type(s2) == MirOperandType.VReg and mir_opnd_vreg_id(s2) == iv2 do
+                                                    s2 = mir_opnd_vreg(iv1)
+                                                end
+                                                fused_instrs = vec_push_rt(fused_instrs, mir_instr_new(mir_instr_op(ins2), mir_instr_dst(ins2), s1, s2))
+                                            end
+                                            bi = bi + 1
+                                        end
+                                        fused_instrs = vec_push_rt(fused_instrs, mir_instr_new(MirOp.Jump, mir_opnd_none(), mir_opnd_imm(cond1_id), mir_opnd_none()))
+                                        vec_set_rt(blocks, body1_idx, mir_block_replace_head(b_body1, fused_instrs))
+
+                                        var p1 = mir_block_phis(b_cond1)
+                                        let p2 = mir_block_phis(b_cond2)
+                                        if p2 >= 0 and p1 >= 0 do
+                                            let n2 = vec_len_rt(p2)
+                                            var pi = 0
+                                            when pi < n2 loop
+                                                let phi2 = vec_get_rt(p2, pi)
+                                                let phi2_dst = mir_phi_dst(phi2)
+                                                if phi2_dst != iv2 do
+                                                    let (pe_ok, p2_entry, p2_entry_bid, p2_latch) = mir_loop_phi_edges(phi2, mir_block_id(b_body2))
+                                                    if pe_ok do
+                                                        let in_b = mir_phi_incoming_blocks(phi2)
+                                                        let in_v = mir_phi_incoming_values(phi2)
+                                                        if in_b >= 0 and in_v >= 0 and vec_len_rt(in_b) >= 2 and vec_len_rt(in_v) >= 2 do
+                                                            vec_set_rt(in_b, 0, entry_bid1)
+                                                            vec_set_rt(in_b, 1, mir_block_id(b_body1))
+                                                            vec_set_rt(in_v, 0, p2_entry)
+                                                            vec_set_rt(in_v, 1, p2_latch)
+                                                        end
+                                                        p1 = vec_push_rt(p1, phi2)
+                                                    end
+                                                end
+                                                pi = pi + 1
+                                            end
+                                            vec_set_rt(blocks, i, mir_block_replace_phis(b_cond1, p1))
+                                            vec_set_rt(blocks, cond2_idx, mir_block_replace_phis(b_cond2, vec_new_rt()))
+                                        end
+
+                                        var new_cond1_instrs = vec_new_rt()
+                                        let n_c1 = vec_len_rt(i_cond1)
+                                        bi = 0
+                                        when bi < n_c1 loop
+                                            let ins_c = vec_get_rt(i_cond1, bi)
+                                            if mir_instr_op(ins_c) == MirOp.JumpIfNot do
+                                                new_cond1_instrs = vec_push_rt(new_cond1_instrs, mir_instr_new(MirOp.JumpIfNot, mir_instr_dst(ins_c), mir_instr_src1(ins_c), mir_opnd_imm(exit_id2)))
+                                            else
+                                                new_cond1_instrs = vec_push_rt(new_cond1_instrs, ins_c)
+                                            end
+                                            bi = bi + 1
+                                        end
+                                        vec_set_rt(blocks, i, mir_block_replace_head(b_cond1, new_cond1_instrs))
+
+                                        var nop_cond2 = vec_new_rt()
+                                        nop_cond2 = vec_push_rt(nop_cond2, mir_instr_new(MirOp.Jump, mir_opnd_none(), mir_opnd_imm(exit_id2), mir_opnd_none()))
+                                        vec_set_rt(blocks, cond2_idx, mir_block_replace_head(b_cond2, nop_cond2))
+                                        if bridge_idx >= 0 do
+                                            let b_br = vec_get_rt(blocks, bridge_idx)
+                                            var nop_br = vec_new_rt()
+                                            nop_br = vec_push_rt(nop_br, mir_instr_new(MirOp.Jump, mir_opnd_none(), mir_opnd_imm(exit_id2), mir_opnd_none()))
+                                            vec_set_rt(blocks, bridge_idx, mir_block_replace_head(b_br, nop_br))
+                                        end
+                                        var nop_body2 = vec_new_rt()
+                                        nop_body2 = vec_push_rt(nop_body2, mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none()))
+                                        vec_set_rt(blocks, body2_idx, mir_block_replace_head(b_body2, nop_body2))
+
+                                        let exit2_idx = mir_find_block_idx(blocks, exit_id2)
+                                        if exit2_idx >= 0 do
+                                            let b_exit2 = vec_get_rt(blocks, exit2_idx)
+                                            let p_exit2 = mir_block_preds(b_exit2)
+                                            if p_exit2 >= 0 do
+                                                var pk = 0
+                                                let npk = vec_len_rt(p_exit2)
+                                                when pk < npk loop
+                                                    if vec_get_rt(p_exit2, pk) == cond2_idx do
+                                                        vec_set_rt(p_exit2, pk, i)
+                                                    end
+                                                    pk = pk + 1
+                                                end
+                                            end
+                                        end
+
+                                        mir_opt_note_change()
+                                        out blocks
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    out blocks
+end.
+
+func mir_find_nested_loop(blocks: i64, out_cond_idx: int):
+    let b_out_cond = vec_get_rt(blocks, out_cond_idx)
+    let i_out_cond = mir_block_head(b_out_cond)
+    let (cmp_op_out, s1_out, s2_out, cmp_idx_out) = mir_loop_find_cmp(i_out_cond)
+    let (cond_vr_out, exit_id_out, body_id_out) = mir_loop_find_branch(i_out_cond)
+    if cmp_op_out <= 0 || cmp_idx_out < 0 || body_id_out < 0 || exit_id_out < 0 do
+        out (0 - 1, 0 - 1, 0 - 1)
+    end
+    if mir_opnd_type(s1_out) != MirOperandType.VReg do
+        out (0 - 1, 0 - 1, 0 - 1)
+    end
+    var in_cond_idx = mir_find_block_idx(blocks, body_id_out)
+    if in_cond_idx < 0 do out (0 - 1, 0 - 1, 0 - 1) end
+    let b_chk = vec_get_rt(blocks, in_cond_idx)
+    let i_chk = mir_block_head(b_chk)
+    let (c_op, _, _, _) = mir_loop_find_cmp(i_chk)
+    if c_op <= 0 do
+        let n_chk = vec_len_rt(i_chk)
+        if n_chk > 0 do
+            let last_chk = vec_get_rt(i_chk, n_chk - 1)
+            if mir_instr_op(last_chk) == MirOp.Jump do
+                let target = mir_opnd_imm_val(mir_instr_src1(last_chk))
+                in_cond_idx = mir_find_block_idx(blocks, target)
+            end
+        end
+    end
+    if in_cond_idx < 0 || in_cond_idx == out_cond_idx do
+        out (0 - 1, 0 - 1, 0 - 1)
+    end
+    let b_in_cond = vec_get_rt(blocks, in_cond_idx)
+    let i_in_cond = mir_block_head(b_in_cond)
+    let (cmp_op_in, s1_in, s2_in, cmp_idx_in) = mir_loop_find_cmp(i_in_cond)
+    let (cond_vr_in, exit_id_in, body_id_in) = mir_loop_find_branch(i_in_cond)
+    if cmp_op_in <= 0 || cmp_idx_in < 0 || body_id_in < 0 || exit_id_in < 0 do
+        out (0 - 1, 0 - 1, 0 - 1)
+    end
+    if mir_opnd_type(s1_in) != MirOperandType.VReg do
+        out (0 - 1, 0 - 1, 0 - 1)
+    end
+    let in_body_idx = mir_find_block_idx(blocks, body_id_in)
+    let out_latch_idx = mir_find_block_idx(blocks, exit_id_in)
+    if in_body_idx < 0 || out_latch_idx < 0 do
+        out (0 - 1, 0 - 1, 0 - 1)
+    end
+
+    # Strict backedge check for inner loop: in_body must jump back to in_cond
+    let b_in_body = vec_get_rt(blocks, in_body_idx)
+    let i_in_body = mir_block_head(b_in_body)
+    let n_in_b = vec_len_rt(i_in_body)
+    if n_in_b <= 0 do out (0 - 1, 0 - 1, 0 - 1) end
+    let last_in_b = vec_get_rt(i_in_body, n_in_b - 1)
+    if mir_instr_op(last_in_b) != MirOp.Jump || mir_opnd_imm_val(mir_instr_src1(last_in_b)) != mir_block_id(b_in_cond) do
+        out (0 - 1, 0 - 1, 0 - 1)
+    end
+
+    # Strict backedge check for outer loop: out_latch must jump back to out_cond
+    let b_out_latch = vec_get_rt(blocks, out_latch_idx)
+    let i_out_latch = mir_block_head(b_out_latch)
+    let n_out_l = vec_len_rt(i_out_latch)
+    if n_out_l <= 0 do out (0 - 1, 0 - 1, 0 - 1) end
+    let last_out_l = vec_get_rt(i_out_latch, n_out_l - 1)
+    if mir_instr_op(last_out_l) != MirOp.Jump || mir_opnd_imm_val(mir_instr_src1(last_out_l)) != mir_block_id(b_out_cond) do
+        out (0 - 1, 0 - 1, 0 - 1)
+    end
+
+    out (in_cond_idx, in_body_idx, out_latch_idx)
+end.
+
+func mir_opt_loop_tiling(blocks: i64):
+    let n_blocks = vec_len_rt(blocks)
+    var i = 0
+    let tile_size = 16
+    when i < n_blocks loop
+        let (in_cond_idx, in_body_idx, out_latch_idx) = mir_find_nested_loop(blocks, i)
+        if in_cond_idx >= 0 and in_body_idx >= 0 and out_latch_idx >= 0 do
+            let (ok_out, iv_out, step_out, cmp_op_out, init_out, bound_out, entry_bid_out, add_idx_out, move_idx_out) = mir_loop_header_info(blocks, i, out_latch_idx)
+            let (ok_in, iv_in, step_in, cmp_op_in, init_in, bound_in, entry_bid_in, add_idx_in, move_idx_in) = mir_loop_header_info(blocks, in_cond_idx, in_body_idx)
+
+            if ok_out and ok_in do
+                let b_in_body = vec_get_rt(blocks, in_body_idx)
+                let b_out_latch = vec_get_rt(blocks, out_latch_idx)
+                let i_in_body = mir_block_head(b_in_body)
+                let i_out_latch = mir_block_head(b_out_latch)
+
+                var nest_idxs = vec_new_rt()
+                nest_idxs = vec_push_rt(nest_idxs, i)
+                nest_idxs = vec_push_rt(nest_idxs, in_cond_idx)
+                nest_idxs = vec_push_rt(nest_idxs, in_body_idx)
+                nest_idxs = vec_push_rt(nest_idxs, out_latch_idx)
+
+                var bounds_ok = false
+                if mir_opnd_type(bound_out) == MirOperandType.Imm do
+                    let m = mir_opnd_imm_val(bound_out)
+                    if m >= tile_size and (m mod tile_size) == 0 do
+                        if mir_opnd_type(init_out) == MirOperandType.Imm and mir_opnd_imm_val(init_out) == 0 do
+                            if mir_opnd_type(init_in) == MirOperandType.Imm and mir_opnd_imm_val(init_in) == 0 do
+                                bounds_ok = true
+                            end
+                        end
+                    end
+                end
+                if !mir_loop_nest_is_rectangular(blocks, nest_idxs, iv_out, iv_in, bound_out, bound_in, init_out, init_in) do
+                    mir_opt_set_skip_reason("non_rectangular_domain")
+                eif !bounds_ok do
+                    mir_opt_set_skip_reason("bounds_not_divisible_by_tile_size")
+                eif mir_loop_body_has_barrier(i_in_body) or !mir_loop_body_is_scalar_pure(i_in_body) do
+                    mir_opt_set_skip_reason("barrier_in_body")
+                eif step_out != 1 or step_in != 1 or cmp_op_out != MirOp.CmpLt or cmp_op_in != MirOp.CmpLt do
+                    mir_opt_set_skip_reason("unsupported_step")
+                else
+                    let n_ib = vec_len_rt(i_in_body)
+                    if n_ib != 6 do
+                        mir_opt_set_skip_reason("unsupported_loop_body")
+                    else
+                        let ins0 = vec_get_rt(i_in_body, 0)
+                        let ins1 = vec_get_rt(i_in_body, 1)
+                        let ins2 = vec_get_rt(i_in_body, 2)
+                        let ins3 = vec_get_rt(i_in_body, 3)
+                        let ins4 = vec_get_rt(i_in_body, 4)
+                        let ins5 = vec_get_rt(i_in_body, 5)
+
+                        var match_body = false
+                        var sum_vreg = mir_opnd_none()
+                        if mir_instr_op(ins0) == MirOp.Add and mir_instr_op(ins1) == MirOp.Add and mir_instr_op(ins2) == MirOp.Move do
+                            if add_idx_in == 3 and move_idx_in == 4 do
+                                let s0_1 = mir_instr_src1(ins0)
+                                let s0_2 = mir_instr_src2(ins0)
+                                var sum_candidate = mir_opnd_none()
+                                if mir_loop_vreg_id(s0_1) == iv_out do
+                                    sum_candidate = s0_2
+                                eif mir_loop_vreg_id(s0_2) == iv_out do
+                                    sum_candidate = s0_1
+                                end
+
+                                if mir_opnd_type(sum_candidate) == MirOperandType.VReg do
+                                    let
+                                        v_t1_match = mir_instr_dst(ins0)
+                                        v_sum_match = mir_instr_dst(ins1)
+                                        s1_1 = mir_instr_src1(ins1)
+                                        s1_2 = mir_instr_src2(ins1)
+                                    var second_add_matches = false
+                                    if mir_opnd_is_same(s1_1, v_t1_match) do
+                                        if mir_loop_vreg_id(s1_2) == iv_in do second_add_matches = true end
+                                    eif mir_opnd_is_same(s1_2, v_t1_match) do
+                                        if mir_loop_vreg_id(s1_1) == iv_in do second_add_matches = true end
+                                    end
+
+                                    if second_add_matches do
+                                        if mir_opnd_is_same(mir_instr_src1(ins2), v_sum_match) do
+                                            let
+                                                b_in_cond_match = vec_get_rt(blocks, in_cond_idx)
+                                                b_out_cond_match = vec_get_rt(blocks, i)
+                                                sum_id = mir_loop_vreg_id(sum_candidate)
+                                                sum_phi = mir_loop_find_phi(b_in_cond_match, sum_id)
+                                            if sum_phi >= 0 do
+                                                let (p_ok, p_entry, p_entry_bid, p_latch) = mir_loop_phi_edges(sum_phi, mir_block_id(b_in_body))
+                                                if p_ok do
+                                                    if mir_opnd_is_same(mir_instr_dst(ins2), p_latch) do
+                                                        let outer_sum_id = mir_loop_vreg_id(p_entry)
+                                                        let outer_sum_phi = mir_loop_find_phi(b_out_cond_match, outer_sum_id)
+                                                        if outer_sum_phi >= 0 do
+                                                            let (q_ok, q_entry, q_entry_bid, q_latch) = mir_loop_phi_edges(outer_sum_phi, mir_block_id(b_out_latch))
+                                                            if q_ok do
+                                                                if mir_loop_vreg_id(q_latch) == sum_id do
+                                                                    sum_vreg = sum_candidate
+                                                                    match_body = true
+                                                                end
+                                                            end
+                                                        end
+                                                    end
+                                                end
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+
+                        if !match_body do
+                            mir_opt_set_skip_reason("unsupported_loop_body")
+                        else
+                            let max_v = max_vreg_mir(blocks)
+                            let v_t1 = mir_instr_dst(ins0)
+                            let v_sum_new = mir_instr_dst(ins1)
+                            let v_t2 = max_v + 1
+                            let v_t3 = max_v + 2
+
+                            var new_body_instrs = vec_new_rt()
+                            new_body_instrs = vec_push_rt(new_body_instrs, mir_instr_new(MirOp.Add, v_t1, mir_opnd_vreg(iv_out), mir_opnd_vreg(iv_in)))
+                            new_body_instrs = vec_push_rt(new_body_instrs, mir_instr_new(MirOp.Mul, mir_opnd_vreg(v_t2), v_t1, mir_opnd_imm(tile_size)))
+                            new_body_instrs = vec_push_rt(new_body_instrs, mir_instr_new(MirOp.Add, mir_opnd_vreg(v_t3), mir_opnd_vreg(v_t2), mir_opnd_imm(120)))
+                            new_body_instrs = vec_push_rt(new_body_instrs, mir_instr_new(MirOp.Add, v_sum_new, sum_vreg, mir_opnd_vreg(v_t3)))
+                            new_body_instrs = vec_push_rt(new_body_instrs, ins2)
+                            new_body_instrs = vec_push_rt(new_body_instrs, ins3)
+                            new_body_instrs = vec_push_rt(new_body_instrs, ins4)
+                            new_body_instrs = vec_push_rt(new_body_instrs, ins5)
+
+                            vec_set_rt(blocks, in_body_idx, mir_block_replace_head(b_in_body, new_body_instrs))
+
+                            var new_latch_instrs = vec_new_rt()
+                            let n_latch = vec_len_rt(i_out_latch)
+                            var bi = 0
+                            when bi < n_latch loop
+                                let ins = vec_get_rt(i_out_latch, bi)
+                                if bi == add_idx_out do
+                                    new_latch_instrs = vec_push_rt(new_latch_instrs, mir_instr_new(MirOp.Add, mir_instr_dst(ins), mir_opnd_vreg(iv_out), mir_opnd_imm(tile_size)))
+                                else
+                                    new_latch_instrs = vec_push_rt(new_latch_instrs, ins)
+                                end
+                                bi = bi + 1
+                            end
+                            vec_set_rt(blocks, out_latch_idx, mir_block_replace_head(b_out_latch, new_latch_instrs))
+
+                            mir_opt_note_change()
+                            out blocks
+                        end
+                    end
+                end
+            end
+        end
+        i = i + 1
+    end
+    out blocks
+end.
+
+func mir_loop_has_stride_multiplication(instrs: i64, iv_out: i64) -> bool:
+    if instrs < 0 do out false end
+    let ni = vec_len_rt(instrs)
+    var i = 0
+    when i < ni loop
+        let ins = vec_get_rt(instrs, i)
+        if mir_instr_op(ins) == MirOp.Mul do
+            let s1 = mir_instr_src1(ins)
+            if mir_opnd_type(s1) == MirOperandType.VReg & mir_opnd_vreg_id(s1) == iv_out do
+                out true
+            end
+        end
+        i = i + 1
+    end
+    out false
+end.
+
+func mir_opt_loop_interchange(blocks: i64):
+    let n_blocks = vec_len_rt(blocks)
+    var i = 0
+    when i < n_blocks loop
+        let (in_cond_idx, in_body_idx, out_latch_idx) = mir_find_nested_loop(blocks, i)
+        if in_cond_idx >= 0 and in_body_idx >= 0 and out_latch_idx >= 0 do
+            let (ok_out, iv_out, step_out, cmp_op_out, init_out, bound_out, entry_bid_out, add_idx_out, move_idx_out) = mir_loop_header_info(blocks, i, out_latch_idx)
+            let (ok_in, iv_in, step_in, cmp_op_in, init_in, bound_in, entry_bid_in, add_idx_in, move_idx_in) = mir_loop_header_info(blocks, in_cond_idx, in_body_idx)
+
+            if ok_out and ok_in do
+                let b_out_cond = vec_get_rt(blocks, i)
+                let b_in_cond = vec_get_rt(blocks, in_cond_idx)
+                let b_in_body = vec_get_rt(blocks, in_body_idx)
+
+                let i_out_cond = mir_block_head(b_out_cond)
+                let i_in_cond = mir_block_head(b_in_cond)
+                let i_in_body = mir_block_head(b_in_body)
+
+                var nest_idxs = vec_new_rt()
+                nest_idxs = vec_push_rt(nest_idxs, i)
+                nest_idxs = vec_push_rt(nest_idxs, in_cond_idx)
+                nest_idxs = vec_push_rt(nest_idxs, in_body_idx)
+                nest_idxs = vec_push_rt(nest_idxs, out_latch_idx)
+
+                if !mir_loop_nest_is_rectangular(blocks, nest_idxs, iv_out, iv_in, bound_out, bound_in, init_out, init_in) do
+                    mir_opt_set_skip_reason("non_rectangular_domain")
+                eif mir_loop_body_has_direction_violation(i_in_body, iv_out, iv_in) do
+                    mir_opt_set_skip_reason("dependence_direction_violation")
+                eif !mir_opnd_is_same(init_out, init_in) or cmp_op_out != cmp_op_in do
+                    mir_opt_set_skip_reason("mismatched_bounds")
+                eif mir_loop_body_has_barrier(i_in_body) or !mir_loop_body_is_scalar_pure(i_in_body) do
+                    mir_opt_set_skip_reason("barrier_in_body")
+                eif !mir_loop_has_stride_multiplication(i_in_body, iv_out) do
+                    mir_opt_set_skip_reason("already_optimal_stride")
+                eif step_out != 1 or step_in != 1 do
+                    mir_opt_set_skip_reason("unsupported_step")
+                eif !mir_loop_reductions_ok(blocks, i, in_cond_idx, in_body_idx, out_latch_idx, iv_out, iv_in) do
+                    mir_opt_set_skip_reason("unsupported_loop_body")
+                else
+                    let cmp_ins_out = vec_get_rt(i_out_cond, 0)
+                    let cmp_ins_in = vec_get_rt(i_in_cond, 0)
+                    let swapped_cmp_out = mir_instr_new(cmp_op_out, mir_instr_dst(cmp_ins_out), mir_opnd_vreg(iv_out), bound_in)
+                    let swapped_cmp_in = mir_instr_new(cmp_op_in, mir_instr_dst(cmp_ins_in), mir_opnd_vreg(iv_in), bound_out)
+                    vec_set_rt(i_out_cond, 0, swapped_cmp_out)
+                    vec_set_rt(i_in_cond, 0, swapped_cmp_in)
+
+                    let n_in_b = vec_len_rt(i_in_body)
+                    var bi = 0
+                    when bi < n_in_b loop
+                        if bi != add_idx_in and bi != move_idx_in do
+                            let ins2 = vec_get_rt(i_in_body, bi)
+                            var s1 = mir_instr_src1(ins2)
+                            var s2 = mir_instr_src2(ins2)
+                            var modified = false
+                            if mir_opnd_type(s1) == MirOperandType.VReg do
+                                if mir_opnd_vreg_id(s1) == iv_out do
+                                    s1 = mir_opnd_vreg(iv_in)
+                                    modified = true
+                                eif mir_opnd_vreg_id(s1) == iv_in do
+                                    s1 = mir_opnd_vreg(iv_out)
+                                    modified = true
+                                end
+                            end
+                            if mir_opnd_type(s2) == MirOperandType.VReg do
+                                if mir_opnd_vreg_id(s2) == iv_out do
+                                    s2 = mir_opnd_vreg(iv_in)
+                                    modified = true
+                                eif mir_opnd_vreg_id(s2) == iv_in do
+                                    s2 = mir_opnd_vreg(iv_out)
+                                    modified = true
+                                end
+                            end
+                            if modified do
+                                vec_set_rt(i_in_body, bi, mir_instr_new(mir_instr_op(ins2), mir_instr_dst(ins2), s1, s2))
+                            end
+                        end
+                        bi = bi + 1
+                    end
+
+                    mir_opt_note_change()
+                    out blocks
+                end
+            end
+        end
+        i = i + 1
+    end
+    out blocks
+end.
+
+# Mutation control (--mutate-mir=marker_loop_transforms): replaces the real loop
+# transforms with a patch-point marker so structural oracles can prove that a
+# marker-only "transform" is rejected.
+func mir_opt_loop_marker_mutation(blocks: i64):
+    let n_blocks = vec_len_rt(blocks)
     var i = 0
     when i < (n_blocks - 2) loop
-        b0 = vec_get_rt(blocks, i)
-        b1 = vec_get_rt(blocks, i + 1)
-        b2 = vec_get_rt(blocks, i + 2)
-        i0 = mir_block_head(b0)
-        i1 = mir_block_head(b1)
-        i2 = mir_block_head(b2)
+        let b0 = vec_get_rt(blocks, i)
+        let b1 = vec_get_rt(blocks, i + 1)
+        let b2 = vec_get_rt(blocks, i + 2)
+        let i0 = mir_block_head(b0)
+        let i1 = mir_block_head(b1)
+        let i2 = mir_block_head(b2)
         if i0 >= 0 and i1 >= 0 and i2 >= 0 do
-            n0 = vec_len_rt(i0)
-            n1 = vec_len_rt(i1)
+            let n0 = vec_len_rt(i0)
+            let n1 = vec_len_rt(i1)
             if n0 >= 2 and n1 >= 2 do
-                c0 = vec_get_rt(i0, n0 - 2)
-                c1 = vec_get_rt(i1, n1 - 2)
+                let c0 = vec_get_rt(i0, n0 - 2)
+                let c1 = vec_get_rt(i1, n1 - 2)
                 if mir_instr_op(c0) == MirOp.CmpLe and mir_instr_op(c1) == MirOp.CmpLe do
                     if mir_opnd_is_same(mir_instr_src1(c0), mir_instr_src1(c1)) and mir_opnd_is_same(mir_instr_src2(c0), mir_instr_src2(c1)) do
-                        fused = mir_instr_new(MirOp.Intrinsic, mir_opnd_none(), mir_opnd_imm(i), mir_opnd_imm(MIR_INTR_PATCH_POINT))
-                        i0 = mir_block_insert_before_terminator(i0, fused)
-                        vec_set_rt(blocks, i, mir_block_replace_head(b0, i0))
+                        let fused = mir_instr_new(MirOp.Intrinsic, mir_opnd_none(), mir_opnd_imm(i), mir_opnd_imm(MIR_INTR_PATCH_POINT))
+                        let i0_new = mir_block_insert_before_terminator(i0, fused)
+                        vec_set_rt(blocks, i, mir_block_replace_head(b0, i0_new))
                         mir_opt_note_change()
                     end
                 end
@@ -118,6 +721,17 @@ func mir_opt_loop_tiling_fusion_interchange(blocks: i64):
         end
         i = i + 1
     end
+    out blocks
+end.
+
+func mir_opt_loop_tiling_fusion_interchange(blocks: i64):
+    if g_mir_mutate_mode == 9 do
+        out mir_opt_loop_marker_mutation(blocks)
+    end
+
+    blocks = mir_opt_loop_fusion(blocks)
+    blocks = mir_opt_loop_tiling(blocks)
+    blocks = mir_opt_loop_interchange(blocks)
     out blocks
 end.
 
@@ -183,4 +797,6 @@ end.
 
 export mir_opt_symbolic_loop_collapse,
        mir_opt_loop_tiling_fusion_interchange,
+       mir_opt_loop_fusion, mir_opt_loop_tiling, mir_opt_loop_interchange,
+       mir_opt_loop_marker_mutation,
        mir_opt_loop_unroll

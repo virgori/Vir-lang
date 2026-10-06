@@ -77,7 +77,7 @@ def check_all(verbose: bool = False) -> tuple[int, list[str]]:
     file_count = 0
 
     for file_path in sorted(COMPILER_SRC.rglob("*.vri")):
-        if not file_path.is_file():
+        if not file_path.is_file() or file_path.is_symlink():
             continue
         file_count += 1
         violations = check_file(file_path)

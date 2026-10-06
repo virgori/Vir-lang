@@ -3,20 +3,37 @@ id: "VIRC-ISS-0004"
 type: "ISSUE"
 domain: "VIRC"
 title: "Bind declarations do not reach external backend contracts"
-status: "TRIAGED"
+status: "IMPLEMENTING"
 severity: "S1"
 priority: "P0"
 created: "2026-10-02"
-updated: "2026-10-02"
-owners: [compiler]
-components: [parser, semantic-analysis, ffi, mir, abi, wasm, object-writers, tests]
+updated: "2026-10-05"
+owners:
+  - "compiler"
+components:
+  - "parser"
+  - "semantic-analysis"
+  - "ffi"
+  - "mir"
+  - "abi"
+  - "wasm"
+  - "object-writers"
+  - "tests"
 related:
   issues: []
-  plans: []
-  reports: []
+  plans:
+    - "VIRC-PLN-0025"
+  reports:
+    - "VIRC-RPT-0042"
 supersedes: null
 superseded_by: null
-tags: [bind, ffi, abi, wasm-import, no-opt, artifact-contract]
+tags:
+  - "bind"
+  - "ffi"
+  - "abi"
+  - "wasm-import"
+  - "no-opt"
+  - "artifact-contract"
 ---
 
 # VIRC-ISS-0004 — Bind declarations do not reach external backend contracts
@@ -141,9 +158,9 @@ correctness failure with silent wrong-code potential, so it is S1/P0.
 
 ## 10. Acceptance Criteria
 
-- [ ] C/WASM body and asm missing-body negatives fail semantically with stable
+- [x] C/WASM body and asm missing-body negatives fail semantically with stable
   diagnostics and no artifact; FFI-001/002/006 pass for the intended reason.
-- [ ] `@bind(c)` invocation reaches a real external symbol with changing inputs
+- [x] `@bind(c)` invocation reaches a real external symbol with changing inputs
   and observable side effects; no local stub or spurious missing-return warning
   remains.
 - [ ] Binding kind, signature, provider/symbol, and no-opt metadata survive
@@ -151,15 +168,15 @@ correctness failure with silent wrong-code potential, so it is S1/P0.
 - [ ] Supported native ABIs validate integer/floating/pointer/void, mixed and
   stack arguments, returns, alignment, clobbers, relocation, and dependencies;
   unsupported signatures fail before codegen.
-- [ ] WASM oracle inspects type/import/function/call indices and instantiates
+- [x] WASM oracle inspects type/import/function/call indices and instantiates
   with a host function; missing or mismatched imports fail.
-- [ ] Asm oracle proves function-scoped optimizer exclusion at each supported
+- [x] Asm oracle proves function-scoped optimizer exclusion at each supported
   optimization level and includes a normal-function control.
-- [ ] Runner mutation controls reject local stubs, missing imports, wrong
+- [x] Runner mutation controls reject local stubs, missing imports, wrong
   signatures, and lost no-opt; generic structural fallback cannot yield PASS.
 - [ ] Existing extern, ownership/lifetime, module identity, min/full, sync, and
   self-host fixed-point gates remain green with a newly built compiler.
-- [ ] A VPS PLAN and REPORT link this ISSUE before closure.
+- [x] A VPS PLAN and REPORT link this ISSUE before closure.
 
 ## 11. Related Papers
 
@@ -180,3 +197,7 @@ correctness failure with silent wrong-code potential, so it is S1/P0.
 | Date | Change |
 |---|---|
 | 2026-10-02 | Created and triaged from 3/7 failing bind contract plus production source audit; excluded completed parser and annotation validation work |
+| 2026-10-05 | Linked VIRC-PLN-0025 and VIRC-RPT-0042; verified semantic/external/Wasm/no-opt path at 10/10 contracts but retained IMPLEMENTING for native floating and cross-target ABI evidence |
+| 2026-10-05 | Added native f64 argument/return transport for AAPCS64 and SysV AMD64, independent mixed FP/GPR argument indexing, exact MC assembly oracles, RISC-V float fail-closed validation, and promoted byte-identical self-host compiler; FFI contract is 12/12 and Group 15 is 7/7, but ISSUE remains IMPLEMENTING pending full native runtime/relocation matrix and green broad-suite prerequisites |
+| 2026-10-05 | Linked VIRC-PLN-0025 |
+| 2026-10-05 | Linked VIRC-RPT-0042 |

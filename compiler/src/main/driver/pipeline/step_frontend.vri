@@ -1,0 +1,283 @@
+##
+ * compiler/src/main/driver/pipeline/step_frontend.vri — Compiler Driver: Source read, preprocess, tokenize and parse
+ ##
+
+func virc_step_frontend(input_path: int, verbose: int):
+    cliUiPhaseBegin(1)
+
+    # ── Read source file ──
+    if verbose == 1 do
+        arena:
+            var sb = sb_new()
+            sb = sb_append(sb, "virc: reading ")
+            sb = sb_append(sb, input_path)
+            sb = sb_append(sb, "...")
+            print_ln(sb_to_string(sb))
+            sb_free(sb)
+        end
+    end
+
+    let source_raw = read_file_str(input_path)
+    let null_ast = ast_new(AstType.Program)
+    if source_raw == 0 do
+        compilerFailure(0, "cannot read input file" as int, "virc: error_msg: cannot read input file" as int)
+        out (null_ast, 1)
+    end
+
+    let src_len = rt_strlen(source_raw)
+    let bad_utf8 = utf8_source_invalid_offset_bytes(source_raw, src_len)
+    if bad_utf8 >= 0 do
+        print_str("virc: error [E2201] Source Encoding: invalid UTF-8 in '")
+        print_str(input_path)
+        print_str("' at byte offset ")
+        print_int(bad_utf8)
+        print_str("\n")
+        out (null_ast, 1)
+    end
+    if verbose == 1 do
+        arena:
+            var sb = sb_new()
+            sb = sb_append(sb, "virc: ")
+            sb = sb_append_int(sb, src_len)
+            sb = sb_append(sb, " bytes source")
+            print_ln(sb_to_string(sb))
+            sb_free(sb)
+        end
+    end
+
+    cliUiPhaseEnd(1, src_len, "bytes" as int)
+    if g_phase_timings == 1 do
+        let d1 = cliUiPhaseDurationNs(1)
+        if d1 >= 0 do g_phase_read_us = d1 / 1000 end
+    end
+    cliUiPhaseBegin(2)
+
+    # ── Step 0: Preprocess includes + imports ──
+    var last_slash = -1
+    var pi = 0
+    let path_len = rt_strlen(input_path)
+    when pi < path_len loop
+        if native_read_u8(input_path, pi) == 47 do
+            last_slash = pi
+        end
+        pi = pi + 1
+    end
+    if last_slash >= 0 do
+        let dbuf = vir_alloc(last_slash + 1)
+        pi = 0
+        when pi < last_slash loop
+            native_write_u8(dbuf, pi, native_read_u8(input_path, pi))
+            pi = pi + 1
+        end
+        native_write_u8(dbuf, last_slash, 0)
+        g_inc_base = dbuf
+    end
+
+    var source_fat = str_from_cstr(source_raw)
+    source_fat = text_ascii_sanitize(source_fat)
+    var is_preexpanded = false
+    if fat_str_len(source_fat) >= 13 do
+        if fat_str_byte_at(source_fat, 0) == 35 and fat_str_byte_at(source_fat, 2) == 64 do
+            is_preexpanded = true
+        end
+    end
+    if not is_preexpanded do
+        g_inc_main_file = input_path
+        if verbose == 1 and g_diag_json == 0 do print_ln("virc: expanding includes...") end
+        source_fat = expand_includes_text(source_fat)
+        if g_inc_err == 1 do
+            if g_diag_json == 0 do print_ln("virc: include expansion failed") end
+            virc_print_compile_time()
+            out (null_ast, 1)
+        end
+        source_fat = expand_imports_text(source_fat)
+        if g_inc_err == 1 do
+            if g_diag_json == 0 do print_ln("virc: import expansion failed") end
+            virc_print_compile_time()
+            out (null_ast, 1)
+        end
+        if g_inc_err == 3 do
+            if g_diag_json == 0 do print_ln("virc: import symbol not exported") end
+            virc_print_compile_time()
+            out (null_ast, 1)
+        end
+        source_fat = expand_includes_text(source_fat)
+        if g_inc_err == 1 do
+            if g_diag_json == 0 do print_ln("virc: include expansion failed") end
+            virc_print_compile_time()
+            out (null_ast, 1)
+        end
+    else
+        # Pre-expanded file (starts with # @vir_source): still expand any
+        # new 'include' directives added for incremental modularisation.
+        # Import expansion is intentionally skipped — modules are already
+        # inlined and re-loading them would produce duplicate definitions.
+        g_inc_main_file = input_path
+        source_fat = expand_includes_text(source_fat)
+        if g_inc_err == 1 do
+            print_ln("virc: include expansion failed")
+            out (null_ast, 1)
+        end
+    end
+    g_active_source_manager = sm_new()
+    sm_build_from_source(g_active_source_manager, source_fat, input_path)
+    diagnosticStoreCaptureSources(g_active_source_manager as int)
+    cliUiPhaseEnd(2, fat_str_len(source_fat), "bytes" as int)
+    if g_phase_timings == 1 do
+        let d2 = cliUiPhaseDurationNs(2)
+        if d2 >= 0 do g_phase_preprocess_us = d2 / 1000 end
+    end
+    cliUiPhaseBegin(3)
+    if verbose == 1 do
+        arena:
+            var sb_pre = sb_new()
+            sb_pre = sb_append(sb_pre, "virc: ")
+            sb_pre = sb_append_int(sb_pre, fat_str_len(source_fat))
+            sb_pre = sb_append(sb_pre, " bytes after preprocess")
+            print_ln(sb_to_string(sb_pre))
+            sb_free(sb_pre)
+        end
+    end
+
+    # ── Step 1: Tokenize ──
+    if verbose == 1 do
+        print_ln("virc: tokenizing...")
+    end
+
+    # Snapshot before lexer_new — CALLs above can clobber source_fat (native ABI).
+    held_src = source_fat
+    var lex = lexer_new(held_src)
+    lex = tokenize(lex)
+
+    # Read lexer state through its published Vec/error handles. The Vec is
+    # published by lexer_new before the token loop, so alternate loop exits do
+    # not depend on aggregate return-register preservation.
+    var lex_has_err = 0
+    var lex_err_line = 1
+    var lex_err_col = 1
+    var lex_err_msg = lexer_error_message()
+    let tok_count_raw = lexer_token_count()
+    var ti_check = 0
+    when ti_check < tok_count_raw loop
+        let t = lexer_token_get(ti_check)
+        if t.tok_type == TokType.Error do
+            lex_has_err = 1
+            lex_err_line = t.line
+            lex_err_col = t.col
+            if lex_err_msg == 0 do
+                lex_err_msg = t.str_val as i64
+            end
+            ti_check = tok_count_raw
+        end
+        ti_check = ti_check + 1
+    end
+    if lex_has_err == 1 or lexer_error_message() != 0 do
+        # Zero-copy error tokens can retain a provisional column. Use the
+        # lexer's offending byte offset, as token_update_span does.
+        if g_active_source_manager != 0 do
+            let errorColumn = sm_col_from_byte_offset(g_active_source_manager, 0, g_lexer_error_offset)
+            if errorColumn > 0 do lex_err_col = errorColumn end
+        end
+        if lex_err_msg == 0 do
+            lex_err_msg = "invalid token" as i64
+        end
+        var early_diag = diagnostic_engine_new()
+        report_error_loc(early_diag, 1, 0, lex_err_line, lex_err_col, lex_err_msg as string)
+        if g_diag_json == 1 do
+            pass10_emit_json(early_diag)
+        else
+            pass10_emit_diagnostics(early_diag)
+        end
+        virc_print_compile_time()
+        out (null_ast, 1)
+    end
+
+    # Read and validate the count immediately.  Do not test this local after
+    # the token-copy loop: that loop performs hundreds of thousands of CALLs
+    # in a full self-host and exposed stale/clobbered caller state as a false 0.
+    let tok_count = lexer_token_count()
+    if tok_count <= 0 do
+        compilerFailure(0, "lexer produced no tokens" as int, "virc: error: lexer produced no tokens" as int)
+        out (null_ast, 1)
+    end
+
+    if verbose == 1 do
+        arena:
+            var sb = sb_new()
+            sb = sb_append(sb, "virc: ")
+            sb = sb_append_int(sb, tok_count)
+            sb = sb_append(sb, " tokens")
+            print_ln(sb_to_string(sb))
+            sb_free(sb)
+        end
+    end
+
+    # Parser expects rt-vec of token pointers; lexer uses collections Vec.
+    let tok_rt = vec_new_rt()
+    g_virc_parser_tokens = tok_rt
+    var ti = 0
+    when ti < tok_count loop
+        let tok = lexer_token_get(ti)
+        g_virc_parser_tokens = vec_push_rt(g_virc_parser_tokens, tok)
+        ti = ti + 1
+    end
+
+    # ── Step 2: Parse ──
+    cliUiPhaseEnd(3, tok_count, "tokens" as int)
+    if g_phase_timings == 1 do
+        let d3 = cliUiPhaseDurationNs(3)
+        if d3 >= 0 do g_phase_lex_us = d3 / 1000 end
+    end
+    cliUiPhaseBegin(4)
+    if verbose == 1 do
+        print_ln("virc: parsing...")
+    end
+
+    var parser = parser_new(g_virc_parser_tokens)
+    var (parser2, ast) = parse_program(parser)
+
+    if verbose == 1 do
+        arena:
+            let k_count = vec_len_rt(ast.children)
+            var sb_ast = sb_new()
+            sb_ast = sb_append(sb_ast, "virc: ast children ")
+            sb_ast = sb_append_int(sb_ast, k_count)
+            print_ln(sb_to_string(sb_ast))
+            sb_free(sb_ast)
+        end
+    end
+
+    # parse_program prints and recovers from individual errors, clearing
+    # error_msg so it can report more than one.  error_line remains non-zero
+    # after any error and must prevent semantic analysis of a partial AST.
+    if parser2.error_line > 0 do
+        var early_diag = diagnostic_engine_new()
+        var errorIndex = 0
+        when errorIndex < vec_len_rt(g_parserErrors) loop
+            let parseErrorEntry = vec_get_rt(g_parserErrors, errorIndex)
+            let errorCode = native_read_i64(parseErrorEntry, 0)
+            let errorLine = native_read_i64(parseErrorEntry, 8)
+            let errorColumn = native_read_i64(parseErrorEntry, 16)
+            let errorDetail = native_read_i64(parseErrorEntry, 24)
+            let secLine = native_read_i64(parseErrorEntry, 32)
+            let secCol = native_read_i64(parseErrorEntry, 40)
+            let secNote = native_read_i64(parseErrorEntry, 48) as string
+            report_error_loc_related(early_diag, errorCode, 0, errorLine, errorColumn, errorDetail as string, secLine, secCol, secNote)
+            errorIndex = errorIndex + 1
+        end
+        if g_diag_json == 1 do
+            pass10_emit_json(early_diag)
+        else
+            pass10_emit_diagnostics(early_diag)
+        end
+        virc_print_compile_time()
+        out (null_ast, 1)
+    end
+
+    cliUiPhaseEnd(4, vec_len_rt(ast.children), "AST nodes" as int)
+    if g_phase_timings == 1 do
+        let d4 = cliUiPhaseDurationNs(4)
+        if d4 >= 0 do g_phase_parse_us = d4 / 1000 end
+    end
+    out (ast, 0)
+end.

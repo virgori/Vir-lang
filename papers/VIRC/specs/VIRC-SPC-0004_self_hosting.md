@@ -4,11 +4,11 @@ type: "SPEC"
 domain: "VIRC"
 title: "Vir Self-Hosting Specification"
 status: "ACTIVE"
-version: "1.0.0"
+version: "1.0.1"
 language: "en"
 spec_class: "SPECIFICATION"
 created: "2026-03-10"
-updated: "2026-10-02"
+updated: "2026-10-06"
 owners:
   - "VIRC"
 components: []
@@ -83,7 +83,7 @@ Phase 5 — Bootstrap "Tự Sinh" (9/3/2026):
   ✅ Fixed-point achieved: Stage 2 (native compiles itself) == Stage 3 (identical)
   ✅ No Python dependency — standalone ARM64 Mach-O executable
   ✅ Bugs fixed during bootstrap:
-     - `^` → `xor` keyword, `>>` → `shr` keyword (C lexer operator mapping)
+     - `^` → `xor` keyword, `>>` → `shr` keyword (C-source migration mapping only; Vir `>>` remains a cast)
      - `var mod` → `var mod_name` (keyword conflict with C lexer `mod` token)
      - Large stack offsets (>255 bytes) — indirect addressing via x9 register
      - Duplicate symbol collision (_char_to_str) — user function guard
@@ -502,8 +502,8 @@ biến sub = cắt(s, 1, 3)        # Slice → "ell"
 biến x = a & b          # AND
 biến y = a | b          # OR
 biến z = a ^ b          # XOR
-biến w = a << 4         # Shift left
-biến v = a >> 8         # Shift right
+biến w = a shl 4        # Shift left
+biến v = a shr 8        # Shift right
 ```
 
 **Implementation:**
@@ -698,8 +698,8 @@ nhập "buffer" dùng đệm_mới, phát_byte, phát_u32
 
 @nếu ARM64 thì
 hàm emit_add(cb, rd, rn, rm) thì
-  # ADD Xd, Xn, Xm → 0x8B000000 | rm<<16 | rn<<5 | rd
-  biến instr = 0x8B000000 | (rm << 16) | (rn << 5) | rd
+  # ADD Xd, Xn, Xm → 0x8B000000 | (rm shl 16) | (rn shl 5) | rd
+  biến instr = 0x8B000000 | (rm shl 16) | (rn shl 5) | rd
   phát_u32(cb, instr)
 hết
 @hết
@@ -707,9 +707,9 @@ hết
 @nếu X86_64 thì
 hàm emit_add(cb, dst, src) thì
   # REX.W prefix + ADD r/m64, r64
-  phát_byte(cb, 0x48 | ((src >> 3) << 2) | (dst >> 3))
+  phát_byte(cb, 0x48 | ((src shr 3) shl 2) | (dst shr 3))
   phát_byte(cb, 0x01)
-  phát_byte(cb, 0xC0 | ((src & 7) << 3) | (dst & 7))
+  phát_byte(cb, 0xC0 | ((src & 7) shl 3) | (dst & 7))
 hết
 @hết
 ```
@@ -905,4 +905,5 @@ Dựa trên dependency graph và độ khó:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-06 | 1.0.1 | Corrected Vir shift examples to `shl`/`shr`; clarified that `>>` is a cast outside C-source migration notes |
 | 2026-10-02 | 1.0.0 | Migrated from `docs/SELF_HOSTING_SPEC.md` and assigned stable ID `VIRC-SPC-0004` |

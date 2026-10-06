@@ -8,18 +8,17 @@ include sem_pass10_diagnostics
  ##
 module vir.compiler.lir_codegen_wasm
 
-include rt.vec_rt
-import bvec_new, bvec_push, bvec_len, bvec_data_ptr, vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from rt.vec_rt
-include rt.io
-import write_file_bytes, print_str, print_ln, print_int, print_newline from rt.io
-include rt.syscall
-import sys_exit from rt.syscall
-include string_rt
+import bvec_new, bvec_push, bvec_len, bvec_data_ptr, vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from rt_vec_rt
+import write_file_bytes, print_str, print_ln, print_int, print_newline from rt_io
+import sys_exit from rt_syscall
+include rt_string_rt
 include lir
 include mir
 include ffi_imports
 include lir_codegen
 include target
+include context
+import g_has_custom_entry, g_entry_function_name from compiler.context
 
 include lir_codegen_wasm_rt_stubs
 
@@ -122,12 +121,20 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
     # body and real vreg operands. Unsupported CFG/function features remain a
     # compiler diagnostic concern, never an empty placeholder body.
     mainf = 0
-    var fi = 0
-    when fi <  vec_len_rt(lir_funcs) loop
-        f = vec_get_rt(lir_funcs, fi)
-        # main is normally the final user function; global init has no strings.
-        if vec_len_rt(lir_func_strings(f)) > 0 do mainf = f end
-        fi = fi + 1
+    if g_has_custom_entry == 1 and fat_str_len(g_entry_function_name) > 0 do
+        let entry_idx = lir_find_func_index(lir_funcs, g_entry_function_name)
+        if entry_idx >= 0 do
+            mainf = vec_get_rt(lir_funcs, entry_idx)
+        end
+    end
+    if mainf == 0 do
+        var fi = 0
+        when fi < vec_len_rt(lir_funcs) loop
+            f = vec_get_rt(lir_funcs, fi)
+            # main is normally the final user function; global init has no strings.
+            if vec_len_rt(lir_func_strings(f)) > 0 do mainf = f end
+            fi = fi + 1
+        end
     end
     if mainf == 0 do mainf = vec_get_rt(lir_funcs, vec_len_rt(lir_funcs) - 1) end
     wasm_lir_validate_supported(mainf, lir_funcs)
@@ -203,13 +210,29 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                                 ffi_k = ffi_k + 1
                             end
                             if ffi_dense >= 0 do
+                                let ffi_call_param_count = ffi_import_param_count(ffi_id)
+                                var ffi_call_param_i = 0
+                                when ffi_call_param_i < ffi_call_param_count loop
+                                    code = w_local_get(code, args_base + ffi_call_param_i)
+                                    let ffi_call_param_type = ffi_import_param_type(ffi_id, ffi_call_param_i)
+                                    if fat_cstr_eq(ffi_call_param_type, "i32") == 1 or fat_cstr_eq(ffi_call_param_type, "u32") == 1 or fat_cstr_eq(ffi_call_param_type, "bool") == 1 or fat_cstr_eq(ffi_call_param_type, "ptr") == 1 or fat_cstr_eq(ffi_call_param_type, "string") == 1 do
+                                        code = bvec_push(code, W_I32_WRAP_I64)
+                                    end
+                                    ffi_call_param_i = ffi_call_param_i + 1
+                                end
                                 call_target = 1 + ffi_dense
                                 code = w_call(code, call_target)
-                                code = bvec_push(code, W_I64_EXTEND_I32_U)
-                                if lir_opnd_type(dst) == LirOperandType.VRegInt as int do
-                                    code = w_local_set(code, lir_opnd_vreg(dst))
-                                else
-                                    code = bvec_push(code, W_DROP)
+                                let ffi_call_return_type = ffi_import_return_type(ffi_id)
+                                let ffi_call_returns = fat_str_len(ffi_call_return_type) > 0 and fat_cstr_eq(ffi_call_return_type, "void") == 0
+                                if ffi_call_returns do
+                                    if fat_cstr_eq(ffi_call_return_type, "i32") == 1 or fat_cstr_eq(ffi_call_return_type, "u32") == 1 or fat_cstr_eq(ffi_call_return_type, "bool") == 1 or fat_cstr_eq(ffi_call_return_type, "ptr") == 1 or fat_cstr_eq(ffi_call_return_type, "string") == 1 do
+                                        code = bvec_push(code, W_I64_EXTEND_I32_U)
+                                    end
+                                    if lir_opnd_type(dst) == LirOperandType.VRegInt as int do
+                                        code = w_local_set(code, lir_opnd_vreg(dst))
+                                    else
+                                        code = bvec_push(code, W_DROP)
+                                    end
                                 end
                             end
                         eif fat_cstr_eq(cname, "print_ln") == 1 or fat_cstr_eq(cname, "print_str") == 1 or fat_cstr_eq(cname, "print") == 1 do
@@ -622,7 +645,30 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
                     if lir_instr_typ(ins) == LirType.F64 as int || lir_opnd_type(src1) == LirOperandType.VRegFloat as int do
                         wasm_lir_unsupported(LirOp.Intrinsic as int, kind)
                     end
+                    var cast_bits = (kind shr 24) and 0xFF
+                    if cast_bits == 0 do cast_bits = 64 end
+                    var cast_is_unsigned = (kind shr 32) and 0xFF
                     code = w_opnd(code, src1)
+                    if cast_is_unsigned == 1 do
+                        if cast_bits == 8 do
+                            code = w_i64_const(code, 255)
+                            code = bvec_push(code, 0x83)
+                        eif cast_bits == 16 do
+                            code = w_i64_const(code, 65535)
+                            code = bvec_push(code, 0x83)
+                        eif cast_bits == 32 do
+                            code = w_i64_const(code, 4294967295)
+                            code = bvec_push(code, 0x83)
+                        end
+                    else
+                        if cast_bits == 8 do
+                            code = bvec_push(code, 0xC2)
+                        eif cast_bits == 16 do
+                            code = bvec_push(code, 0xC3)
+                        eif cast_bits == 32 do
+                            code = bvec_push(code, 0xC4)
+                        end
+                    end
                     code = w_local_set(code, lir_opnd_vreg(dst))
                 eif kind == MIR_INTR_INDEX do
                     code = w_opnd(code, src1)
@@ -934,8 +980,8 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
     end
     # Header
     outb = bvec_new(); outb = bvec_push(outb, 0); outb = bvec_push(outb, 97); outb = bvec_push(outb, 115); outb = bvec_push(outb, 109); outb = bvec_push(outb, 1); outb = bvec_push(outb, 0); outb = bvec_push(outb, 0); outb = bvec_push(outb, 0)
-    # types: fd_write, print, strcat, itoa, _start, wasi_fn, promote_graph
-    t = bvec_new(); t = w_u(t, 7)
+    # Stable runtime types followed by one exact type per used FFI import.
+    t = bvec_new(); t = w_u(t, 7 + n_ffi)
     t = bvec_push(t, 0x60); t = w_u(t, 4); t = bvec_push(t,W_I32); t=bvec_push(t,W_I32); t=bvec_push(t,W_I32); t=bvec_push(t,W_I32); t=w_u(t,1); t=bvec_push(t,W_I32)
     t = bvec_push(t,0x60); t=w_u(t,1); t=bvec_push(t,W_I64); t=w_u(t,0)
     t = bvec_push(t,0x60); t=w_u(t,2); t=bvec_push(t,W_I64); t=bvec_push(t,W_I64); t=w_u(t,1); t=bvec_push(t,W_I64)
@@ -943,7 +989,45 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
     t = bvec_push(t,0x60); t=w_u(t,0); t=w_u(t,0)
     t = bvec_push(t,0x60); t=w_u(t,0); t=w_u(t,1); t=bvec_push(t,W_I32)
     # type 6: w_promote_graph (i32) -> i32
-    t = bvec_push(t,0x60); t=w_u(t,1); t=bvec_push(t,W_I32); t=w_u(t,1); t=bvec_push(t,W_I32); outb=w_section(outb,1,t)
+    t = bvec_push(t,0x60); t=w_u(t,1); t=bvec_push(t,W_I32); t=w_u(t,1); t=bvec_push(t,W_I32)
+    var ffi_type_i = 0
+    when ffi_type_i < n_ffi loop
+        let ffi_type_id = ffi_import_used_at(ffi_type_i)
+        t = bvec_push(t, 0x60)
+        let ffi_param_count = ffi_import_param_count(ffi_type_id)
+        t = w_u(t, ffi_param_count)
+        var ffi_param_i = 0
+        when ffi_param_i < ffi_param_count loop
+            let ffi_param_type = ffi_import_param_type(ffi_type_id, ffi_param_i)
+            if fat_cstr_eq(ffi_param_type, "i32") == 1 or fat_cstr_eq(ffi_param_type, "u32") == 1 or fat_cstr_eq(ffi_param_type, "bool") == 1 or fat_cstr_eq(ffi_param_type, "ptr") == 1 or fat_cstr_eq(ffi_param_type, "string") == 1 do
+                t = bvec_push(t, W_I32)
+            eif fat_cstr_eq(ffi_param_type, "f32") == 1 do
+                t = bvec_push(t, W_F32)
+            eif fat_cstr_eq(ffi_param_type, "f64") == 1 do
+                t = bvec_push(t, W_F64)
+            else
+                t = bvec_push(t, W_I64)
+            end
+            ffi_param_i = ffi_param_i + 1
+        end
+        let ffi_return_type = ffi_import_return_type(ffi_type_id)
+        if fat_str_len(ffi_return_type) == 0 or fat_cstr_eq(ffi_return_type, "void") == 1 do
+            t = w_u(t, 0)
+        else
+            t = w_u(t, 1)
+            if fat_cstr_eq(ffi_return_type, "i32") == 1 or fat_cstr_eq(ffi_return_type, "u32") == 1 or fat_cstr_eq(ffi_return_type, "bool") == 1 or fat_cstr_eq(ffi_return_type, "ptr") == 1 or fat_cstr_eq(ffi_return_type, "string") == 1 do
+                t = bvec_push(t, W_I32)
+            eif fat_cstr_eq(ffi_return_type, "f32") == 1 do
+                t = bvec_push(t, W_F32)
+            eif fat_cstr_eq(ffi_return_type, "f64") == 1 do
+                t = bvec_push(t, W_F64)
+            else
+                t = bvec_push(t, W_I64)
+            end
+        end
+        ffi_type_i = ffi_type_i + 1
+    end
+    outb=w_section(outb,1,t)
     im = bvec_new(); im = w_u(im, 1 + n_ffi)
     im = w_name(im, fat_str_new("wasi_snapshot_preview1")); im = w_name(im, fat_str_new("fd_write")); im = bvec_push(im, 0); im = w_u(im, 0)
     var ffi_w = 0
@@ -960,7 +1044,7 @@ func wasm_lir_write_module(lir_funcs: int, path: int):
         im = w_name(im, s_mod)
         im = w_name(im, s_fun)
         im = bvec_push(im, 0)
-        im = w_u(im, 5)
+        im = w_u(im, 7 + ffi_w)
         ffi_w = ffi_w + 1
     end
     outb = w_section(outb, 2, im)

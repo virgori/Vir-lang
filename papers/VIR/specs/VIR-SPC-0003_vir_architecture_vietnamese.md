@@ -4,11 +4,11 @@ type: "SPEC"
 domain: "VIR"
 title: "Vir – Architecture Specification (Đặc tả Kiến trúc Vir v2.0)"
 status: "ACTIVE"
-version: "2.0.0"
+version: "2.0.1"
 language: "vi"
 spec_class: "ARCHITECTURE"
 created: "2026-09-09"
-updated: "2026-10-02"
+updated: "2026-10-06"
 owners:
   - "VIR"
   - "VIRC"
@@ -27,8 +27,8 @@ tags:
 
 # VIR-SPC-0003 — Vir – Architecture Specification (Đặc tả Kiến trúc Vir v2.0)
 
-> **Phiên bản:** 2.0 (Self-Hosted / Production)  
-> **Cập nhật:** 2026-09  
+> **Phiên bản:** 2.0.1 (Self-Hosted / Production)
+> **Cập nhật:** 2026-10-06
 > **Chuẩn ngôn ngữ:** Vir Language Specification v2.0 (§1.2, §26, §29, §30)  
 > **Trạng thái:** Tự lưu trữ hoàn toàn (Self-Hosted Sovereign Compiler) — Zero Python, Zero C shims, Zero libc, Zero External Linker.  
 > **Bản tiếng Anh (English Version):** [ARCHITECTURE.md](VIR-SPC-0001_vir_architecture.md) | [ARCHITECTURE_en.md](VIR-SPC-0002_vir_architecture_english.md)
@@ -144,7 +144,7 @@ Lexer thực hiện quét luồng byte UTF-8 theo thuật toán Greedy Longest-M
 - **Tập Token Chuẩn (`TokType` - 90+ loại):**
   - **Keywords chính:** `func`, `var`, `let`, `const`, `if`, `eif`, `else`, `when`, `loop`, `for`, `in`, `case`, `out`, `skip`, `break`, `try`, `ensure`, `revert`, `arena`, `isolate`, `entity`, `enum`, `packed`, `register`, `mold`, `method`.
   - **AI/ML & Toán tử cấp cao:** `tensor`, `infer`, `train`, `quantize`, MatMul `**`, FMA `><`, Power `^`, Remainder `mod`.
-  - **Logic & Bitwise chuẩn Vir v2.0:** Logic AND `&`, Logic OR `||`, Logic NOT `!`; Bitwise AND `and`, Bitwise OR `or`, Bitwise XOR `xor`, dịch bit `shl`, `shr`, `>>`.
+  - **Logic & Bitwise chuẩn Vir v2.0:** Logic AND `&`, Logic OR `||`, Logic NOT `!`; Bitwise AND `and`, Bitwise OR `or`, Bitwise XOR `xor`, dịch bit `shl`, `shr`. Cast dùng `as` hoặc `>>`; `>>` không bao giờ là dịch phải.
   - **Toán tử so sánh & gán:** `==`, `!=`, `<`, `>`, `<=`, `>=`, Pattern Match `:~`, Exact Equal `?=`, gán `=`.
   - **Dấu phân cách & Literal:** Dấu hai chấm `:`, dấu chấm `.`, dấu phẩy `,`, dấu chấm phẩy `;`, ngoặc đơn `()`, ngoặc vuông `[]`, Integer, Float, String, Boolean (`true`, `false`), Null literal (`none`).
 
@@ -163,7 +163,7 @@ Parser chuyển đổi danh sách các `Token` thành cây cú pháp trừu tư�
   1. Member Access (`.`), Safe Nav (`?.`), Swizzle (`~`), Atomic (`!!`).
   2. Prefix unary (`!`, `-`), Power (`^` kết hợp phải).
   3. Tensor MatMul (`**`), Tensor FMA (`><`), Nhân/Chia (`*`, `/`), Phép chia lấy dư (`mod`).
-  4. Casts (`as`), Dịch bit (`shl`, `shr`, `>>`), Cộng/Trừ (`+`, `-`).
+  4. Casts (`as`, `>>`), Dịch bit (`shl`, `shr`), Cộng/Trừ (`+`, `-`).
   5. So sánh tương đối (`<`, `>`, `<=`, `>=`), So sánh bằng (`==`, `!=`, `?=`), Pattern match (`:~`).
   6. Logic AND (`&`), Bitwise AND (`and`).
   7. Logic OR (`||`), Bitwise OR (`or`), Bitwise XOR (`xor`).
@@ -659,4 +659,5 @@ end.
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-06 | 2.0.1 | Sửa phân loại toán tử: `>>` là cast; dịch bit chỉ dùng `shl` và `shr` |
 | 2026-10-02 | 2.0.0 | Migrated from `docs/ARCHITECTURE_vi.md` and assigned stable ID `VIR-SPC-0003` |

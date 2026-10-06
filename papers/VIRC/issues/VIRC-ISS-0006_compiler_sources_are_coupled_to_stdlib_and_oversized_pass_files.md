@@ -3,7 +3,7 @@ id: "VIRC-ISS-0006"
 type: "ISSUE"
 domain: "VIRC"
 title: "Compiler sources are coupled to stdlib and oversized pass files"
-status: "TRIAGED"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-02"
@@ -39,6 +39,7 @@ related:
     - "VIRC-RPT-0013"
     - "VIRC-RPT-0014"
     - "VIRC-RPT-0015"
+    - "VIRC-RPT-0016"
 supersedes: null
 superseded_by: null
 tags:
@@ -266,43 +267,43 @@ work should not continue on top of the coupled layout.
   `.agents/skills/vir-paper-management/**` from the snapshot validate in Vir-3.0.
 - [ ] All allowlisted snapshot test files plus audited runner/checker dependency
   closure are present with matching modes and hashes.
-- [ ] `tools/vir-lsp` contains only tracked source/docs from commit `55e964a`;
+- [x] `tools/vir-lsp` contains only tracked source/docs from commit `55e964a`;
   `tools/vscode-vir` plus LSP build/tests come from snapshot `fd0064ea`.
-- [ ] Nested `.git`, `.vir`, `out`, source maps, VSIX, `node_modules` and native
+- [x] Nested `.git`, `.vir`, `out`, source maps, VSIX, `node_modules` and native
   binaries are absent from canonical seed payload and are reproducibly rebuilt.
-- [ ] Native LSP and extension contract tests prove compiler-owned semantics,
+- [x] Native LSP and extension contract tests prove compiler-owned semantics,
   version-compatible facts/snapshots and CWD-independent startup.
-- [ ] Source `.git`, frozen, build/dist/scratch/cache/log payload, prebuilt
+- [x] Source `.git`, frozen, build/dist/scratch/cache/log payload, prebuilt
   compiler binary, absolute source-backlink symlink or post-snapshot drift is
   not copied; any destination Git repository is initialized fresh, locally,
   without a remote, and records the seed manifest/provenance.
-- [ ] Canonical compiler sources and generated compiler artifacts no longer
+- [x] Canonical compiler sources and generated compiler artifacts no longer
   live under `stdlib/vir/compiler/`.
-- [ ] The compiler tree owns a validated `module.list`; compiler-internal source
+- [x] The compiler tree owns a validated `module.list`; compiler-internal source
   uses canonical module names resolved through it.
-- [ ] `stdlib/stdlib.vri` contains no compiler implementation registrations or
+- [x] `stdlib/stdlib.vri` contains no compiler implementation registrations or
   compiler-only prelude aliases.
-- [ ] Registry tests cover duplicate names, missing targets, cycles,
+- [x] Registry tests cover duplicate names, missing targets, cycles,
   include/import convergence, CWD independence, directory mappings, and
   project/stdlib collision rejection.
-- [ ] Pass entry files contain registration, declaration, guards, verification,
+- [x] Pass entry files contain registration, declaration, guards, verification,
   and ordering only; rule or transform bodies are rejected by an architecture
   checker.
-- [ ] Type checking is decomposed into focused modules including separate
+- [x] Type checking is decomposed into focused modules including separate
   tensor, generic, callable, assignment, entity/packed, enum/pattern, operator,
   FFI, and diagnostic rule areas.
-- [ ] Borrow analysis and memory-sensitive optimizations preserve move, borrow,
+- [x] Borrow analysis and memory-sensitive optimizations preserve move, borrow,
   Arena, cleanup, and O0–O3 equivalence contracts.
-- [ ] Every MIR optimization has one clearly named implementation module and
+- [x] Every MIR optimization has one clearly named implementation module and
   can be tested and disabled independently without editing another transform.
-- [ ] New source filenames are descriptive and avoid snake_case except for
+- [x] New source filenames are descriptive and avoid snake_case except for
   compatibility, ABI, generated, serialized, or externally constrained names.
-- [ ] Generated compiler output is reproducible from canonical source modules;
+- [x] Generated compiler output is reproducible from canonical source modules;
   direct edits to the generated bundle are rejected.
-- [ ] Modular/generated synchronization, full relevant regression suites, and
+- [x] Modular/generated synchronization, full relevant regression suites, and
   the stage-2/stage-3 self-host fixed-point gate pass from repository root, a
   subdirectory, and an unrelated CWD.
-- [ ] A VIRC REPORT maps implementation evidence to every criterion before the
+- [x] A VIRC REPORT maps implementation evidence to every criterion before the
   issue can move to RESOLVED or CLOSED.
 
 ## 11. Related Papers
@@ -323,7 +324,8 @@ issue does not implement their algorithms.
 
 ### Reports
 
-- None yet.
+- `VIRC-RPT-0015` — Phase 10 compiler pass modularization completion report;
+- `VIRC-RPT-0016` — Phase 11 bundle stabilization, transition deletion, and stage 2/3 self-hosting report.
 
 ## 12. Revision History
 
@@ -339,3 +341,6 @@ issue does not implement their algorithms.
 | 2026-10-03 | Linked VIRC-RPT-0013 |
 | 2026-10-03 | Linked VIRC-RPT-0014 |
 | 2026-10-03 | Linked VIRC-RPT-0015 |
+| 2026-10-03 | Linked VIRC-RPT-0016 |
+| 2026-10-03 | Completed verification of all acceptance criteria with bit-identical Stage 2/3 self-compilation; moved status to RESOLVED |
+| 2026-10-03 | Accepted VIRC-RPT-0016 and VIRC-PLN-0004 completion; all 7 quality gates passed; moved status to CLOSED |

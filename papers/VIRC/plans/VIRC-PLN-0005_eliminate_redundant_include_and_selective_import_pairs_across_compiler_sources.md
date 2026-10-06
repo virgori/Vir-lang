@@ -3,9 +3,9 @@ id: "VIRC-PLN-0005"
 type: "PLAN"
 domain: "VIRC"
 title: "Eliminate redundant include and selective import pairs across compiler sources"
-status: "DRAFT"
+status: "COMPLETED"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-03"
 owners:
   - "VIRC"
 components:
@@ -16,7 +16,8 @@ related:
   issues:
     - "VIRC-ISS-0007"
   plans: []
-  reports: []
+  reports:
+    - "VIRC-RPT-0017"
 supersedes: null
 superseded_by: null
 tags:
@@ -212,12 +213,12 @@ If any unresolvable preprocessor defect is discovered, git revert the cleanup co
 
 ## 13. Exit Criteria
 
-- [ ] `tools/check_module_dependencies.py` implemented and passing with 0 violations.
-- [ ] No file in `compiler/src/` contains adjacent or redundant `include` + `import` for the same module.
-- [ ] `tests/cli_contract/runner.py` passes 43/43.
-- [ ] Self-hosting compiler rebuilds and passes fixed point.
-- [ ] VIRC-ISS-0007 acceptance criteria met.
-- [ ] Ready to resume VIRC-PLN-0004 with clean, disciplined import rules.
+- [x] `tools/check_module_dependencies.py` implemented and passing with 0 violations.
+- [x] No file in `compiler/src/` contains adjacent or redundant `include` + `import` for the same module.
+- [x] `tests/cli_contract/runner.py` passes 43/43.
+- [x] Self-hosting compiler rebuilds and passes fixed point.
+- [x] VIRC-ISS-0007 acceptance criteria met.
+- [x] Ready to resume VIRC-PLN-0004 with clean, disciplined import rules.
 
 ## 14. Related Papers
 
@@ -231,3 +232,5 @@ If any unresolvable preprocessor defect is discovered, git revert the cleanup co
 | Date | Change |
 |---|---|
 | 2026-10-02 | Initial plan drafted from VIRC-ISS-0007 context and preprocessor audit |
+| 2026-10-03 | Linked VIRC-RPT-0017 |
+| 2026-10-03 | Completed all phases; verified with bit-identical stage 2/stage 3 fixed point; linked VIRC-RPT-0017 |

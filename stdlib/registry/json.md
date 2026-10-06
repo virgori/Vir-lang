@@ -8,6 +8,9 @@ source:
   - name: data.json
     path: vir/data/json.vri
     notes: duplicate / alias path — public namespace is json
+  - name: json.slice
+    path: vir/data/json_slice.vri
+    notes: raw offset scanner only; never validates or serializes JSON
 status: stable
 notes: >-
   Design closed (D1–D5, Q3–Q4, CORE SPEC). Single owner: vir/data/json.vri via vir/json.vri shim.
@@ -27,6 +30,8 @@ json.set(obj, "port", json.number(8080))
 
 Physical modules today: `vir/json.vri` and `vir/data/json.vri` (alias).
 **Public docs use `json.*` only** — users never need `data.json` as a second API.
+`json.slice` is a separate low-level byte-offset view; callers still use
+`json.parse` and `json.stringify` for JSON semantics.
 
 ## Decisions D1–D5 (locked) · Q3–Q4 (locked)
 

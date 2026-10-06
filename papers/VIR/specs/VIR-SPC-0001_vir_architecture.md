@@ -4,11 +4,11 @@ type: "SPEC"
 domain: "VIR"
 title: "Vir – Architecture Specification (Vir v2.0)"
 status: "ACTIVE"
-version: "2.0.0"
+version: "2.0.1"
 language: "en"
 spec_class: "ARCHITECTURE"
 created: "2026-03-10"
-updated: "2026-10-02"
+updated: "2026-10-06"
 owners:
   - "VIR"
   - "VIRC"
@@ -27,8 +27,8 @@ tags:
 
 # VIR-SPC-0001 — Vir – Architecture Specification (Vir v2.0)
 
-> **Version:** 2.0 (Self-Hosted / Production)  
-> **Updated:** 2026-09  
+> **Version:** 2.0.1 (Self-Hosted / Production)
+> **Updated:** 2026-10-06
 > **Language Standard:** Vir Language Specification v2.0 (§1.2, §26, §29, §30)  
 > **Status:** Sovereign Systems Language — Zero Python, Zero C runtime shims, Zero libc, Zero External Linker.  
 > **Canonical Pipeline:** `Source (.vri) → Lexer / Parser → AST → Semantic Analysis (10 Passes) → HIR/MIR (CFG + SSA) → MIR Opts → LIR → RegAlloc (Chaitin-Briggs + George-Appel IRC) → Direct Codegen → Mach-O / ELF / WASM`  
@@ -144,7 +144,7 @@ The lexer performs a single-pass, greedy longest-match scan over UTF-8 bytes wit
 - **Canonical Token Set (`TokType` - 90+ kinds):**
   - **Core Keywords:** `func`, `var`, `let`, `const`, `if`, `eif`, `else`, `when`, `loop`, `for`, `in`, `case`, `out`, `skip`, `break`, `try`, `ensure`, `revert`, `arena`, `isolate`, `entity`, `enum`, `packed`, `register`, `mold`, `method`.
   - **AI / ML & Advanced Ops:** `tensor`, `infer`, `train`, `quantize`, MatMul `**`, FMA `><`, Power `^`, Remainder `mod`.
-  - **Logic & Bitwise (Spec v2.0):** Logical AND `&`, Logical OR `||`, Logical NOT `!`; Bitwise AND `and`, Bitwise OR `or`, Bitwise XOR `xor`, bit shifts `shl`, `shr`, `>>`.
+  - **Logic & Bitwise (Spec v2.0):** Logical AND `&`, Logical OR `||`, Logical NOT `!`; Bitwise AND `and`, Bitwise OR `or`, Bitwise XOR `xor`, bit shifts `shl`, `shr`. Casts use `as` or `>>`; `>>` is never shift-right.
   - **Relational & Equality:** `==`, `!=`, `<`, `>`, `<=`, `>=`, Pattern match `:~`, Exact match `?=`, Assignment `=`.
   - **Separators & Literals:** Colon `:`, Dot `.`, Comma `,`, Semicolon `;`, Parentheses `()`, Brackets `[]`, Braces `{}`, Integer, Float, String, Boolean (`true`, `false`), Null (`none`).
 
@@ -163,7 +163,7 @@ The parser constructs a strongly typed `AstNode` tree from the token stream.
   1. Member Access (`.`), Safe Navigation (`?.`), Swizzle (`~`), Atomic (`!!`).
   2. Unary Prefix (`!`, `-`), Right-associative Power (`^`).
   3. Tensor MatMul (`**`), Tensor FMA (`><`), Multiplication/Division (`*`, `/`), Remainder (`mod`).
-  4. Explicit Cast (`as`), Bit Shifts (`shl`, `shr`, `>>`), Addition/Subtraction (`+`, `-`).
+  4. Explicit Cast (`as`, `>>`), Bit Shifts (`shl`, `shr`), Addition/Subtraction (`+`, `-`).
   5. Relational Comparisons (`<`, `>`, `<=`, `>=`), Equality (`==`, `!=`, `?=`), Pattern Match (`:~`).
   6. Logical AND (`&`), Bitwise AND (`and`).
   7. Logical OR (`||`), Bitwise OR (`or`), Bitwise XOR (`xor`).
@@ -653,4 +653,5 @@ To maintain codebase transparency, the table below delineates obsolete early pro
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-06 | 2.0.1 | Corrected operator classification: `>>` is a cast; shifts use only `shl` and `shr` |
 | 2026-10-02 | 2.0.0 | Migrated from `docs/ARCHITECTURE.md` and assigned stable ID `VIR-SPC-0001` |

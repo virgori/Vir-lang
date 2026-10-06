@@ -1,20 +1,39 @@
 ---
-id: VIRC-PLN-0001
-type: PLAN
-domain: VIRC
-title: Implement production PRE loop transforms and George-Appel IRC
-status: DRAFT
-created: 2026-10-02
-updated: 2026-10-02
-owners: [compiler]
-components: [mir, lir, optimizer, cfg, ssa, register-allocation, tests]
+id: "VIRC-PLN-0001"
+type: "PLAN"
+domain: "VIRC"
+title: "Implement production PRE loop transforms and George-Appel IRC"
+status: "ACTIVE"
+created: "2026-10-02"
+updated: "2026-10-04"
+owners:
+  - "compiler"
+components:
+  - "mir"
+  - "lir"
+  - "optimizer"
+  - "cfg"
+  - "ssa"
+  - "register-allocation"
+  - "tests"
 related:
-  issues: [VIRC-ISS-0001, VIRC-ISS-0002]
+  issues:
+    - "VIRC-ISS-0001"
+    - "VIRC-ISS-0002"
   plans: []
-  reports: []
+  reports:
+    - "VIRC-RPT-0024"
+    - "VIRC-RPT-0025"
+    - "VIRC-RPT-0026"
+    - "VIRC-RPT-0027"
 supersedes: null
 superseded_by: null
-tags: [optimizer, pre, loop-transforms, george-appel, irc]
+tags:
+  - "optimizer"
+  - "pre"
+  - "loop-transforms"
+  - "george-appel"
+  - "irc"
 ---
 
 # VIRC-PLN-0001 — Implement production PRE loop transforms and George-Appel IRC
@@ -326,29 +345,33 @@ VIRC=<new-compiler-path> ./run_tests.sh full
 
 ## 13. Exit Criteria
 
-- [ ] VIRC-ISS-0001 acceptance criteria are satisfied with production
+- [x] VIRC-ISS-0001 acceptance criteria are satisfied with production
   structural and runtime evidence.
 - [ ] VIRC-ISS-0002 acceptance criteria are satisfied with production allocator
   structural and verifier evidence.
-- [ ] Every named capability has a documented supported domain and observable
+- [x] Every named capability has a documented supported domain and observable
   skip reason outside it.
-- [ ] No patch point or hand-authored transformed fixture is used as the sole
+- [x] No patch point or hand-authored transformed fixture is used as the sole
   proof of PRE/fusion/tiling/interchange.
 - [ ] Production IRC contains the full required worklist/alias iteration and
   legal spill rewrite/rerun; post-color copy deletion is only cleanup.
-- [ ] Mutation controls fail for every identified placeholder/fake-oracle mode.
-- [ ] Modular source and generated bundle are synchronized.
-- [ ] Self-host fixed-point, registered contract suites, min/full regression,
+- [x] Mutation controls fail for every identified placeholder/fake-oracle mode.
+- [x] Modular source and generated bundle are synchronized.
+- [x] Self-host fixed-point, registered contract suites, min/full regression,
   and applicable target gates pass with the new compiler.
-- [ ] One or more REPORT papers record actual diffs, exact commands/results,
+- [x] One or more REPORT papers record actual diffs, exact commands/results,
   deviations, limitations, hashes, target applicability, and conclusions.
-- [ ] Linked issues move to VERIFYING/RESOLVED only after their own evidence
+- [x] Linked issues move to VERIFYING/RESOLVED only after their own evidence
   gates pass; neither issue is closed by compilation alone.
 
 ## 14. Related Papers
 
 - VIRC-ISS-0001
 - VIRC-ISS-0002
+- VIRC-RPT-0024 — Production PRE and loop transforms implementation report
+- VIRC-RPT-0025 — Independent acceptance audit of PRE and loop transforms
+- VIRC-RPT-0026 — Driver default output naming, optimizer inlining repair, and test suite integration
+- VIRC-RPT-0027 — Production PRE and loop transforms acceptance report
 - Legacy design/provenance:
   `docs/_legacy/plan/STRICT_PRE_LOOP_TRANSFORMS_AND_GEORGE_APPEL_IRC_PROMPT.md`
 
@@ -357,3 +380,8 @@ VIRC=<new-compiler-path> ./run_tests.sh full
 | Date | Change |
 |---|---|
 | 2026-10-02 | Initial plan derived from verified production-source/test audit and linked source issues |
+| 2026-10-04 | Linked VIRC-RPT-0024; VIRC-ISS-0001 verified and closed |
+| 2026-10-04 | Independent audit VIRC-RPT-0025 invalidated premature completion checks; VIRC-ISS-0001 returned to IMPLEMENTING |
+| 2026-10-04 | Linked VIRC-RPT-0025 |
+| 2026-10-04 | Linked VIRC-RPT-0026 |
+| 2026-10-04 | Linked VIRC-RPT-0027 |

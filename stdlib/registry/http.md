@@ -5,6 +5,12 @@ summary: HTTP/1.1 client helpers — namespace http.*; URL via url.parse.
 source:
   - name: http
     path: vir/http/http.vri
+  - name: static.mime
+    path: vir/http/mime.vri
+  - name: static.etag
+    path: vir/http/etag.vri
+  - name: realtime.sse
+    path: vir/http/sse.vri
 status: stable
 ---
 
@@ -36,8 +42,10 @@ let r = http.get("http://127.0.0.1:8080/health")
 
 | InterVir | Vir stdlib |
 |---|---|
-| `protocol/http_status` | internal `protocol.http_status` |
-| `protocol/http1_parser` | internal `protocol.http1_parser` |
+| `protocol/http_status` | shared `http.status` module (`status.phrase`, `status.line`) |
+| `protocol/http1_parser` | shared `http1.parser` module |
+| `static/mime` | shared `static.mime` MIME lookup module (`mime.byExtension`, `mime.byFilename`) |
+| `static/etag` | shared `static.etag` conditional response module |
 | `transport/tcp` | `net` (TCP) — not re-exported under `http` |
 
 ## Migration map
@@ -71,6 +79,6 @@ let r = http.get("http://127.0.0.1:8080/health")
 ## Implementation notes
 
 - `http.parseUrl` calls **`url.parse`** only; no second URL parser.
-- Reason phrases for empty `statusReason` use internal `protocol.http_status` (not public API).
+- Reason phrases for empty `statusReason` use `status.phrase` from the shared `http.status` module.
 - **`http.send` / `http.get` / `http.post`** use **`net.tcp_connect_host`**, **`net.tcp_write_all_string`**, and **`net.tcp_read_all_string`** — no inline sockets or DNS in `http.vri`.
 - Request wire encoding uses byte buffers (`vir_alloc`); do not assume C-string length for arbitrary Vir strings on the wire path.

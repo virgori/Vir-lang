@@ -4,18 +4,19 @@ type: "SPEC"
 domain: "VIR"
 title: "Vir Types (AI Spec)"
 status: "ACTIVE"
-version: "2.0.0"
+version: "2.1.0"
 language: "en"
 spec_class: "SPECIFICATION"
 created: "2026-09-06"
-updated: "2026-10-02"
+updated: "2026-10-04"
 owners:
   - "VIR"
 components: []
 aliases:
   - "docs/ai-spec/vir-lang/references/types.md"
 related:
-  issues: []
+  issues:
+    - "VIR-ISS-0004"
   plans: []
   reports: []
 supersedes: null
@@ -26,7 +27,7 @@ tags:
 
 # VIR-SPC-0016 — Vir Types (AI Spec)
 
-**Spec:** Vir v2.0
+**Spec:** Vir v2.1
 
 ## Primitives
 
@@ -38,9 +39,11 @@ tags:
 | Float | `float` (IEEE 754, 8 bytes in spec) |
 | Bool | `bool` (`true` / `false`) |
 | String | `string` (immutable, arena) |
-| Pointer | `ptr` (FFI / raw) |
+| Pointer | `ptr` (opaque raw address for FFI/data; non-callable) |
 
 Annotations optional for locals (inference); required for FFI and packed-entity fields.
+
+Structural function types, `func(P...) -> R` and the no-result form `func(P...)`, describe typed callable values. They are distinct from `ptr`: a raw pointer has no checked parameters, result, ABI, provenance, or lifetime and is never implicitly callable or implicitly convertible to a function type. Vir 2.1 defines no raw-address-to-callable conversion. Any future FFI conversion must be explicit and unsafe and must carry the full signature, ABI/calling convention, provenance, and lifetime contract.
 
 ```vir
 var x = 42
@@ -261,4 +264,5 @@ end
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-04 | 2.1.0 | Separated typed structural function values from opaque, non-callable raw `ptr` values |
 | 2026-10-02 | 2.0.0 | Migrated from `docs/ai-spec/vir-lang/references/types.md` and assigned stable ID `VIR-SPC-0016` |

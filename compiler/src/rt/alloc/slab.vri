@@ -1,0 +1,587 @@
+##
+ * compiler/src/rt/alloc/slab.vri — TLSF Bins & Core Heap Operations
+ * =================================================================
+ * Mapping, bin search, block insert/remove, heap_init, alloc, free, and realloc.
+ ##
+
+module vir.rt.alloc.slab
+
+include types_prelude
+include rt_syscall
+include rt_alloc_mmap_core
+include rt_alloc_tlsf_core
+
+# ═══════════════════════════════════════════════════════
+# TLSF Segregated Bin Mapping & Search
+# ═══════════════════════════════════════════════════════
+
+# Map block size to segregated bin index in [0, TOTAL_BINS - 1]
+func tlsf_mapping_bin(size: int) -> int:
+    var s = size
+    if s < MIN_BLOCK_SIZE do
+        s = MIN_BLOCK_SIZE
+    end
+    var fl = tlsf_fls(s)
+    if fl < 5 do
+        fl = 5
+    end
+    if fl > 32 do
+        fl = 32
+    end
+    let fl_idx = fl - 5
+    let sl = (s shr (fl - 4)) bit_and 15
+    out fl_idx * 16 + sl
+end.
+
+# O(1) Search for smallest suitable non-empty bin via bitmaps
+func tlsf_search_suitable_bin(size: int) -> int:
+    var s = size
+    if s < MIN_BLOCK_SIZE do
+        s = MIN_BLOCK_SIZE
+    end
+    var fl = tlsf_fls(s)
+    if fl < 5 do
+        fl = 5
+    end
+    let round_val = (1 shl (fl - 4)) - 1
+    let alloc_size = s + round_val
+
+    var s_fl = tlsf_fls(alloc_size)
+    if s_fl < 5 do
+        s_fl = 5
+    end
+    if s_fl > 32 do
+        s_fl = 32
+    end
+    let fl_idx = s_fl - 5
+    let sl = (alloc_size shr (s_fl - 4)) bit_and 15
+
+    # 1. Look in current fl for sub-bins >= sl
+    g_heap_inspect_count = g_heap_inspect_count + 1
+    let sl_map = get_sl_bitmap(fl_idx) bit_and ((0 - 1) shl sl)
+    if sl_map != 0 do
+        let found_sl = tlsf_ffs(sl_map)
+        out fl_idx * 16 + found_sl
+    end
+
+    # 2. Look in higher fl classes
+    g_heap_inspect_count = g_heap_inspect_count + 1
+    if fl_idx + 1 < FL_INDEX_COUNT do
+        let fl_map = get_fl_bitmap() bit_and ((0 - 1) shl (fl_idx + 1))
+        if fl_map != 0 do
+            let found_fl = tlsf_ffs(fl_map)
+            let found_sl = tlsf_ffs(get_sl_bitmap(found_fl))
+            out found_fl * 16 + found_sl
+        end
+    end
+
+    # 3. First-fit check on exact un-rounded bin head
+    let fl_orig = fl - 5
+    let sl_orig = (s shr (fl - 4)) bit_and 15
+    let exact_bin = fl_orig * 16 + sl_orig
+    let head = get_bin_head(exact_bin)
+    if head != 0 do
+        extern func native_read_i64(addr: int, offset: int) -> int
+        let raw = native_read_i64(head, 0)
+        let bsz = raw bit_and ~(FLAG_MASK)
+        if bsz >= s do
+            out exact_bin
+        end
+    end
+
+    out -1
+end.
+
+# O(1) Prepend block to segregated doubly-linked bin
+func tlsf_insert_block(block: int):
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    let raw = native_read_i64(block, 0)
+    let size = raw bit_and ~(FLAG_MASK)
+    let bin_idx = tlsf_mapping_bin(size)
+    let fl_idx = bin_idx / 16
+    let sl = bin_idx bit_and 15
+
+    let head = get_bin_head(bin_idx)
+    native_write_i64(block, 16, 0);         # block.prev_free = 0
+    native_write_i64(block, 24, head);      # block.next_free = head
+    if head != 0 do
+        native_write_i64(head, 16, block);  # head.prev_free = block
+    end
+    set_bin_head(bin_idx, block)
+
+    let sl_map = get_sl_bitmap(fl_idx) bit_or (1 shl sl)
+    set_sl_bitmap(fl_idx, sl_map)
+    let fl_map = get_fl_bitmap() bit_or (1 shl fl_idx)
+    set_fl_bitmap(fl_map)
+end.
+
+# O(1) Unlink block from segregated doubly-linked bin
+func tlsf_remove_block(block: int):
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    let raw = native_read_i64(block, 0)
+    let size = raw bit_and ~(FLAG_MASK)
+    let bin_idx = tlsf_mapping_bin(size)
+    let fl_idx = bin_idx / 16
+    let sl = bin_idx bit_and 15
+
+    let prev = native_read_i64(block, 16)
+    let next = native_read_i64(block, 24)
+
+    if prev != 0 do
+        native_write_i64(prev, 24, next)
+    else
+        set_bin_head(bin_idx, next)
+    end
+    if next != 0 do
+        native_write_i64(next, 16, prev)
+    end
+
+    native_write_i64(block, 16, 0)
+    native_write_i64(block, 24, 0)
+
+    if get_bin_head(bin_idx) == 0 do
+        let sl_map = get_sl_bitmap(fl_idx) bit_and ~(1 shl sl)
+        set_sl_bitmap(fl_idx, sl_map)
+        if sl_map == 0 do
+            let fl_map = get_fl_bitmap() bit_and ~(1 shl fl_idx)
+            set_fl_bitmap(fl_map)
+        end
+    end
+end.
+
+# ═══════════════════════════════════════════════════════
+# Heap Lifecycle & Allocation Operations
+# ═══════════════════════════════════════════════════════
+
+func heap_init(size: int):
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    if g_tlsf_ctrl == 0 do
+        g_tlsf_ctrl = page_alloc(65536)
+        if g_tlsf_ctrl == 0 do
+            out false
+        end
+    end
+
+    # Zero control memory: bitmaps, bin heads, seg count
+    var zi = 0
+    when zi < 8456 loop
+        native_write_i64(g_tlsf_ctrl, zi, 0)
+        zi = zi + 8
+    end
+    native_write_i64(g_tlsf_ctrl, 36616, 0) # direct_count
+
+    var actual = size
+    if actual < MIN_ARENA_SIZE do
+        actual = MIN_ARENA_SIZE
+    end
+    let ps = rt_page_size()
+    actual = ((actual + ps - 1) / ps) * ps
+
+    let base = page_alloc(actual)
+    if base == 0 do
+        out false
+    end
+
+    let usable_size = actual - BLOCK_HEADER
+    let sentinel = base + usable_size
+
+    native_write_i64(base, 0, usable_size bit_or BLOCK_FREE)
+    native_write_i64(base, 8, 0)
+
+    native_write_i64(sentinel, 0, PREV_FREE)
+    native_write_i64(sentinel, 8, usable_size)
+
+    tlsf_insert_block(base)
+    tlsf_seg_add(base, actual)
+
+    g_heap = Heap ( base: base, capacity: actual, free_head: base, used: 0, peak_used: 0 )
+    out true
+end.
+
+func heap_alloc(size: int):
+    if size <= 0 or size > MAX_ALLOC_SIZE do
+        out 0
+    end
+
+    if g_tlsf_ctrl == 0 do
+        heap_init(MIN_ARENA_SIZE * 4)
+    end
+
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    # Check for direct-mapped large allocation (> 8MB)
+    if size > LARGE_ALLOC_THRESHOLD do
+        let ps = rt_page_size()
+        var total_req = size + BLOCK_HEADER
+        var pages = (total_req + ps - 1) / ps
+        var actual = pages * ps
+        let ptr = vm_alloc(actual, PROT_READ bit_or PROT_WRITE)
+        if ptr <= 0 do
+            out 0
+        end
+        native_write_i64(ptr, 0, actual bit_or BLOCK_DIRECT_MAP)
+        native_write_i64(ptr, 8, actual)
+        tlsf_direct_add(ptr, actual)
+        g_heap.used = g_heap.used + actual
+        if g_heap.used > g_heap.peak_used do
+            g_heap.peak_used = g_heap.used
+        end
+        out ptr + BLOCK_HEADER
+    end
+
+    var needed = size + BLOCK_HEADER
+    needed = (needed + ALIGNMENT - 1) bit_and ~(ALIGNMENT - 1)
+    if needed < MIN_BLOCK_SIZE do
+        needed = MIN_BLOCK_SIZE
+    end
+    if needed <= 0 or needed > MAX_ALLOC_SIZE do
+        out 0
+    end
+
+    var bin_idx = tlsf_search_suitable_bin(needed)
+    if bin_idx < 0 do
+        var grow = needed + MIN_ARENA_SIZE
+        let ps = rt_page_size()
+        grow = ((grow + ps - 1) / ps) * ps
+
+        let new_region = page_alloc(grow)
+        if new_region == 0 do
+            out 0
+        end
+
+        let new_usable = grow - BLOCK_HEADER
+        let new_sentinel = new_region + new_usable
+
+        native_write_i64(new_region, 0, new_usable bit_or BLOCK_FREE)
+        native_write_i64(new_region, 8, 0)
+        native_write_i64(new_sentinel, 0, PREV_FREE)
+        native_write_i64(new_sentinel, 8, new_usable)
+
+        tlsf_insert_block(new_region)
+        tlsf_seg_add(new_region, grow)
+        g_heap.capacity = g_heap.capacity + grow
+
+        bin_idx = tlsf_search_suitable_bin(needed)
+        if bin_idx < 0 do
+            out 0
+        end
+    end
+
+    let block = get_bin_head(bin_idx)
+    tlsf_remove_block(block)
+
+    let raw = native_read_i64(block, 0)
+    let block_size = raw bit_and ~(FLAG_MASK)
+    let prev_flags = raw bit_and PREV_FREE
+
+    let remainder = block_size - needed
+    if remainder >= MIN_BLOCK_SIZE do
+        native_write_i64(block, 0, needed bit_or prev_flags)
+        let rem_block = block + needed
+        native_write_i64(rem_block, 0, remainder bit_or BLOCK_FREE)
+        native_write_i64(rem_block, 8, needed)
+
+        let next_block = rem_block + remainder
+        let next_raw = native_read_i64(next_block, 0)
+        native_write_i64(next_block, 0, next_raw bit_or PREV_FREE)
+        native_write_i64(next_block, 8, remainder)
+
+        tlsf_insert_block(rem_block)
+    else
+        needed = block_size
+        native_write_i64(block, 0, needed bit_or prev_flags)
+
+        let next_block = block + needed
+        let next_raw = native_read_i64(next_block, 0)
+        native_write_i64(next_block, 0, next_raw bit_and ~(PREV_FREE))
+        native_write_i64(next_block, 8, needed)
+    end
+
+    g_heap.used = g_heap.used + needed
+    if g_heap.used > g_heap.peak_used do
+        g_heap.peak_used = g_heap.used
+    end
+    out block + BLOCK_HEADER
+end.
+
+func heap_free(p: int):
+    if p == 0 do
+        out 0
+    end
+
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    extern func sys_exit(code: int)
+
+    # Validate alignment: payload pointer must be 16-byte aligned
+    if (p bit_and (ALIGNMENT - 1)) != 0 do
+        sys_exit(134)
+        out 0
+    end
+
+    let block = p - BLOCK_HEADER
+
+    # Prove pointer validity before dereferencing. The ordered segment registry
+    # makes this O(log segment_count), never a linear scan through every arena.
+    var is_valid = 0
+    var is_direct = 0
+    if tlsf_seg_find(block) >= 0 do
+        is_valid = 1
+    else
+        if tlsf_direct_find(block) >= 0 do
+            is_valid = 1
+            is_direct = 1
+        end
+    end
+
+    if is_valid == 0 do
+        sys_exit(134)
+        out 0
+    end
+
+    let raw = native_read_i64(block, 0)
+
+    # Check for direct-mapped block
+    if is_direct == 1 or (raw bit_and BLOCK_DIRECT_MAP) != 0 do
+        let map_size = raw bit_and ~(FLAG_MASK)
+        if map_size <= 0 or (raw bit_and BLOCK_FREE) != 0 do
+            sys_exit(134)
+            out 0
+        end
+        native_write_i64(block, 0, map_size bit_or BLOCK_FREE)
+        tlsf_direct_remove(block)
+        let ps = rt_page_size()
+        var pages = (map_size + ps - 1) / ps
+        var actual = pages * ps
+        vm_free(block, actual)
+        g_heap.used = g_heap.used - map_size
+        out 0
+    end
+
+    # Hardened double-free check: if already free, trap immediately with SIGABRT (134)
+    if (raw bit_and BLOCK_FREE) != 0 do
+        sys_exit(134)
+        out 0
+    end
+
+    let original_size = raw bit_and ~(FLAG_MASK)
+    # Hardened block size validation: must be at least MIN_BLOCK_SIZE and 16-byte aligned
+    if original_size < MIN_BLOCK_SIZE or original_size > MAX_ALLOC_SIZE or (original_size bit_and (ALIGNMENT - 1)) != 0 do
+        sys_exit(134)
+        out 0
+    end
+
+    # Boundary tag reciprocity: next block must have prev_size == original_size and PREV_FREE == 0
+    let next_b = block + original_size
+    let next_raw = native_read_i64(next_b, 0)
+    let next_prev = native_read_i64(next_b, 8)
+    if next_prev != original_size or (next_raw bit_and PREV_FREE) != 0 do
+        sys_exit(134)
+        out 0
+    end
+
+    var block_size = original_size
+    let prev_is_free = (raw bit_and PREV_FREE) != 0
+    var merged_block = block
+
+    # 1. O(1) Left coalescing via prev_size boundary tag
+    g_heap_inspect_count = g_heap_inspect_count + 1
+    if prev_is_free do
+        let prev_size = native_read_i64(block, 8)
+        let left_block = block - prev_size
+        tlsf_remove_block(left_block)
+        block_size = block_size + prev_size
+        merged_block = left_block
+    end
+
+    # 2. O(1) Right coalescing via physical offset
+    g_heap_inspect_count = g_heap_inspect_count + 1
+    let right_block = block + original_size
+    let right_raw = native_read_i64(right_block, 0)
+    if (right_raw bit_and BLOCK_FREE) != 0 do
+        let right_size = right_raw bit_and ~(FLAG_MASK)
+        tlsf_remove_block(right_block)
+        block_size = block_size + right_size
+    end
+
+    # 3. Write merged block header (inherit left PREV_FREE)
+    let left_raw = native_read_i64(merged_block, 0)
+    let left_prev_flag = left_raw bit_and PREV_FREE
+    native_write_i64(merged_block, 0, block_size bit_or BLOCK_FREE bit_or left_prev_flag)
+
+    # 4. Update the block after the merged block
+    let after_merged = merged_block + block_size
+    let after_raw = native_read_i64(after_merged, 0)
+    native_write_i64(after_merged, 0, after_raw bit_or PREV_FREE)
+    native_write_i64(after_merged, 8, block_size)
+
+    # 5. Reinsert merged block into segregated bin
+    tlsf_insert_block(merged_block)
+
+    # 6. Correct accounting: deduct only the block being freed
+    g_heap.used = g_heap.used - original_size
+    out 0
+end.
+
+func heap_realloc(p: int, new_size: int):
+    if p == 0 do
+        out heap_alloc(new_size)
+    end
+    if new_size <= 0 do
+        heap_free(p)
+        out 0
+    end
+    if new_size > MAX_ALLOC_SIZE do
+        out 0
+    end
+
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+
+    let block = p - BLOCK_HEADER
+    let raw = native_read_i64(block, 0)
+
+    # Handle direct-mapped block realloc
+    if (raw bit_and BLOCK_DIRECT_MAP) != 0 do
+        let old_map_size = raw bit_and ~(FLAG_MASK)
+        let old_payload = old_map_size - BLOCK_HEADER
+        let new_ptr = heap_alloc(new_size)
+        if new_ptr == 0 do
+            out 0
+        end
+        var clen = old_payload
+        if new_size < clen do
+            clen = new_size
+        end
+        var ci = 0
+        when ci + 8 <= clen loop
+            let word = native_read_i64(p, ci)
+            native_write_i64(new_ptr, ci, word)
+            ci = ci + 8
+        end
+        when ci < clen loop
+            extern func native_read_u8(addr: int, offset: int) -> int
+            extern func native_write_u8(addr: int, offset: int, val: int)
+            let byte_val = native_read_u8(p, ci)
+            native_write_u8(new_ptr, ci, byte_val)
+            ci = ci + 1
+        end
+        heap_free(p)
+        out new_ptr
+    end
+
+    let old_block_size = raw bit_and ~(FLAG_MASK)
+    let old_payload_size = old_block_size - BLOCK_HEADER
+
+    var needed = new_size + BLOCK_HEADER
+    needed = (needed + ALIGNMENT - 1) bit_and ~(ALIGNMENT - 1)
+    if needed < MIN_BLOCK_SIZE do
+        needed = MIN_BLOCK_SIZE
+    end
+
+    # In-place shrink / split tail
+    if needed < old_block_size do
+        let remainder = old_block_size - needed
+        if remainder >= MIN_BLOCK_SIZE do
+            let prev_flags = raw bit_and PREV_FREE
+            native_write_i64(block, 0, needed bit_or prev_flags)
+
+            let rem_block = block + needed
+            native_write_i64(rem_block, 0, remainder bit_or BLOCK_FREE)
+            native_write_i64(rem_block, 8, needed)
+
+            let next_block = rem_block + remainder
+            let next_raw = native_read_i64(next_block, 0)
+            if (next_raw bit_and BLOCK_FREE) != 0 do
+                let next_sz = next_raw bit_and ~(FLAG_MASK)
+                tlsf_remove_block(next_block)
+                let combined_rem = remainder + next_sz
+                native_write_i64(rem_block, 0, combined_rem bit_or BLOCK_FREE)
+                let after_next = rem_block + combined_rem
+                let after_raw = native_read_i64(after_next, 0)
+                native_write_i64(after_next, 0, after_raw bit_or PREV_FREE)
+                native_write_i64(after_next, 8, combined_rem)
+                tlsf_insert_block(rem_block)
+            else
+                native_write_i64(next_block, 0, next_raw bit_or PREV_FREE)
+                native_write_i64(next_block, 8, remainder)
+                tlsf_insert_block(rem_block)
+            end
+
+            g_heap.used = g_heap.used - remainder
+        end
+        out p
+    end
+
+    if needed == old_block_size do
+        out p
+    end
+
+    # Check if we can expand in-place into adjacent right free block
+    let right_block = block + old_block_size
+    let right_raw = native_read_i64(right_block, 0)
+    if (right_raw bit_and BLOCK_FREE) != 0 do
+        let right_size = right_raw bit_and ~(FLAG_MASK)
+        let combined_size = old_block_size + right_size
+        if combined_size >= needed do
+            tlsf_remove_block(right_block)
+            let remainder = combined_size - needed
+            let prev_flags = raw bit_and PREV_FREE
+            if remainder >= MIN_BLOCK_SIZE do
+                native_write_i64(block, 0, needed bit_or prev_flags)
+                let rem_block = block + needed
+                native_write_i64(rem_block, 0, remainder bit_or BLOCK_FREE)
+                native_write_i64(rem_block, 8, needed)
+                let next_block = rem_block + remainder
+                let next_raw = native_read_i64(next_block, 0)
+                native_write_i64(next_block, 0, next_raw bit_or PREV_FREE)
+                native_write_i64(next_block, 8, remainder)
+                tlsf_insert_block(rem_block)
+                g_heap.used = g_heap.used + (needed - old_block_size)
+            else
+                native_write_i64(block, 0, combined_size bit_or prev_flags)
+                let next_block = block + combined_size
+                let next_raw = native_read_i64(next_block, 0)
+                native_write_i64(next_block, 0, next_raw bit_and ~(PREV_FREE))
+                native_write_i64(next_block, 8, combined_size)
+                g_heap.used = g_heap.used + (combined_size - old_block_size)
+            end
+            out p
+        end
+    end
+
+    # Allocate new, copy words, free old (failure preservation: if heap_alloc returns 0, old block is untouched)
+    let new_ptr = heap_alloc(new_size)
+    if new_ptr == 0 do
+        out 0
+    end
+
+    var copy_len = old_payload_size
+    if new_size < copy_len do
+        copy_len = new_size
+    end
+
+    var ci = 0
+    when ci + 8 <= copy_len loop
+        let word = native_read_i64(p, ci)
+        native_write_i64(new_ptr, ci, word)
+        ci = ci + 8
+    end
+    when ci < copy_len loop
+        extern func native_read_u8(addr: int, offset: int) -> int
+        extern func native_write_u8(addr: int, offset: int, val: int)
+        let byte_val = native_read_u8(p, ci)
+        native_write_u8(new_ptr, ci, byte_val)
+        ci = ci + 1
+    end
+    heap_free(p)
+    out new_ptr
+end.
+
+export tlsf_mapping_bin, tlsf_search_suitable_bin, tlsf_insert_block, tlsf_remove_block, heap_init, heap_alloc, heap_free, heap_realloc

@@ -5,7 +5,7 @@ domain: "VIRC"
 title: "Q8_0 external tensor view and packed kernel implementation"
 status: "DRAFT"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-03"
 owners:
   - "compiler"
   - "stdlib"
@@ -20,6 +20,7 @@ related:
   issues:
     - "VIRC-ISS-0003"
     - "VIRC-ISS-0005"
+    - "VIRC-ISS-0020"
   plans:
     - "VIRC-PLN-0002"
   reports: []
@@ -191,3 +192,4 @@ PARTIALLY_RESOLVED
 | 2026-10-02 | Recorded verified Phase 1 and local Phase 2 implementation; concluded PARTIALLY_RESOLVED |
 | 2026-10-02 | Linked VIRC-ISS-0005 |
 | 2026-10-02 | Split the active-IR quantized metadata limitation into VIRC-ISS-0005 |
+| 2026-10-03 | Linked VIRC-ISS-0020 |

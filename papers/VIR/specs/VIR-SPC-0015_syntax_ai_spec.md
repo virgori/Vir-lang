@@ -4,18 +4,19 @@ type: "SPEC"
 domain: "VIR"
 title: "Vir Syntax (AI Spec)"
 status: "ACTIVE"
-version: "2.0.0"
+version: "2.1.0"
 language: "en"
 spec_class: "SPECIFICATION"
 created: "2026-09-06"
-updated: "2026-10-02"
+updated: "2026-10-04"
 owners:
   - "VIR"
 components: []
 aliases:
   - "docs/ai-spec/vir-lang/references/syntax.md"
 related:
-  issues: []
+  issues:
+    - "VIR-ISS-0003"
   plans: []
   reports: []
 supersedes: null
@@ -27,7 +28,7 @@ tags:
 # VIR-SPC-0015 — Vir Syntax (AI Spec)
 
 **Extension:** `.vri`  
-**Spec:** Vir v2.0
+**Spec:** Vir v2.1
 
 ## Comments
 
@@ -133,6 +134,18 @@ var y: i32 = 42
 const PI = 3.14
 ```
 
+## Local compensation transfers
+
+Inside the local `revert` of an enclosing `try`, the canonical terminal statements are:
+
+```text
+local_revert_transfer := retry | rethrow
+```
+
+`retry` restarts that exact `try` after documented `isolate` restoration. `rethrow` preserves `erx` and propagates it to the next outer compensation boundary. Both terminate the current path and are invalid outside an applicable local `revert`.
+
+Implementations may accept legacy `resume retry` and `resume revert` through Vir 2.x only with a stable deprecation diagnostic; source generators and formatters emit the canonical forms. Removal is permitted no earlier than Vir 3.0.
+
 ## Generics
 
 Vir's canonical generic syntax is `of (...)` in declarations, type applications, constructors, and explicit generic calls.
@@ -160,4 +173,5 @@ var nested: dict of (string, Box of (int))
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-04 | 2.1.0 | Canonicalized local compensation control transfers as standalone `retry` and `rethrow` |
 | 2026-10-02 | 2.0.0 | Migrated from `docs/ai-spec/vir-lang/references/syntax.md` and assigned stable ID `VIR-SPC-0015` |

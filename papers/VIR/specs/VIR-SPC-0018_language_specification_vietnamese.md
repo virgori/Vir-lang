@@ -2,20 +2,26 @@
 id: "VIR-SPC-0018"
 type: "SPEC"
 domain: "VIR"
-title: "Đặc tả Ngôn ngữ Vir v2.0"
+title: "Đặc tả Ngôn ngữ Vir v3.1.1"
 status: "ACTIVE"
-version: "2.0.0"
+version: "3.1.1"
 language: "vi"
 spec_class: "SPECIFICATION"
 created: "2026-05-12"
-updated: "2026-10-02"
+updated: "2026-10-06"
 owners:
   - "VIR"
 components: []
 aliases:
   - "docs/vir_language_spec_v2.0_vi.md"
 related:
-  issues: []
+  issues:
+    - "VIR-ISS-0003"
+    - "VIR-ISS-0004"
+    - "VIR-ISS-0005"
+    - "VIR-ISS-0006"
+    - "VIR-ISS-0007"
+    - "VIR-ISS-0008"
   plans: []
   reports: []
 supersedes: null
@@ -24,9 +30,9 @@ tags:
   - "migrated-from-docs"
 ---
 
-# VIR-SPC-0018 — Đặc tả Ngôn ngữ Vir v2.0
+# VIR-SPC-0018 — Đặc tả Ngôn ngữ Vir v3.1.1
 
-*Phiên bản: 2.0 | Ngày: 11 tháng 4, 2026 | Trạng thái: Tài liệu sống*
+*Phiên bản: 3.1.1 | Ngày: 6 tháng 10, 2026 | Trạng thái: Tài liệu sống*
 *Thay thế: v1.2 (Tháng 3, 2026)*
 
 ---
@@ -300,7 +306,7 @@ Trình biên dịch Vir hiện thực hóa toàn diện 26 thuật toán tối �
    │
    ├── Tier-1: Tối Ưu Hóa Cục Bộ & Số Học
    │   1. Constant Folding & Propagation (Đại số & Hằng đẳng thức)
-   │   2. Peephole Strength Reduction (x * 2^k → x << k, x / 2^k → x >> k)
+   │   2. Peephole Strength Reduction (x * 2^k → x shl k, x / 2^k → x shr k)
    │   3. Common Subexpression Elimination (CSE cục bộ)
    │   4. Dead Code Elimination (DCE / Liveness analysis)
    │
@@ -429,54 +435,70 @@ Delimiter cũ `## ... ##` vẫn được chấp nhận để tương thích ngư
 
 ## 3. Hệ thống Module
 
-Vir quản lý mã nguồn theo cơ chế **Ánh xạ Thư mục**. Compiler sử dụng dấu chấm `.` để duyệt cây thư mục và xây dựng Đồ thị Phụ thuộc (Dependency Graph) nhằm tránh nạp chồng.
+Vir phân giải public Module ID qua registry. `VIR-SPC-0006` là contract chi tiết
+chuẩn cho registry discovery, identity, resolution, dedup và diagnostic. Cấu
+trúc thư mục tự nó không công bố một module.
 
 ### 3.1 Thứ tự khai báo
 
 Module tuân thủ thứ tự nghiêm ngặt:
 
 ```
-include → import/get → const → var → entity → func → export → share
+include → import → const → var → entity → func → export → share
 ```
 
 ### 3.2 Include — Nhúng toàn bộ file/lib
 
-`include` là **nạp vật lý toàn bộ module** vào đồ thị biên dịch. Nó dùng khi muốn nhúng cả file/lib và cho phép truy cập qua namespace.
+`include` nạp một hoặc nhiều module đã đăng ký vào đồ thị biên dịch và thiết lập
+namespace. Alias chỉ đổi namespace cục bộ, không đổi canonical identity.
 
 ```vir
-include math;                                   # nhúng math.vri
-include net.http;                               # nhúng net/http.vri
-include net.http as web;                        # nhúng net/http.vri, namespace cục bộ là web
-include math, io.file as file, net.http as web; # nhúng nhiều module trên 1 dòng với alias
+include math;
+include net.http as web;
+include math, io.file as file, net.http as web;
 ```
 
-**Cơ chế ánh xạ:** `A.B.C` → tìm file `A/B/C.vri` từ gốc dự án.
+Multi-include tương đương các directive riêng theo thứ tự trái sang phải; một
+`as` alias chỉ áp dụng cho item ngay trước nó.
 
-Dấu chấm `.` là dấu phân cách duy nhất của đường dẫn module. `A::B` không phải cú pháp Vir hợp lệ và compiler phải từ chối ở mọi ngữ cảnh.
+Dấu chấm `.` là separator duy nhất bên trong Module ID. `A::B` không phải cú
+pháp Vir hợp lệ và compiler phải từ chối ở mọi ngữ cảnh. Direct filesystem path
+là compatibility target riêng và dùng `/`:
 
-### 3.3 Import — Nhập symbol đã export vào scope hiện tại
+```vir
+include "provider.vri";
+include provider.vri;
+include "helpers/provider.vri";
+```
+
+Registered dotted Module ID vẫn là form ưu tiên cho project/stdlib. Direct path
+không công bố Module ID. Nếu normalized physical path trùng một registry entry,
+resolution dùng registered canonical identity đó; nếu không thì dùng
+path-derived identity. Một unregistered dotted spelling có thể fallback bằng
+cách đổi dot thành slash để tương thích mã cũ, nhưng project mới nên khai báo ID
+trong `module.list`.
+
+### 3.3 Import — Symbol đã export và namespace
 
 `import` **không yêu cầu phải include trước**. Nó chỉ lấy các symbol đã `export` từ file/module đích vào phạm vi hiện tại.
 
-**Cú pháp chuẩn Vir v2.0:**
+**Cú pháp chuẩn Vir v3.1:**
 
 ```vir
-import add from math;               # nhập 1 hàm đã export
-import add, sub from math;          # nhập nhiều hàm đã export
-import from net.http;               # nhập toàn bộ symbol đã export
-import get from net.http as fetch;  # alias tại scope hiện tại
+import add, sub from math;           # selective import
+import MAX_RETRY from net.config;    # hằng dùng cùng một form
+import get from net.http as fetch;   # `get` là tên export bình thường
+import answer from "provider.vri";   # provider dùng direct-path compatibility
+import from net.http;                # toàn bộ export surface
+import net.http as web;              # namespace của cả module
 ```
 
-> Dạng `from math import add` chỉ là tương thích cũ; **không phải cú pháp chuẩn ưu tiên** của Vir v2.0.
+Import không cần `include` trước. Selective import áp dụng thống nhất cho
+function, type, constant và variable đã export. `import from module` đưa toàn bộ
+exported declarations vào local scope. `import module as alias` tạo namespace
+và không inject unqualified names.
 
-### 3.4 Get — Nhập biến/hằng vào phạm vi cục bộ
-
-```vir
-get MAX_RETRY from net.config;   # dùng MAX_RETRY trực tiếp
-get PI from math as TAU;         # đổi tên
-```
-
-### 3.5 Export / Share / Port
+### 3.4 Export / Share / Port
 
 ```vir
 export add, subtract;            # xuất hàm cho module khác
@@ -494,13 +516,7 @@ port signals, commands;          # kênh tín hiệu có tên (phối hợp gi�
 | Điển hình | Framebuffer, âm thanh, bảng tra cứu | Gateway ↔ Satellite node, producer ↔ consumer |
 | Chặn | Không | `recv` chặn đến khi có tin (hoặc timeout) |
 
-### 3.6 Import kết hợp
-
-```vir
-import add, subtract, get counter, mode from math;
-```
-
-### 3.7 Sử dụng
+### 3.5 Sử dụng
 
 ```vir
 func main:
@@ -510,50 +526,20 @@ func main:
 end.
 ```
 
-### 3.8 Đồ thị Phụ thuộc
+### 3.6 Registry và đồ thị phụ thuộc
 
-Mỗi khi bắt gặp `include`, `import`, hoặc `get`, Compiler thực hiện các bước:
+Project registry là `module.list`. Thư mục chứa file là base ban đầu; `root`
+không bắt buộc và nếu có sẽ đổi base cho các mapping theo sau. Vì vậy registry
+không bắt buộc nằm ở repository root. Standard-library registry thuộc active
+Vir toolchain và không được copy vào project.
 
-1. **Kiểm tra cache:** Module đường dẫn `A.B.C` đã có trong bộ nhớ chưa?
-2. **Kiểm tra vòng:** Nếu module đang ở trạng thái `DangParse` → báo lỗi `"Phụ thuộc vòng: A.B.C"`
-3. **Ánh xạ:** `A.B.C` → `A/B/C.vri`, nạp và parse file nguồn
-4. **Đăng ký:** Thêm các định danh vào bảng ký hiệu (Symbol Table) của module hiện tại
+Các stdlib Module ID đang active được reserve khỏi exact project-ID collision.
+Validation xảy ra khi load registry, kể cả khi source không reference ID bị
+trùng. Prefix-only relationship vẫn hợp lệ: stdlib `http` không reserve project
+`http.app`.
 
-Trạng thái module: `ChuaNap` → `DangParse` → `DaParse`
-
-**Lazy Import — nới lỏng phụ thuộc vòng cho kiểu dữ liệu:**
-
-Khi hai module phụ thuộc lẫn nhau về *kiểu* (không cần logic thực thi), dùng `lazy` để trì hoãn phân giải:
-
-```vir
-# gateway.vri
-lazy include satellite;              # chỉ nhập kiểu, không parse toàn bộ
-
-entity GatewayConfig:
-    satellites: array of (satellite.SatInfo) # dùng kiểu từ satellite
-end.
-```
-
-```vir
-# satellite.vri
-lazy include gateway;                # ngược lại cũng lazy
-
-entity SatStatus:
-    gw: gateway.GatewayConfig               # dùng kiểu từ gateway
-end.
-```
-
-**Quy tắc `lazy`:**
-
-| Thuộc tính | Hành vi |
-|-----------|--------|
-| Phân giải | Chỉ parse **khai báo kiểu** (`entity`, `enum`, `mold`, `register`) trong module đích |
-| Hàm / logic | **Không** có sẵn — gọi hàm từ module `lazy` là lỗi biên dịch |
-| Trạng thái | `ChuaNap` → `DangParseLazy` → `DaParseLazy`; chuyển `DaParse` đầy đủ khi có `include` không lazy |
-| Vòng | Cho phép — hai module `lazy include` lẫn nhau là hợp lệ |
-| Kích hoạt | `lazy include A;` hoặc `lazy import SomeType from A;` |
-
-> **Hạn chế:** `lazy` chỉ phân giải kiểu — sử dụng hằng số (`const`), hàm, hoặc biến `share` từ module lazy yêu cầu nâng cấp thành `include` đầy đủ.
+Dependency được dedup và cycle-check theo canonical Module ID. Cycle là lỗi
+compile-time; Vir 3.0 không có ngoại lệ nạp trì hoãn chỉ dành cho type.
 
 ---
 
@@ -1202,11 +1188,12 @@ named_argument    := IDENT "=" expr     # truyền giá trị cho parameter
 `=` mang nghĩa gán/truyền giá trị cho tham số (`timeout = 10`).  
 Không gộp hai khái niệm này thành một “gán theo tên” rồi kết luận bất nhất.
 
-### 6.5 Khai báo trước
+### 6.5 Thứ tự khai báo
 
-```vir
-has processData;     # khai báo trước khi định nghĩa
-```
+Function definition trong một source unit được thu thập không phụ thuộc thứ tự
+source. Một lời gọi có thể tham chiếu function được định nghĩa phía sau mà không
+cần declaration riêng. Foreign declaration không có body phải dùng form có đầy
+đủ kiểu `extern func`, `extern from ... func` hoặc binding đã quy định tại §15.
 
 ### 6.6 Hàm bậc cao (Higher-Order Functions)
 
@@ -1222,7 +1209,7 @@ func apply(f, value):
 end.
 
 func main:
-    var f = double        # con trỏ hàm
+    var f = double        # giá trị hàm có kiểu
     print f(5)            # → 10
     print apply(double, 7) # → 14
 end.
@@ -1713,7 +1700,7 @@ u.display()                  # → display(u)
 
 Khi compiler gặp `x.foo(args)`:
 1. Nếu `foo` là `method` của entity type → gọi method (implicit `this`)
-2. Nếu `foo` là **callable field** (field kiểu con trỏ hàm) → gọi gián tiếp qua giá trị field
+2. Nếu `foo` là **callable field** (field có kiểu hàm cấu trúc) → gọi gián tiếp qua giá trị field
 3. Nếu tồn tại hàm `foo(x, args)` → gọi UFCS
 4. Nếu không → lỗi biên dịch
 
@@ -1722,7 +1709,7 @@ Bước 2 cho phép pattern hướng sự kiện (event-driven) — entity field
 ```vir
 entity Button:
     label: string
-    on_click: ptr           # field con trỏ hàm
+    on_click: func()        # field giá trị hàm có kiểu
 end.
 
 func handle_click:
@@ -1733,7 +1720,9 @@ var btn = Button(label: "OK", on_click: handle_click)
 btn.on_click()              # bước 2 → gọi gián tiếp qua giá trị field
 ```
 
-> **Lưu ý:** `btn.on_click` (không có ngoặc) vẫn là truy cập field — đọc con trỏ hàm. `btn.on_click()` (có ngoặc) **gọi** con trỏ hàm vì bước 2 nhận biết field chứa kiểu callable.
+> **Lưu ý:** `btn.on_click` (không có ngoặc) vẫn là truy cập field — đọc giá trị hàm có kiểu. `btn.on_click()` (có ngoặc) **gọi** giá trị đó và chỉ truyền các đối số được viết trong cặp ngoặc. Gọi callable field không tự chèn `btn` làm receiver ngầm định.
+
+Chỉ field được khai báo bằng kiểu hàm cấu trúc, `func(P...) -> R` hoặc dạng không trả kết quả `func(P...)`, mới có thể được gọi. Kiểu `ptr` thô là một địa chỉ opaque, không bao giờ tự động callable và không được chuyển đổi ngầm định thành kiểu hàm. Vir 2.1 chưa định nghĩa phép chuyển địa chỉ thô thành callable. Một cơ chế FFI tương lai cho phép chuyển đổi này phải dùng cú pháp unsafe tường minh và khai báo đầy đủ chữ ký hàm, ABI/quy ước gọi, provenance và ràng buộc lifetime.
 
 ### 11.5 Field và Hàm — Không mờ hồ
 
@@ -1959,7 +1948,7 @@ end.
 
 ### 13.7 try / revert — Xử lý lỗi cục bộ với bồi hoàn
 
-`try:` tạo **ranh giới bắt lỗi cục bộ** bên trong thân hàm. Mỗi khối `try` có phần `revert` riêng để bồi hoàn cục bộ. Tính năng bổ sung: **timeout**, **isolate**, **resume retry**, **resume revert**, và **emit** cho ghi sự kiện có cấu trúc.
+`try:` tạo **ranh giới bắt lỗi cục bộ** bên trong thân hàm. Mỗi khối `try` có phần `revert` riêng để bồi hoàn cục bộ. Tính năng bổ sung: **timeout**, **isolate**, **retry**, **rethrow**, và **emit** cho ghi sự kiện có cấu trúc.
 
 **Cấu trúc cơ bản:**
 
@@ -1971,6 +1960,16 @@ revert
 end
 ```
 
+Các câu lệnh kết thúc chuẩn trong `revert` cục bộ được mô tả bởi:
+
+```text
+local_revert_transfer := retry | rethrow
+```
+
+Cả hai câu lệnh chỉ hợp lệ bên trong `revert` cục bộ của một `try` bao ngoài và kết thúc nhánh luồng điều khiển hiện tại. `retry` khởi động lại chính khối `try` đó sau bước khôi phục `isolate` đã đặc tả. `rethrow` giữ nguyên giá trị `erx` hiện tại và lan truyền nó đến ranh giới bồi hoàn bao ngoài tiếp theo, hoặc đến `revert` cấp hàm nếu không còn ranh giới cục bộ. Mã nằm sau một trong hai câu lệnh trên cùng nhánh là không thể đạt tới.
+
+Để tương thích mã nguồn trong toàn bộ Vir 2.x, implementation có thể chấp nhận hai cách viết cũ `resume retry` và `resume revert`. Khi chấp nhận, implementation phải phát diagnostic deprecation ổn định, phải diễn giải chúng hoàn toàn tương đương `retry` và `rethrow`, còn formatter và generator chỉ được phát dạng chuẩn. Chỉ được loại bỏ các cách viết cũ từ Vir 3.0 trở đi.
+
 **Có `timeout` — tự động huỷ sau thời hạn:**
 
 ```vir
@@ -1978,17 +1977,17 @@ try(timeout: 5s):
     download_large_file()
 revert
     emit LOG_ERROR("Tải xuống hết hạn hoặc lỗi: $erx")
-    resume revert
+    rethrow
 end
 ```
 
 Tham số `timeout` là tuỳ chọn. Nếu thao tác vượt thời gian quy định, khối try bị huỷ và `revert` cục bộ chạy với mã lỗi timeout trong `erx`.
 
-**`resume retry` — khởi động lại khối try hiện tại:**
+**`retry` — khởi động lại khối try hiện tại:**
 
-Nếu `revert` cục bộ xác định lỗi có thể phục hồi, `resume retry` khởi động lại khối `try` từ đầu. Dùng biến đếm để tránh vòng lặp vô hạn.
+Nếu `revert` cục bộ xác định lỗi có thể phục hồi, `retry` khởi động lại khối `try` từ đầu. Dùng biến đếm để tránh vòng lặp vô hạn.
 
-**⚠ Cảnh báo trạng thái bẩn:** Vir không có transactional memory. Biến bị sửa đổi trước khi `throw` bên trong `try:` **giữ nguyên giá trị đã bị sửa** khi `resume retry` khởi động lại khối. Developer **phải** reset mọi trạng thái bẩn bên trong `revert` cục bộ trước khi gọi `resume retry`. Nếu không, retry chạy trên dữ liệu rác/hỏng.
+**⚠ Cảnh báo trạng thái bẩn:** Vir không có transactional memory. Biến bị sửa đổi trước khi `throw` bên trong `try:` **giữ nguyên giá trị đã bị sửa** khi `retry` khởi động lại khối. Developer **phải** reset mọi trạng thái bẩn bên trong `revert` cục bộ trước khi gọi `retry`. Nếu không, retry chạy trên dữ liệu rác/hỏng.
 
 ```vir
 var retry_limit = 3
@@ -1998,9 +1997,9 @@ try(timeout: 5s):
 revert
     retry_limit -= 1
     if retry_limit > 0 do
-        resume retry           # khởi động lại khối try này
+        retry           # khởi động lại khối try này
     end
-    resume revert              # bỏ cuộc — lan truyền đến revert hàm
+    rethrow              # bỏ cuộc — lan truyền đến revert hàm
 end
 ```
 
@@ -2017,13 +2016,13 @@ revert
     partial_result = 0            # ← BẮT BUỘC reset trạng thái bẩn trước retry
     retry_limit -= 1
     if retry_limit > 0 do
-        resume retry
+        retry
     end
-    resume revert
+    rethrow
 end
 ```
 
-Compiler phát **cảnh báo** nếu `resume retry` được dùng mà khối `revert` không gán lại bất kỳ biến nào đã bị sửa trong thân `try`. Đây là heuristic nỗ lực tốt nhất — luồng điều khiển phức tạp có thể cần kiểm tra thủ công.
+Compiler phát **cảnh báo** nếu `retry` được dùng mà khối `revert` không gán lại bất kỳ biến nào đã bị sửa trong thân `try`. Đây là heuristic nỗ lực tốt nhất — luồng điều khiển phức tạp có thể cần kiểm tra thủ công.
 
 **`isolate` — snapshot & khôi phục tự động:**
 
@@ -2036,7 +2035,7 @@ Hai dạng `isolate` cùng gốc Isolation, khác **chính sách** gắn kèm:
 | Block `isolate` | `isolate: … end` | **sandbox policy** (§25.5) |
 | `try(isolate:)` | `try(isolate: […]):` | **snapshot / retry policy** (mục này) |
 
-Dạng `try(isolate:)`: tham số của `try` khai báo danh sách biến bên ngoài mà Compiler tự động **snapshot lên Stack** khi vào `try` và **khôi phục** trước mỗi `resume retry`. Điều này loại bỏ nhu cầu reset thủ công trạng thái bẩn trong `revert`.
+Dạng `try(isolate:)`: tham số của `try` khai báo danh sách biến bên ngoài mà Compiler tự động **snapshot lên Stack** khi vào `try` và **khôi phục** trước mỗi `retry`. Điều này loại bỏ nhu cầu reset thủ công trạng thái bẩn trong `revert`.
 
 ```vir
 try(isolate: [retry_limit, partial_result]):
@@ -2045,9 +2044,9 @@ try(isolate: [retry_limit, partial_result]):
 revert
     retry_limit -= 1
     if retry_limit > 0 do
-        resume retry       # partial_result tự động khôi phục về giá trị trước try
+        retry       # partial_result tự động khôi phục về giá trị trước try
     end
-    resume revert
+    rethrow
 end
 ```
 
@@ -2059,16 +2058,16 @@ try(timeout: 5s, isolate: [retry_limit]):
 revert
     retry_limit -= 1
     if retry_limit > 0 do
-        resume retry
+        retry
     end
-    resume revert
+    rethrow
 end
 ```
 
 **Ngữ nghĩa:**
 - **Khi vào `try`:** giá trị snapshot của các biến trong danh sách `isolate` được đẩy lên stack frame bao ngoài (copy semantics; với Move type chỉ copy header/con trỏ — nội dung heap *không* được hoàn tác).
-- **Khi `resume retry`:** các biến được **khôi phục** từ snapshot trước khi thân `try` khởi lại. Snapshot được giữ cho các lần retry tiếp theo.
-- **Khi thoát bình thường hoặc `resume revert`:** snapshot bị huỷ.
+- **Khi `retry`:** các biến được **khôi phục** từ snapshot trước khi thân `try` khởi lại. Snapshot được giữ cho các lần retry tiếp theo.
+- **Khi thoát bình thường hoặc `rethrow`:** snapshot bị huỷ.
 - Biến **không** nằm trong danh sách `isolate` không bị ảnh hưởng — mutation của chúng vẫn còn hiệu lực.
 
 **Phát hiện trạng thái bẩn lúc biên dịch (W302):**
@@ -2076,7 +2075,7 @@ end
 Nếu Compiler phát hiện một biến:
 1. Được khai báo **bên ngoài** khối `try`
 2. Bị **đột biến** bên trong thân `try` (gán, `+=`, `-=`, v.v.)
-3. Trong khối có dùng `resume retry`
+3. Trong khối có dùng `retry`
 4. **Không** được liệt kê trong `isolate`
 5. Và **không** được gán lại trong khối `revert`
 
@@ -2099,9 +2098,9 @@ try(isolate: [connection]):
     connection = open_link()
 revert
     if total_attempts < 5 do
-        resume retry
+        retry
     end
-    resume revert
+    rethrow
 end
 ```
 
@@ -2109,7 +2108,7 @@ end
 
 | Thuộc tính | Hành vi |
 |------------|--------|
-| W302 | Tắt — không cảnh báo khi mutate bên trong `try` có `resume retry` |
+| W302 | Tắt — không cảnh báo khi mutate bên trong `try` có `retry` |
 | Snapshot | Không — biến `atomic` **không** bị khôi phục khi retry |
 | Phạm vi | Cấp hàm hoặc cấp module; không cho phép trong `isolate` list |
 | Kiểu | Chỉ kiểu Copy (`i8`–`i64`, `u8`–`u64`, `int`, `bool`, `float`) |
@@ -2117,9 +2116,9 @@ end
 
 > **Lưu ý:** `atomic` ở đây là thuộc tính biến cho retry logic, không phải atomic bộ nhớ (`lock`/`!!`). Hai cơ chế hoàn toàn độc lập.
 
-**`resume revert` — lan truyền đến revert cấp hàm:**
+**`rethrow` — lan truyền đến revert cấp hàm:**
 
-`resume revert` bên trong khối `revert` cục bộ đẩy lỗi lên `revert` cấp hàm. Đây là **mẫu bồi hoàn Saga** — mỗi cấp dọn dẹp cục bộ, rồi lan truyền lên trên.
+`rethrow` bên trong khối `revert` cục bộ đẩy lỗi lên `revert` cấp hàm. Đây là **mẫu bồi hoàn Saga** — mỗi cấp dọn dẹp cục bộ, rồi lan truyền lên trên.
 
 **`emit` — ghi sự kiện có cấu trúc:**
 
@@ -2147,9 +2146,9 @@ func sync_satellite_data:
         emit LOG_ERROR("Kết nối thất bại (lỗi $erx)")
         retry_limit -= 1
         if retry_limit > 0 do
-            resume retry
+            retry
         end
-        resume revert
+        rethrow
     end
 
     # Cấp 2: Lấy dữ liệu
@@ -2159,7 +2158,7 @@ func sync_satellite_data:
     revert
         emit LOG_ERROR("Lấy dữ liệu thất bại (lỗi $erx)")
         close_satellite_link(connection)
-        resume revert
+        rethrow
     end
 
     # Cấp 3: Ghi vào bộ nhớ
@@ -2168,7 +2167,7 @@ func sync_satellite_data:
         write_storage(data_buffer)
     revert
         emit LOG_ERROR("Ghi thất bại (lỗi $erx)")
-        resume revert
+        rethrow
     end
 
     emit LOG_INFO("Đồng bộ hoàn tất.")
@@ -2198,10 +2197,10 @@ Từ khoá `erx` đọc mã lỗi hiện tại (giá trị truyền cho `throw`)
 |-----------|--------|---------|
 | `try: ... revert ... end` | Trong thân hàm | Ranh giới lỗi với bồi hoàn cục bộ |
 | `try(timeout: T): ...` | Trong thân hàm | Ranh giới lỗi với hết hạn tự động |
-| `try(isolate: [x, y]): ...` | Trong thân hàm | Snapshot biến khi vào; khôi phục khi `resume retry` |
-| `resume retry` | Trong `revert` cục bộ | Khởi động lại khối try hiện tại |
-| `resume revert` | Trong `revert` cục bộ | Lan truyền lỗi đến revert cấp hàm |
-| `revert` | Cuối hàm | Chạy khi lỗi lan truyền qua `resume revert` hoặc `throw` |
+| `try(isolate: [x, y]): ...` | Trong thân hàm | Snapshot biến khi vào; khôi phục khi `retry` |
+| `retry` | Trong `revert` cục bộ | Khởi động lại khối try hiện tại |
+| `rethrow` | Trong `revert` cục bộ | Lan truyền lỗi đến revert cấp hàm |
+| `revert` | Cuối hàm | Chạy khi lỗi lan truyền qua `rethrow` hoặc `throw` |
 | `ensure` | Cuối hàm | Luôn chạy khi thoát hàm |
 | `emit` | Bất kỳ đâu | Ghi sự kiện/log có cấu trúc |
 | `erx` | revert / ensure | Đọc mã lỗi đã throw |
@@ -2211,9 +2210,9 @@ Từ khoá `erx` đọc mã lỗi hiện tại (giá trị truyền cho `throw`)
 | Kịch bản | Luồng |
 |----------|-------|
 | try thành công | thân try → code sau try end → ensure → return |
-| try throw + resume retry | thân try → throw → revert cục bộ → resume retry → thân try (khởi lại) |
-| try throw + resume retry (isolate) | thân try → throw → revert cục bộ → resume retry → **khôi phục snapshot** → thân try (khởi lại) |
-| try throw + resume revert | thân try → throw → revert cục bộ → resume revert → revert hàm → ensure → return |
+| try throw + retry | thân try → throw → revert cục bộ → retry → thân try (khởi lại) |
+| try throw + retry (isolate) | thân try → throw → revert cục bộ → retry → **khôi phục snapshot** → thân try (khởi lại) |
+| try throw + rethrow | thân try → throw → revert cục bộ → rethrow → revert hàm → ensure → return |
 | try hết hạn | timeout kích hoạt → revert cục bộ (erx = mã timeout) |
 | throw ngoài try | thân hàm → throw → revert hàm → ensure → return |
 
@@ -2538,10 +2537,10 @@ end.
 
 | Thao tác | Code sinh ra |
 |----------|-------------|
-| **Đọc 1 bit** `reg.FIELD` | `(value >> bit_pos) & 1` |
-| **Ghi 1 bit** `reg.FIELD = v` | `(value & ~(1 << bit_pos)) \| (v << bit_pos)` |
-| **Đọc nhiều bit** `reg.FIELD` | `(value >> lo) & ((1 << (hi-lo+1)) - 1)` |
-| **Ghi nhiều bit** `reg.FIELD = v` | `(value & ~(mask << lo)) \| ((v & mask) << lo)` |
+| **Đọc 1 bit** `reg.FIELD` | `(value shr bit_pos) and 1` |
+| **Ghi 1 bit** `reg.FIELD = v` | `(value and bnot(1 shl bit_pos)) or (v shl bit_pos)` |
+| **Đọc nhiều bit** `reg.FIELD` | `(value shr lo) and ((1 shl (hi-lo+1)) - 1)` |
+| **Ghi nhiều bit** `reg.FIELD = v` | `(value and bnot(mask shl lo)) or ((v and mask) shl lo)` |
 
 Trên ARM64, compiler emit lệnh `UBFX` (trích) và `BFI` (chèn) native.
 
@@ -3803,9 +3802,7 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 | Từ khoá | Mục đích |
 |---------|---------|
 | `include` | Nạp file và tạo namespace |
-| `lazy include` | Import trì hoãn chỉ kiểu — cho phép phụ thuộc vòng giữa module về kiểu dữ liệu (§3.8) |
-| `import` | Đưa hàm vào phạm vi cục bộ |
-| `get` | Đưa biến/hằng vào phạm vi cục bộ |
+| `import` | Đưa declarations đã export vào local scope hoặc bind namespace module |
 | `from` | Chỉ định module nguồn |
 | `as` | Đổi tên namespace, import, hoặc ép kiểu |
 | `export` | Xuất hàm cho module khác |
@@ -3835,8 +3832,8 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 | `timeout` | Tham số cho `try` — tự động huỷ sau thời hạn |
 | `isolate` | Isolation: execution context độc lập — `try(isolate:)` = snapshot/retry (§13.7); block = sandbox (§25.5) |
 | `atomic` (var) | Bổ ngữ biến — cho phép mutation xuyên retry mà không khôi phục, tắt W302 (§13.7) |
-| `resume retry` | Trong `revert` cục bộ — khởi lại khối try hiện tại |
-| `resume revert` | Trong `revert` cục bộ — lan truyền đến revert cấp hàm |
+| `retry` | Trong `revert` cục bộ — khởi lại khối try hiện tại |
+| `rethrow` | Trong `revert` cục bộ — lan truyền đến revert cấp hàm |
 
 ### Tham số
 
@@ -3901,7 +3898,6 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 
 | Từ khoá | Mục đích |
 |---------|---------|
-| `has` | Khai báo trước |
 | `none` | Giá trị null |
 | `true` / `false` | Giá trị boolean |
 | `mod` | Toán tử modulo |
@@ -3924,7 +3920,7 @@ Từ cao đến thấp:
 | 22 | `**` `><` | Trái |
 | 20 | `*` `/` | Trái |
 | 18 | `%` `mod` | Trái |
-| 12 | `>>` `shl` `shr` `as` | Trái |
+| 12 | Cast: `as`, `>>`; dịch bit: `shl`, `shr` | Trái |
 | 10 | `+` `-` | Trái |
 | 8 | `:~` | Trái |
 | 6 | `>` `<` `>=` `<=` | Trái |
@@ -3955,9 +3951,9 @@ Từ cao đến thấp:
 | try / revert | — | `try: ... revert ... end` ranh giới lỗi cục bộ với bồi hoàn Saga |
 | emit | — | `emit LOG_INFO(...)` ghi sự kiện/log có cấu trúc |
 | timeout | — | `try(timeout: 5s):` tự động huỷ sau thời hạn |
-| resume | — | `resume retry` / `resume revert` — điều khiển luồng trong revert cục bộ |
+| retry / rethrow | — | Điều khiển kết thúc trong `revert` cục bộ; `resume retry` / `resume revert` cũ bị deprecated trong 2.x |
 | isolate | — | Isolation = execution context độc lập; `try(isolate:)` = snapshot/retry; block = sandbox (§13.7, §25.5) |
-| resume retry an toàn | — | Compiler phát W302 nếu biến bị đột biến trong try, khối có `resume retry`, và biến không trong `isolate` hoặc chưa reset trong `revert` (§13.7) |
+| retry an toàn | — | Compiler phát W302 nếu biến bị đột biến trong try, khối có `retry`, và biến không trong `isolate` hoặc chưa reset trong `revert` (§13.7) |
 | `await pass` | — | Điểm nhường quyền tường minh — chống chiếm CPU trong vòng lặp async hợp tác (§22.6) |
 | `cancel` | — | Huỷ tác vụ hợp tác — gửi tại `await` tiếp theo (§22.7) |
 | `select` | — | Đa nhiệm hoá sự kiện — `select: on t1 as r: ... end` chạy đua nhiều tác vụ (§22.8) |
@@ -3969,8 +3965,7 @@ Từ cao đến thấp:
 | Swizzle `~` | — | `v~xyz` — hậu tố xáo trộn/nhân bản kênh `flux`; write-masking: `v~xy = flux(a, b)` (§24.2) |
 | `deck` | — | `deck tên: Kiểu[kích_thước]` — buffer chia sẻ CPU-GPU (§24.3) |
 | `lock` / `!!` | — | Đọc-sửa-ghi nguyên tử: `lock x += 1` hoặc `x!! += 1` (§24.4) |
-| `atomic` (var) | — | Bổ ngữ biến cho retry logic — cho phép mutation xuyên `resume retry` mà không bị khôi phục, tắt W302 (§13.7) |
-| `lazy include` | — | Import trì hoãn chỉ kiểu — cho phép phụ thuộc vòng giữa module về `entity`/`enum` (§3.8) |
+| `atomic` (var) | — | Bổ ngữ biến cho retry logic — cho phép mutation xuyên `retry` mà không bị khôi phục, tắt W302 (§13.7) |
 | Swizzle write-mask | — | `v~xy = flux(a, b)` — ghi chọn lọc kênh, kênh không nêu giữ nguyên; sinh `INS`/`BLENDPS` (§24.2) |
 | `reactive` | — | Biến trạng thái tự động cập nhật UI — propagation tại biên dịch, không runtime refresh (§25.1) |
 | `morph` | — | Ánh xạ tĩnh entity/struct → component UI — binding sinh tại biên dịch, không reflection (§25.2) |
@@ -3989,7 +3984,7 @@ Từ cao đến thấp:
 | Move semantics | — | Kiểu non-copy move khi gán; ràng buộc cũ bị vô hiệu hoá (§4.8) |
 | arena block | — | `arena: ... end` sub-arena có phạm vi cho thu hồi bộ nhớ vòng lặp (§4.6) |
 | Phân tầng runtime | — | Language / Compiler / Library tách cứng; compiler không biết scheduler; zero-cost = không dùng thì không có trong binary (§1.2, `VIR_EXECUTION_MODEL.md`) |
-| callable field | — | Bước UFCS 2: `x.callback()` gọi field con trỏ hàm (§11) |
+| callable field | — | Bước UFCS 2: `x.callback()` gọi field giá trị hàm có kiểu và chỉ truyền đối số tường minh (§11) |
 | Quy tắc biên lexer nội suy | — | `$ident` dừng tại `[`, toán tử; dùng `$(expr)` cho biểu thức phức tạp (§12.6) |
 | arr_compact | — | `arr_compact(arr)` — thu hồi dead space resize mảng (§19.4) |
 | Kiểu mũi tên trả về | `func f(): int` | `func f() -> int:` |
@@ -4000,11 +3995,10 @@ Từ cao đến thấp:
 | Include đường dẫn | `include math;` | + `include net.http;` (ánh xạ thư mục) |
 | Include alias | — | `include net.http as web;` |
 | Import alias | — | `import get from net.http as fetch;` |
-| Get | — | `get PI from math;` (nhập biến/hằng) |
 
 ---
 
-*Đặc tả Ngôn ngữ Vir v2.0 — Ngôn ngữ lập trình hệ thống biên dịch native không phụ thuộc.*
+*Đặc tả Ngôn ngữ Vir v3.1 — Ngôn ngữ lập trình hệ thống biên dịch native không phụ thuộc.*
 *Mục tiêu: ARM64 (Mach-O), x86-64 (ELF), WebAssembly.*
 *Trình biên dịch tự lưu trữ: virc.vri (viết hoàn toàn bằng Vir).*
 
@@ -4012,4 +4006,8 @@ Từ cao đến thấp:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-06 | 3.1.1 | Sửa toàn bộ ví dụ dịch bit Vir sang `shl`/`shr` và giữ `>>` riêng cho phép cast |
+| 2026-10-06 | 3.1.0 | Mô tả registered dotted Module ID, direct `.vri` path compatibility, legacy dot-to-path fallback và canonical convergence giữa các spelling tương đương |
+| 2026-10-06 | 3.0.0 | Chuẩn hóa module contract dựa trên registry, multi-include và namespace/umbrella import; thống nhất selective import cho mọi declaration kind; loại form forward/deferred cũ; reserve exact stdlib Module ID |
+| 2026-10-04 | 2.1.0 | Chuẩn hóa chuyển luồng bồi hoàn cục bộ thành `retry`/`rethrow` và tách callable field có kiểu khỏi `ptr` thô |
 | 2026-10-02 | 2.0.0 | Migrated from `docs/vir_language_spec_v2.0_vi.md` and assigned stable ID `VIR-SPC-0018` |

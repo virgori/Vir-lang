@@ -3,9 +3,9 @@ id: "VIRC-PLN-0003"
 type: "PLAN"
 domain: "VIRC"
 title: "Quantized tensor format shape and storage metadata"
-status: "ACTIVE"
+status: "COMPLETED"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-05"
 owners:
   - "compiler"
   - "stdlib"
@@ -23,7 +23,8 @@ related:
   issues:
     - "VIRC-ISS-0005"
   plans: []
-  reports: []
+  reports:
+    - "VIRC-RPT-0035"
 supersedes: null
 superseded_by: null
 tags:
@@ -107,7 +108,7 @@ In `stdlib/vir/compiler/type_table.vri`:
   - `Q_CODEC_Q8_0 = 2`
 - Define structured type string format:
   - Uniform: `"quantized[uniform; elem=f32; bits=8; 2, 2]"`
-  - Q8_0: `"quantized[q8_0; elem=f64; shape=2,32; block=40; stride=40; align=8; ro=1; own=borrowed; life=1]"`
+  - Q8_0: `"quantized[q8_0; elem=f64; shape=2, 32; block=40; stride=40; align=8; bytes=80; offset=0; view=80; ro=1; own=0; life=1; generation=1]"`
 - Add helper functions:
   - `is_quantized_type_str(s: int) -> bool`
   - `parse_quantized_codec(s: int) -> int`
@@ -263,14 +264,14 @@ Revert changes to `type_table.vri`, `sem_pass6_typecheck.vri`, `ast_to_mir.vri`,
 
 ## 13. Exit Criteria
 
-- [ ] Internal quantized metadata captures codec, element type, shape, and physical layout without flat string collapsing;
-- [ ] AI-001 and AI-003 pass in gap contract runner;
-- [ ] Q80-001 and AI-006 pass with verified dispatch;
-- [ ] Negative tests verify rejection of mismatched shapes, activation types, and codec reinterpretation;
-- [ ] Deterministic dump tests prove metadata preservation across compiler passes;
-- [ ] Modular compiler sources and `virc.vri` are synchronized and self-host compiles cleanly;
-- [ ] VIRC-RPT-0002 implementation report links VIRC-ISS-0005 and VIRC-PLN-0003;
-- [ ] `./paper validate` passes with zero errors.
+- [x] Internal quantized metadata captures codec, element type, shape, and physical layout without flat string collapsing;
+- [x] AI-001 and AI-003 pass in gap contract runner;
+- [x] Q80-001 and AI-006 pass with verified dispatch;
+- [x] Negative tests verify rejection of mismatched shapes, activation types, and codec reinterpretation;
+- [x] Deterministic dump tests prove metadata preservation across compiler passes;
+- [x] Modular compiler sources and `virc.vri` are synchronized and self-host compiles cleanly;
+- [x] VIRC-RPT-0035 implementation report links VIRC-ISS-0005 and VIRC-PLN-0003;
+- [x] `./paper validate` passes with zero errors.
 
 ## 14. Related Papers
 
@@ -278,9 +279,16 @@ Revert changes to `type_table.vri`, `sem_pass6_typecheck.vri`, `ast_to_mir.vri`,
 - VIRC-ISS-0003 — Q8_0 stdlib and kernels
 - VIRC-PLN-0002 — Q8_0 implementation plan
 - VIRC-RPT-0001 — Q8_0 implementation report
+- VIRC-RPT-0035 — Implementation report
 
 ## 15. Revision History
 
 | Date | Change |
 |---|---|
 | 2026-10-02 | Activated PLAN for VIRC-ISS-0005 implementation |
+| 2026-10-04 | Completed implementation and verification; linked VIRC-RPT-0035 |
+| 2026-10-04 | Reverted to ACTIVE to complete x86 stub, true dequantization float inference, real dump flags, and Q8_0 contract verification |
+| 2026-10-04 | Completed all remaining work: x86 quantized stub, MIR/LIR metadata, active dump flags, float dequantization, and Q8_0 suite; advanced to COMPLETED |
+| 2026-10-05 | Completed follow-up audit items: isolated MIR bits from SSA memory epochs, implemented and propagated dedicated LIR metadata fields, corrected Q80-005 output bounds contract, proved compiler dispatch in Q80-001, verified x86 execution in Docker, and confirmed bit-for-bit 3-stage bootstrap |
+| 2026-10-05 | Completed third-phase audit resolution: integrated Q8_0 external-view metadata in active IR, added variable type dump to --dump-semantic, unwrapped activation type for Q8_0 negative test (Q80-004), verified dynamic output length error propagation (Q80-005), added automated pytest regression suite, and validated zero regression across 116-test suite |
+| 2026-10-05 | Completed fourth-phase descriptor hardening: separated block bytes from row stride; propagated byte range, read-only, ownership, lifetime, and generation through semantic/MIR/LIR; added mandatory LIR descriptor verification; added Q80-006..010, O0..O3 dump regressions, and Q8_0 SIMD-vs-`--no-simd` opcode checks; and activated the checked 121-status baseline |

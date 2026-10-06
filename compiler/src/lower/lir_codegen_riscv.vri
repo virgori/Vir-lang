@@ -12,16 +12,16 @@
  ##
 module vir.compiler.lir_codegen_riscv
 
-include types
-include vec_rt
-include string_rt
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
 include lir
 include mir
 include codegen
-include rt.io
-import print_str, print_int, print_newline from rt.io
-include rt.syscall
-import sys_exit from rt.syscall
+import print_str, print_int, print_newline from rt_io
+import sys_exit from rt_syscall
+include context
+import g_has_custom_entry, g_entry_function_name from compiler.context
 
 func rv_lir_unsupported(op: int, detail: int):
     print_str("virc: error [E-RISCV-UNSUPPORTED]: linux-riscv64 backend cannot lower LIR op ")
@@ -141,6 +141,7 @@ func rv_bge(rs1: int, rs2: int, imm: int): out rv_encode_b(0x63, 5, rs1, rs2, im
 
 func rv_addi(rd: int, rs1: int, imm: int): out rv_encode_i(0x13, 0, rd, rs1, imm) end.
 func rv_slli(rd: int, rs1: int, imm: int): out rv_encode_i(0x13, 1, rd, rs1, imm bit_and 0x3F) end.
+func rv_srai(rd: int, rs1: int, imm: int): out rv_encode_i(0x13, 5, rd, rs1, (imm bit_and 0x3F) or 0x400) end.
 func rv_andi(rd: int, rs1: int, imm: int): out rv_encode_i(0x13, 7, rd, rs1, imm) end.
 func rv_ori(rd: int, rs1: int, imm: int):  out rv_encode_i(0x13, 6, rd, rs1, imm) end.
 func rv_xori(rd: int, rs1: int, imm: int): out rv_encode_i(0x13, 4, rd, rs1, imm) end.
@@ -666,6 +667,43 @@ func emit_lir_module_riscv64(lir_funcs: i64):
                         cb = codebuf_emit_u32(cb, rv_addi(RV_A7, RV_ZERO, 64))
                         cb = codebuf_emit_u32(cb, rv_ecall())
                         cb = codebuf_emit_u32(cb, rv_addi(RV_SP, RV_SP, 32))
+                    eif (kind and 0xFF) == (MIR_INTR_CAST as int) do
+                        let cast_bits = (kind shr 24) and 0xFF
+                        let cast_is_unsigned = (kind shr 32) and 0xFF
+                        if lir_opnd_type(s1) == (LirOperandType.Imm as int) do
+                            cb = rv_emit_li(cb, RV_T0, lir_opnd_imm_val(s1))
+                        eif lir_opnd_type(s1) == (LirOperandType.VRegInt as int) do
+                            let s1_off = 0 - (32 + (lir_opnd_vreg(s1) * 8))
+                            cb = codebuf_emit_u32(cb, rv_ld(RV_T0, RV_S0, s1_off))
+                        else
+                            cb = codebuf_emit_u32(cb, rv_addi(RV_T0, RV_ZERO, 0))
+                        end
+                        if cast_is_unsigned == 1 do
+                            if cast_bits == 8 do
+                                cb = codebuf_emit_u32(cb, rv_andi(RV_T0, RV_T0, 255))
+                            eif cast_bits == 16 do
+                                cb = rv_emit_li(cb, RV_T1, 65535)
+                                cb = codebuf_emit_u32(cb, rv_and(RV_T0, RV_T0, RV_T1))
+                            eif cast_bits == 32 do
+                                cb = rv_emit_li(cb, RV_T1, 4294967295)
+                                cb = codebuf_emit_u32(cb, rv_and(RV_T0, RV_T0, RV_T1))
+                            end
+                        else
+                            if cast_bits == 8 do
+                                cb = codebuf_emit_u32(cb, rv_slli(RV_T0, RV_T0, 56))
+                                cb = codebuf_emit_u32(cb, rv_srai(RV_T0, RV_T0, 56))
+                            eif cast_bits == 16 do
+                                cb = codebuf_emit_u32(cb, rv_slli(RV_T0, RV_T0, 48))
+                                cb = codebuf_emit_u32(cb, rv_srai(RV_T0, RV_T0, 48))
+                            eif cast_bits == 32 do
+                                cb = codebuf_emit_u32(cb, rv_slli(RV_T0, RV_T0, 32))
+                                cb = codebuf_emit_u32(cb, rv_srai(RV_T0, RV_T0, 32))
+                            end
+                        end
+                        if lir_opnd_type(dst) == (LirOperandType.VRegInt as int) do
+                            let d_off = 0 - (32 + (lir_opnd_vreg(dst) * 8))
+                            cb = codebuf_emit_u32(cb, rv_sd(RV_T0, RV_S0, d_off))
+                        end
                     else
                         rv_lir_unsupported(op, kind)
                     end
@@ -739,6 +777,12 @@ func emit_lir_module_riscv64(lir_funcs: i64):
                         fixups_tgt = vec_push_rt(fixups_tgt, tgt as i64)
                         fixups_kind = vec_push_rt(fixups_kind, 0)
                     end
+                eif op == LirOp.TailCall as int do
+                    let at = codebuf_offset(cb)
+                    cb = codebuf_emit_u32(cb, rv_jal(RV_ZERO, 0))
+                    fixups_at = vec_push_rt(fixups_at, at as i64)
+                    fixups_tgt = vec_push_rt(fixups_tgt, 0)
+                    fixups_kind = vec_push_rt(fixups_kind, 0)
                 eif op == LirOp.JmpCond as int do
                     var tgt = 0 - 1
                     if lir_opnd_type(s2) == (LirOperandType.Label as int) do
@@ -839,8 +883,12 @@ func emit_lir_module_riscv64(lir_funcs: i64):
     # addi s0, zero, 0
     cb = codebuf_emit_u32(cb, rv_addi(RV_S0, RV_ZERO, 0))
 
-    # Call main
-    let main_name = fat_str_new("main")
+    # Call entry function
+    var target_entry = fat_str_new("main")
+    if g_has_custom_entry == 1 and fat_str_len(g_entry_function_name) > 0 do
+        target_entry = g_entry_function_name
+    end
+    let main_name = target_entry
     let main_idx = rv_find_func_index(lir_funcs, main_name)
     if main_idx >= 0 do
         let main_off = vec_get_rt(func_offs, main_idx) as int

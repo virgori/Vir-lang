@@ -1,34 +1,38 @@
 ---
 module: protocol
 title: Protocol (internal)
-summary: InterVir HTTP/1.1 wire types and parsers — not a public user namespace.
+summary: Shared HTTP/1.1 wire types, parser, and framing helpers owned by Vir stdlib.
 source:
-  - name: protocol.http_status
+  - name: http.status
     path: vir/protocol/http_status.vri
-  - name: protocol.http_types
+  - name: http.types
     path: vir/protocol/http_types.vri
-  - name: protocol.http1_parser
+  - name: http1.parser
     path: vir/protocol/http1_parser.vri
-  - name: protocol.buffer_slice
+  - name: http1.serializer
+    path: vir/protocol/http1_serializer.vri
+  - name: memory.slice
     path: vir/protocol/buffer_slice.vri
 status: draft
 notes: >-
-  Compiler/include names use protocol.* for layering. Symbols may retain
-  snake_case (e.g. parser_new, parse_into). User docs and registry SSOT for
-  HTTP client/server must use http.* / net.* only.
+  Module IDs retain the names used by InterVir callers while their only
+  implementation and registration live in Vir stdlib. Symbols may retain
+  snake_case (e.g. parser_new, parse_into).
 ---
 
 # Protocol (internal)
 
-**Not** part of the camelCase public stdlib surface. Modules exist so `http`,
-future server stacks, and tests can share InterVir-aligned wire logic.
+These modules let `http`, server stacks, and tests share one wire implementation.
 
 | Include | Role |
 |---|---|
-| `protocol.http_status` | reason phrases, status line bytes |
-| `protocol.http_types` | request/response wire entities |
-| `protocol.http1_parser` | incremental HTTP/1.1 parser |
-| `protocol.buffer_slice` | byte slice helper for parser |
+| `http.status` | `status.phrase`, `status.line`, and status category checks |
+| `http.types` | request/response wire entities |
+| `http1.parser` | incremental HTTP/1.1 parser |
+| `http1.serializer` | `serializer.chunkEnd` and `serializer.estimateSize` |
+| `memory.slice` | byte slice helper for parser |
 
-Public facades must not re-export `phrase`, `statusLine`, `parser_new`, or
-`parse_into` as documented user API.
+The `http.status` module exposes its own dot-style `status.*` API. Its legacy
+free functions remain available to existing include callers, but public
+facades must not re-export `phrase`, `statusLine`, `parser_new`, or `parse_into`
+as documented user API.

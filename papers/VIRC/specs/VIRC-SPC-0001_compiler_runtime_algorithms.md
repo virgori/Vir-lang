@@ -4,11 +4,11 @@ type: "SPEC"
 domain: "VIRC"
 title: "Vir Compiler & Runtime Algorithms Specification"
 status: "ACTIVE"
-version: "1.0.0"
+version: "1.0.1"
 language: "en"
 spec_class: "ALGORITHM"
 created: "2026-08-30"
-updated: "2026-10-02"
+updated: "2026-10-06"
 owners:
   - "VIRC"
 components: []
@@ -66,7 +66,7 @@ The Vir optimizer operates over High-Level IR (HIR), Quadruple Mid-Level IR (MIR
 
 ### Tier 1: Local & Algebraic Optimizations
 1. **Constant Folding & Propagation:** Evaluates static arithmetic, bitwise shifts, and boolean expressions at compile time.
-2. **Strength Reduction:** Replaces expensive operations (multiplication/division by power of 2) with hardware bit shifts (`x * 8 -> x << 3`).
+2. **Strength Reduction:** Replaces expensive operations (multiplication/division by a power of 2) with Vir bit shifts (`x * 8 → x shl 3`; `x / 8 → x shr 3`).
 3. **Common Subexpression Elimination (CSE):** Eliminates redundant expressions within basic blocks using value hashing.
 4. **Dead Code Elimination (DCE):** Iteratively removes unused assignments and unreached blocks via post-dominator liveness sweeps.
 
@@ -142,4 +142,5 @@ Vir directly generates native machine code and executable headers without invoki
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-06 | 1.0.1 | Replaced C-style shift notation with canonical Vir `shl`/`shr` operators |
 | 2026-10-02 | 1.0.0 | Migrated from `docs/ALGORITHMS_AND_OPTIMIZATIONS.md` and assigned stable ID `VIRC-SPC-0001` |

@@ -104,13 +104,16 @@ def sync_module_to_virc(target_modules: list[str] | None = None, check: bool = F
         cur_content = virc_lines[start_virc_line + 1 : end_virc_line]
 
         if src_path.endswith("virc.vri"):
+            if virc_path.parent.name == "generated" or src_line >= 97:
+                print(f"Error: self-referential generated marker {src_path}:{src_line} is forbidden at line {start_virc_line + 1}")
+                return 1
             new_virc_lines.extend(cur_content)
             continue
 
         mod_file = ROOT / src_path
         if not mod_file.exists():
-            new_virc_lines.extend(cur_content)
-            continue
+            print(f"Error: source file {src_path} (marker line {start_virc_line + 1}) does not exist on disk")
+            return 1
 
         if target_modules:
             matched = any(target == Path(src_path).name or target == src_path for target in target_modules)

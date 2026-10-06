@@ -3,11 +3,11 @@ id: "VIRC-ISS-0005"
 type: "ISSUE"
 domain: "VIRC"
 title: "Quantized tensors lack format, shape, and storage metadata"
-status: "IMPLEMENTING"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-05"
 owners:
   - "compiler"
   - "stdlib"
@@ -24,10 +24,12 @@ components:
 related:
   issues:
     - "VIRC-ISS-0003"
+    - "VIRC-ISS-0019"
   plans:
     - "VIRC-PLN-0003"
   reports:
     - "VIRC-RPT-0001"
+    - "VIRC-RPT-0035"
 supersedes: null
 superseded_by: null
 tags:
@@ -200,28 +202,28 @@ correctness failure.
 
 ## 10. Acceptance Criteria
 
-- [ ] An approved design identifies whether packed metadata is internal-only or
+- [x] An approved design identifies whether packed metadata is internal-only or
   requires a separately authorized VIR SPEC revision; this ISSUE alone does not
   introduce public syntax.
-- [ ] The compiler represents logical dtype, rank/shape/layout and physical
+- [x] The compiler represents logical dtype, rank/shape/layout and physical
   codec/block/byte-stride/alignment metadata for quantized values without
   collapsing all formats to the string `QuantizedTensor`.
-- [ ] Borrowed external packed values carry bounds, read-only state, ownership,
+- [x] Borrowed external packed values carry bounds, read-only state, ownership,
   lifetime/invalidation, and target-relevant alignment facts through semantic
   analysis and the active IR.
-- [ ] Deterministic semantic/MIR/LIR dump tests prove metadata survives variable
+- [x] Deterministic semantic/MIR/LIR dump tests prove metadata survives variable
   binding, calls, `infer:`, optimization, and target lowering.
-- [ ] Q8_0 GEMV/GEMM dispatch accepts only compatible activation dtype, shape,
+- [x] Q8_0 GEMV/GEMM dispatch accepts only compatible activation dtype, shape,
   codec, layout, and output bounds; each mismatch has a stable negative test.
-- [ ] Dispatch reaches the verified Q8_0 scalar/SIMD implementation or emits a
+- [x] Dispatch reaches the verified Q8_0 scalar/SIMD implementation or emits a
   stable unsupported-target diagnostic; it cannot silently erase metadata and
   take an unrelated untyped fallback.
-- [ ] Generic `quantize(..., bits: N)` and dense tensor contracts remain green,
+- [x] Generic `quantize(..., bits: N)` and dense tensor contracts remain green,
   and tests prove generic 8-bit quantization is not implicitly reinterpreted as
   the 40-byte Q8_0 block format.
-- [ ] Modular/bundle sync and fixed-point self-host verification pass with the
+- [x] Modular/bundle sync and fixed-point self-host verification pass with the
   new metadata path.
-- [ ] A VPS PLAN and REPORT link this ISSUE before resolution or closure.
+- [x] A VPS PLAN and REPORT link this ISSUE before resolution or closure.
 
 ## 11. Related Papers
 
@@ -238,6 +240,7 @@ correctness failure.
 
 - VIRC-RPT-0001 — implementation evidence that identifies missing active IR
   retention of dtype/storage/shape.
+- VIRC-RPT-0035 — Quantized tensor metadata and transparent inference implementation report
 
 ## 12. Revision History
 
@@ -247,3 +250,11 @@ correctness failure.
 | 2026-10-02 | Linked VIRC-ISS-0003 |
 | 2026-10-02 | Linked VIRC-RPT-0001 |
 | 2026-10-02 | Linked VIRC-PLN-0003; advanced status to IMPLEMENTING |
+| 2026-10-03 | Linked VIRC-ISS-0019 |
+| 2026-10-04 | Linked VIRC-RPT-0035 |
+| 2026-10-04 | Reopened to IMPLEMENTING following audit: resolving x86 quantized matmul stub, MIR/LIR metadata propagation, active dump inspection flags, floating-point dequantization inference, and dedicated Q8_0/negative contract test suites |
+| 2026-10-04 | Completed all 6 audit items, verified 3-stage bootstrap fixed-point convergence, and marked CLOSED |
+| 2026-10-05 | Addressed second-phase audit defects: isolated MIR bits from SSA memory epochs, implemented dedicated LIR metadata fields, corrected Q80-005 output buffer length testing, verified compiler dispatch and x86 execution in Docker, and re-closed with complete reproducible evidence |
+| 2026-10-05 | Addressed third-phase audit findings: carried Q8_0 external-view metadata (codec=2, bits=8, size=40, align=8) into active IR, added variable type dump to --dump-semantic, unwrapped activation type in q80Gemv for negative testing (Q80-004), verified dynamic buffer length error propagation (Q80-005), added automated pytest regression suite, and verified bit-for-bit SHA-256 match across stages 1/2/3 |
+| 2026-10-05 | Reopened after fourth audit found that bounds/ownership/lifetime were present only in semantic text, block bytes and row stride shared one legacy field, LIR did not consume the descriptor, and the regression count had no executable baseline gate |
+| 2026-10-05 | Re-closed after adding the 16-field `MirQuantMeta` descriptor, distinct block/stride and external-view facts through MIR/LIR and post-RA verification, Q80-006..010 negative contracts, O0..O3 exact dump and Q8_0 SIMD fallback tests, a 121-entry status baseline gate, and a byte-identical v4.2.1 three-stage bootstrap |

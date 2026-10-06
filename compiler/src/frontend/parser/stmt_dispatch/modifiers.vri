@@ -1,0 +1,244 @@
+##
+ * compiler/src/frontend/parser/stmt_dispatch/modifiers.vri — modifier-led statements (extern, type, async, atomic, precomp, port, send, cancel, quiet, lazy)
+ * VIRC-PLN-0010: helpers extracted from parse_statement_impl in compiler/src/frontend/parser/stmt_dispatch.vri.
+ ##
+
+include types_prelude
+include rt_string_rt
+include lexer
+include ide_facts
+include parser_ast
+include parser_state
+include parser_diagnostics
+include parser_expr
+include parser_stmt_control
+include parser_stmt_decl
+include parser_stmt_module
+
+func parseExternStatement(ref p: Parser, t: Token) -> (Parser, AstNode):
+    var (p2, _) = advance(p)
+    # FFI declarations keep a real signature instead of being discarded:
+    #   extern func puts(s: ptr) -> int
+    #   extern from os func puts(s: ptr) -> int
+    #   extern from "/usr/local/lib/libfoo.dylib" func foo(x: int) -> int
+    # `extern func` remains shorthand for the target OS provider.
+    extern_source = fat_str_new("os")
+    if check(p2, TokType.From) do
+        var (p_from, _) = advance(p2)
+        p2 = p_from
+        src_tok = peek(p2)
+        if is_name_token(src_tok.tok_type) or src_tok.tok_type == TokType.Str do
+            var (p_src, taken_src) = advance(p2)
+            p2 = p_src
+            extern_source = taken_src.str_val
+        else
+            p2 = parse_error_at(p2, "expected OS alias or dylib path after extern from", t.line)
+        end
+    end
+    if check(p2, TokType.Func) do
+        var (p3, _) = advance(p2)
+        var (p4, n) = parse_func_def_mode(p3, true)
+        n.node_type = AstType.ExternFunc
+        # Keep the parsed return type in name2.  Extern provider metadata is
+        # orthogonal to the function signature and is carried in int_val.
+        # Overwriting name2 here used to erase the return type before the
+        # semantic and target ABI passes could inspect it.
+        n.int_val = extern_source as int
+        var (p5, _) = match_tok(p4, TokType.Semicolon)
+        out (p5, n)
+    end
+    # Unknown extern declaration — skip the line
+    when not check(p2, TokType.Newline) and not check(p2, TokType.Eof) loop
+        var (p3, _) = advance(p2)
+        p2 = p3
+    end
+    out (p2, ast_new(AstType.ExternFunc))
+end.
+
+# `type Name = ...;` / `type Name;`
+func parseTypeAliasStatement(ref p: Parser, t: Token) -> (Parser, AstNode):
+    var (p2, _) = advance(p)
+    n = ast_new(AstType.TypeAlias)
+    n.line = t.line
+    if is_name_token(peek(p2).tok_type) do
+        var (p3, nt) = advance(p2)
+        n.name = nt.str_val
+        p2 = p3
+    end
+    if check(p2, TokType.Assign) do
+        var (p3, _) = advance(p2)
+        var (p4, rhs) = parse_expr(p3)
+        n = ast_add_child(n, rhs)
+        p2 = p4
+    end
+    var (p5, _) = match_tok(p2, TokType.Semicolon)
+    out (p5, n)
+end.
+
+# `async func ...`
+func parseAsyncStatement(ref p: Parser, t: Token) -> (Parser, AstNode):
+    var (p2, _) = advance(p)
+    if check(p2, TokType.Func) do
+        var (p3, _) = advance(p2)
+        var (p4, fn) = parse_func_def(p3)
+        fn.name2 = fat_str_new("async")
+        out (p4, fn)
+    end
+    p2 = parse_error(p2, "expected 'func' after 'async'")
+    out (p2, ast_new(AstType.FuncDef))
+end.
+
+# `atomic var ...` / `atomic let ...`
+func parseAtomicStatement(ref p: Parser, t: Token) -> (Parser, AstNode):
+    var (p2, _) = advance(p)
+    if check(p2, TokType.Var) or check(p2, TokType.Let) or check(p2, TokType.Const) do
+        var is_const: bool = check(p2, TokType.Const) or check(p2, TokType.Let)
+        var (p3, _) = advance(p2)
+        var (p4, vd) = parse_var_decl(p3, is_const, t.col, t.line)
+        n = ast_new(AstType.AtomicVarDecl)
+        n.line = t.line
+        n = ast_add_child(n, vd)
+        out (p4, n)
+    end
+    p2 = parse_error(p2, "expected var/let/const after 'atomic'")
+    out (p2, ast_new(AstType.AtomicVarDecl))
+end.
+
+# `precomp:` / `precomp func` / `precomp if`
+func parsePrecompStatement(ref p: Parser, t: Token) -> (Parser, AstNode):
+    var (p2, _) = advance(p)
+    if check(p2, TokType.Func) do
+        var (p3, _) = advance(p2)
+        var (p4, fn) = parse_func_def(p3)
+        fn.name2 = fat_str_new("precomp")
+        out (p4, fn)
+    end
+    if check(p2, TokType.If) do
+        var (p_if, _) = advance(p2)
+        var (p3, if_stmt) = parse_if_stmt(p_if)
+        n = ast_new(AstType.PrecompBlock)
+        n.line = t.line
+        n = ast_add_child(n, if_stmt)
+        out (p3, n)
+    end
+    var (p3, _) = match_tok(p2, TokType.Colon)
+    p3 = skip_newlines(p3)
+    var (p4, body) = parse_block(p3)
+    var (p5, _, _) = expect_tok(p4, TokType.End, "expected 'end' after precomp")
+    var (p6, _) = match_tok(p5, TokType.Dot)
+    n = ast_new(AstType.PrecompBlock)
+    n.line = t.line
+    n = ast_add_child(n, body)
+    out (p6, n)
+end.
+
+# `port name: Type` / `port(cap: N) name: Type` (§23)
+func parsePortDeclaration(ref p: Parser, t: Token) -> (Parser, AstNode):
+    var (p2, _) = advance(p)
+    var cap_val = 0
+    if check(p2, TokType.LParen) do
+        var (p_lp, _) = advance(p2)
+        if check(p_lp, TokType.Ident) do
+            var (p_cap_id, cap_tok) = advance(p_lp)
+            if check(p_cap_id, TokType.Colon) do
+                var (p_col, _) = advance(p_cap_id)
+                if check(p_col, TokType.Int) do
+                    var (p_int, int_tok) = advance(p_col)
+                    cap_val = int_tok.int_val
+                    p_lp = p_int
+                end
+            end
+        end
+        var (p_rp, _, _) = expect_tok(p_lp, TokType.RParen, "expected ')' after port capacity")
+        p2 = p_rp
+    end
+    var (p3, name_tok, ok) = expect_name_tok(p2, "expected port name")
+    n = ast_new(AstType.PortDecl)
+    n.name = name_tok.str_val
+    n.int_val = cap_val
+    n.line = t.line
+    p3 = skip_newlines(p3)
+    if check(p3, TokType.Colon) do
+        var (p4, _) = advance(p3)
+        if check(p4, TokType.Ident) do
+            var (p5, ty_tok) = advance(p4)
+            n.name2 = ty_tok.str_val
+            p3 = p5
+        end
+    end
+    var (p6, _) = match_tok(p3, TokType.Semicolon)
+    out (p6, n)
+end.
+
+# `send port <- message` (§23)
+func parseSendStatement(ref p: Parser, t: Token) -> (Parser, AstNode):
+    var (p2, _) = advance(p)
+    var (p3, port_expr) = parse_expr(p2)
+    var (p4, _) = match_tok(p3, TokType.SendArrow)
+    var (p5, msg_expr) = parse_expr(p4)
+    n = ast_new(AstType.SendStmt)
+    n.line = t.line
+    n = ast_add_child(n, port_expr)
+    n = ast_add_child(n, msg_expr)
+    var (p6, _) = match_tok(p5, TokType.Semicolon)
+    out (p6, n)
+end.
+
+# `cancel task_handle` (§22.7)
+func parseCancelStatement(ref p: Parser, t: Token) -> (Parser, AstNode):
+    var (p2, _) = advance(p)
+    var (p3, task_expr) = parse_expr(p2)
+    n = ast_new(AstType.CancelStmt)
+    n.line = t.line
+    n = ast_add_child(n, task_expr)
+    var (p4, _) = match_tok(p3, TokType.Semicolon)
+    out (p4, n)
+end.
+
+# `quiet fn_call(...)` (§22.9)
+func parseQuietStatement(ref p: Parser, t: Token) -> (Parser, AstNode):
+    var (p2, _) = advance(p)
+    var (p3, call_expr) = parse_expr(p2)
+    n = ast_new(AstType.QuietStmt)
+    n.line = t.line
+    n = ast_add_child(n, call_expr)
+    var (p4, _) = match_tok(p3, TokType.Semicolon)
+    out (p4, n)
+end.
+
+# `lazy include ...`
+func parseLazyStatement(ref p: Parser, t: Token) -> (Parser, AstNode):
+    var (p2, _) = advance(p)
+    if check(p2, TokType.Include) do
+        var (p3, _) = advance(p2)
+        # Reuse include parsing via fake peek — call include path by building stmt
+        n = ast_new(AstType.LazyIncludeStmt)
+        n.line = t.line
+        if check(p3, TokType.Str) do
+            var (p4, ft) = advance(p3)
+            n.name = ft.str_val
+            p3 = p4
+        eif check(p3, TokType.Ident) do
+            var (p4, idt) = advance(p3)
+            path = idt.str_val
+            p3 = p4
+            when check(p3, TokType.Dot) loop
+                var (p5, _) = advance(p3)
+                var (p6, seg, _) = expect_name_tok(p5, "expected name after path sep")
+                path = fat_str_concat(fat_str_concat(path, fat_str_new(".")), seg.str_val)
+                p3 = p6
+            end
+            n.name = path
+        end
+        if check(p3, TokType.As) do
+            var (p_as, _) = advance(p3)
+            var (p_al, at, _) = expect_name_tok(p_as, "expected alias after as")
+            n.name2 = at.str_val
+            p3 = p_al
+        end
+        var (p7, _) = match_tok(p3, TokType.Semicolon)
+        out (p7, n)
+    end
+    p2 = parse_error(p2, "expected 'include' after 'lazy'")
+    out (p2, ast_new(AstType.LazyIncludeStmt))
+end.

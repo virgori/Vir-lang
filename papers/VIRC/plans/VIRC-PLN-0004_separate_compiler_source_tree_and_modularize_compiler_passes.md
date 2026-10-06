@@ -3,7 +3,7 @@ id: "VIRC-PLN-0004"
 type: "PLAN"
 domain: "VIRC"
 title: "Separate compiler source tree and modularize compiler passes"
-status: "DRAFT"
+status: "COMPLETED"
 created: "2026-10-02"
 updated: "2026-10-03"
 owners:
@@ -36,6 +36,7 @@ related:
     - "VIRC-RPT-0013"
     - "VIRC-RPT-0014"
     - "VIRC-RPT-0015"
+    - "VIRC-RPT-0016"
 supersedes: null
 superseded_by: null
 tags:
@@ -1266,35 +1267,35 @@ the selected baseline or skip later regression comparison.
 
 ## 14. Exit Criteria
 
-- [ ] All acceptance criteria of `VIRC-ISS-0006` have direct evidence.
-- [ ] `/Users/gengyang/Vir-3.0` is the verified implementation root.
-- [ ] Docs were copied without `docs/_legacy`; source legacy was not modified.
-- [ ] VPS papers/tool/skill, all baseline tests and audited runner dependency
+- [x] All acceptance criteria of `VIRC-ISS-0006` have direct evidence.
+- [x] `/Users/gengyang/Vir-3.0` is the verified implementation root.
+- [x] Docs were copied without `docs/_legacy`; source legacy was not modified.
+- [x] VPS papers/tool/skill, all baseline tests and audited runner dependency
   closure match the seed manifest.
-- [ ] `tools/vir-lsp` and `tools/vscode-vir` are migrated from their pinned
+- [x] `tools/vir-lsp` and `tools/vscode-vir` are migrated from their pinned
   clean commits with separate provenance and no nested Git/generated/package
   artifact accepted as canonical source.
-- [ ] Native LSP build/tests and VS Code extension compile/unit/contract tests
+- [x] Native LSP build/tests and VS Code extension compile/unit/contract tests
   pass from Vir-3.0; compiler semantics remain owned solely by compiler modules.
-- [ ] No Git metadata, frozen tree, build/cache/scratch payload or prebuilt
+- [x] No Git metadata, frozen tree, build/cache/scratch payload or prebuilt
   compiler binary entered the seed copy.
-- [ ] Canonical compiler source and generated output are outside stdlib.
-- [ ] `compiler/module.list` is the sole compiler-internal path mapping layer.
-- [ ] Module resolution is canonical, deterministic, CWD-independent and tested.
-- [ ] Pass entry files are declarative orchestrators and pass architecture check.
-- [ ] Typecheck and borrow domains are split into focused tested modules.
-- [ ] Every MIR optimization has a separate implementation file.
-- [ ] Remaining non-generated giant files are split or have approved follow-up
+- [x] Canonical compiler source and generated output are outside stdlib.
+- [x] `compiler/module.list` is the sole compiler-internal path mapping layer.
+- [x] Module resolution is canonical, deterministic, CWD-independent and tested.
+- [x] Pass entry files are declarative orchestrators and pass architecture check.
+- [x] Typecheck and borrow domains are split into focused tested modules.
+- [x] Every MIR optimization has a separate implementation file.
+- [x] Remaining non-generated giant files are split or have approved follow-up
   issues and explicit rationale.
-- [ ] New paths follow descriptive lowercase/lower-camel naming policy with no
+- [x] New paths follow descriptive lowercase/lower-camel naming policy with no
   unjustified snake_case.
-- [ ] Standard-library registry has no compiler implementation entries.
-- [ ] Generated bundle is reproducible and cannot drift from canonical modules.
-- [ ] Required registry, stdlib, strict, type, memory, optimizer, CLI,
+- [x] Standard-library registry has no compiler implementation entries.
+- [x] Generated bundle is reproducible and cannot drift from canonical modules.
+- [x] Required registry, stdlib, strict, type, memory, optimizer, CLI,
   source-origin and self-host fixed-point gates pass.
-- [ ] A linked REPORT records actual diff, commands, results, deviations,
+- [x] A linked REPORT records actual diff, commands, results, deviations,
   limitations and one valid conclusion.
-- [ ] `./paper registry --check` and `./paper validate` pass.
+- [x] `./paper registry --check` and `./paper validate` pass.
 
 ## 15. Related Papers
 
@@ -1318,3 +1319,5 @@ the selected baseline or skip later regression comparison.
 | 2026-10-03 | Linked VIRC-RPT-0013 |
 | 2026-10-03 | Linked VIRC-RPT-0014 |
 | 2026-10-03 | Linked VIRC-RPT-0015 |
+| 2026-10-03 | Linked VIRC-RPT-0016 |
+| 2026-10-03 | Completed Phase 11 & Phase 12; verified bit-identical Stage 2/3 fixed point, cleaned up transition artifacts, and moved status to COMPLETED |

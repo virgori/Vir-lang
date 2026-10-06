@@ -3,11 +3,11 @@ id: "VIRC-ISS-0009"
 type: "ISSUE"
 domain: "VIRC"
 title: "Native codegen conflates architecture OS ABI and object format"
-status: "TRIAGED"
+status: "CLOSED"
 severity: "S1"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-03"
+updated: "2026-10-04"
 owners:
   - "VIRC"
 components:
@@ -18,11 +18,18 @@ components:
   - "generated-compiler"
   - "modularization"
 related:
-  issues: []
-  plans: []
+  issues:
+    - "VIRC-ISS-0013"
+    - "VIRC-ISS-0014"
+    - "VIRC-ISS-0036"
+  plans:
+    - "VIRC-PLN-0006"
   reports:
     - "VIRC-RPT-0013"
     - "VIRC-RPT-0015"
+    - "VIRC-RPT-0016"
+    - "VIRC-RPT-0017"
+    - "VIRC-RPT-0018"
 supersedes: null
 superseded_by: null
 tags:
@@ -315,40 +322,40 @@ cost of later correction.
 
 ## 10. Acceptance Criteria
 
-- [ ] One canonical target model defines architecture, OS, ABI, runtime
+- [x] One canonical target model defines architecture, OS, ABI, runtime
   provider, object format, dialect, page policy, and supported emit kinds; no
   duplicated numeric target translation remains in driver/backend code.
-- [ ] The compiler has an explicit capability matrix and rejects unsupported
+- [x] The compiler has an explicit capability matrix and rejects unsupported
   target/emission products before lowering, with no output artifact.
-- [ ] `--format` cannot create a container/runtime mismatch. Either format is
+- [x] `--format` cannot create a container/runtime mismatch. Either format is
   derived from `--target`, or each override is validated against an explicitly
   supported target product.
-- [ ] ARM64 instruction encoding, AAPCS64 lowering, Darwin runtime/startup,
+- [x] ARM64 instruction encoding, AAPCS64 lowering, Darwin runtime/startup,
   Linux runtime/startup, and Windows runtime/startup have separate owners and
   typed interfaces; no `is_linux` boolean crosses the backend API.
-- [ ] x86-64 instruction encoding, SysV AMD64, Windows x64, Linux runtime, and
+- [x] x86-64 instruction encoding, SysV AMD64, Windows x64, Linux runtime, and
   Darwin runtime have separate owners; unsupported combinations fail closed.
-- [ ] ELF, Mach-O, and PE/COFF exist as canonical modules under compiler-owned
+- [x] ELF, Mach-O, and PE/COFF exist as canonical modules under compiler-owned
   source paths and declare supported architectures independently.
-- [ ] No dangling compatibility symlink or missing source marker contributes
+- [x] No dangling compatibility symlink or missing source marker contributes
   code to `compiler/generated/virc.vri`.
-- [ ] The CLI/configuration and final backend dispatch live in canonical source
+- [x] The CLI/configuration and final backend dispatch live in canonical source
   modules under `compiler/src/`; the generated bundle contains no hand-owned
   production section.
-- [ ] Bundle generation fails on a missing source marker and is reproducible
+- [x] Bundle generation fails on a missing source marker and is reproducible
   from one entry module plus the validated module graph.
-- [ ] Both executable and `-S` paths consume the same legalized MCInst stream
+- [x] Both executable and `-S` paths consume the same legalized MCInst stream
   and relocation model, or any temporary divergence is explicitly bounded by a
   linked plan with equivalence tests.
-- [ ] Windows targets either execute correctly under Windows/Wine with verified
+- [x] Windows targets either execute correctly under Windows/Wine with verified
   Windows ABI/import behavior or are reported as unsupported; a valid PE header
   alone is insufficient.
-- [ ] Linux ARM64 and x86-64, Darwin ARM64, every claimed additional target, and
+- [x] Linux ARM64 and x86-64, Darwin ARM64, every claimed additional target, and
   invalid target/format pairs have positive, negative, structural, disassembly,
   and runtime checks appropriate to the platform.
-- [ ] Self-host stage-2/stage-3 fixed-point, generated-source drift, module graph,
+- [x] Self-host stage-2/stage-3 fixed-point, generated-source drift, module graph,
   and full relevant regression gates pass before closure.
-- [ ] A linked PLAN defines reviewable migration phases, rollback boundaries,
+- [x] A linked PLAN defines reviewable migration phases, rollback boundaries,
   and compatibility policy; an accepted REPORT maps evidence to every criterion.
 
 ## 11. Related Papers
@@ -361,14 +368,16 @@ cost of later correction.
 
 ### Plans
 
-- `VIRC-PLN-0004` — contextual modularization plan. It mentions later codegen
-  extraction but does not yet define the OS/ABI/object-writer capability
-  boundaries or this issue's false-success gates; it is not linked as an
-  implementation plan for this issue yet.
+- `VIRC-PLN-0004` — contextual modularization plan.
+- `VIRC-PLN-0006` — Decouple native codegen architecture OS ABI and object format.
 
 ### Reports
 
-- None. No implementation was performed in this audit.
+- `VIRC-RPT-0013` — Phase 8 borrow checker modularization report.
+- `VIRC-RPT-0015` — Phase 10 typecheck modularization report.
+- `VIRC-RPT-0016` — Phase 11 bundle and transition deletion report.
+- `VIRC-RPT-0017` — Eliminate redundant include and selective import pairs across compiler sources verification report.
+- `VIRC-RPT-0018` — Decouple native codegen architecture OS ABI and object format report.
 
 ## 12. Revision History
 
@@ -378,3 +387,10 @@ cost of later correction.
 | 2026-10-02 | Added focused Windows matrix evidence showing structurally valid artifacts remain BLOCKED_NO_RUNNER rather than failing ABI/runtime validation |
 | 2026-10-03 | Linked VIRC-RPT-0013 |
 | 2026-10-03 | Linked VIRC-RPT-0015 |
+| 2026-10-03 | Linked VIRC-RPT-0016 |
+| 2026-10-03 | Linked VIRC-RPT-0017 |
+| 2026-10-03 | Linked VIRC-PLN-0006 |
+| 2026-10-03 | Verified all acceptance criteria via VIRC-RPT-0018 under VIRC-PLN-0006; closed issue |
+| 2026-10-03 | Linked VIRC-ISS-0013 |
+| 2026-10-03 | Linked VIRC-ISS-0014 |
+| 2026-10-04 | Linked VIRC-ISS-0036 |

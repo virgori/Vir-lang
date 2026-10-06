@@ -3,11 +3,11 @@ id: "VIRC-ISS-0007"
 type: "ISSUE"
 domain: "VIRC"
 title: "Compiler sources redundantly combine include with selective import"
-status: "OPEN"
+status: "CLOSED"
 severity: "S3"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-03"
 owners:
   - "VIRC"
 components:
@@ -20,7 +20,8 @@ related:
     - "VIRC-ISS-0008"
   plans:
     - "VIRC-PLN-0005"
-  reports: []
+  reports:
+    - "VIRC-RPT-0017"
 supersedes: null
 superseded_by: null
 tags:
@@ -185,19 +186,19 @@ final module graph now.
 
 ## 10. Acceptance Criteria
 
-- [ ] A deterministic checker resolves canonical Module IDs and reports every
+- [x] A deterministic checker resolves canonical Module IDs and reports every
   compiler source that both includes and selectively imports the same module,
   with narrow documented exceptions only for necessary alias semantics.
-- [ ] Compiler canonical sources contain no redundant same-module pair.
-- [ ] Include-only positive fixtures cover functions, entities/enums, constants,
+- [x] Compiler canonical sources contain no redundant same-module pair.
+- [x] Include-only positive fixtures cover functions, entities/enums, constants,
   and nested dependencies supported by the include contract.
-- [ ] Import-only positive fixtures prove selective imports require no prior
+- [x] Import-only positive fixtures prove selective imports require no prior
   include and load each canonical module once.
-- [ ] Diamond dependencies and repeated includes still deduplicate to one
+- [x] Diamond dependencies and repeated includes still deduplicate to one
   Module ID and retain useful cycle diagnostics.
-- [ ] Modular and generated compiler sources are synchronized through the
+- [x] Modular and generated compiler sources are synchronized through the
   authoritative generation workflow.
-- [ ] Stage 1 -> stage 2 -> stage 3 self-hosting passes the repository fixed-point
+- [x] Stage 1 -> stage 2 -> stage 3 self-hosting passes the repository fixed-point
   contract, with representative module tests run from repository root, a
   subdirectory, and an unrelated CWD.
 
@@ -214,10 +215,11 @@ final module graph now.
 
 - `VIRC-PLN-0004` — active design context; section 6.6 already prohibits
   redundant include/import declarations.
+- `VIRC-PLN-0005` — Eliminate redundant include and selective import pairs across compiler sources.
 
 ### Reports
 
-- None.
+- `VIRC-RPT-0017` — Eliminate redundant include and selective import pairs across compiler sources verification report.
 
 ## 12. Revision History
 
@@ -227,3 +229,5 @@ final module graph now.
 | 2026-10-02 | Linked VIRC-ISS-0008 |
 | 2026-10-02 | Linked VIRC-ISS-0006 |
 | 2026-10-02 | Linked VIRC-PLN-0005 |
+| 2026-10-03 | Linked VIRC-RPT-0017 |
+| 2026-10-03 | Verified all 7 acceptance criteria with bit-identical stage 2/stage 3 fixed point; closed via VIRC-RPT-0017 |

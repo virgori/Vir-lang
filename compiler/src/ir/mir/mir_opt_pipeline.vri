@@ -5,10 +5,9 @@
  * later via opt_backend.vri (SIMD, ISA peephole, shrink-wrap, TCO, IRC).
  ##
 
-include types
+include types_prelude
 include opt_trace
-import optTraceNote from compiler.opt_trace
-include opt_pass
+import optTraceNote, optTransformTraceEnabled, optTransformTraceRecord from compiler.opt_trace
 import OptPassConstFold, OptPassStrengthReduce, OptPassCSE, OptPassDCE,
        OptPassLICM, OptPassIVSR, OptPassLoopUnroll, OptPassLoopCollapse, OptPassLoopTiling,
        OptPassBCE, OptPassEscapeArena, OptPassInlining, OptPassGVN, OptPassPRE, OptPassSLP,
@@ -31,6 +30,87 @@ func mir_opt_report_verify_failure(stage: string):
     print_str("; source_origin=")
     print_int(mir_verify_error_origin())
     print_str("\n")
+end.
+
+func mirOptReportCfgSsaFailure(stage: string):
+    print_str("virc: error [E6001]: MIR CFG/SSA verification failed; transform=")
+    print_str(stage)
+    print_str("; invariant=")
+    print_str(mir_verify_error_reason())
+    print_str("; block=")
+    print_int(mir_verify_error_block())
+    print_str("; instruction=")
+    print_int(mir_verify_error_instr())
+    print_str("; vreg=")
+    print_int(mir_verify_error_origin())
+    print_str("\n")
+end.
+
+# Run one PRE/loop transform under the structural harness (VIRC-ISS-0001).
+# kind: 1 = pre, 2 = loop_fusion, 3 = loop_tiling, 4 = loop_interchange.
+# A transform that reports a change refreshes the cached CFG metadata and must
+# pass the CFG/SSA verifier; while tracing is enabled every invocation records
+# status, skip reason and (for a change) the before/after MIR snapshots.
+func mirOptRunTransform(kind: int, blocks: i64) -> i64:
+    let tracing = optTransformTraceEnabled()
+    var before = 0
+    if tracing != 0 do before = mirSnapshotBlocks(blocks) as int end
+    let changesBefore = mir_opt_get_total_changes()
+    mir_opt_set_skip_reason("no_candidate")
+
+    var name: string = "pre"
+    var result = blocks
+    if kind == 1 do
+        result = mir_opt_pre(blocks)
+    eif kind == 2 do
+        name = "loop_fusion"
+        if g_mir_mutate_mode == 9 do
+            mir_opt_set_skip_reason("mutation_marker_only")
+            result = mir_opt_loop_marker_mutation(blocks)
+        else
+            result = mir_opt_loop_fusion(blocks)
+        end
+    eif kind == 3 do
+        name = "loop_tiling"
+        if g_mir_mutate_mode == 9 do
+            mir_opt_set_skip_reason("mutation_bypassed")
+        else
+            result = mir_opt_loop_tiling(blocks)
+        end
+    else
+        name = "loop_interchange"
+        if g_mir_mutate_mode == 9 do
+            mir_opt_set_skip_reason("mutation_bypassed")
+        else
+            result = mir_opt_loop_interchange(blocks)
+        end
+    end
+
+    let changed = mir_opt_get_total_changes() - changesBefore
+    var verified = 1
+    if changed > 0 do
+        if mirVerifyCfgSsa(result) == false do verified = 0 end
+    end
+    if tracing != 0 do
+        var funcName = "?" as int
+        if g_mir_opt_current_func != 0 do
+            let name_obj = mir_func_name(g_mir_opt_current_func) as i64
+            if name_obj != 0 do
+                funcName = native_read_i64(name_obj, 0) as int
+            end
+        end
+        var after = 0
+        if changed > 0 do after = mirSnapshotBlocks(result) as int end
+        var reason = "changed" as int
+        if changed <= 0 do reason = mir_opt_get_skip_reason() as int end
+        optTransformTraceRecord(funcName, name as int, changed, reason, verified, before, after)
+    end
+    if verified == 0 do
+        extern func sys_exit(code: int)
+        mirOptReportCfgSsaFailure(name)
+        sys_exit(1)
+    end
+    out result
 end.
 
 func set_mir_opt_level(level: int):
@@ -96,10 +176,12 @@ func mir_opt_run_spec_round(blocks: i64, level: int):
     # SSA pattern checks distinguish induction updates from real reductions.
     # 9. Polyhedral tiling (conservative placeholder)
     if mir_opt_should_run(OptPassLoopTiling, level) do
-        blocks = mir_opt_loop_tiling_fusion_interchange(blocks)
+        blocks = mirOptRunTransform(2, blocks)
+        blocks = mirOptRunTransform(3, blocks)
+        blocks = mirOptRunTransform(4, blocks)
     end
     # 10 SIMD — OptStageBackend (skipped)
-    # 11 TCO — OptStageLIR (skipped)
+    # 11 TCO — OptStageLIR (executed in pre-RA LIR hook)
     # 12 IRC — OptStageLIR (skipped)
     # 13. BCE
     if mir_opt_should_run(OptPassBCE, level) do
@@ -122,8 +204,9 @@ func mir_opt_run_spec_round(blocks: i64, level: int):
         blocks = mir_opt_gvn(blocks)
     end
     # 19. PRE
-    # PRE remains disabled: mir_opt_pre is currently an identity placeholder.
-    # No invocation or capability claim until safe predecessor insertion exists.
+    if mir_opt_should_run(OptPassPRE, level) do
+        blocks = mirOptRunTransform(1, blocks)
+    end
     # 20. SLP (MIR packing; SIMD lowering is backend)
     if mir_opt_should_run(OptPassSLP, level) do
         blocks = mir_opt_slp(blocks)

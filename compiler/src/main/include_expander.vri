@@ -3,14 +3,10 @@
  * ========================================================================
  ##
 
-include rt.alloc
-import vir_alloc from rt.alloc
-include rt.string_rt
-import fat_str_new, fat_str_len, fat_str_byte_at, fat_cstr_eq, fat_str_concat, fat_str_eq, rt_streq, str_from_cstr, rt_strlen, rt_itoa, vir_free from rt.string_rt
-include rt.vec_rt
-import bvec_len, bvec_get, vec_len_rt, vec_get_rt, vec_new_rt, vec_push_rt from rt.vec_rt
-include rt.io
-import read_file_str, print_str, print_ln, print_int, print_newline from rt.io
+import vir_alloc from rt_alloc
+import fat_str_new, fat_str_len, fat_str_byte_at, fat_cstr_eq, fat_str_concat, fat_str_eq, rt_streq, str_from_cstr, rt_strlen, rt_itoa, vir_free, StringBuilder, sb_new, sb_grow, sb_append, sb_append_char, sb_append_int, sb_to_string, sb_len, sb_free from rt_string_rt
+import bvec_len, bvec_get, vec_len_rt, vec_get_rt, vec_new_rt, vec_push_rt from rt_vec_rt
+import read_file_str, print_str, print_ln, print_int, print_newline from rt_io
 include main_path_util
 include main_module_resolver
 
@@ -890,6 +886,286 @@ func inc_validate_utf8_source(body: string, path: int):
     out 1
 end.
 
+var g_cycle_stack: int = 0
+var g_cycle_depth: int = 0
+var g_inc_guard: int = 0
+
+func inc_sb_append_range(sb: StringBuilder, data: int, len: int):
+    if len <= 0 or data == 0 do
+        out sb
+    end
+    sb = sb_grow(sb, len)
+    let dst = sb.buf + sb.len
+    rt_memcpy(dst, data, len)
+    sb.len = sb.len + len
+    out sb
+end.
+
+func inc_compute_active_dir(cur_file: int):
+    if cur_file == 0 do out 0 end
+    let cflen = rt_strlen(cur_file)
+    var has_slash = 0
+    var last_slash = 0
+    var ci = 0
+    when ci < cflen loop
+        if native_read_u8(cur_file, ci) == 47 do
+            has_slash = 1
+            last_slash = ci
+        end
+        ci = ci + 1
+    end
+    if has_slash == 1 and last_slash > 0 do
+        let dir_buf = vir_alloc(last_slash + 1)
+        var dj = 0
+        when dj < last_slash loop
+            native_write_u8(dir_buf, dj, native_read_u8(cur_file, dj))
+            dj = dj + 1
+        end
+        native_write_u8(dir_buf, last_slash, 0)
+        out dir_buf
+    end
+    out 0
+end.
+
+func text_find_include_at(source: int, start_i: int):
+    let data = native_read_i64(source as i64, 0)
+    let n = native_read_i64(source as i64, 8)
+    var i = start_i
+    var at_line = 1
+    if i > 0 and native_read_u8(data, i - 1) != 10 do
+        at_line = 0
+    end
+    when i + 8 <= n loop
+        if at_line == 1 do
+            if native_read_u8(data, i) == 105 and native_read_u8(data, i + 1) == 110 and native_read_u8(data, i + 2) == 99 and native_read_u8(data, i + 3) == 108 and native_read_u8(data, i + 4) == 117 and native_read_u8(data, i + 5) == 100 and native_read_u8(data, i + 6) == 101 and native_read_u8(data, i + 7) == 32 do
+                out i
+            end
+        end
+        let ch = native_read_u8(data, i)
+        if ch == 10 do
+            at_line = 1
+        else
+            if ch != 32 and ch != 9 do
+                at_line = 0
+            end
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func inc_scan_markers_forward(sdata: int, start_pos: int, end_pos: int, cur_file: int, cur_line: int):
+    var p = start_pos
+    var f = cur_file
+    var l = cur_line
+    when p < end_pos loop
+        let line_start = p
+        when p < end_pos and native_read_u8(sdata, p) != 10 loop
+            p = p + 1
+        end
+        let line_end = p
+        if line_end - line_start >= 15 and native_read_u8(sdata, line_start) == 35 and native_read_u8(sdata, line_start + 1) == 32 and native_read_u8(sdata, line_start + 2) == 64 do
+            if native_read_u8(sdata, line_start + 11) == 99 and native_read_u8(sdata, line_start + 12) == 101 and native_read_u8(sdata, line_start + 13) == 32 do
+                let path_start = line_start + 14
+                var sep = path_start
+                when sep < line_end and native_read_u8(sdata, sep) != 32 loop
+                    sep = sep + 1
+                end
+                let path_len = sep - path_start
+                let path_buf = vir_alloc(path_len + 1)
+                var pj = 0
+                when pj < path_len loop
+                    native_write_u8(path_buf, pj, native_read_u8(sdata, path_start + pj))
+                    pj = pj + 1
+                end
+                native_write_u8(path_buf, path_len, 0)
+                f = path_buf
+                l = 0
+                var pk = sep + 1
+                when pk < line_end loop
+                    let c = native_read_u8(sdata, pk)
+                    if c >= 48 and c <= 57 do
+                        l = l * 10 + c - 48
+                    end
+                    pk = pk + 1
+                end
+            eif line_end - line_start >= 18 and native_read_u8(sdata, line_start + 11) == 115 and native_read_u8(sdata, line_start + 16) == 32 do
+                let id_start = line_start + 17
+                let id_len = line_end - id_start
+                let id_buf = vir_alloc(id_len + 1)
+                var ij = 0
+                when ij < id_len loop
+                    native_write_u8(id_buf, ij, native_read_u8(sdata, id_start + ij))
+                    ij = ij + 1
+                end
+                native_write_u8(id_buf, id_len, 0)
+                if g_cycle_depth < 64 do
+                    native_write_i64(g_cycle_stack, g_cycle_depth * 8, id_buf)
+                    g_cycle_depth = g_cycle_depth + 1
+                end
+            eif line_end - line_start >= 16 and native_read_u8(sdata, line_start + 11) == 101 and native_read_u8(sdata, line_start + 14) == 32 do
+                if g_cycle_depth > 0 do
+                    g_cycle_depth = g_cycle_depth - 1
+                end
+            end
+        else
+            l = l + 1
+        end
+        if p < end_pos and native_read_u8(sdata, p) == 10 do
+            p = p + 1
+        end
+    end
+    out (f, l)
+end.
+
+func expand_include_recurse(source: int, file_path: int, sb: StringBuilder):
+    let sdata = native_read_i64(source as i64, 0)
+    let slen = native_read_i64(source as i64, 8)
+    var pos = 0
+    var cur_file = file_path
+    var cur_line = 1
+
+    when pos < slen and g_inc_err == 0 loop
+        let at = text_find_include_at(source, pos)
+        if at < 0 do
+            sb = inc_sb_append_range(sb, sdata + pos, slen - pos)
+            pos = slen
+            out sb
+        end
+
+        if at > pos do
+            sb = inc_sb_append_range(sb, sdata + pos, at - pos)
+            let (nf, nl) = inc_scan_markers_forward(sdata, pos, at, cur_file, cur_line)
+            cur_file = nf
+            cur_line = nl
+        end
+
+        g_inc_guard = g_inc_guard + 1
+        if g_inc_guard >= G_PREPROCESS_MAX do
+            inc_report_early_error(2104, cur_file, cur_line, "")
+            out sb
+        end
+
+        if text_line_has_double_colon(source, at) == 1 do
+            inc_report_early_error(2103, cur_file, cur_line, "")
+            out sb
+        end
+
+        let iname = text_parse_include_name(source, at)
+        if iname == 0 do
+            inc_report_early_error(2101, cur_file, cur_line, "")
+            out sb
+        end
+
+        let end_at = text_skip_include_stmt(source, at)
+        let resume_line = cur_line + inc_count_newlines(source, at, end_at)
+
+        g_inc_cur_parent_file = cur_file
+        g_inc_cur_parent_line = cur_line
+        g_inc_active_dir = inc_compute_active_dir(cur_file)
+
+        g_inc_resolved_path = 0
+        var body = read_include_source(iname)
+        ideCaptureResolvedModule(iname, cur_file, cur_line, body)
+        if ide_enabled() == 1 do
+            var is_root = 0
+            if g_inc_main_file == 0 do
+                is_root = 1
+            eif cur_file != 0 and rt_streq(cur_file, g_inc_main_file) == 1 do
+                is_root = 1
+            end
+            if is_root == 1 do
+                var inc_res = 0
+                if body != 0 do inc_res = 1 end
+                ide_register_include(iname, cur_line, 0, inc_res)
+            end
+        end
+
+        if body == 0 do
+            inc_report_early_error(2102, cur_file, cur_line, native_read_i64(iname as i64, 0) as string)
+            out sb
+        end
+
+        var body_path = g_inc_resolved_path
+        if body_path == 0 do body_path = native_read_i64(iname as i64, 0) end
+        if inc_validate_utf8_source(body, body_path) == 0 do out sb end
+
+        var inc_key = g_inc_canonical_id
+        if inc_key == 0 do inc_key = g_inc_resolved_path end
+        if inc_key == 0 do inc_key = native_read_i64(iname as i64, 0) end
+
+        var ci = 0
+        var cycle_found = 0
+        var cycle_pos = 0
+        when ci < g_cycle_depth loop
+            let mid = native_read_i64(g_cycle_stack, ci * 8)
+            if rt_streq(mid, inc_key) == 1 do
+                cycle_found = 1
+                cycle_pos = ci
+                break
+            end
+            ci = ci + 1
+        end
+
+        if cycle_found == 1 do
+            var cycle_str = str_from_cstr(inc_key)
+            arena:
+                var csb = sb_new()
+                var m = cycle_pos
+                when m < g_cycle_depth loop
+                    csb = sb_append(csb, str_from_cstr(native_read_i64(g_cycle_stack, m * 8)))
+                    csb = sb_append(csb, " -> ")
+                    m = m + 1
+                end
+                csb = sb_append(csb, str_from_cstr(inc_key))
+                cycle_str = sb_to_string(csb)
+            end
+            inc_report_early_error(2105, cur_file, cur_line, cycle_str)
+            out sb
+        end
+
+        let inc_key_fat = str_from_cstr(inc_key)
+        if g_inc_has(inc_key_fat) == 1 do
+            sb = sb_append(sb, "# [include duplicate: ")
+            sb = sb_append(sb, inc_key)
+            sb = sb_append(sb, "]\n")
+        else
+            g_inc_mark(inc_key_fat)
+            body = text_ascii_sanitize(body)
+            if g_cycle_depth < 64 do
+                native_write_i64(g_cycle_stack, g_cycle_depth * 8, inc_key)
+                g_cycle_depth = g_cycle_depth + 1
+            end
+            sb = sb_append(sb, "# @vir_mod_start ")
+            sb = sb_append(sb, inc_key)
+            sb = sb_append(sb, "\n# @vir_source ")
+            sb = sb_append(sb, body_path)
+            sb = sb_append(sb, " 1\n")
+
+            sb = expand_include_recurse(body, body_path, sb)
+
+            if g_cycle_depth > 0 do
+                g_cycle_depth = g_cycle_depth - 1
+            end
+
+            if sb_len(sb) > 0 and native_read_u8(sb.buf, sb.len - 1) != 10 do
+                sb = sb_append_char(sb, 10)
+            end
+            sb = sb_append(sb, "# @vir_mod_end ")
+            sb = sb_append(sb, inc_key)
+            sb = sb_append(sb, "\n# @vir_source ")
+            sb = sb_append(sb, cur_file)
+            sb = sb_append_char(sb, 32)
+            sb = sb_append_int(sb, resume_line)
+            sb = sb_append(sb, "\n")
+        end
+
+        cur_line = resume_line
+        pos = end_at
+    end
+    out sb
+end.
+
 func expand_includes_text(source: int):
     g_inc_init()
     g_inc_resolved_path = 0
@@ -899,81 +1175,61 @@ func expand_includes_text(source: int):
         out source
     end
 
-    source = inc_prepend_root_marker(source)
+    if g_cycle_stack == 0 do
+        g_cycle_stack = vir_alloc(64 * 8)
+    end
+    g_cycle_depth = 0
+    g_inc_guard = 0
 
-    var guard = 0
-    when guard < G_PREPROCESS_MAX loop
-        guard = guard + 1
-        let at = text_find_include(source)
-        if at < 0 do
-            out source
-        end
-        if text_line_has_double_colon(source, at) == 1 do
-            inc_locate_marker_before(source, at)
-            inc_report_early_error(2103, g_inc_cur_parent_file, g_inc_cur_parent_line, "")
-            out source
-        end
-        let iname = text_parse_include_name(source, at)
-        if iname == 0 do
-            inc_locate_marker_before(source, at)
-            inc_report_early_error(2101, g_inc_cur_parent_file, g_inc_cur_parent_line, "")
-            out source
-        end
-        inc_locate_marker_before(source, at)
-        g_inc_resolved_path = 0
-        var body = read_include_source(iname)
-        ideCaptureResolvedModule(iname, g_inc_cur_parent_file, g_inc_cur_parent_line, body)
-        if ide_enabled() == 1 do
-            var is_root = 0
-            if g_inc_main_file == 0 do
-                is_root = 1
-            eif g_inc_cur_parent_file != 0 and rt_streq(g_inc_cur_parent_file, g_inc_main_file) == 1 do
-                is_root = 1
-            end
-            if is_root == 1 do
-                var inc_res = 0
-                if body != 0 do inc_res = 1 end
-                ide_register_include(iname, g_inc_cur_parent_line, 0, inc_res)
-            end
-        end
-        if body == 0 do
-            inc_report_early_error(2102, g_inc_cur_parent_file, g_inc_cur_parent_line, native_read_i64(iname as i64, 0) as string)
-            out source
-        end
-        var body_path = g_inc_resolved_path
-        if body_path == 0 do body_path = native_read_i64(iname as i64, 0) end
-        if inc_validate_utf8_source(body, body_path) == 0 do out source end
-        var inc_key = g_inc_canonical_id
-        if inc_key == 0 do
-            inc_key = g_inc_resolved_path
-        end
-        if inc_key == 0 do
-            inc_key = native_read_i64(iname as i64, 0)
-        end
-        if check_active_cycle(source, at, inc_key) == 1 do
-            inc_set_error(2105)
-            out source
-        end
-        let inc_key_fat = str_from_cstr(inc_key)
-        if g_inc_has(inc_key_fat) == 1 do
-            let end_at = text_skip_include_stmt(source, at)
-            let dup_str = inc_make_dup_comment(inc_key)
-            source = text_splice_at(source, at, end_at, dup_str)
-        else
-            g_inc_mark(inc_key_fat)
-            body = text_ascii_sanitize(body)
-            let end_at = text_skip_include_stmt(source, at)
-            inc_locate_marker_before(source, at)
-            let p_file = g_inc_cur_parent_file
-            let p_line = g_inc_cur_parent_line + inc_count_newlines(source, at, end_at)
-            let wrapped_body = inc_wrap_source_with_mod(body, body_path, p_file, p_line, inc_key)
-            source = text_splice_at(source, at, end_at, wrapped_body)
+    let sdata = native_read_i64(source as i64, 0)
+    let slen = native_read_i64(source as i64, 8)
+    var is_already_marked = 0
+    if slen >= 15 do
+        if native_read_u8(sdata, 0) == 35 and native_read_u8(sdata, 1) == 32 and native_read_u8(sdata, 2) == 64 do
+            is_already_marked = 1
         end
     end
-    if guard >= G_PREPROCESS_MAX do
-        inc_report_early_error(2104, g_inc_cur_parent_file, g_inc_cur_parent_line, "")
+
+    var root_f = "<main>" as i64
+    if g_inc_main_file != 0 do
+        root_f = g_inc_main_file
     end
-    out source
+
+    var sb = sb_new()
+    sb = sb_grow(sb, slen * 2)
+
+    if is_already_marked == 0 do
+        sb = sb_append(sb, "# @vir_mod_start ")
+        sb = sb_append(sb, root_f)
+        sb = sb_append(sb, "\n# @vir_source ")
+        sb = sb_append(sb, root_f)
+        sb = sb_append(sb, " 1\n")
+        if g_cycle_depth < 64 do
+            native_write_i64(g_cycle_stack, g_cycle_depth * 8, root_f)
+            g_cycle_depth = g_cycle_depth + 1
+        end
+    end
+
+    sb = expand_include_recurse(source, root_f, sb)
+
+    if g_inc_err != 0 do
+        out source
+    end
+
+    if is_already_marked == 0 do
+        if sb_len(sb) > 0 and native_read_u8(sb.buf, sb.len - 1) != 10 do
+            sb = sb_append_char(sb, 10)
+        end
+        sb = sb_append(sb, "# @vir_mod_end ")
+        sb = sb_append(sb, root_f)
+        sb = sb_append(sb, "\n")
+        if g_cycle_depth > 0 do
+            g_cycle_depth = g_cycle_depth - 1
+        end
+    end
+
+    let out_cstr = sb_to_string(sb)
+    out str_from_cstr(out_cstr)
 end.
 
 # ── Text-level import splice: import add from math → splice func add ──

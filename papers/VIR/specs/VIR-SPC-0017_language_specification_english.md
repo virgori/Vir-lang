@@ -2,20 +2,26 @@
 id: "VIR-SPC-0017"
 type: "SPEC"
 domain: "VIR"
-title: "Vir Language Specification v2.0"
+title: "Vir Language Specification v3.1.1"
 status: "ACTIVE"
-version: "2.0.0"
+version: "3.1.1"
 language: "en"
 spec_class: "SPECIFICATION"
 created: "2026-05-12"
-updated: "2026-10-02"
+updated: "2026-10-06"
 owners:
   - "VIR"
 components: []
 aliases:
   - "docs/vir_language_spec_v2.0_en.md"
 related:
-  issues: []
+  issues:
+    - "VIR-ISS-0003"
+    - "VIR-ISS-0004"
+    - "VIR-ISS-0005"
+    - "VIR-ISS-0006"
+    - "VIR-ISS-0007"
+    - "VIR-ISS-0008"
   plans: []
   reports: []
 supersedes: null
@@ -24,9 +30,9 @@ tags:
   - "migrated-from-docs"
 ---
 
-# VIR-SPC-0017 — Vir Language Specification v2.0
+# VIR-SPC-0017 — Vir Language Specification v3.1.1
 
-*Version: 2.0 | Date: April 11, 2026 | Status: Living Document*
+*Version: 3.1.1 | Date: October 6, 2026 | Status: Living Document*
 *Supersedes: v1.2 (March 2026)*
 
 ---
@@ -304,7 +310,7 @@ The Vir compiler implements a complete suite of 26 industry-standard optimizatio
    │
    ├── Tier-1: Local & Arithmetic Optimizations
    │   1. Constant Folding & Algebraic Identities
-   │   2. Peephole Strength Reduction (x * 2^k → x << k, x / 2^k → x >> k)
+   │   2. Peephole Strength Reduction (x * 2^k → x shl k, x / 2^k → x shr k)
    │   3. Common Subexpression Elimination (Local CSE)
    │   4. Dead Code Elimination (DCE / Liveness analysis)
    │
@@ -433,45 +439,67 @@ The legacy `## ... ##` delimiter remains accepted for backward compatibility.
 
 ## 3. Module System
 
-Vir manages source code using **Directory Mapping**. The compiler uses the dot `.` separator to traverse directory trees and builds a Dependency Graph to prevent circular imports.
+Vir resolves public Module IDs through registries. `VIR-SPC-0006` is the
+canonical detailed contract for registry discovery, identity, resolution,
+deduplication, and diagnostics. A directory layout alone does not publish a
+module.
 
 ### 3.1 Module Ordering
 
 Modules follow a strict declaration order:
 
 ```
-include → import/get → const → var → entity → func → export → share
+include → import → const → var → entity → func → export → share
 ```
 
 ### 3.2 Include — Physical File Loading
 
-Declares the presence of a source file and establishes a namespace.
+Loads one or more registered modules and establishes namespaces. An alias
+changes only the local namespace, not canonical identity.
 
 ```vir
-include math;                    # loads math.vri, namespace = math
-include net.http;                # loads net/http.vri, namespace = http
-include net.http as web;         # loads net/http.vri, namespace = web
+include math;
+include net.http as web;
+include math, io.file as file, net.http as web;
 ```
 
-**Resolution:** `A.B.C` → searches for `A/B/C.vri` from project root.
+Multi-include is equivalent to separate directives evaluated left to right; an
+`as` alias applies only to the item immediately before it.
 
-The dot `.` is the only module-path separator. `A::B` is not valid Vir syntax and must be rejected in every context.
-
-### 3.3 Import — Bring Functions into Scope
+The dot `.` is the only separator inside a Module ID. `A::B` is not valid Vir
+syntax and must be rejected in every context. Direct filesystem paths are a
+separate compatibility target and use `/`:
 
 ```vir
-import add from math;            # call add() directly
-import get from net.http as fetch;  # call fetch() instead of get()
+include "provider.vri";
+include provider.vri;
+include "helpers/provider.vri";
 ```
 
-### 3.4 Get — Bring Variables/Constants into Scope
+Registered dotted Module IDs remain the preferred project/stdlib form. A direct
+path does not publish a Module ID. If its normalized physical path matches a
+registry entry, resolution uses that registered canonical identity; otherwise
+it uses a path-derived identity. An unregistered dotted spelling may fall back
+to dot-to-slash lookup for legacy compatibility, but new projects should declare
+the ID in `module.list`.
+
+### 3.3 Import — Exported Symbols and Namespaces
 
 ```vir
-get MAX_RETRY from net.config;   # use MAX_RETRY directly
-get PI from math as TAU;         # alias
+import add, sub from math;           # selective import
+import MAX_RETRY from net.config;    # constants use the same selective form
+import get from net.http as fetch;   # `get` is an ordinary export name
+import answer from "provider.vri";   # direct-path compatibility provider
+import from net.http;                # complete export surface
+import net.http as web;              # whole-module namespace
 ```
 
-### 3.5 Export / Share / Port
+Import does not require a preceding include. Selective import applies uniformly
+to exported functions, types, constants, and variables. `import from module`
+brings every exported declaration into local scope. `import module as alias`
+creates a namespace and does not inject unqualified names.
+
+### 3.4 Export / Share / Port
 
 ```vir
 export add, subtract;            # export functions to other modules
@@ -489,32 +517,30 @@ port signals, commands;          # expose named signal ports (inter-worker coord
 | Typical use | Framebuffer, audio buffers, lookup tables | Gateway ↔ Satellite, producer ↔ consumer pipelines |
 | Blocking | No | `recv` blocks until a message arrives (or timeout) |
 
-### 3.6 Combined Import
-
-```vir
-import add, subtract, get counter, mode from math;
-```
-
-### 3.7 Usage
+### 3.5 Usage
 
 ```vir
 func main:
     var resp = http.get("/api")     # qualified call via namespace
     var resp2 = fetch("/api")       # aliased import
-    print MAX_RETRY                 # imported constant
+    print MAX_RETRY                 # selectively imported constant
 end.
 ```
 
-### 3.8 Dependency Graph
+### 3.6 Registries and Dependency Graph
 
-Each time the compiler encounters `include`, `import`, or `get`, it performs these steps:
+The project registry is `module.list`. Its containing directory is the initial
+base; optional `root` changes the base for following mappings, so the registry
+need not be at repository root. The standard-library registry belongs to the
+active Vir toolchain and must not be copied into the project.
 
-1. **Cache check:** Is module path `A.B.C` already loaded?
-2. **Circular check:** If module status is `Parsing`, emit error `"Circular Dependency detected: A.B.C"`
-3. **Mapping:** Resolve `A.B.C` → `A/B/C.vri`, load and parse source file
-4. **Registration:** Add identifiers to the current module's Symbol Table
+Active stdlib Module IDs are reserved against exact project-ID collisions.
+Validation occurs when registries are loaded, even if source never references
+the colliding ID. Prefix-only relationships remain valid: stdlib `http` does
+not reserve project `http.app`.
 
-Module states: `NotLoaded` → `Parsing` → `Parsed`
+Dependencies are deduplicated and cycle-checked by canonical Module ID. A cycle
+is a compile-time error; Vir 3.0 has no deferred type-only module exception.
 
 ---
 
@@ -1226,11 +1252,12 @@ Treating both as one “named assignment” merges two distinct concepts and wro
 
 Canonical: `VIR-SPC-0018` §6.4.
 
-### 6.5 Forward Declaration
+### 6.5 Declaration Order
 
-```vir
-has processData;     # declare before defining
-```
+Function definitions in a source unit are collected independently of source
+order. A call may refer to a function defined later without a separate forward
+declaration. Bodyless foreign declarations use the fully typed `extern func`,
+`extern from ... func`, or binding forms defined in §15.
 
 ### 6.6 Higher-Order Functions
 
@@ -1246,7 +1273,7 @@ func apply(f, value):
 end.
 
 func main:
-    var f = double        # function pointer
+    var f = double        # typed function value
     print f(5)            # → 10
     print apply(double, 7) # → 14
 end.
@@ -1682,7 +1709,7 @@ u.display()                  # → display(u)
 
 When the compiler sees `x.foo(args)`:
 1. If `foo` is a `method` of the entity type → method call (implicit `this`)
-2. If `foo` is a **callable field** (field of function-pointer type) → indirect call via field value
+2. If `foo` is a **callable field** (field of structural function type) → indirect call via field value
 3. If `foo(x, args)` exists as a standalone function → UFCS call
 4. Otherwise → compile error
 
@@ -1691,7 +1718,7 @@ Step 2 enables event-driven patterns where entity fields store callbacks:
 ```vir
 entity Button:
     label: string
-    on_click: ptr           # function pointer field
+    on_click: func()        # typed function-value field
 end.
 
 func handle_click:
@@ -1702,7 +1729,9 @@ var btn = Button(label: "OK", on_click: handle_click)
 btn.on_click()              # step 2 → indirect call via field value
 ```
 
-> **Note:** `btn.on_click` (no parens) is still a field access — it reads the function pointer. `btn.on_click()` (with parens) **calls** the function pointer because step 2 detects that the field holds a callable type.
+> **Note:** `btn.on_click` (no parens) is still a field access — it reads the typed function value. `btn.on_click()` (with parens) **calls** that value and passes only the arguments written inside the parentheses. Callable-field dispatch does not inject `btn` as an implicit receiver.
+
+Only a field declared with a structural function type, `func(P...) -> R` or its no-result form `func(P...)`, is callable. The raw `ptr` type is an opaque address and is never implicitly callable or implicitly convertible to a function type. Vir 2.1 defines no raw-address-to-callable conversion. A future FFI facility for such conversion must use explicit unsafe syntax and declare the complete function signature, ABI/calling convention, provenance, and lifetime constraints.
 
 ### 11.5 Field vs Function — No Ambiguity
 
@@ -1961,7 +1990,7 @@ end.
 
 ### 13.7 try / revert — Local Error Handling with Compensation
 
-`try:` creates a **local error boundary** inside a function body. Each `try` block has its own `revert` section for local compensation. Additional features: **timeout**, **isolate**, **resume retry**, **resume revert**, and **emit** for structured logging.
+`try:` creates a **local error boundary** inside a function body. Each `try` block has its own `revert` section for local compensation. Additional features: **timeout**, **isolate**, **retry**, **rethrow**, and **emit** for structured logging.
 
 **Basic structure:**
 
@@ -1973,6 +2002,16 @@ revert
 end
 ```
 
+The canonical terminal statements in a local `revert` are described by:
+
+```text
+local_revert_transfer := retry | rethrow
+```
+
+Both statements are valid only inside the local `revert` of an enclosing `try` and terminate their control-flow path. `retry` restarts that exact `try` after the documented `isolate` restoration. `rethrow` preserves the current `erx` value and propagates it to the next enclosing compensation boundary, or to the function-level `revert` when no outer local boundary exists. Code after either statement on the same path is unreachable.
+
+For source compatibility throughout Vir 2.x, implementations may accept the legacy two-token spellings `resume retry` and `resume revert`. When accepted, they must emit a stable deprecation diagnostic, must interpret them exactly as `retry` and `rethrow`, and formatters and generators must emit only the canonical forms. Removal is permitted no earlier than Vir 3.0.
+
 **With `timeout` — automatic abort after duration:**
 
 ```vir
@@ -1980,17 +2019,17 @@ try(timeout: 5s):
     download_large_file()
 revert
     emit LOG_ERROR("Download timed out or failed: $erx")
-    resume revert
+    rethrow
 end
 ```
 
 The `timeout` parameter is optional. If the operation exceeds the specified duration, the try block is aborted and the local `revert` runs with a timeout error code in `erx`.
 
-**`resume retry` — restart the current try block:**
+**`retry` — restart the current try block:**
 
-If the local `revert` determines the error is recoverable, `resume retry` restarts the `try` block from the top. Use a counter to prevent infinite loops.
+If the local `revert` determines the error is recoverable, `retry` restarts the `try` block from the top. Use a counter to prevent infinite loops.
 
-**⚠ Dirty state warning:** Vir has no transactional memory. Variables modified before the `throw` inside `try:` **retain their mutated values** when `resume retry` restarts the block. The developer **must** reset any dirty state inside the local `revert` before calling `resume retry`. Failure to do so means the retry runs on corrupted/partial data.
+**⚠ Dirty state warning:** Vir has no transactional memory. Variables modified before the `throw` inside `try:` **retain their mutated values** when `retry` restarts the block. The developer **must** reset any dirty state inside the local `revert` before calling `retry`. Failure to do so means the retry runs on corrupted/partial data.
 
 ```vir
 var retry_limit = 3
@@ -2000,9 +2039,9 @@ try(timeout: 5s):
 revert
     retry_limit -= 1
     if retry_limit > 0 do
-        resume retry           # restart this try block
+        retry           # restart this try block
     end
-    resume revert              # give up — propagate to function revert
+    rethrow              # give up — propagate to function revert
 end
 ```
 
@@ -2019,13 +2058,13 @@ revert
     partial_result = 0            # ← MUST reset dirty state before retry
     retry_limit -= 1
     if retry_limit > 0 do
-        resume retry
+        retry
     end
-    resume revert
+    rethrow
 end
 ```
 
-The compiler emits a **warning** if `resume retry` is used and the `revert` block does not reassign any variable that was modified inside the `try` body. This is a best-effort heuristic, not a guarantee — complex control flow may require manual auditing.
+The compiler emits a **warning** if `retry` is used and the `revert` block does not reassign any variable that was modified inside the `try` body. This is a best-effort heuristic, not a guarantee — complex control flow may require manual auditing.
 
 **`isolate` — automatic snapshot & restore:**
 
@@ -2038,7 +2077,7 @@ Both `isolate` forms share that root; they differ in the **attached policy**:
 | Block `isolate` | `isolate: … end` | **sandbox policy** (VI §25.5; security sandbox) |
 | `try(isolate:)` | `try(isolate: […]):` | **snapshot / retry policy** (this section) |
 
-`try(isolate:)` declares external variables the compiler automatically **snapshots onto the stack** on `try` entry and **restores** before each `resume retry`. This eliminates manually resetting dirty state in `revert`.
+`try(isolate:)` declares external variables the compiler automatically **snapshots onto the stack** on `try` entry and **restores** before each `retry`. This eliminates manually resetting dirty state in `revert`.
 
 Canonical: `VIR-SPC-0018` §13.7 / §25.5.
 
@@ -2049,9 +2088,9 @@ try(isolate: [retry_limit, partial_result]):
 revert
     retry_limit -= 1
     if retry_limit > 0 do
-        resume retry       # partial_result auto-restored to its pre-try value
+        retry       # partial_result auto-restored to its pre-try value
     end
-    resume revert
+    rethrow
 end
 ```
 
@@ -2063,16 +2102,16 @@ try(timeout: 5s, isolate: [retry_limit]):
 revert
     retry_limit -= 1
     if retry_limit > 0 do
-        resume retry
+        retry
     end
-    resume revert
+    rethrow
 end
 ```
 
 **Semantics:**
 - **On `try` entry:** snapshot values of all `isolate`-listed variables are pushed to the enclosing stack frame (copy semantics; for Move types only the header/pointer is copied — heap contents are *not* rolled back).
-- **On `resume retry`:** listed variables are **restored** from snapshot before the `try` body restarts. The snapshot is kept for subsequent retries.
-- **On normal exit or `resume revert`:** snapshot is discarded.
+- **On `retry`:** listed variables are **restored** from snapshot before the `try` body restarts. The snapshot is kept for subsequent retries.
+- **On normal exit or `rethrow`:** snapshot is discarded.
 - Variables **not** in the `isolate` list are unaffected — their mutations remain live.
 
 **Compile-time dirty state detection (W302):**
@@ -2080,7 +2119,7 @@ end
 If the compiler detects that a variable is:
 1. Declared **outside** the `try` block
 2. **Mutated** inside the `try` body (assigned, `+=`, `-=`, etc.)
-3. In a block that uses `resume retry`
+3. In a block that uses `retry`
 4. **Not** listed in `isolate`
 5. And **not** reassigned in the `revert` block
 
@@ -2091,9 +2130,9 @@ Warning W302: Variable 'retry_limit' is mutated before retry.
   State may be dirty. Use isolate: [retry_limit] or reset manually in revert.
 ```
 
-**`resume revert` — propagate to function-level revert:**
+**`rethrow` — propagate to function-level revert:**
 
-`resume revert` inside a local `revert` block escalates the error to the function-level `revert`. This implements the **Saga compensation pattern** — each level cleans up locally, then propagates upward.
+`rethrow` inside a local `revert` block escalates the error to the function-level `revert`. This implements the **Saga compensation pattern** — each level cleans up locally, then propagates upward.
 
 **`emit` — structured event logging:**
 
@@ -2121,9 +2160,9 @@ func sync_satellite_data:
         emit LOG_ERROR("Connection failed (error $erx)")
         retry_limit -= 1
         if retry_limit > 0 do
-            resume retry
+            retry
         end
-        resume revert
+        rethrow
     end
 
     # Level 2: Fetch data
@@ -2133,7 +2172,7 @@ func sync_satellite_data:
     revert
         emit LOG_ERROR("Fetch failed (error $erx)")
         close_satellite_link(connection)
-        resume revert
+        rethrow
     end
 
     # Level 3: Write to storage
@@ -2142,7 +2181,7 @@ func sync_satellite_data:
         write_storage(data_buffer)
     revert
         emit LOG_ERROR("Write failed (error $erx)")
-        resume revert
+        rethrow
     end
 
     emit LOG_INFO("Sync complete.")
@@ -2172,10 +2211,10 @@ The `erx` keyword reads the current error code (the value passed to `throw`). Av
 |-----------|-------|----------|
 | `try: ... revert ... end` | Inside function body | Error boundary with local compensation |
 | `try(timeout: T): ...` | Inside function body | Error boundary with automatic timeout |
-| `try(isolate: [x, y]): ...` | Inside function body | Auto-snapshot vars on entry; restore on `resume retry` |
-| `resume retry` | Inside local `revert` | Restart the current try block |
-| `resume revert` | Inside local `revert` | Propagate error to function-level revert |
-| `revert` | End of function | Runs only when error propagates via `resume revert` or `throw` |
+| `try(isolate: [x, y]): ...` | Inside function body | Auto-snapshot vars on entry; restore on `retry` |
+| `retry` | Inside local `revert` | Restart the current try block |
+| `rethrow` | Inside local `revert` | Propagate error to function-level revert |
+| `revert` | End of function | Runs only when error propagates via `rethrow` or `throw` |
 | `ensure` | End of function | Always runs on function exit |
 | `emit` | Anywhere | Structured event/log emission |
 | `erx` | revert / ensure | Reads the thrown error code |
@@ -2185,9 +2224,9 @@ The `erx` keyword reads the current error code (the value passed to `throw`). Av
 | Scenario | Flow |
 |----------|------|
 | try succeeds | try body → code after try end → ensure → return |
-| try throws + resume retry | try body → throw → local revert → resume retry → try body (restart) |
-| try throws + resume retry (isolate) | try body → throw → local revert → resume retry → **restore snapshots** → try body (restart) |
-| try throws + resume revert | try body → throw → local revert → resume revert → function revert → ensure → return |
+| try throws + retry | try body → throw → local revert → retry → try body (restart) |
+| try throws + retry (isolate) | try body → throw → local revert → retry → **restore snapshots** → try body (restart) |
+| try throws + rethrow | try body → throw → local revert → rethrow → function revert → ensure → return |
 | try timeout | timeout fires → local revert (erx = timeout code) |
 | throw outside try | body → throw → function revert → ensure → return |
 
@@ -2527,10 +2566,10 @@ end.
 
 | Operation | Generated code |
 |-----------|---------------|
-| **Read single bit** `reg.FIELD` | `(value >> bit_pos) & 1` |
-| **Write single bit** `reg.FIELD = v` | `(value & ~(1 << bit_pos)) \| (v << bit_pos)` |
-| **Read multi-bit** `reg.FIELD` | `(value >> lo) & ((1 << (hi-lo+1)) - 1)` |
-| **Write multi-bit** `reg.FIELD = v` | `(value & ~(mask << lo)) \| ((v & mask) << lo)` |
+| **Read single bit** `reg.FIELD` | `(value shr bit_pos) and 1` |
+| **Write single bit** `reg.FIELD = v` | `(value and bnot(1 shl bit_pos)) or (v shl bit_pos)` |
+| **Read multi-bit** `reg.FIELD` | `(value shr lo) and ((1 shl (hi-lo+1)) - 1)` |
+| **Write multi-bit** `reg.FIELD = v` | `(value and bnot(mask shl lo)) or ((v and mask) shl lo)` |
 
 On ARM64, the compiler emits native `UBFX` (extract) and `BFI` (insert) instructions.
 
@@ -3780,8 +3819,7 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 | Keyword | Purpose |
 |---------|---------|
 | `include` | Load a file and create namespace |
-| `import` | Bring a function into local scope |
-| `get` | Bring a variable/constant into local scope |
+| `import` | Bring exported declarations into local scope or bind a module namespace |
 | `from` | Specify source module |
 | `as` | Alias for namespace, import, or type cast |
 | `export` | Export functions to other modules |
@@ -3810,8 +3848,8 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 | `emit` | Structured event/log emission |
 | `timeout` | Parameter for `try` — automatic abort after duration |
 | `isolate` | Isolation: independent execution context — `try(isolate:)` = snapshot/retry (§13.7); block = sandbox (VI §25.5) |
-| `resume retry` | Inside local `revert` — restart current try block |
-| `resume revert` | Inside local `revert` — propagate to function-level revert |
+| `retry` | Inside local `revert` — restart current try block |
+| `rethrow` | Inside local `revert` — propagate to function-level revert |
 
 ### Parameters
 
@@ -3874,7 +3912,6 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 
 | Keyword | Purpose |
 |---------|---------|
-| `has` | Forward declaration |
 | `none` | Null value |
 | `true` / `false` | Boolean literals |
 | `mod` | Modulo operator |
@@ -3898,7 +3935,7 @@ From highest to lowest:
 | 22 | `**` `><` | Left |
 | 20 | `*` `/` | Left |
 | 18 | `%` `mod` | Left |
-| 12 | `>>` `shl` `shr` `as` | Left |
+| 12 | Casts: `as`, `>>`; shifts: `shl`, `shr` | Left |
 | 10 | `+` `-` | Left |
 | 8 | `:~` | Left |
 | 6 | `>` `<` `>=` `<=` | Left |
@@ -3929,7 +3966,7 @@ From highest to lowest:
 | try / revert | — | `try: ... revert ... end` local error boundary with Saga compensation |
 | emit | — | `emit LOG_INFO(...)` structured event/log emission |
 | timeout | — | `try(timeout: 5s):` automatic abort after duration |
-| resume | — | `resume retry` / `resume revert` — flow control inside local revert |
+| retry / rethrow | — | Terminal flow control inside local `revert`; legacy `resume retry` / `resume revert` are deprecated through 2.x |
 | erx | — | Error register — reads thrown error code |
 | Return type arrow | `func f(): int` | `func f() -> int:` |
 | dict (was map) | `map[K,V]` | Type `dict of (K, V)` + literal `[key: value, ...]` — same `[]` syntax; presence of `:` means dict |
@@ -3939,18 +3976,17 @@ From highest to lowest:
 | Include paths | `include math;` | + `include net.http;` (dot-path directory mapping) |
 | Include alias | — | `include net.http as web;` |
 | Import alias | — | `import get from net.http as fetch;` |
-| Get | — | `get PI from math;` (import variable/constant) |
 | Borrow checker | — | Compile-time ownership, borrow, move safety — zero runtime overhead (§4.8) |
 | `&` / `&mut` | — | Shared / mutable borrow syntax — no move, validated by borrow checker |
 | Move semantics | — | Non-copy types move on assignment; old binding invalidated (§4.8) |
 | arena block | — | `arena: ... end` scoped sub-arena for loop memory reclamation (§4.6) |
 | Runtime separation | — | Hard Language / Compiler / Library split; compiler must not know schedulers; zero-cost = unused code absent from the binary (§1.2, `VIR_EXECUTION_MODEL.md`) |
 | arr_compact | — | `arr_compact(arr)` — reclaim array resize dead space (§19.4) |
-| Callable field | — | UFCS step 2: `x.callback()` calls function-pointer field (§11) |
+| Callable field | — | UFCS step 2: `x.callback()` calls a typed function-value field and passes only explicit arguments (§11) |
 | Interpolation boundary | — | `$ident` stops at non-identifier chars; use `$(expr)` for `[]` access (§12.6) |
 | Semicolon / separator | — | Unified list separator `;` \| `NEWLINE` (§1.0); compiler detects orphan parameters in group blocks (§14.2) |
 | isolate | — | Isolation = independent execution context; `try(isolate:)` = snapshot/retry; block `isolate` = sandbox (VI §13.7, §25.5) |
-| resume retry safety | — | Compiler emits W302 if variable mutated in try body, block uses `resume retry`, and variable not in `isolate` list or reset in `revert` (§13.7) |
+| retry safety | — | Compiler emits W302 if variable mutated in try body, block uses `retry`, and variable not in `isolate` list or reset in `revert` (§13.7) |
 | `await pass` | — | Explicit yield point — prevents CPU hogging in cooperative async loops (§22.6) |
 | `cancel` | — | Cooperative task cancellation — delivered at next `await` (§22.7) |
 | `select` | — | Event multiplexing — `select: on t1 as r: ... end` races multiple tasks (§22.8) |
@@ -3960,8 +3996,7 @@ From highest to lowest:
 | Swizzle `~` | — | `v~xyz` — postfix channel reorder/replicate for `flux` (§24.2) |
 | `deck` | — | `deck name: Type[size]` — shared CPU-GPU buffer (§24.3) |
 | `lock` / `!!` | — | Atomic read-modify-write: `lock x += 1` or `x!! += 1` (§24.4) |
-| `atomic` (var) | — | Variable modifier for retry logic — mutations survive `resume retry`, suppress W302 (§13.7) |
-| `lazy include` | — | Deferred type-only import — allows cyclic `entity`/`enum` deps between modules (§3.8) |
+| `atomic` (var) | — | Variable modifier for retry logic — mutations survive `retry`, suppress W302 (§13.7) |
 | Swizzle write-mask | — | `v~xy = flux(a, b)` — selective channel write; omitted channels unchanged (§24.2) |
 | `reactive` | — | UI state variable with compile-time propagation — no runtime refresh (§25.1) |
 | `morph` | — | Static entity/struct → UI component map — compile-time bindings (§25.2) |
@@ -3979,7 +4014,7 @@ From highest to lowest:
 
 ---
 
-*Vir Language Specification v2.0 — Systems programming language with zero-dependency native compilation.*
+*Vir Language Specification v3.1 — Systems programming language with zero-dependency native compilation.*
 *Targets: ARM64 (Mach-O), x86-64 (ELF), WebAssembly.*
 *Self-hosting compiler: virc.vri (written entirely in Vir).*
 
@@ -3987,4 +4022,8 @@ From highest to lowest:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-06 | 3.1.1 | Corrected all Vir shift examples to `shl`/`shr` and preserved `>>` exclusively as the cast operator |
+| 2026-10-06 | 3.1.0 | Documented registered dotted Module IDs, direct `.vri` path compatibility, legacy dot-to-path fallback, and canonical convergence across equivalent spellings |
+| 2026-10-06 | 3.0.0 | Standardized the registry-based module contract, multi-include and namespace/umbrella imports; unified selective imports across declaration kinds; removed untyped forward and deferred module forms; reserved exact stdlib Module IDs |
+| 2026-10-04 | 2.1.0 | Canonicalized local compensation transfers as `retry`/`rethrow` and separated typed callable fields from raw `ptr` |
 | 2026-10-02 | 2.0.0 | Migrated from `docs/vir_language_spec_v2.0_en.md` and assigned stable ID `VIR-SPC-0017` |

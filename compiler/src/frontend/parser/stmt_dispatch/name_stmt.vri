@@ -1,0 +1,235 @@
+##
+ * compiler/src/frontend/parser/stmt_dispatch/name_stmt.vri — identifier-led statements (assignments and expression statements)
+ * VIRC-PLN-0010: helpers extracted from parse_statement_impl in compiler/src/frontend/parser/stmt_dispatch.vri.
+ ##
+
+include types_prelude
+include rt_string_rt
+include lexer
+include ide_facts
+include parser_ast
+include parser_state
+include parser_diagnostics
+include parser_expr
+include parser_stmt_control
+include parser_stmt_decl
+include parser_stmt_module
+
+# Identifier (may be assignment, field/index assign, or expression)
+func parseNameStatement(ref p: Parser, t: Token, statementSpan: int, statementLine: int) -> (Parser, AstNode):
+    if is_orphan_param(p) do
+        var (p_err, _) = advance(p)
+        p_err = parse_error_code_at(p_err, 3047, "tham số không có nhóm (§14.2)", t.line)
+        # Consume the complete declaration-shaped fragment before returning
+        # recovery control to the enclosing function.  Leaving `: type`
+        # behind causes a cascading missing-`end` diagnostic and hides the
+        # intended E3047 error.
+        if check(p_err, TokType.Colon) do
+            var (p_type_start, _) = advance(p_err)
+            p_err = skip_type_expr(p_type_start)
+        end
+        out (p_err, ast_new(AstType.ParamDef))
+    end
+    ident_pos = p.pos
+
+    # IDENT(...) — expression statement; no backtracking.
+    if peek_n(p, 1).tok_type == TokType.LParen do
+        out parse_expr(p)
+    end
+
+    # IDENT.FIELD[.FIELD...] = expr — lookahead avoids rewinding into parse_expr.
+    if stmt_is_field_assign(p) do
+        var (p2, id_tok) = advance(p)
+        id_name = tok_lex(id_tok)
+        var base_obj = ast_new(AstType.Identifier)
+        base_obj.name = id_name
+        base_obj.line = id_tok.line
+        var (p_dot, _) = advance(p2)
+        var (p_field, field_tok1) = advance(p_dot)
+        var last_field_tok = field_tok1
+        var cur_p = p_field
+        when check(cur_p, TokType.Dot) and is_name_token(peek_n(cur_p, 1).tok_type) loop
+            var next_base = ast_new(AstType.FieldAccess)
+            next_base.name = tok_lex(last_field_tok)
+            next_base.line = last_field_tok.line
+            next_base = ast_add_child(next_base, base_obj)
+            base_obj = next_base
+            var (p_d, _) = advance(cur_p)
+            var (p_f, f_tok) = advance(p_d)
+            last_field_tok = f_tok
+            cur_p = p_f
+        end
+        field_name = tok_lex(last_field_tok)
+        if check(cur_p, TokType.Assign) do
+            let labelLine = native_read_i64(last_field_tok as int, 8)
+            let labelSpan = native_read_i64(last_field_tok as int, 72)
+            let labelName = field_name
+            var (p5, _) = advance(cur_p)
+            var (p6, val) = parse_expr(p5)
+            fa = ast_new(AstType.FieldAssign)
+            fa.line = id_tok.line
+            fa = ast_add_child(fa, val)
+            fa = ast_add_child(fa, base_obj)
+            fa.name = id_name
+            fa.name2 = field_name
+            if g_ideFactsEnabled == 1 do
+                let fieldLabel = ast_new(AstType.FieldAccess)
+                native_write_i64(fieldLabel as int, 0, labelName as int)
+                native_write_i64(fieldLabel as int, 32, labelLine)
+                native_write_i64(fieldLabel as int, 72, labelSpan)
+                ideFactOrigin(fieldLabel as int, labelSpan, labelLine)
+                ideFactSetProjection(fa as int, fieldLabel as int)
+            end
+            out (p6, fa)
+        end
+        var (p5, op_tok) = advance(cur_p)
+        var (p6, val) = parse_expr(p5)
+        lhs_fa = ast_new(AstType.FieldAccess)
+        lhs_fa.line = last_field_tok.line
+        lhs_fa = ast_add_child(lhs_fa, base_obj)
+        lhs_fa.name = field_name
+        bin = ast_new(AstType.BinOp)
+        bin.op = compound_assign_op(op_tok.tok_type)
+        bin.line = op_tok.line
+        bin = ast_add_child(bin, lhs_fa)
+        bin = ast_add_child(bin, val)
+        fa = ast_new(AstType.FieldAssign)
+        fa.line = id_tok.line
+        fa = ast_add_child(fa, bin)
+        fa = ast_add_child(fa, base_obj)
+        fa.name = id_name
+        fa.name2 = field_name
+        out (p6, fa)
+    end
+
+    var (p2, id_tok) = advance(p)
+    id_name = tok_lex(id_tok)
+    # Swizzle assignment: IDENT ~ MASK = expr
+    if (check(p2, TokType.BitNot) or check(p2, TokType.Swizzle)) and peek_n(p2, 1).tok_type == TokType.Ident and peek_n(p2, 2).tok_type == TokType.Assign do
+        var (p3, op_tok) = advance(p2)
+        var (p4, mask_tok) = advance(p3)
+        var (p5, assign_tok) = advance(p4)
+        var (p6, val) = parse_expr(p5)
+        sw_assign = ast_new(AstType.SwizzleAssign)
+        sw_assign.line = id_tok.line
+        sw_assign.name = id_name
+        sw_assign.name2 = tok_lex(mask_tok)
+        sw_assign = ast_add_child(sw_assign, val)
+        out (p6, sw_assign)
+    end
+
+    # Simple assignment: IDENT = expr or IDENT += expr
+    if check(p2, TokType.Assign) do
+        p2.pos = p2.pos + 1
+        var (p4, val) = parse_expr(p2)
+        assign = ast_new(AstType.Assign)
+        assign.line = id_tok.line
+        assign = ast_add_child(assign, val)
+        assign.name = id_name
+        ideFactOrigin(assign as int, statementSpan, statementLine)
+        out (p4, assign)
+    end
+    if is_compound_assign(peek(p2)) do
+        var (p3, op_tok) = advance(p2)
+        var (p4, val) = parse_expr(p3)
+        lhs_id = ast_new(AstType.Identifier)
+        lhs_id.name = id_name
+        lhs_id.line = id_tok.line
+        ideFactOrigin(lhs_id as int, statementSpan, statementLine)
+        bin = ast_new(AstType.BinOp)
+        bin.op = compound_assign_op(op_tok.tok_type)
+        bin.line = op_tok.line
+        bin = ast_add_child(bin, lhs_id)
+        bin = ast_add_child(bin, val)
+        assign = ast_new(AstType.Assign)
+        assign.line = id_tok.line
+        assign = ast_add_child(assign, bin)
+        assign.name = id_name
+        ideFactOrigin(assign as int, statementSpan, statementLine)
+        out (p4, assign)
+    end
+
+    # Index assignment: IDENT[expr, ...] = expr or IDENT[expr, ...] += expr
+    if check(p2, TokType.LBracket) do
+        var (p3, lbr_tok) = advance(p2)
+        if check(p3, TokType.Comma) do
+            p_err = parse_error_at(p3, "unexpected ',' at start of index", peek(p3).line)
+            out (p_err, ast_new(AstType.IndexAssign))
+        end
+        if check(p3, TokType.RBracket) do
+            p_err = parse_error_at(p3, "expected expression after '['", peek(p3).line)
+            out (p_err, ast_new(AstType.IndexAssign))
+        end
+        var (p4, first_idx) = parse_expr(p3)
+        var indices = vec_new_rt()
+        indices = vec_push_rt(indices, first_idx)
+        p_cur = p4
+        var idx_loop = true
+        when idx_loop loop
+            if check(p_cur, TokType.Comma) do
+                var (p_comma, _) = advance(p_cur)
+                if check(p_comma, TokType.RBracket) do
+                    p_cur = parse_error_at(p_comma, "unexpected ',' before ']'", peek(p_comma).line)
+                    idx_loop = false
+                else
+                    var (p_next, next_idx) = parse_expr(p_comma)
+                    indices = vec_push_rt(indices, next_idx)
+                    p_cur = p_next
+                end
+            else
+                idx_loop = false
+            end
+        end
+        var (p5, _, _) = expect_tok(p_cur, TokType.RBracket, "expected ']'")
+        if check(p5, TokType.Assign) do
+            var (p6, _) = advance(p5)
+            var (p7, val) = parse_expr(p6)
+            ia = ast_new(AstType.IndexAssign)
+            ia.line = id_tok.line
+            num_indices = vec_len_rt(indices)
+            var ki = 0
+            when ki < num_indices loop
+                ia = ast_add_child(ia, vec_get_rt(indices, ki))
+                ki = ki + 1
+            end
+            ia = ast_add_child(ia, val)
+            ia.name = id_name
+            ideFactOrigin(ia as int, statementSpan, statementLine)
+            out (p7, ia)
+        end
+        if is_compound_assign(peek(p5)) do
+            var (p6, op_tok) = advance(p5)
+            var (p7, val) = parse_expr(p6)
+            lhs_ia = ast_new(AstType.IndexAccess)
+            lhs_ia.line = id_tok.line
+            num_indices = vec_len_rt(indices)
+            var ki = 0
+            when ki < num_indices loop
+                lhs_ia = ast_add_child(lhs_ia, vec_get_rt(indices, ki))
+                ki = ki + 1
+            end
+            lhs_ia.name = id_name
+            ideFactOrigin(lhs_ia as int, statementSpan, statementLine)
+            bin = ast_new(AstType.BinOp)
+            bin.op = compound_assign_op(op_tok.tok_type)
+            bin.line = op_tok.line
+            bin = ast_add_child(bin, lhs_ia)
+            bin = ast_add_child(bin, val)
+            ia = ast_new(AstType.IndexAssign)
+            ia.line = id_tok.line
+            var kj = 0
+            when kj < num_indices loop
+                ia = ast_add_child(ia, vec_get_rt(indices, kj))
+                kj = kj + 1
+            end
+            ia = ast_add_child(ia, bin)
+            ia.name = id_name
+            ideFactOrigin(ia as int, statementSpan, statementLine)
+            out (p7, ia)
+        end
+    end
+
+    # Expression statement (field access, index, calls, etc.)
+    p.pos = ident_pos
+    out parse_expr(p)
+end.

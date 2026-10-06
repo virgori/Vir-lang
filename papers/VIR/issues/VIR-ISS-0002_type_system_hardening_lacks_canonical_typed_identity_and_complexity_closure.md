@@ -7,16 +7,34 @@ status: "TRIAGED"
 severity: "S1"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-02"
-owners: [language, compiler]
-components: [type-system, semantic-analysis, binding-identity, mir-verifier, complexity, tests]
+updated: "2026-10-04"
+owners:
+  - "language"
+  - "compiler"
+components:
+  - "type-system"
+  - "semantic-analysis"
+  - "binding-identity"
+  - "mir-verifier"
+  - "complexity"
+  - "tests"
 related:
-  issues: [VIR-ISS-0001]
+  issues:
+    - "VIR-ISS-0001"
+    - "VIRC-ISS-0016"
+    - "VIRC-ISS-0022"
+    - "VIRC-ISS-0023"
+    - "VIRC-ISS-0026"
   plans: []
   reports: []
 supersedes: null
 superseded_by: null
-tags: [soundness, termination, type-identity, complexity, fail-closed]
+tags:
+  - "soundness"
+  - "termination"
+  - "type-identity"
+  - "complexity"
+  - "fail-closed"
 ---
 
 # VIR-ISS-0002 — Type system hardening lacks canonical typed identity and complexity closure
@@ -181,3 +199,7 @@ is S1; no new broad failure is claimed.
 | Date | Change |
 |---|---|
 | 2026-10-02 | Created and triaged after 105/105 verification; retained only architectural, verifier, complexity, and closure gaps |
+| 2026-10-03 | Linked VIRC-ISS-0016 |
+| 2026-10-04 | Linked VIRC-ISS-0022 |
+| 2026-10-04 | Linked VIRC-ISS-0023 |
+| 2026-10-04 | Linked VIRC-ISS-0026 |

@@ -5,7 +5,7 @@
  * devirtualization, and hot/cold block layout partitioning.
  ##
 
-include types
+include types_prelude
 include mir_types
 include mir_ops
 include mir_builder
@@ -13,9 +13,344 @@ include mir_opt_context
 include mir_opt_rewrite
 include mir_opt_loop_idiom
 
+func mir_is_pre_candidate_op(op: i64):
+    if op == MirOp.Add or op == MirOp.Sub or op == MirOp.Mul do out true end
+    if op == MirOp.And or op == MirOp.Or or op == MirOp.Xor do out true end
+    if op == MirOp.Shl or op == MirOp.Shr do out true end
+    out false
+end.
+
+func mir_is_pre_commutative(op: i64):
+    if op == MirOp.Add or op == MirOp.Mul do out true end
+    if op == MirOp.And or op == MirOp.Or or op == MirOp.Xor do out true end
+    out false
+end.
+
+func mir_pre_opnd_is_match(a: &MirOperand, b: &MirOperand):
+    let at = mir_opnd_type(a)
+    let bt = mir_opnd_type(b)
+    if at != bt do out false end
+    if at == MirOperandType.VReg do
+        out mir_opnd_vreg_id(a) == mir_opnd_vreg_id(b)
+    end
+    if at == MirOperandType.Imm do
+        out mir_opnd_imm_val(a) == mir_opnd_imm_val(b)
+    end
+    out false
+end.
+
+func mir_pre_expr_is_match(op1: i64, s1a: &MirOperand, s2a: &MirOperand,
+                           op2: i64, s1b: &MirOperand, s2b: &MirOperand):
+    if op1 != op2 do out false end
+    if mir_pre_opnd_is_match(s1a, s1b) and mir_pre_opnd_is_match(s2a, s2b) do
+        out true
+    end
+    if mir_is_pre_commutative(op1) do
+        if mir_pre_opnd_is_match(s1a, s2b) and mir_pre_opnd_is_match(s2a, s1b) do
+            out true
+        end
+    end
+    out false
+end.
+
+func mir_pre_instr_is_barrier(ins: &MirInstr):
+    let op = mir_instr_op(ins)
+    if op == MirOp.Call or op == MirOp.Return do out true end
+    if op == MirOp.Intrinsic do
+        let kind = mir_instr_src2(ins)
+        if mir_opnd_type(kind) == MirOperandType.Imm do
+            let kv = mir_opnd_imm_val(kind)
+            if kv == MIR_MEM_RESET or kv == MIR_MEM_DROP or kv == MIR_MEM_MARK or kv == MIR_INTR_THROW or kv == MIR_INTR_REVERT do
+                out true
+            end
+        end
+    end
+    out false
+end.
+
+func mir_pre_opnd_defined_in_range(instrs: i64, start_i: i64, end_i: i64, opnd: &MirOperand):
+    if mir_opnd_type(opnd) != MirOperandType.VReg do out false end
+    let vr = mir_opnd_vreg_id(opnd)
+    var i = start_i
+    when i < end_i loop
+        let ins = vec_get_rt(instrs, i)
+        if mir_instr_defines_vreg(ins, vr) do out true end
+        i = i + 1
+    end
+    out false
+end.
+
+func mir_pre_find_avail_in_pred(b: &MirBlock, op: i64, s1: &MirOperand, s2: &MirOperand):
+    let instrs = mir_block_head(b)
+    if instrs < 0 do out (false, mir_opnd_none()) end
+    let n_ins = vec_len_rt(instrs)
+    var found_idx = 0 - 1
+    var found_dst = mir_opnd_none()
+    var i = n_ins - 1
+    when i >= 0 and found_idx < 0 loop
+        let ins = vec_get_rt(instrs, i)
+        let i_op = mir_instr_op(ins)
+        if mir_pre_expr_is_match(op, s1, s2, i_op, mir_instr_src1(ins), mir_instr_src2(ins)) do
+            let d = mir_instr_dst(ins)
+            if mir_opnd_type(d) == MirOperandType.VReg do
+                found_idx = i
+                found_dst = d
+            end
+        end
+        i = i - 1
+    end
+    if found_idx < 0 do
+        out (false, mir_opnd_none())
+    end
+    if mir_pre_opnd_defined_in_range(instrs, found_idx + 1, n_ins, s1) do
+        out (false, mir_opnd_none())
+    end
+    if mir_pre_opnd_defined_in_range(instrs, found_idx + 1, n_ins, s2) do
+        out (false, mir_opnd_none())
+    end
+    if mir_pre_opnd_defined_in_range(instrs, found_idx + 1, n_ins, found_dst) do
+        out (false, mir_opnd_none())
+    end
+    out (true, found_dst)
+end.
+
+func mir_pre_is_safe_to_insert_in_pred(blocks: i64, b: &MirBlock, s1: &MirOperand, s2: &MirOperand):
+    let instrs = mir_block_head(b)
+    if instrs < 0 do out false end
+    let n_ins = vec_len_rt(instrs)
+    var i = 0
+    when i < n_ins loop
+        let ins = vec_get_rt(instrs, i)
+        if mir_pre_instr_is_barrier(ins) do
+            out false
+        end
+        i = i + 1
+    end
+    let preds = mir_block_preds(b)
+    if preds >= 0 and vec_len_rt(preds) > 0 do
+        var pi = 0
+        let np = vec_len_rt(preds)
+        when pi < np loop
+            let pred_id = vec_get_rt(preds, pi)
+            let p_idx = mir_find_block_index(blocks, pred_id)
+            if p_idx >= 0 do
+                let pb = vec_get_rt(blocks, p_idx)
+                let p_instrs = mir_block_head(pb)
+                if p_instrs >= 0 do
+                    var pj = 0
+                    let npj = vec_len_rt(p_instrs)
+                    when pj < npj loop
+                        let p_ins = vec_get_rt(p_instrs, pj)
+                        if mir_pre_instr_is_barrier(p_ins) do out false end
+                        pj = pj + 1
+                    end
+                end
+            end
+            pi = pi + 1
+        end
+    end
+    out true
+end.
+
+func mir_pre_max_block_id(blocks: i64):
+    let n = vec_len_rt(blocks)
+    var m = 0
+    var i = 0
+    when i < n loop
+        let bid = mir_block_id(vec_get_rt(blocks, i))
+        if bid > m do m = bid end
+        i = i + 1
+    end
+    out m
+end.
+
 func mir_opt_pre(blocks: i64):
-    # PRE is disabled until safe cross-predecessor insertion is implemented.
-    # Blindly hoisting from a successor into one predecessor starves all other predecessors.
+    if g_mir_mutate_mode == 8 do
+        # Mutation control: identity PRE placeholder for oracle verification
+        mir_opt_set_skip_reason("mutation_identity_pre")
+        out blocks
+    end
+
+    let n_blocks = vec_len_rt(blocks)
+    var cur_max_vreg = max_vreg_mir(blocks)
+    var cur_max_bid = mir_pre_max_block_id(blocks)
+
+    var b_idx = 0
+    when b_idx < n_blocks loop
+        let join_b = vec_get_rt(blocks, b_idx)
+        let preds = mir_block_preds(join_b)
+        if preds >= 0 and vec_len_rt(preds) >= 2 do
+            let join_instrs = mir_block_head(join_b)
+            if join_instrs >= 0 do
+                let n_ins = vec_len_rt(join_instrs)
+                var ins_i = 0
+                when ins_i < n_ins loop
+                    let ins = vec_get_rt(join_instrs, ins_i)
+                    let op = mir_instr_op(ins)
+                    let dst = mir_instr_dst(ins)
+                    if mir_is_pre_candidate_op(op) and mir_opnd_type(dst) == MirOperandType.VReg do
+                        let s1 = mir_instr_src1(ins)
+                        let s2 = mir_instr_src2(ins)
+                        # Check that operands are not defined earlier in join_b
+                        let s1_redef = mir_pre_opnd_defined_in_range(join_instrs, 0, ins_i, s1)
+                        let s2_redef = mir_pre_opnd_defined_in_range(join_instrs, 0, ins_i, s2)
+                        if s1_redef or s2_redef do
+                            mir_opt_set_skip_reason("operand_redefined_in_join")
+                        end
+                        if not s1_redef and not s2_redef do
+                            let n_preds = vec_len_rt(preds)
+                            var avail_count = 0
+                            var missing_count = 0
+                            var all_safe = true
+                            var unsafe_reason = "barrier_in_predecessor"
+                            var pred_vals = vec_new_rt()
+                            var pred_has_avail = vec_new_rt()
+
+                            var pi = 0
+                            when pi < n_preds loop
+                                let p_id = vec_get_rt(preds, pi)
+                                let p_idx = mir_find_block_index(blocks, p_id)
+                                if p_idx < 0 do
+                                    all_safe = false
+                                    unsafe_reason = "unresolved_predecessor"
+                                    pred_vals = vec_push_rt(pred_vals, mir_opnd_none())
+                                    pred_has_avail = vec_push_rt(pred_has_avail, 0)
+                                else
+                                    let pb = vec_get_rt(blocks, p_idx)
+                                    let (has_avail, val_opnd) = mir_pre_find_avail_in_pred(pb, op, s1, s2)
+                                    if has_avail do
+                                        avail_count = avail_count + 1
+                                        pred_vals = vec_push_rt(pred_vals, val_opnd)
+                                        pred_has_avail = vec_push_rt(pred_has_avail, 1)
+                                    else
+                                        missing_count = missing_count + 1
+                                        pred_vals = vec_push_rt(pred_vals, mir_opnd_none())
+                                        pred_has_avail = vec_push_rt(pred_has_avail, 0)
+                                        if not mir_pre_is_safe_to_insert_in_pred(blocks, pb, s1, s2) do
+                                            all_safe = false
+                                            unsafe_reason = "barrier_in_predecessor"
+                                        end
+                                        let p_succs = mir_block_successors(pb)
+                                        if p_succs < 0 || vec_len_rt(p_succs) != 1 do
+                                            all_safe = false
+                                            unsafe_reason = "critical_edge"
+                                        end
+                                    end
+                                end
+                                pi = pi + 1
+                            end
+
+                            if avail_count == 0 do
+                                mir_opt_set_skip_reason("not_available_in_any_predecessor")
+                            eif missing_count == 0 do
+                                mir_opt_set_skip_reason("fully_redundant")
+                            eif not all_safe do
+                                mir_opt_set_skip_reason(unsafe_reason)
+                            end
+                            # Partially Redundant: available in >= 1 pred and missing in >= 1 pred!
+                            if avail_count >= 1 and missing_count >= 1 and all_safe do
+                                cur_max_vreg = cur_max_vreg + 1
+                                let phi_v = cur_max_vreg
+                                var inc_vals = vec_new_rt()
+                                var inc_blks = vec_new_rt()
+
+                                pi = 0
+                                when pi < n_preds loop
+                                    let p_id = vec_get_rt(preds, pi)
+                                    let p_idx = mir_find_block_index(blocks, p_id)
+                                    let pb = vec_get_rt(blocks, p_idx)
+                                    if vec_get_rt(pred_has_avail, pi) == 1 do
+                                        # Already available from pb
+                                        inc_vals = vec_push_rt(inc_vals, vec_get_rt(pred_vals, pi))
+                                        inc_blks = vec_push_rt(inc_blks, p_id)
+                                    else
+                                        # Insert computation for missing predecessor
+                                        cur_max_vreg = cur_max_vreg + 1
+                                        let fresh_v = cur_max_vreg
+                                        let fresh_dst = mir_opnd_vreg(fresh_v)
+                                        let hoisted_ins = mir_instr_new(op, fresh_dst, s1, s2)
+                                        mir_copy_instr_metadata(ins, hoisted_ins)
+
+                                        let p_succs = mir_block_successors(pb)
+                                        if p_succs >= 0 and vec_len_rt(p_succs) == 1 do
+                                            # Not a critical edge: insert right before terminator
+                                            var p_instrs = mir_block_head(pb)
+                                            p_instrs = mir_block_insert_before_terminator(p_instrs, hoisted_ins)
+                                            vec_set_rt(blocks, p_idx, mir_block_replace_head(pb, p_instrs))
+                                            inc_vals = vec_push_rt(inc_vals, fresh_dst)
+                                            inc_blks = vec_push_rt(inc_blks, p_id)
+                                        else
+                                            # Critical edge: split edge pb -> join_b
+                                            cur_max_bid = cur_max_bid + 1
+                                            let split_bid = cur_max_bid
+                                            var split_b = mir_create_block(split_bid)
+                                            var split_instrs = vec_new_rt()
+                                            split_instrs = vec_push_rt(split_instrs, hoisted_ins)
+                                            let jump_join = mir_instr_new(MirOp.Jump, mir_opnd_none(), mir_opnd_imm(mir_block_id(join_b)), mir_opnd_none())
+                                            split_instrs = vec_push_rt(split_instrs, jump_join)
+                                            split_b = mir_block_replace_head(split_b, split_instrs)
+                                            blocks = vec_push_rt(blocks, split_b)
+
+                                            # Redirect pb's branch target from join_b to split_bid
+                                            let pb_instrs = mir_block_head(pb)
+                                            if pb_instrs >= 0 do
+                                                var ti = 0
+                                                when ti < vec_len_rt(pb_instrs) loop
+                                                    let t_ins = vec_get_rt(pb_instrs, ti)
+                                                    let t_op = mir_instr_op(t_ins)
+                                                    if t_op == MirOp.Jump do
+                                                        let t_tgt = mir_instr_src1(t_ins)
+                                                        if mir_opnd_type(t_tgt) == MirOperandType.Imm and mir_opnd_imm_val(t_tgt) == mir_block_id(join_b) do
+                                                            vec_set_rt(pb_instrs, ti, mir_instr_new(MirOp.Jump, mir_instr_dst(t_ins), mir_opnd_imm(split_bid), mir_instr_src2(t_ins)))
+                                                        end
+                                                    eif t_op == MirOp.JumpIf or t_op == MirOp.JumpIfNot do
+                                                        let t_tgt = mir_instr_src2(t_ins)
+                                                        if mir_opnd_type(t_tgt) == MirOperandType.Imm and mir_opnd_imm_val(t_tgt) == mir_block_id(join_b) do
+                                                            vec_set_rt(pb_instrs, ti, mir_instr_new(t_op, mir_instr_dst(t_ins), mir_instr_src1(t_ins), mir_opnd_imm(split_bid)))
+                                                        end
+                                                    end
+                                                    ti = ti + 1
+                                                end
+                                            end
+                                            inc_vals = vec_push_rt(inc_vals, fresh_dst)
+                                            inc_blks = vec_push_rt(inc_blks, split_bid)
+                                        end
+                                    end
+                                    pi = pi + 1
+                                end
+
+                                # Insert phi node into join_b
+                                var phi_vals = inc_vals
+                                var phi_blks = inc_blks
+                                if g_mir_mutate_mode == 10 do
+                                    # Mutation control: drop all but the first incoming edge so the
+                                    # CFG/SSA verifier must reject the malformed phi.
+                                    phi_vals = vec_push_rt(vec_new_rt(), vec_get_rt(inc_vals, 0))
+                                    phi_blks = vec_push_rt(vec_new_rt(), vec_get_rt(inc_blks, 0))
+                                end
+                                let phi_node = mir_phi_new(phi_v, phi_v, phi_vals, phi_blks, 0)
+                                var b_phis = mir_block_phis(join_b)
+                                if b_phis < 0 do b_phis = vec_new_rt() end
+                                b_phis = vec_push_rt(b_phis, phi_node)
+                                native_write_i64(join_b as i64, 8, b_phis)
+
+                                # Replace redundant computation with Move from phi
+                                let mv_ins = mir_instr_new(MirOp.Move, dst, mir_opnd_vreg(phi_v), mir_opnd_none())
+                                mir_copy_instr_metadata(ins, mv_ins)
+                                vec_set_rt(join_instrs, ins_i, mv_ins)
+
+                                mir_opt_note_change()
+                            end
+                            vec_free_rt(pred_vals)
+                            vec_free_rt(pred_has_avail)
+                        end
+                    end
+                    ins_i = ins_i + 1
+                end
+            end
+        end
+        b_idx = b_idx + 1
+    end
     out blocks
 end.
 

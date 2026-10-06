@@ -17,8 +17,9 @@ if [ ! -x "$VIRC" ]; then
     exit 1
 fi
 A_OUT="./scratch/a_test.$$.out"
+COMPILER_INGEST_OUT="./scratch/virc_project_ingestion.$$.out"
 mkdir -p scratch
-trap 'rm -f "$A_OUT"' EXIT
+trap 'rm -f "$A_OUT" "$COMPILER_INGEST_OUT"' EXIT
 
 MODE="${1:-min}"
 TARGET_GROUP=""
@@ -207,6 +208,53 @@ run_test_in_group() {
         GP_PASS[$g]=$((GP_PASS[$g]+1))
         TOTAL_PASS=$((TOTAL_PASS+1))
     fi
+}
+
+run_compile_reject_in_group() {
+    local g="$1"
+    local label="$2"
+    local expected="$3"
+    shift 3
+    rm -f "$A_OUT"
+
+    local reject_out
+    reject_out=$("$VIRC" "$@" -o "$A_OUT" 2>&1)
+    local reject_rc=$?
+    if [ "$reject_rc" -ne 0 ] && [ ! -e "$A_OUT" ] && grep -Fq "$expected" <<<"$reject_out"; then
+        echo "  [PASS-REJECT] $label"
+        GP_PASS[$g]=$((GP_PASS[$g]+1))
+        TOTAL_PASS=$((TOTAL_PASS+1))
+        return
+    fi
+
+    echo "  [FAIL-EXPECT-REJECT] $label"
+    echo "    kỳ vọng: '$expected'"
+    echo "    exit code: $reject_rc; artifact: $([ -e "$A_OUT" ] && echo yes || echo no)"
+    if [ -n "$reject_out" ]; then echo "$reject_out" | sed 's/^/    /' | head -20; fi
+    GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+    TOTAL_FAIL=$((TOTAL_FAIL+1))
+}
+
+run_entry_asm_target() {
+    local g=18
+    local target="$1"
+    local call_pattern="$2"
+    local asm_path="./scratch/entry_${target}.s"
+    local compile_out
+    rm -f "$asm_path"
+    if compile_out=$("$VIRC" tests/test_entry.vri --target "$target" -S -q -o "$asm_path" 2>&1) \
+        && grep -Fq "$call_pattern" "$asm_path" \
+        && ! grep -Eq '^[[:space:]]*(bl|call|jal ra,)[[:space:]]+main$' "$asm_path"; then
+        echo "  [PASS-MC] @entry $target assembly dispatch"
+        GP_PASS[$g]=$((GP_PASS[$g]+1))
+        TOTAL_PASS=$((TOTAL_PASS+1))
+        return
+    fi
+
+    echo "  [FAIL-MC] @entry $target assembly dispatch"
+    if [ -n "$compile_out" ]; then echo "$compile_out" | sed 's/^/    /' | head -20; fi
+    GP_FAIL[$g]=$((GP_FAIL[$g]+1))
+    TOTAL_FAIL=$((TOTAL_FAIL+1))
 }
 
 run_contract_suite_in_group() {
@@ -509,10 +557,20 @@ run_group_1() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm  1: Tổng quan (§1.0 Separator, §1.1 Mở khối, §1.2 Pipeline IR)"
     echo "──────────────────────────────────────────────────────────────────────────"
+    if python3 tests/test_opt_pre_and_loop_transforms.py --virc "$VIRC"; then
+        GP_PASS[1]=$((${GP_PASS[1]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        GP_FAIL[1]=$((${GP_FAIL[1]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
     if [ "$MODE" = "min" ]; then
         run_test_in_group 1 "tests/vri/test_48.vri"
         run_test_in_group 1 "tests/vri/test_add.vri"
         run_test_in_group 1 "tests/vri/test_add_rt.vri"
+        run_test_in_group 1 "tests/opt_structural/pre_positive.vri"
+        run_test_in_group 1 "tests/opt_structural/loop_fusion_positive.vri"
+        run_test_in_group 1 "tests/opt_structural/loop_interchange_positive.vri"
         run_test_in_group 1 "tests/strict_v2/test_spec1_separator_e2e.vri"
         run_test_in_group 1 "tests/strict_v2/test_spec1_pipeline_opt_tiers_e2e.vri"
         run_test_in_group 1 "tests/strict_v2/spec1_decl_comma_rejected.vri"
@@ -564,6 +622,9 @@ run_group_1() {
         run_test_in_group 1 "tests/vri/test_reassign.vri"
         run_test_in_group 1 "tests/vri/test_spill.vri"
         run_test_in_group 1 "tests/vri/test_this.vri"
+        run_test_in_group 1 "tests/opt_structural/pre_positive.vri"
+        run_test_in_group 1 "tests/opt_structural/loop_fusion_positive.vri"
+        run_test_in_group 1 "tests/opt_structural/loop_interchange_positive.vri"
         run_test_in_group 1 "tests/strict_v2/test_spec1_separator_e2e.vri"
         run_test_in_group 1 "tests/strict_v2/test_spec1_pipeline_opt_tiers_e2e.vri"
         run_test_in_group 1 "tests/strict_v2/spec1_decl_comma_rejected.vri"
@@ -606,6 +667,39 @@ run_group_3() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm  3: Hệ thống Module (include, import, export)"
     echo "──────────────────────────────────────────────────────────────────────────"
+    if python3 -m unittest tests/module/test_module_resolver.py >/dev/null && \
+       python3 tools/module_graph.py --root . --entry driver >/dev/null && \
+       python3 tools/module_graph.py --root . --entry bundle_entry >/dev/null; then
+        echo "  [PASS] module registry, diagnostics, and compiler dependency closure"
+        GP_PASS[3]=$((${GP_PASS[3]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        echo "  [FAIL] module registry, diagnostics, or compiler dependency closure"
+        GP_FAIL[3]=$((${GP_FAIL[3]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
+    rm -f "$COMPILER_INGEST_OUT"
+    local compiler_ingest_ok=0
+    if "$VIRC" compiler/src/entry.vri -o "$COMPILER_INGEST_OUT" >/dev/null 2>&1; then
+        if [ "$(uname -s)" = "Darwin" ]; then
+            codesign -s - -i virc -f "$COMPILER_INGEST_OUT" >/dev/null 2>&1 || compiler_ingest_ok=1
+        fi
+        if [ "$compiler_ingest_ok" -eq 0 ] && ! "$COMPILER_INGEST_OUT" --version >/dev/null 2>&1; then
+            compiler_ingest_ok=1
+        fi
+    else
+        compiler_ingest_ok=1
+    fi
+    if [ "$compiler_ingest_ok" -eq 0 ]; then
+        echo "  [PASS] native compiler project ingestion"
+        GP_PASS[3]=$((${GP_PASS[3]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        echo "  [FAIL] native compiler project ingestion"
+        GP_FAIL[3]=$((${GP_FAIL[3]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
+    rm -f "$COMPILER_INGEST_OUT"
     if [ "$MODE" = "min" ]; then
         run_test_in_group 3 "tests/bootstrap_codegen/cg_include_basic.vri"
         run_test_in_group 3 "tests/bootstrap_codegen/cg_include_nested.vri"
@@ -639,6 +733,13 @@ run_group_4() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm  4: Kiểu dữ liệu (Primitives, Casts, Nil-safety)"
     echo "──────────────────────────────────────────────────────────────────────────"
+    if VIRC="$VIRC" python3 tests/test_f32_f64_print.py; then
+        GP_PASS[4]=$((${GP_PASS[4]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        GP_FAIL[4]=$((${GP_FAIL[4]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
     if [ "$MODE" = "min" ]; then
         run_test_in_group 4 "tests/test_adv_001_i64_max.vri"
         run_test_in_group 4 "tests/test_adv_009_bool_chain.vri"
@@ -726,6 +827,7 @@ run_group_5() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm  5: Biến & Hằng số (var, let, const, Scoping)"
     echo "──────────────────────────────────────────────────────────────────────────"
+    run_test_in_group 5 "tests/bootstrap_codegen/cg_function_type_scope_isolation.vri"
     if [ "$MODE" = "min" ]; then
         run_test_in_group 5 "tests/test_10vars.vri"
         run_test_in_group 5 "tests/test_1p_novar.vri"
@@ -795,6 +897,13 @@ run_group_6() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm  6: Hàm (Functions, out, Recursion, TCO)"
     echo "──────────────────────────────────────────────────────────────────────────"
+    if VIRC="$VIRC" python3 -m unittest tests/test_opt_tail_call.py; then
+        GP_PASS[6]=$((${GP_PASS[6]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        GP_FAIL[6]=$((${GP_FAIL[6]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
     if [ "$MODE" = "min" ]; then
         run_test_in_group 6 "tests/boot_in_form2_call.vri"
         run_test_in_group 6 "tests/test_2var_loop_call.vri"
@@ -1136,6 +1245,7 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_entity_receiver_type_mismatch_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_type_mismatch_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_url_parse_positive_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/enum_constructor_for_case_out_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_x86_fn_ptr_spill_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_receiver_forms_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_eval_order_e2e.vri"
@@ -1155,6 +1265,7 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_entity_receiver_type_mismatch_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_type_mismatch_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_url_parse_positive_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/enum_constructor_for_case_out_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_x86_fn_ptr_spill_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_entity_receiver_wrong_type_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_receiver_wrong_type_rejected.vri"
@@ -1185,6 +1296,15 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_module_order_ab_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_module_order_ba_rejected.vri"
         run_test_in_group 11 "tests/vri/test_ufcs.vri"
+    fi
+    if VIRC="$VIRC" python3 tests/test_source_map_spans.py; then
+        echo "  [PASS-CONTRACT] UFCS/include/import source spans and one-line mutation oracle"
+        GP_PASS[11]=$((${GP_PASS[11]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        echo "  [FAIL-CONTRACT] UFCS/include/import source spans or mutation oracle"
+        GP_FAIL[11]=$((${GP_FAIL[11]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
     run_ufcs_mc_target "linux-arm64"
     run_ufcs_mc_target "linux-x86_64"
@@ -1382,6 +1502,13 @@ run_group_16() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm 16: Register & Mold (Bit structures, pack)"
     echo "──────────────────────────────────────────────────────────────────────────"
+    if VIRC="$VIRC" python3 tests/test_narrow_cast_contract.py; then
+        GP_PASS[16]=$((${GP_PASS[16]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        GP_FAIL[16]=$((${GP_FAIL[16]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
     if [ "$MODE" = "min" ]; then
         run_test_in_group 16 "tests/test_register.vri"
         run_test_in_group 16 "tests/strict_v2/mold_packed_e2e.vri"
@@ -1401,6 +1528,9 @@ run_group_16() {
         run_test_in_group 16 "tests/strict_v2/register_negative_value_rejected.vri"
         run_test_in_group 16 "tests/strict_v2/register_value_edges_e2e.vri"
         run_test_in_group 16 "tests/vri/test_register.vri"
+        run_test_in_group 16 "tests/test_mold_u16_cast.vri"
+        run_test_in_group 16 "tests/test_narrow_casts.vri"
+        run_test_in_group 16 "tests/test_narrow_cast_flow.vri"
     else
         run_test_in_group 16 "tests/test_register.vri"
         run_test_in_group 16 "tests/strict_v2/mold_packed_e2e.vri"
@@ -1420,6 +1550,9 @@ run_group_16() {
         run_test_in_group 16 "tests/strict_v2/register_negative_value_rejected.vri"
         run_test_in_group 16 "tests/strict_v2/register_value_edges_e2e.vri"
         run_test_in_group 16 "tests/vri/test_register.vri"
+        run_test_in_group 16 "tests/test_mold_u16_cast.vri"
+        run_test_in_group 16 "tests/test_narrow_casts.vri"
+        run_test_in_group 16 "tests/test_narrow_cast_flow.vri"
     fi
     local pass_cnt=${GP_PASS[16]}
     local fail_cnt=${GP_FAIL[16]}
@@ -1471,6 +1604,13 @@ run_group_18() {
         run_test_in_group 18 "tests/test_arg_count.vri"
         run_test_in_group 18 "tests/strict_v2/stdio_cli_e2e.vri"
         run_test_in_group 18 "tests/strict_v2/stdio_full_api_e2e.vri"
+        run_test_in_group 18 "tests/test_entry.vri"
+        run_test_in_group 18 "tests/vri/test_entry.vri"
+        run_test_in_group 18 "tests/test_entry_user_repro.vri"
+        run_test_in_group 18 "tests/test_entry_coexistence.vri"
+        run_test_in_group 18 "tests/test_entry_non_func_negative.vri"
+        run_test_in_group 18 "tests/test_entry_duplicate_negative.vri"
+        run_test_in_group 18 "tests/test_entry_params_negative.vri"
     else
         run_test_in_group 18 "tests/bootstrap_codegen/cg_getarg.vri"
         run_test_in_group 18 "tests/test_adv_071_exit_code.vri"
@@ -1480,7 +1620,26 @@ run_group_18() {
         run_test_in_group 18 "tests/test_helper_argc.vri"
         run_test_in_group 18 "tests/vri/test_adv_071_exit_code.vri"
         run_test_in_group 18 "tests/test_argc.vri"
+        run_test_in_group 18 "tests/test_entry.vri"
+        run_test_in_group 18 "tests/vri/test_entry.vri"
+        run_test_in_group 18 "tests/test_entry_user_repro.vri"
+        run_test_in_group 18 "tests/test_entry_coexistence.vri"
+        run_test_in_group 18 "tests/test_entry_non_func_negative.vri"
+        run_test_in_group 18 "tests/test_entry_duplicate_negative.vri"
+        run_test_in_group 18 "tests/test_entry_params_negative.vri"
     fi
+    run_compile_reject_in_group 18 "missing default entry diagnostic" \
+        "executable has no main function in LIR" \
+        tests/test_entry_missing_negative.vri -q
+    run_compile_reject_in_group 18 "@entry unsupported on windows-arm64" \
+        "target runtime is not supported: windows-arm64" \
+        tests/test_entry_unsupported_target_negative.vri --target windows-arm64 -q
+    run_compile_reject_in_group 18 "@entry unsupported on windows-x86_64" \
+        "target runtime is not supported: windows-x86_64" \
+        tests/test_entry_unsupported_target_negative.vri --target windows-x86_64 -q
+    run_entry_asm_target "linux-arm64" "bl app_start"
+    run_entry_asm_target "linux-x86_64" "call app_start"
+    run_entry_asm_target "linux-riscv64" "jal ra, app_start"
     local pass_cnt=${GP_PASS[18]}
     local fail_cnt=${GP_FAIL[18]}
     local total_cnt=$((pass_cnt + fail_cnt))

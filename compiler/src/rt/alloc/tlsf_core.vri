@@ -1,0 +1,358 @@
+##
+ * compiler/src/rt/alloc/tlsf_core.vri — TLSF Heap Allocator Core Structures & Tables
+ * =================================================================================
+ * Bitmaps, segment registry, direct-mapped tracking hash table, and bitwise scans.
+ ##
+
+module vir.rt.alloc.tlsf_core
+
+include types_prelude
+include rt_syscall
+include rt_alloc_mmap_core
+
+# ═══════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════
+
+const BLOCK_FREE:            0x1;          # bit 0: 1 = block is free, 0 = used
+const PREV_FREE:             0x2;          # bit 1: 1 = preceding block is free, 0 = used
+const BLOCK_DIRECT_MAP:      0x4;          # bit 2: 1 = direct-mapped via page_alloc (>8MB)
+const FLAG_MASK:             0xF;          # lower 4 bits reserved for flags
+
+const LARGE_ALLOC_THRESHOLD: 8388608;      # 8MB: requests above threshold use direct mapping
+
+const FL_INDEX_COUNT:        28;           # 28 first-level classes (size 32 B to 4 GB)
+const SL_INDEX_COUNT:        16;           # 16 second-level bins per class
+const TOTAL_BINS:            448;          # 28 * 16 = 448 bins
+
+const HEAP_THREAD_SAFE: false;
+
+# Direct-map hash table: 512 slots at g_tlsf_ctrl[44816]
+# Slot format: [base: i64, array_idx: i64] — 16 bytes per slot
+# Empty slot: base == 0
+const DM_HASH_BASE: int = 44816
+const DM_HASH_SIZE: int = 512
+
+# ═══════════════════════════════════════════════════════
+# Entities & Globals
+# ═══════════════════════════════════════════════════════
+
+entity FreeNode:
+    size:       int;      # total block size (including header)
+    next_ptr:   int      # pointer to next FreeNode, or 0
+end.
+
+entity Heap:
+    base:       int;      # mmap'd region base
+    capacity:   int;      # total region size
+    free_head:  int;      # compatibility field (points to base or first block)
+    used:       int;      # bytes currently allocated
+    peak_used:  int       # peak bytes allocated
+end.
+
+# Heap singleton
+var g_heap = Heap ( base: 0, capacity: 0, free_head: 0, used: 0, peak_used: 0 )
+var g_tlsf_ctrl: int = 0
+var g_heapSegments: int = 0
+var g_heapSegmentCapacity: int = 0
+var g_heap_inspect_count: int = 0
+var g_initialized = false
+
+# ═══════════════════════════════════════════════════════
+# Inspections & Control Bitmaps
+# ═══════════════════════════════════════════════════════
+
+func heap_is_thread_safe() -> bool:
+    out HEAP_THREAD_SAFE
+end.
+
+func heap_get_inspect_count() -> int:
+    out g_heap_inspect_count
+end.
+
+func heap_reset_inspect_count():
+    g_heap_inspect_count = 0
+end.
+
+func get_fl_bitmap() -> int:
+    extern func native_read_i64(addr: int, offset: int) -> int
+    out native_read_i64(g_tlsf_ctrl, 0)
+end.
+
+func set_fl_bitmap(val: int):
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    native_write_i64(g_tlsf_ctrl, 0, val)
+end.
+
+func get_sl_bitmap(fl: int) -> int:
+    extern func native_read_i64(addr: int, offset: int) -> int
+    out native_read_i64(g_tlsf_ctrl, 8 + fl * 8)
+end.
+
+func set_sl_bitmap(fl: int, val: int):
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    native_write_i64(g_tlsf_ctrl, 8 + fl * 8, val)
+end.
+
+func get_bin_head(bin_idx: int) -> int:
+    extern func native_read_i64(addr: int, offset: int) -> int
+    out native_read_i64(g_tlsf_ctrl, 256 + bin_idx * 8)
+end.
+
+func set_bin_head(bin_idx: int, val: int):
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    native_write_i64(g_tlsf_ctrl, 256 + bin_idx * 8, val)
+end.
+
+# ═══════════════════════════════════════════════════════
+# Segment Registry
+# ═══════════════════════════════════════════════════════
+
+func tlsf_seg_count() -> int:
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    out native_read_i64(g_tlsf_ctrl, 3840)
+end.
+
+func tlsf_seg_add(base: int, size: int):
+    if g_tlsf_ctrl == 0 do out 0 end
+    let count = tlsf_seg_count()
+    if count == g_heapSegmentCapacity do
+        var capacity = g_heapSegmentCapacity * 2
+        if capacity < 2048 do capacity = 2048 end
+        let segments = page_alloc(capacity * 16)
+        if segments == 0 do sys_exit(137) end
+        var index = 0
+        extern func native_read_i64(addr: int, offset: int) -> int
+        extern func native_write_i64(addr: int, offset: int, val: int)
+        when index < count loop
+            native_write_i64(segments, index * 16, native_read_i64(g_heapSegments, index * 16))
+            native_write_i64(segments, index * 16 + 8, native_read_i64(g_heapSegments, index * 16 + 8))
+            index = index + 1
+        end
+        if g_heapSegments != 0 do page_free(g_heapSegments, g_heapSegmentCapacity * 16) end
+        g_heapSegments = segments
+        g_heapSegmentCapacity = capacity
+    end
+    var position = count
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    when position > 0 loop
+        let previous = (position - 1) * 16
+        if native_read_i64(g_heapSegments, previous) <= base do break end
+        native_write_i64(g_heapSegments, position * 16, native_read_i64(g_heapSegments, previous))
+        native_write_i64(g_heapSegments, position * 16 + 8, native_read_i64(g_heapSegments, previous + 8))
+        position = position - 1
+    end
+    native_write_i64(g_heapSegments, position * 16, base)
+    native_write_i64(g_heapSegments, position * 16 + 8, size)
+    native_write_i64(g_tlsf_ctrl, 3840, count + 1)
+end.
+
+func tlsf_seg_base(idx: int) -> int:
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    out native_read_i64(g_heapSegments, idx * 16)
+end.
+
+func tlsf_seg_size(idx: int) -> int:
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    out native_read_i64(g_heapSegments, idx * 16 + 8)
+end.
+
+func tlsf_seg_find(block: int) -> int:
+    if g_tlsf_ctrl == 0 do out 0 - 1 end
+    var lo = 0
+    var hi = tlsf_seg_count()
+    when lo < hi loop
+        let mid = lo + (hi - lo) / 2
+        let base = tlsf_seg_base(mid)
+        if block < base do
+            hi = mid
+        else
+            lo = mid + 1
+        end
+    end
+    let idx = lo - 1
+    if idx >= 0 do
+        let base = tlsf_seg_base(idx)
+        let size = tlsf_seg_size(idx)
+        if block >= base and block + MIN_BLOCK_SIZE <= base + size do
+            out idx
+        end
+    end
+    out 0 - 1
+end.
+
+# ═══════════════════════════════════════════════════════
+# Direct-Map Hash Table & Segment Tracker
+# ═══════════════════════════════════════════════════════
+
+func tlsf_direct_count() -> int:
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    out native_read_i64(g_tlsf_ctrl, 36616)
+end.
+
+func tlsf_dm_hash_slot(base: int) -> int:
+    out (base shr 20) bit_and (DM_HASH_SIZE - 1)
+end.
+
+func tlsf_direct_hash_find(base: int) -> int:
+    if g_tlsf_ctrl == 0 do out 0 - 1 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    var slot = tlsf_dm_hash_slot(base)
+    var probes = 0
+    when probes < DM_HASH_SIZE loop
+        let off = DM_HASH_BASE + slot * 16
+        let stored_base = native_read_i64(g_tlsf_ctrl, off)
+        if stored_base == 0 do out 0 - 1 end           # empty slot: not found
+        if stored_base == base do
+            out native_read_i64(g_tlsf_ctrl, off + 8)  # return array index
+        end
+        slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+        probes = probes + 1
+    end
+    out 0 - 1
+end.
+
+func tlsf_direct_hash_insert(base: int, arr_idx: int):
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    var slot = tlsf_dm_hash_slot(base)
+    var probes = 0
+    when probes < DM_HASH_SIZE loop
+        let off = DM_HASH_BASE + slot * 16
+        let stored_base = native_read_i64(g_tlsf_ctrl, off)
+        if stored_base == 0 or stored_base == base do
+            native_write_i64(g_tlsf_ctrl, off, base)
+            native_write_i64(g_tlsf_ctrl, off + 8, arr_idx)
+            out 0
+        end
+        slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+        probes = probes + 1
+    end
+end.
+
+func tlsf_direct_hash_remove(base: int):
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    var slot = tlsf_dm_hash_slot(base)
+    var probes = 0
+    when probes < DM_HASH_SIZE loop
+        let off = DM_HASH_BASE + slot * 16
+        let stored_base = native_read_i64(g_tlsf_ctrl, off)
+        if stored_base == 0 do out 0 end  # not found
+        if stored_base == base do
+            native_write_i64(g_tlsf_ctrl, off, 0)
+            native_write_i64(g_tlsf_ctrl, off + 8, 0)
+            var next_slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+            var rehashed = 0
+            when rehashed < DM_HASH_SIZE - 1 loop
+                let next_off = DM_HASH_BASE + next_slot * 16
+                let next_base = native_read_i64(g_tlsf_ctrl, next_off)
+                if next_base == 0 do out 0 end
+                let next_idx = native_read_i64(g_tlsf_ctrl, next_off + 8)
+                native_write_i64(g_tlsf_ctrl, next_off, 0)
+                native_write_i64(g_tlsf_ctrl, next_off + 8, 0)
+                tlsf_direct_hash_insert(next_base, next_idx)
+                next_slot = (next_slot + 1) bit_and (DM_HASH_SIZE - 1)
+                rehashed = rehashed + 1
+            end
+            out 0
+        end
+        slot = (slot + 1) bit_and (DM_HASH_SIZE - 1)
+        probes = probes + 1
+    end
+end.
+
+func tlsf_direct_add(base: int, size: int):
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    let cnt = native_read_i64(g_tlsf_ctrl, 36616)
+    if cnt < 512 do
+        let off = 36624 + cnt * 16
+        native_write_i64(g_tlsf_ctrl, off, base)
+        native_write_i64(g_tlsf_ctrl, off + 8, size)
+        native_write_i64(g_tlsf_ctrl, 36616, cnt + 1)
+        tlsf_direct_hash_insert(base, cnt)
+    else
+        extern func sys_exit(code: int)
+        sys_exit(134)
+    end
+end.
+
+func tlsf_direct_find(base: int) -> int:
+    out tlsf_direct_hash_find(base)
+end.
+
+func tlsf_direct_remove(base: int):
+    if g_tlsf_ctrl == 0 do out 0 end
+    extern func native_read_i64(addr: int, offset: int) -> int
+    extern func native_write_i64(addr: int, offset: int, val: int)
+    let idx = tlsf_direct_find(base)
+    if idx >= 0 do
+        let cnt = native_read_i64(g_tlsf_ctrl, 36616)
+        let last_idx = cnt - 1
+        if idx != last_idx do
+            let last_off = 36624 + last_idx * 16
+            let cur_off = 36624 + idx * 16
+            let last_base = native_read_i64(g_tlsf_ctrl, last_off)
+            native_write_i64(g_tlsf_ctrl, cur_off, last_base)
+            native_write_i64(g_tlsf_ctrl, cur_off + 8, native_read_i64(g_tlsf_ctrl, last_off + 8))
+            tlsf_direct_hash_insert(last_base, idx)
+        end
+        native_write_i64(g_tlsf_ctrl, 36616, last_idx)
+    end
+    tlsf_direct_hash_remove(base)
+end.
+
+# ═══════════════════════════════════════════════════════
+# Bit Scanning Primitives (ffs / fls)
+# ═══════════════════════════════════════════════════════
+
+func tlsf_fls(val: int) -> int:
+    if val <= 0 do
+        out -1
+    end
+    var bit = 0
+    var v = val
+    if (v shr 32) != 0 do
+        bit = bit + 32
+        v = v shr 32
+    end
+    if (v shr 16) != 0 do
+        bit = bit + 16
+        v = v shr 16
+    end
+    if (v shr 8) != 0 do
+        bit = bit + 8
+        v = v shr 8
+    end
+    if (v shr 4) != 0 do
+        bit = bit + 4
+        v = v shr 4
+    end
+    if (v shr 2) != 0 do
+        bit = bit + 2
+        v = v shr 2
+    end
+    if (v shr 1) != 0 do
+        bit = bit + 1
+    end
+    out bit
+end.
+
+func tlsf_ffs(val: int) -> int:
+    if val <= 0 do
+        out -1
+    end
+    let lowest = val bit_and (0 - val)
+    out tlsf_fls(lowest)
+end.
+
+export BLOCK_FREE, PREV_FREE, BLOCK_DIRECT_MAP, FLAG_MASK, LARGE_ALLOC_THRESHOLD, FL_INDEX_COUNT, SL_INDEX_COUNT, TOTAL_BINS, HEAP_THREAD_SAFE, DM_HASH_BASE, DM_HASH_SIZE, FreeNode, Heap, g_heap, g_tlsf_ctrl, g_heapSegments, g_heapSegmentCapacity, g_heap_inspect_count, g_initialized, heap_is_thread_safe, heap_get_inspect_count, heap_reset_inspect_count, get_fl_bitmap, set_fl_bitmap, get_sl_bitmap, set_sl_bitmap, get_bin_head, set_bin_head, tlsf_seg_count, tlsf_seg_add, tlsf_seg_find, tlsf_seg_base, tlsf_seg_size, tlsf_direct_count, tlsf_dm_hash_slot, tlsf_direct_hash_find, tlsf_direct_hash_insert, tlsf_direct_hash_remove, tlsf_direct_add, tlsf_direct_find, tlsf_direct_remove, tlsf_fls, tlsf_ffs

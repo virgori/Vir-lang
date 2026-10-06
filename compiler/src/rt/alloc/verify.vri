@@ -1,0 +1,221 @@
+##
+ * compiler/src/rt/alloc/verify.vri — TLSF Heap Verification and Destruction
+ * =========================================================================
+ * Consistency assertions across bitmaps, bin lists, boundary tags, and heap cleanup.
+ ##
+
+module vir.rt.alloc.verify
+
+include types_prelude
+include rt_syscall
+include rt_alloc_mmap_core
+include rt_alloc_tlsf_core
+include rt_alloc_slab
+
+# ═══════════════════════════════════════════════════════
+# Heap Verification & Diagnostics
+# ═══════════════════════════════════════════════════════
+
+func heap_verify() -> int:
+    if g_tlsf_ctrl == 0 do
+        out 1
+    end
+    extern func native_read_i64(addr: int, offset: int) -> int
+
+    # 1. Check Bitmap <-> Bin consistency and free block list integrity
+    let fl_map = get_fl_bitmap()
+    var fl = 0
+    when fl < FL_INDEX_COUNT loop
+        let sl_map = get_sl_bitmap(fl)
+        let fl_bit = (fl_map bit_and (1 shl fl)) != 0
+        if sl_map != 0 and fl_bit == false do
+            out 0
+        end
+        if sl_map == 0 and fl_bit == true do
+            out 0
+        end
+
+        var sl = 0
+        when sl < SL_INDEX_COUNT loop
+            let bin_idx = fl * SL_INDEX_COUNT + sl
+            let head = get_bin_head(bin_idx)
+            let sl_bit = (sl_map bit_and (1 shl sl)) != 0
+
+            if head != 0 and sl_bit == false do
+                out 0
+            end
+            if head == 0 and sl_bit == true do
+                out 0
+            end
+
+            var cur = head
+            var prev = 0
+            var cycle_guard = 0
+            when cur != 0 loop
+                let raw = native_read_i64(cur, 0)
+                if (raw bit_and BLOCK_FREE) == 0 do
+                    out 0
+                end
+                let p = native_read_i64(cur, 16)
+                if p != prev do
+                    out 0
+                end
+                let bsz = raw bit_and ~(FLAG_MASK)
+                if bsz < MIN_BLOCK_SIZE or (bsz bit_and 0xF) != 0 do
+                    out 0
+                end
+                let mapped_bin = tlsf_mapping_bin(bsz)
+                if mapped_bin != bin_idx do
+                    out 0
+                end
+
+                prev = cur
+                cur = native_read_i64(cur, 24)
+                cycle_guard = cycle_guard + 1
+                if cycle_guard > 500000 do
+                    out 0
+                end
+            end
+
+            sl = sl + 1
+        end
+        fl = fl + 1
+    end
+
+    # 2. Physical heap walk across each registered segment: boundary tag reciprocity and sentinel integrity
+    let seg_n = tlsf_seg_count()
+    if seg_n > 0 do
+        var s_idx = 0
+        when s_idx < seg_n loop
+            let s_base = tlsf_seg_base(s_idx)
+            let s_size = tlsf_seg_size(s_idx)
+            if s_base != 0 and s_size > 0 do
+                var cur = s_base
+                var seg_limit = s_base + s_size
+                var prev_sz = 0
+                var prev_was_free = 0
+                var walk_guard = 0
+                when cur < seg_limit loop
+                    let raw = native_read_i64(cur, 0)
+                    let cur_sz = raw bit_and ~(FLAG_MASK)
+                    let cur_prev_free = (raw bit_and PREV_FREE) != 0
+
+                    if prev_sz > 0 do
+                        if cur_prev_free != (prev_was_free != 0) do
+                            out 0
+                        end
+                        let rec_prev_sz = native_read_i64(cur, 8)
+                        if rec_prev_sz != prev_sz do
+                            out 0
+                        end
+                    end
+
+                    if cur_sz == 0 do
+                        cur = seg_limit
+                    else
+                        if cur_sz < MIN_BLOCK_SIZE or (cur_sz bit_and 0xF) != 0 do
+                            out 0
+                        end
+                        if cur + cur_sz > seg_limit do
+                            out 0
+                        end
+                        prev_sz = cur_sz
+                        prev_was_free = raw bit_and BLOCK_FREE
+                        cur = cur + cur_sz
+                    end
+
+                    walk_guard = walk_guard + 1
+                    if walk_guard > 500000 do
+                        out 0
+                    end
+                end
+            end
+            s_idx = s_idx + 1
+        end
+    eif g_heap.base != 0 do
+        var cur = g_heap.base
+        var seg_limit = g_heap.base + g_heap.capacity
+        var prev_sz = 0
+        var prev_was_free = 0
+        var walk_guard = 0
+        when cur < seg_limit loop
+            let raw = native_read_i64(cur, 0)
+            let cur_sz = raw bit_and ~(FLAG_MASK)
+            let cur_prev_free = (raw bit_and PREV_FREE) != 0
+
+            if prev_sz > 0 do
+                if cur_prev_free != (prev_was_free != 0) do
+                    out 0
+                end
+                let rec_prev_sz = native_read_i64(cur, 8)
+                if rec_prev_sz != prev_sz do
+                    out 0
+                end
+            end
+
+            if cur_sz == 0 do
+                cur = seg_limit
+            else
+                if cur_sz < MIN_BLOCK_SIZE or (cur_sz bit_and 0xF) != 0 do
+                    out 0
+                end
+                if cur + cur_sz > seg_limit do
+                    out 0
+                end
+                prev_sz = cur_sz
+                prev_was_free = raw bit_and BLOCK_FREE
+                cur = cur + cur_sz
+            end
+
+            walk_guard = walk_guard + 1
+            if walk_guard > 500000 do
+                out 0
+            end
+        end
+    end
+
+    out 1
+end.
+
+# ═══════════════════════════════════════════════════════
+# Heap Destruction & Cleanup
+# ═══════════════════════════════════════════════════════
+
+func heap_destroy():
+    if g_tlsf_ctrl == 0 do out 0 end
+    let seg_n = tlsf_seg_count()
+    var s_idx = 0
+    when s_idx < seg_n loop
+        let s_base = tlsf_seg_base(s_idx)
+        let s_size = tlsf_seg_size(s_idx)
+        if s_base != 0 and s_size > 0 do
+            page_free(s_base, s_size)
+        end
+        s_idx = s_idx + 1
+    end
+    let dir_n = tlsf_direct_count()
+    var d_idx = 0
+    when d_idx < dir_n loop
+        let off = 36624 + d_idx * 16
+        extern func native_read_i64(addr: int, offset: int) -> int
+        let d_base = native_read_i64(g_tlsf_ctrl, off)
+        let d_size = native_read_i64(g_tlsf_ctrl, off + 8)
+        if d_base != 0 and d_size > 0 do
+            vm_free(d_base, d_size)
+        end
+        d_idx = d_idx + 1
+    end
+    if g_heapSegments != 0 do page_free(g_heapSegments, g_heapSegmentCapacity * 16) end
+    g_heapSegments = 0
+    g_heapSegmentCapacity = 0
+    page_free(g_tlsf_ctrl, 65536)
+    g_tlsf_ctrl = 0
+    g_heap.base = 0
+    g_heap.capacity = 0
+    g_heap.used = 0
+    g_heap.peak_used = 0
+    g_initialized = false
+    out 1
+end.
+
+export heap_verify, heap_destroy

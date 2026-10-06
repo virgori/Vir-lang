@@ -1,0 +1,238 @@
+##
+ * compiler/src/lower/ast_to_mir/stmt_control/jumps.vri — Statement lowering: jumps
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+include parser
+include mir
+include ast_to_mir_context
+include ast_to_mir_layout
+include ast_to_mir_builder
+include ast_to_mir_calls
+include ast_to_mir_expr_ops
+include ast_to_mir_expr
+
+func lower_stmt_return(b: &MirBuilder, stmt: &AstNode):
+	child_count = ast_node_child_count(stmt)
+	if g_func_return_block >= 0 and g_in_func_cleanup == 0 do
+		var b_ret = b
+		if child_count > 0 do
+			let ret_expr = ast_node_child(stmt, 0)
+			var is_arena_self_tail = false
+			var cur_fname = ""
+			let f_obj = builder_func(b_ret)
+			if (f_obj as i64) != 0 do
+				cur_fname = native_read_i64(f_obj as i64, 8) as string
+			end
+			if (cur_fname as i64) != 0 and fat_str_len(cur_fname) > 0 and g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 and g_func_normal_ensure_block < 0 do
+				if ast_node_type_of(ret_expr) == AstType.Call do
+					let raw_callee = ast_node_name(ret_expr)
+					let callee = resolve_callee_alias(raw_callee)
+					# Only treat as a self-tail when the callee resolves to the current
+					# function AND is NOT shadowed by a local variable binding.
+					# get_var_vreg returns >= 0 when a local vreg exists for raw_callee;
+					# that means the call is an indirect call through a local, not a
+					# self-recursive call, so the arena fast-path must not fire.
+					let local_binding = get_var_vreg(b_ret as i64, raw_callee)
+					if local_binding < 0 do
+						if fat_str_eq(callee, cur_fname) == 1 or fat_str_eq(raw_callee, cur_fname) == 1 do
+							is_arena_self_tail = true
+						end
+					end
+				end
+			end
+
+			if is_arena_self_tail do
+				var n_args = ast_node_child_count(ret_expr)
+				var staged_args = vec_new_rt()
+				var b_cur = b_ret
+				var ai = 0
+				when ai < n_args loop
+					let arg = ast_node_child(ret_expr, ai)
+					var b_a = lower_expr(b_cur, arg)
+					var aop = g_lower_expr_result_opnd as MirOperand
+					var arg_flux_t = infer_expr_type_name(arg)
+					if (arg_flux_t as i64) == 0 or fat_str_len(arg_flux_t) == 0 do
+						if ast_node_type_of(arg) == AstType.Identifier do
+							arg_flux_t = get_var_type(ast_node_name(arg))
+						end
+					end
+					if is_flux_type_str(arg_flux_t) do
+						var (b_cl, cl_op) = emit_flux_clone(b_a, aop, arg_flux_t)
+						b_a = b_cl
+						aop = cl_op
+					end
+					staged_args = vec_push_rt(staged_args, aop as i64)
+					b_cur = b_a
+					ai = ai + 1
+				end
+
+				var pi = 0
+				when pi < n_args loop
+					let p_op = vec_get_rt(staged_args, pi) as MirOperand
+					if mir_opnd_type(p_op) == MirOperandType.VReg do
+						let vr = mir_opnd_vreg_id(p_op)
+						let arg_ast = ast_node_child(ret_expr, pi)
+						let at = infer_expr_type_name(arg_ast)
+						if is_flux_type_str(at) or is_entity_name(at) == 1 do
+							b_cur = emit_intrinsic(b_cur, MIR_MEM_PROMOTE, mir_opnd_vreg(vr), mir_opnd_vreg(vr))
+						end
+					end
+					pi = pi + 1
+				end
+
+				var ams_len = vec_len_rt(g_arena_mark_stack)
+				var ams_i = ams_len - 1
+				when ams_i >= 0 loop
+					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+					b_cur = emit_intrinsic(b_cur, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+					ams_i = ams_i - 1
+				end
+
+				let saved_ams = g_arena_mark_stack
+				g_arena_mark_stack = vec_new_rt()
+				b_cur = lower_prepare_call_error(b_cur)
+				var j = 0
+				when j < n_args loop
+					let a_opnd = vec_get_rt(staged_args, j) as MirOperand
+					b_cur = emit_set_arg(b_cur, j, a_opnd)
+					j = j + 1
+				end
+
+				var (b_call, cid) = builder_intern(b_cur, cur_fname)
+				var (b_call2, dst_v) = builder_new_vreg(b_call)
+				var ins_c = mir_instr_new(MirOp.Call, mir_opnd_vreg(dst_v), mir_opnd_imm(n_args), mir_opnd_imm(cid))
+				b_call2 = builder_add_instr(b_call2, ins_c)
+				b_call2 = lower_check_call_error(b_call2)
+				g_arena_mark_stack = saved_ams
+
+				b_ret = emit_move(b_call2, g_func_ret_vreg, mir_opnd_vreg(dst_v))
+				if g_func_normal_ensure_block >= 0 do
+					b_ret = emit_jump(b_ret, g_func_normal_ensure_block)
+				else
+					b_ret = emit_jump(b_ret, g_func_return_block)
+				end
+				out b_ret
+			end
+
+			var b_value = lower_expr(b_ret, ret_expr)
+			var ret_value = g_lower_expr_result_opnd as MirOperand
+			var ret_flux_t = infer_expr_type_name(ret_expr)
+			if (ret_flux_t as i64) == 0 or fat_str_len(ret_flux_t) == 0 do
+				let r_ch = ret_expr
+				if ast_node_type_of(r_ch) == AstType.Identifier do
+					ret_flux_t = get_var_type(ast_node_name(r_ch))
+				end
+			end
+			if is_flux_type_str(ret_flux_t) do
+				var (b_rcl, rcl_op) = emit_flux_clone(b_value, ret_value, ret_flux_t)
+				b_value = b_rcl
+				ret_value = rcl_op
+			end
+			b_ret = emit_move(b_value, g_func_ret_vreg, ret_value)
+			if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+				b_ret = emit_intrinsic(b_ret, MIR_MEM_PROMOTE, mir_opnd_vreg(g_func_ret_vreg), mir_opnd_vreg(g_func_ret_vreg))
+				var ams_len = vec_len_rt(g_arena_mark_stack)
+				var ams_i = ams_len - 1
+				when ams_i >= 0 loop
+					var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+					b_ret = emit_intrinsic(b_ret, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+					ams_i = ams_i - 1
+				end
+			end
+		end
+		if g_func_normal_ensure_block >= 0 do
+			b_ret = emit_jump(b_ret, g_func_normal_ensure_block)
+		else
+			b_ret = emit_jump(b_ret, g_func_return_block)
+		end
+		var (b_dead, dead_return_id) = builder_add_block(b_ret)
+		out builder_set_current_block(b_dead, dead_return_id)
+	end
+	if child_count > 0 do
+		var b2 = lower_expr(b, ast_node_child(stmt, 0))
+		var ret_opnd = g_lower_expr_result_opnd as MirOperand
+		var ret_flux_t2 = infer_expr_type_name(ast_node_child(stmt, 0))
+		if (ret_flux_t2 as i64) == 0 or fat_str_len(ret_flux_t2) == 0 do
+			let r_ch2 = ast_node_child(stmt, 0)
+			if ast_node_type_of(r_ch2) == AstType.Identifier do
+				ret_flux_t2 = get_var_type(ast_node_name(r_ch2))
+			end
+		end
+		if is_flux_type_str(ret_flux_t2) do
+			var (b_rcl2, rcl_op2) = emit_flux_clone(b2, ret_opnd, ret_flux_t2)
+			b2 = b_rcl2
+			ret_opnd = rcl_op2
+		end
+		ins = mir_instr_new(MirOp.Return, mir_opnd_none(), ret_opnd, mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out b2
+	else
+		ins = mir_instr_new(MirOp.Return, mir_opnd_none(), mir_opnd_none(), mir_opnd_none())
+		b2 = builder_add_instr(b, ins)
+		out b2
+	end
+end.
+
+func lower_stmt_print(b: &MirBuilder, stmt: &AstNode):
+	child_count = ast_node_child_count(stmt)
+	if child_count > 0 do
+		expr = ast_node_child(stmt, 0)
+		var b2 = lower_expr(b, expr)
+		var val_opnd = g_lower_expr_result_opnd as MirOperand
+		print_type = infer_expr_type_name(expr)
+		if ast_node_type_of(expr) == AstType.LiteralStr or ast_node_type_of(expr) == AstType.InterpExpr or fat_cstr_eq(print_type, "string") == 1 do
+			b2 = emit_intrinsic(b2, MIR_INTR_PRINT_STR, mir_opnd_none(), val_opnd)
+		eif ast_node_type_of(expr) == AstType.LiteralBool or fat_cstr_eq(print_type, "bool") == 1 do
+			b2 = emit_intrinsic(b2, MIR_INTR_PRINT_BOOL, mir_opnd_none(), val_opnd)
+		eif ast_node_type_of(expr) == AstType.LiteralFloat or is_float_type_name(print_type) do
+			b2 = emit_intrinsic(b2, MIR_INTR_PRINT_FLOAT, mir_opnd_none(), val_opnd)
+		else
+			b2 = emit_intrinsic(b2, MIR_INTR_PRINT, mir_opnd_none(), val_opnd)
+		end
+		out b2
+	end
+	out b
+end.
+
+func lower_stmt_break(b: &MirBuilder, stmt: &AstNode):
+	lt = builder_loop_top(b)
+	brk = loop_target_break_block(lt)
+	if brk >= 0 do
+		let base_depth = loop_target_arena_depth(lt)
+		# Restore active arena marks down to the loop's outer depth
+		if g_arena_mark_stack != 0 do
+			var ams_len = vec_len_rt(g_arena_mark_stack)
+			var ams_i = ams_len - 1
+			when ams_i >= base_depth loop
+				var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+				b = emit_intrinsic(b, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+				ams_i = ams_i - 1
+			end
+		end
+		out emit_jump(b, brk)
+	end
+	out b
+end.
+
+func lower_stmt_continue(b: &MirBuilder, stmt: &AstNode):
+	lt = builder_loop_top(b)
+	cnt = loop_target_continue_block(lt)
+	if cnt >= 0 do
+		let base_depth = loop_target_arena_depth(lt)
+		# Restore active arena marks down to the loop's outer depth
+		if g_arena_mark_stack != 0 do
+			var ams_len = vec_len_rt(g_arena_mark_stack)
+			var ams_i = ams_len - 1
+			when ams_i >= base_depth loop
+				var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+				b = emit_intrinsic(b, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+				ams_i = ams_i - 1
+			end
+		end
+		out emit_jump(b, cnt)
+	end
+	out b
+end.

@@ -42,6 +42,7 @@ let r = url.parse("https://example.com/path?q=1")
 | `url.decode` | `url.decode` | `url.decode(raw: string) -> Result of (string)` | draft |
 | `url.decodeForm` | `url.decodeForm` | `url.decodeForm(raw: string) -> Result of (string)` | draft |
 | `url.queryGet` | `url.queryGet` | `url.queryGet(u: Url, key: string) -> Option of (string)` | draft |
+| `url.queryParam` | `url.queryParam` | `url.queryParam(query: string, key: string) -> Option of (string)` | draft |
 
 ## Implementation notes
 

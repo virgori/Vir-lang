@@ -38,3 +38,228 @@ func pass8_tree_uses_ident(node: &AstNode, name: int) -> int:
     end
     out 0
 end.
+
+# ═══════════════════════════════════════════════════════
+# Block-Level Last-Use Index (VIRC-PLN-0012)
+# Maps unshadowed identifier name -> maximum statement index in one lexical
+# block. Nested declarations are excluded from their parent block's liveness.
+# ═══════════════════════════════════════════════════════
+
+func pass8_last_use_map_new() -> int:
+    out pass8_map_new()
+end.
+
+func pass8_last_use_get(lu_table: int, name: int) -> int:
+    if lu_table == 0 or pass8_strlen(name) == 0 do
+        out -1
+    end
+    let item = pass8_map_find(lu_table, name)
+    if item == 0 do out -1 end
+    out native_read_i64(item, 8)
+end.
+
+func pass8_last_use_insert_first(lu_table: int, name: int, stmt_idx: int) -> int:
+    if lu_table == 0 or pass8_strlen(name) == 0 do
+        out 0
+    end
+    if pass8_map_find(lu_table, name) != 0 do out 0 end
+    let item = vir_alloc(16)
+    native_write_i64(item, 0, name)
+    native_write_i64(item, 8, stmt_idx as i64)
+    pass8_map_index(lu_table, name, item)
+    out 1
+end.
+
+func pass8_last_use_record(lu_table: int, expiry_table: int, name: int, stmt_idx: int) -> int:
+    if pass8_strlen(name) == 0 do out 0 end
+    let inserted = pass8_last_use_insert_first(lu_table, name, stmt_idx)
+    if inserted == 1 and expiry_table != 0 do
+        var exp_vec = native_read_i64(expiry_table, stmt_idx * 8)
+        exp_vec = vec_push_rt(exp_vec, name)
+        native_write_i64(expiry_table, stmt_idx * 8, exp_vec)
+    end
+    out inserted
+end.
+
+func pass8_shadow_push(shadowed: int, name: int) -> int:
+    if shadowed == 0 or pass8_strlen(name) == 0 do out 0 end
+    if pass8_box_find(shadowed, name) != 0 do out 0 end
+    let marker = vir_alloc(16)
+    native_write_i64(marker, 0, name)
+    native_write_i64(marker, 8, 0)
+    pass8_box_push(shadowed, marker)
+    out 1
+end.
+
+func pass8_collect_node_uses(node: &AstNode, lu_table: int, expiry_table: int,
+                             stmt_idx: int, shadowed: int) -> int:
+    if (node as i64) == 0 do
+        out 0
+    end
+    g_pass8_stat_nll_nodes = g_pass8_stat_nll_nodes + 1
+    let t = pass8_ast_type(node)
+    if t == AstType.Identifier do
+        let nm = pass8_ast_name(node)
+        if pass8_box_find(shadowed, nm as int) == 0 do
+            pass8_last_use_record(lu_table, expiry_table, nm as int, stmt_idx)
+        end
+        out 0
+    end
+    if t == AstType.Block or t == AstType.ArenaBlock do
+        out pass8_collect_nested_block_uses(node, lu_table, expiry_table, stmt_idx, shadowed)
+    end
+    if t == AstType.VarDecl or t == AstType.ConstDecl do
+        let watermark = pass8_box_len(shadowed)
+        pass8_shadow_push(shadowed, pass8_ast_name(node) as int)
+        let decl_children = pass8_ast_children(node)
+        if decl_children != 0 do
+            let decl_count = vec_len_rt(decl_children)
+            var decl_i = 0
+            when decl_i < decl_count loop
+                pass8_collect_node_uses(vec_get_rt(decl_children, decl_i), lu_table,
+                                        expiry_table, stmt_idx, shadowed)
+                decl_i = decl_i + 1
+            end
+        end
+        pass8_box_truncate_to(shadowed, watermark)
+        out 0
+    end
+    let ch_vec = pass8_ast_children(node)
+    if ch_vec != 0 do
+        let count = vec_len_rt(ch_vec)
+        var i = 0
+        when i < count loop
+            let ch = vec_get_rt(ch_vec, i)
+            pass8_collect_node_uses(ch, lu_table, expiry_table, stmt_idx, shadowed)
+            i = i + 1
+        end
+    end
+    out 0
+end.
+
+func pass8_collect_nested_decl_uses(node: &AstNode, lu_table: int, expiry_table: int,
+                                    stmt_idx: int, shadowed: int) -> int:
+    pass8_shadow_push(shadowed, pass8_ast_name(node) as int)
+    let children = pass8_ast_children(node)
+    if children == 0 do out 0 end
+    let count = vec_len_rt(children)
+    var i = 0
+    when i < count loop
+        pass8_collect_node_uses(vec_get_rt(children, i), lu_table, expiry_table,
+                                stmt_idx, shadowed)
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass8_collect_nested_block_uses(node: &AstNode, lu_table: int, expiry_table: int,
+                                     stmt_idx: int, shadowed: int) -> int:
+    let watermark = pass8_box_len(shadowed)
+    let children = pass8_ast_children(node)
+    if children != 0 do
+        let count = vec_len_rt(children)
+        var i = 0
+        when i < count loop
+            let child = vec_get_rt(children, i)
+            let child_type = pass8_ast_type(child)
+            if child_type == AstType.VarDecl or child_type == AstType.ConstDecl do
+                pass8_collect_nested_decl_uses(child, lu_table, expiry_table,
+                                               stmt_idx, shadowed)
+            eif child_type == AstType.VarDeclGroup do
+                let group_children = pass8_ast_children(child)
+                if group_children != 0 do
+                    let group_count = vec_len_rt(group_children)
+                    var group_i = 0
+                    when group_i < group_count loop
+                        pass8_collect_nested_decl_uses(vec_get_rt(group_children, group_i),
+                                                       lu_table, expiry_table, stmt_idx, shadowed)
+                        group_i = group_i + 1
+                    end
+                end
+            else
+                pass8_collect_node_uses(child, lu_table, expiry_table, stmt_idx, shadowed)
+            end
+            i = i + 1
+        end
+    end
+    pass8_box_truncate_to(shadowed, watermark)
+    out 0
+end.
+
+func pass8_collect_current_decl_uses(node: &AstNode, lu_table: int, expiry_table: int,
+                                     stmt_idx: int, shadowed: int) -> int:
+    let name = pass8_ast_name(node)
+    pass8_last_use_record(lu_table, expiry_table, name as int, stmt_idx)
+    let watermark = pass8_box_len(shadowed)
+    pass8_shadow_push(shadowed, name as int)
+    let children = pass8_ast_children(node)
+    if children != 0 do
+        let count = vec_len_rt(children)
+        var i = 0
+        when i < count loop
+            pass8_collect_node_uses(vec_get_rt(children, i), lu_table, expiry_table,
+                                    stmt_idx, shadowed)
+            i = i + 1
+        end
+    end
+    pass8_box_truncate_to(shadowed, watermark)
+    out 0
+end.
+
+func pass8_collect_current_stmt_uses(node: &AstNode, lu_table: int, expiry_table: int,
+                                     stmt_idx: int, shadowed: int) -> int:
+    let t = pass8_ast_type(node)
+    if t == AstType.VarDecl or t == AstType.ConstDecl do
+        out pass8_collect_current_decl_uses(node, lu_table, expiry_table, stmt_idx, shadowed)
+    end
+    if t == AstType.VarDeclGroup do
+        let children = pass8_ast_children(node)
+        if children != 0 do
+            let count = vec_len_rt(children)
+            var i = 0
+            when i < count loop
+                pass8_collect_current_decl_uses(vec_get_rt(children, i), lu_table,
+                                                expiry_table, stmt_idx, shadowed)
+                i = i + 1
+            end
+        end
+        out 0
+    end
+    out pass8_collect_node_uses(node, lu_table, expiry_table, stmt_idx, shadowed)
+end.
+
+func pass8_expiry_table_new(count: int) -> int:
+    if count <= 0 do out 0 end
+    let t = vir_alloc(count * 8)
+    var i = 0
+    when i < count loop
+        native_write_i64(t, i * 8, vec_new_rt())
+        i = i + 1
+    end
+    out t
+end.
+
+func pass8_build_block_liveness(node: &AstNode, expiry_table: int) -> int:
+    let lu_table = pass8_last_use_map_new()
+    if (node as i64) == 0 do
+        out lu_table
+    end
+    let ch_vec = pass8_ast_children(node)
+    if ch_vec == 0 do
+        out lu_table
+    end
+    let count = vec_len_rt(ch_vec)
+    let shadowed = pass8_box_new()
+    pass8_box_ensure_map(shadowed)
+    var j = count - 1
+    when j >= 0 loop
+        let stmt = vec_get_rt(ch_vec, j)
+        pass8_collect_current_stmt_uses(stmt, lu_table, expiry_table, j, shadowed)
+        j = j - 1
+    end
+    out lu_table
+end.
+
+func pass8_build_block_last_use_map(node: &AstNode) -> int:
+    out pass8_build_block_liveness(node, 0)
+end.

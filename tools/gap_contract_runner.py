@@ -4,6 +4,7 @@ tools/gap_contract_runner.py — Strict Spec Gap Contract Test Runner
 
 Runner for tests/spec_gap_contract/manifest.tsv.
 Supports kinds:
+  - check: semantic/type check succeeds and no executable artifact is emitted
   - run: compile, run, exact stdout and exit code match
   - compile_fail: compiler returns non-zero, diagnostic oracle match, no artifact
   - run_fail: compile succeeds, run traps/exits non-zero via error path
@@ -239,6 +240,84 @@ def has_x86_spilled_promote_reload(binary: bytes) -> bool:
         start = at + 1
 
 
+def read_wasm_uleb(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    shift = 0
+    while offset < len(data):
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, offset
+        shift += 7
+        if shift > 63:
+            break
+    raise ValueError("invalid Wasm ULEB128")
+
+
+def read_wasm_name(data: bytes, offset: int) -> tuple[str, int]:
+    length, offset = read_wasm_uleb(data, offset)
+    end = offset + length
+    if end > len(data):
+        raise ValueError("truncated Wasm name")
+    return data[offset:end].decode("utf-8"), end
+
+
+def inspect_bind_wasm_import(binary: bytes) -> tuple[bool, str]:
+    if binary[:8] != b"\0asm\x01\0\0\0":
+        return False, "artifact is not a Wasm v1 module"
+    sections: dict[int, bytes] = {}
+    offset = 8
+    try:
+        while offset < len(binary):
+            section_id = binary[offset]
+            size, payload_at = read_wasm_uleb(binary, offset + 1)
+            sections[section_id] = binary[payload_at : payload_at + size]
+            offset = payload_at + size
+
+        type_data = sections[1]
+        type_count, at = read_wasm_uleb(type_data, 0)
+        types: list[tuple[list[int], list[int]]] = []
+        for _ in range(type_count):
+            if type_data[at] != 0x60:
+                return False, "Wasm type section contains a non-function type"
+            at += 1
+            param_count, at = read_wasm_uleb(type_data, at)
+            params = list(type_data[at : at + param_count])
+            at += param_count
+            result_count, at = read_wasm_uleb(type_data, at)
+            results = list(type_data[at : at + result_count])
+            at += result_count
+            types.append((params, results))
+
+        import_data = sections[2]
+        import_count, at = read_wasm_uleb(import_data, 0)
+        host_index = -1
+        host_type_index = -1
+        for import_index in range(import_count):
+            module, at = read_wasm_name(import_data, at)
+            name, at = read_wasm_name(import_data, at)
+            kind = import_data[at]
+            at += 1
+            if kind != 0:
+                return False, "FFI structural oracle only accepts function imports"
+            type_index, at = read_wasm_uleb(import_data, at)
+            if module == "env" and name == "host_value":
+                host_index = import_index
+                host_type_index = type_index
+
+        if host_index < 0:
+            return False, "missing env.host_value function import"
+        if host_type_index >= len(types) or types[host_type_index] != ([], [0x7E]):
+            return False, "env.host_value does not have exact () -> i64 type"
+        encoded_call = b"\x10" + bytes([host_index])
+        if encoded_call not in sections.get(10, b""):
+            return False, "code section does not call env.host_value import index"
+        return True, "env.host_value has exact () -> i64 type and is called by import index"
+    except (KeyError, IndexError, UnicodeDecodeError, ValueError) as exc:
+        return False, f"invalid Wasm structure: {exc}"
+
+
 def check_compile_fail_oracle(oracle: str, compile_output: str) -> tuple[bool, str]:
     """Verify that compile error diagnostic satisfies oracle keywords."""
     out_lower = compile_output.lower()
@@ -311,10 +390,13 @@ def run_test(
 
         compile_target = (
             "wasm32-wasi-p1"
-            if entry.kind == "wasm_run"
+            if entry.kind == "wasm_run" or entry.test_id == "FFI-007"
             else ("linux-riscv64" if entry.kind == "riscv_structural" else target)
         )
-        compile_cmd = [str(virc_bin), str(fixture_path), "-o", str(bin_out)]
+        if entry.kind == "check":
+            compile_cmd = [str(virc_bin), str(fixture_path), "--check"]
+        else:
+            compile_cmd = [str(virc_bin), str(fixture_path), "-o", str(bin_out)]
         if compile_target:
             compile_cmd.extend(["--target", compile_target])
         if opt_level:
@@ -369,6 +451,44 @@ def run_test(
                 stdout=c_stdout,
                 stderr=c_stderr,
                 reason=reason,
+            )
+
+        # ── Kind: check ──
+        if entry.kind == "check":
+            if c_exit != 0:
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="FAIL",
+                    target=target,
+                    compile_exit=c_exit,
+                    run_exit=None,
+                    stdout=c_stdout,
+                    stderr=c_stderr,
+                    reason=f"Semantic check failed with exit code {c_exit}",
+                )
+            if bin_out.exists():
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="FAIL",
+                    target=target,
+                    compile_exit=c_exit,
+                    run_exit=None,
+                    stdout=c_stdout,
+                    stderr=c_stderr,
+                    reason="Semantic check unexpectedly emitted an artifact",
+                )
+            return TestResult(
+                test_id=entry.test_id,
+                kind=entry.kind,
+                status="PASS",
+                target=target,
+                compile_exit=c_exit,
+                run_exit=None,
+                stdout=c_stdout,
+                stderr=c_stderr,
+                reason="Semantic check succeeded without emitting an artifact",
             )
 
         # Non compile-fail cases require successful compilation
@@ -661,6 +781,90 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                 reason=f"No RISC-V structural oracle for {entry.test_id}",
             )
 
+        if entry.test_id == "FFI-007":
+            wasm_binary = bin_out.read_bytes()
+            valid, structural_reason = inspect_bind_wasm_import(wasm_binary)
+            if not valid:
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="FAIL",
+                    target=compile_target,
+                    compile_exit=c_exit,
+                    run_exit=None,
+                    stdout=c_stdout,
+                    stderr=c_stderr,
+                    reason=structural_reason,
+                )
+            missing_import = wasm_binary.replace(b"host_value", b"host_v_lue", 1)
+            wrong_signature = bytearray(wasm_binary)
+            signature_at = wasm_binary.rfind(b"\x60\x00\x01\x7e")
+            if signature_at >= 0:
+                wrong_signature[signature_at + 3] = 0x7F
+            missing_call = bytearray(wasm_binary)
+            call_at = wasm_binary.rfind(b"\x10\x01")
+            if call_at >= 0:
+                missing_call[call_at] = 0x01
+            mutation_results = (
+                inspect_bind_wasm_import(missing_import)[0],
+                inspect_bind_wasm_import(bytes(wrong_signature))[0],
+                inspect_bind_wasm_import(bytes(missing_call))[0],
+            )
+            if signature_at < 0 or call_at < 0 or any(mutation_results):
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="FAIL",
+                    target=compile_target,
+                    compile_exit=c_exit,
+                    run_exit=None,
+                    stdout=c_stdout,
+                    stderr=c_stderr,
+                    reason=f"Wasm bind mutation controls were not rejected: {mutation_results}",
+                )
+            if shutil.which("node") is None:
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="BLOCKED",
+                    target=compile_target,
+                    compile_exit=c_exit,
+                    run_exit=None,
+                    stdout="",
+                    stderr="",
+                    reason="Node.js is required for bind(wasm) host instantiation",
+                )
+            node_script = r'''
+const fs = require("fs");
+const { WASI } = require("wasi");
+const wasi = new WASI({ version: "preview1", args: [], env: {}, preopens: {} });
+const imports = wasi.getImportObject();
+imports.env = { host_value: () => 42n };
+WebAssembly.instantiate(fs.readFileSync(process.argv[1]), imports).then(({ instance }) => {
+  wasi.start(instance);
+}).catch((error) => { console.error(error); process.exit(1); });
+'''
+            r_exit, r_stdout, r_stderr = run_command(
+                ["node", "--no-warnings", "-e", node_script, str(bin_out)],
+                cwd=ROOT,
+                timeout=timeout,
+            )
+            return TestResult(
+                test_id=entry.test_id,
+                kind=entry.kind,
+                status="PASS" if r_exit == 0 and r_stdout.strip() == "42" else "FAIL",
+                target=compile_target,
+                compile_exit=c_exit,
+                run_exit=r_exit,
+                stdout=r_stdout,
+                stderr=r_stderr,
+                reason=(
+                    structural_reason + "; missing-import/wrong-signature/missing-call mutations rejected; host BigInt result instantiated and printed"
+                    if r_exit == 0 and r_stdout.strip() == "42"
+                    else "Wasm bind host instantiation or runtime result failed"
+                ),
+            )
+
         # Run artifact
         run_cmd = [str(bin_out)]
         r_exit, r_stdout, r_stderr = run_command(run_cmd, cwd=ROOT, timeout=timeout)
@@ -745,6 +949,60 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
                         reason=f"Stdout mismatch: expected '{expected_stdout}', got '{actual_stdout}'",
                     )
 
+            if entry.test_id == "FFI-008":
+                assembly_by_target: dict[str, str] = {}
+                for asm_target in ("linux-arm64", "linux-x86_64"):
+                    asm_path = tmp_path / f"bind_c_{asm_target}.s"
+                    asm_exit, asm_stdout, asm_stderr = run_command(
+                        [str(virc_bin), str(fixture_path), "--target", asm_target, "-S", "-q", "-o", str(asm_path)],
+                        cwd=ROOT,
+                        timeout=compile_timeout,
+                    )
+                    if asm_exit != 0 or not asm_path.exists():
+                        return TestResult(
+                            test_id=entry.test_id,
+                            kind=entry.kind,
+                            status="FAIL",
+                            target=asm_target,
+                            compile_exit=asm_exit,
+                            run_exit=r_exit,
+                            stdout=asm_stdout,
+                            stderr=asm_stderr,
+                            reason=f"Could not emit {asm_target} assembly for native FFI ABI oracle",
+                        )
+                    assembly_by_target[asm_target] = asm_path.read_text(encoding="utf-8")
+
+                arm_asm = assembly_by_target["linux-arm64"]
+                x86_asm = assembly_by_target["linux-x86_64"]
+                arm_ok = all(token in arm_asm for token in ("fmov d0,", "bl fabs", "bl ldexp", "fmov x0, d0"))
+                x86_ok = all(token in x86_asm for token in ("movq xmm0,", "call fabs", "call ldexp", "movq rax, xmm0"))
+                arm_ldexp = re.search(r"fmov d0,.*?mov(?:z)? x0, #?3.*?bl ldexp", arm_asm, re.DOTALL)
+                x86_ldexp = re.search(r"movq xmm0,.*?mov rdi, 3.*?call ldexp", x86_asm, re.DOTALL)
+                if not arm_ok or not x86_ok or arm_ldexp is None or x86_ldexp is None:
+                    return TestResult(
+                        test_id=entry.test_id,
+                        kind=entry.kind,
+                        status="FAIL",
+                        target=target,
+                        compile_exit=c_exit,
+                        run_exit=r_exit,
+                        stdout=r_stdout,
+                        stderr=r_stderr,
+                        reason=f"Native FFI ABI assembly oracle failed (arm64={arm_ok and arm_ldexp is not None}, x86_64={x86_ok and x86_ldexp is not None})",
+                    )
+
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="PASS",
+                    target=target,
+                    compile_exit=c_exit,
+                    run_exit=r_exit,
+                    stdout=r_stdout,
+                    stderr=r_stderr,
+                    reason="Runtime integer/pointer/void/stack/f64/mixed calls passed; ARM64 and x86-64 assembly use independent FP/GPR ABI registers",
+                )
+
             return TestResult(
                 test_id=entry.test_id,
                 kind=entry.kind,
@@ -759,6 +1017,62 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
 
         # ── Kind: structural ──
         if entry.kind == "structural":
+            if entry.test_id == "FFI-003":
+                exact_bodies: list[str] = []
+                main_bodies: list[str] = []
+                for level in ("-O0", "-O1", "-O2", "-O3"):
+                    asm_path = tmp_path / f"bind_asm_{level[2:]}.s"
+                    asm_exit, asm_stdout, asm_stderr = run_command(
+                        [str(virc_bin), str(fixture_path), level, "-S", "-q", "-o", str(asm_path)],
+                        cwd=ROOT,
+                        timeout=compile_timeout,
+                    )
+                    if asm_exit != 0 or not asm_path.exists():
+                        return TestResult(
+                            test_id=entry.test_id,
+                            kind=entry.kind,
+                            status="FAIL",
+                            target=target,
+                            compile_exit=asm_exit,
+                            run_exit=r_exit,
+                            stdout=asm_stdout,
+                            stderr=asm_stderr,
+                            reason=f"could not emit {level} assembly for bind(asm) oracle",
+                        )
+                    assembly = asm_path.read_text(encoding="utf-8")
+                    exact = re.search(r"\.globl _exact_sequence\n.*?\n_exact_sequence:\n(.*?)(?=\n\.globl |\Z)", assembly, re.DOTALL)
+                    main = re.search(r"\.globl _main\n.*?\n_main:\n(.*?)(?=\n\.globl |\Z)", assembly, re.DOTALL)
+                    if not exact or not main:
+                        return TestResult(
+                            test_id=entry.test_id,
+                            kind=entry.kind,
+                            status="FAIL",
+                            target=target,
+                            compile_exit=asm_exit,
+                            run_exit=r_exit,
+                            stdout=asm_stdout,
+                            stderr=asm_stderr,
+                            reason="bind(asm) or normal control function missing from assembly",
+                        )
+                    exact_bodies.append(exact.group(1).strip())
+                    main_bodies.append(main.group(1).strip())
+                exact_preserved = len(set(exact_bodies)) == 1
+                control_optimized = main_bodies[0] != main_bodies[-1]
+                return TestResult(
+                    test_id=entry.test_id,
+                    kind=entry.kind,
+                    status="PASS" if r_exit == 0 and r_stdout.strip() == "41" and exact_preserved and control_optimized else "FAIL",
+                    target=target,
+                    compile_exit=c_exit,
+                    run_exit=r_exit,
+                    stdout=r_stdout,
+                    stderr=r_stderr,
+                    reason=(
+                        "bind(asm) body is byte-stable in assembly across -O0..-O3 while main control changes"
+                        if exact_preserved and control_optimized
+                        else f"no-opt oracle failed (exact_preserved={exact_preserved}, control_optimized={control_optimized})"
+                    ),
+                )
             m_out = re.search(r"stdout=([^;]+)", entry.oracle)
             if m_out:
                 exp_s = m_out.group(1).replace(r"\n", "\n").strip()
@@ -1350,16 +1664,61 @@ WebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {
 def save_baseline(results: list[TestResult], output_path: Path):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write("# id\tkind\tstatus\ttarget\tcompile_exit\trun_exit\treason\tstdout_escaped\n")
+        # Keep the baseline intentionally small and deterministic.  Diagnostics,
+        # timings, and stdout belong to the live report and are too volatile to
+        # serve as a status-regression oracle.
+        f.write("# id\tkind\tstatus\n")
         for r in results:
-            clean_stdout = r.stdout.strip().replace("\n", "\\n").replace("\t", " ")
-            clean_reason = r.reason.replace("\t", " ").replace("\n", " ")
-            f.write(
-                f"{r.test_id}\t{r.kind}\t{r.status}\t{r.target}\t"
-                f"{r.compile_exit if r.compile_exit is not None else ''}\t"
-                f"{r.run_exit if r.run_exit is not None else ''}\t"
-                f"{clean_reason}\t{clean_stdout}\n"
+            f.write(f"{r.test_id}\t{r.kind}\t{r.status}\n")
+
+
+def load_baseline(input_path: Path) -> dict[str, tuple[str, str]]:
+    """Load the stable fields used by the zero-regression gate."""
+    baseline: dict[str, tuple[str, str]] = {}
+    for line_number, raw_line in enumerate(
+        input_path.read_text(encoding="utf-8").splitlines(),
+        1,
+    ):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = line.split("\t")
+        if len(fields) < 3:
+            raise ValueError(f"invalid baseline row {line_number}: expected at least 3 fields")
+        test_id, kind, status = fields[:3]
+        if test_id in baseline:
+            raise ValueError(f"duplicate baseline id at row {line_number}: {test_id}")
+        baseline[test_id] = (kind, status)
+    return baseline
+
+
+def compare_baseline(
+    results: list[TestResult],
+    input_path: Path,
+) -> tuple[bool, list[str]]:
+    """Compare IDs, kinds and statuses without freezing incidental diagnostics."""
+    if not input_path.is_file():
+        return False, [f"baseline does not exist: {input_path}"]
+    try:
+        baseline = load_baseline(input_path)
+    except (OSError, ValueError) as error:
+        return False, [str(error)]
+
+    current = {result.test_id: (result.kind, result.status) for result in results}
+    messages: list[str] = []
+    for test_id in sorted(baseline.keys() - current.keys()):
+        messages.append(f"missing current result: {test_id}")
+    for test_id in sorted(current.keys() - baseline.keys()):
+        messages.append(f"new result absent from baseline: {test_id}")
+    for test_id in sorted(baseline.keys() & current.keys()):
+        expected = baseline[test_id]
+        actual = current[test_id]
+        if expected != actual:
+            messages.append(
+                f"{test_id}: expected kind/status {expected[0]}/{expected[1]}, "
+                f"got {actual[0]}/{actual[1]}"
             )
+    return not messages, messages
 
 
 def main() -> int:
@@ -1369,6 +1728,14 @@ def main() -> int:
     parser.add_argument("--virc", type=Path, default=ROOT / "bin/virc", help="Path to virc compiler")
     parser.add_argument("--target", type=str, default="macos-arm64", help="Target architecture")
     parser.add_argument("--save-baseline", type=Path, default=None, help="Path to save baseline TSV")
+    parser.add_argument(
+        "--check-baseline",
+        nargs="?",
+        const=DEFAULT_BASELINE,
+        type=Path,
+        default=None,
+        help="Compare IDs/kinds/statuses with a baseline TSV (default: docs/spec_gap_contract_baseline.tsv)",
+    )
     parser.add_argument("--filter", type=str, default="", help="Regex filter by test ID")
     parser.add_argument("--group", type=str, default="", help="Filter by group/phase (e.g. Phase1)")
     parser.add_argument("--timeout", type=float, default=5.0, help="Execution timeout in seconds")
@@ -1443,7 +1810,20 @@ def main() -> int:
 
     if args.save_baseline:
         save_baseline(results, args.save_baseline)
-        print(f"\nBaseline saved to: {args.save_baseline.relative_to(ROOT)}")
+        baseline_saved = args.save_baseline.resolve()
+        if baseline_saved.is_relative_to(ROOT):
+            baseline_saved = baseline_saved.relative_to(ROOT)
+        print(f"\nBaseline saved to: {baseline_saved}")
+
+    baseline_ok = False
+    if args.check_baseline:
+        baseline_ok, baseline_messages = compare_baseline(results, args.check_baseline)
+        if baseline_ok:
+            print(f"\nBaseline check: PASS ({len(results)} unchanged results)")
+        else:
+            print("\nBaseline check: FAIL")
+            for message in baseline_messages:
+                print(f"  - {message}")
 
     print(f"\nSummary:")
     print(f"  PASS    : {pass_count}")
@@ -1451,6 +1831,8 @@ def main() -> int:
     print(f"  BLOCKED : {blocked_count}")
     print(f"  TOTAL   : {len(entries)}")
 
+    if args.check_baseline:
+        return 0 if baseline_ok else 1
     return 0 if fail_count == 0 else 1
 
 

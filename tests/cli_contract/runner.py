@@ -25,7 +25,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE = ROOT / "tests/cli_contract/success.vri"
-VIRC = ROOT / "bin/virc"
+VIRC = Path(os.environ.get("VIRC", ROOT / "bin/virc"))
 BASELINE = ROOT / "tests/cli_contract/classic_baseline.json"
 FAILURE = ROOT / "tests/cli_contract/failure.vri"
 FAILURE_BASELINE = ROOT / "tests/cli_contract/classic_failure_baseline.json"
@@ -310,7 +310,7 @@ class CliContract(unittest.TestCase):
             self.assertEqual(sum(line.startswith(f"✓ {phase}") for line in lines), 1, (phase, lines))
         # 6. Aligned metadata in banner
         self.assertEqual(sum("VIRC" in line for line in lines), 1)
-        self.assertTrue(any("Version      4.0.0" in line for line in lines))
+        self.assertTrue(any("Version      4.2.1" in line for line in lines))
         self.assertTrue(any("What's New   Native LSP Daemon" in line for line in lines))
         # 7. Final build summary separated from stages with indented path
         self.assertEqual(sum(line.startswith("✓ Build succeeded · ") for line in lines), 1)
@@ -911,7 +911,9 @@ end.
                 self.assertEqual(observation["resolvedLevel"], level)
                 self.assertEqual(observation["requestedSelector"], selectors[-1] if selectors else "default")
                 passes = {entry["id"] for entry in observation["passInvocations"]}
-                self.assertTrue({5, 7, 8, 19}.isdisjoint(passes), "disabled passes must not be invoked")
+                self.assertTrue({5, 7, 8}.isdisjoint(passes), "disabled passes must not be invoked")
+                if level >= 2:
+                    self.assertIn(19, passes)
                 if level < 3:
                     self.assertTrue({24, 25, 26}.isdisjoint(passes), "O3 passes must not run in O1/O2 cleanup")
                 if level == 0:

@@ -7,7 +7,7 @@ status: "OPEN"
 severity: "S1"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-06"
 owners:
   - "VIRC"
 components:
@@ -17,7 +17,10 @@ components:
   - "self-hosting"
 related:
   issues:
+    - "VIR-ISS-0005"
+    - "VIR-ISS-0006"
     - "VIRC-ISS-0007"
+    - "VIRC-ISS-0046"
   plans: []
   reports: []
 supersedes: null
@@ -216,8 +219,13 @@ behavior.
 
 ### Issues
 
+- `VIR-ISS-0005` — standalone `get` removal consolidates named module access on
+  import/export without weakening visibility.
+- `VIR-ISS-0006` — active module/include SPEC audit and conformance matrix.
 - `VIRC-ISS-0007` — redundant same-module include/import declarations can mask
   the intended dependency form but are not required to reproduce this issue.
+- `VIRC-ISS-0046` — umbrella `import from module` must reuse the same fail-closed
+  export boundary.
 
 ### Plans
 
@@ -234,3 +242,6 @@ behavior.
 |---|---|
 | 2026-10-02 | Opened from import-only and explicit-export-list control fixtures against the active self-hosted compiler |
 | 2026-10-02 | Linked VIRC-ISS-0007 |
+| 2026-10-06 | Linked VIR-ISS-0005 |
+| 2026-10-06 | Linked VIRC-ISS-0046 |
+| 2026-10-06 | Linked VIR-ISS-0006 |

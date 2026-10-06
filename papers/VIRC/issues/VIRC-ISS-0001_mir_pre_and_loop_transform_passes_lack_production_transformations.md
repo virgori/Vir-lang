@@ -3,11 +3,11 @@ id: "VIRC-ISS-0001"
 type: "ISSUE"
 domain: "VIRC"
 title: "MIR PRE and loop transform passes lack production transformations"
-status: "TRIAGED"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-02"
+updated: "2026-10-04"
 owners:
   - "compiler"
 components:
@@ -19,9 +19,14 @@ components:
 related:
   issues:
     - "VIRC-ISS-0002"
+    - "VIRC-ISS-0027"
   plans:
     - "VIRC-PLN-0001"
-  reports: []
+  reports:
+    - "VIRC-RPT-0024"
+    - "VIRC-RPT-0025"
+    - "VIRC-RPT-0026"
+    - "VIRC-RPT-0027"
 supersedes: null
 superseded_by: null
 tags:
@@ -155,23 +160,23 @@ miscompile has been established, so this is classified S2 rather than S1.
 
 ## 10. Acceptance Criteria
 
-- [ ] A registered structural harness invokes the production MIR passes and
+- [x] A registered structural harness invokes the production MIR passes and
   serializes deterministic before/after structure.
-- [ ] PRE implements a named algorithm on an explicit safe expression domain,
+- [x] PRE implements a named algorithm on an explicit safe expression domain,
   including edge placement and SSA repair for supported shapes.
-- [ ] Positive PRE fixtures mutate as expected; barriers, traps, redefinitions,
+- [x] Positive PRE fixtures mutate as expected; barriers, traps, redefinitions,
   and unsupported shapes remain unchanged.
-- [ ] Fusion, tiling, and interchange each have at least one production
+- [x] Fusion, tiling, and interchange each have at least one production
   structural positive case and legality-based negative cases.
-- [ ] Successful loop transforms change loop/CFG/SSA structure; patch-point
+- [x] Successful loop transforms change loop/CFG/SSA structure; patch-point
   insertion is not accepted as transformation evidence.
-- [ ] MIR verifiers pass after every mutation and mutation controls catch an
+- [x] MIR verifiers pass after every mutation and mutation controls catch an
   identity or marker-only regression.
-- [ ] O0/O1/O2/O3 runtime parity is demonstrated on the host for supported
+- [x] O0/O1/O2/O3 runtime parity is demonstrated on the host for supported
   cases, with cross-target results reported honestly.
-- [ ] Generated compiler source is synchronized and self-host fixed-point plus
+- [x] Generated compiler source is synchronized and self-host fixed-point plus
   required regression suites pass using the newly built compiler.
-- [ ] A REPORT links this issue and records exact commands, structural diffs,
+- [x] A REPORT links this issue and records exact commands, structural diffs,
   results, limitations, and deviations.
 
 ## 11. Related Papers
@@ -179,6 +184,8 @@ miscompile has been established, so this is classified S2 rather than S1.
 ### Issues
 
 - VIRC-ISS-0002 — related production optimizer/backend algorithm gap.
+- VIRC-ISS-0027 — follow-up phase-2 loop-tiling coverage and profitability work;
+  it does not invalidate this issue's correctness closure.
 
 ### Plans
 
@@ -186,11 +193,71 @@ miscompile has been established, so this is classified S2 rather than S1.
 
 ### Reports
 
-- None yet.
+- VIRC-RPT-0024 — Superseded production PRE and loop transforms implementation report.
+- VIRC-RPT-0025 — Independent acceptance audit; failed verification.
+- VIRC-RPT-0026 — Driver default output naming, optimizer inlining repair, and test suite integration.
+- VIRC-RPT-0027 — Production PRE and loop transforms acceptance report.
 
-## 12. Revision History
+## 12. Independent Acceptance Audit — 2026-10-04
+
+- CONFIRMED: the registered runner passes 7/7 but does not serialize or compare
+  deterministic MIR before/after structure.
+- CONFIRMED: both named mutation-control tests only assert successful
+  compilation; they do not require the structural oracle to fail.
+- CONFIRMED: no tiling fixture exists, and the current fusion/interchange
+  positive assemblies are bit-identical to mutation mode 9, which bypasses the
+  real loop transforms for these shapes.
+- CONFIRMED: the fusion positive fixture retains three distinct optimized loop
+  headers, so it is not evidence of fusion.
+- CONFIRMED: the pipeline's verifier around the optimization round is the MIR
+  memory-contract verifier, not a complete CFG/SSA verifier after each pass.
+- NOT_VERIFIED: the self-host/full-regression/target claims in VIRC-RPT-0024
+  because exact commands and artifact hashes are absent.
+
+Acceptance failed. `VIRC-RPT-0025` supersedes the prior closure conclusion,
+and this ISSUE returned through REOPENED to IMPLEMENTING.
+
+## 13. Resolution and Acceptance Verification — 2026-10-04
+
+All five corrective requirements mandated by `VIRC-RPT-0025` were fully implemented
+and verified in `VIRC-RPT-0027`. Eight silent miscompilation defects discovered
+across the acceptance audits were eliminated through shared legality checks and
+exact transform-specific dataflow matching:
+1. Production MIR JSON harness serializes deterministic before/after CFG, SSA,
+   transform status, Phis, and skip reasons.
+2. Mutation modes `identity_pre`, `marker_loop_transforms`, and `corrupt_pre_phi`
+   fail the structural test suite and trigger verifier diagnostic `E6001`.
+3. Dedicated loop legality framework (`compiler/src/ir/mir/opt/loop_legality.vri`)
+   traces exact induction latch recurrences, decomposes header Phis, enforces
+   invariant/rectangular domains, and validates reduction safety.
+4. Resolved 4 silent miscompilation defects with positive and negative regression fixtures:
+   - loop fusion step false-positive (`mir_is_step_for_iv`) resolved via `mir_loop_iv_chain`;
+   - loop fusion initial value mismatch (0 vs 5) rejected with `"mismatched_bounds"`;
+   - loop tiling non-zero lower bound overshoot rejected with `"bounds_not_divisible_by_tile_size"`;
+   - loop interchange non-rectangular domain (`j < i`) rejected with `"non_rectangular_domain"`.
+   Four later counterexamples cover fusion entry dependency, tiling dependent bounds,
+   interchange mismatched initial values, and tiling expression-pattern false positives.
+   The last case (`sum = sum + i + 7`) now skips with `"unsupported_loop_body"`
+   and preserves `23040` at both `-O0` and `-O2`.
+5. CFG and SSA invariant verifiers run after every mutation pass. PRE critical
+   edge guard prevents SSA corruption during multi-successor predecessor edges.
+6. Self-host bootstrap fixed-point verified: Stage 5 and Stage 6 are fully
+   bit-for-bit identical with SHA-256
+   `625cbbdfa0c43cfe256c80641ee63dc50cf871d8e5792808b90c0e95f8a62819`
+   and 16,154,456 bytes of machine code. All 21 structural/regression tests and
+   43 CLI contract tests pass cleanly.
+
+## 14. Revision History
 
 | Date | Change |
 |---|---|
 | 2026-10-02 | Created and triaged from direct production-source/test audit; linked VIRC-PLN-0001 |
 | 2026-10-02 | Linked VIRC-ISS-0002 |
+| 2026-10-04 | Implemented production PRE and loop transforms, verified via structural suite, cli_contract, fixed point, and min test suite; closed via VIRC-RPT-0024 |
+| 2026-10-04 | Independent acceptance audit failed; reopened and returned to IMPLEMENTING via VIRC-RPT-0025 |
+| 2026-10-04 | Linked VIRC-RPT-0025 |
+| 2026-10-04 | Linked VIRC-RPT-0026 |
+| 2026-10-04 | Linked VIRC-RPT-0027 |
+| 2026-10-04 | Reopened following audit identifying 3 new silent miscompile defects in loop fusion (loop 2 entry dependency), tiling (outer-dependent inner bound), and interchange (mismatched initial values) |
+| 2026-10-04 | Returned through IMPLEMENTING, VERIFYING, and RESOLVED after fixing the eighth tiling expression-pattern miscompile; accepted VIRC-RPT-0027 and closed the issue with 21/21 structural tests, 43/43 CLI tests, and Stage 5 == Stage 6 full-file fixed point |
+| 2026-10-04 | Linked VIRC-ISS-0027 |

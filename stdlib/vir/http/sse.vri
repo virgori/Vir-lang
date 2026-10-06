@@ -1,0 +1,206 @@
+# ═════════════════════════════════════════════════════════════════════
+# Module: realtime/sse.vri
+# Pure Vir Server-Sent Events (SSE) Streamer Engine (W3C text/event-stream)
+# Handles HTTP stream initialization, framing, multi-line payloads & retry
+# ═════════════════════════════════════════════════════════════════════
+
+func sse_str_len(s: ptr) -> int:
+    if s == 0 as ptr do out 0 end
+    var i = 0
+    when read_byte(s, i) != 0 loop
+        i = i + 1
+    end
+    out i
+end.
+
+# Helper: Append string to buffer with bounds check
+func sse_buf_append(dst: ptr, dst_pos: int, max_len: int, src: ptr) -> int:
+    if src == 0 as ptr do out dst_pos end
+    let slen = sse_str_len(src)
+    var p = dst_pos
+    var i = 0
+    when i < slen loop
+        if p < (max_len - 1) do
+            write_byte(dst, p, read_byte(src, i))
+            p = p + 1
+        end
+        i = i + 1
+    end
+    out p
+end.
+
+# Helper: Format integer as decimal string and append to buffer
+func sse_buf_append_int(dst: ptr, dst_pos: int, max_len: int, val: int) -> int:
+    if val == 0 do
+        if dst_pos < (max_len - 1) do
+            write_byte(dst, dst_pos, 48) # '0'
+            out dst_pos + 1
+        end
+        out dst_pos
+    end
+
+    var v = val
+    if v < 0 do
+        if dst_pos < (max_len - 1) do
+            write_byte(dst, dst_pos, 45) # '-'
+            dst_pos = dst_pos + 1
+        end
+        v = 0 - v
+    end
+
+    let digits: ptr = alloc(24) as ptr
+    var d_count = 0
+    when v > 0 loop
+        write_byte(digits, d_count, 48 + (v mod 10))
+        v = v / 10
+        d_count = d_count + 1
+    end
+
+    var p = dst_pos
+    var j = d_count - 1
+    when j >= 0 loop
+        if p < (max_len - 1) do
+            write_byte(dst, p, read_byte(digits, j))
+            p = p + 1
+        end
+        j = j - 1
+    end
+
+    out p
+end.
+
+# Format HTTP Response Headers for SSE Stream
+func sse_format_headers(out_buf: ptr, max_len: int) -> int:
+    if out_buf == 0 as ptr do out 0 end
+    if max_len <= 0 do out 0 end
+    var p = 0
+    p = sse_buf_append(out_buf, p, max_len, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\nX-Accel-Buffering: no\r\n\r\n" as ptr)
+    write_byte(out_buf, p, 0)
+    out p
+end.
+
+# Build W3C SSE Event Frame
+# event_name: optional custom event type (e.g. "message", "update", "ping")
+# payload_data: event body (handles multi-line by prefixing each line with "data: ")
+# event_id: optional client tracking ID
+# retry_ms: reconnection delay in ms (0 to omit)
+func sse_build_event(event_name: ptr, payload_data: ptr, event_id: ptr, retry_ms: int, out_buf: ptr, max_len: int) -> int:
+    if out_buf == 0 as ptr do out 0 end
+    if max_len <= 0 do out 0 end
+    var p = 0
+
+    # 1. event: <name>\n
+    if event_name != 0 as ptr do
+        if sse_str_len(event_name) > 0 do
+            p = sse_buf_append(out_buf, p, max_len, "event: " as ptr)
+            p = sse_buf_append(out_buf, p, max_len, event_name)
+            if p < (max_len - 1) do
+                write_byte(out_buf, p, 10) # '\n'
+                p = p + 1
+            end
+        end
+    end
+
+    # 2. id: <id>\n
+    if event_id != 0 as ptr do
+        if sse_str_len(event_id) > 0 do
+            p = sse_buf_append(out_buf, p, max_len, "id: " as ptr)
+            p = sse_buf_append(out_buf, p, max_len, event_id)
+            if p < (max_len - 1) do
+                write_byte(out_buf, p, 10) # '\n'
+                p = p + 1
+            end
+        end
+    end
+
+    # 3. retry: <ms>\n
+    if retry_ms > 0 do
+        p = sse_buf_append(out_buf, p, max_len, "retry: " as ptr)
+        p = sse_buf_append_int(out_buf, p, max_len, retry_ms)
+        if p < (max_len - 1) do
+            write_byte(out_buf, p, 10) # '\n'
+            p = p + 1
+        end
+    end
+
+    # 4. data: <payload>\n (Multi-line support per W3C specification)
+    if payload_data != 0 as ptr do
+        let dlen = sse_str_len(payload_data)
+        var line_start = 0
+        var i = 0
+        when i < dlen loop
+            if read_byte(payload_data, i) == 10 do # '\n'
+                # Emit line
+                p = sse_buf_append(out_buf, p, max_len, "data: " as ptr)
+                var k = line_start
+                # Strip trailing \r if present
+                var line_end = i
+                if line_end > line_start do
+                    if read_byte(payload_data, line_end - 1) == 13 do
+                        line_end = line_end - 1
+                    end
+                end
+                when k < line_end loop
+                    if p < (max_len - 1) do
+                        write_byte(out_buf, p, read_byte(payload_data, k))
+                        p = p + 1
+                    end
+                    k = k + 1
+                end
+                if p < (max_len - 1) do
+                    write_byte(out_buf, p, 10)
+                    p = p + 1
+                end
+                line_start = i + 1
+            end
+            i = i + 1
+        end
+
+        # Emit remaining line if non-empty or if no newline was in string
+        if line_start < dlen do
+            p = sse_buf_append(out_buf, p, max_len, "data: " as ptr)
+            var k = line_start
+            var line_end = dlen
+            if line_end > line_start do
+                if read_byte(payload_data, line_end - 1) == 13 do
+                    line_end = line_end - 1
+                end
+            end
+            when k < line_end loop
+                if p < (max_len - 1) do
+                    write_byte(out_buf, p, read_byte(payload_data, k))
+                    p = p + 1
+                end
+                k = k + 1
+            end
+            if p < (max_len - 1) do
+                write_byte(out_buf, p, 10)
+                p = p + 1
+            end
+        end
+    else
+        # empty data
+        p = sse_buf_append(out_buf, p, max_len, "data: \n" as ptr)
+    end
+
+    # 5. Terminal empty line '\n' to commit the frame per RFC/W3C
+    if p < (max_len - 1) do
+        write_byte(out_buf, p, 10)
+        p = p + 1
+    end
+
+    write_byte(out_buf, p, 0)
+    out p
+end.
+
+# Build lightweight SSE Keep-Alive Ping comment (": ping\n\n")
+func sse_build_ping(out_buf: ptr, max_len: int) -> int:
+    if out_buf == 0 as ptr do out 0 end
+    if max_len <= 0 do out 0 end
+    var p = 0
+    p = sse_buf_append(out_buf, p, max_len, ": ping\n\n" as ptr)
+    write_byte(out_buf, p, 0)
+    out p
+end.
+
+export sse_format_headers, sse_build_event, sse_build_ping, sse_str_len

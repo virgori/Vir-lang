@@ -103,13 +103,19 @@ def main() -> int:
     # Check stdlib boundary
     all_errors.extend(check_stdlib_boundary())
 
+    # Check compiler module dependency hygiene (VIRC-ISS-0007 / VIRC-PLN-0005)
+    sys.path.insert(0, str(ROOT / "tools"))
+    from check_module_dependencies import check_all as check_module_deps
+    dep_count, dep_violations = check_module_deps()
+    all_errors.extend(dep_violations)
+
     if all_errors:
         print("FAIL: Pass architecture violations detected:")
         for err in all_errors:
             print(f"  • {err}")
         return 1
 
-    print(f"PASS: Architecture verified ({len(pass_files)} orchestrator(s) checked, stdlib boundary clean).")
+    print(f"PASS: Architecture verified ({len(pass_files)} orchestrator(s) checked, stdlib boundary clean, {dep_count} module dependencies clean).")
     return 0
 
 if __name__ == "__main__":

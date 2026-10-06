@@ -17,7 +17,7 @@ include result
 include alloc
 import vir_alloc, vir_free, vir_realloc from alloc
 include vec_rt
-import vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from vec_rt
+import vec_new_rt, vec_push_rt, vec_get_rt, vec_set_rt, vec_pop_rt, vec_clear_rt, vec_len_rt from vec_rt
 include vir.data.error
 
 extern func native_read_u8(addr: int, offset: int) -> int
@@ -33,6 +33,9 @@ enum JsonType:
     Array  = 4
     Object = 5
 end.
+
+# Independent stdlib guard. HTTP stacks may impose a smaller request-body cap.
+const JSON_MAX_DOCUMENT_BYTES = 10485760
 
 entity JsonValue:
     tag: int
@@ -55,6 +58,68 @@ end.
 
 func json_number(n: int) -> JsonValue:
     out JsonValue ( tag: JsonType.Number, num_val: n, str_val: "", arr_val: 0, obj_keys: 0, obj_vals: 0 )
+end.
+
+# Parsed numbers keep their exact JSON token in str_val. Integer conversion is
+# intentionally restricted to integer-form tokens; decimal/exponent forms are
+# available losslessly through asNumber() and are never truncated.
+func json_as_int(val: JsonValue) -> Option of (int):
+    if val.tag != JsonType.Number do out Option.None end
+    let src = val.str_val as int
+    if src == 0 or json_str_len(src) == 0 do
+        out Option.Some(val.num_val)
+    end
+
+    let len = json_str_len(src)
+    var i = 0
+    var negative = false
+    if native_read_u8(src, 0) == 45 do
+        negative = true
+        i = 1
+    end
+    if i >= len do out Option.None end
+
+    var magnitude = 0
+    when i < len loop
+        let ch = native_read_u8(src, i)
+        if ch < 48 or ch > 57 do out Option.None end
+        let digit = ch - 48
+        if magnitude > 922337203685477580 do out Option.None end
+        if magnitude == 922337203685477580 do
+            if negative and digit > 8 do out Option.None end
+            if negative == false and digit > 7 do out Option.None end
+        end
+        magnitude = magnitude * 10 + digit
+        i = i + 1
+    end
+    if negative do
+        if magnitude == 922337203685477580 do
+            out Option.Some(0 - 9223372036854775807 - 1)
+        end
+        out Option.Some(0 - magnitude)
+    end
+    out Option.Some(magnitude)
+end.
+
+func json_as_string(val: JsonValue) -> Option of (string):
+    if val.tag == JsonType.Str do out Option.Some(val.str_val) end
+    out Option.None
+end.
+
+func json_as_bool(val: JsonValue) -> Option of (bool):
+    if val.tag == JsonType.Bool do
+        if val.num_val != 0 do out Option.Some(true) end
+        out Option.Some(false)
+    end
+    out Option.None
+end.
+
+func json_as_number(val: JsonValue) -> Option of (string):
+    if val.tag != JsonType.Number do out Option.None end
+    if val.str_val as int != 0 and json_str_len(val.str_val as int) > 0 do
+        out Option.Some(val.str_val)
+    end
+    out Option.Some("$val.num_val")
 end.
 
 func json_string(s: string) -> JsonValue:
@@ -125,6 +190,93 @@ func json_arr_get(arr: JsonValue, idx: int) -> JsonValue:
     out json_null()
 end.
 
+func json_arr_pop(arr: JsonValue) -> Option of (JsonValue):
+    if arr.tag == JsonType.Array and arr.arr_val != 0 do
+        let n = vec_len_rt(arr.arr_val)
+        if n > 0 do
+            let value = json_arr_get(arr, n - 1)
+            vec_pop_rt(arr.arr_val)
+            out Option.Some(value)
+        end
+    end
+    out Option.None
+end.
+
+func json_arr_insert(arr: JsonValue, idx: int, item: JsonValue) -> bool:
+    if arr.tag != JsonType.Array or arr.arr_val == 0 do out false end
+    let n = vec_len_rt(arr.arr_val)
+    if idx < 0 or idx > n do out false end
+    arr.arr_val = vec_push_rt(arr.arr_val, 0)
+    var i = n
+    when i > idx loop
+        vec_set_rt(arr.arr_val, i, vec_get_rt(arr.arr_val, i - 1))
+        i = i - 1
+    end
+    let ptr = vir_alloc(48)
+    native_write_i64(ptr, 0, item.tag)
+    native_write_i64(ptr, 8, item.num_val)
+    native_write_i64(ptr, 16, item.str_val as int)
+    native_write_i64(ptr, 24, item.arr_val)
+    native_write_i64(ptr, 32, item.obj_keys)
+    native_write_i64(ptr, 40, item.obj_vals)
+    vec_set_rt(arr.arr_val, idx, ptr)
+    out true
+end.
+
+func json_arr_remove(arr: JsonValue, idx: int) -> Option of (JsonValue):
+    if arr.tag != JsonType.Array or arr.arr_val == 0 do out Option.None end
+    let n = vec_len_rt(arr.arr_val)
+    if idx < 0 or idx >= n do out Option.None end
+    let removed = json_arr_get(arr, idx)
+    var i = idx
+    when i + 1 < n loop
+        vec_set_rt(arr.arr_val, i, vec_get_rt(arr.arr_val, i + 1))
+        i = i + 1
+    end
+    vec_pop_rt(arr.arr_val)
+    out Option.Some(removed)
+end.
+
+func json_arr_contains(arr: JsonValue, item: JsonValue) -> bool:
+    if arr.tag != JsonType.Array or arr.arr_val == 0 do out false end
+    var i = 0
+    let n = vec_len_rt(arr.arr_val)
+    when i < n loop
+        let current = json_arr_get(arr, i)
+        if current.tag == item.tag do
+            if current.tag == JsonType.Null do out true end
+            if current.tag == JsonType.Bool do
+                if current.num_val == item.num_val do out true end
+            end
+            if current.tag == JsonType.Number do
+                case json_as_number(current)
+                    Option.Some(left):
+                        case json_as_number(item)
+                            Option.Some(right):
+                                if json_internal_streq(left as int, right as int) do out true end
+                            Option.None: ()
+                        end
+                    Option.None: ()
+                end
+            end
+            if current.tag == JsonType.Str do
+                if current.str_val == item.str_val do out true end
+            end
+            if current.tag == JsonType.Array or current.tag == JsonType.Object do
+                if current.arr_val == item.arr_val and current.obj_keys == item.obj_keys do out true end
+            end
+        end
+        i = i + 1
+    end
+    out false
+end.
+
+func json_arr_clear(arr: JsonValue):
+    if arr.tag == JsonType.Array and arr.arr_val != 0 do
+        vec_clear_rt(arr.arr_val)
+    end
+end.
+
 func json_obj_set(obj: JsonValue, key: string, val: JsonValue):
     if obj.tag == JsonType.Object and obj.obj_keys != 0 do
         let kptr = key as int
@@ -184,6 +336,146 @@ func json_obj_len(obj: JsonValue) -> int:
         out vec_len_rt(obj.obj_keys)
     end
     out 0
+end.
+
+func json_obj_remove(obj: JsonValue, key: string) -> Option of (JsonValue):
+    if obj.tag != JsonType.Object or obj.obj_keys == 0 or obj.obj_vals == 0 do
+        out Option.None
+    end
+    let n = vec_len_rt(obj.obj_keys)
+    var idx = 0
+    var found = false
+    when idx < n and found == false loop
+        if json_internal_streq(vec_get_rt(obj.obj_keys, idx), key as int) do
+            found = true
+        else
+            idx = idx + 1
+        end
+    end
+    if found == false do out Option.None end
+    let ptr = vec_get_rt(obj.obj_vals, idx)
+    let removed = JsonValue(
+        tag: native_read_i64(ptr, 0),
+        num_val: native_read_i64(ptr, 8),
+        str_val: native_read_i64(ptr, 16) as string,
+        arr_val: native_read_i64(ptr, 24),
+        obj_keys: native_read_i64(ptr, 32),
+        obj_vals: native_read_i64(ptr, 40)
+    )
+    var i = idx
+    when i + 1 < n loop
+        vec_set_rt(obj.obj_keys, i, vec_get_rt(obj.obj_keys, i + 1))
+        vec_set_rt(obj.obj_vals, i, vec_get_rt(obj.obj_vals, i + 1))
+        i = i + 1
+    end
+    vec_pop_rt(obj.obj_keys)
+    vec_pop_rt(obj.obj_vals)
+    out Option.Some(removed)
+end.
+
+func json_obj_clear(obj: JsonValue):
+    if obj.tag == JsonType.Object and obj.obj_keys != 0 and obj.obj_vals != 0 do
+        vec_clear_rt(obj.obj_keys)
+        vec_clear_rt(obj.obj_vals)
+    end
+end.
+
+func json_obj_keys(obj: JsonValue) -> JsonValue:
+    var result = json_array()
+    var i = 0
+    let n = json_obj_len(obj)
+    when i < n loop
+        json_arr_push(result, json_string(json_obj_key_at(obj, i)))
+        i = i + 1
+    end
+    out result
+end.
+
+func json_obj_values(obj: JsonValue) -> JsonValue:
+    var result = json_array()
+    var i = 0
+    let n = json_obj_len(obj)
+    when i < n loop
+        json_arr_push(result, json_obj_val_at(obj, i))
+        i = i + 1
+    end
+    out result
+end.
+
+func json_obj_entries(obj: JsonValue) -> JsonValue:
+    var result = json_array()
+    var i = 0
+    let n = json_obj_len(obj)
+    when i < n loop
+        var entry = json_array()
+        json_arr_push(entry, json_string(json_obj_key_at(obj, i)))
+        json_arr_push(entry, json_obj_val_at(obj, i))
+        json_arr_push(result, entry)
+        i = i + 1
+    end
+    out result
+end.
+
+func json_deep_equal(left: JsonValue, right: JsonValue) -> bool:
+    if left.tag != right.tag do out false end
+    if left.tag == JsonType.Null do out true end
+    if left.tag == JsonType.Bool do out left.num_val == right.num_val end
+    if left.tag == JsonType.Number do
+        case json_as_number(left)
+            Option.Some(left_num):
+                case json_as_number(right)
+                    Option.Some(right_num): out json_internal_streq(left_num as int, right_num as int)
+                    Option.None: out false
+                end
+            Option.None: out false
+        end
+    end
+    if left.tag == JsonType.Str do out left.str_val == right.str_val end
+    if left.tag == JsonType.Array do
+        let left_len = json_arr_len(left)
+        if left_len != json_arr_len(right) do out false end
+        var i = 0
+        when i < left_len loop
+            if json_deep_equal(json_arr_get(left, i), json_arr_get(right, i)) == false do
+                out false
+            end
+            i = i + 1
+        end
+        out true
+    end
+    if left.tag == JsonType.Object do
+        let left_len = json_obj_len(left)
+        if left_len != json_obj_len(right) do out false end
+        var i = 0
+        when i < left_len loop
+            let key = json_obj_key_at(left, i)
+            case json_obj_get(right, key)
+                Option.Some(value):
+                    if json_deep_equal(json_obj_val_at(left, i), value) == false do
+                        out false
+                    end
+                Option.None: out false
+            end
+            i = i + 1
+        end
+        out true
+    end
+    out false
+end.
+
+func json_deep_clone(value: JsonValue):
+    out json_parse(json_stringify(value))
+end.
+
+func json_obj_merge(target: JsonValue, source: JsonValue) -> bool:
+    if target.tag != JsonType.Object or source.tag != JsonType.Object do out false end
+    var i = 0
+    let n = json_obj_len(source)
+    when i < n loop
+        json_obj_set(target, json_obj_key_at(source, i), json_obj_val_at(source, i))
+        i = i + 1
+    end
+    out true
 end.
 
 func json_obj_key_at(obj: JsonValue, idx: int) -> string:
@@ -493,9 +785,7 @@ end.
 
 func json_parse_num(ref p: JsonParser) -> JsonValue:
     let start = p.pos
-    var is_neg = 0
     if native_read_u8(p.src, p.pos) == 45 do
-        is_neg = 1
         p.pos = p.pos + 1
         if p.pos >= p.len do
             json_parse_error(p, "unexpected end of number")
@@ -586,20 +876,6 @@ func json_parse_num(ref p: JsonParser) -> JsonValue:
     end
 
     let num_len = p.pos - start
-    var int_val = 0
-    var i = start
-    if is_neg == 1 do i = i + 1 end
-    when i < p.pos loop
-        let d = native_read_u8(p.src, i)
-        if d >= 48 and d <= 57 do
-            int_val = (int_val * 10) + (d - 48)
-        else
-            break
-        end
-        i = i + 1
-    end
-    if is_neg == 1 do int_val = -int_val end
-
     let raw_buf = vir_alloc(num_len + 1)
     var j = 0
     when j < num_len loop
@@ -610,7 +886,7 @@ func json_parse_num(ref p: JsonParser) -> JsonValue:
 
     out JsonValue (
         tag: JsonType.Number,
-        num_val: int_val,
+        num_val: 0,
         str_val: raw_buf as string,
         arr_val: 0,
         obj_keys: 0,
@@ -713,6 +989,8 @@ func json_parse_object(ref p: JsonParser) -> JsonValue:
             p.depth = p.depth - 1
             out obj
         end
+        # Duplicate keys use last-wins: replacement keeps the original key slot,
+        # preserving insertion order while replacing its value.
         json_obj_set(obj, key, val)
 
         json_skip_ws(p)
@@ -761,6 +1039,9 @@ func json_parse(text: string):
         out Result.Err(parse_error_new(0, 1, 1, "empty input"))
     end
     let len = json_str_len(src)
+    if len > JSON_MAX_DOCUMENT_BYTES do
+        out Result.Err(parse_error_new(JSON_MAX_DOCUMENT_BYTES, 1, 1, "maximum JSON document size exceeded (10485760 bytes)"))
+    end
     var p = JsonParser (
         src: src,
         len: len,
@@ -964,12 +1245,7 @@ func json_serialize_node(ref jb: JsonBuf, val: JsonValue, indent: int, level: in
                         obj_vals: native_read_i64(ptr, 40)
                     )
                     json_serialize_node(jb, item, indent, level + 1)
-                    if i + 1 < count do
-                        jb_append_byte(jb, 44)
-                        if indent == 0 do
-                            jb_append_byte(jb, 32)
-                        end
-                    end
+                    if i + 1 < count do jb_append_byte(jb, 44) end
                     i = i + 1
                 end
                 if indent > 0 do
@@ -1013,16 +1289,11 @@ func json_serialize_node(ref jb: JsonBuf, val: JsonValue, indent: int, level: in
                     )
                     jb_append_escaped_string(jb, k)
                     jb_append_byte(jb, 58)
-                    if indent > 0 or true do
+                    if indent > 0 do
                         jb_append_byte(jb, 32)
                     end
                     json_serialize_node(jb, v, indent, level + 1)
-                    if i + 1 < count do
-                        jb_append_byte(jb, 44)
-                        if indent == 0 do
-                            jb_append_byte(jb, 32)
-                        end
-                    end
+                    if i + 1 < count do jb_append_byte(jb, 44) end
                     i = i + 1
                 end
                 if indent > 0 do
@@ -1108,6 +1379,46 @@ entity JsonNamespace:
     method push(arr: JsonValue, item: JsonValue):
         json_arr_push(arr, item)
     end.
+    method pop(arr: JsonValue) -> Option of (JsonValue):
+        out json_arr_pop(arr)
+    end.
+    method insert(arr: JsonValue, idx: int, item: JsonValue) -> bool:
+        out json_arr_insert(arr, idx, item)
+    end.
+    method removeAt(arr: JsonValue, idx: int) -> Option of (JsonValue):
+        out json_arr_remove(arr, idx)
+    end.
+    method contains(arr: JsonValue, item: JsonValue) -> bool:
+        out json_arr_contains(arr, item)
+    end.
+    method clear(val: JsonValue):
+        if val.tag == JsonType.Array do
+            json_arr_clear(val)
+        eif val.tag == JsonType.Object do
+            json_obj_clear(val)
+        end
+    end.
+    method keys(obj: JsonValue) -> JsonValue:
+        out json_obj_keys(obj)
+    end.
+    method values(obj: JsonValue) -> JsonValue:
+        out json_obj_values(obj)
+    end.
+    method entries(obj: JsonValue) -> JsonValue:
+        out json_obj_entries(obj)
+    end.
+    method remove(obj: JsonValue, key: string) -> Option of (JsonValue):
+        out json_obj_remove(obj, key)
+    end.
+    method deepEqual(left: JsonValue, right: JsonValue) -> bool:
+        out json_deep_equal(left, right)
+    end.
+    method deepClone(val: JsonValue):
+        out json_deep_clone(val)
+    end.
+    method merge(target: JsonValue, source: JsonValue) -> bool:
+        out json_obj_merge(target, source)
+    end.
     method len(val: JsonValue) -> int:
         if val.tag == JsonType.Array and val.arr_val != 0 do
             out vec_len_rt(val.arr_val)
@@ -1138,25 +1449,26 @@ entity JsonNamespace:
     method kind(val: JsonValue) -> int:
         out val.tag
     end.
-    method as_int(val: JsonValue) -> int:
-        out val.num_val
+    method as_int(val: JsonValue) -> Option of (int):
+        out json_as_int(val)
     end.
-    method asInt(val: JsonValue) -> int:
-        out val.num_val
+    method asInt(val: JsonValue) -> Option of (int):
+        out json_as_int(val)
     end.
-    method as_string(val: JsonValue) -> string:
-        out val.str_val
+    method as_string(val: JsonValue) -> Option of (string):
+        out json_as_string(val)
     end.
-    method asString(val: JsonValue) -> string:
-        out val.str_val
+    method asString(val: JsonValue) -> Option of (string):
+        out json_as_string(val)
     end.
-    method as_bool(val: JsonValue) -> bool:
-        if val.num_val != 0 do out true end
-        out false
+    method as_bool(val: JsonValue) -> Option of (bool):
+        out json_as_bool(val)
     end.
-    method asBool(val: JsonValue) -> bool:
-        if val.num_val != 0 do out true end
-        out false
+    method asBool(val: JsonValue) -> Option of (bool):
+        out json_as_bool(val)
+    end.
+    method asNumber(val: JsonValue) -> Option of (string):
+        out json_as_number(val)
     end.
     method is_null(val: JsonValue) -> bool:
         if val.tag == JsonType.Null do out true end
@@ -1183,8 +1495,9 @@ entity JsonNamespace:
         let opt = json_obj_get(obj, key)
         case opt
             Option.Some(v):
-                if kind(v) == JsonType.Number do
-                    out as_int(v)
+                case json_as_int(v)
+                    Option.Some(n): out n
+                    Option.None: out default
                 end
             Option.None:
                 out default
@@ -1195,8 +1508,9 @@ entity JsonNamespace:
         let opt = json_obj_get(obj, key)
         case opt
             Option.Some(v):
-                if kind(v) == JsonType.Str do
-                    out as_string(v)
+                case json_as_string(v)
+                    Option.Some(s): out s
+                    Option.None: out default
                 end
             Option.None:
                 out default
@@ -1207,8 +1521,9 @@ entity JsonNamespace:
         let opt = json_obj_get(obj, key)
         case opt
             Option.Some(v):
-                if kind(v) == JsonType.Bool do
-                    out as_bool(v)
+                case json_as_bool(v)
+                    Option.Some(b): out b
+                    Option.None: out default
                 end
             Option.None:
                 out default
@@ -1255,30 +1570,32 @@ func kind(v: JsonValue) -> int:
     out v.tag
 end.
 
-func as_int(v: JsonValue) -> int:
-    out v.num_val
+func as_int(v: JsonValue) -> Option of (int):
+    out json_as_int(v)
 end.
 
-func asInt(v: JsonValue) -> int:
-    out v.num_val
+func asInt(v: JsonValue) -> Option of (int):
+    out json_as_int(v)
 end.
 
-func as_string(v: JsonValue) -> string:
-    out v.str_val
+func as_string(v: JsonValue) -> Option of (string):
+    out json_as_string(v)
 end.
 
-func asString(v: JsonValue) -> string:
-    out v.str_val
+func asString(v: JsonValue) -> Option of (string):
+    out json_as_string(v)
 end.
 
-func as_bool(v: JsonValue) -> bool:
-    if v.num_val != 0 do out true end
-    out false
+func as_bool(v: JsonValue) -> Option of (bool):
+    out json_as_bool(v)
 end.
 
-func asBool(v: JsonValue) -> bool:
-    if v.num_val != 0 do out true end
-    out false
+func asBool(v: JsonValue) -> Option of (bool):
+    out json_as_bool(v)
+end.
+
+func asNumber(v: JsonValue) -> Option of (string):
+    out json_as_number(v)
 end.
 
 func is_null(v: JsonValue) -> bool:
@@ -1363,6 +1680,58 @@ func push(v: JsonValue, item: JsonValue):
     json_arr_push(v, item)
 end.
 
+func pop(v: JsonValue) -> Option of (JsonValue):
+    out json_arr_pop(v)
+end.
+
+func insert(v: JsonValue, idx: int, item: JsonValue) -> bool:
+    out json_arr_insert(v, idx, item)
+end.
+
+func removeAt(v: JsonValue, idx: int) -> Option of (JsonValue):
+    out json_arr_remove(v, idx)
+end.
+
+func contains(v: JsonValue, item: JsonValue) -> bool:
+    out json_arr_contains(v, item)
+end.
+
+func clear(v: JsonValue):
+    if v.tag == JsonType.Array do
+        json_arr_clear(v)
+    eif v.tag == JsonType.Object do
+        json_obj_clear(v)
+    end
+end.
+
+func keys(v: JsonValue) -> JsonValue:
+    out json_obj_keys(v)
+end.
+
+func values(v: JsonValue) -> JsonValue:
+    out json_obj_values(v)
+end.
+
+func entries(v: JsonValue) -> JsonValue:
+    out json_obj_entries(v)
+end.
+
+func remove(v: JsonValue, key: string) -> Option of (JsonValue):
+    out json_obj_remove(v, key)
+end.
+
+func deepEqual(left: JsonValue, right: JsonValue) -> bool:
+    out json_deep_equal(left, right)
+end.
+
+func deepClone(v: JsonValue):
+    out json_deep_clone(v)
+end.
+
+func merge(target: JsonValue, source: JsonValue) -> bool:
+    out json_obj_merge(target, source)
+end.
+
 func has(v: JsonValue, key: string) -> bool:
     let opt = json_obj_get(v, key)
     case opt
@@ -1386,7 +1755,10 @@ func getInt(v: JsonValue, key: string, default: int) -> int:
     case opt
         Option.Some(val):
             if kind(val) == JsonType.Number do
-                out as_int(val)
+                case json_as_int(val)
+                    Option.Some(n): out n
+                    Option.None: out default
+                end
             end
         Option.None:
             out default
@@ -1400,7 +1772,10 @@ func getStr(v: JsonValue, key: string, default: string) -> string:
     case opt
         Option.Some(val):
             if kind(val) == JsonType.Str do
-                out as_string(val)
+                case json_as_string(val)
+                    Option.Some(s): out s
+                    Option.None: out default
+                end
             end
         Option.None:
             out default
@@ -1413,7 +1788,10 @@ func getBool(v: JsonValue, key: string, default: bool) -> bool:
     case opt
         Option.Some(val):
             if kind(val) == JsonType.Bool do
-                out as_bool(val)
+                case json_as_bool(val)
+                    Option.Some(b): out b
+                    Option.None: out default
+                end
             end
         Option.None:
             out default
@@ -1458,4 +1836,4 @@ func fromBools(values: [bool]) -> JsonValue:
     out arr
 end.
 
-export JsonType, JsonValue, JsonNamespace, json, kind, as_int, asInt, as_string, asString, as_bool, asBool, is_null, isNull, asArray, asObject, len, count, size, at, get, set, push, has, key, value, getInt, getStr, getBool, fromInts, fromStrings, fromBools
+export JsonType, JsonValue, JsonNamespace, JSON_MAX_DOCUMENT_BYTES, json, json_null, json_bool, json_number, json_string, json_array, json_object, json_parse, json_stringify, json_stringify_pretty, json_obj_get, json_obj_set, json_arr_get, json_arr_push, json_arr_pop, json_arr_insert, json_arr_remove, json_arr_contains, json_arr_clear, json_obj_remove, json_obj_clear, json_obj_keys, json_obj_values, json_obj_entries, json_deep_equal, json_deep_clone, json_obj_merge, kind, as_int, asInt, as_string, asString, as_bool, asBool, asNumber, is_null, isNull, asArray, asObject, len, count, size, at, get, set, push, pop, insert, removeAt, contains, clear, keys, values, entries, remove, deepEqual, deepClone, merge, has, key, value, getInt, getStr, getBool, fromInts, fromStrings, fromBools

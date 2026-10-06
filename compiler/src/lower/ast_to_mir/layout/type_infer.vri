@@ -1,0 +1,524 @@
+##
+ * compiler/src/lower/ast_to_mir/layout/type_infer.vri — generic substitution, field types and expression type inference
+ * VIRC-PLN-0009: extracted verbatim from compiler/src/lower/ast_to_mir/layout.vri.
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+include parser
+include mir
+include ast_to_mir_context
+
+func generic_substitute_type(param_names: &string, arg_types: &string, target_type: &string):
+    tlen = fat_str_len(target_type as string)
+    if fat_str_len(param_names as string) == 0 or fat_str_len(arg_types as string) == 0 or tlen == 0 do
+        out target_type as string
+    end
+    p_count = count_list_items(param_names as string)
+    if p_count <= 0 do out target_type as string end
+
+    # Fast path: exact whole-string match
+    var p = 0
+    when p < p_count loop
+        p_name = get_list_item(param_names as string, p)
+        if fat_str_eq(p_name, target_type as string) == 1 do
+            out get_list_item(arg_types as string, p)
+        end
+        p = p + 1
+    end
+
+    # Word/token-level substitution for compound types:
+    # Handles Vec<T>, Map<K,V>, func(U,T)->U, &T, &mut T, [T], tensor<T>[M,N], etc.
+    var res = fat_str_new("")
+    var i = 0
+    var changed = false
+    when i < tlen loop
+        c = fat_str_byte_at(target_type as string, i)
+        if (c >= 65 and c <= 90) or (c >= 97 and c <= 122) or c == 95 do
+            var wstart = i
+            i = i + 1
+            when i < tlen loop
+                c2 = fat_str_byte_at(target_type as string, i)
+                if (c2 >= 65 and c2 <= 90) or (c2 >= 97 and c2 <= 122) or (c2 >= 48 and c2 <= 57) or c2 == 95 do
+                    i = i + 1
+                else
+                    break
+                end
+            end
+            word = fat_str_slice(target_type as string, wstart, i - wstart)
+            var matched = false
+            var j = 0
+            when j < p_count loop
+                p_name = get_list_item(param_names as string, j)
+                if fat_str_eq(p_name, word) == 1 do
+                    arg_t = get_list_item(arg_types as string, j)
+                    res = fat_str_concat(res, arg_t)
+                    matched = true
+                    changed = true
+                    break
+                end
+                j = j + 1
+            end
+            if not matched do
+                res = fat_str_concat(res, word)
+            end
+        else
+            res = fat_str_concat(res, fat_str_slice(target_type as string, i, 1))
+            i = i + 1
+        end
+    end
+    if changed do
+        out res
+    end
+    out target_type as string
+end.
+
+func get_entity_field_type_by_name(ent_name: &string, field_name: &string):
+    if g_entity_hash != 0 and ent_name != 0 and field_name != 0 do
+        e_idx = hash_table_lookup(g_entity_hash, g_entity_names, ent_name)
+        if e_idx >= 0 and e_idx < vec_len_rt(g_entity_nodes) do
+            ent_ast = vec_get_rt(g_entity_nodes, e_idx) as AstNode
+            if (ent_ast as i64) != 0 do
+                n_ch = ast_node_child_count(ent_ast)
+                var j = 0
+                when j < n_ch loop
+                    f_child = ast_node_child(ent_ast, j)
+                    if ast_node_type_of(f_child) != AstType.FuncDef and fat_str_eq(ast_node_name(f_child), field_name) == 1 do
+                        out ast_node_name2(f_child)
+                    end
+                    j = j + 1
+                end
+            end
+        end
+    end
+    out fat_str_new("")
+end.
+
+func get_entity_field_tdesc_by_name(ent_name: &string, field_name: &string) -> int:
+    if g_entity_hash != 0 and ent_name != 0 and field_name != 0 do
+        let e_idx = hash_table_lookup(g_entity_hash, g_entity_names, ent_name)
+        if e_idx >= 0 and e_idx < vec_len_rt(g_entity_nodes) do
+            let ent_ast = vec_get_rt(g_entity_nodes, e_idx) as AstNode
+            if (ent_ast as i64) != 0 do
+                let n_ch = ast_node_child_count(ent_ast)
+                var j = 0
+                when j < n_ch loop
+                    let f_child = ast_node_child(ent_ast, j)
+                    if ast_node_type_of(f_child) != AstType.FuncDef and fat_str_eq(ast_node_name(f_child), field_name) == 1 do
+                        out f_child.builtin_id
+                    end
+                    j = j + 1
+                end
+            end
+        end
+    end
+    out 0
+end.
+
+func is_float_type_name(name: &string) -> bool:
+    out type_primitive_kind_from_name(name) == TypeKind.Float
+end.
+
+# Lightweight lowering-time type recovery for inferred locals.  The semantic
+# passes already validate compatibility; this table is needed by representation-
+# sensitive lowering such as interpolation and tensor result metadata.
+func infer_expr_type_name(node: &AstNode):
+    if node == 0 do out fat_str_new("") end
+    nt = ast_node_type_of(node)
+    if nt == AstType.LiteralInt do out fat_str_new("int") end
+    if nt == AstType.LiteralFloat do out fat_str_new("float") end
+    if nt == AstType.PercentExpr do out fat_str_new("float") end
+    if nt == AstType.LiteralBool do out fat_str_new("bool") end
+    if nt == AstType.LiteralNone do out fat_str_new("none") end
+    if nt == AstType.EnumConstruct do out ast_node_name2(node) end
+    if nt == AstType.LiteralStr or nt == AstType.InterpExpr do out fat_str_new("string") end
+    if nt == AstType.ArrayLiteral do
+        if ast_node_child_count(node) > 0 do
+            let elem_t = infer_expr_type_name(ast_node_child(node, 0))
+            if fat_str_len(elem_t) > 0 do
+                out fat_str_concat(fat_str_new("["), fat_str_concat(elem_t, fat_str_new("]")))
+            end
+        end
+        out fat_str_new("[int]")
+    end
+    if nt == AstType.CastExpr do out ast_node_name(node) end
+    if nt == AstType.AddrOf and ast_node_child_count(node) > 0 do
+        let child_type = infer_expr_type_name(ast_node_child(node, 0))
+        if fat_str_len(child_type) == 0 do out child_type end
+        if fat_cstr_eq(ast_node_name(node), "mut") == 1 or ast_node_int_val(node) == 1 do
+            out fat_str_concat(fat_str_new("&mut "), child_type)
+        end
+        out fat_str_concat(fat_str_new("&"), child_type)
+    end
+    if nt == AstType.Identifier do
+        vt = get_var_type(ast_node_name(node))
+        if vt != 0 and fat_str_len(vt) > 0 do out vt end
+        let fn_chk = find_func_ast(ast_node_name(node))
+        if (fn_chk as i64) != 0 do
+            out ast_node_name(node)
+        end
+        out fat_str_new("")
+    end
+    if nt == AstType.Call do
+        callee_name = resolve_callee_alias(ast_node_name(node))
+        if fat_cstr_eq(callee_name, "flux") == 1 do
+            var child_c = ast_node_child_count(node)
+            var flux_elem_t = fat_str_new("int")
+            var has_float = false
+            var has_int = false
+            var ci = 0
+            when ci < child_c loop
+                var ch_node = ast_node_child(node, ci)
+                var ch_nt = ast_node_type_of(ch_node)
+                var ch_t = infer_expr_type_name(ch_node)
+                if ch_nt == AstType.LiteralFloat or fat_cstr_eq(ch_t, "float") == 1 or fat_cstr_eq(ch_t, "f64") == 1 or fat_cstr_eq(ch_t, "f32") == 1 do
+                    has_float = true
+                else
+                    has_int = true
+                end
+                ci = ci + 1
+            end
+            if has_float and has_int do
+                print_str("virc: error: [E3001] heterogeneous flux lanes not supported\n")
+                sys_exit(1)
+            end
+            if has_float do
+                flux_elem_t = fat_str_new("float")
+            end
+            out fat_str_concat(fat_str_new("flux<"), fat_str_concat(flux_elem_t, fat_str_concat(fat_str_new(", "), fat_str_concat(fat_str_new(rt_itoa(child_c)), fat_str_new(">")))))
+        end
+        if fat_cstr_eq(callee_name, "flux_splat") == 1 and ast_node_child_count(node) >= 2 do
+            var n_arg = ast_node_child(node, 1)
+            var n_lanes = 4
+            if ast_node_type_of(n_arg) == AstType.LiteralInt do
+                n_lanes = ast_node_int_val(n_arg)
+            end
+            out fat_str_concat(fat_str_new("flux<int, "), fat_str_concat(fat_str_new(rt_itoa(n_lanes)), fat_str_new(">")))
+        end
+        if fat_cstr_eq(callee_name, "flux_dot") == 1 do
+            out fat_str_new("int")
+        end
+        if fat_cstr_eq(callee_name, "flux_norm") == 1 do
+            out fat_str_new("int")
+        end
+        if fat_cstr_eq(callee_name, "q80CreateView") == 1 do
+            if fat_str_len(ast_node_name2(node)) > 0 do
+                out ast_node_name2(node)
+            end
+            out fat_str_new("Q80TensorView")
+        end
+        callee_ast = find_func_ast(callee_name as i64)
+        if (callee_ast as i64) != 0 do
+            ret_t = ast_node_name2(callee_ast)
+            if ret_t != 0 and fat_str_len(ret_t) > 0 do out ret_t end
+        end
+        out fat_str_new("")
+    end
+    if nt == AstType.QuantizeExpr do
+        if fat_str_len(ast_node_name2(node)) > 0 do
+            out ast_node_name2(node)
+        end
+        out fat_str_new("QuantizedTensor")
+    end
+    if nt == AstType.SwizzleExpr do
+        var sw_len = fat_str_len(ast_node_name(node))
+        var sw_elem = fat_str_new("int")
+        if ast_node_child_count(node) > 0 do
+            var c_node = ast_node_child(node, 0)
+            var c_t = infer_expr_type_name(c_node)
+            if (c_t as i64) == 0 or fat_str_len(c_t) == 0 do
+                if ast_node_type_of(c_node) == AstType.Identifier do
+                    c_t = get_var_type(ast_node_name(c_node))
+                end
+            end
+            if is_flux_type_str(c_t) and (parse_flux_elem_type(c_t) as int) == (TypeKind.Float as int) do
+                sw_elem = fat_str_new("float")
+            end
+        end
+        out fat_str_concat(fat_str_new("flux<"), fat_str_concat(sw_elem, fat_str_concat(fat_str_new(", "), fat_str_concat(fat_str_new(rt_itoa(sw_len)), fat_str_new(">")))))
+    end
+    if nt == AstType.EntityLiteral do
+        let gen_args_lit = ast_node_name2(node)
+        if (gen_args_lit as i64) != 0 and fat_str_len(gen_args_lit) > 0 do
+            out fat_str_concat(ast_node_name(node), fat_str_concat(fat_str_new("<"), fat_str_concat(gen_args_lit, fat_str_new(">"))))
+        end
+        out ast_node_name(node)
+    end
+    if nt == AstType.FieldAccess and ast_node_child_count(node) >= 1 do
+        base_ast = ast_node_child(node, 0)
+        base_t = infer_expr_type_name(base_ast)
+        fname = ast_node_name(node)
+        if fat_str_len(base_t) > 0 do
+            ent_name = extract_base_entity_name(base_t)
+            raw_field_t = get_entity_field_type_by_name(ent_name, fname)
+            if fat_str_len(raw_field_t) > 0 do
+                e_idx = hash_table_lookup(g_entity_hash, g_entity_names, ent_name)
+                if e_idx >= 0 and e_idx < vec_len_rt(g_entity_nodes) do
+                    ent_ast = vec_get_rt(g_entity_nodes, e_idx) as AstNode
+                    if ent_ast.builtin_id != 0 do
+                        ent_params = ent_ast.builtin_id as string
+                        ent_args = extract_generic_args_content(base_t)
+                        out generic_substitute_type(ent_params, ent_args, raw_field_t)
+                    end
+                end
+                out raw_field_t
+            end
+        end
+        out fat_str_new("")
+    end
+    if nt == AstType.Compare do out fat_str_new("bool") end
+    if nt == AstType.BinOp and ast_node_child_count(node) >= 2 do
+        op = ast_node_op_of(node)
+        if op == OpType.PowOp and ast_node_int_val(node) == 1 do out fat_str_new("float") end
+        if op == OpType.Eq or op == OpType.Ne or op == OpType.Gt or op == OpType.Lt or op == OpType.Ge or op == OpType.Le or op == OpType.SafeEq or op == OpType.SafeNe or op == OpType.Land or op == OpType.Lor do
+            out fat_str_new("bool")
+        end
+        left_t = infer_expr_type_name(ast_node_child(node, 0))
+        right_t = infer_expr_type_name(ast_node_child(node, 1))
+        if is_flux_type_str(left_t) do out left_t end
+        if is_flux_type_str(right_t) do out right_t end
+        if op == OpType.MatMulOp or op == OpType.FmaOp do
+            let mm_desc = infer_expr_tdesc(node)
+            if mm_desc != 0 do out tdesc_type_string(mm_desc) end
+            out left_t
+        end
+        if is_float_type_name(left_t) or is_float_type_name(right_t) do out fat_str_new("float") end
+        if fat_cstr_eq(left_t, "string") == 1 and fat_cstr_eq(right_t, "string") == 1 do out fat_str_new("string") end
+        if fat_str_len(left_t) > 0 do out left_t end
+        out right_t
+    end
+    if (nt == AstType.UnaryMinus or nt == AstType.UnaryNot) and ast_node_child_count(node) > 0 do
+        out infer_expr_type_name(ast_node_child(node, 0))
+    end
+    if nt == AstType.Assign and ast_node_child_count(node) > 0 do
+        out infer_expr_type_name(ast_node_child(node, 0))
+    end
+    if nt == AstType.IndexAccess or nt == AstType.ExprIndex do
+        var base_t = fat_str_new("")
+        if nt == AstType.IndexAccess do
+            base_t = get_var_type(ast_node_name(node))
+        else
+            if ast_node_child_count(node) > 0 do
+                base_t = infer_expr_type_name(ast_node_child(node, 0))
+            end
+        end
+        if is_flux_type_str(base_t) do
+            var f_elem = parse_flux_elem_type(base_t) as int
+            if f_elem == (TypeKind.Float as int) do
+                out fat_str_new("float")
+            else
+                out fat_str_new("int")
+            end
+        end
+        let base_d = infer_expr_tdesc_of_index_base(node)
+        if base_d != 0 do
+            if tdesc_is_float(base_d) do
+                out fat_str_new("float")
+            else
+                out fat_str_new("int")
+            end
+        end
+    end
+    out fat_str_new("")
+end.
+
+
+# Descriptor of the container indexed by an IndexAccess/ExprIndex node.
+func infer_expr_tdesc_of_index_base(node: &AstNode) -> int:
+    let nt = ast_node_type_of(node)
+    if nt == AstType.IndexAccess do
+        out get_var_tdesc(ast_node_name(node))
+    end
+    if nt == AstType.ExprIndex and ast_node_child_count(node) > 0 do
+        out infer_expr_tdesc(ast_node_child(node, 0))
+    end
+    out 0
+end.
+
+# Structural tensor descriptor of an expression (0 when it is not a tensor).
+# Variables carry the descriptor recorded at their declaration; matmul/FMA
+# results are derived from operand descriptors; calls, casts, and fields
+# consume descriptors attached during semantic analysis.
+func infer_expr_tdesc(node: &AstNode) -> int:
+    if node == 0 do out 0 end
+    let nt = ast_node_type_of(node)
+    if nt == AstType.Identifier do
+        out get_var_tdesc(ast_node_name(node))
+    end
+    if nt == AstType.BinOp and ast_node_child_count(node) >= 2 do
+        let op = ast_node_op_of(node)
+        if op == OpType.MatMulOp or op == OpType.FmaOp do
+            let right_d = infer_expr_tdesc(ast_node_child(node, 1))
+            let left_q = infer_expr_type_name(ast_node_child(node, 0))
+            if is_quantized_type_str(left_q as int) do
+                # Quantized left operand: its metadata is the quantized codec
+                # annotation (outside the dense-tensor descriptor); the result
+                # is a dense tensor, f64 when either side is floating point.
+                let shape_q = parse_quantized_shape(left_q as int)
+                if vec_len_rt(shape_q) >= 2 and tdesc_rank(right_d) >= 2 do
+                    var q_code = 6
+                    if parse_quantized_elem_type(left_q as int) == TypeKind.Float or tdesc_is_float(right_d) do
+                        q_code = 7
+                    end
+                    out tdesc_matmul_result_elem(vec_get_rt(shape_q, 0) as int, tdesc_dim(right_d, 1), q_code)
+                end
+                out 0
+            end
+            out tdesc_matmul_result(infer_expr_tdesc(ast_node_child(node, 0)), right_d)
+        end
+        out 0
+    end
+    if nt == AstType.UnaryMinus or nt == AstType.Assign do
+        if ast_node_child_count(node) > 0 do
+            out infer_expr_tdesc(ast_node_child(node, 0))
+        end
+        out 0
+    end
+    if nt == AstType.CastExpr do
+        out node.builtin_id
+    end
+    if nt == AstType.FieldAccess and ast_node_child_count(node) >= 1 do
+        let base_ast = ast_node_child(node, 0)
+        let base_t = infer_expr_type_name(base_ast)
+        let fname = ast_node_name(node)
+        if fat_str_len(base_t) > 0 do
+            let ent_name = extract_base_entity_name(base_t)
+            out get_entity_field_tdesc_by_name(ent_name, fname)
+        end
+        out 0
+    end
+    if nt == AstType.Call do
+        let callee_ast = find_func_ast(resolve_callee_alias(ast_node_name(node)) as i64)
+        if (callee_ast as i64) != 0 do
+            out ast_node_op_of(callee_ast) as int
+        end
+        out 0
+    end
+    out 0
+end.
+
+
+func get_callable_param_mode(fn_type_str: &string, p_idx: i64) -> int:
+    if (fn_type_str as i64) == 0 do out 0 end
+    let slen = fat_str_len(fn_type_str)
+    if slen == 0 do out 0 end
+    var p_open = 0 - 1
+    var p_close = slen
+    var i = 0
+    when i < slen loop
+        let b = fat_str_byte_at(fn_type_str, i)
+        if b == 40 and p_open < 0 do
+            p_open = i
+        eif b == 41 and p_open >= 0 and p_close == slen do
+            p_close = i
+        end
+        i = i + 1
+    end
+    if p_open < 0 do out 0 end
+    var cur_idx = 0
+    var param_start = p_open + 1
+    var depth = 0
+    var pos = p_open + 1
+    when pos <= p_close loop
+        var is_delim = 0
+        if pos == p_close do
+            is_delim = 1
+        else
+            let ch = fat_str_byte_at(fn_type_str, pos)
+            if ch == 40 or ch == 91 or ch == 60 do
+                depth = depth + 1
+            eif ch == 41 or ch == 93 or ch == 62 do
+                if depth > 0 do depth = depth - 1 end
+            eif ch == 44 and depth == 0 do
+                is_delim = 1
+            end
+        end
+        if is_delim == 1 do
+            if cur_idx == p_idx do
+                var k = param_start
+                when k < pos and (fat_str_byte_at(fn_type_str, k) == 32 or fat_str_byte_at(fn_type_str, k) == 9) loop
+                    k = k + 1
+                end
+                if k + 3 <= pos and fat_str_byte_at(fn_type_str, k) == 114 and fat_str_byte_at(fn_type_str, k + 1) == 101 and fat_str_byte_at(fn_type_str, k + 2) == 102 do
+                    if k + 3 == pos do
+                        out 1
+                    else
+                        let c3 = fat_str_byte_at(fn_type_str, k + 3)
+                        if c3 == 32 or c3 == 9 or c3 == 58 or c3 == 38 or (c3 >= 65 and c3 <= 90) or c3 == 95 do
+                            out 1
+                        end
+                    end
+                end
+                if k + 3 <= pos and fat_str_byte_at(fn_type_str, k) == 111 and fat_str_byte_at(fn_type_str, k + 1) == 117 and fat_str_byte_at(fn_type_str, k + 2) == 116 do
+                    if k + 3 == pos do
+                        out 2
+                    else
+                        let c3 = fat_str_byte_at(fn_type_str, k + 3)
+                        if c3 == 32 or c3 == 9 or c3 == 58 or c3 == 38 or (c3 >= 65 and c3 <= 90) or c3 == 95 do
+                            out 2
+                        end
+                    end
+                end
+                if k < pos and fat_str_byte_at(fn_type_str, k) == 38 do
+                    out 1
+                end
+                var col_pos = 0 - 1
+                var m = k
+                when m < pos loop
+                    if fat_str_byte_at(fn_type_str, m) == 58 do
+                        col_pos = m
+                        m = pos
+                    else
+                        m = m + 1
+                    end
+                end
+                if col_pos >= 0 do
+                    var aft = col_pos + 1
+                    when aft < pos and (fat_str_byte_at(fn_type_str, aft) == 32 or fat_str_byte_at(fn_type_str, aft) == 9) loop
+                        aft = aft + 1
+                    end
+                    if aft + 3 <= pos and fat_str_byte_at(fn_type_str, aft) == 114 and fat_str_byte_at(fn_type_str, aft + 1) == 101 and fat_str_byte_at(fn_type_str, aft + 2) == 102 do
+                        if aft + 3 == pos do
+                            out 1
+                        else
+                            let c3 = fat_str_byte_at(fn_type_str, aft + 3)
+                            if c3 == 32 or c3 == 9 or c3 == 58 or c3 == 38 or (c3 >= 65 and c3 <= 90) or c3 == 95 do
+                                out 1
+                            end
+                        end
+                    end
+                    if aft + 3 <= pos and fat_str_byte_at(fn_type_str, aft) == 111 and fat_str_byte_at(fn_type_str, aft + 1) == 117 and fat_str_byte_at(fn_type_str, aft + 2) == 116 do
+                        if aft + 3 == pos do
+                            out 2
+                        else
+                            let c3 = fat_str_byte_at(fn_type_str, aft + 3)
+                            if c3 == 32 or c3 == 9 or c3 == 58 or c3 == 38 or (c3 >= 65 and c3 <= 90) or c3 == 95 do
+                                out 2
+                            end
+                        end
+                    end
+                    if aft < pos and fat_str_byte_at(fn_type_str, aft) == 38 do
+                        out 1
+                    end
+                end
+                out 0
+            end
+            cur_idx = cur_idx + 1
+            param_start = pos + 1
+        end
+        pos = pos + 1
+    end
+    out 0
+end.
+
+func get_call_param_mode(fn_ast: &AstNode, fn_type_str: &string, p_idx: i64) -> int:
+    if (fn_ast as i64) != 0 do
+        let m = get_func_param_mode(fn_ast, p_idx)
+        if m != 0 do out m end
+    end
+    if (fn_type_str as i64) != 0 and fat_str_len(fn_type_str) > 0 do
+        out get_callable_param_mode(fn_type_str, p_idx)
+    end
+    out 0
+end.

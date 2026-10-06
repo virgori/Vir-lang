@@ -70,7 +70,7 @@ class ModuleResolver:
                 val = val[1:-1].strip()
             
             if key == "root":
-                root_dir = (base_dir / val).resolve()
+                root_dir = (reg_path.parent / val).resolve()
                 continue
             
             # Reject duplicate entries
@@ -117,6 +117,10 @@ class ModuleResolver:
                 self.dir_aliases[key] = entry
             
             self.entries[key] = entry
+            if not is_dir and target_phys.is_file():
+                phys_str = str(target_phys.resolve())
+                if phys_str not in self.realpath_to_id:
+                    self.realpath_to_id[phys_str] = f"mod::{key}"
 
     def load_registries(self) -> None:
         # 1. Load stdlib registry if present
@@ -156,8 +160,19 @@ class ModuleResolver:
             canonical_id = f"mod::{spec}"
             self.realpath_to_id[str(entry.phys_path.resolve())] = canonical_id
             return canonical_id, entry.phys_path
+        # Dotted namespace prefix matching registered module (e.g. 'compiler.context' -> 'context')
+        if "." in spec:
+            parts = spec.split(".", 1)
+            if parts[0] in ("compiler", "virc") and parts[1] in self.entries and not self.entries[parts[1]].is_dir:
+                entry = self.entries[parts[1]]
+                if not entry.phys_path.is_file():
+                    raise ModuleRegistryError(2125, f"Registered target for '{parts[1]}' does not exist: {entry.phys_path}", entry.source_registry)
+                canonical_id = f"mod::{parts[1]}"
+                self.realpath_to_id[str(entry.phys_path.resolve())] = canonical_id
+                return canonical_id, entry.phys_path
 
         # Dotted tail lookup under directory alias
+
         if "." in spec:
             parts = spec.split(".")
             prefix = parts[0]
@@ -183,6 +198,20 @@ class ModuleResolver:
             canonical_id = f"file::{file_candidate.relative_to(self.repo_root).as_posix()}"
             self.realpath_to_id[canon_str] = canonical_id
             return canonical_id, file_candidate
+
+        # Stdlib fallback: dotted namespace relative to stdlib root (e.g. rt.string_rt -> stdlib/vir/rt/string_rt.vri)
+        if "." in spec:
+            parts = spec.split(".")
+            if parts[0] == "vir":
+                parts = parts[1:]
+            std_candidate = (self.stdlib_root / "vir" / Path(*parts)).with_suffix(".vri")
+            if std_candidate.is_file():
+                canon_str = str(std_candidate.resolve())
+                if canon_str in self.realpath_to_id:
+                    return self.realpath_to_id[canon_str], std_candidate
+                canonical_id = f"mod::{spec}"
+                self.realpath_to_id[canon_str] = canonical_id
+                return canonical_id, std_candidate
 
         raise ModuleRegistryError(2120, f"Module '{spec}' could not be resolved in registry or filesystem")
 
