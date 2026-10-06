@@ -1,0 +1,244 @@
+include ide_facts
+
+##
+ * vir/compiler/sem_pass8_borrow.vri
+ * ==============================================================
+ * Pass 8: Borrow / Ownership / Lifetime Analysis (Pure Vir AST).
+ * Implements rigorous CS affine ownership rules & borrow checking:
+ *   - Move semantics for non-copy types (Array, String, Entity, Dict, etc.)
+ *   - Use-after-move / Double move detection (E5001)
+ *   - Re-assignment / Re-initialization reviving moved variables
+ *   - Ownership transfer on by-value function call arguments
+ *   - Aliasing XOR Mutability exclusivity (& vs &mut) (E5002, E5003, E5006)
+ *   - Moving values while borrowed prevention (E5008)
+ *   - Borrow of moved value prevention (E5004)
+ *   - Function-local reference escape detection (E5007)
+ *   - Region / Arena-allocated lifetime escape detection (E5005)
+ ##
+
+include borrow_context
+include borrow_binding
+include borrow_paths
+include borrow_moves
+include borrow_loans
+include borrow_state
+include borrow_diagnostics
+include borrow_scopes
+include borrow_loops
+include borrow_branches
+include borrow_arena
+include borrow_async
+include borrow_funcs
+include borrow_nll
+include borrow_walk_access
+include borrow_walk_assign
+include borrow_walk_decl
+include borrow_walk_call
+include borrow_walk_return
+include borrow_walk_stmts
+include borrow_walk_func
+include borrow_walk_block
+include borrow_walk_branches
+include borrow_walk_loops
+include rt_io
+
+func pass8_stats_requested() -> int:
+    let argc = arg_count()
+    var i = 0
+    when i < argc loop
+        if rt_streq(get_arg(i), "--borrow-stats" as int) do out 1 end
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass8_stats_emit_if_requested():
+    if pass8_stats_requested() == 0 do out end
+    eprint_str("VIRC_PASS8_STATS ast_nodes=" as int)
+    eprint_str(rt_itoa(g_pass8_stat_ast_nodes))
+    eprint_str(" nll_nodes=" as int)
+    eprint_str(rt_itoa(g_pass8_stat_nll_nodes))
+    eprint_str(" hash_bytes=" as int)
+    eprint_str(rt_itoa(g_pass8_stat_hash_bytes))
+    eprint_str(" map_probes=" as int)
+    eprint_str(rt_itoa(g_pass8_stat_map_probes))
+    eprint_str(" rehash_nodes=" as int)
+    eprint_str(rt_itoa(g_pass8_stat_rehash_nodes))
+    eprint_str(" overlap_checks=" as int)
+    eprint_str(rt_itoa(g_pass8_stat_overlap_checks))
+    eprint_str(" release_steps=" as int)
+    eprint_ln(rt_itoa(g_pass8_stat_release_steps))
+end.
+
+func pass8_analyze_borrow(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode):
+    pass8_stats_reset()
+    g_pass8_func_map = pass8_map_new()
+    g_pass8_shadow_frames = pass8_box_new()
+    g_pass8_scope_depth = 0
+    g_pass8_var_scopes = pass8_box_new()
+    g_pass8_var_decl_lines = pass8_box_new()
+    g_pass8_reported_diags = pass8_box_new()
+    g_pass8_bindings = pass8_box_new()
+    g_pass8_scope_stack = pass8_box_new()
+    g_pass8_scope_ids = pass8_box_new()
+    g_pass8_loop_flows = pass8_box_new()
+    g_pass8_flow_kind = 0
+    pass8_box_push(g_pass8_scope_stack, var_item_new(fat_str_new("scope"), 0) as i64)
+    g_pass8_next_binding_id = 1
+    g_pass8_next_scope_id = 1
+    pass8_collect_funcs(node, g_pass8_func_map)
+    let moved_vars = pass8_box_new()
+    let shared_borrows = pass8_box_new()
+    let mut_borrows = pass8_box_new()
+    let bound_borrows = pass8_box_new()
+    let arena_locals = pass8_box_new()
+    let pre_arena_names = pass8_box_new()
+    let var_types = pass8_box_new()
+    let func_locals = pass8_box_new()
+    let uninit_vars = pass8_box_new()
+    if ide_enabled() == 1 do
+        ide_pass8_bind(symbols, scopes)
+    end
+    pass8_walk(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+               bound_borrows, arena_locals, pre_arena_names, 0, var_types, func_locals, uninit_vars)
+    pass8_stats_emit_if_requested()
+end.
+
+func pass8_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode,
+                moved_vars: int, shared_borrows: int, mut_borrows: int,
+                bound_borrows: int, arena_locals: int, pre_arena_names: int, in_arena: int,
+                var_types: int, func_locals: int, uninit_vars: int) -> int:
+    if (node as i64) == 0 do
+        out 0
+    end
+    g_pass8_stat_ast_nodes = g_pass8_stat_ast_nodes + 1
+
+    let nt = pass8_ast_type(node)
+
+    if nt == AstType.BreakStmt do
+        pass8_capture_loop_edge(1, moved_vars, shared_borrows, mut_borrows, bound_borrows, uninit_vars)
+        g_pass8_flow_kind = 1
+        out 0
+    end
+
+    if nt == AstType.ContinueStmt do
+        pass8_capture_loop_edge(2, moved_vars, shared_borrows, mut_borrows, bound_borrows, uninit_vars)
+        g_pass8_flow_kind = 2
+        out 0
+    end
+
+    if nt == AstType.ExportStmt or nt == AstType.ImportStmt or nt == AstType.ModuleStmt or nt == AstType.IncludeStmt or nt == AstType.EntityDef or nt == AstType.PackedDef or nt == AstType.RegisterDef or nt == AstType.EnumDef or nt == AstType.ExternFunc do
+        out 0
+    end
+
+    # 1. Identifier — check use of uninitialized or moved value
+    if nt == AstType.Identifier do
+        out pass8_walk_identifier(diag, node, moved_vars, shared_borrows, mut_borrows, bound_borrows, uninit_vars)
+    end
+
+    # 1b. IndexAccess — check use of uninitialized or moved base container
+    if nt == AstType.IndexAccess do
+        out pass8_walk_index_access(diag, node, moved_vars, uninit_vars)
+    end
+
+    # 1c. AwaitExpr — temporary borrow directly inside await expression
+    if nt == AstType.AwaitExpr do
+        out pass8_walk_await(diag, node)
+    end
+
+    # 2. AddrOf
+    if nt == AstType.AddrOf do
+        pass8_handle_addr_of(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                             bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+        out 0
+    end
+
+    # 3. Variable Assignment (x = rhs / x[i] = rhs)
+    if nt == AstType.Assign or nt == AstType.FieldAssign or nt == AstType.SwizzleAssign or nt == AstType.IndexAssign do
+        out pass8_walk_assign(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                              bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    if nt == AstType.VarDeclGroup do
+        out pass8_walk_var_decl_group(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                                      bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 4. Variable / Constant Declaration (let x = init / var x = init)
+    if nt == AstType.VarDecl or nt == AstType.ConstDecl do
+        out pass8_walk_decl(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                            bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 5. Function & Method Calls — by-value arguments transfer ownership
+    if nt == AstType.Call or nt == AstType.MethodCall do
+        out pass8_walk_call(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                            bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 6. Return Statement — verify no local reference / arena reference escape
+    if nt == AstType.ReturnStmt do
+        out pass8_walk_return(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                              bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 7. Print / Throw Statements
+    if nt == AstType.PrintStmt or nt == AstType.ThrowStmt do
+        out pass8_walk_throw_or_print(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                                      bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 8. Attribute bindings
+    if nt == AstType.BindAttr or nt == AstType.ExposeAttr do
+        out pass8_walk_attr(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                            bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 9. Function Definition — fresh function-level ownership tracking context
+    if nt == AstType.FuncDef do
+        out pass8_walk_func_def(symbols, scopes, diag, node)
+    end
+
+    # 10. Generic Block — lexical borrow lifetime scope
+    if nt == AstType.Block do
+        out pass8_walk_block(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                             bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 11. Arena Block — region lifetime validation
+    if nt == AstType.ArenaBlock do
+        out pass8_walk_arena_block(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                                   bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 12. If joins branch move sets conservatively
+    if nt == AstType.IfStmt do
+        out pass8_walk_if(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                          bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 13. Case arms
+    if nt == AstType.CaseExpr do
+        out pass8_walk_case(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                            bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 14. Control Flow: LoopStmt, WhileStmt, ForRange, WhenStmt
+    if nt == AstType.LoopStmt or nt == AstType.WhileStmt or nt == AstType.ForRange or nt == AstType.WhenStmt do
+        out pass8_walk_loop(symbols, scopes, diag, node, moved_vars, shared_borrows, mut_borrows,
+                            bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+
+    # 15. Default: walk all child AST nodes
+    let child_count = vec_len_rt(pass8_ast_children(node))
+    var i = 0
+    when i < child_count loop
+        let child = vec_get_rt(pass8_ast_children(node), i)
+        pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
+                   bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+        i = i + 1
+    end
+    out 0
+end.
+
+export pass8_analyze_borrow

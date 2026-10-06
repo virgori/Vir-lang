@@ -1,0 +1,607 @@
+# Module: protocol/http1_parser
+# Incremental HTTP/1.1 request & response parser state machine and Strict L7 Security Parser.
+
+include memory.slice
+include http.types
+
+const MAX_REQUEST_LINE_BYTES: 8192
+const MAX_HEADER_COUNT: 64
+const MAX_HEADER_BLOCK_BYTES: 32768
+const MAX_BODY_BYTES: 10485760
+
+const PARSE_OK: 0
+const PARSE_ERR_BAD_REQUEST: 400
+const PARSE_ERR_URI_TOO_LONG: 414
+const PARSE_ERR_HEADERS_TOO_LARGE: 431
+const PARSE_ERR_PAYLOAD_TOO_LARGE: 413
+const PARSE_ERR_NOT_IMPLEMENTED: 501
+const PARSE_ERR_VERSION_NOT_SUPPORTED: 505
+
+enum Http1ParserState:
+    Dead
+    Method
+    Path
+    Version
+    HeaderName
+    HeaderValue
+    Body
+    Complete
+    Error
+end.
+
+entity Http1Parser:
+    state: Http1ParserState
+    header_count: int
+    content_length: int
+    is_chunked: bool
+    keep_alive: bool
+    upgrade_ws: bool
+end.
+
+entity ValidatedRequest:
+    vr_err: int
+    vr_method: int
+    vr_pstart: int
+    vr_plen: int
+    vr_hcount: int
+    vr_clen: int
+    vr_chunked: bool
+    vr_ka: bool
+    vr_upg: bool
+    vr_bstart: int
+end.
+
+func parser_new() -> Http1Parser:
+    out Http1Parser(
+        state: Http1ParserState.Method,
+        header_count: 0,
+        content_length: -1,
+        is_chunked: false,
+        keep_alive: true,
+        upgrade_ws: false
+    )
+end.
+
+func is_complete(this: Http1Parser) -> bool:
+    if this.state == Http1ParserState.Complete do
+        out true
+    end
+    out false
+end.
+
+func parse_slice -> int:
+    in
+        this: Http1Parser
+        slice: BufferSlice
+    if slice.length <= 0 do
+        out 0
+    end
+    this.state = Http1ParserState.Complete
+    out slice.length
+end.
+
+func parseHeader -> int:
+    in
+        this: Http1Parser
+        is_chunked: bool
+        content_len: int
+        keep_alive: bool
+        is_upgrade: bool
+    this.header_count = this.header_count + 1
+    if is_chunked do
+        this.is_chunked = true
+    end
+    if content_len >= 0 do
+        this.content_length = content_len
+    end
+    if not keep_alive do
+        this.keep_alive = false
+    end
+    if is_upgrade do
+        this.upgrade_ws = true
+    end
+    out 0
+end.
+
+func mark_complete(this: Http1Parser) -> int:
+    this.state = Http1ParserState.Complete
+    out 0
+end.
+
+func reset(this: Http1Parser):
+    this.state = Http1ParserState.Method
+    this.header_count = 0
+    this.content_length = -1
+    this.is_chunked = false
+    this.keep_alive = true
+    this.upgrade_ws = false
+end.
+
+# ═══════════════════════════════════════════════════════════
+# Strict L7 Security Parser & RFC 9112 Desync Eliminator
+# ═══════════════════════════════════════════════════════════
+
+func to_lower_char(c: int) -> int:
+    if c >= 65 do
+        if c <= 90 do
+            out c + 32
+        end
+    end
+    out c
+end.
+
+func mem_eq_ci -> bool:
+    in
+        buf: ptr
+        offset: int
+        target: string
+        len: int
+    var i = 0
+    when i < len loop
+        var b1 = to_lower_char(read_byte(buf, offset + i))
+        var b2 = to_lower_char(read_byte(target, i))
+        if b1 != b2 do
+            out false
+        end
+        i = i + 1
+    end
+    out true
+end.
+
+func validated_request_new() -> ValidatedRequest:
+    out ValidatedRequest(
+        vr_err: 0,
+        vr_method: 0,
+        vr_pstart: 0,
+        vr_plen: 0,
+        vr_hcount: 0,
+        vr_clen: -1,
+        vr_chunked: false,
+        vr_ka: false,
+        vr_upg: false,
+        vr_bstart: 0
+    )
+end.
+
+func set_req_err -> int:
+    in
+        req: ValidatedRequest
+        err: int
+    req.vr_err = err
+    req.vr_method = 0
+    req.vr_pstart = 0
+    req.vr_plen = 0
+    req.vr_hcount = 0
+    req.vr_clen = -1
+    req.vr_chunked = false
+    req.vr_ka = false
+    req.vr_upg = false
+    req.vr_bstart = 0
+    out err
+end.
+
+func parse_into -> int:
+    in
+        buf: ptr
+        nread: int
+        req: ValidatedRequest
+    if nread < 4 do
+        out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+    end
+
+    # Step 1: Scan for first newline to find request line end
+    var req_line_end = -1
+    var i = 0
+    var scanning_line = true
+    when scanning_line loop
+        if i >= nread do
+            scanning_line = false
+        else
+            var b = read_byte(buf, i)
+            if b == 10 do # '\n'
+                req_line_end = i
+                scanning_line = false
+            else
+                i = i + 1
+            end
+        end
+    end
+
+    if req_line_end < 0 do
+        if nread >= MAX_REQUEST_LINE_BYTES do
+            out set_req_err(req, PARSE_ERR_URI_TOO_LONG)
+        end
+        out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+    end
+
+    if req_line_end > MAX_REQUEST_LINE_BYTES do
+        out set_req_err(req, PARSE_ERR_URI_TOO_LONG)
+    end
+
+    # Check illegal control chars in request line (0..31 except TAB, and 127 DEL)
+    var j = 0
+    when j < req_line_end loop
+        var cb = read_byte(buf, j)
+        if cb < 32 do
+            if cb != 9 do
+                if cb != 13 do
+                    out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+                end
+            end
+        end
+        if cb == 127 do
+            out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+        end
+        j = j + 1
+    end
+
+    # Parse method
+    var m_id = 0
+    var p_start = 0
+    # "GET "
+    if read_byte(buf, 0) == 71 do
+        if read_byte(buf, 1) == 69 do
+            if read_byte(buf, 2) == 84 do
+                if read_byte(buf, 3) == 32 do
+                    m_id = 1
+                    p_start = 4
+                end
+            end
+        end
+    end
+    # "POST "
+    if read_byte(buf, 0) == 80 do
+        if read_byte(buf, 1) == 79 do
+            if read_byte(buf, 2) == 83 do
+                if read_byte(buf, 3) == 84 do
+                    if read_byte(buf, 4) == 32 do
+                        m_id = 2
+                        p_start = 5
+                    end
+                end
+            end
+        end
+    end
+    # "HEAD "
+    if read_byte(buf, 0) == 72 do
+        if read_byte(buf, 1) == 69 do
+            if read_byte(buf, 2) == 65 do
+                if read_byte(buf, 3) == 68 do
+                    if read_byte(buf, 4) == 32 do
+                        m_id = 5
+                        p_start = 5
+                    end
+                end
+            end
+        end
+    end
+    # "PUT "
+    if read_byte(buf, 0) == 80 do
+        if read_byte(buf, 1) == 85 do
+            if read_byte(buf, 2) == 84 do
+                if read_byte(buf, 3) == 32 do
+                    m_id = 3
+                    p_start = 4
+                end
+            end
+        end
+    end
+    # "DELETE "
+    if read_byte(buf, 0) == 68 do
+        if read_byte(buf, 1) == 69 do
+            if read_byte(buf, 2) == 76 do
+                if read_byte(buf, 3) == 69 do
+                    if read_byte(buf, 4) == 84 do
+                        if read_byte(buf, 5) == 69 do
+                            if read_byte(buf, 6) == 32 do
+                                m_id = 4
+                                p_start = 7
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+    # "OPTIONS "
+    if read_byte(buf, 0) == 79 do
+        if read_byte(buf, 1) == 80 do
+            if read_byte(buf, 2) == 84 do
+                if read_byte(buf, 3) == 73 do
+                    if read_byte(buf, 4) == 79 do
+                        if read_byte(buf, 5) == 78 do
+                            if read_byte(buf, 6) == 83 do
+                                if read_byte(buf, 7) == 32 do
+                                    m_id = 6
+                                    p_start = 8
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if m_id == 0 do
+        out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+    end
+
+    # Parse path up to ' ' or '?'
+    var p_len = 0
+    var curr = p_start
+    var scanning_path = true
+    when scanning_path loop
+        if curr >= req_line_end do
+            scanning_path = false
+        else
+            var pb = read_byte(buf, curr)
+            if pb == 32 do
+                scanning_path = false
+            else
+                if pb == 63 do
+                    scanning_path = false
+                else
+                    p_len = p_len + 1
+                    curr = curr + 1
+                end
+            end
+        end
+    end
+
+    if p_len == 0 do
+        out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+    end
+
+    # Parse headers starting right after req_line_end
+    var h_pos = req_line_end + 1
+    var h_count = 0
+    var h_bytes = 0
+    var cl_seen = false
+    var cl_val = -1
+    var te_seen = false
+    var is_chunked = false
+    var keep_alive = true
+    var is_upgrade = false
+    var host_count = 0
+
+    var in_headers = true
+    when in_headers loop
+        if h_pos >= nread do
+            in_headers = false
+        else
+            # Check for empty line marking end of headers
+            var b0 = read_byte(buf, h_pos)
+            if b0 == 13 do # '\r'
+                if h_pos + 1 < nread do
+                    if read_byte(buf, h_pos + 1) == 10 do # "\r\n"
+                        h_pos = h_pos + 2
+                        in_headers = false
+                    end
+                end
+            else
+                if b0 == 10 do # "\n"
+                    h_pos = h_pos + 1
+                    in_headers = false
+                end
+            end
+
+            if in_headers do
+                # Find end of this header line
+                var line_start = h_pos
+                var line_end = -1
+                var scan_h = line_start
+                var scanning_h = true
+                when scanning_h loop
+                    if scan_h >= nread do
+                        scanning_h = false
+                        line_end = scan_h
+                    else
+                        if read_byte(buf, scan_h) == 10 do
+                            line_end = scan_h
+                            scanning_h = false
+                        else
+                            scan_h = scan_h + 1
+                        end
+                    end
+                end
+
+                if line_end < 0 do
+                    line_end = nread
+                end
+
+                var line_len = line_end - line_start
+                var hj = line_start
+                when hj < line_end loop
+                    var hcb = read_byte(buf, hj)
+                    if hcb < 32 do
+                        if hcb != 9 do
+                            if hcb != 13 do
+                                out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+                            end
+                        end
+                    end
+                    if hcb == 127 do
+                        out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+                    end
+                    hj = hj + 1
+                end
+
+                h_bytes = h_bytes + line_len
+                if h_bytes > MAX_HEADER_BLOCK_BYTES do
+                    out set_req_err(req, PARSE_ERR_HEADERS_TOO_LARGE)
+                end
+
+                h_count = h_count + 1
+                if h_count > MAX_HEADER_COUNT do
+                    out set_req_err(req, PARSE_ERR_HEADERS_TOO_LARGE)
+                end
+
+                # Find colon in line
+                var colon_pos = -1
+                var ci = line_start
+                var find_colon = true
+                when find_colon loop
+                    if ci >= line_end do
+                        find_colon = false
+                    else
+                        if read_byte(buf, ci) == 58 do # ':'
+                            colon_pos = ci
+                            find_colon = false
+                        else
+                            ci = ci + 1
+                        end
+                    end
+                end
+
+                if colon_pos < 0 do
+                    out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+                end
+
+                # RFC 9112 Section 5.1: No whitespace allowed before colon
+                if colon_pos > line_start do
+                    var prev_b = read_byte(buf, colon_pos - 1)
+                    if prev_b == 32 do # ' '
+                        out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+                    end
+                    if prev_b == 9 do # '\t'
+                        out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+                    end
+                end
+
+                var name_len = colon_pos - line_start
+
+                # Check "Content-Length" (14 chars)
+                if name_len == 14 do
+                    var cl_target = "content-length"
+                    if mem_eq_ci(buf, line_start, cl_target, 14) do
+                        if cl_seen do
+                            # Duplicate Content-Length -> Reject!
+                            out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+                        end
+                        cl_seen = true
+                        # Parse digits
+                        var vi = colon_pos + 1
+                        var parsed_num = 0
+                        var parsing_val = true
+                        when parsing_val loop
+                            if vi >= line_end do
+                                parsing_val = false
+                            else
+                                var vb = read_byte(buf, vi)
+                                if vb >= 48 do
+                                    if vb <= 57 do
+                                        let digit = vb - 48
+                                        if parsed_num > (MAX_BODY_BYTES - digit) / 10 do
+                                            out set_req_err(req, PARSE_ERR_PAYLOAD_TOO_LARGE)
+                                        end
+                                        parsed_num = parsed_num * 10 + digit
+                                    else
+                                        if vb != 13 do
+                                            if vb != 10 do
+                                                if vb != 32 do
+                                                    parsing_val = false
+                                                    parsed_num = -999
+                                                end
+                                            end
+                                        end
+                                    end
+                                else
+                                    if vb != 13 do
+                                        if vb != 10 do
+                                            if vb != 32 do
+                                                parsing_val = false
+                                                parsed_num = -999
+                                            end
+                                        end
+                                    end
+                                end
+                                vi = vi + 1
+                            end
+                        end
+
+                        if parsed_num < 0 do
+                            out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+                        end
+                        cl_val = parsed_num
+                    end
+                end
+
+                # Check "Transfer-Encoding" (17 chars)
+                if name_len == 17 do
+                    var te_target = "transfer-encoding"
+                    if mem_eq_ci(buf, line_start, te_target, 17) do
+                        if te_seen do
+                            # Duplicate Transfer-Encoding
+                            out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+                        end
+                        te_seen = true
+                        is_chunked = true
+                    end
+                end
+
+                # Check "Host" (4 chars)
+                if name_len == 4 do
+                    var host_target = "host"
+                    if mem_eq_ci(buf, line_start, host_target, 4) do
+                        host_count = host_count + 1
+                        if host_count > 1 do
+                            # Duplicate Host header -> RFC 9112 §7.1 violation!
+                            out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+                        end
+                    end
+                end
+
+                # Check "Connection" (10 chars)
+                if name_len == 10 do
+                    var conn_target = "connection"
+                    if mem_eq_ci(buf, line_start, conn_target, 10) do
+                        var close_target = "close"
+                        var cvi = colon_pos + 1
+                        when cvi + 5 <= line_end loop
+                            if mem_eq_ci(buf, cvi, close_target, 5) do
+                                keep_alive = false
+                            end
+                            cvi = cvi + 1
+                        end
+                    end
+                end
+
+                # Advance to next line
+                h_pos = line_end + 1
+            end
+        end
+    end
+
+    # Smuggling defense: If both Content-Length and Transfer-Encoding are present -> 400!
+    if cl_seen do
+        if te_seen do
+            out set_req_err(req, PARSE_ERR_BAD_REQUEST)
+        end
+    end
+
+    req.vr_err = 0
+    req.vr_method = m_id
+    req.vr_pstart = p_start
+    req.vr_plen = p_len
+    req.vr_hcount = h_count
+    req.vr_clen = cl_val
+    req.vr_chunked = is_chunked
+    req.vr_ka = keep_alive
+    req.vr_upg = is_upgrade
+    req.vr_bstart = h_pos
+    out 0
+end.
+
+# parse -- canonical public API: parse an HTTP/1.1 request from raw bytes.
+# Usage: var req = parse(buf, nread)
+func parse -> ValidatedRequest:
+    in
+        buf: ptr
+        nread: int
+    var req = validated_request_new()
+    parse_into(buf, nread, req)
+    out req
+end.
+
+export Http1ParserState, Http1Parser, ValidatedRequest, parser_new, validated_request_new, parse_into, parse, PARSE_ERR_PAYLOAD_TOO_LARGE

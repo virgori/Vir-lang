@@ -1,0 +1,280 @@
+##
+ * compiler/src/semantic/typecheck/walk_expr.vri — Binary & Swizzle Expression Walk
+ * ================================================================================
+ * VIRC-PLN-0004 Section 5: AST walk handlers for BinOp, SwizzleAssign, SwizzleExpr.
+ *
+ * Implements:
+ * - pass6WalkBinOp: type-check binary operations, tensor dimensions, pow2 checks
+ * - pass6WalkSwizzleAssign: validate flux vector swizzle assignments and mask uniqueness
+ * - pass6WalkSwizzleExpr: validate flux vector swizzle projections and lane ranges
+ ##
+
+include typecheck_context
+include typecheck_operators
+include typecheck_tensor
+
+func pass6WalkBinOp(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode) -> int:
+    child_count = vec_len_rt(node.children)
+    if child_count >= 2 do
+        left = vec_get_rt(node.children, 0)
+        right = vec_get_rt(node.children, 1)
+        lt = pass6_infer_type(symbols, scopes, left)
+        rt_type = pass6_infer_type(symbols, scopes, right)
+        if node.op == OpType.PowOp do
+            var (exp_known, exp_value) = pass6_eval_const_int(symbols, scopes, right, 0)
+            if exp_known == 1 and exp_value < 0 do
+                # Mark this power expression as floating-result lowering.
+                node.int_val = 1
+            end
+        end
+        if lt != TypeKind.Void and rt_type != TypeKind.Void do
+            var binop_err = typecheck_check_binop_types(node.op as int, lt, rt_type)
+            if binop_err != 0 do
+                report_error(diag, binop_err, node.line, 0)
+            end
+            if node.op == OpType.MatMulOp or node.op == OpType.FmaOp do
+                var type_a_str = fat_str_new("")
+                var type_b_str = fat_str_new("")
+                if left.node_type == AstType.Identifier do
+                    found_a = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), left.name)
+                    if found_a != -1 do
+                        sym_a = pass6_symbol_at(symbols, found_a)
+                        if sym_a.ast_id != 0 do
+                            ast_a = sym_a.ast_id as AstNode
+                            type_a_str = ast_a.name2
+                        end
+                    end
+                    if fat_str_len(type_a_str) == 0 do
+                        type_a_str = pass6_get_var_type(left.name)
+                    end
+                eif left.node_type == AstType.QuantizeExpr do
+                    type_a_str = left.name2
+                end
+
+                if right.node_type == AstType.Identifier do
+                    found_b = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), right.name)
+                    if found_b != -1 do
+                        sym_b = pass6_symbol_at(symbols, found_b)
+                        if sym_b.ast_id != 0 do
+                            ast_b = sym_b.ast_id as AstNode
+                            type_b_str = ast_b.name2
+                        end
+                    end
+                    if fat_str_len(type_b_str) == 0 do
+                        type_b_str = pass6_get_var_type(right.name)
+                    end
+                eif right.node_type == AstType.QuantizeExpr do
+                    type_b_str = right.name2
+                end
+
+                let matmul_err = typecheck_check_matmul_dimensions(type_a_str, type_b_str, lt, rt_type, g_pass6_ai_mode)
+                if matmul_err != 0 do
+                    if matmul_err == 3007 do
+                        var elem_a = TypeKind.Float
+                        var elem_b = TypeKind.Float
+                        if is_quantized_type_str(type_a_str as int) do
+                            elem_a = parse_quantized_elem_type(type_a_str as int)
+                        else
+                            elem_a = parse_tensor_elem_type(type_a_str)
+                        end
+                        if is_quantized_type_str(type_b_str as int) do
+                            elem_b = parse_quantized_elem_type(type_b_str as int)
+                        else
+                            elem_b = parse_tensor_elem_type(type_b_str)
+                        end
+                        pass6_report_type_mismatch(diag, symbols, scopes, node, right, pass6_type_kind_to_str(elem_a), pass6_type_kind_to_str(elem_b))
+                    else
+                        report_error(diag, matmul_err, node.line, 0)
+                    end
+                end
+                node.name2 = pass6_infer_tensor_op_result_type(symbols, scopes, node)
+            end
+            # Flux arithmetic width and element type compatibility check [E3001]
+            var type_f_a = fat_str_new("")
+            var type_f_b = fat_str_new("")
+            if left.node_type == AstType.Identifier do
+                let found_fa = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), left.name)
+                if found_fa != -1 do
+                    let sym_fa = pass6_symbol_at(symbols, found_fa)
+                    if sym_fa.ast_id != 0 do
+                        let ast_fa = sym_fa.ast_id as AstNode
+                        type_f_a = ast_fa.name2
+                    end
+                end
+            eif left.node_type == AstType.Call and fat_cstr_eq(left.name, "flux") do
+                var fa_elem = fat_str_new("int")
+                if vec_len_rt(left.children) > 0 do
+                    let ch0 = vec_get_rt(left.children, 0) as AstNode
+                    if ch0.node_type == AstType.LiteralFloat do fa_elem = fat_str_new("float") end
+                end
+                type_f_a = fat_str_concat(fat_str_new("flux of ("), fat_str_concat(fa_elem, fat_str_concat(fat_str_new(", "), fat_str_concat(fat_str_new(rt_itoa(vec_len_rt(left.children))), fat_str_new(")")))))
+            end
+            if right.node_type == AstType.Identifier do
+                let found_fb = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), right.name)
+                if found_fb != -1 do
+                    let sym_fb = pass6_symbol_at(symbols, found_fb)
+                    if sym_fb.ast_id != 0 do
+                        let ast_fb = sym_fb.ast_id as AstNode
+                        type_f_b = ast_fb.name2
+                    end
+                end
+            eif right.node_type == AstType.Call and fat_cstr_eq(right.name, "flux") do
+                var fb_elem = fat_str_new("int")
+                if vec_len_rt(right.children) > 0 do
+                    let ch1 = vec_get_rt(right.children, 0) as AstNode
+                    if ch1.node_type == AstType.LiteralFloat do fb_elem = fat_str_new("float") end
+                end
+                type_f_b = fat_str_concat(fat_str_new("flux of ("), fat_str_concat(fb_elem, fat_str_concat(fat_str_new(", "), fat_str_concat(fat_str_new(rt_itoa(vec_len_rt(right.children))), fat_str_new(")")))))
+            end
+            if is_flux_type_str(type_f_a as int) and is_flux_type_str(type_f_b as int) do
+                let lanes_a = parse_flux_lanes(type_f_a as int)
+                let lanes_b = parse_flux_lanes(type_f_b as int)
+                let elem_fa = parse_flux_elem_type(type_f_a as int) as int
+                let elem_fb = parse_flux_elem_type(type_f_b as int) as int
+                if lanes_a > 0 and lanes_b > 0 and lanes_a != lanes_b do
+                    report_error(diag, 3001, node.line, 0)
+                end
+                if elem_fa != elem_fb do
+                    report_error(diag, 3001, node.line, 0)
+                end
+            eif is_flux_type_str(type_f_a as int) and not is_flux_type_str(type_f_b as int) do
+                let elem_fa = parse_flux_elem_type(type_f_a as int) as int
+                let r_elem = pass6_infer_type(symbols, scopes, right)
+                if (elem_fa == (TypeKind.Int as int) and r_elem == TypeKind.Float) or (elem_fa == (TypeKind.Float as int) and r_elem == TypeKind.Int) do
+                    report_error(diag, 3001, node.line, 0)
+                end
+            eif not is_flux_type_str(type_f_a as int) and is_flux_type_str(type_f_b as int) do
+                let elem_fb = parse_flux_elem_type(type_f_b as int) as int
+                let l_elem = pass6_infer_type(symbols, scopes, left)
+                if (elem_fb == (TypeKind.Int as int) and l_elem == TypeKind.Float) or (elem_fb == (TypeKind.Float as int) and l_elem == TypeKind.Int) do
+                    report_error(diag, 3001, node.line, 0)
+                end
+            end
+        end
+    end
+    child_count2 = vec_len_rt(node.children)
+    var i = 0
+    when i < child_count2 loop
+        child = vec_get_rt(node.children, i)
+        pass6_walk(symbols, scopes, diag, child)
+        i = i + 1
+    end
+    out 0
+    out 0
+end.
+
+func pass6WalkSwizzleAssign(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode) -> int:
+    child_count = vec_len_rt(node.children)
+    if fat_str_len(node.name) > 0 do
+        found = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        if found == -1 do
+            report_error(diag, 2001, node.line, 0)
+        else
+            sym = pass6_symbol_at(symbols, found)
+            if not sym.is_mutable do
+                report_error(diag, 3003, node.line, 0)
+            end
+            var target_w = 4
+            if sym.ast_id != 0 do
+                var d_ast = sym.ast_id as AstNode
+                if fat_str_len(d_ast.name2) > 0 and is_flux_type_str(d_ast.name2 as int) do
+                    target_w = parse_flux_lanes(d_ast.name2 as int)
+                end
+            end
+            var m_len = fat_str_len(node.name2)
+            var has_duplicate = false
+            var seen_mask = 0
+            var m_idx = 0
+            when m_idx < m_len loop
+                var ch_i = fat_str_byte_at(node.name2 as int, m_idx)
+                var l_i = swizzle_char_to_lane(ch_i)
+                if l_i >= target_w or l_i < 0 do
+                    report_error(diag, 3089, node.line, 0)
+                else
+                    var bit = 1 shl l_i
+                    if (seen_mask and bit) != 0 do
+                        has_duplicate = true
+                    end
+                    seen_mask = seen_mask or bit
+                end
+                m_idx = m_idx + 1
+            end
+            if has_duplicate do
+                report_error(diag, 3087, node.line, 0)
+            end
+            if child_count >= 1 do
+                var rhs_n = vec_get_rt(node.children, 0) as AstNode
+                var rhs_w = 0
+                if rhs_n.node_type == AstType.Call and fat_cstr_eq(rhs_n.name, "flux") do
+                    rhs_w = vec_len_rt(rhs_n.children)
+                eif rhs_n.node_type == AstType.SwizzleExpr do
+                    rhs_w = fat_str_len(rhs_n.name)
+                eif rhs_n.node_type == AstType.Identifier do
+                    var r_found = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), rhs_n.name)
+                    if r_found != -1 do
+                        var r_sym = pass6_symbol_at(symbols, r_found)
+                        if r_sym.ast_id != 0 do
+                            var rd_ast = r_sym.ast_id as AstNode
+                            if fat_str_len(rd_ast.name2) > 0 and is_flux_type_str(rd_ast.name2 as int) do
+                                rhs_w = parse_flux_lanes(rd_ast.name2 as int)
+                            end
+                        end
+                    end
+                eif rhs_n.node_type == AstType.ArrayLiteral do
+                    rhs_w = vec_len_rt(rhs_n.children)
+                end
+                if rhs_w > 0 and rhs_w != m_len do
+                    report_error(diag, 3088, node.line, 0)
+                end
+            end
+        end
+    end
+    var ci = 0
+    when ci < child_count loop
+        pass6_walk(symbols, scopes, diag, vec_get_rt(node.children, ci) as AstNode)
+        ci = ci + 1
+    end
+    out 0
+end.
+
+func pass6WalkSwizzleExpr(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode) -> int:
+    child_count = vec_len_rt(node.children)
+    var recv_w = 4
+    if child_count > 0 do
+        var rec_n = vec_get_rt(node.children, 0) as AstNode
+        if rec_n.node_type == AstType.Identifier do
+            var r_f = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), rec_n.name)
+            if r_f != -1 do
+                var r_s = pass6_symbol_at(symbols, r_f)
+                if r_s.ast_id != 0 do
+                    var rd = r_s.ast_id as AstNode
+                    if fat_str_len(rd.name2) > 0 and is_flux_type_str(rd.name2 as int) do
+                        recv_w = parse_flux_lanes(rd.name2 as int)
+                    end
+                end
+            end
+        eif rec_n.node_type == AstType.Call and fat_cstr_eq(rec_n.name, "flux") do
+            recv_w = vec_len_rt(rec_n.children)
+        eif rec_n.node_type == AstType.SwizzleExpr do
+            recv_w = fat_str_len(rec_n.name)
+        end
+    end
+    var sw_l = fat_str_len(node.name)
+    var sw_k = 0
+    when sw_k < sw_l loop
+        var sc = fat_str_byte_at(node.name as int, sw_k)
+        var l_idx = swizzle_char_to_lane(sc)
+        if l_idx >= recv_w or l_idx < 0 do
+            report_error(diag, 3089, node.line, 0)
+        end
+        sw_k = sw_k + 1
+    end
+    var si = 0
+    when si < child_count loop
+        pass6_walk(symbols, scopes, diag, vec_get_rt(node.children, si) as AstNode)
+        si = si + 1
+    end
+    out 0
+end.
+
+export pass6WalkBinOp, pass6WalkSwizzleAssign, pass6WalkSwizzleExpr

@@ -1,0 +1,260 @@
+##
+ * compiler/src/semantic/borrow/walk_branches.vri — Conditional Branch & Pattern Case Borrow Walker
+ * ==============================================================================================
+ * VIRC-PLN-0004 Section 5.6 & Phase 8: Borrow Analysis Decomposition.
+ *
+ * Implements conservative dataflow joins for conditional branches (IfStmt)
+ * and pattern matching (CaseExpr), tracking points-to set merges and CFG termination.
+ ##
+
+include borrow_context
+include borrow_binding
+include borrow_state
+include borrow_loans
+include borrow_moves
+include borrow_scopes
+
+func pass8_walk_if(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine,
+                   node: &AstNode, moved_vars: int, shared_borrows: int, mut_borrows: int,
+                   bound_borrows: int, arena_locals: int, pre_arena_names: int, in_arena: int,
+                   var_types: int, func_locals: int, uninit_vars: int) -> int:
+    scope_push(scopes, ScopeKind.Block)
+    pass8_enter_binding_scope(node as i64)
+    g_pass8_scope_depth = g_pass8_scope_depth + 1
+    let if_depth = g_pass8_scope_depth
+    let child_count = vec_len_rt(pass8_ast_children(node))
+    if child_count > 0 do
+        let cond = vec_get_rt(pass8_ast_children(node), 0)
+        pass8_walk(symbols, scopes, diag, cond, moved_vars, shared_borrows, mut_borrows,
+                   bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+    let cond_moved = pass8_box_clone(moved_vars)
+    let cond_shared = pass8_box_clone(shared_borrows)
+    let cond_mut = pass8_box_clone(mut_borrows)
+    let cond_bound = pass8_box_clone(bound_borrows)
+    let cond_uninit = pass8_box_clone(uninit_vars)
+
+    let then_moved = pass8_box_clone(cond_moved)
+    let then_shared = pass8_box_clone(cond_shared)
+    let then_mut = pass8_box_clone(cond_mut)
+    let then_bound = pass8_box_clone(cond_bound)
+    let then_uninit = pass8_box_clone(cond_uninit)
+    var then_flow = 0
+    if child_count > 1 do
+        let then_branch = vec_get_rt(pass8_ast_children(node), 1)
+        g_pass8_flow_kind = 0
+        pass8_walk(symbols, scopes, diag, then_branch, then_moved, then_shared, then_mut,
+                   then_bound, arena_locals, pre_arena_names, in_arena, var_types, func_locals, then_uninit)
+        then_flow = g_pass8_flow_kind
+    end
+
+    let else_moved = pass8_box_clone(cond_moved)
+    let else_shared = pass8_box_clone(cond_shared)
+    let else_mut = pass8_box_clone(cond_mut)
+    let else_bound = pass8_box_clone(cond_bound)
+    let else_uninit = pass8_box_clone(cond_uninit)
+    var else_flow = 0
+    if child_count > 2 do
+        let else_branch = vec_get_rt(pass8_ast_children(node), 2)
+        g_pass8_flow_kind = 0
+        pass8_walk(symbols, scopes, diag, else_branch, else_moved, else_shared, else_mut,
+                   else_bound, arena_locals, pre_arena_names, in_arena, var_types, func_locals, else_uninit)
+        else_flow = g_pass8_flow_kind
+    end
+
+    if then_flow != 0 and else_flow != 0 do
+        # Both branches terminate; fallthrough is unreachable.
+        if then_flow == else_flow do
+            g_pass8_flow_kind = then_flow
+        else
+            g_pass8_flow_kind = 3
+        end
+    eif then_flow != 0 do
+        g_pass8_flow_kind = 0
+        pass8_box_copy_into(moved_vars, else_moved)
+        pass8_box_copy_into(shared_borrows, else_shared)
+        pass8_box_copy_into(mut_borrows, else_mut)
+        pass8_box_copy_into(bound_borrows, else_bound)
+        pass8_box_copy_into(uninit_vars, else_uninit)
+    eif else_flow != 0 do
+        g_pass8_flow_kind = 0
+        pass8_box_copy_into(moved_vars, then_moved)
+        pass8_box_copy_into(shared_borrows, then_shared)
+        pass8_box_copy_into(mut_borrows, then_mut)
+        pass8_box_copy_into(bound_borrows, then_bound)
+        pass8_box_copy_into(uninit_vars, then_uninit)
+    else
+        g_pass8_flow_kind = 0
+        pass8_merge_moved_box(moved_vars, then_moved)
+        pass8_merge_moved_box(moved_vars, else_moved)
+
+        let u_count = pass8_box_len(then_uninit)
+        var ui = 0
+        when ui < u_count loop
+            let u_name = var_item_name(pass8_box_get(then_uninit, ui))
+            pass8_mark_uninit(uninit_vars, u_name)
+            ui = ui + 1
+        end
+        let eu_count = pass8_box_len(else_uninit)
+        ui = 0
+        when ui < eu_count loop
+            let u_name = var_item_name(pass8_box_get(else_uninit, ui))
+            pass8_mark_uninit(uninit_vars, u_name)
+            ui = ui + 1
+        end
+
+        # Conditional points-to merging:
+        var bi = 0
+        let t_len = pass8_box_len(then_bound)
+        when bi < t_len loop
+            let b_item = pass8_box_get(then_bound, bi)
+            let b_lhs = borrow_binding_lhs(b_item)
+            if pass8_get_var_scope_depth(b_lhs) < if_depth do
+                pass8_release_borrower(bound_borrows, shared_borrows, mut_borrows, b_lhs)
+            end
+            bi = bi + 1
+        end
+        bi = 0
+        let e_len = pass8_box_len(else_bound)
+        when bi < e_len loop
+            let b_item = pass8_box_get(else_bound, bi)
+            let b_lhs = borrow_binding_lhs(b_item)
+            if pass8_get_var_scope_depth(b_lhs) < if_depth do
+                pass8_release_borrower(bound_borrows, shared_borrows, mut_borrows, b_lhs)
+            end
+            bi = bi + 1
+        end
+
+        bi = 0
+        when bi < t_len loop
+            let b_item = pass8_box_get(then_bound, bi)
+            let b_lhs = borrow_binding_lhs(b_item)
+            if pass8_get_var_scope_depth(b_lhs) < if_depth do
+                let b_tgt = borrow_binding_target(b_item)
+                let b_kind = borrow_binding_kind(b_item)
+                pass8_claim_borrow(bound_borrows, b_lhs, b_tgt, b_kind)
+                if b_kind == 2 do
+                    pass8_box_push(mut_borrows, var_item_new(b_tgt, pass8_ast_line(node)) as i64)
+                else
+                    pass8_box_push(shared_borrows, var_item_new(b_tgt, pass8_ast_line(node)) as i64)
+                end
+            end
+            bi = bi + 1
+        end
+
+        bi = 0
+        when bi < e_len loop
+            let b_item = pass8_box_get(else_bound, bi)
+            let b_lhs = borrow_binding_lhs(b_item)
+            if pass8_get_var_scope_depth(b_lhs) < if_depth do
+                let b_tgt = borrow_binding_target(b_item)
+                let b_kind = borrow_binding_kind(b_item)
+                var present = 0
+                let bb_len = pass8_box_len(bound_borrows)
+                var bbi = 0
+                when bbi < bb_len loop
+                    let bb = pass8_box_get(bound_borrows, bbi)
+                    if pass8_streq(borrow_binding_lhs(bb), b_lhs) == 1 and pass8_streq(borrow_binding_target(bb), b_tgt) == 1 do
+                        present = 1
+                        bbi = bb_len
+                    else
+                        bbi = bbi + 1
+                    end
+                end
+                if present == 0 do
+                    pass8_claim_borrow(bound_borrows, b_lhs, b_tgt, b_kind)
+                    if b_kind == 2 do
+                        pass8_box_push(mut_borrows, var_item_new(b_tgt, pass8_ast_line(node)) as i64)
+                    else
+                        pass8_box_push(shared_borrows, var_item_new(b_tgt, pass8_ast_line(node)) as i64)
+                    end
+                end
+            end
+            bi = bi + 1
+        end
+    end
+
+    g_pass8_scope_depth = g_pass8_scope_depth - 1
+    pass8_leave_binding_scope()
+    scope_pop(scopes)
+    out 1
+end.
+
+func pass8_walk_case(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine,
+                     node: &AstNode, moved_vars: int, shared_borrows: int, mut_borrows: int,
+                     bound_borrows: int, arena_locals: int, pre_arena_names: int, in_arena: int,
+                     var_types: int, func_locals: int, uninit_vars: int) -> int:
+    let case_count = vec_len_rt(pass8_ast_children(node))
+    if case_count > 0 do
+        let selector = vec_get_rt(pass8_ast_children(node), 0)
+        pass8_walk(symbols, scopes, diag, selector, moved_vars, shared_borrows, mut_borrows,
+                   bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+    end
+    let case_entry_moved = pass8_box_clone(moved_vars)
+    let case_entry_shared = pass8_box_clone(shared_borrows)
+    let case_entry_mut = pass8_box_clone(mut_borrows)
+    let case_entry_bound = pass8_box_clone(bound_borrows)
+    let case_entry_uninit = pass8_box_clone(uninit_vars)
+    let case_join_moved = pass8_box_new()
+    let case_join_shared = pass8_box_new()
+    let case_join_mut = pass8_box_new()
+    let case_join_bound = pass8_box_new()
+    let case_join_uninit = pass8_box_new()
+    var case_has_continuing = 0
+    var case_idx = 2
+    when case_idx < case_count loop
+        let case_body = vec_get_rt(pass8_ast_children(node), case_idx)
+        let arm_moved = pass8_box_clone(case_entry_moved)
+        let arm_shared = pass8_box_clone(case_entry_shared)
+        let arm_mut = pass8_box_clone(case_entry_mut)
+        let arm_bound = pass8_box_clone(case_entry_bound)
+        let arm_uninit = pass8_box_clone(case_entry_uninit)
+        g_pass8_flow_kind = 0
+        pass8_walk(symbols, scopes, diag, case_body, arm_moved, arm_shared, arm_mut,
+                   arm_bound, arena_locals, pre_arena_names, in_arena, var_types, func_locals, arm_uninit)
+        if g_pass8_flow_kind == 0 do
+            pass8_merge_moved_box(case_join_moved, arm_moved)
+            pass8_merge_borrows_box(case_join_shared, arm_shared)
+            pass8_merge_borrows_box(case_join_mut, arm_mut)
+            pass8_merge_bound_box(case_join_bound, arm_bound)
+            pass8_merge_moved_box(case_join_uninit, arm_uninit)
+            case_has_continuing = 1
+        end
+        case_idx = case_idx + 2
+    end
+    if pass8_ast_int_val(node) == 1 and case_count > 1 do
+        let else_body = vec_get_rt(pass8_ast_children(node), case_count - 1)
+        let else_arm_moved = pass8_box_clone(case_entry_moved)
+        let else_arm_shared = pass8_box_clone(case_entry_shared)
+        let else_arm_mut = pass8_box_clone(case_entry_mut)
+        let else_arm_bound = pass8_box_clone(case_entry_bound)
+        let else_arm_uninit = pass8_box_clone(case_entry_uninit)
+        g_pass8_flow_kind = 0
+        pass8_walk(symbols, scopes, diag, else_body, else_arm_moved, else_arm_shared, else_arm_mut,
+                   else_arm_bound, arena_locals, pre_arena_names, in_arena, var_types, func_locals, else_arm_uninit)
+        if g_pass8_flow_kind == 0 do
+            pass8_merge_moved_box(case_join_moved, else_arm_moved)
+            pass8_merge_borrows_box(case_join_shared, else_arm_shared)
+            pass8_merge_borrows_box(case_join_mut, else_arm_mut)
+            pass8_merge_bound_box(case_join_bound, else_arm_bound)
+            pass8_merge_moved_box(case_join_uninit, else_arm_uninit)
+            case_has_continuing = 1
+        end
+    else
+        pass8_merge_moved_box(case_join_moved, case_entry_moved)
+        pass8_merge_borrows_box(case_join_shared, case_entry_shared)
+        pass8_merge_borrows_box(case_join_mut, case_entry_mut)
+        pass8_merge_bound_box(case_join_bound, case_entry_bound)
+        pass8_merge_moved_box(case_join_uninit, case_entry_uninit)
+        case_has_continuing = 1
+    end
+    if case_has_continuing == 1 do
+        pass8_box_copy_into(moved_vars, case_join_moved)
+        pass8_box_copy_into(shared_borrows, case_join_shared)
+        pass8_box_copy_into(mut_borrows, case_join_mut)
+        pass8_box_copy_into(bound_borrows, case_join_bound)
+        pass8_box_copy_into(uninit_vars, case_join_uninit)
+        g_pass8_flow_kind = 0
+    end
+    out 1
+end.

@@ -1,0 +1,491 @@
+##
+ * compiler/src/ir/mir/opt/loop_legality.vri — Loop transform legality analysis
+ * =============================================================================
+ * VIRC-ISS-0001: shared, conservative facts for loop fusion, tiling and
+ * interchange. A pass may rewrite only a loop shape proven here:
+ *
+ *   - a single-latch counted loop whose induction update is the exact chain
+ *     `t = Add(iv, #step); latch = Move(t)` feeding the header phi;
+ *   - a bound and an initial value that are loop invariant (immediate, or a
+ *     vreg defined outside every loop block under transformation);
+ *   - side-effect-free scalar integer bodies (no calls, memory, traps).
+ *
+ * Anything not proven here is skipped by the calling pass with an observable
+ * reason. Never widen these predicates to make a fixture fire; add a fixture
+ * that proves the new shape instead.
+ ##
+
+include types_prelude
+include rt_vec_rt
+include mir
+
+func mir_loop_vec_len(v: i64) -> int:
+    if v < 0 do out 0 end
+    out vec_len_rt(v)
+end.
+
+func mir_loop_vec_has(v: i64, x: i64) -> bool:
+    let n = mir_loop_vec_len(v)
+    var i = 0
+    when i < n loop
+        if vec_get_rt(v, i) == x do out true end
+        i = i + 1
+    end
+    out false
+end.
+
+func mir_loop_vreg_id(o: i64) -> i64:
+    if mir_opnd_type(o) == MirOperandType.VReg do out mir_opnd_vreg_id(o) end
+    out 0 - 1
+end.
+
+# Scalar integer operations that may be reordered across loop iterations.
+# Div/Mod are excluded on purpose: reordering them can change which trap fires.
+func mir_loop_op_is_scalar_pure(op: i64) -> bool:
+    if op == MirOp.Move or op == MirOp.Add or op == MirOp.Sub or op == MirOp.Mul do out true end
+    if op == MirOp.Shl or op == MirOp.Shr or op == MirOp.And or op == MirOp.Or or op == MirOp.Xor or op == MirOp.Not do out true end
+    if op == MirOp.CmpEq or op == MirOp.CmpNe or op == MirOp.CmpGt or op == MirOp.CmpLt or op == MirOp.CmpGe or op == MirOp.CmpLe do out true end
+    out false
+end.
+
+# Every non-terminator instruction is a pure scalar integer operation and the
+# block ends with an unconditional Jump (the back edge or fallthrough).
+func mir_loop_body_is_scalar_pure(instrs: i64) -> bool:
+    let n = mir_loop_vec_len(instrs)
+    if n < 1 do out false end
+    var i = 0
+    when i < n - 1 loop
+        let ins = vec_get_rt(instrs, i)
+        if !mir_loop_op_is_scalar_pure(mir_instr_op(ins)) do out false end
+        if mir_instr_type(ins) > MirType.Int64 as i64 do out false end
+        i = i + 1
+    end
+    out mir_instr_op(vec_get_rt(instrs, n - 1)) == MirOp.Jump
+end.
+
+func mir_loop_block_defines(b: i64, v: i64) -> bool:
+    if v < 0 do out false end
+    let phis = mir_block_phis(b)
+    let np = mir_loop_vec_len(phis)
+    var pi = 0
+    when pi < np loop
+        if mir_phi_dst(vec_get_rt(phis, pi)) == v do out true end
+        pi = pi + 1
+    end
+    let instrs = mir_block_head(b)
+    let ni = mir_loop_vec_len(instrs)
+    var ii = 0
+    when ii < ni loop
+        if mir_loop_vreg_id(mir_instr_dst(vec_get_rt(instrs, ii))) == v do out true end
+        ii = ii + 1
+    end
+    out false
+end.
+
+# `idxs` is a vector of block indices forming the region under transformation.
+func mir_loop_defined_in_set(blocks: i64, idxs: i64, v: i64) -> bool:
+    let n = mir_loop_vec_len(idxs)
+    var i = 0
+    when i < n loop
+        if mir_loop_block_defines(vec_get_rt(blocks, vec_get_rt(idxs, i)), v) do out true end
+        i = i + 1
+    end
+    out false
+end.
+
+# An operand is invariant over the region when it is an immediate or a vreg
+# that no block of the region defines (SSA: one definition, outside the region).
+func mir_loop_operand_invariant(blocks: i64, idxs: i64, o: i64) -> bool:
+    if mir_opnd_type(o) == MirOperandType.Imm do out true end
+    if mir_opnd_type(o) == MirOperandType.VReg do
+        if mir_loop_defined_in_set(blocks, idxs, mir_opnd_vreg_id(o)) do out false end
+        out true
+    end
+    out false
+end.
+
+func mir_loop_instr_use_count(ins: i64, v: i64) -> int:
+    if v < 0 do out 0 end
+    var n = 0
+    if mir_loop_vreg_id(mir_instr_src1(ins)) == v do n = n + 1 end
+    if mir_loop_vreg_id(mir_instr_src2(ins)) == v do n = n + 1 end
+    let op = mir_instr_op(ins)
+    if op >= MirOp.VLoad as i64 and op <= MirOp.Shuffle as i64 do
+        if mir_loop_vreg_id(mir_instr_dst(ins)) == v do n = n + 1 end
+    end
+    out n
+end.
+
+func mir_loop_instrs_use_count(instrs: i64, v: i64) -> int:
+    let n = mir_loop_vec_len(instrs)
+    var total = 0
+    var i = 0
+    when i < n loop
+        total = total + mir_loop_instr_use_count(vec_get_rt(instrs, i), v)
+        i = i + 1
+    end
+    out total
+end.
+
+func mir_loop_phi_use_count(phi: i64, v: i64) -> int:
+    let vals = mir_phi_incoming_values(phi)
+    let n = mir_loop_vec_len(vals)
+    var total = 0
+    var i = 0
+    when i < n loop
+        if mir_loop_vreg_id(vec_get_rt(vals, i)) == v do total = total + 1 end
+        i = i + 1
+    end
+    out total
+end.
+
+# Uses of `v` anywhere in the function. With `ignore_dead_phis`, an incoming
+# value of a phi whose result is itself unused is not counted (such a phi only
+# carries a value nobody reads and cannot observe a changed iteration order).
+func mir_loop_function_use_count(blocks: i64, v: i64, ignore_dead_phis: bool) -> int:
+    if v < 0 do out 0 end
+    let nb = vec_len_rt(blocks)
+    var total = 0
+    var bi = 0
+    when bi < nb loop
+        let b = vec_get_rt(blocks, bi)
+        total = total + mir_loop_instrs_use_count(mir_block_head(b), v)
+        let phis = mir_block_phis(b)
+        let np = mir_loop_vec_len(phis)
+        var pi = 0
+        when pi < np loop
+            let phi = vec_get_rt(phis, pi)
+            let uses = mir_loop_phi_use_count(phi, v)
+            if uses > 0 do
+                if ignore_dead_phis do
+                    if mir_loop_function_use_count(blocks, mir_phi_dst(phi), false) > 0 do
+                        total = total + uses
+                    end
+                else
+                    total = total + uses
+                end
+            end
+            pi = pi + 1
+        end
+        bi = bi + 1
+    end
+    out total
+end.
+
+func mir_loop_find_phi(b: i64, v: i64) -> i64:
+    let phis = mir_block_phis(b)
+    let np = mir_loop_vec_len(phis)
+    var pi = 0
+    when pi < np loop
+        let phi = vec_get_rt(phis, pi)
+        if mir_phi_dst(phi) == v do out phi end
+        pi = pi + 1
+    end
+    out 0 - 1
+end.
+
+# Splits a two-edge header phi into (ok, entry value, entry block id, latch value).
+func mir_loop_phi_edges(phi: i64, latch_bid: i64):
+    let blks = mir_phi_incoming_blocks(phi)
+    let vals = mir_phi_incoming_values(phi)
+    if mir_loop_vec_len(blks) != 2 do
+        out (false, mir_opnd_none(), 0 - 1, mir_opnd_none())
+    end
+    var li = 0 - 1
+    if vec_get_rt(blks, 0) == latch_bid do li = 0 end
+    if vec_get_rt(blks, 1) == latch_bid do li = 1 end
+    if li < 0 do
+        out (false, mir_opnd_none(), 0 - 1, mir_opnd_none())
+    end
+    out (true, vec_get_rt(vals, 1 - li), vec_get_rt(blks, 1 - li), vec_get_rt(vals, li))
+end.
+
+# Recognises the exact induction update `t = Add(iv, #step); latch = Move(t)` in
+# one block. Returns (ok, step, add index, move index). A bare `Add` that merely
+# reads the induction variable is NOT an induction update.
+func mir_loop_iv_chain(instrs: i64, iv: i64, latch_vreg: i64):
+    let n = mir_loop_vec_len(instrs)
+    var move_idx = 0 - 1
+    var i = 0
+    when i < n loop
+        let ins = vec_get_rt(instrs, i)
+        if mir_instr_op(ins) == MirOp.Move do
+            if mir_loop_vreg_id(mir_instr_dst(ins)) == latch_vreg do move_idx = i end
+        end
+        i = i + 1
+    end
+    if move_idx < 0 do out (false, 0, 0 - 1, 0 - 1) end
+    let t = mir_loop_vreg_id(mir_instr_src1(vec_get_rt(instrs, move_idx)))
+    if t < 0 do out (false, 0, 0 - 1, 0 - 1) end
+    var add_idx = 0 - 1
+    var step = 0
+    i = 0
+    when i < move_idx loop
+        let ins = vec_get_rt(instrs, i)
+        if mir_instr_op(ins) == MirOp.Add do
+            if mir_loop_vreg_id(mir_instr_dst(ins)) == t do
+                let s1 = mir_instr_src1(ins)
+                let s2 = mir_instr_src2(ins)
+                if mir_loop_vreg_id(s1) == iv and mir_opnd_type(s2) == MirOperandType.Imm do
+                    add_idx = i
+                    step = mir_opnd_imm_val(s2)
+                eif mir_loop_vreg_id(s2) == iv and mir_opnd_type(s1) == MirOperandType.Imm do
+                    add_idx = i
+                    step = mir_opnd_imm_val(s1)
+                end
+            end
+        end
+        i = i + 1
+    end
+    if add_idx < 0 do out (false, 0, 0 - 1, 0 - 1) end
+    if mir_instr_type(vec_get_rt(instrs, add_idx)) > MirType.Int64 as i64 do
+        out (false, 0, 0 - 1, 0 - 1)
+    end
+    out (true, step, add_idx, move_idx)
+end.
+
+func mir_loop_no_header():
+    out (false, 0 - 1, 0, 0, mir_opnd_none(), mir_opnd_none(), 0 - 1, 0 - 1, 0 - 1)
+end.
+
+# Proves a canonical counted loop whose header is `cond_idx` and whose single
+# latch block is `latch_idx`. Returns
+#   (ok, iv, step, cmp_op, init, bound, entry block id, add index, move index)
+# where the indices locate the induction chain inside the latch block.
+# Proven: header is exactly [Cmp; JumpIfNot; Jump] on the iv phi with a bound
+# operand, the header has exactly two predecessors (entry + latch), the latch
+# ends with a jump back to the header, and the chain feeds the iv phi with a
+# positive immediate step.
+func mir_loop_header_info(blocks: i64, cond_idx: int, latch_idx: int):
+    if cond_idx < 0 or latch_idx < 0 do out mir_loop_no_header() end
+    let b_cond = vec_get_rt(blocks, cond_idx)
+    let b_latch = vec_get_rt(blocks, latch_idx)
+    let i_cond = mir_block_head(b_cond)
+    let i_latch = mir_block_head(b_latch)
+    if mir_loop_vec_len(i_cond) != 3 do out mir_loop_no_header() end
+    let n_latch = mir_loop_vec_len(i_latch)
+    if n_latch < 1 do out mir_loop_no_header() end
+
+    let cmp_ins = vec_get_rt(i_cond, 0)
+    let jin = vec_get_rt(i_cond, 1)
+    let jmp = vec_get_rt(i_cond, 2)
+    let cmp_op = mir_instr_op(cmp_ins)
+    if cmp_op != MirOp.CmpLt and cmp_op != MirOp.CmpLe and cmp_op != MirOp.CmpNe do
+        out mir_loop_no_header()
+    end
+    if mir_instr_op(jin) != MirOp.JumpIfNot or mir_instr_op(jmp) != MirOp.Jump do
+        out mir_loop_no_header()
+    end
+    let cond_v = mir_loop_vreg_id(mir_instr_dst(cmp_ins))
+    if cond_v < 0 or mir_loop_vreg_id(mir_instr_src1(jin)) != cond_v do
+        out mir_loop_no_header()
+    end
+    let iv = mir_loop_vreg_id(mir_instr_src1(cmp_ins))
+    if iv < 0 do out mir_loop_no_header() end
+
+    let last = vec_get_rt(i_latch, n_latch - 1)
+    if mir_instr_op(last) != MirOp.Jump do out mir_loop_no_header() end
+    if mir_opnd_imm_val(mir_instr_src1(last)) != mir_block_id(b_cond) do
+        out mir_loop_no_header()
+    end
+    if mir_loop_vec_len(mir_block_preds(b_cond)) != 2 do out mir_loop_no_header() end
+
+    let phi = mir_loop_find_phi(b_cond, iv)
+    if phi < 0 do out mir_loop_no_header() end
+    let (edges_ok, entry_v, entry_bid, latch_v) = mir_loop_phi_edges(phi, mir_block_id(b_latch))
+    if !edges_ok do out mir_loop_no_header() end
+    let latch_vreg = mir_loop_vreg_id(latch_v)
+    if latch_vreg < 0 do out mir_loop_no_header() end
+    let (chain_ok, step, add_idx, move_idx) = mir_loop_iv_chain(i_latch, iv, latch_vreg)
+    if !chain_ok || step < 1 do out mir_loop_no_header() end
+    out (true, iv, step, cmp_op, entry_v, mir_instr_src2(cmp_ins), entry_bid, add_idx, move_idx)
+end.
+
+# A bridge holds exactly one unconditional Jump, no phis, and one predecessor.
+func mir_loop_is_empty_bridge(blocks: i64, idx: int) -> bool:
+    if idx < 0 do out false end
+    let b = vec_get_rt(blocks, idx)
+    let instrs = mir_block_head(b)
+    if mir_loop_vec_len(instrs) != 1 do out false end
+    if mir_instr_op(vec_get_rt(instrs, 0)) != MirOp.Jump do out false end
+    if mir_loop_vec_len(mir_block_phis(b)) != 0 do out false end
+    out mir_loop_vec_len(mir_block_preds(b)) == 1
+end.
+
+# True when any instruction in `instrs` reads a vreg defined by block `def_block`.
+func mir_loop_reads_defs_of(instrs: i64, def_block: i64) -> bool:
+    let n = mir_loop_vec_len(instrs)
+    var i = 0
+    when i < n loop
+        let ins = vec_get_rt(instrs, i)
+        let v1 = mir_loop_vreg_id(mir_instr_src1(ins))
+        let v2 = mir_loop_vreg_id(mir_instr_src2(ins))
+        if v1 >= 0 do
+            if mir_loop_block_defines(def_block, v1) do out true end
+        end
+        if v2 >= 0 do
+            if mir_loop_block_defines(def_block, v2) do out true end
+        end
+        i = i + 1
+    end
+    out false
+end.
+
+# Interchange reorders iterations, so every live loop-carried scalar must be an
+# order-insensitive additive reduction:
+#   - inner phi P: its only body use is `r = Add(P, x)` where x is not derived
+#     from any carried value, and r's only use is `Move(latch(P), r)`;
+#   - outer phi Q: Q's latch value is such an inner phi whose entry value is Q.
+# Dead phis (no readers) are ignored. Anything else (overwritten or order
+# dependent values such as `last = i * j`) is rejected.
+func mir_loop_reductions_ok(blocks: i64, out_cond_idx: int, in_cond_idx: int, in_body_idx: int, out_latch_idx: int, iv_out: i64, iv_in: i64) -> bool:
+    let b_out_cond = vec_get_rt(blocks, out_cond_idx)
+    let b_in_cond = vec_get_rt(blocks, in_cond_idx)
+    let b_body = vec_get_rt(blocks, in_body_idx)
+    let i_body = mir_block_head(b_body)
+    let body_id = mir_block_id(b_body)
+    let latch_id = mir_block_id(vec_get_rt(blocks, out_latch_idx))
+    let in_phis = mir_block_phis(b_in_cond)
+    let out_phis = mir_block_phis(b_out_cond)
+
+    var carried = vec_new_rt()
+    var inner_carried = vec_new_rt()
+    var pi = 0
+    when pi < mir_loop_vec_len(in_phis) loop
+        let p = mir_phi_dst(vec_get_rt(in_phis, pi))
+        if p != iv_in do
+            if mir_loop_function_use_count(blocks, p, false) > 0 do
+                carried = vec_push_rt(carried, p)
+                inner_carried = vec_push_rt(inner_carried, p)
+                # A live inner value must be read by exactly one body instruction.
+                if mir_loop_instrs_use_count(i_body, p) != 1 do out false end
+            end
+        end
+        pi = pi + 1
+    end
+    pi = 0
+    when pi < mir_loop_vec_len(out_phis) loop
+        let q = mir_phi_dst(vec_get_rt(out_phis, pi))
+        if q != iv_out do
+            if mir_loop_function_use_count(blocks, q, false) > 0 do
+                carried = vec_push_rt(carried, q)
+                # An outer carried value must never be read inside the body.
+                if mir_loop_instrs_use_count(i_body, q) != 0 do out false end
+                let (q_ok, q_entry, q_entry_bid, q_latch) = mir_loop_phi_edges(vec_get_rt(out_phis, pi), latch_id)
+                if !q_ok do out false end
+                let p_chain = mir_loop_vreg_id(q_latch)
+                if !mir_loop_vec_has(inner_carried, p_chain) do out false end
+                let p_phi = mir_loop_find_phi(b_in_cond, p_chain)
+                if p_phi < 0 do out false end
+                let (pe_ok, p_entry, p_entry_bid, p_latch) = mir_loop_phi_edges(p_phi, body_id)
+                if !pe_ok do out false end
+                if mir_loop_vreg_id(p_entry) != q do out false end
+            end
+        end
+        pi = pi + 1
+    end
+
+    # Taint walk over the body: instructions reading a carried value must be
+    # accepted reductions; their result is consumed by the latch Move.
+    var tainted = vec_new_rt()
+    let n = mir_loop_vec_len(i_body)
+    var i = 0
+    when i < n - 1 loop
+        let ins = vec_get_rt(i_body, i)
+        let s1 = mir_loop_vreg_id(mir_instr_src1(ins))
+        let s2 = mir_loop_vreg_id(mir_instr_src2(ins))
+        let t1 = mir_loop_vec_has(carried, s1) or mir_loop_vec_has(tainted, s1)
+        let t2 = mir_loop_vec_has(carried, s2) or mir_loop_vec_has(tainted, s2)
+        if t1 or t2 do
+            if mir_instr_op(ins) != MirOp.Add do out false end
+            if t1 and t2 do out false end
+            var p = s1
+            var x = s2
+            if t2 do
+                p = s2
+                x = s1
+            end
+            if !mir_loop_vec_has(inner_carried, p) do out false end
+            let r = mir_loop_vreg_id(mir_instr_dst(ins))
+            if r < 0 do out false end
+            if mir_loop_function_use_count(blocks, r, false) != 1 do out false end
+            let p_phi2 = mir_loop_find_phi(b_in_cond, p)
+            let (pe2_ok, pe2_entry, pe2_bid, pe2_latch) = mir_loop_phi_edges(p_phi2, body_id)
+            if !pe2_ok do out false end
+            # The single use of r must be the Move that closes P's recurrence.
+            var closes = false
+            var k = i + 1
+            when k < n - 1 loop
+                let nxt = vec_get_rt(i_body, k)
+                if mir_instr_op(nxt) == MirOp.Move and mir_loop_vreg_id(mir_instr_src1(nxt)) == r do
+                    if mir_loop_vreg_id(mir_instr_dst(nxt)) == mir_loop_vreg_id(pe2_latch) do closes = true end
+                end
+                k = k + 1
+            end
+            if !closes do out false end
+        else
+            let d = mir_loop_vreg_id(mir_instr_dst(ins))
+            if d >= 0 do
+                # Values derived from a carried value (other than a consumed
+                # reduction result) make the iteration order observable.
+                if mir_loop_vec_has(tainted, s1) or mir_loop_vec_has(tainted, s2) do
+                    tainted = vec_push_rt(tainted, d)
+                end
+            end
+        end
+        i = i + 1
+    end
+    out true
+end.
+
+# Checks whether loop 2 has any data dependency on loop 1 or bridge blocks:
+# - bounds or initial values reading definitions of loop 1;
+# - loop 2 body instructions reading definitions of loop 1;
+# - loop 2 non-IV phi incoming entry values reading definitions of loop 1.
+func mir_loop_fusion_has_cross_dep(blocks: i64, loop1_blocks: i64, cond2_idx: int, body2_idx: int, iv2: i64, bound2: i64, init2: i64) -> bool:
+    if !mir_loop_operand_invariant(blocks, loop1_blocks, bound2) do out true end
+    if !mir_loop_operand_invariant(blocks, loop1_blocks, init2) do out true end
+
+    let b_body2 = vec_get_rt(blocks, body2_idx)
+    let i_body2 = mir_block_head(b_body2)
+    let n_l1 = mir_loop_vec_len(loop1_blocks)
+    var k = 0
+    when k < n_l1 loop
+        let b1 = vec_get_rt(blocks, vec_get_rt(loop1_blocks, k))
+        if mir_loop_reads_defs_of(i_body2, b1) do out true end
+        k = k + 1
+    end
+
+    let b_cond2 = vec_get_rt(blocks, cond2_idx)
+    let p2 = mir_block_phis(b_cond2)
+    let np2 = mir_loop_vec_len(p2)
+    var pi = 0
+    when pi < np2 loop
+        let phi2 = vec_get_rt(p2, pi)
+        if mir_phi_dst(phi2) != iv2 do
+            let (pe_ok, p2_entry, p2_bid, p2_latch) = mir_loop_phi_edges(phi2, mir_block_id(b_body2))
+            if !pe_ok do out true end
+            if !mir_loop_operand_invariant(blocks, loop1_blocks, p2_entry) do out true end
+        end
+        pi = pi + 1
+    end
+    out false
+end.
+
+# Verifies that both loops in a 2D nest have rectangular, induction-independent iteration domains:
+# bounds and initial values must be invariant over the nest and must not equal either IV.
+func mir_loop_nest_is_rectangular(blocks: i64, nest_idxs: i64, iv_out: i64, iv_in: i64, bound_out: i64, bound_in: i64, init_out: i64, init_in: i64) -> bool:
+    if !mir_loop_operand_invariant(blocks, nest_idxs, bound_in) or mir_loop_vreg_id(bound_in) == iv_out do out false end
+    if !mir_loop_operand_invariant(blocks, nest_idxs, bound_out) or mir_loop_vreg_id(bound_out) == iv_in do out false end
+    if !mir_loop_operand_invariant(blocks, nest_idxs, init_in) or mir_loop_vreg_id(init_in) == iv_out do out false end
+    if !mir_loop_operand_invariant(blocks, nest_idxs, init_out) or mir_loop_vreg_id(init_out) == iv_in do out false end
+    out true
+end.
+
+export mir_loop_vec_len, mir_loop_vec_has, mir_loop_vreg_id, mir_loop_op_is_scalar_pure,
+       mir_loop_body_is_scalar_pure, mir_loop_block_defines, mir_loop_defined_in_set,
+       mir_loop_operand_invariant, mir_loop_instr_use_count, mir_loop_instrs_use_count,
+       mir_loop_function_use_count, mir_loop_find_phi, mir_loop_phi_edges,
+       mir_loop_iv_chain, mir_loop_header_info, mir_loop_is_empty_bridge,
+       mir_loop_reads_defs_of, mir_loop_reductions_ok,
+       mir_loop_fusion_has_cross_dep, mir_loop_nest_is_rectangular

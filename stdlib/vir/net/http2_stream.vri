@@ -1,0 +1,231 @@
+# Module: protocol/http2_stream
+# HTTP/2 Stream State Machine and Per-Stream Flow Control (RFC 7540 §5.1 & §5.2)
+# InterVir Unified Web Runtime — Phase 15: HTTP/2 Protocol Engine
+
+include http2.frame
+
+# Numeric and boolean fields first, string fields last (Bug 3 alignment safety)
+entity H2Stream:
+    strm_id: int
+    strm_state: int # 0=Idle, 1=Reserved, 2=Open, 3=HalfClosedLocal, 4=HalfClosedRemote, 5=Closed
+    strm_send_window: int
+    strm_recv_window: int
+    strm_bytes_sent: int
+    strm_bytes_received: int
+    strm_error_code: int
+    strm_request_method: int # HttpMethod
+    strm_response_status: int
+    strm_end_stream_sent: bool
+    strm_end_stream_recv: bool
+    strm_active: bool
+    strm_request_path: string
+    strm_request_host: string
+end.
+
+func h2_stream_init(this: H2Stream, id: int, init_win: int):
+    this.strm_id = id
+    this.strm_state = 0 # Idle
+    this.strm_send_window = init_win
+    this.strm_recv_window = init_win
+    this.strm_bytes_sent = 0
+    this.strm_bytes_received = 0
+    this.strm_error_code = 0 # NoError
+    this.strm_request_method = 0 # Get
+    this.strm_response_status = 0
+    this.strm_end_stream_sent = false
+    this.strm_end_stream_recv = false
+    this.strm_active = true
+    this.strm_request_path = "/"
+    this.strm_request_host = ""
+end.
+
+func strm_is_open(this: H2Stream) -> bool:
+    out this.strm_state == 2
+end.
+
+func strm_is_closed(this: H2Stream) -> bool:
+    out this.strm_state == 5
+end.
+
+func strm_is_half_closed_remote(this: H2Stream) -> bool:
+    out this.strm_state == 4
+end.
+
+func strm_is_half_closed_local(this: H2Stream) -> bool:
+    out this.strm_state == 3
+end.
+
+func strm_reset(this: H2Stream, err: int):
+    this.strm_state = 5 # Closed
+    this.strm_error_code = err
+    this.strm_active = false
+end.
+
+# State transitions when RECEIVING frames from peer
+# ftype: 0=Data, 1=Headers, 3=RstStream
+func strm_transition_recv(this: H2Stream, ftype: int, is_end: bool) -> bool:
+    if this.strm_state == 5 do
+        # Stream already closed
+        out false
+    end
+
+    if ftype == 3 do
+        # RST_STREAM closes immediately
+        this.strm_state = 5
+        this.strm_active = false
+        out true
+    end
+
+    if this.strm_state == 0 do
+        # Idle -> receiving HEADERS
+        if ftype == 1 do
+            if is_end do
+                this.strm_state = 4 # HalfClosedRemote
+                this.strm_end_stream_recv = true
+            else
+                this.strm_state = 2 # Open
+            end
+            out true
+        end
+        out false
+    end
+
+    if this.strm_state == 2 do
+        # Open
+        if is_end do
+            this.strm_state = 4 # HalfClosedRemote
+            this.strm_end_stream_recv = true
+        end
+        out true
+    end
+
+    if this.strm_state == 3 do
+        # HalfClosedLocal -> receiving peer's END_STREAM closes stream
+        if is_end do
+            this.strm_state = 5 # Closed
+            this.strm_end_stream_recv = true
+            this.strm_active = false
+        end
+        out true
+    end
+
+    if this.strm_state == 4 do
+        # HalfClosedRemote: peer cannot send further DATA or HEADERS
+        out false
+    end
+
+    out false
+end.
+
+# State transitions when SENDING frames to peer
+# ftype: 0=Data, 1=Headers, 3=RstStream
+func strm_transition_send(this: H2Stream, ftype: int, is_end: bool) -> bool:
+    if this.strm_state == 5 do
+        out false
+    end
+
+    if ftype == 3 do
+        # Sending RST_STREAM closes immediately
+        this.strm_state = 5
+        this.strm_active = false
+        out true
+    end
+
+    if this.strm_state == 0 do
+        # Idle -> sending HEADERS (e.g. server push or client request)
+        if ftype == 1 do
+            if is_end do
+                this.strm_state = 3 # HalfClosedLocal
+                this.strm_end_stream_sent = true
+            else
+                this.strm_state = 2 # Open
+            end
+            out true
+        end
+        out false
+    end
+
+    if this.strm_state == 2 do
+        # Open
+        if is_end do
+            this.strm_state = 3 # HalfClosedLocal
+            this.strm_end_stream_sent = true
+        end
+        out true
+    end
+
+    if this.strm_state == 4 do
+        # HalfClosedRemote -> server finishing response with END_STREAM
+        if is_end do
+            this.strm_state = 5 # Closed
+            this.strm_end_stream_sent = true
+            this.strm_active = false
+        end
+        out true
+    end
+
+    if this.strm_state == 3 do
+        # HalfClosedLocal: cannot send further DATA or HEADERS
+        out false
+    end
+
+    out false
+end.
+
+# Flow control management
+
+func strm_consume_send_window(this: H2Stream, bytes: int) -> bool:
+    if bytes < 0 do
+        out false
+    end
+    if bytes > this.strm_send_window do
+        out false
+    end
+    this.strm_send_window = this.strm_send_window - bytes
+    this.strm_bytes_sent = this.strm_bytes_sent + bytes
+    out true
+end.
+
+func strm_consume_recv_window(this: H2Stream, bytes: int) -> bool:
+    if bytes < 0 do
+        out false
+    end
+    if bytes > this.strm_recv_window do
+        # Received more data than window allows
+        this.strm_error_code = 3 # FlowControlError
+        out false
+    end
+    this.strm_recv_window = this.strm_recv_window - bytes
+    this.strm_bytes_received = this.strm_bytes_received + bytes
+    out true
+end.
+
+func strm_update_send_window(this: H2Stream, delta: int) -> bool:
+    # RFC 7540 §6.9: window increment must be positive 1..0x7FFFFFFF
+    if delta <= 0 do
+        this.strm_error_code = 1 # ProtocolError
+        out false
+    end
+    var max_win = 2147483647 # 0x7FFFFFFF
+    if this.strm_send_window > max_win - delta do
+        # Overflow error
+        this.strm_error_code = 3 # FlowControlError
+        out false
+    end
+    this.strm_send_window = this.strm_send_window + delta
+    out true
+end.
+
+func strm_update_recv_window(this: H2Stream, delta: int) -> bool:
+    if delta <= 0 do
+        this.strm_error_code = 1 # ProtocolError
+        out false
+    end
+    var max_win = 2147483647
+    if this.strm_recv_window > max_win - delta do
+        this.strm_error_code = 3 # FlowControlError
+        out false
+    end
+    this.strm_recv_window = this.strm_recv_window + delta
+    out true
+end.

@@ -1,0 +1,485 @@
+##
+ * vir/compiler/opt_backend.vri — Backend optimizer dispatch (no arch in MIR pipeline)
+ * ================================================================================
+ * Passes 10 (SIMD), 11 (TCO), 12 (IRC), 15 (ARC), 21 (shrink-wrap) are routed here.
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+include lir
+include opt_pass
+include opt_trace
+import optTraceNote from compiler.opt_trace
+include target
+import opt_arm64_run_mir_passes, opt_arm64_run_lir_passes, opt_arm64_run_simd_mir_passes from opt_backend_arm64
+import opt_arm64_run_mir_passes, opt_arm64_run_lir_passes, opt_arm64_run_simd_mir_passes, opt_arm64_run_lir_pre, opt_arm64_run_lir_post from opt_backend_arm64
+import opt_x86_run_mir_passes, opt_x86_run_lir_pre, opt_x86_run_lir_post from opt_backend_x86
+import opt_riscv_run_mir_passes, opt_riscv_run_lir_pre, opt_riscv_run_lir_post from opt_backend_riscv
+import opt_wasm_run_mir_passes, opt_wasm_run_lir_pre, opt_wasm_run_lir_post from opt_backend_wasm
+import opt_generic_run_mir_passes, opt_generic_run_lir_passes, opt_generic_run_simd_mir_passes from opt_backend_generic
+import optGenericRunMirLayout from opt_backend_generic
+import opt_backend_run_arc_passes from opt_backend_arc
+
+# MIR hooks after shared spec pipeline (ISA-specific MIR prep only).
+func opt_backend_run_mir_post(blocks: i64, arch: int, opt_level: int):
+    if opt_level < 1 do out blocks end
+    if arch == TargetArch.ARM64 or arch == 2 or arch == 0 do
+        optTraceNote(101)
+        blocks = opt_arm64_run_mir_passes(blocks)
+        if opt_level >= 2 do
+            optTraceNote(102)
+            blocks = opt_arm64_run_simd_mir_passes(blocks)
+        end
+        if opt_level >= 2 do
+            optTraceNote(108)
+            blocks = opt_backend_run_arc_passes(blocks, opt_level)
+        end
+        out blocks
+    end
+    if arch == TargetArch.X86_64 or arch == 1 do
+        optTraceNote(104)
+        blocks = opt_x86_run_mir_passes(blocks)
+        if opt_level >= 2 do
+            optTraceNote(103)
+            blocks = optGenericRunMirLayout(blocks)
+        end
+        if opt_level >= 2 do
+            optTraceNote(108)
+            blocks = opt_backend_run_arc_passes(blocks, opt_level)
+        end
+        out blocks
+    end
+    if arch == TargetArch.RISCV64 or arch == 3 do
+        optTraceNote(105)
+        blocks = opt_riscv_run_mir_passes(blocks)
+        if opt_level >= 2 do
+            optTraceNote(108)
+            blocks = opt_backend_run_arc_passes(blocks, opt_level)
+        end
+        out blocks
+    end
+    if arch == TargetArch.Wasm32 or arch == 4 do
+        optTraceNote(106)
+        blocks = opt_wasm_run_mir_passes(blocks)
+        if opt_level >= 2 do
+            optTraceNote(103)
+            blocks = optGenericRunMirLayout(blocks)
+        end
+        if opt_level >= 2 do
+            optTraceNote(108)
+            blocks = opt_backend_run_arc_passes(blocks, opt_level)
+        end
+        out blocks
+    end
+    optTraceNote(107)
+    blocks = opt_generic_run_mir_passes(blocks)
+    if opt_level >= 2 do
+        optTraceNote(108)
+        blocks = opt_backend_run_arc_passes(blocks, opt_level)
+    end
+    out blocks
+end.
+
+# ── Tail-Call Optimization (Spec §1.2.1 Pass 11 / OptStageLIR) ──
+
+func opt_tco_str_eq(a: string, b: string):
+    if (a as i64) == (b as i64) do out 1 end
+    if (a as i64) == 0 or (b as i64) == 0 do out 0 end
+    let la = native_read_i64(a as i64, 8)
+    let lb = native_read_i64(b as i64, 8)
+    if la >= 0 and la < 10000 and lb >= 0 and lb < 10000 do
+        if fat_str_eq(a, b) == 1 do out 1 end
+    end
+    if fat_cstr_eq(a as i64, b) == 1 do out 1 end
+    if fat_cstr_eq(b as i64, a) == 1 do out 1 end
+    out 0
+end.
+
+func lir_func_has_cleanup(lf: i64):
+    let blocks = lir_func_blocks(lf)
+    let n_blocks = vec_len_rt(blocks)
+    var bi = 0
+    when bi < n_blocks loop
+        let b = vec_get_rt(blocks, bi)
+        let instrs = lir_block_instrs(b)
+        let n_ins = vec_len_rt(instrs)
+        var ii = 0
+        when ii < n_ins loop
+            let ins = vec_get_rt(instrs, ii)
+            let op = lir_instr_op(ins)
+            if op == (LirOp.Intrinsic as i64) do
+                let aux = lir_instr_aux(ins)
+                # Canonical constants: MIR_INTR_ARENA=18, MIR_INTR_ENSURE=19, MIR_INTR_REVERT=20,
+                # MIR_INTR_TRY=36, MIR_MEM_MARK=71, MIR_MEM_RESET=72, MIR_MEM_PROMOTE=73,
+                # MIR_MEM_DROP=74, MIR_MEM_ALLOC=75.
+                # Function-level cleanups: ensure (19), revert (20), try (36).
+                # Explicit arena scope mark/reset (71, 72, 73) perform sub-arena teardown
+                # before tail-call jump and do not block TCO.
+                if aux == 18 or aux == 19 or aux == 20 or aux == 36 or aux == 74 or aux == 75 do
+                    out 1
+                end
+            end
+            ii = ii + 1
+        end
+        bi = bi + 1
+    end
+    out 0
+end.
+
+func lir_is_pure_return_block(b: i64, call_dst_vreg: i64):
+    if (b as i64) == 0 do out 0 end
+    let
+        instrs = lir_block_instrs(b)
+        n_ins = vec_len_rt(instrs)
+    if n_ins == 0 do out 0 end
+    var
+        has_call_dst_use = 0
+        has_any_mov = 0
+    if call_dst_vreg < 0 do has_call_dst_use = 1 end
+    var ii = 0
+    when ii < n_ins loop
+        let
+            ins = vec_get_rt(instrs, ii)
+            op = lir_instr_op(ins)
+        if opt_tco_is_ignorable(ins) == 1 do
+            # ignore
+        eif op == (LirOp.Mov as i64) do
+            has_any_mov = 1
+            let s1 = lir_instr_src1(ins)
+            if (s1 as i64) != 0 do
+                let s1_typ = native_read_i64(s1 as i64, 0)
+                if s1_typ == (LirOperandType.VRegInt as i64) or s1_typ == (LirOperandType.VRegFloat as i64) do
+                    let s1_vr = native_read_i64(s1 as i64, 8)
+                    if s1_vr == call_dst_vreg do
+                        has_call_dst_use = 1
+                    end
+                end
+            end
+        eif op == (LirOp.Jmp as i64) or op == (LirOp.Ret as i64) do
+            # terminator
+        else
+            out 0
+        end
+        ii = ii + 1
+    end
+    if has_any_mov == 0 do has_call_dst_use = 1 end
+    out has_call_dst_use
+end.
+
+func lir_is_pure_fail_block(b: i64):
+    if (b as i64) == 0 do out 0 end
+    let instrs = lir_block_instrs(b)
+    let n_ins = vec_len_rt(instrs)
+    if n_ins == 0 do out 0 end
+    var ii = 0
+    when ii < n_ins loop
+        let ins = vec_get_rt(instrs, ii)
+        let op = lir_instr_op(ins)
+        if opt_tco_is_ignorable(ins) == 1 or op == (LirOp.Mov as i64) or op == (LirOp.Jmp as i64) or op == (LirOp.Ret as i64) do
+            # valid
+        eif op == (LirOp.Intrinsic as i64) and lir_instr_aux(ins) == 72 do
+            # MIR_MEM_RESET in fail block is expected when failing across an arena
+        else
+            out 0
+        end
+        ii = ii + 1
+    end
+    out 1
+end.
+
+func opt_tco_find_block(blocks: i64, target_id: i64):
+    if (blocks as i64) == 0 do out 0 end
+    let n = vec_len_rt(blocks)
+    var i = 0
+    when i < n loop
+        let b = vec_get_rt(blocks, i)
+        if (b as i64) != 0 and lir_block_id(b) == target_id do
+            out b
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func opt_tco_is_ignorable(ins: i64):
+    if (ins as i64) == 0 do out 1 end
+    let op = lir_instr_op(ins)
+    if op == (LirOp.Nop as i64) do out 1 end
+    if op == (LirOp.Intrinsic as i64) do
+        let aux = lir_instr_aux(ins)
+        if aux == 28 or aux == 26 or aux == 25 or aux == 24 or aux == 27 or aux == 29 or aux == 56 or aux == 59 or aux == 61 or aux == 62 do
+            out 1
+        end
+    end
+    out 0
+end.
+
+func opt_tco_skip_ignorable(instrs: i64, start: int, n: int):
+    var idx = start
+    when idx < n loop
+        let ins = vec_get_rt(instrs, idx)
+        if opt_tco_is_ignorable(ins) == 0 do
+            out idx
+        end
+        idx = idx + 1
+    end
+    out n
+end.
+
+func opt_backend_run_tco(lf: i64, level: int):
+    if level < 1 do out lf end
+    if (lf as i64) == 0 do out lf end
+    let f_name = lir_func_name(lf)
+    if (f_name as i64) == 0 do out lf end
+    let has_cl = lir_func_has_cleanup(lf)
+    if has_cl == 1 do out lf end
+
+    let
+        strings = lir_func_strings(lf)
+        blocks = lir_func_blocks(lf)
+        n_blocks = vec_len_rt(blocks)
+    if n_blocks == 0 do out lf end
+
+    var
+        transformed_any = 0
+        bi = 0
+    when bi < n_blocks loop
+        let
+            b = vec_get_rt(blocks, bi)
+            instrs = lir_block_instrs(b)
+            n_ins = vec_len_rt(instrs)
+
+        var
+            call_idx = 0 - 1
+            ci = n_ins - 1
+        when ci >= 0 loop
+            let ins_c = vec_get_rt(instrs, ci)
+            if lir_instr_op(ins_c) == (LirOp.Call as i64) do
+                call_idx = ci
+                ci = 0 - 1
+            else
+                ci = ci - 1
+            end
+        end
+
+        if call_idx >= 0 do
+            let
+                call_ins = vec_get_rt(instrs, call_idx)
+                sid = lir_instr_aux(call_ins)
+            var is_self = 0
+            if sid >= 0 and (strings as i64) != 0 and sid < vec_len_rt(strings) do
+                let callee_name = vec_get_rt(strings, sid) as string
+                if opt_tco_str_eq(callee_name, f_name) == 1 do
+                    is_self = 1
+                end
+            end
+
+            if is_self == 1 do
+                let call_dst = lir_instr_dst(call_ins)
+                var call_dst_vr = 0 - 1
+                if (call_dst as i64) != 0 do
+                    let cd_typ = native_read_i64(call_dst as i64, 0)
+                    if cd_typ == (LirOperandType.VRegInt as i64) or cd_typ == (LirOperandType.VRegFloat as i64) do
+                        call_dst_vr = native_read_i64(call_dst as i64, 8)
+                    end
+                end
+
+                var
+                    is_tail = 0
+                    ok_bid = 0 - 1
+                    fail_bid = 0 - 1
+
+                # Pattern A: ERX check + JmpCond (skipping ignorable instructions)
+                let idx_erx = opt_tco_skip_ignorable(instrs, call_idx + 1, n_ins)
+                if idx_erx < n_ins do
+                    let
+                        ins_erx = vec_get_rt(instrs, idx_erx)
+                        aux_erx = lir_instr_aux(ins_erx)
+                    if lir_instr_op(ins_erx) == (LirOp.Intrinsic as i64) and (aux_erx == 35 or aux_erx == 55) do
+                        let idx_jmp = opt_tco_skip_ignorable(instrs, idx_erx + 1, n_ins)
+                        if idx_jmp < n_ins do
+                            let ins_jmp = vec_get_rt(instrs, idx_jmp)
+                            if lir_instr_op(ins_jmp) == (LirOp.JmpCond as i64) do
+                                let s2 = lir_instr_src2(ins_jmp)
+                                var target_cond = 0 - 1
+                                if (s2 as i64) != 0 do
+                                    let s2_typ = native_read_i64(s2 as i64, 0)
+                                    if s2_typ == (LirOperandType.Imm as i64) do
+                                        target_cond = native_read_i64(s2 as i64, 32)
+                                    eif s2_typ == (LirOperandType.Label as i64) do
+                                        target_cond = native_read_i64(s2 as i64, 40)
+                                    end
+                                end
+                                var target_fall = 0 - 1
+                                let idx_fail = opt_tco_skip_ignorable(instrs, idx_jmp + 1, n_ins)
+                                if idx_fail < n_ins do
+                                    let ins_fail = vec_get_rt(instrs, idx_fail)
+                                    if lir_instr_op(ins_fail) == (LirOp.Jmp as i64) do
+                                        let fs1 = lir_instr_src1(ins_fail)
+                                        if (fs1 as i64) != 0 do
+                                            let fs1_typ = native_read_i64(fs1 as i64, 0)
+                                            if fs1_typ == (LirOperandType.Imm as i64) do
+                                                target_fall = native_read_i64(fs1 as i64, 32)
+                                            eif fs1_typ == (LirOperandType.Label as i64) do
+                                                target_fall = native_read_i64(fs1 as i64, 40)
+                                            end
+                                        end
+                                    end
+                                end
+                                if target_fall < 0 and bi + 1 < n_blocks do
+                                    target_fall = lir_block_id(vec_get_rt(blocks, bi + 1))
+                                end
+                                let
+                                    b_cond = opt_tco_find_block(blocks, target_cond)
+                                    b_fall = opt_tco_find_block(blocks, target_fall)
+                                if (b_cond as i64) != 0 and (b_fall as i64) != 0 do
+                                    if lir_is_pure_return_block(b_cond, call_dst_vr) == 1 and lir_is_pure_fail_block(b_fall) == 1 do
+                                        is_tail = 1
+                                        ok_bid = target_cond
+                                        fail_bid = target_fall
+                                    eif lir_is_pure_return_block(b_fall, call_dst_vr) == 1 and lir_is_pure_fail_block(b_cond) == 1 do
+                                        is_tail = 1
+                                        ok_bid = target_fall
+                                        fail_bid = target_cond
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+
+                # Pattern B: directly followed by Ret or pure return (skipping ignorable)
+                let idx_after_call = opt_tco_skip_ignorable(instrs, call_idx + 1, n_ins)
+                if is_tail == 0 and idx_after_call == n_ins do
+                    if bi + 1 < n_blocks do
+                        let b_next = vec_get_rt(blocks, bi + 1)
+                        if lir_is_pure_return_block(b_next, call_dst_vr) == 1 do
+                            is_tail = 1
+                            ok_bid = lir_block_id(b_next)
+                        end
+                    end
+                eif is_tail == 0 and idx_after_call < n_ins do
+                    var
+                        pure_rem = 1
+                        rem_i = idx_after_call
+                    when rem_i < n_ins loop
+                        let
+                            r_ins = vec_get_rt(instrs, rem_i)
+                            r_op = lir_instr_op(r_ins)
+                        if opt_tco_is_ignorable(r_ins) == 1 or r_op == (LirOp.Ret as i64) or r_op == (LirOp.Jmp as i64) do
+                            # ok
+                        eif r_op == (LirOp.Mov as i64) do
+                            let s1 = lir_instr_src1(r_ins)
+                            if (s1 as i64) != 0 and call_dst_vr >= 0 do
+                                if native_read_i64(s1 as i64, 8) != call_dst_vr do pure_rem = 0 end
+                            end
+                        else
+                            pure_rem = 0
+                        end
+                        rem_i = rem_i + 1
+                    end
+                    if pure_rem == 1 do
+                        is_tail = 1
+                    end
+                end
+
+                if is_tail == 1 do
+                    var
+                        new_instrs = vec_new_rt()
+                        ki = 0
+                    when ki < call_idx loop
+                        new_instrs = vec_push_rt(new_instrs, vec_get_rt(instrs, ki))
+                        ki = ki + 1
+                    end
+                    let tail_ins = lir_instr_new(
+                        LirOp.TailCall as i64,
+                        LirType.None as i64,
+                        lir_opnd_none() as i64,
+                        lir_opnd_imm(0) as i64,
+                        lir_opnd_none() as i64,
+                        0
+                    )
+                    new_instrs = vec_push_rt(new_instrs, tail_ins)
+                    native_write_i64(b as i64, 8, new_instrs as i64)
+
+                    if ok_bid >= 0 do
+                        let b_ok = opt_tco_find_block(blocks, ok_bid)
+                        if (b_ok as i64) != 0 do
+                            native_write_i64(b_ok as i64, 8, vec_new_rt() as i64)
+                        end
+                    end
+                    if fail_bid >= 0 do
+                        let b_fail = opt_tco_find_block(blocks, fail_bid)
+                        if (b_fail as i64) != 0 do
+                            native_write_i64(b_fail as i64, 8, vec_new_rt() as i64)
+                        end
+                    end
+
+                    transformed_any = 1
+                end
+            end
+        end
+        bi = bi + 1
+    end
+
+    if transformed_any == 1 do
+        optTraceNote(OptPassTCO)
+    end
+    out lf
+end.
+
+# LIR hooks: shrink-wrap (21), TCO (11); IRC (12) in regalloc.
+func optBackendRunLirPreLevel(lf: i64, arch: int, level: int):
+    if level < 1 do out lf end
+    lf = opt_backend_run_tco(lf, level)
+    out opt_backend_run_lir_pre(lf, arch)
+end.
+
+# Pre-RA LIR hook: branch by target before register allocation
+func opt_backend_run_lir_pre(lf: i64, arch: int):
+    if arch == TargetArch.ARM64 or arch == 2 or arch == 0 do
+        optTraceNote(110)
+        out opt_arm64_run_lir_pre(lf)
+    end
+    if arch == TargetArch.X86_64 or arch == 1 do
+        optTraceNote(111)
+        out opt_x86_run_lir_pre(lf)
+    end
+    if arch == TargetArch.RISCV64 or arch == 3 do
+        optTraceNote(112)
+        out opt_riscv_run_lir_pre(lf)
+    end
+    if arch == TargetArch.Wasm32 or arch == 4 do
+        optTraceNote(113)
+        out opt_wasm_run_lir_pre(lf)
+    end
+    out lf
+end.
+
+# Post-RA LIR hook: completely independent optimizations per target
+func opt_backend_run_lir_post(lf: i64, arch: int, opt_level: int):
+    if opt_level < 1 do
+        out lf
+    end
+    if arch == TargetArch.ARM64 or arch == 2 or arch == 0 do
+        optTraceNote(120)
+        out opt_arm64_run_lir_post(lf)
+    end
+    if arch == TargetArch.X86_64 or arch == 1 do
+        optTraceNote(121)
+        out opt_x86_run_lir_post(lf)
+    end
+    if arch == TargetArch.RISCV64 or arch == 3 do
+        optTraceNote(122)
+        out opt_riscv_run_lir_post(lf)
+    end
+    if arch == TargetArch.Wasm32 or arch == 4 do
+        optTraceNote(123)
+        out opt_wasm_run_lir_post(lf)
+    end
+    optTraceNote(124)
+    out opt_generic_run_lir_passes(lf)
+end.
+
+export opt_backend_run_mir_post, opt_backend_run_lir_pre, opt_backend_run_lir_post, optBackendRunLirPreLevel

@@ -1,0 +1,429 @@
+# ═════════════════════════════════════════════════════════════════════
+# Module: binding/multipart.vri
+# Pure Vir Streaming Multipart Form-Data & File Upload Parser
+# Spec RFC 7578 / RFC 2046
+# ═════════════════════════════════════════════════════════════════════
+
+const MP_MAX_PARTS: 16
+const MP_PART_SIZE: 48
+
+# Part layout (48 bytes):
+#  Offset 0:  name (ptr)
+#  Offset 8:  filename (ptr)
+#  Offset 16: content_type (ptr)
+#  Offset 24: data (ptr)
+#  Offset 32: data_len (int)
+#  Offset 40: is_file (int)
+
+func mp_str_len(s: ptr) -> int:
+    if s == 0 as ptr do out 0 end
+    var i = 0
+    when read_byte(s, i) != 0 loop
+        i = i + 1
+    end
+    out i
+end.
+
+func mp_str_eq(a: ptr, b: ptr) -> int:
+    if a == 0 as ptr do
+        if b == 0 as ptr do out 1 end
+        out 0
+    end
+    if b == 0 as ptr do out 0 end
+    let la = mp_str_len(a)
+    let lb = mp_str_len(b)
+    if la != lb do out 0 end
+    var i = 0
+    when i < la loop
+        if read_byte(a, i) != read_byte(b, i) do out 0 end
+        i = i + 1
+    end
+    out 1
+end.
+
+# Extract boundary string from Content-Type header
+# e.g. "multipart/form-data; boundary=---------------------------974767299852498929531610575"
+func multipart_extract_boundary(content_type_header: ptr, out_boundary: ptr, max_len: int) -> int:
+    if content_type_header == 0 as ptr do out 0 end
+    if out_boundary == 0 as ptr do out 0 end
+
+    let clen = mp_str_len(content_type_header)
+    let b_pat = "boundary=" as ptr
+    let blen = mp_str_len(b_pat)
+
+    var p = 0
+    var found = 0 - 1
+    when p <= (clen - blen) loop
+        if found < 0 do
+            var m = 1
+            var j = 0
+            when j < blen loop
+                let c1 = read_byte(content_type_header, p + j)
+                let c2 = read_byte(b_pat, j)
+                # Case-insensitive check
+                var ch1 = c1
+                if (ch1 >= 65) & (ch1 <= 90) do ch1 = ch1 + 32 end
+                var ch2 = c2
+                if (ch2 >= 65) & (ch2 <= 90) do ch2 = ch2 + 32 end
+                if ch1 != ch2 do
+                    m = 0
+                    j = blen
+                else
+                    j = j + 1
+                end
+            end
+            if m == 1 do
+                found = p + blen
+            end
+            p = p + 1
+        else
+            p = clen
+        end
+    end
+
+    if found < 0 do out 0 end
+
+    # Check for quotes around boundary
+    var b_start = found
+    var in_quotes = 0
+    if b_start < clen do
+        if read_byte(content_type_header, b_start) == 34 do # '"'
+            in_quotes = 1
+            b_start = b_start + 1
+        end
+    end
+
+    var b_end = b_start
+    var scanning = 1
+    when scanning == 1 loop
+        if b_end < clen do
+            let b = read_byte(content_type_header, b_end)
+            if in_quotes == 1 do
+                if b == 34 do # closing '"'
+                    scanning = 0
+                else
+                    b_end = b_end + 1
+                end
+            else
+                if (b == 59) | (b == 32) | (b == 13) | (b == 10) do # ';' or space or CRLF
+                    scanning = 0
+                else
+                    b_end = b_end + 1
+                end
+            end
+        else
+            scanning = 0
+        end
+    end
+
+    let actual_len = b_end - b_start
+    var written = 0
+    when written < actual_len loop
+        if written < (max_len - 1) do
+            write_byte(out_boundary, written, read_byte(content_type_header, b_start + written))
+            written = written + 1
+        else
+            written = actual_len
+        end
+    end
+    write_byte(out_boundary, written, 0)
+    out written
+end.
+
+# Helper: Extract quoted attribute value from header slice (e.g. name="avatar" -> "avatar")
+func mp_extract_attr(header_slice: ptr, h_len: int, attr_key: ptr, out_buf: ptr, max_len: int) -> int:
+    let klen = mp_str_len(attr_key)
+    var p = 0
+    var found = 0 - 1
+    when p <= (h_len - klen) loop
+        if found < 0 do
+            var match = 1
+            var j = 0
+            when j < klen loop
+                if read_byte(header_slice, p + j) != read_byte(attr_key, j) do
+                    match = 0
+                    j = klen
+                else
+                    j = j + 1
+                end
+            end
+            if match == 1 do
+                found = p + klen
+            end
+            p = p + 1
+        else
+            p = h_len
+        end
+    end
+
+    if found < 0 do out 0 end
+
+    var start = found
+    if start < h_len do
+        let b = read_byte(header_slice, start)
+        if (b == 61) | (b == 58) do # '=' or ':'
+            start = start + 1
+        end
+    end
+    # skip leading spaces
+    var skip_sp = 1
+    when skip_sp == 1 loop
+        if start < h_len do
+            if read_byte(header_slice, start) == 32 do
+                start = start + 1
+            else
+                skip_sp = 0
+            end
+        else
+            skip_sp = 0
+        end
+    end
+    if start < h_len do
+        if read_byte(header_slice, start) == 34 do # '"'
+            start = start + 1
+        end
+    end
+
+    var end_pos = start
+    var scanning = 1
+    when scanning == 1 loop
+        if end_pos < h_len do
+            let b = read_byte(header_slice, end_pos)
+            if (b == 34) | (b == 59) | (b == 13) | (b == 10) do
+                scanning = 0
+            else
+                end_pos = end_pos + 1
+            end
+        else
+            scanning = 0
+        end
+    end
+
+    let l = end_pos - start
+    var w = 0
+    when w < l loop
+        if w < (max_len - 1) do
+            write_byte(out_buf, w, read_byte(header_slice, start + w))
+            w = w + 1
+        else
+            w = l
+        end
+    end
+    write_byte(out_buf, w, 0)
+    out w
+end.
+
+# Parse multipart payload into parts array
+# parts_arr buffer must hold (max_parts * MP_PART_SIZE)
+# Returns number of parsed parts
+func multipart_parse(body: ptr, body_len: int, boundary: ptr, parts_arr: ptr, max_parts: int) -> int:
+    if body == 0 do out 0 end
+    if boundary == 0 do out 0 end
+    if parts_arr == 0 do out 0 end
+
+    let blen = mp_str_len(boundary)
+    if blen == 0 do out 0 end
+
+    # Full delimiter: "--" + boundary
+    let delim_len = 2 + blen
+    let delim = alloc(delim_len + 1)
+    write_byte(delim, 0, 45) # '-'
+    write_byte(delim, 1, 45) # '-'
+    var b_idx = 0
+    when b_idx < blen loop
+        write_byte(delim, 2 + b_idx, read_byte(boundary, b_idx))
+        b_idx = b_idx + 1
+    end
+    write_byte(delim, delim_len, 0)
+
+    var count = 0
+    var p = 0
+
+    # Scan for first delimiter
+    var first_delim = 0 - 1
+    when p <= (body_len - delim_len) loop
+        if first_delim < 0 do
+            var m = 1
+            var j = 0
+            when j < delim_len loop
+                if read_byte(body, p + j) != read_byte(delim, j) do
+                    m = 0
+                    j = delim_len
+                else
+                    j = j + 1
+                end
+            end
+            if m == 1 do
+                first_delim = p
+            end
+            p = p + 1
+        else
+            p = body_len
+        end
+    end
+
+    if first_delim < 0 do out 0 end
+    p = first_delim + delim_len
+
+    # Loop through parts
+    var parsing = 1
+    when parsing == 1 loop
+        if (p < body_len) & (count < max_parts) do
+            # Check for closing '--'
+            if (p + 1) < body_len do
+                if (read_byte(body, p) == 45) & (read_byte(body, p + 1) == 45) do # '--'
+                    parsing = 0
+                end
+            end
+
+            if parsing == 1 do
+                # Skip CRLF after delimiter
+                if p < body_len do
+                    if read_byte(body, p) == 13 do p = p + 1 end
+                end
+                if p < body_len do
+                    if read_byte(body, p) == 10 do p = p + 1 end
+                end
+
+                # Read part headers until \r\n\r\n (4 bytes: 13, 10, 13, 10)
+                let header_start = p
+                var header_end = 0 - 1
+                when p <= (body_len - 4) loop
+                    if header_end < 0 do
+                        if (read_byte(body, p) == 13) & (read_byte(body, p + 1) == 10) & (read_byte(body, p + 2) == 13) & (read_byte(body, p + 3) == 10) do
+                            header_end = p
+                            p = p + 4
+                        else
+                            p = p + 1
+                        end
+                    else
+                        p = body_len
+                    end
+                end
+
+                if header_end > 0 do
+                    let h_len = header_end - header_start
+                    let h_slice = body + header_start
+
+                    # Extract name, filename, and Content-Type
+                    let name_buf: ptr = alloc(64) as ptr
+                    mp_extract_attr(h_slice, h_len, "name" as ptr, name_buf, 64)
+
+                    let filename_buf: ptr = alloc(128) as ptr
+                    let flen = mp_extract_attr(h_slice, h_len, "filename" as ptr, filename_buf, 128)
+                    var is_file = 0
+                    if flen > 0 do is_file = 1 end
+
+                    let ct_buf: ptr = alloc(64) as ptr
+                    let ct_len = mp_extract_attr(h_slice, h_len, "Content-Type" as ptr, ct_buf, 64)
+                    if ct_len == 0 do
+                        # Fallback default if not specified
+                        if is_file == 1 do
+                            let def_bin = "application/octet-stream" as ptr
+                            var di = 0
+                            let dblen = mp_str_len(def_bin)
+                            when di < dblen loop
+                                write_byte(ct_buf, di, read_byte(def_bin, di))
+                                di = di + 1
+                            end
+                            write_byte(ct_buf, di, 0)
+                        else
+                            let def_txt = "text/plain" as ptr
+                            var di = 0
+                            let dtlen = mp_str_len(def_txt)
+                            when di < dtlen loop
+                                write_byte(ct_buf, di, read_byte(def_txt, di))
+                                di = di + 1
+                            end
+                            write_byte(ct_buf, di, 0)
+                        end
+                    end
+
+                    # Part body starts right after \r\n\r\n
+                    let body_start = header_end + 4
+                    # Scan for next delimiter: CRLF + "--" + boundary
+                    let next_delim_len = 2 + delim_len
+                    let next_delim: ptr = alloc(next_delim_len + 1) as ptr
+                    write_byte(next_delim, 0, 13)
+                    write_byte(next_delim, 1, 10)
+                    var d_i = 0
+                    when d_i < delim_len loop
+                        write_byte(next_delim, 2 + d_i, read_byte(delim, d_i))
+                        d_i = d_i + 1
+                    end
+
+                    var scan_p = body_start
+                    var next_pos = 0 - 1
+                    when scan_p <= (body_len - next_delim_len) loop
+                        if next_pos < 0 do
+                            var match = 1
+                            var dj = 0
+                            when dj < next_delim_len loop
+                                if read_byte(body, scan_p + dj) != read_byte(next_delim, dj) do
+                                    match = 0
+                                    dj = next_delim_len
+                                else
+                                    dj = dj + 1
+                                end
+                            end
+                            if match == 1 do
+                                next_pos = scan_p
+                            end
+                            scan_p = scan_p + 1
+                        else
+                            scan_p = body_len
+                        end
+                    end
+
+                    if next_pos >= 0 do
+                        let part_data_len = next_pos - body_start
+                        let part_data: ptr = alloc(part_data_len + 1) as ptr
+                        var cpi = 0
+                        when cpi < part_data_len loop
+                            write_byte(part_data, cpi, read_byte(body, body_start + cpi))
+                            cpi = cpi + 1
+                        end
+                        write_byte(part_data, part_data_len, 0)
+
+                        # Write to parts_arr slot
+                        let slot = parts_arr + (count * MP_PART_SIZE)
+                        write_word(slot, 0, name_buf as int)
+                        write_word(slot, 8, filename_buf as int)
+                        write_word(slot, 16, ct_buf as int)
+                        write_word(slot, 24, part_data as int)
+                        write_word(slot, 32, part_data_len)
+                        write_word(slot, 40, is_file)
+                        count = count + 1
+
+                        p = next_pos + 2 + delim_len # advance past CRLF + delim
+                    else
+                        parsing = 0
+                    end
+                else
+                    parsing = 0
+                end
+            end
+        else
+            parsing = 0
+        end
+    end
+
+    out count
+end.
+
+# Get part by name from parts array
+func multipart_get_part(parts_arr: ptr, count: int, name: ptr) -> ptr:
+    if parts_arr == 0 do out 0 end
+    if name == 0 do out 0 end
+
+    var i = 0
+    when i < count loop
+        let slot = parts_arr + (i * MP_PART_SIZE)
+        let n = read_word(slot, 0)
+        if mp_str_eq(n, name) == 1 do
+            out slot
+        end
+        i = i + 1
+    end
+    out 0
+end.

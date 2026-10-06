@@ -1,0 +1,234 @@
+##
+ * vir/compiler/semantic/diagnostics/session.vri
+ * ==============================================================
+ * Diagnostic session tracking, execution timers, and phase timings.
+ ##
+
+include rt_vec_rt
+include cli_ui
+include opt_trace
+import optTraceAppendJson from virc.backend.opt_trace
+include ide_semantic
+
+include rt_string_rt
+
+import vir_alloc, vir_free, alloc from rt_alloc
+
+include context
+
+import sys_getrusage, sys_clock_gettime, sys_platform, Platform, sys_open, sys_read, sys_close, VIR_O_RDONLY from rt_syscall
+
+extern func syscall2(num: int, a1: int, a2: int) -> int
+extern func syscall3(num: int, a1: int, a2: int, a3: int) -> int
+
+var g_color_mode: int = 0
+var g_time_buf_start: int = 0
+var g_compile_timer_printed: int = 0
+var g_diag_json: int = 0
+var g_phase_timings: int = 0
+var g_phase_read_us: int = 0
+var g_phase_preprocess_us: int = 0
+var g_phase_lex_us: int = 0
+var g_phase_parse_us: int = 0
+var g_phase_semantic_us: int = 0
+var g_phase_semantic_start_us: int = 0
+var g_phase_lower_us: int = 0
+var g_phase_codegen_us: int = 0
+var g_phase_link_us: int = 0
+
+# The driver owns this bounded buffer outside semantic arenas. Records are
+# serialized while their source tables still live; only copied bytes survive.
+var g_diagSessionActive: int = 0
+var g_diagSessionBody: int = 0
+var g_diagSessionErrors: int = 0
+var g_diagSessionWarnings: int = 0
+var g_diagSessionCaptured: int = 0
+var g_diagSessionOverflow: int = 0
+var g_diagSessionEmitted: int = 0
+var g_diagSessionArrayStart: int = 0
+var g_diagRecordIndex: int = 0
+
+func pass10SessionReset():
+    ide_reset()
+    if g_diagSessionBody == 0 do g_diagSessionBody = vir_alloc(16777217) end
+    native_write_u8(g_diagSessionBody, 0, 0)
+    g_diagSessionActive = 1
+    g_diagSessionErrors = 0
+    g_diagSessionWarnings = 0
+    g_diagSessionCaptured = 0
+    g_diagSessionOverflow = 0
+    g_diagSessionEmitted = 0
+    g_diagSessionArrayStart = 0
+end.
+
+func pass10SessionCopy(value: int):
+    let length = rt_strlen(value)
+    if length > 16777216 do
+        g_diagSessionOverflow = 1
+        out
+    end
+    var index = 0
+    when index <= length loop
+        native_write_u8(g_diagSessionBody, index, native_read_u8(value, index))
+        index = index + 1
+    end
+    g_diagSessionCaptured = 1
+end.
+
+func pass10SessionSerialize(exitCode: int):
+    var text = sb_append(sb_new(), "{\"schema_version\":1,")
+    text = optTraceAppendJson(text)
+    if exitCode == 0 do text = sb_append(text, "\"success\":true,")
+    else text = sb_append(text, "\"success\":false,") end
+    if g_diagSessionOverflow == 1 do
+        text = sb_append(text, "\"diagnostics\":[],\"complete\":false,\"unavailableReason\":\"diagnostic payload exceeds 16 MiB\"")
+    eif g_diagSessionCaptured == 1 do
+        text = sb_append(text, g_diagSessionBody)
+    else
+        text = sb_append(text, "\"diagnostics\":[]")
+    end
+    text = sb_append(text, ",\"error_count\":")
+    text = sb_append_int(text, g_diagSessionErrors)
+    text = sb_append(text, ",\"warning_count\":")
+    text = sb_append_int(text, g_diagSessionWarnings)
+    text = sb_append(text, ",\"compile_time_ms\":")
+    text = sb_append_int(text, virc_elapsed_us() / 1000)
+    if g_diagSessionActive == 1 do text = cliSessionAppendJson(text) end
+    text = ide_append_json_block(text)
+    text = sb_append_char(text, 125)
+    out sb_to_string(text)
+end.
+
+func pass10SessionEmit(exitCode: int):
+    if g_diagSessionEmitted == 1 do out end
+    if g_diag_json != 1 do out end
+    g_diagSessionEmitted = 1
+    print_ln(pass10SessionSerialize(exitCode))
+    g_compile_timer_printed = 1
+end.
+
+func virc_timer_init():
+    if g_time_buf_start == 0 do
+        let plat = sys_platform()
+        if plat == Platform.MacOS_ARM64 or plat == Platform.MacOS_x86_64 do
+            g_time_buf_start = vir_alloc(144)
+            sys_getrusage(0, g_time_buf_start)
+        else
+            g_time_buf_start = vir_alloc(16)
+            sys_clock_gettime(1, g_time_buf_start)
+        end
+    end
+end.
+
+func virc_elapsed_us():
+    let plat = sys_platform()
+    if plat == Platform.MacOS_ARM64 or plat == Platform.MacOS_x86_64 do
+        let buf = vir_alloc(144)
+        sys_getrusage(0, buf)
+        let u_sec = native_read_i64(buf, 0)
+        let u_usec = native_read_i64(buf, 8)
+        let s_sec = native_read_i64(buf, 16)
+        let s_usec = native_read_i64(buf, 24)
+        var st_u_sec = 0
+        var st_u_usec = 0
+        var st_s_sec = 0
+        var st_s_usec = 0
+        if g_time_buf_start != 0 do
+            st_u_sec = native_read_i64(g_time_buf_start, 0)
+            st_u_usec = native_read_i64(g_time_buf_start, 8)
+            st_s_sec = native_read_i64(g_time_buf_start, 16)
+            st_s_usec = native_read_i64(g_time_buf_start, 24)
+        end
+        let cur_us = (u_sec + s_sec) * 1000000 + u_usec + s_usec
+        let start_us = (st_u_sec + st_s_sec) * 1000000 + st_u_usec + st_s_usec
+        var total = cur_us - start_us
+        if total < 0 do total = 0 end
+        out total
+    else
+        let buf = vir_alloc(16)
+        sys_clock_gettime(1, buf)
+        let sec = native_read_i64(buf, 0)
+        let nsec = native_read_i64(buf, 8)
+        var s_sec = 0
+        var s_nsec = 0
+        if g_time_buf_start != 0 do
+            s_sec = native_read_i64(g_time_buf_start, 0)
+            s_nsec = native_read_i64(g_time_buf_start, 8)
+        end
+        var d_sec = sec - s_sec
+        var d_nsec = nsec - s_nsec
+        if d_nsec < 0 do
+            d_sec = d_sec - 1
+            d_nsec = d_nsec + 1000000000
+        end
+        var total = d_sec * 1000000 + (d_nsec / 1000)
+        if total < 0 do total = 0 end
+        out total
+    end
+end.
+
+func virc_print_phase_timings():
+    if g_phase_timings == 0 do out 0 end
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "Phase timings (ms): read=")
+        sb = sb_append_int(sb, g_phase_read_us / 1000)
+        sb = sb_append(sb, " preprocess=")
+        sb = sb_append_int(sb, g_phase_preprocess_us / 1000)
+        sb = sb_append(sb, " lex=")
+        sb = sb_append_int(sb, g_phase_lex_us / 1000)
+        sb = sb_append(sb, " parse=")
+        sb = sb_append_int(sb, g_phase_parse_us / 1000)
+        sb = sb_append(sb, " semantic=")
+        sb = sb_append_int(sb, g_phase_semantic_us / 1000)
+        sb = sb_append(sb, " lower=")
+        sb = sb_append_int(sb, g_phase_lower_us / 1000)
+        sb = sb_append(sb, " codegen=")
+        sb = sb_append_int(sb, g_phase_codegen_us / 1000)
+        sb = sb_append(sb, " link=")
+        sb = sb_append_int(sb, g_phase_link_us / 1000)
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+    out 0
+end.
+
+func virc_print_compile_time():
+    if g_ui_mode == 1 do out 0 end
+    if g_compile_timer_printed == 1 do out 0 end
+    if g_diag_json == 1 do
+        if g_diagSessionActive == 1 do out 0 end
+        var diag = diagnostic_engine_new()
+        pass10_emit_json(diag)
+        out 0
+    end
+    g_compile_timer_printed = 1
+    let total_us = virc_elapsed_us()
+    var ms = total_us / 1000
+    var frac = (total_us mod 1000) / 10
+    virc_print_phase_timings()
+    arena:
+        var sb = sb_new()
+        sb = sb_append(sb, "Compile time: ")
+        sb = sb_append_int(sb, ms)
+        sb = sb_append(sb, ".")
+        if frac < 10 do
+            sb = sb_append(sb, "0")
+        end
+        sb = sb_append_int(sb, frac)
+        sb = sb_append(sb, " ms")
+        print_ln(sb_to_string(sb))
+        sb_free(sb)
+    end
+    out 0
+end.
+
+export g_color_mode, g_time_buf_start, g_compile_timer_printed, g_diag_json,
+       g_phase_timings, g_phase_read_us, g_phase_preprocess_us, g_phase_lex_us,
+       g_phase_parse_us, g_phase_semantic_us, g_phase_semantic_start_us,
+       g_phase_lower_us, g_phase_codegen_us, g_phase_link_us,
+       g_diagSessionActive, g_diagSessionBody, g_diagSessionErrors,
+       g_diagSessionWarnings, g_diagSessionCaptured, g_diagSessionOverflow,
+       g_diagSessionEmitted, g_diagSessionArrayStart, g_diagRecordIndex,
+       pass10SessionReset, pass10SessionCopy, pass10SessionSerialize, pass10SessionEmit,
+       virc_timer_init, virc_elapsed_us, virc_print_phase_timings, virc_print_compile_time

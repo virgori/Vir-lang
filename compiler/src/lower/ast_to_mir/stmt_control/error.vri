@@ -1,0 +1,142 @@
+##
+ * compiler/src/lower/ast_to_mir/stmt_control/error.vri — Statement lowering: error
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+include parser
+include mir
+include ast_to_mir_context
+include ast_to_mir_layout
+include ast_to_mir_builder
+include ast_to_mir_calls
+include ast_to_mir_expr_ops
+include ast_to_mir_expr
+
+func lower_stmt_ensure(b: &MirBuilder, stmt: &AstNode):
+	b = emit_intrinsic(b, MIR_INTR_ENSURE, mir_opnd_none(), mir_opnd_none())
+	if ast_node_child_count(stmt) > 0 do
+		out lower_stmt(b, ast_node_child(stmt, 0))
+	end
+	out b
+end.
+
+func lower_stmt_revert(b: &MirBuilder, stmt: &AstNode):
+	b = emit_intrinsic(b, MIR_INTR_REVERT, mir_opnd_none(), mir_opnd_none())
+	if ast_node_child_count(stmt) > 0 do
+		out lower_stmt(b, ast_node_child(stmt, 0))
+	end
+	out b
+end.
+
+func lower_stmt_when(b: &MirBuilder, stmt: &AstNode):
+	cond_expr = ast_node_child(stmt, 0)
+	body_block = ast_node_child(stmt, 1)
+	var (b2, cond_id) = builder_add_block(b)
+	var (b3, body_id) = builder_add_block(b2)
+	var (b4, end_id) = builder_add_block(b3)
+	b4 = emit_jump(b4, cond_id)
+	b4 = builder_push_loop(b4, end_id, cond_id)
+	b4 = builder_set_current_block(b4, cond_id)
+	var b5 = lower_expr(b4, cond_expr)
+	var cond_opnd = g_lower_expr_result_opnd as MirOperand
+	b5 = emit_jump_if_not(b5, cond_opnd, end_id, body_id)
+	b5 = builder_set_current_block(b5, body_id)
+
+	let has_arena_when = scan_has_local_arena_alloc(body_block)
+	let esc_name_when = scan_arena_escaped_var(body_block)
+	var b_body = b5
+	var iter_mark = 0
+	if has_arena_when == 1 and fat_str_len(esc_name_when) == 0 do
+		var (b_mark, imk) = builder_new_vreg(b_body)
+		iter_mark = imk
+		b_body = emit_intrinsic(b_mark, MIR_MEM_MARK, mir_opnd_vreg(iter_mark), mir_opnd_none())
+		if g_arena_mark_stack == 0 do
+			g_arena_mark_stack = vec_new_rt()
+		end
+		g_arena_mark_stack = vec_push_rt(g_arena_mark_stack, iter_mark as i64)
+		if g_arena_escaped_stack != 0 do g_arena_escaped_stack = vec_push_rt(g_arena_escaped_stack, 0 as i64) end
+	end
+
+	b_body = lower_stmt(b_body, body_block)
+
+	if has_arena_when == 1 and fat_str_len(esc_name_when) == 0 do
+		if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+			vec_pop_rt(g_arena_mark_stack)
+		end
+		if g_arena_escaped_stack != 0 and vec_len_rt(g_arena_escaped_stack) > 0 do
+			vec_pop_rt(g_arena_escaped_stack)
+		end
+		if not builder_current_block_terminated(b_body) do
+			b_body = emit_intrinsic(b_body, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(iter_mark))
+		end
+	end
+
+	if not builder_current_block_terminated(b_body) do
+		b_body = emit_jump(b_body, cond_id)
+	end
+	b_body = builder_pop_loop(b_body)
+	b_body = builder_set_current_block(b_body, end_id)
+	out b_body
+end.
+
+func lower_stmt_throw(b: &MirBuilder, stmt: &AstNode):
+    # Inside a `try` body: set `err` to the thrown value and branch to the
+    # revert handler. Subsequent code in this block is dead, so continue in
+    # a fresh (unreachable) block to keep the CFG well-formed.
+	if g_try_revert_block >= 0 do
+		if ast_node_child_count(stmt) > 0 do
+			var bt = lower_expr(b, ast_node_child(stmt, 0))
+			var tv = g_lower_expr_result_opnd as MirOperand
+			bt = emit_move(bt, g_try_err_vreg, tv)
+			b = bt
+		end
+		# Promote escaped vars from any arena being exited by throw BEFORE reset
+		if g_arena_escaped_stack != 0 and vec_len_rt(g_arena_escaped_stack) > 0 do
+			var aes_len = vec_len_rt(g_arena_escaped_stack)
+			var aes_i = aes_len - 1
+			when aes_i >= g_try_arena_depth loop
+				let ev_list = vec_get_rt(g_arena_escaped_stack, aes_i)
+				if ev_list != 0 do
+					let ev_cnt = vec_len_rt(ev_list)
+					var evi = 0
+					when evi < ev_cnt loop
+						let ev_name = vec_get_rt(ev_list, evi) as string
+						let ev_vr = get_var_vreg(b, ev_name)
+						if ev_vr >= 0 do
+							b = emit_intrinsic(b, MIR_MEM_PROMOTE, mir_opnd_vreg(ev_vr), mir_opnd_vreg(ev_vr))
+							b = set_var_vreg(b, ev_name, ev_vr)
+						end
+						evi = evi + 1
+					end
+				end
+				aes_i = aes_i - 1
+			end
+		end
+		# Promote the thrown error value if it was a vreg
+		if g_try_err_vreg >= 0 do
+			b = emit_intrinsic(b, MIR_MEM_PROMOTE, mir_opnd_none(), mir_opnd_vreg(g_try_err_vreg))
+		end
+		# Restore active arena marks down to the try's outer depth
+		if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+			var ams_len = vec_len_rt(g_arena_mark_stack)
+			var ams_i = ams_len - 1
+			when ams_i >= g_try_arena_depth loop
+				var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+				b = emit_intrinsic(b, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+				ams_i = ams_i - 1
+			end
+		end
+		b = emit_jump(b, g_try_revert_block)
+		var (bd, dead_id) = builder_add_block(b)
+		out builder_set_current_block(bd, dead_id)
+	end
+	if ast_node_child_count(stmt) > 0 do
+		var b2 = lower_expr(b, ast_node_child(stmt, 0))
+		var v = g_lower_expr_result_opnd as MirOperand
+		out emit_intrinsic(b2, MIR_INTR_THROW, mir_opnd_none(), v)
+	end
+	out emit_intrinsic(b, MIR_INTR_THROW, mir_opnd_none(), mir_opnd_none())
+end.
+

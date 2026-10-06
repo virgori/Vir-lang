@@ -1,0 +1,642 @@
+##
+ * compiler/src/main/path_util.vri — Compiler Path Resolution & State Helpers
+ * =========================================================================
+ ##
+
+import vir_alloc from rt_alloc
+import fat_str_new, fat_str_len, fat_str_byte_at, fat_cstr_eq, fat_str_concat, fat_str_eq, rt_streq, str_from_cstr, rt_strlen, rt_itoa, vir_free from rt_string_rt
+import bvec_len, bvec_get, vec_len_rt, vec_get_rt, vec_new_rt, vec_push_rt from rt_vec_rt
+import read_file_str, print_str, print_ln, print_int, print_newline from rt_io
+include diagnostic_context
+include sem_pass10_diagnostics
+
+extern func native_read_i64(addr: int, offset: int) -> int
+extern func native_write_i64(addr: int, offset: int, val: int)
+extern func native_read_u8(addr: int, offset: int) -> int
+extern func native_write_u8(addr: int, offset: int, val: int)
+extern func native_file_open(data: int, len: int, mode: int) -> int
+extern func native_file_read(fd: int, buf: int, buflen: int) -> int
+extern func native_file_close(fd: int) -> int
+
+# ── include resolution (physical splice, mirrors C lower_resolve_includes) ──
+const G_INC_MAX = 4096
+const G_PREPROCESS_MAX = 8192
+const G_REG_MAX = 4096
+const G_MOD_MAX = 4096
+var g_inc_tab = 0
+var g_inc_base = 0;   # C-string directory of the main source file
+var g_inc_err = 0;    # 1 = cannot read/parse/resolve, 3 = import symbol/export missing
+var g_inc_diag_code = 0
+var g_inc_last_dir = 0
+var g_imp_mod = 0
+var g_imp_syms = 0
+var g_imp_aliases = 0
+var g_imp_sym_count = 0
+var g_imp_alias = 0;  # optional rename for single-symbol import … as X
+var g_imp_end = 0;    # byte offset immediately after the parsed import stmt
+var g_imp_chunk_line = 1; # original line of the currently extracted definition
+var g_inc_resolved_path = 0;   # C-string of last successfully read file path
+var g_inc_canonical_id = 0;    # C-string of canonical module ID
+var g_inc_main_file = 0;       # C-string of root input file
+var g_inc_cur_parent_file = 0; # C-string of current file being expanded
+var g_inc_cur_parent_line = 0; # Line number of current include in parent
+var g_inc_active_dir = 0;       # C-string directory of current file being expanded
+
+var g_reg_names = 0
+var g_reg_paths = 0
+var g_reg_phys = 0
+var g_reg_lines = 0
+var g_reg_source = 0
+var g_reg_isdir = 0
+var g_reg_count = 0
+var g_reg_stdlib_count = 0
+var g_reg_loaded = 0
+# Explicit IDE sysroot registry. A missing configured file fails without fallback.
+var g_ideStdlibRegistry = 0
+var g_ideResolvedModules = 0
+var g_virc_sysroot = 0
+var g_virc_stdlib_dir = 0
+var g_virc_stdlib_registry = 0
+var g_reg_root = 0
+var g_reg_stdlib_dir = 0
+var g_reg_project_root = 0
+
+func g_inc_init:
+    if g_inc_tab == 0 do
+        g_inc_tab = vir_alloc(8 + G_INC_MAX * 8)
+    end
+    native_write_i64(g_inc_tab, 0, 0)
+    g_inc_err = 0
+    g_inc_diag_code = 0
+    g_inc_resolved_path = 0
+    g_inc_canonical_id = 0
+    g_inc_cur_parent_file = 0
+    g_inc_cur_parent_line = 0
+    virc_registry_load()
+end.
+
+func inc_set_error(code: int):
+    g_inc_diag_code = code
+    if code == 2113 do
+        g_inc_err = 3
+    else
+        g_inc_err = 1
+    end
+end.
+
+func inc_report_early_error(code: int, parent_file: int, parent_line: int, extra: string):
+    inc_set_error(code)
+    var early_diag = diagnostic_engine_new()
+    var p_line = parent_line
+    if p_line <= 0 do p_line = 1 end
+    report_error_loc(early_diag, code, 0, p_line, 1, extra)
+    let d0 = vec_get_rt(early_diag.diagnostics, 0)
+    if parent_file != 0 do
+        native_write_i64(d0 as i64, 80, parent_file)
+    end
+    if g_ideFactsEnabled == 1 do
+        g_ideEarlyDiagnostics = native_read_i64(early_diag as int, 0)
+        out 0
+    end
+    pass10_emit_diagnostics(early_diag)
+    compilerAbort()
+end.
+
+func inc_print_error_prefix(code: int, area: string):
+    out 0
+end.
+
+func g_inc_norm_key(name: string):
+    # Include/import identity must describe the resolved source unit, not just
+    # its basename.  Basename keys make foo/resolver.vri hide bar/resolver.vri.
+    out name
+end.
+
+func path_normalize_fat(path: &string):
+    data = native_read_i64(path, 0)
+    n = native_read_i64(path, 8)
+    out_buf = vir_alloc(n + 2)
+    seg_starts = vir_alloc((n + 2) * 8)
+    seg_lens = vir_alloc((n + 2) * 8)
+    seg_count = 0
+    out_len = 0
+    absolute = 0
+    if n > 0 do
+        if native_read_u8(data, 0) == 47 do
+            absolute = 1
+            native_write_u8(out_buf, 0, 47)
+            out_len = 1
+        end
+    end
+    i = 0
+    when i < n loop
+        when i < n loop
+            if native_read_u8(data, i) != 47 do
+                break
+            end
+            i = i + 1
+        end
+        seg_start = i
+        when i < n loop
+            if native_read_u8(data, i) == 47 do
+                break
+            end
+            i = i + 1
+        end
+        l = i - seg_start
+        if l == 0 do
+            skip
+        eif l == 1 do
+            if native_read_u8(data, seg_start) == 46 do
+                skip
+            else
+                if out_len > 0 do
+                    if native_read_u8(out_buf, out_len - 1) != 47 do
+                        native_write_u8(out_buf, out_len, 47)
+                        out_len = out_len + 1
+                    end
+                end
+                native_write_i64(seg_starts, seg_count * 8, out_len)
+                native_write_i64(seg_lens, seg_count * 8, l)
+                native_write_u8(out_buf, out_len, native_read_u8(data, seg_start))
+                out_len = out_len + 1
+                seg_count = seg_count + 1
+            end
+        eif l == 2 do
+            if native_read_u8(data, seg_start) == 46 & native_read_u8(data, seg_start + 1) == 46 do
+                if seg_count > 0 do
+                    seg_count = seg_count - 1
+                    out_len = native_read_i64(seg_starts, seg_count * 8)
+                    if out_len > 1 do
+                        if native_read_u8(out_buf, out_len - 1) == 47 do
+                            out_len = out_len - 1
+                        end
+                    end
+                else
+                    if absolute == 0 do
+                        if out_len > 0 do
+                            if native_read_u8(out_buf, out_len - 1) != 47 do
+                                native_write_u8(out_buf, out_len, 47)
+                                out_len = out_len + 1
+                            end
+                        end
+                        native_write_i64(seg_starts, seg_count * 8, out_len)
+                        native_write_i64(seg_lens, seg_count * 8, 2)
+                        native_write_u8(out_buf, out_len, 46)
+                        native_write_u8(out_buf, out_len + 1, 46)
+                        out_len = out_len + 2
+                        seg_count = seg_count + 1
+                    end
+                end
+            else
+                if out_len > 0 do
+                    if native_read_u8(out_buf, out_len - 1) != 47 do
+                        native_write_u8(out_buf, out_len, 47)
+                        out_len = out_len + 1
+                    end
+                end
+                native_write_i64(seg_starts, seg_count * 8, out_len)
+                native_write_i64(seg_lens, seg_count * 8, l)
+                j = 0
+                when j < l loop
+                    native_write_u8(out_buf, out_len + j, native_read_u8(data, seg_start + j))
+                    j = j + 1
+                end
+                out_len = out_len + l
+                seg_count = seg_count + 1
+            end
+        else
+            if out_len > 0 do
+                if native_read_u8(out_buf, out_len - 1) != 47 do
+                    native_write_u8(out_buf, out_len, 47)
+                    out_len = out_len + 1
+                end
+            end
+            native_write_i64(seg_starts, seg_count * 8, out_len)
+            native_write_i64(seg_lens, seg_count * 8, l)
+            j = 0
+            when j < l loop
+                native_write_u8(out_buf, out_len + j, native_read_u8(data, seg_start + j))
+                j = j + 1
+            end
+            out_len = out_len + l
+            seg_count = seg_count + 1
+        end
+    end
+    if out_len == 0 do
+        native_write_u8(out_buf, 0, 46)
+        out_len = 1
+    end
+    native_write_u8(out_buf, out_len, 0)
+    out str_from_cstr(out_buf)
+end.
+
+func g_inc_has(name: string):
+    key = g_inc_norm_key(name)
+    n = native_read_i64(g_inc_tab, 0)
+    i = 0
+    when i < n loop
+        en = native_read_i64(g_inc_tab, 8 + i * 8)
+        if fat_str_eq(en, key) do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func g_inc_mark(name: string):
+    key = g_inc_norm_key(name)
+    n = native_read_i64(g_inc_tab, 0)
+    if n >= G_INC_MAX do
+        out 0
+    end
+    native_write_i64(g_inc_tab, 8 + n * 8, fat_str_concat(key, fat_str_new("")))
+    native_write_i64(g_inc_tab, 0, n + 1)
+    out 1
+end.
+
+func fat_ends_with_vri(s: int):
+    n = fat_str_len(s)
+    if n < 4 do
+        out 0
+    end
+    if fat_str_byte_at(s, n - 4) == 46 and fat_str_byte_at(s, n - 3) == 118 and fat_str_byte_at(s, n - 2) == 114 and fat_str_byte_at(s, n - 1) == 105 do
+        out 1
+    end
+    out 0
+end.
+
+func fat_has_slash(s: int):
+    i = 0
+    n = fat_str_len(s)
+    when i < n loop
+        if fat_str_byte_at(s, i) == 47 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func text_line_has_double_colon(source: int, at: int):
+    data = native_read_i64(source, 0)
+    n = native_read_i64(source, 8)
+    i = at
+    when i + 1 < n loop
+        c = native_read_u8(data, i)
+        if c == 10 or c == 13 or c == 59 do
+            out 0
+        end
+        if c == 58 and native_read_u8(data, i + 1) == 58 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func module_to_relpath(name: string):
+    # "math" → "math.vri"; "rt/foo" → "rt/foo.vri".
+    # Snapshot fat fields with natives first — nested CALLs clobber R0 params.
+    data = native_read_i64(name, 0)
+    n = native_read_i64(name, 8)
+    if n >= 4 do
+        if native_read_u8(data, n - 4) == 46 and native_read_u8(data, n - 3) == 118 and native_read_u8(data, n - 2) == 114 and native_read_u8(data, n - 1) == 105 do
+            out name
+        end
+    end
+    buf = vir_alloc(n + 5)
+    i = 0
+    when i < n loop
+        native_write_u8(buf, i, native_read_u8(data, i))
+        i = i + 1
+    end
+    native_write_u8(buf, n, 46)
+    native_write_u8(buf, n + 1, 118)
+    native_write_u8(buf, n + 2, 114)
+    native_write_u8(buf, n + 3, 105)
+    native_write_u8(buf, n + 4, 0)
+    out str_from_cstr(buf)
+end.
+
+func read_include_try_stdlib_vir(rel: string):
+    # vir/rt/foo.vri → stdlib/vir/rt/foo.vri (legacy dotted modules).
+    rdata = native_read_i64(rel, 0)
+    rlen = native_read_i64(rel, 8)
+    if rlen < 5 do
+        out 0
+    end
+    if native_read_u8(rdata, 0) != 118 do
+        out 0
+    end
+    if native_read_u8(rdata, 1) != 105 do
+        out 0
+    end
+    if native_read_u8(rdata, 2) != 114 do
+        out 0
+    end
+    if native_read_u8(rdata, 3) != 47 do
+        out 0
+    end
+    sub = vir_alloc(rlen - 3)
+    j = 0
+    when j < rlen - 4 loop
+        native_write_u8(sub, j, native_read_u8(rdata, j + 4))
+        j = j + 1
+    end
+    native_write_u8(sub, rlen - 4, 0)
+    out try_read_under_prefix(fat_str_new("stdlib/vir"), str_from_cstr(sub))
+end.
+
+func join_dir_file(dir_cstr: int, rel: string):
+    # dir_cstr may be 0 → just rel
+    if dir_cstr == 0 do
+        out rel
+    end
+    # Snapshot before CALLs (R0 return clobber).
+    d = dir_cstr
+    rdata = native_read_i64(rel, 0)
+    rlen = native_read_i64(rel, 8)
+    dlen = rt_strlen(d)
+    buf = vir_alloc(dlen + 1 + rlen + 1)
+    i = 0
+    when i < dlen loop
+        native_write_u8(buf, i, native_read_u8(d, i))
+        i = i + 1
+    end
+    native_write_u8(buf, dlen, 47)
+    j = 0
+    when j < rlen loop
+        native_write_u8(buf, dlen + 1 + j, native_read_u8(rdata, j))
+        j = j + 1
+    end
+    native_write_u8(buf, dlen + 1 + rlen, 0)
+    out str_from_cstr(buf)
+end.
+
+# IDE overlays are scoped to a worker and are never enabled by normal builds.
+# Entry layout is [next, normalized path fat-string, source fat-string].
+var g_ideEarlyDiagnostics: int = 0
+var g_ideVirtualFiles: int = 0
+var g_ideImportOrigins: int = 0
+var g_ideImportParentFile: int = 0
+var g_ideImportParentLine: int = 0
+var g_io_cache_keys: int = 0
+var g_io_cache_vals: int = 0
+var g_io_cache_count: int = 0
+var G_IO_CACHE_MAX: int = 512
+
+func io_cache_get(norm_path_cstr: int) -> int:
+    if g_io_cache_count == 0 or norm_path_cstr == 0 do out 0 end
+    var i = g_io_cache_count - 1
+    when i >= 0 loop
+        let k = native_read_i64(g_io_cache_keys, i * 8)
+        if rt_streq(k, norm_path_cstr) == 1 do
+            out native_read_i64(g_io_cache_vals, i * 8)
+        end
+        i = i - 1
+    end
+    out 0
+end.
+
+func io_cache_put(norm_path_cstr: int, content_raw: int):
+    if norm_path_cstr == 0 or content_raw == 0 do out end
+    if g_io_cache_keys == 0 do
+        g_io_cache_keys = vir_alloc(G_IO_CACHE_MAX * 8)
+        g_io_cache_vals = vir_alloc(G_IO_CACHE_MAX * 8)
+    end
+    if g_io_cache_count >= G_IO_CACHE_MAX do out end
+    native_write_i64(g_io_cache_keys, g_io_cache_count * 8, norm_path_cstr)
+    native_write_i64(g_io_cache_vals, g_io_cache_count * 8, content_raw)
+    g_io_cache_count = g_io_cache_count + 1
+end.
+
+func io_cache_reset():
+    g_io_cache_count = 0
+end.
+
+func try_read_file(path_fat: &string):
+    if g_ideVirtualFiles != 0 do
+        let normalized: int = path_normalize_fat(path_fat) as int
+        var entry = g_ideVirtualFiles
+        when entry != 0 loop
+            if fat_str_eq(normalized, native_read_i64(entry, 8)) == 1 do
+                g_inc_resolved_path = native_read_i64(normalized, 0)
+                out native_read_i64(entry, 16)
+            end
+            entry = native_read_i64(entry, 0)
+        end
+    end
+    cstr = native_read_i64(path_fat, 0)
+    plen = native_read_i64(path_fat, 8)
+    if cstr == 0 or plen <= 0 do
+        out 0
+    end
+    let norm_path = path_normalize_fat(path_fat)
+    let norm_cstr = native_read_i64(norm_path, 0)
+    let cached = io_cache_get(norm_cstr)
+    if cached != 0 do
+        g_inc_resolved_path = norm_cstr
+        out str_from_cstr(cached)
+    end
+    raw = read_file_str(cstr)
+    if raw == 0 do
+        out 0
+    end
+    io_cache_put(norm_cstr, raw)
+    g_inc_resolved_path = norm_cstr
+    out str_from_cstr(raw)
+end.
+
+func try_read_under_prefix(prefix: string, rel: string):
+    # Build prefix + "/" + rel (prefix has no trailing slash).
+    pdata = native_read_i64(prefix, 0)
+    plen = native_read_i64(prefix, 8)
+    rdata = native_read_i64(rel, 0)
+    rlen = native_read_i64(rel, 8)
+    buf = vir_alloc(plen + 1 + rlen + 1)
+    j = 0
+    when j < plen loop
+        native_write_u8(buf, j, native_read_u8(pdata, j))
+        j = j + 1
+    end
+    native_write_u8(buf, plen, 47)
+    j = 0
+    when j < rlen loop
+        native_write_u8(buf, plen + 1 + j, native_read_u8(rdata, j))
+        j = j + 1
+    end
+    native_write_u8(buf, plen + 1 + rlen, 0)
+    out try_read_file(str_from_cstr(buf))
+end.
+
+func trim_cstr(cstr: int) -> int:
+    let n = rt_strlen(cstr)
+    var trim_start = 0
+    when trim_start < n loop
+        let c = native_read_u8(cstr, trim_start)
+        if c != 32 and c != 9 and c != 13 and c != 10 do break end
+        trim_start = trim_start + 1
+    end
+    var e = n
+    when e > trim_start loop
+        let c = native_read_u8(cstr, e - 1)
+        if c != 32 and c != 9 and c != 13 and c != 10 do break end
+        e = e - 1
+    end
+    let len = e - trim_start
+    let buf = vir_alloc(len + 1)
+    var i = 0
+    when i < len loop
+        native_write_u8(buf, i, native_read_u8(cstr, trim_start + i))
+        i = i + 1
+    end
+    native_write_u8(buf, len, 0)
+    out buf
+end.
+
+func cstr_clone(cstr: int) -> int:
+    let len = rt_strlen(cstr)
+    let buf = vir_alloc(len + 1)
+    var i = 0
+    when i < len loop
+        native_write_u8(buf, i, native_read_u8(cstr, i))
+        i = i + 1
+    end
+    native_write_u8(buf, len, 0)
+    out buf
+end.
+
+func join_path_cstr(dir: int, file: int) -> int:
+    if dir == 0 do out file end
+    let dlen = rt_strlen(dir)
+    if dlen == 0 do out file end
+    let flen = rt_strlen(file)
+    var has_slash = 0
+    if native_read_u8(dir, dlen - 1) == 47 do
+        has_slash = 1
+    end
+    let buf = vir_alloc(dlen + 1 + flen + 1)
+    var i = 0
+    when i < dlen loop
+        native_write_u8(buf, i, native_read_u8(dir, i))
+        i = i + 1
+    end
+    var out_len = dlen
+    if has_slash == 0 do
+        native_write_u8(buf, out_len, 47)
+        out_len = out_len + 1
+    end
+    var j = 0
+    when j < flen loop
+        native_write_u8(buf, out_len + j, native_read_u8(file, j))
+        j = j + 1
+    end
+    native_write_u8(buf, out_len + flen, 0)
+    out buf
+end.
+
+func file_exists_cstr(path: int) -> int:
+    if path == 0 do out 0 end
+    if g_ideVirtualFiles != 0 do
+        let normalized: int = path_normalize_fat(str_from_cstr(path)) as int
+        var entry = g_ideVirtualFiles
+        when entry != 0 loop
+            if fat_str_eq(normalized, native_read_i64(entry, 8)) == 1 do out 1 end
+            entry = native_read_i64(entry, 0)
+        end
+    end
+    let fd = sys_open(path, 0, 0)
+    if fd >= 0 do
+        sys_close(fd)
+        out 1
+    end
+    out 0
+end.
+
+func virc_path_starts_with(path: int, prefix: int) -> int:
+    if path == 0 or prefix == 0 do out 0 end
+    let plen = rt_strlen(path)
+    let prlen = rt_strlen(prefix)
+    if plen < prlen do out 0 end
+    var i = 0
+    when i < prlen loop
+        if native_read_u8(path, i) != native_read_u8(prefix, i) do
+            out 0
+        end
+        i = i + 1
+    end
+    out 1
+end.
+
+func virc_span_is_safe_relative(buf: int, start: int, len: int) -> int:
+    if buf == 0 or len <= 0 do out 0 end
+    if native_read_u8(buf, start) == 47 do out 0 end
+    var i = 0
+    when i < len loop
+        let ch = native_read_u8(buf, start + i)
+        if ch == 46 and i + 1 < len and native_read_u8(buf, start + i + 1) == 46 do
+            var prev_ok = 0
+            if i == 0 do prev_ok = 1 eif native_read_u8(buf, start + i - 1) == 47 do prev_ok = 1 end
+            var next_ok = 0
+            if i + 2 == len do next_ok = 1 eif native_read_u8(buf, start + i + 2) == 47 do next_ok = 1 end
+            if prev_ok == 1 and next_ok == 1 do out 0 end
+        end
+        i = i + 1
+    end
+    out 1
+end.
+
+func virc_path_is_safe_relative(path: int) -> int:
+    if path == 0 do out 0 end
+    let plen = rt_strlen(path)
+    out virc_span_is_safe_relative(path, 0, plen)
+end.
+
+func find_file_up(start_dir: int, target: int) -> int:
+    if file_exists_cstr(target) == 1 do
+        out target
+    end
+    if start_dir == 0 do
+        out 0
+    end
+    var cur = start_dir
+    when true loop
+        let candidate = join_path_cstr(cur, target)
+        if file_exists_cstr(candidate) == 1 do
+            out candidate
+        end
+        let clen = rt_strlen(cur)
+        var has_slash = 0
+        var last_slash = 0
+        var i = 0
+        when i < clen loop
+            if native_read_u8(cur, i) == 47 do
+                has_slash = 1
+                last_slash = i
+            end
+            i = i + 1
+        end
+        if has_slash == 0 do
+            break
+        end
+        if last_slash == 0 do
+            let root_candidate = join_path_cstr("/" as int, target)
+            if file_exists_cstr(root_candidate) == 1 do
+                out root_candidate
+            end
+            break
+        end
+        let next_cur = vir_alloc(last_slash + 1)
+        var k = 0
+        when k < last_slash loop
+            native_write_u8(next_cur, k, native_read_u8(cur, k))
+            k = k + 1
+        end
+        native_write_u8(next_cur, last_slash, 0)
+        cur = next_cur
+    end
+    out 0
+end.
+

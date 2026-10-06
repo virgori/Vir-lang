@@ -1,0 +1,685 @@
+##
+ * compiler/src/semantic/borrow/context.vri — Borrow Analysis Context
+ * =================================================================
+ * VIRC-PLN-0004 Section 5.6 & Phase 8: Borrow Analysis Decomposition.
+ *
+ * Owns Pass 8 global state, binding IDs, AST accessors, boxed vector helpers,
+ * and string/hash maps for efficient borrow & lifetime verification.
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+include parser
+include symbol_table
+include scope_tree
+include type_table
+include rt_alloc
+include context
+include ide_semantic
+include ide_facts
+
+var g_pass8_func_map: int = 0
+var g_pass8_func_params: int = 0
+var g_pass8_shadow_frames: int = 0
+var g_pass8_scope_depth: int = 0
+var g_pass8_var_scopes: int = 0
+var g_pass8_var_decl_lines: int = 0
+var g_pass8_reported_diags: int = 0
+var g_pass8_bindings: int = 0
+var g_pass8_scope_stack: int = 0
+var g_pass8_next_binding_id: int = 1
+var g_pass8_next_scope_id: int = 1
+var g_pass8_scope_ids: int = 0
+var g_pass8_loop_flows: int = 0
+var g_pass8_flow_kind: int = 0
+var g_pass8_has_proj_loans: int = 0
+var g_pass8_stat_ast_nodes: int = 0
+var g_pass8_stat_nll_nodes: int = 0
+var g_pass8_stat_hash_bytes: int = 0
+var g_pass8_stat_map_probes: int = 0
+var g_pass8_stat_rehash_nodes: int = 0
+var g_pass8_stat_overlap_checks: int = 0
+var g_pass8_stat_release_steps: int = 0
+
+func pass8_stats_reset():
+    g_pass8_stat_ast_nodes = 0
+    g_pass8_stat_nll_nodes = 0
+    g_pass8_stat_hash_bytes = 0
+    g_pass8_stat_map_probes = 0
+    g_pass8_stat_rehash_nodes = 0
+    g_pass8_stat_overlap_checks = 0
+    g_pass8_stat_release_steps = 0
+end.
+
+func pass8_ast_name(n: &AstNode):
+    out native_read_i64(n as i64, 0) as string
+end.
+
+func pass8_ast_name2(n: &AstNode):
+    out native_read_i64(n as i64, 8) as string
+end.
+
+func pass8_type_kind_from_type_str(type_str: &string):
+    if pass8_strlen(type_str) == 0 do
+        out TypeKind.Int
+    end
+    if pass8_cstr_eq(type_str, "string") == 1 do
+        out TypeKind.String
+    end
+    if pass8_cstr_eq(type_str, "dict") == 1 do
+        out TypeKind.Dict
+    end
+    if is_tensor_type_str(type_str as int) do
+        out TypeKind.Tensor
+    end
+    # Fieldless enums are copy types with scalar integer representation (Spec §3, §4).
+    if pass8_cstr_eq(type_str, "TypeKind") == 1 or pass8_cstr_eq(type_str, "AstType") == 1 or pass8_cstr_eq(type_str, "MirOp") == 1 or pass8_cstr_eq(type_str, "MirOperandType") == 1 or pass8_cstr_eq(type_str, "MirType") == 1 or pass8_cstr_eq(type_str, "SymbolKind") == 1 or pass8_cstr_eq(type_str, "ScopeKind") == 1 or pass8_cstr_eq(type_str, "TokType") == 1 or pass8_cstr_eq(type_str, "LirOp") == 1 or pass8_cstr_eq(type_str, "MCOpcode") == 1 or pass8_cstr_eq(type_str, "AsmDialect") == 1 or pass8_cstr_eq(type_str, "TargetArch") == 1 or pass8_cstr_eq(type_str, "TargetOS") == 1 or pass8_cstr_eq(type_str, "TargetABI") == 1 or pass8_cstr_eq(type_str, "DiagnosticLevel") == 1 or pass8_cstr_eq(type_str, "HirKind") == 1 or pass8_cstr_eq(type_str, "ParamMode") == 1 or pass8_cstr_eq(type_str, "Option") == 1 or pass8_cstr_eq(type_str, "Result") == 1 do
+        out TypeKind.Enum
+    end
+    let c0 = pass8_str_byte_at(type_str, 0)
+    if c0 == 38 do
+        if pass8_strlen(type_str) > 4 and pass8_str_byte_at(type_str, 1) == 109 and pass8_str_byte_at(type_str, 2) == 117 and pass8_str_byte_at(type_str, 3) == 116 do
+            out TypeKind.MutRef
+        else
+            out TypeKind.Ref
+        end
+    end
+    if c0 == 91 do
+        out TypeKind.Array
+    end
+    if c0 >= 65 and c0 <= 90 do
+        out TypeKind.Entity
+    end
+    out TypeKind.Int
+end.
+
+func pass8_ast_type(n: &AstNode):
+    if (n as i64) == 0 do out 0 as AstType end
+    out native_read_i64(n as i64, 16) as AstType
+end.
+
+func pass8_ast_line(n: &AstNode):
+    if (n as i64) == 0 do out 0 end
+    out native_read_i64(n as i64, 32)
+end.
+
+func pass8_ast_int_val(n: &AstNode):
+    if (n as i64) == 0 do out 0 end
+    out native_read_i64(n as i64, 40)
+end.
+
+func pass8_ast_children(n: &AstNode):
+    if (n as i64) == 0 do out 0 end
+    out native_read_i64(n as i64, 64)
+end.
+
+# ═══════════════════════════════════════════════════════
+# Boxed Vector Helpers (Pointer-safe across recursive walks)
+# Box layout: [0]=vec, [8]=lazy name→item hash map.
+# Avoids O(n²) linear scans on var_types / moved / locals / borrows.
+# ═══════════════════════════════════════════════════════
+
+const PASS8_INITIAL_BUCKETS: int = 256
+
+func pass8_hash_name_for_buckets(name: int, bucket_count: int):
+    let n = pass8_strlen(name)
+    if n <= 0 or bucket_count <= 0 do
+        out 0
+    end
+    var h = (n * 17) mod bucket_count
+    var i = 0
+    when i < n loop
+        g_pass8_stat_hash_bytes = g_pass8_stat_hash_bytes + 1
+        h = (h * 131 + pass8_str_byte_at(name, i)) mod bucket_count
+        i = i + 1
+    end
+    out h
+end.
+
+func pass8_map_new():
+    let
+        table = vir_alloc(24)
+        heads = vir_alloc(PASS8_INITIAL_BUCKETS * 8)
+    var i = 0
+    when i < PASS8_INITIAL_BUCKETS loop
+        native_write_i64(heads, i * 8, 0)
+        i = i + 1
+    end
+    native_write_i64(table, 0, PASS8_INITIAL_BUCKETS)
+    native_write_i64(table, 8, 0)
+    native_write_i64(table, 16, heads)
+    out table
+end.
+
+func pass8_map_bucket_count(ht: int) -> int:
+    if ht == 0 do out 0 end
+    out native_read_i64(ht, 0)
+end.
+
+func pass8_map_bucket_head(ht: int, name: int):
+    if ht == 0 or pass8_strlen(name) == 0 do out 0 end
+    let bucket_count = pass8_map_bucket_count(ht)
+    if bucket_count <= 0 do out 0 end
+    let
+        heads = native_read_i64(ht, 16)
+        bid = pass8_hash_name_for_buckets(name, bucket_count)
+    out native_read_i64(heads, bid * 8)
+end.
+
+func pass8_map_rehash(ht: int):
+    if ht == 0 do out 0 end
+    let
+        old_bucket_count = native_read_i64(ht, 0)
+        old_heads = native_read_i64(ht, 16)
+        new_bucket_count = old_bucket_count * 2
+        new_heads = vir_alloc(new_bucket_count * 8)
+    var i = 0
+    when i < new_bucket_count loop
+        native_write_i64(new_heads, i * 8, 0)
+        i = i + 1
+    end
+
+    i = 0
+    when i < old_bucket_count loop
+        var node = native_read_i64(old_heads, i * 8)
+        when node != 0 loop
+            g_pass8_stat_rehash_nodes = g_pass8_stat_rehash_nodes + 1
+            let
+                next = native_read_i64(node, 0)
+                item = native_read_i64(node, 8)
+                name = pass8_item_name(item)
+                bid = pass8_hash_name_for_buckets(name, new_bucket_count)
+            native_write_i64(node, 0, native_read_i64(new_heads, bid * 8))
+            native_write_i64(new_heads, bid * 8, node)
+            node = next
+        end
+        i = i + 1
+    end
+    native_write_i64(ht, 0, new_bucket_count)
+    native_write_i64(ht, 16, new_heads)
+    out 0
+end.
+
+func pass8_box_new():
+    let p = vir_alloc(16)
+    native_write_i64(p, 0, vec_new_rt())
+    native_write_i64(p, 8, 0)
+    out p
+end.
+
+func pass8_box_map(b: int):
+    out native_read_i64(b, 8)
+end.
+
+func pass8_box_ensure_map(b: int):
+    var ht = native_read_i64(b, 8)
+    if ht == 0 do
+        ht = pass8_map_new()
+        native_write_i64(b, 8, ht)
+        let v = native_read_i64(b, 0)
+        let n = vec_len_rt(v)
+        var i = 0
+        when i < n loop
+            let item = vec_get_rt(v, i)
+            let nm = pass8_item_name(item)
+            if nm != 0 do
+                pass8_map_index_at(ht, nm, item, i)
+            end
+            i = i + 1
+        end
+    end
+    out ht
+end.
+
+# Chain node: [0]=next, [8]=item ptr, [16]=box vector index or -1.
+func pass8_map_index_at(ht: int, name: int, item: int, item_index: int):
+    if pass8_strlen(name) == 0 do
+        out 0
+    end
+    if ht == 0 do
+        out 0
+    end
+    var bucket_count = native_read_i64(ht, 0)
+    let item_count = native_read_i64(ht, 8)
+    if (item_count + 1) * 4 > bucket_count * 3 do
+        pass8_map_rehash(ht)
+        bucket_count = native_read_i64(ht, 0)
+    end
+    let
+        heads = native_read_i64(ht, 16)
+        bid = pass8_hash_name_for_buckets(name, bucket_count)
+    let node = vir_alloc(24)
+    native_write_i64(node, 0, native_read_i64(heads, bid * 8))
+    native_write_i64(node, 8, item as i64)
+    native_write_i64(node, 16, item_index)
+    native_write_i64(heads, bid * 8, node)
+    native_write_i64(ht, 8, item_count + 1)
+    out 0
+end.
+
+func pass8_map_index(ht: int, name: int, item: int):
+    out pass8_map_index_at(ht, name, item, -1)
+end.
+
+func pass8_map_set_item_index(ht: int, name: int, item: int, item_index: int):
+    if ht == 0 or pass8_strlen(name) == 0 do out 0 end
+    var node = pass8_map_bucket_head(ht, name)
+    when node != 0 loop
+        g_pass8_stat_map_probes = g_pass8_stat_map_probes + 1
+        if native_read_i64(node, 8) == item do
+            native_write_i64(node, 16, item_index)
+            out 1
+        end
+        node = native_read_i64(node, 0)
+    end
+    out 0
+end.
+
+func pass8_map_item_index(ht: int, name: int, item: int) -> int:
+    if ht == 0 or pass8_strlen(name) == 0 do out -1 end
+    var node = pass8_map_bucket_head(ht, name)
+    when node != 0 loop
+        g_pass8_stat_map_probes = g_pass8_stat_map_probes + 1
+        if native_read_i64(node, 8) == item do
+            out native_read_i64(node, 16)
+        end
+        node = native_read_i64(node, 0)
+    end
+    out -1
+end.
+
+func pass8_map_unindex_one(ht: int, name: int, item: int):
+    if ht == 0 or pass8_strlen(name) == 0 do
+        out 0
+    end
+    let
+        bucket_count = native_read_i64(ht, 0)
+        heads = native_read_i64(ht, 16)
+        bid = pass8_hash_name_for_buckets(name, bucket_count)
+    var prev = 0
+    var node = native_read_i64(heads, bid * 8)
+    var nxt = 0
+    var it = 0
+    when node != 0 loop
+        g_pass8_stat_map_probes = g_pass8_stat_map_probes + 1
+        if pass8_is_heap_ptr(node) == 0 do
+            out 0
+        end
+        nxt = native_read_i64(node, 0)
+        it = native_read_i64(node, 8)
+        if it == item as i64 do
+            if prev == 0 do
+                native_write_i64(heads, bid * 8, nxt)
+            else
+                native_write_i64(prev, 0, nxt)
+            end
+            native_write_i64(ht, 8, native_read_i64(ht, 8) - 1)
+            out 0
+        end
+        prev = node
+        node = nxt
+    end
+    out 0
+end.
+
+func pass8_map_find(ht: int, name: int):
+    if ht == 0 or pass8_strlen(name) == 0 do
+        out 0
+    end
+    var node = pass8_map_bucket_head(ht, name)
+    var it = 0
+    var nm_ptr = 0
+    when node != 0 loop
+        g_pass8_stat_map_probes = g_pass8_stat_map_probes + 1
+        if pass8_is_heap_ptr(node) == 0 do
+            out 0
+        end
+        it = native_read_i64(node, 8)
+        if pass8_is_heap_ptr(it) == 1 do
+            nm_ptr = native_read_i64(it, 0)
+            if nm_ptr == name do
+                out it
+            end
+            if pass8_streq(nm_ptr, name) == 1 do
+                out it
+            end
+        end
+        node = native_read_i64(node, 0)
+    end
+    out 0
+end.
+
+func pass8_map_count(ht: int, name: int):
+    if ht == 0 or pass8_strlen(name) == 0 do
+        out 0
+    end
+    var total = 0
+    var node = pass8_map_bucket_head(ht, name)
+    var it = 0
+    var nm_ptr = 0
+    when node != 0 loop
+        if pass8_is_heap_ptr(node) == 0 do
+            out total
+        end
+        it = native_read_i64(node, 8)
+        if pass8_is_heap_ptr(it) == 1 do
+            nm_ptr = native_read_i64(it, 0)
+            if nm_ptr == name or pass8_streq(nm_ptr, name) == 1 do
+                total = total + 1
+            end
+        end
+        node = native_read_i64(node, 0)
+    end
+    out total
+end.
+
+func pass8_box_len(b: int):
+    let v = native_read_i64(b, 0)
+    out vec_len_rt(v)
+end.
+
+func pass8_box_get(b: int, i: int):
+    let v = native_read_i64(b, 0)
+    out vec_get_rt(v, i)
+end.
+
+func pass8_box_set(b: int, i: int, val: int):
+    let v = native_read_i64(b, 0)
+    let old_item = vec_get_rt(v, i)
+    vec_set_rt(v, i, val)
+    let ht = native_read_i64(b, 8)
+    if ht != 0 do
+        let old_nm = pass8_item_name(old_item)
+        if old_nm != 0 do
+            pass8_map_unindex_one(ht, old_nm, old_item)
+        end
+        let new_nm = pass8_item_name(val)
+        if new_nm != 0 do
+            pass8_map_index_at(ht, new_nm, val, i)
+        end
+    end
+end.
+
+func pass8_box_push(b: int, val: int):
+    var v = native_read_i64(b, 0)
+    let item_index = vec_len_rt(v)
+    v = vec_push_rt(v, val)
+    native_write_i64(b, 0, v)
+    let ht = native_read_i64(b, 8)
+    if ht != 0 do
+        let nm = pass8_item_name(val)
+        if nm != 0 do
+            pass8_map_index_at(ht, nm, val, item_index)
+        end
+    end
+end.
+
+func pass8_box_pop(b: int):
+    let v = native_read_i64(b, 0)
+    let item = vec_pop_rt(v)
+    let ht = native_read_i64(b, 8)
+    if ht != 0 do
+        let nm = pass8_item_name(item)
+        if nm != 0 do
+            pass8_map_unindex_one(ht, nm, item)
+        end
+    end
+    out item
+end.
+
+func pass8_box_swap_remove(b: int, i: int):
+    let v = native_read_i64(b, 0)
+    let len = vec_len_rt(v)
+    if i < 0 or i >= len do
+        out 0
+    end
+    let item = vec_get_rt(v, i)
+    var swapped = 0
+    if i < len - 1 do
+        swapped = vec_get_rt(v, len - 1)
+        vec_set_rt(v, i, swapped)
+    end
+    vec_pop_rt(v)
+    let ht = native_read_i64(b, 8)
+    if ht != 0 do
+        let nm = pass8_item_name(item)
+        if nm != 0 do
+            pass8_map_unindex_one(ht, nm, item)
+        end
+        if swapped != 0 do
+            let swapped_name = pass8_item_name(swapped)
+            if swapped_name != 0 do
+                pass8_map_set_item_index(ht, swapped_name, swapped, i)
+            end
+        end
+    end
+    out item
+end.
+
+func pass8_box_item_index(b: int, item: int) -> int:
+    if b == 0 or item == 0 do out -1 end
+    let name = pass8_item_name(item)
+    if name == 0 do out -1 end
+    let ht = pass8_box_ensure_map(b)
+    out pass8_map_item_index(ht, name, item)
+end.
+
+func pass8_box_truncate_to(b: int, watermark: int):
+    let v = native_read_i64(b, 0)
+    let ht = native_read_i64(b, 8)
+    var popped = 0
+    when vec_len_rt(v) > watermark loop
+        popped = vec_pop_rt(v)
+        if ht != 0 do
+            let nm = pass8_item_name(popped)
+            if nm != 0 do
+                pass8_map_unindex_one(ht, nm, popped)
+            end
+        end
+    end
+end.
+
+func pass8_streq(a: int, b: int):
+    if a < 4096 or b < 4096 do
+        out 0
+    end
+    if pass8_is_packed_ascii_word(a) == 1 or pass8_is_packed_ascii_word(b) == 1 do
+        out 0
+    end
+    let fa = pass8_str_is_fat(a)
+    let fb = pass8_str_is_fat(b)
+    if fa == 1 and fb == 1 do
+        out fat_str_eq(a as string, b as string) == 1
+    end
+    if fa == 1 and fb == 0 do
+        out fat_cstr_eq(a as string, b) == 1
+    end
+    if fa == 0 and fb == 1 do
+        out fat_cstr_eq(b as string, a) == 1
+    end
+    out rt_streq(a, b) == 1
+end.
+
+func pass8_item_name(item: int):
+    if pass8_is_heap_ptr(item) == 0 do
+        out 0
+    end
+    out native_read_i64(item, 0)
+end.
+
+func pass8_box_find(b: int, name: int):
+    if b == 0 or pass8_strlen(name) == 0 do
+        out 0
+    end
+    var ht = native_read_i64(b, 8)
+    if ht == 0 do
+        let v = native_read_i64(b, 0)
+        let n = vec_len_rt(v)
+        if n > 8 do
+            ht = pass8_box_ensure_map(b)
+        else
+            var i = 0
+            when i < n loop
+                let item = vec_get_rt(v, i)
+                if pass8_streq(pass8_item_name(item), name) == 1 do
+                    out item
+                end
+                i = i + 1
+            end
+            out 0
+        end
+    end
+    out pass8_map_find(ht, name)
+end.
+
+func pass8_box_count_name(b: int, name: int):
+    if b == 0 or pass8_strlen(name) == 0 do
+        out 0
+    end
+    var ht = native_read_i64(b, 8)
+    if ht == 0 do
+        let v = native_read_i64(b, 0)
+        let n = vec_len_rt(v)
+        if n > 8 do
+            ht = pass8_box_ensure_map(b)
+        else
+            var total = 0
+            var i = 0
+            when i < n loop
+                let item = vec_get_rt(v, i)
+                if pass8_streq(pass8_item_name(item), name) == 1 do
+                    total = total + 1
+                end
+                i = i + 1
+            end
+            out total
+        end
+    end
+    out pass8_map_count(ht, name)
+end.
+
+func pass8_cstr_eq(s: int, cstr: string):
+    if s < 4096 do
+        out 0
+    end
+    if pass8_is_packed_ascii_word(s) == 1 do
+        out 0
+    end
+    if pass8_str_is_fat(s) == 1 do
+        out fat_cstr_eq(s, cstr)
+    end
+    out rt_streq(s, cstr)
+end.
+
+func pass8_str_is_fat(s: int):
+    if s < 4096 do
+        out 0
+    end
+    if pass8_is_packed_ascii_word(s) == 1 do
+        out 0
+    end
+    let data_ptr = native_read_i64(s, 0)
+    let n = native_read_i64(s, 8)
+    if data_ptr >= 4096 and n >= 0 and n < 1048576 do
+        out 1
+    end
+    out 0
+end.
+
+func pass8_strlen(s: int):
+    if s < 4096 do
+        out 0
+    end
+    if pass8_is_packed_ascii_word(s) == 1 do
+        out 0
+    end
+    if pass8_str_is_fat(s) == 1 do
+        out fat_str_len(s as string)
+    end
+    out rt_strlen(s)
+end.
+
+func pass8_str_byte_at(s: int, index: int):
+    if s < 4096 do
+        out 0
+    end
+    if pass8_is_packed_ascii_word(s) == 1 do
+        out 0
+    end
+    if pass8_str_is_fat(s) == 1 do
+        out fat_str_byte_at(s as string, index)
+    end
+    out native_read_u8(s, index)
+end.
+
+func pass8_str_starts_with(s: int, prefix: int) -> int:
+    let slen = pass8_strlen(s)
+    let plen = pass8_strlen(prefix)
+    if plen > slen do out 0 end
+    var i = 0
+    when i < plen loop
+        if pass8_str_byte_at(s, i) != pass8_str_byte_at(prefix, i) do
+            out 0
+        end
+        i = i + 1
+    end
+    out 1
+end.
+
+func pass8_str_contains(s: int, sub: int) -> int:
+    let slen = pass8_strlen(s)
+    let sublen = pass8_strlen(sub)
+    if sublen > slen do out 0 end
+    var i = 0
+    let limit = slen - sublen
+    when i <= limit loop
+        var j = 0
+        var matched = 1
+        when j < sublen loop
+            if pass8_str_byte_at(s, i + j) != pass8_str_byte_at(sub, j) do
+                matched = 0
+                j = sublen
+            end
+            j = j + 1
+        end
+        if matched == 1 do out 1 end
+        i = i + 1
+    end
+    out 0
+end.
+
+func pass8_is_packed_ascii_word(v: int):
+    if v < 4096 do
+        out 0
+    end
+    var i = 0
+    var printable = 0
+    var zeros = 0
+    var other = 0
+    when i < 8 loop
+        let b = (v shr (i * 8)) and 255
+        if b >= 32 and b <= 126 do
+            printable = printable + 1
+        eif b == 0 do
+            zeros = zeros + 1
+        else
+            other = other + 1
+        end
+        i = i + 1
+    end
+    if other == 0 and printable >= 1 do
+        out 1
+    end
+    out 0
+end.
+
+func pass8_is_heap_ptr(v: int):
+    if v < 4294967296 do
+        out 0
+    end
+    if pass8_is_packed_ascii_word(v) == 1 do
+        out 0
+    end
+    out 1
+end.

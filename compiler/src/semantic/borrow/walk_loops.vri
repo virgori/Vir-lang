@@ -1,0 +1,135 @@
+##
+ * compiler/src/semantic/borrow/walk_loops.vri — Loop Construct Borrow Walker
+ * =========================================================================
+ * VIRC-PLN-0004 Section 5.6 & Phase 8: Borrow Analysis Decomposition.
+ *
+ * Implements fixed-point dataflow lattice iteration for loops (LoopStmt, WhileStmt,
+ * ForRange, WhenStmt), tracking break/skip edges and convergence proofs.
+ ##
+
+include borrow_context
+include borrow_binding
+include borrow_state
+include borrow_loans
+include borrow_moves
+include borrow_scopes
+include borrow_loops
+include borrow_nll
+
+func pass8_walk_loop(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine,
+                     node: &AstNode, moved_vars: int, shared_borrows: int, mut_borrows: int,
+                     bound_borrows: int, arena_locals: int, pre_arena_names: int, in_arena: int,
+                     var_types: int, func_locals: int, uninit_vars: int) -> int:
+    scope_push(scopes, ScopeKind.Block)
+    pass8_enter_binding_scope(node as i64)
+    g_pass8_scope_depth = g_pass8_scope_depth + 1
+    let loop_depth = g_pass8_scope_depth
+    let child_count = vec_len_rt(pass8_ast_children(node))
+
+    var loop_converged = 0
+    let exit_moved = pass8_box_new()
+    let exit_uninit = pass8_box_new()
+    let loop_flow = pass8_loop_flow_new()
+    pass8_box_push(g_pass8_loop_flows, loop_flow as i64)
+    let loop_entry_moved = pass8_box_clone(moved_vars)
+    let loop_entry_shared = pass8_box_clone(shared_borrows)
+    let loop_entry_mut = pass8_box_clone(mut_borrows)
+    let loop_entry_bound = pass8_box_clone(bound_borrows)
+    let loop_entry_uninit = pass8_box_clone(uninit_vars)
+
+    # The state lattice is finite. Re-evaluate the header transfer until
+    # every ownership component is stable; never stop at a source-independent
+    # iteration cap because long dependency chains may require more rounds.
+    when loop_converged == 0 loop
+        g_pass8_flow_kind = 0
+        let iter_start_moved = pass8_box_clone(moved_vars)
+        let iter_start_shared = pass8_box_clone(shared_borrows)
+        let iter_start_mut = pass8_box_clone(mut_borrows)
+        let iter_start_bound = pass8_box_clone(bound_borrows)
+        let iter_start_uninit = pass8_box_clone(uninit_vars)
+
+        if child_count > 0 do
+            let cond = vec_get_rt(pass8_ast_children(node), 0)
+            pass8_walk(symbols, scopes, diag, cond, moved_vars, shared_borrows, mut_borrows,
+                       bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+        end
+
+        var i = 1
+        when i < child_count loop
+            let shared_stmt_wm = pass8_box_len(shared_borrows)
+            let mut_stmt_wm = pass8_box_len(mut_borrows)
+            let child = vec_get_rt(pass8_ast_children(node), i)
+
+            let claimed = pass8_walk(symbols, scopes, diag, child, moved_vars, shared_borrows, mut_borrows,
+                                     bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+            pass8_end_stmt(shared_borrows, mut_borrows, shared_stmt_wm, mut_stmt_wm, claimed)
+            i = i + 1
+        end
+
+        # `skip` is a real back-edge. Its state participates in the next
+        # header join, while `break` is retained only for the loop exit.
+        pass8_merge_loop_edge(loop_flow, 5, moved_vars, shared_borrows, mut_borrows,
+                              bound_borrows, uninit_vars)
+
+        pass8_merge_moved_box(exit_moved, iter_start_moved)
+        let u_count = pass8_box_len(iter_start_uninit)
+        var ui = 0
+        when ui < u_count loop
+            let u_name = var_item_name(pass8_box_get(iter_start_uninit, ui))
+            pass8_mark_uninit(exit_uninit, u_name)
+            ui = ui + 1
+        end
+
+        if g_pass8_flow_kind == 1 or g_pass8_flow_kind == 3 do
+            loop_converged = 1
+        else
+            g_pass8_flow_kind = 0
+            pass8_filter_out_scope_borrows(bound_borrows, loop_depth)
+            # Standard header equation: H = Entry join Latch(H). Rebuild
+            # the header from the immutable entry state every round so
+            # transfer kills (reinitialization/rebind) remain monotone and
+            # cannot oscillate between latch states.
+            let next_moved = pass8_box_clone(loop_entry_moved)
+            let next_shared = pass8_box_clone(loop_entry_shared)
+            let next_mut = pass8_box_clone(loop_entry_mut)
+            let next_bound = pass8_box_clone(loop_entry_bound)
+            let next_uninit = pass8_box_clone(loop_entry_uninit)
+            pass8_merge_moved_box(next_moved, moved_vars)
+            pass8_merge_borrows_box(next_shared, shared_borrows)
+            pass8_merge_borrows_box(next_mut, mut_borrows)
+            pass8_merge_bound_box(next_bound, bound_borrows)
+            pass8_merge_moved_box(next_uninit, uninit_vars)
+            if pass8_dataflow_state_equal(iter_start_moved, next_moved,
+                                          iter_start_shared, next_shared,
+                                          iter_start_mut, next_mut,
+                                          iter_start_bound, next_bound,
+                                          iter_start_uninit, next_uninit) == 1 do
+                loop_converged = 1
+            end
+            pass8_box_copy_into(moved_vars, next_moved)
+            pass8_box_copy_into(shared_borrows, next_shared)
+            pass8_box_copy_into(mut_borrows, next_mut)
+            pass8_box_copy_into(bound_borrows, next_bound)
+            pass8_box_copy_into(uninit_vars, next_uninit)
+        end
+    end
+
+    pass8_merge_moved_box(moved_vars, exit_moved)
+    let ex_u_count = pass8_box_len(exit_uninit)
+    var eui = 0
+    when eui < ex_u_count loop
+        let u_name = var_item_name(pass8_box_get(exit_uninit, eui))
+        pass8_mark_uninit(uninit_vars, u_name)
+        eui = eui + 1
+    end
+    pass8_filter_out_scope_borrows(bound_borrows, loop_depth)
+    pass8_merge_loop_edge(loop_flow, 0, moved_vars, shared_borrows, mut_borrows,
+                          bound_borrows, uninit_vars)
+    pass8_box_pop(g_pass8_loop_flows)
+    g_pass8_flow_kind = 0
+
+    g_pass8_scope_depth = g_pass8_scope_depth - 1
+    pass8_leave_binding_scope()
+    scope_pop(scopes)
+    out 1
+end.

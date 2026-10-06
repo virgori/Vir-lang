@@ -1,0 +1,1070 @@
+include sem_pass10_diagnostics
+##
+ * LIR -> WASI preview1 WebAssembly emitter.
+ *
+ * This deliberately avoids the obsolete soft QIR `Vec<T>` backend.  The
+ * compiler's active path is MIR -> LIR, so this writer consumes its raw LIR
+ * layout and emits a self-contained WASI module with a real `_start`.
+ ##
+module vir.compiler.lir_codegen_wasm
+
+import bvec_new, bvec_push, bvec_len, bvec_data_ptr, vec_new_rt, vec_push_rt, vec_get_rt, vec_len_rt from rt_vec_rt
+import write_file_bytes, print_str, print_ln, print_int, print_newline from rt_io
+import sys_exit from rt_syscall
+include rt_string_rt
+include lir
+include mir
+include ffi_imports
+include lir_codegen
+include target
+include context
+import g_has_custom_entry, g_entry_function_name from compiler.context
+
+include lir_codegen_wasm_rt_stubs
+
+func wasm_lir_validate_supported(mainf: int, lir_funcs: int):
+    blocks = lir_func_blocks(mainf)
+    var bi = 0
+    var done = 0
+    when bi < vec_len_rt(blocks) & done == 0 loop
+        insv = lir_block_instrs(vec_get_rt(blocks, bi))
+        var ii = 0
+        when ii < vec_len_rt(insv) loop
+            ins = vec_get_rt(insv, ii)
+            op = lir_instr_op(ins)
+            var supported = op == LirOp.Mov as int or op == LirOp.Add as int or op == LirOp.Sub as int or op == LirOp.Mul as int or op == LirOp.Div as int or op == LirOp.SetArg as int or op == LirOp.Ret as int or op == LirOp.Load as int or op == LirOp.Store as int or op == LirOp.Nop as int or (op >= LirOp.VLoad as int and op <= LirOp.Shuffle as int)
+            var kind = 0 - 1
+            if op == LirOp.Jmp as int do
+                target = lir_opnd_imm_val(lir_instr_src1(ins))
+                if bi + 1 < vec_len_rt(blocks) & lir_block_id(vec_get_rt(blocks, bi + 1)) == target do
+                    supported = true
+                end
+            eif op == LirOp.Call as int do
+                sid = lir_instr_aux(ins)
+                strings = lir_func_strings(mainf)
+                var call_unresolved = 0
+                if sid < 0 or sid >= vec_len_rt(strings) do
+                    call_unresolved = 1
+                else
+                    cname = vec_get_rt(strings, sid)
+                    if cname as int == 0 do
+                        call_unresolved = 1
+                    else
+                        ffi_id = ffi_import_find(cname)
+                        if ffi_id >= 0 do
+                            ffi_import_mark_used(ffi_id as int)
+                            supported = true
+                        eif fat_cstr_eq(cname, "print_ln") == 1 or fat_cstr_eq(cname, "print_str") == 1 or fat_cstr_eq(cname, "print") == 1 do
+                            supported = true
+                        eif lir_funcs != 0 and lir_find_func_index(lir_funcs as i64, cname as string) >= 0 do
+                            supported = true
+                        else
+                            call_unresolved = 1
+                        end
+                    end
+                end
+                if call_unresolved == 1 do
+                    print_str("virc: linker error: unresolved direct function call\n")
+                    sys_exit(1)
+                end
+            eif op == LirOp.Intrinsic as int do
+                kind = lir_instr_aux(ins)
+                if kind == MIR_INTR_ADDR_OF do
+                    sid = lir_opnd_imm_val(lir_instr_src1(ins))
+                    strings = lir_func_strings(mainf)
+                    var addr_unresolved = 0
+                    if sid < 0 or sid >= vec_len_rt(strings) do
+                        addr_unresolved = 1
+                    else
+                        cname = vec_get_rt(strings, sid)
+                        if cname as int == 0 do
+                            addr_unresolved = 1
+                        else
+                            ffi_id = ffi_import_find(cname)
+                            if ffi_id >= 0 do
+                                # FFI function address
+                            eif fat_cstr_eq(cname, "print_ln") == 1 or fat_cstr_eq(cname, "print_str") == 1 or fat_cstr_eq(cname, "print") == 1 do
+                                # Built-in print
+                            eif lir_funcs != 0 and lir_find_func_index(lir_funcs as i64, cname as string) >= 0 do
+                                # LIR function
+                            else
+                                addr_unresolved = 1
+                            end
+                        end
+                    end
+                    if addr_unresolved == 1 do
+                        print_str("virc: linker error: unresolved function address\n")
+                        sys_exit(1)
+                    end
+                end
+                supported = kind == MIR_INTR_STR_LIT or kind == MIR_INTR_PRINT or kind == MIR_INTR_PRINT_STR or kind == MIR_INTR_PERCENT or kind == MIR_INTR_LOAD_ADDR or kind == MIR_INTR_ERX or kind == MIR_INTR_PATCH_POINT or kind == 28 or kind == MIR_MEM_MARK or kind == MIR_MEM_RESET or kind == MIR_MEM_DROP or kind == MIR_MEM_PROMOTE or kind == MIR_INTR_THROW or kind == MIR_INTR_INDEX or kind == MIR_INTR_INDEX_STORE
+                if (kind and 0xFF) == MIR_INTR_CAST do
+                    supported = lir_instr_typ(ins) != LirType.F64 as int & lir_opnd_type(lir_instr_src1(ins)) != LirOperandType.VRegFloat as int
+                end
+                if kind == MIR_INTR_BUILTIN do
+                    bid = lir_opnd_imm_val(lir_instr_src1(ins))
+                    supported = bid == 11 or bid == 19 or bid == 1000 or bid == 3 or bid == 4 or bid == 5 or bid == 6 or bid == 7 or bid == 8 or bid == 22 or bid == 18 or bid == 1 or bid == 9 or bid == 31 or bid == 32
+                end
+            end
+            if not supported do
+                wasm_lir_unsupported(op, kind)
+            end
+            if op == LirOp.Ret as int do done = 1 end
+            ii = ii + 1
+        end
+        bi = bi + 1
+    end
+end.
+
+func wasm_lir_write_module(lir_funcs: int, path: int):
+    # The active frontend always emits global-init then main; use main's LIR
+    # body and real vreg operands. Unsupported CFG/function features remain a
+    # compiler diagnostic concern, never an empty placeholder body.
+    mainf = 0
+    if g_has_custom_entry == 1 and fat_str_len(g_entry_function_name) > 0 do
+        let entry_idx = lir_find_func_index(lir_funcs, g_entry_function_name)
+        if entry_idx >= 0 do
+            mainf = vec_get_rt(lir_funcs, entry_idx)
+        end
+    end
+    if mainf == 0 do
+        var fi = 0
+        when fi < vec_len_rt(lir_funcs) loop
+            f = vec_get_rt(lir_funcs, fi)
+            # main is normally the final user function; global init has no strings.
+            if vec_len_rt(lir_func_strings(f)) > 0 do mainf = f end
+            fi = fi + 1
+        end
+    end
+    if mainf == 0 do mainf = vec_get_rt(lir_funcs, vec_len_rt(lir_funcs) - 1) end
+    wasm_lir_validate_supported(mainf, lir_funcs)
+    let n_ffi = ffi_import_used_count()
+    strings = lir_func_strings(mainf)
+    data = bvec_new(); data = bvec_push(data, 10); data = bvec_push(data, 0)
+    # Stable bool spellings used by w_bool_code: false@1026, true@1032.
+    data = bvec_push(data, 102); data = bvec_push(data, 97); data = bvec_push(data, 108); data = bvec_push(data, 115); data = bvec_push(data, 101); data = bvec_push(data, 0)
+    data = bvec_push(data, 116); data = bvec_push(data, 114); data = bvec_push(data, 117); data = bvec_push(data, 101); data = bvec_push(data, 0)
+    offsets = vec_new_rt(); off = 1037
+    var si = 0
+    when si < vec_len_rt(strings) loop
+        s = vec_get_rt(strings, si) as string
+        offsets = vec_push_rt(offsets, off)
+        if s as int != 0 do
+            sp = native_read_i64(s as int, 0); sl = fat_str_len(s)
+            var bi = 0
+            when bi < sl loop data = bvec_push(data, native_read_u8(sp, bi)); bi = bi + 1 end
+            data = bvec_push(data, 0); off = off + sl + 1
+        else
+            data = bvec_push(data, 0); off = off + 1
+        end
+        si = si + 1
+    end
+    heap = off + 16
+    var freelists_base = off + 16
+    heap = freelists_base + 32
+    code = bvec_new(); maxr = 0; args_base = 128
+    blocks = lir_func_blocks(mainf)
+    var bi = 0
+    var code_done = 0
+    when bi < vec_len_rt(blocks) & code_done == 0 loop
+        insv = lir_block_instrs(vec_get_rt(blocks, bi))
+        var ii = 0
+        when ii < vec_len_rt(insv) loop
+            ins = vec_get_rt(insv, ii); dst = lir_instr_dst(ins); src1 = lir_instr_src1(ins); src2 = lir_instr_src2(ins)
+            if (lir_opnd_type(dst) == LirOperandType.VRegInt as int or lir_opnd_type(dst) == LirOperandType.VRegFloat as int) and lir_opnd_vreg(dst) > maxr do maxr = lir_opnd_vreg(dst) end
+            op = lir_instr_op(ins)
+            if op == LirOp.Mov as int do
+                code = w_opnd(code, src1); code = w_local_set(code, lir_opnd_vreg(dst))
+            eif op == LirOp.Add as int or op == LirOp.Sub as int or op == LirOp.Mul as int or op == LirOp.Div as int do
+                code = w_opnd(code, src1); code = w_opnd(code, src2)
+                if op == LirOp.Add as int do code = bvec_push(code, 0x7c) end
+                if op == LirOp.Sub as int do code = bvec_push(code, 0x7d) end
+                if op == LirOp.Mul as int do code = bvec_push(code, 0x7e) end
+                if op == LirOp.Div as int do code = bvec_push(code, W_I64_DIV_S) end
+                code = w_local_set(code, lir_opnd_vreg(dst))
+            eif op == LirOp.SetArg as int do
+                code = w_opnd(code, src2); code = w_local_set(code, args_base + lir_opnd_imm_val(src1))
+            eif op == LirOp.Call as int do
+                sid = lir_instr_aux(ins)
+                var call_unresolved = 0
+                if sid < 0 or sid >= vec_len_rt(strings) do
+                    call_unresolved = 1
+                else
+                    cname = vec_get_rt(strings, sid)
+                    if cname as int == 0 or fat_cstr_eq(cname, "__unresolved_callee__") == 1 do
+                        call_unresolved = 1
+                    end
+                end
+                if call_unresolved == 1 do
+                    print_str("virc: linker error: unresolved direct function call\n")
+                    sys_exit(1)
+                end
+                        ffi_id = ffi_import_find(cname)
+                        if ffi_id >= 0 do
+                            var ffi_dense = 0 - 1
+                            var ffi_k = 0
+                            when ffi_k < n_ffi loop
+                                if ffi_import_used_at(ffi_k) == ffi_id do
+                                    ffi_dense = ffi_k
+                                end
+                                ffi_k = ffi_k + 1
+                            end
+                            if ffi_dense >= 0 do
+                                let ffi_call_param_count = ffi_import_param_count(ffi_id)
+                                var ffi_call_param_i = 0
+                                when ffi_call_param_i < ffi_call_param_count loop
+                                    code = w_local_get(code, args_base + ffi_call_param_i)
+                                    let ffi_call_param_type = ffi_import_param_type(ffi_id, ffi_call_param_i)
+                                    if fat_cstr_eq(ffi_call_param_type, "i32") == 1 or fat_cstr_eq(ffi_call_param_type, "u32") == 1 or fat_cstr_eq(ffi_call_param_type, "bool") == 1 or fat_cstr_eq(ffi_call_param_type, "ptr") == 1 or fat_cstr_eq(ffi_call_param_type, "string") == 1 do
+                                        code = bvec_push(code, W_I32_WRAP_I64)
+                                    end
+                                    ffi_call_param_i = ffi_call_param_i + 1
+                                end
+                                call_target = 1 + ffi_dense
+                                code = w_call(code, call_target)
+                                let ffi_call_return_type = ffi_import_return_type(ffi_id)
+                                let ffi_call_returns = fat_str_len(ffi_call_return_type) > 0 and fat_cstr_eq(ffi_call_return_type, "void") == 0
+                                if ffi_call_returns do
+                                    if fat_cstr_eq(ffi_call_return_type, "i32") == 1 or fat_cstr_eq(ffi_call_return_type, "u32") == 1 or fat_cstr_eq(ffi_call_return_type, "bool") == 1 or fat_cstr_eq(ffi_call_return_type, "ptr") == 1 or fat_cstr_eq(ffi_call_return_type, "string") == 1 do
+                                        code = bvec_push(code, W_I64_EXTEND_I32_U)
+                                    end
+                                    if lir_opnd_type(dst) == LirOperandType.VRegInt as int do
+                                        code = w_local_set(code, lir_opnd_vreg(dst))
+                                    else
+                                        code = bvec_push(code, W_DROP)
+                                    end
+                                end
+                            end
+                        eif fat_cstr_eq(cname, "print_ln") == 1 or fat_cstr_eq(cname, "print_str") == 1 or fat_cstr_eq(cname, "print") == 1 do
+                            code = w_local_get(code, args_base)
+                            code = w_call(code, 1 + n_ffi)
+                        end
+            eif op == LirOp.Load as int do
+                code = w_opnd(code, src1)
+                code = bvec_push(code, W_I32_WRAP_I64)
+                code = bvec_push(code, 0x29)
+                code = bvec_push(code, 3)
+                code = bvec_push(code, 0)
+                code = w_local_set(code, lir_opnd_vreg(dst))
+            eif op == LirOp.Store as int do
+                code = w_opnd(code, src2)
+                code = bvec_push(code, W_I32_WRAP_I64)
+                code = w_opnd(code, src1)
+                code = bvec_push(code, 0x37)
+                code = bvec_push(code, 3)
+                code = bvec_push(code, 0)
+            eif op == LirOp.Splat as int do
+                sp_aux = lir_instr_aux(ins)
+                var sp_lanes = (sp_aux shr 8) and 255
+                if sp_lanes <= 0 do sp_lanes = 4 end
+                var spi = 0
+                if target_has_wasm_simd128() == 1 do
+                    when spi + 2 <= sp_lanes loop
+                        code = w_opnd(code, dst)
+                        code = w_i64_const(code, 16 + spi * 8)
+                        code = bvec_push(code, 0x7c)
+                        code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_opnd(code, src1)
+                        code = bvec_push(code, 0xfd)
+                        code = bvec_push(code, 0x12)
+                        code = bvec_push(code, 0xfd)
+                        code = bvec_push(code, 0x0b)
+                        code = bvec_push(code, 3)
+                        code = bvec_push(code, 0)
+                        spi = spi + 2
+                    end
+                end
+                when spi < sp_lanes loop
+                    code = w_opnd(code, dst)
+                    code = w_i64_const(code, 16 + spi * 8)
+                    code = bvec_push(code, 0x7c)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = w_opnd(code, src1)
+                    code = bvec_push(code, 0x37)
+                    code = bvec_push(code, 3)
+                    code = bvec_push(code, 0)
+                    spi = spi + 1
+                end
+            eif op == LirOp.Shuffle as int do
+                sh_aux = lir_instr_aux(ins)
+                var sh_lanes = (sh_aux shr 8) and 255
+                if sh_lanes <= 0 do sh_lanes = 4 end
+                let sh_mask = (sh_aux shr 32)
+                var shi = 0
+                when shi < sh_lanes loop
+                    let src_lane = (sh_mask shr (shi * 4)) and 15
+                    code = w_opnd(code, dst)
+                    code = w_i64_const(code, 16 + shi * 8)
+                    code = bvec_push(code, 0x7c)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = w_opnd(code, src1)
+                    code = w_i64_const(code, 16 + src_lane * 8)
+                    code = bvec_push(code, 0x7c)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = bvec_push(code, 0x29)
+                    code = bvec_push(code, 3)
+                    code = bvec_push(code, 0)
+                    code = bvec_push(code, 0x37)
+                    code = bvec_push(code, 3)
+                    code = bvec_push(code, 0)
+                    shi = shi + 1
+                end
+            eif op == LirOp.VAdd as int or op == LirOp.VSub as int or op == LirOp.VMul as int or op == LirOp.VFma as int do
+                v_aux = lir_instr_aux(ins)
+                var v_lanes = (v_aux shr 8) and 255
+                if v_lanes <= 0 do v_lanes = 4 end
+                var v_is_float = 0
+                if (v_aux and 255) == 2 or lir_instr_typ(ins) == (LirType.F64 as int) or lir_instr_typ(ins) == (LirType.F32 as int) do
+                    v_is_float = 1
+                end
+                let v_l_scalar = (v_aux shr 24) and 1
+                let v_r_scalar = (v_aux shr 25) and 1
+                let v_dyn_idx = (v_aux shr 26) and 1
+                var vi = 0
+                if target_has_wasm_simd128() == 1 do
+                    when vi + 2 <= v_lanes loop
+                        code = w_opnd(code, dst)
+                        if v_dyn_idx == 1 do
+                            code = w_local_get(code, args_base)
+                            if vi > 0 do
+                                code = w_i64_const(code, vi)
+                                code = bvec_push(code, 0x7c)
+                            end
+                            code = w_i64_const(code, 8)
+                            code = bvec_push(code, 0x7e)
+                            code = w_i64_const(code, 16)
+                            code = bvec_push(code, 0x7c)
+                        else
+                            code = w_i64_const(code, 16 + vi * 8)
+                        end
+                        code = bvec_push(code, 0x7c)
+                        code = bvec_push(code, W_I32_WRAP_I64)
+                        if v_l_scalar == 1 do
+                            code = w_opnd(code, src1)
+                            if v_is_float == 1 do
+                                code = bvec_push(code, W_F64_REINTERPRET_I64)
+                                code = bvec_push(code, 0xfd)
+                                code = bvec_push(code, 0x14)
+                            else
+                                code = bvec_push(code, 0xfd)
+                                code = bvec_push(code, 0x12)
+                            end
+                        else
+                            code = w_opnd(code, src1)
+                            if v_dyn_idx == 1 do
+                                code = w_local_get(code, args_base)
+                                if vi > 0 do
+                                    code = w_i64_const(code, vi)
+                                    code = bvec_push(code, 0x7c)
+                                end
+                                code = w_i64_const(code, 8)
+                                code = bvec_push(code, 0x7e)
+                                code = w_i64_const(code, 16)
+                                code = bvec_push(code, 0x7c)
+                            else
+                                code = w_i64_const(code, 16 + vi * 8)
+                            end
+                            code = bvec_push(code, 0x7c)
+                            code = bvec_push(code, W_I32_WRAP_I64)
+                            code = bvec_push(code, 0xfd)
+                            code = bvec_push(code, 0x00)
+                            code = bvec_push(code, 3)
+                            code = bvec_push(code, 0)
+                        end
+                        if v_r_scalar == 1 do
+                            code = w_opnd(code, src2)
+                            if v_is_float == 1 do
+                                code = bvec_push(code, W_F64_REINTERPRET_I64)
+                                code = bvec_push(code, 0xfd)
+                                code = bvec_push(code, 0x14)
+                            else
+                                code = bvec_push(code, 0xfd)
+                                code = bvec_push(code, 0x12)
+                            end
+                        else
+                            code = w_opnd(code, src2)
+                            if v_dyn_idx == 1 do
+                                code = w_local_get(code, args_base)
+                                if vi > 0 do
+                                    code = w_i64_const(code, vi)
+                                    code = bvec_push(code, 0x7c)
+                                end
+                                code = w_i64_const(code, 8)
+                                code = bvec_push(code, 0x7e)
+                                code = w_i64_const(code, 16)
+                                code = bvec_push(code, 0x7c)
+                            else
+                                code = w_i64_const(code, 16 + vi * 8)
+                            end
+                            code = bvec_push(code, 0x7c)
+                            code = bvec_push(code, W_I32_WRAP_I64)
+                            code = bvec_push(code, 0xfd)
+                            code = bvec_push(code, 0x00)
+                            code = bvec_push(code, 3)
+                            code = bvec_push(code, 0)
+                        end
+                        code = bvec_push(code, 0xfd)
+                        if v_is_float == 1 do
+                            if op == LirOp.VAdd as int do code = w_u(code, 0xF0) end
+                            if op == LirOp.VSub as int do code = w_u(code, 0xF1) end
+                            if op == LirOp.VMul as int or op == LirOp.VFma as int do code = w_u(code, 0xF2) end
+                        else
+                            if op == LirOp.VAdd as int do code = w_u(code, 0xCE) end
+                            if op == LirOp.VSub as int do code = w_u(code, 0xD1) end
+                            if op == LirOp.VMul as int or op == LirOp.VFma as int do code = w_u(code, 0xD5) end
+                        end
+                        code = bvec_push(code, 0xfd)
+                        code = bvec_push(code, 0x0b)
+                        code = bvec_push(code, 3)
+                        code = bvec_push(code, 0)
+                        vi = vi + 2
+                    end
+                end
+                when vi < v_lanes loop
+                    code = w_opnd(code, dst)
+                    if v_dyn_idx == 1 do
+                        code = w_local_get(code, args_base)
+                        if vi > 0 do
+                            code = w_i64_const(code, vi)
+                            code = bvec_push(code, 0x7c)
+                        end
+                        code = w_i64_const(code, 8)
+                        code = bvec_push(code, 0x7e)
+                        code = w_i64_const(code, 16)
+                        code = bvec_push(code, 0x7c)
+                    else
+                        code = w_i64_const(code, 16 + vi * 8)
+                    end
+                    code = bvec_push(code, 0x7c)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    if v_l_scalar == 1 do
+                        code = w_opnd(code, src1)
+                        if v_is_float == 1 do
+                            code = bvec_push(code, W_F64_REINTERPRET_I64)
+                        end
+                    else
+                        code = w_opnd(code, src1)
+                        if v_dyn_idx == 1 do
+                            code = w_local_get(code, args_base)
+                            if vi > 0 do
+                                code = w_i64_const(code, vi)
+                                code = bvec_push(code, 0x7c)
+                            end
+                            code = w_i64_const(code, 8)
+                            code = bvec_push(code, 0x7e)
+                            code = w_i64_const(code, 16)
+                            code = bvec_push(code, 0x7c)
+                        else
+                            code = w_i64_const(code, 16 + vi * 8)
+                        end
+                        code = bvec_push(code, 0x7c)
+                        code = bvec_push(code, W_I32_WRAP_I64)
+                        if v_is_float == 1 do
+                            code = bvec_push(code, 0x2b)
+                        else
+                            code = bvec_push(code, 0x29)
+                        end
+                        code = bvec_push(code, 3)
+                        code = bvec_push(code, 0)
+                    end
+                    if v_r_scalar == 1 do
+                        code = w_opnd(code, src2)
+                        if v_is_float == 1 do
+                            code = bvec_push(code, W_F64_REINTERPRET_I64)
+                        end
+                    else
+                        code = w_opnd(code, src2)
+                        if v_dyn_idx == 1 do
+                            code = w_local_get(code, args_base)
+                            if vi > 0 do
+                                code = w_i64_const(code, vi)
+                                code = bvec_push(code, 0x7c)
+                            end
+                            code = w_i64_const(code, 8)
+                            code = bvec_push(code, 0x7e)
+                            code = w_i64_const(code, 16)
+                            code = bvec_push(code, 0x7c)
+                        else
+                            code = w_i64_const(code, 16 + vi * 8)
+                        end
+                        code = bvec_push(code, 0x7c)
+                        code = bvec_push(code, W_I32_WRAP_I64)
+                        if v_is_float == 1 do
+                            code = bvec_push(code, 0x2b)
+                        else
+                            code = bvec_push(code, 0x29)
+                        end
+                        code = bvec_push(code, 3)
+                        code = bvec_push(code, 0)
+                    end
+                    if v_is_float == 1 do
+                        if op == LirOp.VAdd as int do code = bvec_push(code, 0xa0) end
+                        if op == LirOp.VSub as int do code = bvec_push(code, 0xa1) end
+                        if op == LirOp.VMul as int or op == LirOp.VFma as int do code = bvec_push(code, 0xa2) end
+                        code = bvec_push(code, 0x39)
+                    else
+                        if op == LirOp.VAdd as int do code = bvec_push(code, 0x7c) end
+                        if op == LirOp.VSub as int do code = bvec_push(code, 0x7d) end
+                        if op == LirOp.VMul as int or op == LirOp.VFma as int do code = bvec_push(code, 0x7e) end
+                        code = bvec_push(code, 0x37)
+                    end
+                    code = bvec_push(code, 3)
+                    code = bvec_push(code, 0)
+                    vi = vi + 1
+                end
+            eif op == LirOp.VLoad as int do
+                vl_aux = lir_instr_aux(ins)
+                var vl_lanes = (vl_aux shr 8) and 255
+                if vl_lanes <= 0 do vl_lanes = 4 end
+                var vli = 0
+                if target_has_wasm_simd128() == 1 do
+                    when vli + 2 <= vl_lanes loop
+                        code = w_opnd(code, dst)
+                        code = w_i64_const(code, 16 + vli * 8)
+                        code = bvec_push(code, 0x7c)
+                        code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_opnd(code, src1)
+                        code = w_i64_const(code, vli * 8)
+                        code = bvec_push(code, 0x7c)
+                        code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, 0xfd)
+                        code = bvec_push(code, 0x00)
+                        code = bvec_push(code, 3)
+                        code = bvec_push(code, 0)
+                        code = bvec_push(code, 0xfd)
+                        code = bvec_push(code, 0x0b)
+                        code = bvec_push(code, 3)
+                        code = bvec_push(code, 0)
+                        vli = vli + 2
+                    end
+                end
+                when vli < vl_lanes loop
+                    code = w_opnd(code, dst)
+                    code = w_i64_const(code, 16 + vli * 8)
+                    code = bvec_push(code, 0x7c)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = w_opnd(code, src1)
+                    code = w_i64_const(code, vli * 8)
+                    code = bvec_push(code, 0x7c)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = bvec_push(code, 0x29)
+                    code = bvec_push(code, 3)
+                    code = bvec_push(code, 0)
+                    code = bvec_push(code, 0x37)
+                    code = bvec_push(code, 3)
+                    code = bvec_push(code, 0)
+                    vli = vli + 1
+                end
+            eif op == LirOp.VStore as int do
+                vs_aux = lir_instr_aux(ins)
+                var vs_lanes = (vs_aux shr 8) and 255
+                if vs_lanes <= 0 do vs_lanes = 4 end
+                var vsi = 0
+                if target_has_wasm_simd128() == 1 do
+                    when vsi + 2 <= vs_lanes loop
+                        code = w_opnd(code, src1)
+                        code = w_i64_const(code, vsi * 8)
+                        code = bvec_push(code, 0x7c)
+                        code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_opnd(code, src2)
+                        code = w_i64_const(code, 16 + vsi * 8)
+                        code = bvec_push(code, 0x7c)
+                        code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, 0xfd)
+                        code = bvec_push(code, 0x00)
+                        code = bvec_push(code, 3)
+                        code = bvec_push(code, 0)
+                        code = bvec_push(code, 0xfd)
+                        code = bvec_push(code, 0x0b)
+                        code = bvec_push(code, 3)
+                        code = bvec_push(code, 0)
+                        vsi = vsi + 2
+                    end
+                end
+                when vsi < vs_lanes loop
+                    code = w_opnd(code, src1)
+                    code = w_i64_const(code, vsi * 8)
+                    code = bvec_push(code, 0x7c)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = w_opnd(code, src2)
+                    code = w_i64_const(code, 16 + vsi * 8)
+                    code = bvec_push(code, 0x7c)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = bvec_push(code, 0x29)
+                    code = bvec_push(code, 3)
+                    code = bvec_push(code, 0)
+                    code = bvec_push(code, 0x37)
+                    code = bvec_push(code, 3)
+                    code = bvec_push(code, 0)
+                    vsi = vsi + 1
+                end
+            eif op == LirOp.Intrinsic as int do
+                kind = lir_instr_aux(ins)
+                if kind == MIR_INTR_ADDR_OF do
+                    sid = lir_opnd_imm_val(src1)
+                    var addr_unresolved = 0
+                    if sid < 0 or sid >= vec_len_rt(strings) do
+                        addr_unresolved = 1
+                    else
+                        cname = vec_get_rt(strings, sid)
+                        if cname as int == 0 or fat_cstr_eq(cname, "__unresolved_callee__") == 1 do
+                            addr_unresolved = 1
+                        end
+                    end
+                    if addr_unresolved == 1 do
+                        print_str("virc: linker error: unresolved function address\n")
+                        sys_exit(1)
+                    end
+                end
+                if kind == MIR_INTR_LOAD_ADDR do
+                    slot = lir_opnd_imm_val(src1)
+                    code = w_i64_const(code, 512 + 8 * slot)
+                    code = w_local_set(code, lir_opnd_vreg(dst))
+                eif kind == MIR_INTR_ERX do
+                    # WASI helpers emitted by this backend are non-throwing;
+                    # the function-level error check therefore observes zero.
+                    if lir_opnd_type(dst) == LirOperandType.VRegInt as int do
+                        code = w_i64_const(code, 0)
+                        code = w_local_set(code, lir_opnd_vreg(dst))
+                    end
+                eif kind == MIR_INTR_STR_LIT do
+                    sid = lir_opnd_imm_val(src1); ptr = 0
+                    if sid >= 0 and sid < vec_len_rt(offsets) do ptr = vec_get_rt(offsets, sid) end
+                    code = w_i64_const(code, ptr); code = w_local_set(code, lir_opnd_vreg(dst))
+                eif kind == MIR_INTR_PRINT_STR do
+                    print_op = src1
+                    if lir_opnd_type(print_op) == LirOperandType.None as int do print_op = src2 end
+                    code = w_opnd(code, print_op); code = w_call(code, 1 + n_ffi)
+                eif kind == MIR_INTR_PRINT do
+                    print_op = src1
+                    if lir_opnd_type(print_op) == LirOperandType.None as int do print_op = src2 end
+                    code = w_opnd(code, print_op)
+                    code = w_call(code, 3 + n_ffi)
+                    code = w_call(code, 1 + n_ffi)
+                eif (kind and 0xFF) == MIR_INTR_CAST do
+                    if lir_instr_typ(ins) == LirType.F64 as int || lir_opnd_type(src1) == LirOperandType.VRegFloat as int do
+                        wasm_lir_unsupported(LirOp.Intrinsic as int, kind)
+                    end
+                    var cast_bits = (kind shr 24) and 0xFF
+                    if cast_bits == 0 do cast_bits = 64 end
+                    var cast_is_unsigned = (kind shr 32) and 0xFF
+                    code = w_opnd(code, src1)
+                    if cast_is_unsigned == 1 do
+                        if cast_bits == 8 do
+                            code = w_i64_const(code, 255)
+                            code = bvec_push(code, 0x83)
+                        eif cast_bits == 16 do
+                            code = w_i64_const(code, 65535)
+                            code = bvec_push(code, 0x83)
+                        eif cast_bits == 32 do
+                            code = w_i64_const(code, 4294967295)
+                            code = bvec_push(code, 0x83)
+                        end
+                    else
+                        if cast_bits == 8 do
+                            code = bvec_push(code, 0xC2)
+                        eif cast_bits == 16 do
+                            code = bvec_push(code, 0xC3)
+                        eif cast_bits == 32 do
+                            code = bvec_push(code, 0xC4)
+                        end
+                    end
+                    code = w_local_set(code, lir_opnd_vreg(dst))
+                eif kind == MIR_INTR_INDEX do
+                    code = w_opnd(code, src1)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = w_i32_const(code, 16)
+                    code = bvec_push(code, W_I32_ADD)
+                    code = w_local_get(code, args_base)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = w_i32_const(code, 8)
+                    code = bvec_push(code, W_I32_MUL)
+                    code = bvec_push(code, W_I32_ADD)
+                    code = bvec_push(code, 0x29)
+                    code = bvec_push(code, 3)
+                    code = bvec_push(code, 0)
+                    code = w_local_set(code, lir_opnd_vreg(dst))
+                eif kind == MIR_INTR_INDEX_STORE do
+                    code = w_opnd(code, src1)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = w_i32_const(code, 16)
+                    code = bvec_push(code, W_I32_ADD)
+                    code = w_local_get(code, args_base)
+                    code = bvec_push(code, W_I32_WRAP_I64)
+                    code = w_i32_const(code, 8)
+                    code = bvec_push(code, W_I32_MUL)
+                    code = bvec_push(code, W_I32_ADD)
+                    code = w_local_get(code, args_base + 1)
+                    code = bvec_push(code, 0x37)
+                    code = bvec_push(code, 3)
+                    code = bvec_push(code, 0)
+                eif kind == MIR_INTR_BUILTIN do
+                    bid = lir_opnd_imm_val(src1)
+                    if bid == 11 do
+                        code = w_local_get(code, args_base); code = w_local_get(code, args_base + 1); code = w_call(code, 2 + n_ffi); code = w_local_set(code, lir_opnd_vreg(dst))
+                    eif bid == 19 do
+                        code = w_local_get(code, args_base); code = w_call(code, 3 + n_ffi); code = w_local_set(code, lir_opnd_vreg(dst))
+                    eif bid == 1000 do
+                        code = w_local_get(code, args_base); code = w_call(code, 4 + n_ffi); code = w_local_set(code, lir_opnd_vreg(dst))
+                    eif bid == 3 do
+                        code = w_local_get(code, args_base)
+                        code = bvec_push(code, W_I64_EQZ)
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+                        code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U)
+                        code = w_local_set(code, lir_opnd_vreg(dst))
+                        code = bvec_push(code, W_ELSE)
+
+                        code = bvec_push(code, W_BLOCK); code = bvec_push(code, W_VOID)
+
+                        # sc = 29 - clz((size - 1) | 7)
+                        code = w_i32_const(code, 29)
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 1); code = bvec_push(code, W_I32_SUB)
+                        code = w_i32_const(code, 7); code = bvec_push(code, W_I32_OR)
+                        code = bvec_push(code, 0x67) # W_I32_CLZ
+                        code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 1)
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, 0x48) # W_I32_LT_S
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        code = w_i32_const(code, freelists_base)
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 4); code = bvec_push(code, W_I32_MUL)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 2)
+
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 3)
+
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_EQZ)
+                        code = bvec_push(code, 0x45) # W_I32_EQZ (which is just 'not', so head != 0)
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        # i32.store(addr, i32.load(head))
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        code = w_local_get(code, args_base + 3)
+                        code = w_local_set(code, lir_opnd_vreg(dst))
+                        code = bvec_push(code, W_BR); code = w_u(code, 2) # break to end of W_BLOCK
+
+                        code = bvec_push(code, W_END)
+                        code = bvec_push(code, W_END)
+
+                        # bump alloc fallback
+                        code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 7); code = bvec_push(code, W_I32_ADD)
+                        code = w_i32_const(code, 0 - 8); code = bvec_push(code, 0x71)
+                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        # forward_flag = 0 @ G0 + 4
+                        code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
+                        code = w_i32_const(code, 4); code = bvec_push(code, W_I32_ADD)
+                        code = w_i32_const(code, 0)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
+                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U)
+                        code = w_local_set(code, lir_opnd_vreg(dst))
+
+                        code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
+                        code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_GLOBAL_SET); code = w_u(code, 0)
+
+                        code = bvec_push(code, W_END) # W_BLOCK
+                        code = bvec_push(code, W_END) # W_ELSE
+                    eif bid == 4 do
+                        # free: no-op
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 1) # hdr_addr
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 2) # blk_size
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
+                        code = bvec_push(code, W_I32_EQ)
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_GLOBAL_SET); code = w_u(code, 0)
+
+                        code = bvec_push(code, W_ELSE)
+
+                        # user_size = blk_size - 8
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+
+                        # sc = 29 - clz((user_size - 1) | 7)
+                        code = w_i32_const(code, 1); code = bvec_push(code, W_I32_SUB)
+                        code = w_i32_const(code, 7); code = bvec_push(code, W_I32_OR)
+                        code = bvec_push(code, 0x67) # W_I32_CLZ
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 3)
+                        code = w_i32_const(code, 29)
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 3) # sc
+
+                        # if sc < 8
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, 0x48) # W_I32_LT_S
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+
+                        # addr = freelists_base + sc * 4
+                        code = w_i32_const(code, freelists_base)
+                        code = w_local_get(code, args_base + 3); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 4); code = bvec_push(code, W_I32_MUL)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U); code = w_local_set(code, args_base + 4) # addr
+
+                        # i32.store(ptr, i32.load(addr))
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 4); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        # i32.store(addr, ptr)
+                        code = w_local_get(code, args_base + 4); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_STORE); code = bvec_push(code, 0); code = bvec_push(code, 0)
+
+                        code = bvec_push(code, W_END) # sc < 8 IF
+                        code = bvec_push(code, W_END) # LIFO IF
+                        code = bvec_push(code, W_END) # ptr != 0 IF
+                    eif bid == 5 do
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_I32_LOAD8_U); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U)
+                        code = w_local_set(code, lir_opnd_vreg(dst))
+                    eif bid == 6 do
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = w_local_get(code, args_base + 2); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_STORE8); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                    eif bid == 7 do
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, 0x29); code = bvec_push(code, 3); code = bvec_push(code, 0)
+                        code = w_local_set(code, lir_opnd_vreg(dst))
+                    eif bid == 8 do
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = w_local_get(code, args_base + 2)
+                        code = bvec_push(code, 0x37); code = bvec_push(code, 3); code = bvec_push(code, 0)
+                    eif bid == 31 do
+                        if lir_opnd_type(dst) == (LirOperandType.VRegInt as int) do
+                            code = w_local_get(code, args_base)
+                            code = w_local_set(code, lir_opnd_vreg(dst))
+                        end
+                        code = bvec_push(code, W_BLOCK); code = bvec_push(code, W_VOID)
+                        code = bvec_push(code, W_LOOP); code = bvec_push(code, W_VOID)
+                        code = w_local_get(code, args_base + 2)
+                        code = bvec_push(code, W_I64_EQZ)
+                        code = bvec_push(code, W_BR_IF); code = w_u(code, 1)
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_LOAD8_U); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I32_STORE8); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = w_local_get(code, args_base); code = w_i64_const(code, 1); code = bvec_push(code, 0x7c); code = w_local_set(code, args_base)
+                        code = w_local_get(code, args_base + 1); code = w_i64_const(code, 1); code = bvec_push(code, 0x7c); code = w_local_set(code, args_base + 1)
+                        code = w_local_get(code, args_base + 2); code = w_i64_const(code, 1); code = bvec_push(code, 0x7d); code = w_local_set(code, args_base + 2)
+                        code = bvec_push(code, W_BR); code = w_u(code, 0)
+                        code = bvec_push(code, W_END); code = bvec_push(code, W_END)
+                    eif bid == 32 do
+                        if lir_opnd_type(dst) == (LirOperandType.VRegInt as int) do
+                            code = w_local_get(code, args_base)
+                            code = w_local_set(code, lir_opnd_vreg(dst))
+                        end
+                        code = bvec_push(code, W_BLOCK); code = bvec_push(code, W_VOID)
+                        code = bvec_push(code, W_LOOP); code = bvec_push(code, W_VOID)
+                        code = w_local_get(code, args_base + 2)
+                        code = bvec_push(code, W_I64_EQZ)
+                        code = bvec_push(code, W_BR_IF); code = w_u(code, 1)
+                        code = w_local_get(code, args_base); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_local_get(code, args_base + 1); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_I32_STORE8); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = w_local_get(code, args_base); code = w_i64_const(code, 1); code = bvec_push(code, 0x7c); code = w_local_set(code, args_base)
+                        code = w_local_get(code, args_base + 2); code = w_i64_const(code, 1); code = bvec_push(code, 0x7d); code = w_local_set(code, args_base + 2)
+                        code = bvec_push(code, W_BR); code = w_u(code, 0)
+                        code = bvec_push(code, W_END); code = bvec_push(code, W_END)
+                    eif bid == 22 do
+                        code = w_local_get(code, args_base)
+                        code = w_call(code, 1 + n_ffi)
+                    eif bid == 18 do
+                        code = bvec_push(code, 0x00)
+                    end
+                eif kind == MIR_INTR_PERCENT do
+                    code = w_opnd(code, src1)
+                    if lir_instr_typ(ins) == LirType.F64 as int do
+                        code = bvec_push(code, W_F64_REINTERPRET_I64)
+                    else
+                        code = bvec_push(code, W_F64_CONVERT_I64_S)
+                    end
+                    code = w_f64_const_100(code)
+                    code = bvec_push(code, W_F64_DIV)
+                    code = bvec_push(code, W_I64_REINTERPRET_F64)
+                    code = w_local_set(code, lir_opnd_vreg(dst))
+                eif kind == MIR_MEM_MARK do
+                    if lir_opnd_type(dst) == (LirOperandType.VRegInt as int) do
+                        code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U)
+                        code = w_local_set(code, lir_opnd_vreg(dst))
+                    end
+                eif kind == MIR_MEM_RESET do
+                    if lir_opnd_type(src1) == (LirOperandType.VRegInt as int) do
+                        code = w_local_get(code, lir_opnd_vreg(src1))
+                        code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_GLOBAL_SET); code = w_u(code, 0)
+                    end
+                eif kind == MIR_MEM_DROP do
+                    if lir_opnd_type(src1) == (LirOperandType.VRegInt as int) do
+                        code = w_local_get(code, lir_opnd_vreg(src1)); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+                        code = w_local_get(code, lir_opnd_vreg(src1)); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+                        code = w_local_get(code, lir_opnd_vreg(src1)); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_I32_LOAD); code = bvec_push(code, 0); code = bvec_push(code, 0)
+                        code = bvec_push(code, W_I32_ADD)
+                        code = bvec_push(code, W_GLOBAL_GET); code = w_u(code, 0)
+                        code = bvec_push(code, W_I32_EQ)
+                        code = bvec_push(code, W_IF); code = bvec_push(code, W_VOID)
+                        code = w_local_get(code, lir_opnd_vreg(src1)); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_i32_const(code, 8); code = bvec_push(code, W_I32_SUB)
+                        code = bvec_push(code, W_GLOBAL_SET); code = w_u(code, 0)
+                        code = bvec_push(code, W_END)
+                        code = bvec_push(code, W_END)
+                    end
+                eif kind == MIR_MEM_PROMOTE do
+                    if lir_opnd_type(src1) == (LirOperandType.VRegInt as int) do
+                        let s1_vreg = lir_opnd_vreg(src1)
+                        code = w_local_get(code, s1_vreg); code = bvec_push(code, W_I32_WRAP_I64)
+                        code = w_call(code, 5 + n_ffi)
+                        code = bvec_push(code, W_I64_EXTEND_I32_U)
+                        code = w_local_set(code, s1_vreg)
+                        if lir_opnd_type(dst) == (LirOperandType.VRegInt as int) do
+                            code = w_local_get(code, s1_vreg)
+                            code = w_local_set(code, lir_opnd_vreg(dst))
+                        end
+                    end
+                end
+            end
+            if op == LirOp.Ret as int do code_done = 1 end
+            ii = ii + 1
+        end
+        bi = bi + 1
+    end
+    # Header
+    outb = bvec_new(); outb = bvec_push(outb, 0); outb = bvec_push(outb, 97); outb = bvec_push(outb, 115); outb = bvec_push(outb, 109); outb = bvec_push(outb, 1); outb = bvec_push(outb, 0); outb = bvec_push(outb, 0); outb = bvec_push(outb, 0)
+    # Stable runtime types followed by one exact type per used FFI import.
+    t = bvec_new(); t = w_u(t, 7 + n_ffi)
+    t = bvec_push(t, 0x60); t = w_u(t, 4); t = bvec_push(t,W_I32); t=bvec_push(t,W_I32); t=bvec_push(t,W_I32); t=bvec_push(t,W_I32); t=w_u(t,1); t=bvec_push(t,W_I32)
+    t = bvec_push(t,0x60); t=w_u(t,1); t=bvec_push(t,W_I64); t=w_u(t,0)
+    t = bvec_push(t,0x60); t=w_u(t,2); t=bvec_push(t,W_I64); t=bvec_push(t,W_I64); t=w_u(t,1); t=bvec_push(t,W_I64)
+    t = bvec_push(t,0x60); t=w_u(t,1); t=bvec_push(t,W_I64); t=w_u(t,1); t=bvec_push(t,W_I64)
+    t = bvec_push(t,0x60); t=w_u(t,0); t=w_u(t,0)
+    t = bvec_push(t,0x60); t=w_u(t,0); t=w_u(t,1); t=bvec_push(t,W_I32)
+    # type 6: w_promote_graph (i32) -> i32
+    t = bvec_push(t,0x60); t=w_u(t,1); t=bvec_push(t,W_I32); t=w_u(t,1); t=bvec_push(t,W_I32)
+    var ffi_type_i = 0
+    when ffi_type_i < n_ffi loop
+        let ffi_type_id = ffi_import_used_at(ffi_type_i)
+        t = bvec_push(t, 0x60)
+        let ffi_param_count = ffi_import_param_count(ffi_type_id)
+        t = w_u(t, ffi_param_count)
+        var ffi_param_i = 0
+        when ffi_param_i < ffi_param_count loop
+            let ffi_param_type = ffi_import_param_type(ffi_type_id, ffi_param_i)
+            if fat_cstr_eq(ffi_param_type, "i32") == 1 or fat_cstr_eq(ffi_param_type, "u32") == 1 or fat_cstr_eq(ffi_param_type, "bool") == 1 or fat_cstr_eq(ffi_param_type, "ptr") == 1 or fat_cstr_eq(ffi_param_type, "string") == 1 do
+                t = bvec_push(t, W_I32)
+            eif fat_cstr_eq(ffi_param_type, "f32") == 1 do
+                t = bvec_push(t, W_F32)
+            eif fat_cstr_eq(ffi_param_type, "f64") == 1 do
+                t = bvec_push(t, W_F64)
+            else
+                t = bvec_push(t, W_I64)
+            end
+            ffi_param_i = ffi_param_i + 1
+        end
+        let ffi_return_type = ffi_import_return_type(ffi_type_id)
+        if fat_str_len(ffi_return_type) == 0 or fat_cstr_eq(ffi_return_type, "void") == 1 do
+            t = w_u(t, 0)
+        else
+            t = w_u(t, 1)
+            if fat_cstr_eq(ffi_return_type, "i32") == 1 or fat_cstr_eq(ffi_return_type, "u32") == 1 or fat_cstr_eq(ffi_return_type, "bool") == 1 or fat_cstr_eq(ffi_return_type, "ptr") == 1 or fat_cstr_eq(ffi_return_type, "string") == 1 do
+                t = bvec_push(t, W_I32)
+            eif fat_cstr_eq(ffi_return_type, "f32") == 1 do
+                t = bvec_push(t, W_F32)
+            eif fat_cstr_eq(ffi_return_type, "f64") == 1 do
+                t = bvec_push(t, W_F64)
+            else
+                t = bvec_push(t, W_I64)
+            end
+        end
+        ffi_type_i = ffi_type_i + 1
+    end
+    outb=w_section(outb,1,t)
+    im = bvec_new(); im = w_u(im, 1 + n_ffi)
+    im = w_name(im, fat_str_new("wasi_snapshot_preview1")); im = w_name(im, fat_str_new("fd_write")); im = bvec_push(im, 0); im = w_u(im, 0)
+    var ffi_w = 0
+    when ffi_w < n_ffi loop
+        let u_id = ffi_import_used_at(ffi_w)
+        var s_mod = ffi_import_source(u_id)
+        if s_mod as int == 0 or ffi_source_is_os(s_mod as int) == 1 do
+            s_mod = fat_str_new("wasi_snapshot_preview1")
+        end
+        var s_fun = ffi_import_name(u_id)
+        if s_fun as int == 0 do
+            s_fun = fat_str_new("unnamed")
+        end
+        im = w_name(im, s_mod)
+        im = w_name(im, s_fun)
+        im = bvec_push(im, 0)
+        im = w_u(im, 7 + ffi_w)
+        ffi_w = ffi_w + 1
+    end
+    outb = w_section(outb, 2, im)
+    # function section: print(1), strcat(2), itoa(3), bool(3), promote_graph(6), _start(4)
+    fs = bvec_new(); fs = w_u(fs, 6); fs = w_u(fs, 1); fs = w_u(fs, 2); fs = w_u(fs, 3); fs = w_u(fs, 3); fs = w_u(fs, 6); fs = w_u(fs, 4); outb = w_section(outb, 3, fs)
+    mem = bvec_new(); mem = w_u(mem, 1); mem = bvec_push(mem, 0); mem = w_u(mem, 32); outb = w_section(outb, 5, mem)
+    gl = bvec_new(); gl = w_u(gl, 2)
+    gl = bvec_push(gl, W_I32); gl = bvec_push(gl, 1); gl = w_i32_const(gl, 1048576); gl = bvec_push(gl, W_END)
+    gl = bvec_push(gl, W_I32); gl = bvec_push(gl, 1); gl = w_i32_const(gl, heap); gl = bvec_push(gl, W_END)
+    outb = w_section(outb, 6, gl)
+    # _start is now at index 6 + n_ffi (shifted by new promote_graph function)
+    ex = bvec_new(); ex = w_u(ex, 2); ex = w_name(ex, fat_str_new("_start")); ex = bvec_push(ex, 0); ex = w_u(ex, 6 + n_ffi); ex = w_name(ex, fat_str_new("memory")); ex = bvec_push(ex, 2); ex = w_u(ex, 0); outb = w_section(outb, 7, ex)
+    local_count = maxr + 1
+    if local_count < args_base + 2 do local_count = args_base + 2 end
+    if local_count < args_base + 16 do local_count = args_base + 16 end
+    # pg_fn_idx = absolute index of w_promote_graph_code = 5 + n_ffi (after 1 imported + n_ffi + 4 builtins)
+    let pg_fn_idx = 5 + n_ffi
+    cs=bvec_new(); cs=w_u(cs,6); cs=w_bytes(cs,w_func_body(w_print_code(),2,W_I32)); cs=w_bytes(cs,w_func_body(w_strcat_code(),6,W_I32)); cs=w_bytes(cs,w_itoa_body(w_itoa_code())); cs=w_bytes(cs,w_func_body(w_bool_code(),0,W_I64)); cs=w_bytes(cs,w_func_body(w_promote_graph_code(pg_fn_idx),8,W_I32)); cs=w_bytes(cs,w_func_body(code,local_count,W_I64)); outb=w_section(outb,10,cs)
+    ds=bvec_new(); ds=w_u(ds,1); ds=bvec_push(ds,0); ds=w_i32_const(ds,1024); ds=bvec_push(ds,W_END); ds=w_u(ds,bvec_len(data)); ds=w_bytes(ds,data); outb=w_section(outb,11,ds)
+    out write_file_bytes(path, bvec_data_ptr(outb), bvec_len(outb), 0o644)
+end.
+
+export wasm_lir_write_module

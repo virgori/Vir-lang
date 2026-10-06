@@ -1,0 +1,221 @@
+##
+ * vir/compiler/lir_codegen_x86.vri — LIR to Machine Code (x86-64)
+ * ================================================================
+ * VIRC-PLN-0004 Phase 10 / VIRC-ISS-0006 / VIRC-ISS-0009: Modularized x86 Codegen.
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+import print_str, print_int from rt_io
+import sys_exit from rt_syscall
+include lir
+include mir
+include ffi_imports
+include codegen
+include target
+include context
+import g_has_custom_entry, g_entry_function_name from compiler.context
+
+include lir_codegen_x86_types
+include lir_codegen_x86_intrinsics
+include lir_codegen_x86_calls
+include lir_codegen_x86_rt_stubs_base
+include lir_codegen_x86_rt_stubs_math
+include lir_codegen_x86_emit_func
+
+func emit_lir_module_x86_64(lir_funcs: i64, target_spec: &TargetSpec):
+    if (target_spec as i64) > 1 do
+        if target_spec_os(target_spec as i64) != TargetOS.Linux do
+            print_str("virc: internal error: x86_64 backend currently only supports Linux SysV ABI\n")
+            sys_exit(1)
+        end
+    end
+    x86_prepare_func_index(lir_funcs)
+    cb = codebuf_new(TargetArch.X86_64)
+    n_funcs = vec_len_rt(lir_funcs)
+    func_offs = vec_new_cap_rt_x86(4096)
+    call_fixups_box = alloc(8)
+    native_write_i64(call_fixups_box, 0, vec_new_cap_rt_x86(65536))
+    str_fixups_box = alloc(8)
+    native_write_i64(str_fixups_box, 0, vec_new_cap_rt_x86(65536))
+
+    var fi = 0
+    when fi < n_funcs loop
+        func_offs = vec_push_rt(func_offs, codebuf_offset(cb) as i64)
+        lf = vec_get_rt(lir_funcs, fi)
+        cb = emit_lir_x86_into(cb, lf, 0 - 1, lir_funcs, call_fixups_box, str_fixups_box)
+        fi = fi + 1
+    end
+
+    var vir_free_off = 0 - 1
+    let vf_name = fat_str_new("vir_free")
+    let vf_idx = lir_find_func_index(lir_funcs, vf_name)
+    if vf_idx >= 0 and vf_idx < n_funcs do
+        vir_free_off = vec_get_rt(func_offs, vf_idx)
+    end
+    var rt_promote_graph_off = 0 - 1
+    let pg_name = fat_str_new("rt_promote_graph")
+    let pg_idx = lir_find_func_index(lir_funcs, pg_name)
+    if pg_idx >= 0 and pg_idx < n_funcs do
+        rt_promote_graph_off = vec_get_rt(func_offs, pg_idx)
+    end
+    rt_offs = vec_new_cap_rt_x86(1024)
+    cb = emit_lir_rt_stubs_x86(cb, rt_offs, vir_free_off, rt_promote_graph_off)
+
+    call_fixups = native_read_i64(call_fixups_box, 0)
+    nf = vec_len_rt(call_fixups)
+    var ci = 0
+    when ci < nf loop
+        fx = vec_get_rt(call_fixups, ci)
+        f_tkind = native_read_i64(fx as i64, 8)
+        f_tid = native_read_i64(fx as i64, 16)
+        f_at = native_read_i64(fx as i64, 0)
+        if f_tkind == 2 do
+            if f_tid >= 0 and f_tid < n_funcs do
+                dest_adr = vec_get_rt(func_offs, f_tid)
+                va_dest = 0x401000 + dest_adr
+                cb = codebuf_patch_u32(cb, f_at as int, (va_dest and 0xFFFFFFFF) as int)
+                cb = codebuf_patch_u32(cb, (f_at + 4) as int, ((va_dest shr 32) and 0xFFFFFFFF) as int)
+            end
+        else
+            dest = 0 - 1
+            if f_tkind == 0 do
+                if f_tid >= 0 and f_tid < n_funcs do
+                    dest = vec_get_rt(func_offs, f_tid)
+                end
+            eif f_tkind == 3 do
+                # Extern FFI: no dynamic linker on bare ELF — fall back to UNRESOLVED stub (exit 1)
+                dest = vec_get_rt(rt_offs, LIR_RT_UNRESOLVED)
+            else
+                if f_tid >= 0 and f_tid < LIR_RT_STUB_COUNT do
+                    dest = vec_get_rt(rt_offs, f_tid)
+                end
+            end
+            if dest < 0 do
+                print_str("virc: linker error[FIXUP]: tkind=")
+                print_int(f_tkind)
+                print_str(" tid=")
+                print_int(f_tid)
+                print_str("\n")
+                sys_exit(1)
+            end
+            cb = patch_rel32(cb, (f_at + 1) as int, dest as int)
+        end
+        ci = ci + 1
+    end
+
+    let cur_start_off = codebuf_offset(cb)
+    cb.start_offset = cur_start_off
+    native_write_i64(cb as i64, 24, cur_start_off)
+
+    cb = x86_emit_push(cb, X86_RBP)
+    cb = x86_emit_mov_rr(cb, X86_RBP, X86_RSP)
+    cb = x86_emit_mov_reg_imm64(cb, X86_RDI, 0)
+    cb = x86_emit_mov_reg_imm64(cb, X86_RSI, 268435456)
+    cb = x86_emit_mov_reg_imm32(cb, X86_RDX, X86_PROT_RW)
+    cb = x86_emit_mov_reg_imm32(cb, X86_R10, X86_MAP_ANON or X86_MAP_PRIVATE)
+    cb = x86_emit_mov_reg_imm64(cb, X86_R8, 0 - 1)
+    cb = x86_emit_mov_reg_imm64(cb, X86_R9, 0)
+    cb = x86_emit_mov_reg_imm64(cb, X86_RAX, X86_SYS_MMAP)
+    cb = x86_emit_syscall(cb)
+    cb = x86_emit_mov_rr(cb, X86_R15, X86_RAX)
+    cb = x86_emit_mov_rr(cb, X86_RSI, X86_R15)
+    cb = x86_emit_mov_reg_imm32(cb, SCR as int, 32768)
+    cb = x86_emit_add_rr(cb, X86_RSI, SCR as int)
+    cb = x86_emit_mov_mem_reg(cb, X86_R15, 0, X86_RSI)
+
+    # Linux ELF enters at _start with argc at [initial RSP] and argv starting
+    # at [initial RSP + 8]. RBP is initial RSP - 8 after the prologue above.
+    cb = x86_emit_mov_reg_mem(cb, X86_RAX, X86_RBP, 8)
+    cb = x86_emit_mov_mem_reg(cb, X86_R15, 8, X86_RAX)
+    cb = x86_emit_mov_rr(cb, X86_RAX, X86_RBP)
+    cb = x86_emit_mov_reg_imm32(cb, SCR as int, 16)
+    cb = x86_emit_add_rr(cb, X86_RAX, SCR as int)
+    cb = x86_emit_mov_mem_reg(cb, X86_R15, 16, X86_RAX)
+
+    cb = x86_emit_mov_rr(cb, X86_RAX, X86_R15)
+    cb = x86_emit_mov_reg_imm32(cb, SCR as int, 268435456)
+    cb = x86_emit_add_rr(cb, X86_RAX, SCR as int)
+    cb = x86_emit_mov_mem_reg(cb, X86_R15, 24, X86_RAX)
+    cb = x86_emit_mov_mem_reg(cb, X86_R15, 80, X86_RAX)
+
+    if n_funcs > 0 do
+        init_name = fat_str_new("__vir_global_init")
+        init_idx = x86_find_func_index(lir_funcs, init_name)
+        if init_idx >= 0 do
+            init_at = codebuf_offset(cb)
+            cb = x86_emit_call_rel32(cb, 0)
+            cb = patch_rel32(cb, init_at + 1, vec_get_rt(func_offs, init_idx) as int)
+        end
+        var target_entry = fat_str_new("main")
+        if g_has_custom_entry == 1 and fat_str_len(g_entry_function_name) > 0 do
+            target_entry = g_entry_function_name
+        end
+        main_name = target_entry
+        main_idx = x86_find_func_index(lir_funcs, main_name)
+        if main_idx < 0 and g_has_custom_entry == 0 do
+            fallback_main_name = fat_str_new("__main__")
+            main_idx = x86_find_func_index(lir_funcs, fallback_main_name)
+        end
+        if main_idx < 0 do
+            main_idx = 0
+        end
+        call_at = codebuf_offset(cb)
+        cb = x86_emit_call_rel32(cb, 0)
+        main_off = vec_get_rt(func_offs, main_idx)
+        cb = patch_rel32(cb, call_at + 1, main_off as int)
+    end
+
+    # Linux exit(2) receives the entry function result in RDI.
+    if n_funcs > 0 do
+        cb = x86_emit_mov_rr(cb, X86_RDI, X86_RAX)
+    else
+        cb = x86_emit_mov_reg_imm64(cb, X86_RDI, 0)
+    end
+    cb = x86_emit_mov_reg_imm64(cb, X86_RAX, X86_SYS_EXIT)
+    cb = x86_emit_syscall(cb)
+    cb = x86_emit_mov_rr(cb, X86_RSP, X86_RBP)
+    cb = x86_emit_pop(cb, X86_RBP)
+    cb = x86_emit_ret(cb)
+
+    # ── String Literal Pool & Patch mov reg, imm64 sites ──
+    let str_fixups = native_read_i64(str_fixups_box, 0)
+    let n_sfx = vec_len_rt(str_fixups)
+    if n_sfx > 0 do
+        let va_base: i64 = 0x401000
+        pool_offsets = vec_new_cap_rt_x86(n_sfx)
+        var sfi = 0
+        when sfi < n_sfx loop
+            sfx = vec_get_rt(str_fixups, sfi)
+            s_val = native_read_i64(sfx as i64, 8) as string
+            s_data = native_read_i64(s_val as i64, 0)
+            s_len = native_read_i64(s_val as i64, 8)
+            found_off = codebuf_offset(cb) as i64
+            var bi = 0
+            when bi < s_len loop
+                b_ch = native_read_u8(s_data, bi)
+                cb = codebuf_emit_byte(cb, b_ch)
+                bi = bi + 1
+            end
+            cb = codebuf_emit_byte(cb, 0)
+            pool_offsets = vec_push_rt(pool_offsets, found_off)
+            sfi = sfi + 1
+        end
+
+        sfi = 0
+        when sfi < n_sfx loop
+            sfx = vec_get_rt(str_fixups, sfi)
+            imm_at = native_read_i64(sfx as i64, 0)
+            s_target = vec_get_rt(pool_offsets, sfi)
+            va_target = va_base + s_target
+            cb = codebuf_patch_u32(cb, imm_at as int, (va_target and 0xFFFFFFFF) as int)
+            cb = codebuf_patch_u32(cb, (imm_at + 4) as int, ((va_target shr 32) and 0xFFFFFFFF) as int)
+            sfi = sfi + 1
+        end
+    end
+
+    out cb
+end.
+
+export emit_lir_module_x86_64

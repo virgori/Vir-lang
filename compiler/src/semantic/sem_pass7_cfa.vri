@@ -1,0 +1,173 @@
+##
+ * vir/compiler/sem_pass7_cfa.vri
+ * ==============================================================
+ * Pass 7: Control Flow Analysis Orchestrator.
+ * Checks for break/skip outside loops, unreachable code,
+ * missing return statements, out-parameter initialization, and
+ * error flow / saga constraints.
+ ##
+
+include rt_vec_rt
+include rt_string_rt
+include parser
+include symbol_table
+include scope_tree
+include context
+include cfa_context
+include cfa_error_flow
+include cfa_out_params
+include cfa_returns
+
+func pass7_analyze_cfa(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode):
+    g_pass7_func_asts = vec_new_rt()
+    if node.node_type == AstType.Program do
+        var fi = 0
+        when fi < vec_len_rt(node.children) loop
+            fn = vec_get_rt(node.children, fi) as AstNode
+            if fn.node_type == AstType.FuncDef do
+                g_pass7_func_asts = vec_push_rt(g_pass7_func_asts, fn as i64)
+            end
+            fi = fi + 1
+        end
+    end
+    g_pass7_error_in_func = 0
+    g_pass7_error_clause = 0
+    g_pass7_error_try_depth = 0
+    g_pass7_error_locals = vec_new_rt()
+    g_pass7_error_atomics = vec_new_rt()
+    pass7_validate_error_flow(diag, node)
+    # Start with loop_depth=0, in_func=0
+    pass7_walk(symbols, scopes, diag, node, 0, 0)
+end.
+
+func pass7_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode, loop_depth: int, in_func: int):
+
+    if node.node_type == AstType.FuncDef do
+        # Check if function has a return type annotation (name2)
+        has_return_type = fat_str_len(node.name2) > 0
+
+        scope_push(scopes, ScopeKind.Func)
+        child_count = vec_len_rt(node.children)
+        body_idx = child_count - 1
+        if body_idx < 0 do
+            body_idx = 0
+        end
+        var bi = 0
+        when bi < child_count loop
+            ch = vec_get_rt(node.children, bi)
+            if ch.node_type == AstType.Block do
+                body_idx = bi
+                bi = child_count
+            else
+                bi = bi + 1
+            end
+        end
+        has_out = 0
+        if child_count > 0 and body_idx < child_count do
+            body = vec_get_rt(node.children, body_idx)
+            has_out = pass7_walk_block_check_return(symbols, scopes, diag, body, 0)
+
+            # Collect out parameters for definite assignment check (§14.4)
+            var out_params = vec_new_rt()
+            var pi = 0
+            when pi < body_idx loop
+                p_ch = vec_get_rt(node.children, pi)
+                if p_ch.node_type == AstType.OutParam or (p_ch.node_type == AstType.ParamDef and p_ch.int_val == 2) do
+                    out_params = vec_push_rt(out_params, p_ch.name)
+                end
+                pi = pi + 1
+            end
+
+            if vec_len_rt(out_params) > 0 and body != 0 do
+                assigned_outs = pass7_check_stmt_outs(diag, body, out_params, vec_new_rt())
+                if pass7_state_falls_through(assigned_outs) do
+                    pass7_require_outs_assigned(diag, node.line, out_params, assigned_outs)
+                end
+            end
+        end
+        var j = body_idx + 1
+        when j < child_count loop
+            child = vec_get_rt(node.children, j)
+            pass7_walk(symbols, scopes, diag, child, 0, 1)
+            j = j + 1
+        end
+
+        if has_return_type and not has_out do
+            report_warning(diag, 4001, node.line, 0)
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    if node.node_type == AstType.BreakStmt do
+        if loop_depth == 0 do
+            report_error(diag, 4004, node.line, 0)
+        end
+        out 0
+    end
+
+    if node.node_type == AstType.ContinueStmt do
+        if loop_depth == 0 do
+            report_error(diag, 4004, node.line, 0)
+        end
+        out 0
+    end
+
+    if node.node_type == AstType.ThrowStmt do
+        # Check if throw is inside an ensure block — Error 4005
+        # (Not tracked yet, will be added when ensure handling is more complete)
+        out 0
+    end
+
+    if node.node_type == AstType.LoopStmt or node.node_type == AstType.WhileStmt or node.node_type == AstType.ForRange do
+        # Increase loop depth for children
+        scope_push(scopes, ScopeKind.Loop)
+        child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            child = vec_get_rt(node.children, i)
+            pass7_walk(symbols, scopes, diag, child, loop_depth + 1, in_func)
+            i = i + 1
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    if node.node_type == AstType.Block do
+        # Check for unreachable code
+        scope_push(scopes, ScopeKind.Block)
+        child_count = vec_len_rt(node.children)
+        var found_terminator = 0
+        var i = 0
+        when i < child_count loop
+            child = vec_get_rt(node.children, i)
+            if found_terminator == 1 do
+                # Code after terminator is unreachable
+                report_warning(diag, 4002, child.line, 0)
+                # Don't walk unreachable code
+                i = child_count
+            else
+                pass7_walk(symbols, scopes, diag, child, loop_depth, in_func)
+                # Check if this child is a terminator
+                if child.node_type == AstType.ReturnStmt or child.node_type == AstType.ThrowStmt or child.node_type == AstType.BreakStmt do
+                    found_terminator = 1
+                end
+            end
+            i = i + 1
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    # Default recurse
+    child_count = vec_len_rt(node.children)
+    var i = 0
+    when i < child_count loop
+        child = vec_get_rt(node.children, i)
+        pass7_walk(symbols, scopes, diag, child, loop_depth, in_func)
+        i = i + 1
+    end
+    out 0
+end.
+
+export pass7_analyze_cfa

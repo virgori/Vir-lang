@@ -1,0 +1,342 @@
+# ═════════════════════════════════════════════════════════════════════
+# Module: protocol/proxy_protocol.vri
+# High-Performance PROXY Protocol (v1 Text & v2 Binary) Decoder
+# Compliant with HAProxy PROXY protocol specification.
+# ═════════════════════════════════════════════════════════════════════
+
+const PROXY_STATUS_OK: 0
+const PROXY_STATUS_NEED_MORE_DATA: 1
+const PROXY_STATUS_NOT_PROXY: 2
+const PROXY_STATUS_ERROR: 0 - 1
+
+const PROXY_FAMILY_UNKNOWN: 0
+const PROXY_FAMILY_IPV4: 1
+const PROXY_FAMILY_IPV6: 2
+const PROXY_FAMILY_UNIX: 3
+
+const PROXY_PROTO_STREAM: 1
+const PROXY_PROTO_DGRAM: 2
+
+# Helper: compute string length
+func proxy_str_len(s: ptr) -> int:
+    if s == 0 do out 0 end
+    var i = 0
+    when read_byte(s, i) != 0 loop
+        i = i + 1
+    end
+    out i
+end.
+
+# Format 1-byte integer (0..255) into buffer
+func proxy_format_u8(val: int, buf: ptr, idx: int) -> int:
+    var v = val
+    if v >= 100 do
+        let d100 = v / 100
+        write_byte(buf, idx, 48 + d100)
+        idx = idx + 1
+        v = v - (d100 * 100)
+        let d10 = v / 10
+        write_byte(buf, idx, 48 + d10)
+        idx = idx + 1
+        let d1 = v - (d10 * 10)
+        write_byte(buf, idx, 48 + d1)
+        idx = idx + 1
+    else
+        if v >= 10 do
+            let d10 = v / 10
+            write_byte(buf, idx, 48 + d10)
+            idx = idx + 1
+            let d1 = v - (d10 * 10)
+            write_byte(buf, idx, 48 + d1)
+            idx = idx + 1
+        else
+            write_byte(buf, idx, 48 + v)
+            idx = idx + 1
+        end
+    end
+    out idx
+end.
+
+# Format IPv4 4 bytes into dotted decimal string buffer
+func proxy_format_ipv4(b0: int, b1: int, b2: int, b3: int, out_buf: ptr) -> int:
+    var idx = 0
+    idx = proxy_format_u8(b0, out_buf, idx)
+    write_byte(out_buf, idx, 46) # '.'
+    idx = idx + 1
+    idx = proxy_format_u8(b1, out_buf, idx)
+    write_byte(out_buf, idx, 46) # '.'
+    idx = idx + 1
+    idx = proxy_format_u8(b2, out_buf, idx)
+    write_byte(out_buf, idx, 46) # '.'
+    idx = idx + 1
+    idx = proxy_format_u8(b3, out_buf, idx)
+    write_byte(out_buf, idx, 0)
+    out idx
+end.
+
+# Entity storing decoded PROXY header info
+# Offsets:
+#   0: family (int)
+#   8: proto (int)
+#  16: src_port (int)
+#  24: dst_port (int)
+#  32: consumed_bytes (int)
+#  40: src_ip_str (ptr)
+#  48: dst_ip_str (ptr)
+func proxy_info_create:
+    let p = alloc(56)
+    write_word(p, 0, PROXY_FAMILY_UNKNOWN)
+    write_word(p, 8, PROXY_PROTO_STREAM)
+    write_word(p, 16, 0)
+    write_word(p, 24, 0)
+    write_word(p, 32, 0)
+    write_word(p, 40, alloc(64))
+    write_word(p, 48, alloc(64))
+    out p
+end.
+
+# Check if buffer starts with PROXY v1 "PROXY "
+func proxy_is_v1(buf: ptr, buf_len: int) -> int:
+    if buf_len < 6 do out 0 end
+    if read_byte(buf, 0) != 80 do out 0 end # 'P'
+    if read_byte(buf, 1) != 82 do out 0 end # 'R'
+    if read_byte(buf, 2) != 79 do out 0 end # 'O'
+    if read_byte(buf, 3) != 88 do out 0 end # 'X'
+    if read_byte(buf, 4) != 89 do out 0 end # 'Y'
+    if read_byte(buf, 5) != 32 do out 0 end # ' '
+    out 1
+end.
+
+# Check if buffer starts with 12-byte PROXY v2 binary header:
+# \x0D \x0A \x0D \x0A \x00 \x0D \x0A \x51 \x55 \x49 \x54 \x0A
+func proxy_is_v2(buf: ptr, buf_len: int) -> int:
+    if buf_len < 12 do out 0 end
+    if read_byte(buf, 0) != 13 do out 0 end
+    if read_byte(buf, 1) != 10 do out 0 end
+    if read_byte(buf, 2) != 13 do out 0 end
+    if read_byte(buf, 3) != 10 do out 0 end
+    if read_byte(buf, 4) != 0 do out 0 end
+    if read_byte(buf, 5) != 13 do out 0 end
+    if read_byte(buf, 6) != 10 do out 0 end
+    if read_byte(buf, 7) != 81 do out 0 end # 'Q'
+    if read_byte(buf, 8) != 85 do out 0 end # 'U'
+    if read_byte(buf, 9) != 73 do out 0 end # 'I'
+    if read_byte(buf, 10) != 84 do out 0 end # 'T'
+    if read_byte(buf, 11) != 10 do out 0 end
+    out 1
+end.
+
+# Parse PROXY v1 Human-readable text header
+func proxy_parse_v1(buf: ptr, offset: int, buf_len: int, info: ptr) -> int:
+    # Max PROXY v1 line length is 107 chars + CRLF = 108 bytes
+    let avail = buf_len - offset
+    if avail < 6 do out PROXY_STATUS_NEED_MORE_DATA end
+
+    # Find CRLF
+    var crlf_pos = 0 - 1
+    var i = 0
+    let max_scan = 108
+    var scan_limit = avail
+    if scan_limit > max_scan do scan_limit = max_scan end
+
+    when i < (scan_limit - 1) loop
+        if (read_byte(buf, offset + i) == 13) & (read_byte(buf, offset + i + 1) == 10) do
+            crlf_pos = i
+            i = scan_limit # break
+        else
+            i = i + 1
+        end
+    end
+
+    if crlf_pos < 0 do
+        if avail >= 108 do
+            out PROXY_STATUS_ERROR
+        end
+        out PROXY_STATUS_NEED_MORE_DATA
+    end
+
+    # Check "PROXY UNKNOWN\r\n"
+    if (crlf_pos == 13) & (read_byte(buf, offset + 6) == 85) do
+        write_word(info, 0, PROXY_FAMILY_UNKNOWN)
+        write_word(info, 32, crlf_pos + 2)
+        out PROXY_STATUS_OK
+    end
+
+    # Parse tokens: PROXY <FAMILY> <SRC_IP> <DST_IP> <SRC_PORT> <DST_PORT>
+    var p = 6
+    # Skip spaces
+    when (p < crlf_pos) & (read_byte(buf, offset + p) == 32) loop
+        p = p + 1
+    end
+
+    # Check TCP4 or TCP6
+    var family = PROXY_FAMILY_UNKNOWN
+    if (read_byte(buf, offset + p) == 84) & (read_byte(buf, offset + p + 1) == 67) & (read_byte(buf, offset + p + 2) == 80) do
+        if read_byte(buf, offset + p + 3) == 52 do
+            family = PROXY_FAMILY_IPV4
+            p = p + 4
+        else
+            if read_byte(buf, offset + p + 3) == 54 do
+                family = PROXY_FAMILY_IPV6
+                p = p + 4
+            else
+                out PROXY_STATUS_ERROR
+            end
+        end
+    else
+        out PROXY_STATUS_ERROR
+    end
+    write_word(info, 0, family)
+
+    # Next token: SRC_IP
+    if read_byte(buf, offset + p) != 32 do out PROXY_STATUS_ERROR end
+    p = p + 1
+    let src_ip_start = p
+    when (p < crlf_pos) & (read_byte(buf, offset + p) != 32) loop
+        p = p + 1
+    end
+    let src_ip_len = p - src_ip_start
+    if src_ip_len <= 0 do out PROXY_STATUS_ERROR end
+
+    # Copy SRC_IP to info.src_ip_str
+    let src_ip_dst = read_word(info, 40)
+    var c = 0
+    when c < src_ip_len loop
+        write_byte(src_ip_dst, c, read_byte(buf, offset + src_ip_start + c))
+        c = c + 1
+    end
+    write_byte(src_ip_dst, c, 0)
+
+    # Next token: DST_IP
+    if read_byte(buf, offset + p) != 32 do out PROXY_STATUS_ERROR end
+    p = p + 1
+    let dst_ip_start = p
+    when (p < crlf_pos) & (read_byte(buf, offset + p) != 32) loop
+        p = p + 1
+    end
+    let dst_ip_len = p - dst_ip_start
+    if dst_ip_len <= 0 do out PROXY_STATUS_ERROR end
+
+    let dst_ip_dst = read_word(info, 48)
+    c = 0
+    when c < dst_ip_len loop
+        write_byte(dst_ip_dst, c, read_byte(buf, offset + dst_ip_start + c))
+        c = c + 1
+    end
+    write_byte(dst_ip_dst, c, 0)
+
+    # Next token: SRC_PORT
+    if read_byte(buf, offset + p) != 32 do out PROXY_STATUS_ERROR end
+    p = p + 1
+    var src_port = 0
+    when (p < crlf_pos) & (read_byte(buf, offset + p) >= 48) & (read_byte(buf, offset + p) <= 57) loop
+        src_port = src_port * 10 + (read_byte(buf, offset + p) - 48)
+        p = p + 1
+    end
+    write_word(info, 16, src_port)
+
+    # Next token: DST_PORT
+    if read_byte(buf, offset + p) != 32 do out PROXY_STATUS_ERROR end
+    p = p + 1
+    var dst_port = 0
+    when (p < crlf_pos) & (read_byte(buf, offset + p) >= 48) & (read_byte(buf, offset + p) <= 57) loop
+        dst_port = dst_port * 10 + (read_byte(buf, offset + p) - 48)
+        p = p + 1
+    end
+    write_word(info, 24, dst_port)
+
+    write_word(info, 32, crlf_pos + 2)
+    out PROXY_STATUS_OK
+end.
+
+# Parse PROXY v2 Binary header
+func proxy_parse_v2(buf: ptr, offset: int, buf_len: int, info: ptr) -> int:
+    let avail = buf_len - offset
+    if avail < 16 do out PROXY_STATUS_NEED_MORE_DATA end
+
+    # 12-byte magic check
+    var m = 0
+    let magic_ok = proxy_is_v2(buf + offset, avail)
+    if magic_ok == 0 do out PROXY_STATUS_ERROR end
+
+    let ver_cmd = read_byte(buf, offset + 12)
+    let ver = ver_cmd shr 4
+    if ver != 2 do out PROXY_STATUS_ERROR end # must be v2
+
+    let cmd = ver_cmd & 15 # 0x0 = LOCAL, 0x1 = PROXY
+    let fam_trans = read_byte(buf, offset + 13)
+    let fam = fam_trans shr 4
+    let trans = fam_trans & 15
+
+    let len_hi = read_byte(buf, offset + 14)
+    let len_lo = read_byte(buf, offset + 15)
+    let payload_len = (len_hi shl 8) | len_lo
+
+    let total_hdr_len = 16 + payload_len
+    if avail < total_hdr_len do out PROXY_STATUS_NEED_MORE_DATA end
+
+    write_word(info, 32, total_hdr_len)
+    write_word(info, 8, PROXY_PROTO_STREAM)
+
+    # IPv4 + STREAM (fam == 1, trans == 1) -> 12 bytes address data
+    if (fam == 1) & (trans == 1) do
+        write_word(info, 0, PROXY_FAMILY_IPV4)
+        let b0 = read_byte(buf, offset + 16)
+        let b1 = read_byte(buf, offset + 17)
+        let b2 = read_byte(buf, offset + 18)
+        let b3 = read_byte(buf, offset + 19)
+        proxy_format_ipv4(b0, b1, b2, b3, read_word(info, 40))
+
+        let d0 = read_byte(buf, offset + 20)
+        let d1 = read_byte(buf, offset + 21)
+        let d2 = read_byte(buf, offset + 22)
+        let d3 = read_byte(buf, offset + 23)
+        proxy_format_ipv4(d0, d1, d2, d3, read_word(info, 48))
+
+        let sp_hi = read_byte(buf, offset + 24)
+        let sp_lo = read_byte(buf, offset + 25)
+        let dp_hi = read_byte(buf, offset + 26)
+        let dp_lo = read_byte(buf, offset + 27)
+        write_word(info, 16, (sp_hi shl 8) | sp_lo)
+        write_word(info, 24, (dp_hi shl 8) | dp_lo)
+        out PROXY_STATUS_OK
+    end
+
+    # LOCAL command or AF_UNSPEC
+    if (cmd == 0) | (fam == 0) do
+        write_word(info, 0, PROXY_FAMILY_UNKNOWN)
+        out PROXY_STATUS_OK
+    end
+
+    # Other families supported as generic ok
+    write_word(info, 0, fam)
+    out PROXY_STATUS_OK
+end.
+
+# Universal PROXY Protocol frame entrypoint:
+# Returns:
+#   PROXY_STATUS_OK: Successfully parsed PROXY v1 or v2 header. info populated.
+#   PROXY_STATUS_NOT_PROXY: No proxy header detected, buffer is direct payload.
+#   PROXY_STATUS_NEED_MORE_DATA: Proxy header identified, but incomplete in buffer.
+#   PROXY_STATUS_ERROR: Corrupted or invalid proxy header.
+func proxy_parse_frame(buf: ptr, offset: int, buf_len: int, info: ptr) -> int:
+    let avail = buf_len - offset
+    if avail <= 0 do out PROXY_STATUS_NEED_MORE_DATA end
+
+    # Check PROXY v1
+    if proxy_is_v1(buf + offset, avail) != 0 do
+        out proxy_parse_v1(buf, offset, buf_len, info)
+    end
+
+    # Check PROXY v2
+    if avail >= 4 do
+        # Quick check for \x0D\x0A\x0D\x0A prefix
+        if (read_byte(buf, offset) == 13) & (read_byte(buf, offset + 1) == 10) & (read_byte(buf, offset + 2) == 13) & (read_byte(buf, offset + 3) == 10) do
+            out proxy_parse_v2(buf, offset, buf_len, info)
+        end
+    end
+
+    # Not proxy protocol header
+    write_word(info, 32, 0)
+    out PROXY_STATUS_NOT_PROXY
+end.

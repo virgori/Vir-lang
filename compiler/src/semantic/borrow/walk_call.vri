@@ -1,0 +1,161 @@
+##
+ * compiler/src/semantic/borrow/walk_call.vri — Function & Method Call Borrow Walker
+ * ===============================================================================
+ * VIRC-PLN-0004 Section 5.6 & Phase 8: Borrow Analysis Decomposition.
+ *
+ * Checks argument ownership transfers, by-value moves, method receiver alias
+ * exclusivity with mutable arguments, out-parameter initialization, and arena reset safety.
+ ##
+
+include borrow_context
+include borrow_funcs
+include borrow_paths
+include borrow_loans
+include borrow_moves
+include borrow_scopes
+include borrow_diagnostics
+include ide_facts
+
+func pass8_walk_call(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine,
+                     node: &AstNode, moved_vars: int, shared_borrows: int, mut_borrows: int,
+                     bound_borrows: int, arena_locals: int, pre_arena_names: int, in_arena: int,
+                     var_types: int, func_locals: int, uninit_vars: int) -> int:
+    let call_name = pass8_ast_name(node)
+    if pass8_cstr_eq(call_name, "arena_reset") == 1 or pass8_cstr_eq(call_name, "arena_free") == 1 do
+        if pass8_box_len(shared_borrows) > 0 or pass8_box_len(mut_borrows) > 0 or pass8_box_len(bound_borrows) > 0 do
+            var borrow_line = pass8_first_borrow_line(shared_borrows)
+            if borrow_line == 0 do borrow_line = pass8_first_borrow_line(mut_borrows) end
+            pass8_report_error_related(diag, 5010, pass8_ast_line(node), 0, call_name,
+                                       borrow_line, 0, "Live borrow started here")
+        end
+    end
+    let callee_fn = pass8_find_func(call_name)
+    let child_count = vec_len_rt(pass8_ast_children(node))
+    var i = 0
+    when i < child_count loop
+        let arg = vec_get_rt(pass8_ast_children(node), i)
+        let compilerArgPointer = arg as int
+        # Method-call child 0 is the receiver. It is an implicit `this`
+        # borrow, not a by-value argument, so repeated mutating method
+        # calls must not consume the receiver.
+        if pass8_ast_type(node) == AstType.MethodCall and i == 0 do
+            pass8_walk(symbols, scopes, diag, arg, moved_vars, shared_borrows, mut_borrows,
+                       bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+        eif pass8_ast_type(arg) == AstType.AddrOf do
+            if pass8_ast_type(node) == AstType.MethodCall and i > 0 and pass8_cstr_eq(pass8_ast_name(arg), "mut") == 1 do
+                let receiver = vec_get_rt(pass8_ast_children(node), 0)
+                let receiver_path = pass8_owner_path(receiver)
+                let mutable_arg_path = pass8_get_addr_target(arg)
+                if pass8_strlen(receiver_path) > 0 and pass8_strlen(mutable_arg_path) > 0 and pass8_paths_overlap(receiver_path, mutable_arg_path) == 1 do
+                    pass8_report_error_related(diag, 5003, pass8_ast_line(arg), 0, mutable_arg_path,
+                                               pass8_ast_line(receiver), 0, "Mutable method receiver aliases this argument")
+                end
+            end
+            pass8_handle_addr_of(symbols, scopes, diag, arg, moved_vars, shared_borrows, mut_borrows,
+                                 bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+        eif pass8_ast_type(arg) == AstType.Identifier do
+            let arg_name = pass8_ast_name(arg)
+            if g_ideFactsEnabled == 1 do ideFactBinding(compilerArgPointer, pass8_state_path(arg_name) as int) end
+            pass8CaptureIdeLoan(compilerArgPointer, arg_name, bound_borrows, shared_borrows, mut_borrows)
+            var param_idx = i
+            if pass8_ast_type(node) == AstType.MethodCall do
+                param_idx = i - 1
+            end
+            var is_out_param = 0
+            if (callee_fn as i64) != 0 do
+                let p_node = pass8_get_param(callee_fn, param_idx)
+                if (p_node as i64) != 0 do
+                    let p_type = pass8_ast_type(p_node)
+                    let p_mode = pass8_ast_int_val(p_node)
+                    if p_type == AstType.OutParam or p_mode == 2 do
+                        is_out_param = 1
+                    end
+                end
+            end
+            if is_out_param == 1 do
+                pass8_unmark_uninit(uninit_vars, arg_name)
+                pass8_unmark_moved(moved_vars, arg_name)
+                ideFactState(compilerArgPointer, IDE_STATE_OUT)
+            else
+                if pass8_is_uninit(uninit_vars, arg_name) == 1 do
+                    ideFactState(compilerArgPointer, IDE_STATE_INVALID)
+                    let decl_line = pass8_get_var_decl_line(arg_name)
+                    pass8_report_error_related(diag, 5013, pass8_ast_line(arg), 0, arg_name,
+                                               decl_line, 0, "Variable declared here")
+                eif pass8_is_moved(moved_vars, arg_name) == 1 do
+                    ideFactResourceOrigins(compilerArgPointer, pass8_moved_line(moved_vars, arg_name), 0, pass8_state_path(arg_name) as int)
+                    ideFactState(compilerArgPointer, IDE_STATE_MOVED)
+                    pass8_report_error_related(diag, 5001, pass8_ast_line(arg), 0, arg_name,
+                                               pass8_moved_line(moved_vars, arg_name), 0, "Value was moved here")
+                else
+                    ideFactState(compilerArgPointer, IDE_STATE_ALIVE)
+                    if pass8_borrow_count(shared_borrows, arg_name) > 0 or pass8_borrow_count(mut_borrows, arg_name) > 0 do
+                        var borrow_line = pass8_borrow_line(shared_borrows, arg_name)
+                        if borrow_line == 0 do borrow_line = pass8_borrow_line(mut_borrows, arg_name) end
+                        pass8_report_error_related(diag, 5008, pass8_ast_line(arg), 0, arg_name,
+                                                   borrow_line, 0, "Borrow started here")
+                    end
+                    let arg_type = pass8_get_var_type(var_types, arg_name)
+                    if type_is_move(arg_type) do
+                        var should_move = 0
+                        if (callee_fn as i64) != 0 do
+                            let p_node = pass8_get_param(callee_fn, param_idx)
+                            if (p_node as i64) != 0 do
+                                let p_type = pass8_ast_type(p_node)
+                                let p_mode = pass8_ast_int_val(p_node)
+                                if p_type != AstType.RefParam and p_mode != 1 and p_type != AstType.OutParam and p_mode != 2 do
+                                    let p_type_str = pass8_ast_name2(p_node)
+                                    let p_kind = pass8_type_kind_from_type_str(p_type_str)
+                                    if type_is_move(p_kind) do
+                                        should_move = 1
+                                    end
+                                end
+                            end
+                        end
+                        if should_move == 1 do
+                            pass8_mark_moved_at(moved_vars, arg_name, pass8_ast_line(arg))
+                            ideFactResourceOrigins(compilerArgPointer, pass8_ast_line(arg), 0, pass8_state_path(arg_name) as int)
+                            ideFactState(compilerArgPointer, IDE_STATE_MOVED)
+                        end
+                    end
+                end
+            end
+        eif pass8_ast_type(arg) == AstType.FieldAccess or pass8_ast_type(arg) == AstType.IndexAccess or pass8_ast_type(arg) == AstType.ExprIndex do
+            let projected_arg = pass8_owner_path(arg)
+            if pass8_is_moved(moved_vars, projected_arg) == 1 do
+                pass8_report_error_related(diag, 5001, pass8_ast_line(arg), 0, projected_arg,
+                                           pass8_moved_line(moved_vars, projected_arg), 0, "Value was moved here")
+            else
+                if pass8_borrow_count(shared_borrows, projected_arg) > 0 or pass8_borrow_count(mut_borrows, projected_arg) > 0 do
+                    var projected_borrow_line = pass8_borrow_line(shared_borrows, projected_arg)
+                    if projected_borrow_line == 0 do projected_borrow_line = pass8_borrow_line(mut_borrows, projected_arg) end
+                    pass8_report_error_related(diag, 5008, pass8_ast_line(arg), 0, projected_arg,
+                                               projected_borrow_line, 0, "Borrow started here")
+                end
+                var projected_param_idx = i
+                if pass8_ast_type(node) == AstType.MethodCall do projected_param_idx = i - 1 end
+                var projected_should_move = 0
+                if (callee_fn as i64) != 0 do
+                    let projected_param = pass8_get_param(callee_fn, projected_param_idx)
+                    if (projected_param as i64) != 0 do
+                        let projected_mode = pass8_ast_int_val(projected_param)
+                        let projected_param_type = pass8_ast_type(projected_param)
+                        if projected_param_type != AstType.RefParam and projected_mode != 1 and projected_param_type != AstType.OutParam and projected_mode != 2 do
+                            if type_is_move(pass8_type_kind_from_type_str(pass8_ast_name2(projected_param))) do
+                                projected_should_move = 1
+                            end
+                        end
+                    end
+                end
+                if projected_should_move == 1 do
+                    pass8_mark_moved_at(moved_vars, projected_arg, pass8_ast_line(arg))
+                end
+            end
+        else
+            pass8_walk(symbols, scopes, diag, arg, moved_vars, shared_borrows, mut_borrows,
+                       bound_borrows, arena_locals, pre_arena_names, in_arena, var_types, func_locals, uninit_vars)
+        end
+        i = i + 1
+    end
+    out 0
+end.

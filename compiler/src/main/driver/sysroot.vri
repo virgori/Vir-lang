@@ -1,0 +1,1062 @@
+##
+ * compiler/src/main/driver/sysroot.vri — Toolchain Sysroot Discovery & Validation
+ * VIRC-PLN-0028: Canonical sysroot resolution, precedence, and layout profiles.
+ ##
+
+import cliEnvironmentGet, cliExecutablePath, cliCanonicalPath from cli_environment
+import vir_alloc, vir_free from rt_alloc
+import rt_strlen, rt_streq, rt_strdup, native_read_u8, native_write_u8,
+       native_read_i64, native_write_i64,
+       sb_new, sb_append, sb_to_string, sb_free from rt_string_rt
+import print_str, print_ln, read_file_str from rt_io
+import file_exists_cstr, join_path_cstr, virc_path_starts_with, virc_span_is_safe_relative, virc_path_is_safe_relative from main_path_util
+import vircVersionMajor, vircVersionMinor, vircVersionPatch from driver_config
+
+func virc_path_parent(path: int):
+    if path == 0 do out 0 end
+    let plen = rt_strlen(path)
+    var last_slash = -1
+    var i = 0
+    when i < plen loop
+        if native_read_u8(path, i) == 47 do
+            last_slash = i
+        end
+        i = i + 1
+    end
+    if last_slash < 0 do out 0 end
+    if last_slash == 0 do
+        let res = vir_alloc(2)
+        native_write_u8(res, 0, 47)
+        native_write_u8(res, 1, 0)
+        out res
+    end
+    let res = vir_alloc(last_slash + 1)
+    i = 0
+    when i < last_slash loop
+        native_write_u8(res, i, native_read_u8(path, i))
+        i = i + 1
+    end
+    native_write_u8(res, last_slash, 0)
+    out res
+end.
+
+func virc_path_ends_with(path: int, suffix: int):
+    if path == 0 or suffix == 0 do out 0 end
+    let plen = rt_strlen(path)
+    let slen = rt_strlen(suffix)
+    if plen < slen do out 0 end
+    var i = 0
+    when i < slen loop
+        if native_read_u8(path, plen - slen + i) != native_read_u8(suffix, i) do
+            out 0
+        end
+        i = i + 1
+    end
+    out 1
+end.
+
+func virc_file_contains_substring(content: int, clen: int, sub: int, sublen: int):
+    if content == 0 or sub == 0 or sublen <= 0 or clen < sublen do out 0 end
+    var i = 0
+    let max_i = clen - sublen
+    when i <= max_i loop
+        var match = 1
+        var j = 0
+        when j < sublen loop
+            if native_read_u8(content, i + j) != native_read_u8(sub, j) do
+                match = 0
+                break
+            end
+            j = j + 1
+        end
+        if match == 1 do out 1 end
+        i = i + 1
+    end
+    out 0
+end.
+
+func virc_sub_matches(buf: int, start_pos: int, length: int, lit: int) -> int:
+    if buf == 0 or lit == 0 do out 0 end
+    let lit_len = rt_strlen(lit)
+    if length != lit_len do out 0 end
+    var i = 0
+    when i < length loop
+        if native_read_u8(buf, start_pos + i) != native_read_u8(lit, i) do
+            out 0
+        end
+        i = i + 1
+    end
+    out 1
+end.
+
+func virc_is_ident_char(ch: int) -> int:
+    if (ch >= 97 and ch <= 122) or (ch >= 65 and ch <= 90) or (ch >= 48 and ch <= 57) or ch == 95 or ch >= 128 do
+        out 1
+    end
+    out 0
+end.
+
+func virc_is_ident_start_char(ch: int) -> int:
+    if (ch >= 97 and ch <= 122) or (ch >= 65 and ch <= 90) or ch == 95 or ch >= 128 do
+        out 1
+    end
+    out 0
+end.
+
+func virc_is_valid_module_id(buf: int, start_pos: int, length: int) -> int:
+    if buf == 0 or length <= 0 do out 0 end
+    var i = 0
+    var seg_len = 0
+    when i < length loop
+        let ch = native_read_u8(buf, start_pos + i)
+        if ch == 46 do
+            if seg_len == 0 do out 0 end
+            seg_len = 0
+        else
+            if seg_len == 0 do
+                if virc_is_ident_start_char(ch) == 0 do out 0 end
+                seg_len = 1
+            else
+                if virc_is_ident_char(ch) == 0 do out 0 end
+                seg_len = seg_len + 1
+            end
+        end
+        i = i + 1
+    end
+    if seg_len == 0 do out 0 end
+    out 1
+end.
+
+func virc_is_space(ch: int) -> int:
+    if ch == 32 or ch == 9 or ch == 10 or ch == 13 do out 1 end
+    out 0
+end.
+
+func virc_has_type_declaration(code: int, code_len: int, type_name: int, name_len: int) -> int:
+    if code == 0 or type_name == 0 or name_len <= 0 or code_len < 4 + 1 + name_len do
+        out 0
+    end
+    var p = 0
+    let max_p = code_len - (4 + 1 + name_len)
+    when p <= max_p loop
+        var prev_ok = 0
+        if p == 0 do
+            prev_ok = 1
+        else
+            let prev_c = native_read_u8(code, p - 1)
+            if virc_is_ident_char(prev_c) == 0 and prev_c != 46 do
+                prev_ok = 1
+            end
+        end
+        if prev_ok == 1 and virc_sub_matches(code, p, 4, "type" as int) == 1 do
+            let next_c = native_read_u8(code, p + 4)
+            if virc_is_space(next_c) == 1 do
+                var q = p + 5
+                when q < code_len loop
+                    if virc_is_space(native_read_u8(code, q)) == 0 do break end
+                    q = q + 1
+                end
+                if q + name_len <= code_len and virc_sub_matches(code, q, name_len, type_name) == 1 do
+                    var end_ok = 0
+                    if q + name_len == code_len do
+                        end_ok = 1
+                    else
+                        let post_c = native_read_u8(code, q + name_len)
+                        if virc_is_ident_char(post_c) == 0 and post_c != 46 do
+                            if virc_is_space(post_c) == 1 or post_c == 59 or post_c == 58 or post_c == 61 or post_c == 60 do
+                                end_ok = 1
+                            end
+                        end
+                    end
+                    if end_ok == 1 do out 1 end
+                end
+            end
+        end
+        p = p + 1
+    end
+    out 0
+end.
+
+func virc_has_module_declaration(code: int, code_len: int, mod_path: int, path_len: int) -> int:
+    if code == 0 or mod_path == 0 or path_len <= 0 or code_len < 6 + 1 + path_len do
+        out 0
+    end
+    var p = 0
+    let max_p = code_len - (6 + 1 + path_len)
+    when p <= max_p loop
+        var prev_ok = 0
+        if p == 0 do
+            prev_ok = 1
+        else
+            let prev_c = native_read_u8(code, p - 1)
+            if virc_is_ident_char(prev_c) == 0 and prev_c != 46 do
+                prev_ok = 1
+            end
+        end
+        if prev_ok == 1 and virc_sub_matches(code, p, 6, "module" as int) == 1 do
+            let next_c = native_read_u8(code, p + 6)
+            if virc_is_space(next_c) == 1 do
+                var q = p + 7
+                when q < code_len loop
+                    if virc_is_space(native_read_u8(code, q)) == 0 do break end
+                    q = q + 1
+                end
+                if q + path_len <= code_len and virc_sub_matches(code, q, path_len, mod_path) == 1 do
+                    var end_ok = 0
+                    if q + path_len == code_len do
+                        end_ok = 1
+                    else
+                        let post_c = native_read_u8(code, q + path_len)
+                        if virc_is_ident_char(post_c) == 0 and post_c != 46 do
+                            if virc_is_space(post_c) == 1 or post_c == 59 or post_c == 58 do
+                                end_ok = 1
+                            end
+                        end
+                    end
+                    if end_ok == 1 do out 1 end
+                end
+            end
+        end
+        p = p + 1
+    end
+    out 0
+end.
+
+func virc_has_func_declaration(code: int, code_len: int, func_name: int, func_len: int) -> int:
+    if code == 0 or func_name == 0 or func_len <= 0 or code_len < 4 + 1 + func_len do
+        out 0
+    end
+    var p = 0
+    let max_p = code_len - (4 + 1 + func_len)
+    when p <= max_p loop
+        var prev_ok = 0
+        if p == 0 do
+            prev_ok = 1
+        else
+            let prev_c = native_read_u8(code, p - 1)
+            if virc_is_ident_char(prev_c) == 0 and prev_c != 46 do
+                prev_ok = 1
+            end
+        end
+        if prev_ok == 1 and virc_sub_matches(code, p, 4, "func" as int) == 1 do
+            let next_c = native_read_u8(code, p + 4)
+            if virc_is_space(next_c) == 1 do
+                var q = p + 5
+                when q < code_len loop
+                    if virc_is_space(native_read_u8(code, q)) == 0 do break end
+                    q = q + 1
+                end
+                if q + func_len <= code_len and virc_sub_matches(code, q, func_len, func_name) == 1 do
+                    var end_ok = 0
+                    if q + func_len == code_len do
+                        end_ok = 1
+                    else
+                        let post_c = native_read_u8(code, q + func_len)
+                        if virc_is_ident_char(post_c) == 0 and post_c != 46 do
+                            if virc_is_space(post_c) == 1 or post_c == 40 or post_c == 58 or post_c == 60 do
+                                end_ok = 1
+                            end
+                        end
+                    end
+                    if end_ok == 1 do out 1 end
+                end
+            end
+        end
+        p = p + 1
+    end
+    out 0
+end.
+
+func virc_strip_comments(src: int, src_len: int, out_len: int) -> int:
+    if src == 0 do
+        if out_len != 0 do native_write_i64(out_len, 0, 0) end
+        out 0
+    end
+    var
+        dst = vir_alloc(src_len + 1)
+        d_idx = 0
+        i = 0
+        in_block = 0
+        block_type = 0
+        in_line = 0
+        in_str = 0
+        c = 0
+        c1 = 0
+        c2 = 0
+
+    when i < src_len loop
+        c = native_read_u8(src, i)
+        if in_block == 1 do
+            if block_type == 1 do
+                if c == 35 and i + 2 < src_len do
+                    c1 = native_read_u8(src, i + 1)
+                    c2 = native_read_u8(src, i + 2)
+                    if c1 == 42 and c2 == 35 do
+                        in_block = 0
+                        block_type = 0
+                        i = i + 3
+                        native_write_u8(dst, d_idx, 32)
+                        d_idx = d_idx + 1
+                    else
+                        if c == 10 do
+                            native_write_u8(dst, d_idx, 10)
+                            d_idx = d_idx + 1
+                        end
+                        i = i + 1
+                    end
+                else
+                    if c == 10 do
+                        native_write_u8(dst, d_idx, 10)
+                        d_idx = d_idx + 1
+                    end
+                    i = i + 1
+                end
+            else
+                if c == 35 and i + 1 < src_len do
+                    c1 = native_read_u8(src, i + 1)
+                    if c1 == 35 do
+                        in_block = 0
+                        block_type = 0
+                        i = i + 2
+                        native_write_u8(dst, d_idx, 32)
+                        d_idx = d_idx + 1
+                    else
+                        if c == 10 do
+                            native_write_u8(dst, d_idx, 10)
+                            d_idx = d_idx + 1
+                        end
+                        i = i + 1
+                    end
+                else
+                    if c == 10 do
+                        native_write_u8(dst, d_idx, 10)
+                        d_idx = d_idx + 1
+                    end
+                    i = i + 1
+                end
+            end
+        eif in_line == 1 do
+            if c == 10 do
+                in_line = 0
+                native_write_u8(dst, d_idx, 10)
+                d_idx = d_idx + 1
+            end
+            i = i + 1
+        eif in_str == 1 do
+            if c == 92 and i + 1 < src_len do
+                i = i + 2
+            eif c == 34 do
+                in_str = 0
+                native_write_u8(dst, d_idx, 32)
+                d_idx = d_idx + 1
+                i = i + 1
+            else
+                i = i + 1
+            end
+        else
+            if c == 35 do
+                if i + 2 < src_len do
+                    c1 = native_read_u8(src, i + 1)
+                    c2 = native_read_u8(src, i + 2)
+                    if c1 == 42 and c2 == 35 do
+                        in_block = 1
+                        block_type = 1
+                        i = i + 3
+                    eif c1 == 35 do
+                        in_block = 1
+                        block_type = 2
+                        i = i + 2
+                    else
+                        in_line = 1
+                        i = i + 1
+                    end
+                eif i + 1 < src_len do
+                    c1 = native_read_u8(src, i + 1)
+                    if c1 == 35 do
+                        in_block = 1
+                        block_type = 2
+                        i = i + 2
+                    else
+                        in_line = 1
+                        i = i + 1
+                    end
+                else
+                    in_line = 1
+                    i = i + 1
+                end
+            eif c == 34 do
+                in_str = 1
+                native_write_u8(dst, d_idx, 32)
+                d_idx = d_idx + 1
+                i = i + 1
+            else
+                native_write_u8(dst, d_idx, c)
+                d_idx = d_idx + 1
+                i = i + 1
+            end
+        end
+    end
+
+    native_write_u8(dst, d_idx, 0)
+    if out_len != 0 do
+        native_write_i64(out_len, 0, d_idx)
+    end
+    out dst
+end.
+
+func virc_parse_semver_triple(content: int, start_pos: int, length: int, out_triple: int):
+    if length <= 0 do out 0 end
+    var
+        p = start_pos
+        end_p = start_pos + length
+        major = 0
+        minor = 0
+        patch_val = 0
+        count = 0
+        first_ch = 0
+        ch = 0
+
+    if p >= end_p do out 0 end
+    first_ch = native_read_u8(content, p)
+    when p < end_p loop
+        ch = native_read_u8(content, p)
+        if ch >= 48 and ch <= 57 do
+            if count >= 10 or major > 1000000000 do out 0 end
+            major = major * 10 + (ch - 48)
+            count = count + 1
+            p = p + 1
+        else
+            break
+        end
+    end
+    if count == 0 or (count > 1 and first_ch == 48) do out 0 end
+    if p >= end_p or native_read_u8(content, p) != 46 do out 0 end
+    p = p + 1
+
+    count = 0
+    if p >= end_p do out 0 end
+    first_ch = native_read_u8(content, p)
+    when p < end_p loop
+        ch = native_read_u8(content, p)
+        if ch >= 48 and ch <= 57 do
+            if count >= 10 or minor > 1000000000 do out 0 end
+            minor = minor * 10 + (ch - 48)
+            count = count + 1
+            p = p + 1
+        else
+            break
+        end
+    end
+    if count == 0 or (count > 1 and first_ch == 48) do out 0 end
+    if p >= end_p or native_read_u8(content, p) != 46 do out 0 end
+    p = p + 1
+
+    count = 0
+    if p >= end_p do out 0 end
+    first_ch = native_read_u8(content, p)
+    when p < end_p loop
+        ch = native_read_u8(content, p)
+        if ch >= 48 and ch <= 57 do
+            if count >= 10 or patch_val > 1000000000 do out 0 end
+            patch_val = patch_val * 10 + (ch - 48)
+            count = count + 1
+            p = p + 1
+        else
+            break
+        end
+    end
+    if count == 0 or (count > 1 and first_ch == 48) do out 0 end
+    if p != end_p do out 0 end
+
+    native_write_i64(out_triple, 0, major)
+    native_write_i64(out_triple, 8, minor)
+    native_write_i64(out_triple, 16, patch_val)
+    out 1
+end.
+
+func virc_free_seen_keys(seen_keys: int, count: int, seen_lens: int):
+    if seen_keys != 0 do
+        var i = 0
+        when i < count loop
+            let ptr = native_read_i64(seen_keys, i * 8)
+            if ptr != 0 do vir_free(ptr) end
+            i = i + 1
+        end
+        vir_free(seen_keys)
+    end
+    if seen_lens != 0 do
+        vir_free(seen_lens)
+    end
+    out 0
+end.
+
+func virc_validate_registry_file(reg_path: int, stdlib_dir: int):
+    if reg_path == 0 or stdlib_dir == 0 do out 0 end
+    if file_exists_cstr(reg_path) != 1 do out 0 end
+    let content = read_file_str(reg_path)
+    if content == 0 do out 0 end
+    let clen = rt_strlen(content)
+    var
+        root_dir = 0
+        root_count = 0
+        schema_count = 0
+        abi_count = 0
+        version_count = 0
+        compiler_min_count = 0
+        has_duplicate = 0
+        has_malformed = 0
+        schema_ok = 0
+        abi_ok = 0
+        version_ok = 0
+        compiler_min_ok = 0
+        compat = 0
+        is_contained = 0
+        pos = 0
+        ti = 0
+        seen_count = 0
+        target_ok = 1
+    let
+        ver_triple = vir_alloc(24)
+        comp_triple = vir_alloc(24)
+        max_seen = 4096
+        seen_keys = vir_alloc(max_seen * 8)
+        seen_lens = vir_alloc(max_seen * 8)
+
+    # ── Pass 1: Parse lines, validate line grammar, check key uniqueness & metadata ──
+    when pos < clen loop
+        when pos < clen loop
+            let ch = native_read_u8(content, pos)
+            if ch != 32 and ch != 9 do break end
+            pos = pos + 1
+        end
+        if pos >= clen do break end
+        let start_ch = native_read_u8(content, pos)
+        if start_ch == 10 do
+            pos = pos + 1
+        eif start_ch == 13 do
+            pos = pos + 1
+            if pos < clen and native_read_u8(content, pos) == 10 do
+                pos = pos + 1
+            end
+        eif start_ch == 35 do
+            when pos < clen loop
+                let ch2 = native_read_u8(content, pos)
+                pos = pos + 1
+                if ch2 == 10 do break end
+            end
+        else
+            let key_start = pos
+            when pos < clen loop
+                let c = native_read_u8(content, pos)
+                if c == 61 or c == 32 or c == 9 or c == 10 or c == 13 or c == 35 do break end
+                pos = pos + 1
+            end
+            let key_len = pos - key_start
+            if key_len == 0 do
+                has_malformed = 1
+            end
+
+            when pos < clen loop
+                let c = native_read_u8(content, pos)
+                if c != 32 and c != 9 do break end
+                pos = pos + 1
+            end
+
+            if pos >= clen or native_read_u8(content, pos) != 61 do
+                has_malformed = 1
+            else
+                pos = pos + 1
+                when pos < clen loop
+                    let c = native_read_u8(content, pos)
+                    if c != 32 and c != 9 do break end
+                    pos = pos + 1
+                end
+
+                let val_start = pos
+                when pos < clen loop
+                    let c = native_read_u8(content, pos)
+                    if c == 32 or c == 9 or c == 10 or c == 13 or c == 35 do break end
+                    pos = pos + 1
+                end
+                let val_len = pos - val_start
+                if val_len == 0 do
+                    has_malformed = 1
+                end
+
+                # Check trailing characters on line: only whitespace or comment allowed
+                when pos < clen loop
+                    let c = native_read_u8(content, pos)
+                    if c != 32 and c != 9 do break end
+                    pos = pos + 1
+                end
+                if pos < clen do
+                    let c = native_read_u8(content, pos)
+                    if c != 10 and c != 13 and c != 35 do
+                        has_malformed = 1
+                    end
+                end
+
+                # Key uniqueness check across ALL keys
+                if key_len > 0 do
+                    var k_idx = 0
+                    var dup_found = 0
+                    when k_idx < seen_count loop
+                        let prev_k = native_read_i64(seen_keys, k_idx * 8)
+                        let prev_l = native_read_i64(seen_lens, k_idx * 8)
+                        if prev_l == key_len do
+                            var kmatch = 1
+                            var ki = 0
+                            when ki < key_len loop
+                                if native_read_u8(prev_k, ki) != native_read_u8(content, key_start + ki) do
+                                    kmatch = 0
+                                    break
+                                end
+                                ki = ki + 1
+                            end
+                            if kmatch == 1 do
+                                dup_found = 1
+                                break
+                            end
+                        end
+                        k_idx = k_idx + 1
+                    end
+                    if dup_found == 1 do
+                        has_duplicate = 1
+                    else
+                        if seen_count < max_seen do
+                            let k_copy = vir_alloc(key_len + 1)
+                            var ci = 0
+                            when ci < key_len loop
+                                native_write_u8(k_copy, ci, native_read_u8(content, key_start + ci))
+                                ci = ci + 1
+                            end
+                            native_write_u8(k_copy, key_len, 0)
+                            native_write_i64(seen_keys, seen_count * 8, k_copy)
+                            native_write_i64(seen_lens, seen_count * 8, key_len)
+                            seen_count = seen_count + 1
+                        end
+                    end
+                end
+
+                if key_len > 0 do
+                    if virc_sub_matches(content, key_start, key_len, "root" as int) == 1 do
+                        root_count = root_count + 1
+                        if root_count > 1 do
+                            has_duplicate = 1
+                        eif val_len > 0 do
+                            root_dir = vir_alloc(val_len + 1)
+                            ti = 0
+                            when ti < val_len loop
+                                native_write_u8(root_dir, ti, native_read_u8(content, val_start + ti))
+                                ti = ti + 1
+                            end
+                            native_write_u8(root_dir, val_len, 0)
+                        end
+                    eif virc_sub_matches(content, key_start, key_len, "schema" as int) == 1 do
+                        schema_count = schema_count + 1
+                        if schema_count > 1 do
+                            has_duplicate = 1
+                        eif val_len == 1 and native_read_u8(content, val_start) == 49 do
+                            schema_ok = 1
+                        end
+                    eif virc_sub_matches(content, key_start, key_len, "abi_version" as int) == 1 do
+                        abi_count = abi_count + 1
+                        if abi_count > 1 do
+                            has_duplicate = 1
+                        eif val_len == 1 and native_read_u8(content, val_start) == 50 do
+                            abi_ok = 1
+                        end
+                    eif virc_sub_matches(content, key_start, key_len, "version" as int) == 1 do
+                        version_count = version_count + 1
+                        if version_count > 1 do
+                            has_duplicate = 1
+                        eif val_len > 0 do
+                            if virc_parse_semver_triple(content, val_start, val_len, ver_triple) == 1 do
+                                if native_read_i64(ver_triple, 0) == 2 do
+                                    version_ok = 1
+                                end
+                            end
+                        end
+                    eif virc_sub_matches(content, key_start, key_len, "compiler_min" as int) == 1 do
+                        compiler_min_count = compiler_min_count + 1
+                        if compiler_min_count > 1 do
+                            has_duplicate = 1
+                        eif val_len > 0 do
+                            if virc_parse_semver_triple(content, val_start, val_len, comp_triple) == 1 do
+                                let c_maj = vircVersionMajor()
+                                let c_min = vircVersionMinor()
+                                let c_pat = vircVersionPatch()
+                                let r_maj = native_read_i64(comp_triple, 0)
+                                let r_min = native_read_i64(comp_triple, 8)
+                                let r_pat = native_read_i64(comp_triple, 16)
+                                compat = 1
+                                if c_maj < r_maj do
+                                    compat = 0
+                                eif c_maj == r_maj do
+                                    if c_min < r_min do
+                                        compat = 0
+                                    eif c_min == r_min do
+                                        if c_pat < r_pat do
+                                            compat = 0
+                                        end
+                                    end
+                                end
+                                if compat == 1 do
+                                    compiler_min_ok = 1
+                                end
+                            end
+                        end
+                    else
+                        if virc_is_valid_module_id(content, key_start, key_len) == 0 do
+                            has_malformed = 1
+                        end
+                        if virc_span_is_safe_relative(content, val_start, val_len) == 0 do
+                            has_malformed = 1
+                        end
+                    end
+                end
+            end
+
+            when pos < clen loop
+                let ch2 = native_read_u8(content, pos)
+                pos = pos + 1
+                if ch2 == 10 do break end
+            end
+        end
+    end
+    virc_free_seen_keys(seen_keys, seen_count, seen_lens)
+    vir_free(ver_triple)
+    vir_free(comp_triple)
+
+    if has_malformed == 1 or has_duplicate == 1 do
+        if root_dir != 0 do vir_free(root_dir) end
+        vir_free(content)
+        out 0
+    end
+    if root_dir == 0 do
+        vir_free(content)
+        out 0
+    end
+    if root_count != 1 or schema_count != 1 or abi_count != 1 or version_count != 1 or compiler_min_count != 1 do
+        vir_free(root_dir)
+        vir_free(content)
+        out 0
+    end
+    if schema_ok != 1 or abi_ok != 1 or version_ok != 1 or compiler_min_ok != 1 do
+        vir_free(root_dir)
+        vir_free(content)
+        out 0
+    end
+
+    if virc_path_is_safe_relative(root_dir) != 1 do
+        vir_free(root_dir)
+        vir_free(content)
+        out 0
+    end
+
+    let raw_root = join_path_cstr(stdlib_dir, root_dir)
+    vir_free(root_dir)
+    let canon_root = cliCanonicalPath(raw_root)
+    vir_free(raw_root)
+    let canon_stdlib = cliCanonicalPath(stdlib_dir)
+    if canon_root == 0 or canon_stdlib == 0 do
+        if canon_root != 0 do vir_free(canon_root) end
+        if canon_stdlib != 0 do vir_free(canon_stdlib) end
+        vir_free(content)
+        out 0
+    end
+
+    let slen = rt_strlen(canon_stdlib)
+    is_contained = virc_path_starts_with(canon_root, canon_stdlib)
+    if is_contained == 1 do
+        let next_c = native_read_u8(canon_root, slen)
+        if next_c != 0 and next_c != 47 do
+            is_contained = 0
+        end
+    end
+    vir_free(canon_stdlib)
+    if is_contained != 1 do
+        vir_free(canon_root)
+        vir_free(content)
+        out 0
+    end
+
+    # ── Pass 2: Verify every module mapping exists and is canonically contained in canon_root ──
+    pos = 0
+    when pos < clen loop
+        when pos < clen loop
+            let ch = native_read_u8(content, pos)
+            if ch != 32 and ch != 9 do break end
+            pos = pos + 1
+        end
+        if pos >= clen do break end
+        let start_ch = native_read_u8(content, pos)
+        if start_ch == 10 do
+            pos = pos + 1
+        eif start_ch == 13 do
+            pos = pos + 1
+            if pos < clen and native_read_u8(content, pos) == 10 do pos = pos + 1 end
+        eif start_ch == 35 do
+            when pos < clen loop
+                let ch2 = native_read_u8(content, pos)
+                pos = pos + 1
+                if ch2 == 10 do break end
+            end
+        else
+            let key_start = pos
+            when pos < clen loop
+                let c = native_read_u8(content, pos)
+                if c == 61 or c == 32 or c == 9 or c == 10 or c == 13 or c == 35 do break end
+                pos = pos + 1
+            end
+            let key_len = pos - key_start
+            when pos < clen loop
+                let c = native_read_u8(content, pos)
+                if c != 32 and c != 9 do break end
+                pos = pos + 1
+            end
+            pos = pos + 1
+            when pos < clen loop
+                let c = native_read_u8(content, pos)
+                if c != 32 and c != 9 do break end
+                pos = pos + 1
+            end
+            let val_start = pos
+            when pos < clen loop
+                let c = native_read_u8(content, pos)
+                if c == 32 or c == 9 or c == 10 or c == 13 or c == 35 do break end
+                pos = pos + 1
+            end
+            let val_len = pos - val_start
+
+            var is_meta = 0
+            if virc_sub_matches(content, key_start, key_len, "root" as int) == 1 or
+               virc_sub_matches(content, key_start, key_len, "schema" as int) == 1 or
+               virc_sub_matches(content, key_start, key_len, "version" as int) == 1 or
+               virc_sub_matches(content, key_start, key_len, "abi_version" as int) == 1 or
+               virc_sub_matches(content, key_start, key_len, "compiler_min" as int) == 1 do
+                is_meta = 1
+            end
+
+            if is_meta == 0 do
+                let val_str = vir_alloc(val_len + 1)
+                var vi = 0
+                when vi < val_len loop
+                    native_write_u8(val_str, vi, native_read_u8(content, val_start + vi))
+                    vi = vi + 1
+                end
+                native_write_u8(val_str, val_len, 0)
+
+                let full_target = join_path_cstr(canon_root, val_str)
+                vir_free(val_str)
+                if file_exists_cstr(full_target) != 1 do
+                    vir_free(full_target)
+                    target_ok = 0
+                    break
+                end
+
+                let canon_target = cliCanonicalPath(full_target)
+                vir_free(full_target)
+                if canon_target == 0 do
+                    target_ok = 0
+                    break
+                end
+
+                let cr_len = rt_strlen(canon_root)
+                var is_target_cont = virc_path_starts_with(canon_target, canon_root)
+                if is_target_cont == 1 do
+                    let nxc = native_read_u8(canon_target, cr_len)
+                    if nxc != 47 do
+                        is_target_cont = 0
+                    end
+                end
+                vir_free(canon_target)
+                if is_target_cont != 1 do
+                    target_ok = 0
+                    break
+                end
+            end
+
+            when pos < clen loop
+                let ch2 = native_read_u8(content, pos)
+                pos = pos + 1
+                if ch2 == 10 do break end
+            end
+        end
+    end
+    vir_free(content)
+
+    if target_ok != 1 do
+        vir_free(canon_root)
+        out 0
+    end
+
+    # ── Pass 3: Prelude verification (types.vri and alloc.vri) ──
+    let types_path = join_path_cstr(canon_root, "core/types.vri" as int)
+    let alloc_path = join_path_cstr(canon_root, "rt/alloc.vri" as int)
+    vir_free(canon_root)
+
+    let types_content = read_file_str(types_path)
+    vir_free(types_path)
+    if types_content == 0 do
+        vir_free(alloc_path)
+        out 0
+    end
+    let tlen = rt_strlen(types_content)
+    let t_code_slot = vir_alloc(8)
+    let types_code = virc_strip_comments(types_content, tlen, t_code_slot)
+    let t_code_len = native_read_i64(t_code_slot, 0)
+    vir_free(t_code_slot)
+    vir_free(types_content)
+    let has_type_i64 = virc_has_type_declaration(types_code, t_code_len, "i64" as int, 3)
+    let has_type_bool = virc_has_type_declaration(types_code, t_code_len, "bool" as int, 4)
+    vir_free(types_code)
+    if t_code_len < 20 or has_type_i64 != 1 or has_type_bool != 1 do
+        vir_free(alloc_path)
+        out 0
+    end
+
+    let alloc_content = read_file_str(alloc_path)
+    vir_free(alloc_path)
+    if alloc_content == 0 do
+        out 0
+    end
+    let alen = rt_strlen(alloc_content)
+    let a_code_slot = vir_alloc(8)
+    let alloc_code = virc_strip_comments(alloc_content, alen, a_code_slot)
+    let a_code_len = native_read_i64(a_code_slot, 0)
+    vir_free(a_code_slot)
+    vir_free(alloc_content)
+    let has_rt_alloc = virc_has_module_declaration(alloc_code, a_code_len, "vir.rt.alloc" as int, 12)
+    let has_vir_alloc = virc_has_func_declaration(alloc_code, a_code_len, "vir_alloc" as int, 9)
+    vir_free(alloc_code)
+    if a_code_len < 20 or has_rt_alloc != 1 or has_vir_alloc != 1 do
+        out 0
+    end
+
+    out 1
+end.
+
+func virc_validate_sysroot(prefix: int):
+    if prefix == 0 do out 0 end
+    let compact_reg = join_path_cstr(prefix, "stdlib/stdlib.vri" as int)
+    let compact_dir = join_path_cstr(prefix, "stdlib" as int)
+    let valid_compact = virc_validate_registry_file(compact_reg, compact_dir)
+    vir_free(compact_reg)
+    vir_free(compact_dir)
+    if valid_compact == 1 do
+        out 1
+    end
+
+    let fhs_reg = join_path_cstr(prefix, "lib/vir/stdlib/stdlib.vri" as int)
+    let fhs_dir = join_path_cstr(prefix, "lib/vir/stdlib" as int)
+    let valid_fhs = virc_validate_registry_file(fhs_reg, fhs_dir)
+    vir_free(fhs_reg)
+    vir_free(fhs_dir)
+    if valid_fhs == 1 do
+        out 2
+    end
+
+    out 0
+end.
+
+func virc_apply_sysroot(prefix: int, profile: int):
+    g_virc_sysroot = prefix
+    if profile == 1 do
+        g_virc_stdlib_dir = join_path_cstr(prefix, "stdlib" as int)
+        g_virc_stdlib_registry = join_path_cstr(prefix, "stdlib/stdlib.vri" as int)
+    eif profile == 2 do
+        g_virc_stdlib_dir = join_path_cstr(prefix, "lib/vir/stdlib" as int)
+        g_virc_stdlib_registry = join_path_cstr(prefix, "lib/vir/stdlib/stdlib.vri" as int)
+    end
+    out 0
+end.
+
+func virc_resolve_sysroot(cli_sysroot: int):
+    if g_virc_sysroot != 0 and cli_sysroot == 0 do
+        out 0
+    end
+
+    # Precedence 1: Explicit CLI option --sysroot <path>
+    if cli_sysroot != 0 do
+        let canon_cli = cliCanonicalPath(cli_sysroot)
+        let profile = virc_validate_sysroot(canon_cli)
+        if profile > 0 do
+            virc_apply_sysroot(canon_cli, profile)
+            out 0
+        end
+        if g_diag_json == 1 do
+            print_str("{\"schema_version\":1,\"success\":false,\"error_kind\":\"sysroot\",\"message\":\"invalid --sysroot: failed to locate stdlib/stdlib.vri\",\"argument\":\"\",\"diagnostics\":[],\"error_count\":1,\"warning_count\":0}")
+        else
+            var sb = sb_new()
+            sb = sb_append(sb, "virc: error [E2120]: invalid --sysroot: failed to locate stdlib/stdlib.vri in '")
+            sb = sb_append(sb, cli_sysroot)
+            sb = sb_append(sb, "'\n")
+            print_str(sb_to_string(sb))
+            sb_free(sb)
+        end
+        vir_free(canon_cli)
+        sys_exit(1)
+        out 1
+    end
+
+    # Precedence 2: Environment variable VIR_SYSROOT
+    let env_sysroot = cliEnvironmentGet("VIR_SYSROOT" as int)
+    if env_sysroot > 0 do
+        if rt_strlen(env_sysroot) > 0 do
+            let canon_env = cliCanonicalPath(env_sysroot)
+            let profile = virc_validate_sysroot(canon_env)
+            if profile > 0 do
+                vir_free(env_sysroot)
+                virc_apply_sysroot(canon_env, profile)
+                out 0
+            end
+            if g_diag_json == 1 do
+                print_str("{\"schema_version\":1,\"success\":false,\"error_kind\":\"sysroot\",\"message\":\"invalid VIR_SYSROOT: failed to locate stdlib/stdlib.vri\",\"argument\":\"\",\"diagnostics\":[],\"error_count\":1,\"warning_count\":0}")
+            else
+                var sb = sb_new()
+                sb = sb_append(sb, "virc: error [E2120]: invalid VIR_SYSROOT: failed to locate stdlib/stdlib.vri in '")
+                sb = sb_append(sb, env_sysroot)
+                sb = sb_append(sb, "'\n")
+                print_str(sb_to_string(sb))
+                sb_free(sb)
+            end
+            vir_free(canon_env)
+            vir_free(env_sysroot)
+            sys_exit(1)
+            out 1
+        end
+        vir_free(env_sysroot)
+    end
+
+    # Precedence 3: Installed sysroot derived from canonical executable location
+    let exe = cliExecutablePath()
+    if exe != 0 do
+        let exe_dir = virc_path_parent(exe)
+        if exe_dir != 0 do
+            if virc_path_ends_with(exe_dir, "/bin" as int) == 1 do
+                let prefix = virc_path_parent(exe_dir)
+                if prefix != 0 do
+                    let profile = virc_validate_sysroot(prefix)
+                    if profile > 0 do
+                        virc_apply_sysroot(prefix, profile)
+                        vir_free(exe_dir)
+                        vir_free(exe)
+                        out 0
+                    end
+                    vir_free(prefix)
+                end
+            end
+            let profile2 = virc_validate_sysroot(exe_dir)
+            if profile2 > 0 do
+                virc_apply_sysroot(exe_dir, profile2)
+                vir_free(exe)
+                out 0
+            end
+            vir_free(exe_dir)
+        end
+        vir_free(exe)
+    end
+
+    out 0
+end.

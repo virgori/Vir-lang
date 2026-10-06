@@ -1,0 +1,637 @@
+# Human UI boundary. Classic bytes remain owned by the existing renderer.
+# Modern plain renderer consumes phase IDs/metrics, never legacy log strings.
+# Durations are measured from a host monotonic clock, never legacy CPU time.
+
+include cli_environment
+include rt_string_rt
+import vir_alloc, vir_free from rt_alloc
+import sys_write, sys_platform, sys_clock_gettime, Platform from rt_syscall
+
+extern func syscall3(number: int, first: int, second: int, third: int) -> int
+
+var g_ui_mode: int = 0
+var g_ui_quiet: int = 0
+var g_ui_failed: int = 0
+var g_ui_phase: int = 0
+var g_ui_phaseRecords: int = 0
+var g_ui_clockBuffer: int = 0
+var g_ui_clockFrequency: int = 0
+var g_ui_startNs: int = 0 - 1
+var g_ui_colorRequested: int = 0
+var g_ui_colorEnabled: int = 0
+var g_ui_liveEnabled: int = 0
+var g_ui_liveVisible: int = 0
+var g_ui_width: int = 0
+var g_ui_lastRefreshNs: int = 0 - 1
+var g_ui_endNs: int = 0 - 1
+var g_ui_exitCode: int = 0
+var g_ui_artifactPath: int = 0
+
+func cliUiSetArtifact(path: int):
+    g_ui_artifactPath = path
+end.
+
+func cliUiConfigure(color: int):
+    g_ui_colorRequested = color
+end.
+
+func cliUiAppendAnsi(builder: StringBuilder, code: i64):
+    if g_ui_colorEnabled != 1 do out builder end
+    var text = sb_append_char(builder, 27)
+    out sb_append(text, code)
+end.
+
+func cliUiAppendReset(builder: StringBuilder):
+    if g_ui_colorEnabled != 1 do out builder end
+    var text = sb_append_char(builder, 27)
+    out sb_append(text, "[0m")
+end.
+
+func cliUiWriteRaw(value: i64):
+    var
+        written = 0
+        length = rt_strlen(value)
+    when written < length loop
+        let count = sys_write(2, value + written, length - written)
+        if count <= 0 do break end
+        written = written + count
+    end
+end.
+
+func cliUiClearLive():
+    if g_ui_liveVisible == 1 do
+        cliUiEraseCurrentLine()
+        g_ui_liveVisible = 0
+    end
+end.
+
+func cliUiEraseCurrentLine():
+    var text = sb_new()
+    text = sb_append_char(text, 13)
+    text = sb_append_char(text, 27)
+    text = sb_append(text, "[2K")
+    cliUiWriteRaw(sb_to_string(text))
+    sb_free(text)
+end.
+
+func cliUiColoredStatus(builder: StringBuilder, status: int):
+    var text = sb_append_char(builder, 27)
+    if status == 1 do
+        text = sb_append(text, "[32m[OK]")
+    else
+        text = sb_append(text, "[31m[FAIL]")
+    end
+    text = sb_append_char(text, 27)
+    out sb_append(text, "[0m")
+end.
+
+func cliUiTerminalReset():
+    g_ui_colorEnabled = 0
+    g_ui_liveEnabled = 0
+    g_ui_liveVisible = 0
+    g_ui_width = 0
+    g_ui_lastRefreshNs = 0 - 1
+    if g_ui_mode != 1 do out end
+    let platform = sys_platform()
+    var
+        ioctlNumber = 0
+        widthRequest = 0x5413
+    if cliIsDarwinPlatform(platform) == 1 do
+        ioctlNumber = 0x2000036
+        widthRequest = 0x40087468
+    eif platform == Platform.Linux_x86_64 do
+        ioctlNumber = 16
+    eif cliIsLinuxPlatform(platform) == 1 do
+        ioctlNumber = 29
+    end
+    var terminal = 0
+    if ioctlNumber != 0 do
+        native_write_i64(g_ui_clockBuffer, 40, 0)
+        if syscall3(ioctlNumber, 2, widthRequest, g_ui_clockBuffer + 40) == 0 do
+            terminal = 1
+            g_ui_width = native_read_u8(g_ui_clockBuffer, 42) +
+                         (native_read_u8(g_ui_clockBuffer, 43) shl 8)
+        end
+    end
+    let
+        term = cliEnvironmentGet("TERM" as int)
+        noColor = cliEnvironmentGet("NO_COLOR" as int)
+        ci = cliEnvironmentGet("CI" as int)
+    var plain = 0
+    if term < 0 do plain = 1 end
+    if ci != 0 do plain = 1 end
+    if term > 0 do
+        if rt_streq(term, "dumb" as int) do plain = 1 end
+    end
+    # Explicit always wins over NO_COLOR/TERM; never and machine UI win first.
+    if g_ui_colorRequested == 1 do
+        g_ui_colorEnabled = 1
+    eif g_ui_colorRequested == 0 do
+        if terminal == 1 do
+            if plain == 0 do
+                if noColor == 0 do g_ui_colorEnabled = 1 end
+            end
+        end
+    end
+    if terminal == 1 do
+        if plain == 0 do
+            if g_ui_quiet == 0 do
+                if g_ui_startNs >= 0 do
+                    if g_ui_width >= 8 do g_ui_liveEnabled = 1 end
+                end
+            end
+        end
+    end
+    if term > 0 do vir_free(term) end
+    if noColor > 0 do vir_free(noColor) end
+    if ci > 0 do vir_free(ci) end
+end.
+
+# Owned session scratch, allocated before semantic arenas. Darwin's BSD
+# gettimeofday takes struct timeval (8-byte tv_sec, 4-byte tv_usec).
+# Unsupported/denied clocks return -1 explicitly.
+func cliClockReset():
+    if g_ui_clockBuffer == 0 do g_ui_clockBuffer = vir_alloc(48) end
+    g_ui_clockFrequency = 1
+end.
+
+func cliTicksToNs(ticks: int, frequency: int):
+    if ticks < 0 do out 0 - 1 end
+    if frequency <= 0 do out 0 - 1 end
+    if frequency > 1000000000 do out 0 - 1 end
+    let seconds = ticks / frequency
+    if seconds > 9223372035 do out 0 - 1 end
+    let fraction = ((ticks mod frequency) * 1000000000) / frequency
+    let whole = seconds * 1000000000
+    if fraction > 9223372036854775807 - whole do out 0 - 1 end
+    out whole + fraction
+end.
+
+func cliClockNowNs():
+    if g_ui_clockBuffer == 0 do out 0 - 1 end
+    let platform = sys_platform()
+    if cliIsDarwinPlatform(platform) == 1 do
+        if syscall3(0x2000074, g_ui_clockBuffer, 0, 0) != 0 do out 0 - 1 end
+        let seconds = native_read_i64(g_ui_clockBuffer, 0)
+        let fraction = native_read_i64(g_ui_clockBuffer, 8) bit_and 0xFFFFFFFF
+        if seconds < 0 do out 0 - 1 end
+        if seconds > 9223372035 do out 0 - 1 end
+        if fraction < 0 do out 0 - 1 end
+        let whole = seconds * 1000000000
+        let fractionNs = fraction * 1000
+        if fractionNs > 9223372036854775807 - whole do out 0 - 1 end
+        out whole + fractionNs
+    end
+    if cliIsLinuxPlatform(platform) == 1 do
+        if sys_clock_gettime(1, g_ui_clockBuffer + 16) != 0 do out 0 - 1 end
+        let
+            seconds = native_read_i64(g_ui_clockBuffer, 16)
+            fraction = native_read_i64(g_ui_clockBuffer, 24)
+        if seconds < 0 do out 0 - 1 end
+        if seconds > 9223372035 do out 0 - 1 end
+        if fraction < 0 do out 0 - 1 end
+        if fraction >= 1000000000 do out 0 - 1 end
+        let whole = seconds * 1000000000
+        if fraction > 9223372036854775807 - whole do out 0 - 1 end
+        out whole + fraction
+    end
+    out 0 - 1
+end.
+
+func cliUiPhaseDurationNs(phase: int):
+    if g_ui_phaseRecords == 0 or phase < 1 or phase > 11 do out 0 - 1 end
+    out native_read_i64(g_ui_phaseRecords, phase * 32 + 24)
+end.
+
+# Round half up using quotient/remainder to avoid overflowing large durations.
+func cliRoundDuration(value: int, quantum: int):
+    let result = value / quantum
+    if value mod quantum >= quantum / 2 do out result + 1 end
+    out result
+end.
+
+func cliAppendTwoDigits(builder: StringBuilder, value: int):
+    var text = builder
+    if value < 10 do text = sb_append_char(text, 48) end
+    out sb_append_int(text, value)
+end.
+
+# Canonical formatter uses integer nanoseconds to retain hundredths of ms.
+# Unit selection follows rounded values, carrying at every boundary. Unknown
+# clocks are represented as unavailable, never as negative or zero elapsed time.
+func formatDurationNs(value: int):
+    if value < 0 do out "unavailable" as int end
+    var text = sb_new()
+    let hundredthsMs = cliRoundDuration(value, 10000)
+    if hundredthsMs < 100000 do
+        text = sb_append_int(text, hundredthsMs / 100)
+        text = sb_append_char(text, 46)
+        text = cliAppendTwoDigits(text, hundredthsMs mod 100)
+        text = sb_append(text, "ms")
+        out sb_to_string(text)
+    end
+    let hundredthsSec = cliRoundDuration(value, 10000000)
+    if hundredthsSec < 6000 do
+        text = sb_append_int(text, hundredthsSec / 100)
+        text = sb_append_char(text, 46)
+        text = cliAppendTwoDigits(text, hundredthsSec mod 100)
+        text = sb_append_char(text, 115)
+        out sb_to_string(text)
+    end
+    if hundredthsSec < 360000 do
+        text = sb_append_int(text, hundredthsSec / 6000)
+        text = sb_append(text, "m ")
+        text = cliAppendTwoDigits(text, (hundredthsSec / 100) mod 60)
+        text = sb_append_char(text, 46)
+        text = cliAppendTwoDigits(text, hundredthsSec mod 100)
+        text = sb_append_char(text, 115)
+        out sb_to_string(text)
+    end
+    let seconds = cliRoundDuration(value, 1000000000)
+    text = sb_append_int(text, seconds / 3600)
+    text = sb_append(text, "h ")
+    text = cliAppendTwoDigits(text, (seconds / 60) mod 60)
+    text = sb_append(text, "m ")
+    text = cliAppendTwoDigits(text, seconds mod 60)
+    text = sb_append_char(text, 115)
+    out sb_to_string(text)
+end.
+
+func formatDuration(ms: int):
+    if ms < 0 do out "unavailable" as int end
+    if ms > 9223372036854 do out "unavailable" as int end
+    out formatDurationNs(ms * 1000000)
+end.
+
+func cliElapsedNs(start: int):
+    if start < 0 do out 0 - 1 end
+    let finish = cliClockNowNs()
+    if finish < start do out 0 - 1 end
+    out finish - start
+end.
+
+func cliUiAppendDuration(builder: StringBuilder, elapsed: int):
+    var text = sb_append(builder, " · ")
+    out sb_append(text, formatDurationNs(elapsed))
+end.
+
+func cliUiAppendSafe(builder: StringBuilder, value: int, multiline: int):
+    var
+        text = builder
+        index = 0
+    if value == 0 do out text end
+    when native_read_u8(value, index) != 0 loop
+        let byte = native_read_u8(value, index)
+        if byte >= 32 do
+            if byte == 127 do
+                text = sb_append_char(text, 32)
+            else
+                text = sb_append_char(text, byte)
+            end
+        eif byte == 10 do
+            if multiline == 1 do
+                text = sb_append_char(text, 10)
+            else
+                text = sb_append_char(text, 32)
+            end
+        else
+            text = sb_append_char(text, 32)
+        end
+        index = index + 1
+    end
+    out text
+end.
+
+func cliUiLine(value: i64):
+    cliUiClearLive()
+    if value != 0 do
+        let len = rt_strlen(value)
+        if g_ui_colorEnabled == 1 and len >= 4 do
+            if native_read_u8(value, 0) == 226 and native_read_u8(value, 1) == 154 do
+                if native_read_u8(value, 2) == 160 and native_read_u8(value, 3) == 32 do
+                    var wtext = sb_new()
+                    wtext = sb_append_char(wtext, 27)
+                    wtext = sb_append(wtext, "[33m⚠ ")
+                    wtext = cliUiAppendSafe(wtext, value + 4, 0)
+                    wtext = sb_append_char(wtext, 27)
+                    wtext = sb_append(wtext, "[0m")
+                    cliUiWriteRaw(sb_to_string(wtext))
+                    sb_free(wtext)
+                    var wnl = sb_new()
+                    wnl = sb_append_char(wnl, 10)
+                    cliUiWriteRaw(sb_to_string(wnl))
+                    sb_free(wnl)
+                    out
+                end
+            end
+        end
+        cliUiWriteRaw(value)
+    end
+    var text = sb_new()
+    text = sb_append_char(text, 10)
+    cliUiWriteRaw(sb_to_string(text))
+    sb_free(text)
+end.
+
+func cliUiReset(mode: int, quiet: int):
+    g_ui_mode = mode
+    g_ui_quiet = quiet
+    g_ui_failed = 0
+    g_ui_phase = 0
+    g_ui_artifactPath = 0
+    # Each record: state (0=not started,1=running,2=ok,3=failed), metric,
+    # monotonic start ns, elapsed ns (-1 means unavailable).
+    # Allocated outside semantic arenas; do not retain semantic/AST pointers.
+    if g_ui_phaseRecords == 0 do g_ui_phaseRecords = vir_alloc(384) end
+    var index = 0
+    when index < 48 loop
+        native_write_i64(g_ui_phaseRecords, index * 8, 0)
+        index = index + 1
+    end
+    cliClockReset()
+    g_ui_startNs = cliClockNowNs()
+    g_ui_endNs = 0 - 1
+    g_ui_exitCode = 0
+    cliUiTerminalReset()
+end.
+
+func cliUiPhaseName(phase: int):
+    if phase == 1 do out "Reading" end
+    if phase == 2 do out "Preprocess" end
+    if phase == 3 do out "Lexer" end
+    if phase == 4 do out "Parser" end
+    if phase == 5 do out "Semantic" end
+    if phase == 6 do out "AST → MIR" end
+    if phase == 7 do out "MIR optimize" end
+    if phase == 8 do out "LIR lowering" end
+    if phase == 9 do out "Regalloc" end
+    if phase == 10 do out "Codegen" end
+    if phase == 11 do out "Linking" end
+    out "Compiler"
+end.
+
+func cliUiAppendPaddedStage(builder: StringBuilder, phase: int):
+    if phase == 2 do out sb_append(builder, "Preprocess        ") end
+    if phase == 3 do out sb_append(builder, "Lexer             ") end
+    if phase == 4 do out sb_append(builder, "Parser            ") end
+    if phase == 5 do out sb_append(builder, "Semantic          ") end
+    if phase == 6 do out sb_append(builder, "AST → MIR         ") end
+    if phase == 7 do out sb_append(builder, "MIR optimize      ") end
+    if phase == 8 do out sb_append(builder, "LIR lowering      ") end
+    if phase == 9 do out sb_append(builder, "Regalloc          ") end
+    if phase == 10 do out sb_append(builder, "Codegen           ") end
+    if phase == 11 do out sb_append(builder, "Linking           ") end
+    out sb_append(builder, "Compiler          ")
+end.
+
+func cliUiFitWidth(value: int, maxWidth: int):
+    if maxWidth <= 0 do out value end
+    let len = rt_strlen(value)
+    if len < maxWidth do out value end
+    var text = sb_new()
+    var i = 0
+    let limit = maxWidth - 1
+    when i < limit loop
+        text = sb_append_char(text, native_read_u8(value, i))
+        i = i + 1
+    end
+    out sb_to_string(text)
+end.
+
+func cliUiPhaseBegin(phase: int):
+    if g_ui_phaseRecords == 0 do out end
+    if phase < 1 do out end
+    if phase > 11 do out end
+    g_ui_phase = phase
+    # The first event of each phase bypasses the previous phase's throttle.
+    g_ui_lastRefreshNs = 0 - 1
+    native_write_i64(g_ui_phaseRecords, phase * 32, 1)
+    native_write_i64(g_ui_phaseRecords, phase * 32 + 16, cliClockNowNs())
+    cliUiPhaseUpdate(0, 0, 0)
+end.
+
+# Current-item pointers are borrowed only for this event. No AST/symbol pointer
+# escapes into session state. At most 20 Hz; initial/final events bypass throttle.
+func cliUiPhaseUpdate(done: int, total: int, current: int):
+    if g_ui_liveEnabled != 1 do out end
+    if g_ui_phase <= 1 do out end
+    let now = cliClockNowNs()
+    if now < 0 do cliUiClearLive(); out end
+    if g_ui_lastRefreshNs >= 0 do
+        if now - g_ui_lastRefreshNs < 50000000 do out end
+    end
+    g_ui_lastRefreshNs = now
+    var text = sb_new()
+    text = sb_append(text, "  ")
+    text = cliUiAppendPaddedStage(text, g_ui_phase)
+    if total > 0 do
+        text = sb_append_int(text, done)
+        text = sb_append(text, " / ")
+        text = sb_append_int(text, total)
+        text = sb_append(text, " funcs")
+    end
+    if current != 0 do
+        if total > 0 do
+            text = sb_append(text, " · ")
+        end
+        text = cliUiAppendSafe(text, current, 0)
+    end
+    let elapsed = cliElapsedNs(native_read_i64(g_ui_phaseRecords, g_ui_phase * 32 + 16))
+    if total > 0 or current != 0 do
+        text = sb_append(text, " · ")
+    end
+    text = sb_append(text, formatDurationNs(elapsed))
+    var data = sb_to_string(text)
+    sb_free(text)
+    if g_ui_width > 0 and rt_strlen(data) >= g_ui_width do
+        data = cliUiFitWidth(data, g_ui_width)
+    end
+    cliUiEraseCurrentLine()
+    cliUiWriteRaw(data)
+    g_ui_liveVisible = 1
+end.
+
+func cliUiPhaseItem(done: int, total: int, symbol: string):
+    if g_ui_liveEnabled != 1 do out end
+    if symbol as int == 0 do out end
+    cliUiPhaseUpdate(done, total, native_read_i64(symbol as int, 0))
+end.
+
+func cliUiPhaseEnd(phase: int, metric: int, unit: int):
+    if g_ui_phaseRecords == 0 do out end
+    if phase < 1 do out end
+    if phase > 11 do out end
+    if native_read_i64(g_ui_phaseRecords, phase * 32) != 1 do out end
+    native_write_i64(g_ui_phaseRecords, phase * 32, 2)
+    native_write_i64(g_ui_phaseRecords, phase * 32 + 8, metric)
+    let elapsed = cliElapsedNs(native_read_i64(g_ui_phaseRecords, phase * 32 + 16))
+    native_write_i64(g_ui_phaseRecords, phase * 32 + 24, elapsed)
+    cliUiClearLive()
+    g_ui_lastRefreshNs = 0 - 1
+    g_ui_phase = 0
+    if phase == 1 do out end
+    if g_ui_mode != 1 do out end
+    if g_ui_quiet == 1 do out end
+    var text = sb_new()
+    text = cliUiAppendAnsi(text, "[32m")
+    text = sb_append(text, "✓")
+    text = cliUiAppendReset(text)
+    text = sb_append_char(text, 32)
+    if phase == 6 do
+        text = cliUiAppendAnsi(text, "[35m")
+        text = sb_append(text, "AST → MIR")
+        text = cliUiAppendReset(text)
+        text = sb_append(text, "         ")
+    else
+        text = cliUiAppendPaddedStage(text, phase)
+    end
+    if metric >= 0 and unit != 0 do
+        if phase == 4 do
+            text = cliUiAppendAnsi(text, "[35m")
+            text = sb_append_int(text, metric)
+            text = sb_append_char(text, 32)
+            text = cliUiAppendSafe(text, unit, 0)
+            text = cliUiAppendReset(text)
+        else
+            text = cliUiAppendAnsi(text, "[36m")
+            text = sb_append_int(text, metric)
+            text = sb_append_char(text, 32)
+            text = cliUiAppendSafe(text, unit, 0)
+            text = cliUiAppendReset(text)
+        end
+        text = cliUiAppendAnsi(text, "[90m")
+        text = sb_append(text, " · ")
+        text = sb_append(text, formatDurationNs(elapsed))
+        text = cliUiAppendReset(text)
+    else
+        text = cliUiAppendAnsi(text, "[90m")
+        text = sb_append(text, formatDurationNs(elapsed))
+        text = cliUiAppendReset(text)
+    end
+    cliUiLine(sb_to_string(text))
+    sb_free(text)
+end.
+
+func cliUiFailurePhase():
+    g_ui_failed = 1
+    if g_ui_phaseRecords == 0 do out end
+    if g_ui_phase > 0 do
+        let phase = g_ui_phase
+        native_write_i64(g_ui_phaseRecords, phase * 32, 3)
+        let elapsed = cliElapsedNs(native_read_i64(g_ui_phaseRecords, phase * 32 + 16))
+        native_write_i64(g_ui_phaseRecords, phase * 32 + 24, elapsed)
+        if g_ui_mode != 1 do
+            g_ui_phase = 0
+            out
+        end
+        if phase > 1 do
+            var text = sb_new()
+            text = cliUiAppendAnsi(text, "[31m")
+            text = sb_append(text, "✗")
+            text = cliUiAppendReset(text)
+            text = sb_append_char(text, 32)
+            text = cliUiAppendPaddedStage(text, phase)
+            text = cliUiAppendAnsi(text, "[90m")
+            text = sb_append(text, formatDurationNs(elapsed))
+            text = cliUiAppendReset(text)
+            cliUiLine(sb_to_string(text))
+            sb_free(text)
+        end
+        g_ui_phase = 0
+    end
+end.
+
+# Versioned observational session shared by every renderer. All values are
+# copied scalars; this buffer never retains semantic arena pointers.
+func cliSessionFinish(exitCode: int):
+    g_ui_exitCode = exitCode
+    if exitCode != 0 do cliUiFailurePhase() end
+    cliUiClearLive()
+    g_ui_endNs = cliClockNowNs()
+end.
+
+func cliSessionAppendJson(builder: StringBuilder):
+    var text = sb_append(builder, ",\"session\":{\"schemaVersion\":1,\"exitCode\":")
+    text = sb_append_int(text, g_ui_exitCode)
+    text = sb_append(text, ",\"durationNs\":")
+    if g_ui_startNs >= 0 & g_ui_endNs >= g_ui_startNs do
+        text = sb_append_int(text, g_ui_endNs - g_ui_startNs)
+    else
+        text = sb_append(text, "null")
+    end
+    text = sb_append(text, ",\"phases\":[")
+    var
+        phase = 1
+        emitted = 0
+    when phase <= 11 loop
+        let state = native_read_i64(g_ui_phaseRecords, phase * 32)
+        if state != 0 do
+            if emitted != 0 do text = sb_append_char(text, 44) end
+            emitted = 1
+            text = sb_append(text, "{\"id\":")
+            text = sb_append_int(text, phase)
+            text = sb_append(text, ",\"name\":\"")
+            text = sb_append(text, cliUiPhaseName(phase))
+            text = sb_append(text, "\",\"state\":\"")
+            if state == 2 do text = sb_append(text, "succeeded")
+            eif state == 3 do text = sb_append(text, "failed")
+            else text = sb_append(text, "running") end
+            text = sb_append(text, "\",\"metric\":")
+            text = sb_append_int(text, native_read_i64(g_ui_phaseRecords, phase * 32 + 8))
+            text = sb_append(text, ",\"durationNs\":")
+            let elapsed = native_read_i64(g_ui_phaseRecords, phase * 32 + 24)
+            if elapsed >= 0 do text = sb_append_int(text, elapsed)
+            else text = sb_append(text, "null") end
+            text = sb_append_char(text, 125)
+        end
+        phase = phase + 1
+    end
+    out sb_append(text, "]}")
+end.
+
+func cliUiBuildResult(errors: int):
+    if g_ui_mode != 1 do out end
+    if errors > 0 do
+        var text = sb_new()
+        text = cliUiAppendAnsi(text, "[1;31m")
+        text = sb_append(text, "✗ Build failed · ")
+        text = sb_append_int(text, errors)
+        text = sb_append(text, " errors")
+        text = cliUiAppendReset(text)
+        text = cliUiAppendAnsi(text, "[90m")
+        text = sb_append(text, " · ")
+        text = sb_append(text, formatDurationNs(cliElapsedNs(g_ui_startNs)))
+        text = cliUiAppendReset(text)
+        cliUiLine(sb_to_string(text))
+        sb_free(text)
+    eif g_ui_quiet == 0 do
+        cliUiLine("" as int)
+        var text = sb_new()
+        text = cliUiAppendAnsi(text, "[1;32m")
+        text = sb_append(text, "✓ Build succeeded")
+        text = cliUiAppendReset(text)
+        text = cliUiAppendAnsi(text, "[90m")
+        text = sb_append(text, " · ")
+        text = sb_append(text, formatDurationNs(cliElapsedNs(g_ui_startNs)))
+        text = cliUiAppendReset(text)
+        cliUiLine(sb_to_string(text))
+        sb_free(text)
+        if g_ui_artifactPath != 0 do
+            var pathText = sb_new()
+            pathText = cliUiAppendAnsi(pathText, "[90m")
+            pathText = sb_append(pathText, "  ")
+            pathText = cliUiAppendSafe(pathText, g_ui_artifactPath, 0)
+            pathText = cliUiAppendReset(pathText)
+            cliUiLine(sb_to_string(pathText))
+            sb_free(pathText)
+        end
+    end
+end.
+
+export g_ui_mode, g_ui_quiet, g_ui_failed, g_ui_phase, g_ui_phaseRecords,
+       cliUiAppendSafe, cliUiLine, cliUiReset, cliUiPhaseName, cliUiPhaseBegin,
+       cliUiPhaseEnd, cliUiPhaseDurationNs, cliUiFailurePhase, cliUiBuildResult, cliClockReset,
+       cliClockNowNs, cliTicksToNs, cliElapsedNs, formatDuration, formatDurationNs,
+       cliUiConfigure, cliUiPhaseUpdate, cliUiPhaseItem, cliUiClearLive,
+       cliSessionFinish, cliSessionAppendJson, cliUiSetArtifact,
+       cliUiAppendAnsi, cliUiAppendReset, g_ui_colorEnabled

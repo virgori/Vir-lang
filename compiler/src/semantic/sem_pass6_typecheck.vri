@@ -1,0 +1,297 @@
+##
+ * vir/compiler/sem_pass6_typecheck.vri
+ * ==============================================================
+ * Pass 6: Complete Type Checking for Vir v2.0
+ * Validates type compatibility for operators, assignments, calls,
+ * returns, entity field accesses, and array indexing.
+ ##
+
+include typecheck_context
+include ide_facts
+include typecheck_index
+include typecheck_compatibility
+include typecheck_inference
+include typecheck_calls
+include typecheck_methods
+include typecheck_assignment
+include typecheck_operators
+include typecheck_tensor
+include typecheck_generics
+include typecheck_entities
+include typecheck_enums
+include typecheck_patterns
+include typecheck_containers
+include typecheck_ffi
+include typecheck_diagnostics
+include typecheck_lookup
+include typecheck_lvalue
+include typecheck_walk_decl
+include typecheck_walk_stmt
+include typecheck_walk_case
+include typecheck_walk_method
+include typecheck_walk_field
+include typecheck_walk_expr
+include typecheck_walk_index
+include typecheck_walk_entity
+include typecheck_walk_other
+include typecheck_eval
+include typecheck_type_str
+include typecheck_compat_state
+include typecheck_registry
+
+func pass6_typecheck(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode):
+    g_pass6_symbols = symbols as i64
+    g_pass6_scopes = scopes as i64
+    g_pass6_diag = diag as i64
+    pass6_rebuild_index(symbols, scopes)
+    g_pass6_extern_names = vec_new_rt()
+    g_pass6_extern_nodes = vec_new_rt()
+    g_pass6_extern_buckets = pass6_global_map_new()
+    g_pass6_entity_names = vec_new_rt()
+    g_pass6_entity_nodes = vec_new_rt()
+    g_pass6_entity_buckets = pass6_global_map_new()
+    g_pass6_enum_buckets = pass6_global_map_new()
+    g_pass6_func_names = vec_new_rt()
+    g_pass6_func_nodes = vec_new_rt()
+    g_pass6_func_canonical_names = vec_new_rt()
+    g_pass6_func_buckets = pass6_global_map_new()
+    g_pass6_func_canon_buckets = pass6_global_map_new()
+    g_pass6_func_canon_by_node = pass6_global_map_new()
+    g_pass6_ret_stmt_buckets = pass6_global_map_new()
+    g_pass6_visiting_symbols = vec_new_rt()
+    g_pass6_fn_ret_cache_keys = vec_new_rt()
+    g_pass6_fn_ret_cache_vals = vec_new_rt()
+    g_pass6_visiting_funcs = vec_new_rt()
+    g_pass6_visiting_local_exprs = vec_new_rt()
+    g_pass6_sym_types = vec_new_rt()
+    g_pass6_scoped_var_names = vec_new_rt()
+    g_pass6_scoped_var_types = vec_new_rt()
+    g_pass6_scope_watermarks = vec_new_rt()
+    g_pass6_var_names = vec_new_rt()
+    g_pass6_var_types = vec_new_rt()
+    g_pass6_current_entity_name = 0
+    g_pass6_ai_mode = 0
+    g_pass6_infer_values = vec_new_rt()
+    g_pass6_train_values = vec_new_rt()
+    g_pass6_assigned_vars = vec_new_rt()
+    pass6_collect_externs(node)
+    pass6_collect_entities(node)
+    pass6_collect_free_functions(node)
+    pass6_walk(symbols, scopes, diag, node)
+end.
+
+
+func pass6_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode):
+    # Recovered/optional parser children may be represented by a null AST
+    # entry.  Semantic traversal must ignore the absent child rather than
+    # dereferencing its fields during large self-host inputs.
+    if node as i64 == 0 do out 0 end
+    # Method bodies are resolved by pass 6 rather than the pass 3 walk.
+    # Capture the binding that this resolver actually selected.
+    if g_ideFactsEnabled == 1 do
+        if g_pass6_current_entity_name != 0 do
+            if node.node_type == AstType.Identifier & ideFactSymbol(node as int) < 0 do
+                let methodBinding = pass6_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+                if methodBinding >= 0 do
+                    ideFactResolve(node as int, methodBinding, scope_current_id(scopes), 2)
+                    let methodSymbol = pass6_symbol_at(symbols, methodBinding)
+                    ideFactType(node as int, native_read_i64(methodSymbol as int, 16))
+                end
+            end
+        end
+    end
+
+    if node.node_type == AstType.ModuleStmt do
+        g_pass6_cur_module = node.name
+        out 0
+    end
+
+    if fat_str_len(node.name2) > 0 and is_tensor_type_str(node.name2) and not tensor_type_is_well_formed(node.name2) do
+        report_error(diag, 3024, node.line, 0)
+    end
+
+    if node.node_type == AstType.ThrowStmt do
+        pass6WalkThrowStmt(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.ReturnStmt do
+        out pass6WalkReturnStmt(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.PrintStmt do
+        out pass6WalkPrintStmt(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.AddrOf do
+        out pass6WalkAddrOf(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.EmitStmt do
+        pass6WalkEmitStmt(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.AtomicVarDecl do
+        pass6WalkAtomicVarDecl(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.EntityLiteral do
+        out pass6WalkEntityLiteral(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.RegisterDef do
+        out pass6WalkRegisterDef(symbols, scopes, diag, node)
+    end
+
+    # Register/mold fields are unsigned bit slices. Reject constant writes
+    # that would otherwise be silently truncated by BIT_INSERT.
+    if node.node_type == AstType.FieldAssign and vec_len_rt(node.children) > 0 do
+        out pass6WalkFieldAssign(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.EntityDef or node.node_type == AstType.PackedDef do
+        out pass6WalkEntityDef(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.MethodCall do
+        out pass6WalkMethodCall(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.FieldAccess do
+        out pass6WalkFieldAccess(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.QuantizeExpr do
+        out pass6WalkQuantizeExpr(symbols, scopes, diag, node)
+    end
+
+    # String Interpolation Type Check & Node Binding
+    if node.node_type == AstType.InterpExpr do
+        out pass6WalkInterpExpr(symbols, scopes, diag, node)
+    end
+
+    # Spec §10.1: postfix percent accepts exactly one numeric operand and
+    # always produces Float. Keep this separate from binary `mod` checking.
+    if node.node_type == AstType.PercentExpr do
+        out pass6WalkPercentExpr(symbols, scopes, diag, node)
+    end
+
+    # 1. Binary Operator Type Check
+    if node.node_type == AstType.BinOp do
+        out pass6WalkBinOp(symbols, scopes, diag, node)
+    end
+
+    # 2. Assignment & L-Value Check
+    # Parser shape: Assign.name = LHS ident; children[0] = RHS (not lhs child).
+    if node.node_type == AstType.Assign do
+        out pass6WalkAssign(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.SwizzleAssign do
+        out pass6WalkSwizzleAssign(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.SwizzleExpr do
+        out pass6WalkSwizzleExpr(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.EnumDef do
+        pass6_check_enum_def(diag, node)
+        out 0
+    end
+
+    if node.node_type == AstType.CaseExpr do
+        pass6_check_case_expr(symbols, scopes, diag, node)
+        out 0
+    end
+
+    if node.node_type == AstType.CastExpr do
+        pass6WalkCastExpr(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.Compare do
+        pass6WalkCompare(symbols, scopes, diag, node)
+    end
+
+    # 3. Call Resolution & Argument Count Check
+    if node.node_type == AstType.EnumConstruct do
+        out pass6WalkEnumConstruct(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.Call do
+        out pass6WalkCall(symbols, scopes, diag, node)
+    end
+
+    # A dict literal has one key type inferred from its first pair. Reject
+    # mixed-key literals before lowering can compare incompatible bit patterns.
+    if node.node_type == AstType.DictLiteral do
+        out pass6WalkDictLiteral(symbols, scopes, diag, node)
+    end
+
+    # 4. Index Access Check (Index must be Int, rank matching for tensor)
+    if node.node_type == AstType.IndexAccess or node.node_type == AstType.ExprIndex do
+        out pass6WalkIndexAccess(symbols, scopes, diag, node)
+    end
+
+    # 4b. Index Assign Check (Index must be Int, rank matching for tensor)
+    if node.node_type == AstType.IndexAssign do
+        out pass6WalkIndexAssign(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.BindAttr do
+        out pass6WalkBindAttr(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.InferBlock do
+        out pass6WalkInferBlock(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.TrainBlock do
+        out pass6WalkTrainBlock(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.ReactiveDecl or node.node_type == AstType.BundleExpr or node.node_type == AstType.ExposeAttr do
+        out pass6WalkReactiveBlock(symbols, scopes, diag, node)
+    end
+
+    # 5. FuncDef Scope & Local Parameter Registration
+    if node.node_type == AstType.FuncDef do
+        out pass6WalkFuncDef(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.Block do
+        out pass6WalkBlock(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.MapExpr do
+        out pass6WalkMapExpr(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.ExternFunc do
+        out 0
+    end
+
+    if node.node_type == AstType.VarDecl do
+        out pass6WalkVarDecl(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.VarDeclGroup do
+        out pass6WalkVarDeclGroup(symbols, scopes, diag, node)
+    end
+
+    if node.node_type == AstType.ConstDecl do
+        out pass6WalkConstDecl(symbols, scopes, diag, node)
+    end
+
+    # Default recurse
+    child_count = vec_len_rt(node.children)
+    var i = 0
+    when i < child_count loop
+        child = vec_get_rt(node.children, i)
+        pass6_walk(symbols, scopes, diag, child)
+        i = i + 1
+    end
+    out 0
+end.
+
+
+export pass6_typecheck

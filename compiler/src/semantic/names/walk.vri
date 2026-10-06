@@ -1,0 +1,272 @@
+##
+ * vir/compiler/semantic/names/walk.vri
+ * ==============================================================
+ * Pass 3: Declaration & Statement Name Resolution Walker.
+ * Scans functions, blocks, declarations, pattern matching, and control flow.
+ ##
+
+include rt_vec_rt
+include rt_string_rt
+include parser
+include symbol_table
+include scope_tree
+include context
+include ide_facts
+include names_context
+include names_lookup
+include names_register
+include names_rewrite
+include names_walk_expr
+include names_walk_decl
+
+func pass3_walk(ref symbols: SymbolTable, ref scopes: ScopeTree, diag: &DiagnosticEngine, node: &AstNode):
+    if node.node_type == AstType.FuncDef or node.node_type == AstType.EntityDef or node.node_type == AstType.EnumDef or node.node_type == AstType.PackedDef or node.node_type == AstType.RegisterDef or node.node_type == AstType.ClassDef or node.node_type == AstType.TypeAlias do
+        let declarationId = pass3_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        ideFactResolve(node as int, declarationId, scope_current_id(scopes), 1)
+    end
+
+    if g_ideFactsEnabled == 1 and (node.node_type == AstType.IndexAccess or node.node_type == AstType.IndexAssign) do
+        let baseSymbol = pass3_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+        var accessRole = 2
+        if node.node_type == AstType.IndexAssign do accessRole = 3 end
+        ideFactResolve(node as int, baseSymbol, scope_current_id(scopes), accessRole)
+    end
+
+    # Import children are declaration names, never value expressions. Walking
+    # them as identifiers would rewrite `import Some, Ok, Err ...` into three
+    # zero-argument enum constructions.
+    # Import children are declaration names, never value expressions. Collect
+    # aliases so `import Enum as Alias` resolves properly.
+    if node.node_type == AstType.ImportStmt do
+        child_count = vec_len_rt(node.children)
+        var ii = 0
+        when ii < child_count loop
+            sym_ch = vec_get_rt(node.children, ii) as AstNode
+            if fat_str_len(sym_ch.name2) > 0 do
+                g_pass3_import_aliases = vec_push_rt(g_pass3_import_aliases, sym_ch.name2 as i64)
+                g_pass3_import_targets = vec_push_rt(g_pass3_import_targets, sym_ch.name as i64)
+            end
+            ii = ii + 1
+        end
+        out 0
+    end
+    if g_ideFactsEnabled == 1 do
+        if node.node_type == AstType.ExportStmt do
+            let target = pass3_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+            ideFactResolve(node as int, target, scope_current_id(scopes), 2)
+            var exportIndex = 0
+            when exportIndex < vec_len_rt(node.children) loop
+                let exported = vec_get_rt(node.children, exportIndex)
+                pass3_walk(symbols, scopes, diag, exported)
+                exportIndex = exportIndex + 1
+            end
+        end
+    end
+    if node.node_type == AstType.ExportStmt or node.node_type == AstType.IncludeStmt or node.node_type == AstType.ModuleStmt do
+        out 0
+    end
+
+    # Expressions (Identifier, BuiltinCall, Call, MethodCall, EntityLiteral, FieldAccess, EnumAccess)
+    if pass3_walk_expr(symbols, scopes, diag, node) == 1 do
+        out 0
+    end
+
+    # Declarations (FuncDef, VarDeclGroup, VarDecl/ConstDecl/ReactiveDecl, ShareDecl/HasDecl)
+    if pass3_walk_decl(symbols, scopes, diag, node) == 1 do
+        out 0
+    end
+
+    if node.node_type == AstType.BindAttr do
+        child_count = vec_len_rt(node.children)
+        if child_count > 0 do
+            child = vec_get_rt(node.children, 0)
+            pass3_walk(symbols, scopes, diag, child)
+        end
+        out 0
+    end
+
+    if node.node_type == AstType.EntityDef or node.node_type == AstType.PackedDef or node.node_type == AstType.RegisterDef or node.node_type == AstType.ClassDef or node.node_type == AstType.EnumDef or node.node_type == AstType.ExternFunc or node.node_type == AstType.TypeAlias do
+        out 0
+    end
+
+    if node.node_type == AstType.CaseExpr do
+        child_count = vec_len_rt(node.children)
+        if child_count > 0 do
+            # 1. Walk target expression
+            target = vec_get_rt(node.children, 0)
+            pass3_walk(symbols, scopes, diag, target)
+
+            # 2. Walk each arm: [pat, body, pat, body, ...]
+            var i = 1
+            when i + 1 < child_count loop
+                pat = vec_get_rt(node.children, i)
+                body = vec_get_rt(node.children, i + 1)
+
+                old_scope = scope_current_id(scopes)
+                scope_id = scope_push(scopes, ScopeKind.Block)
+
+                pass3_register_pattern_binders(symbols, scopes, diag, pat)
+                pass3_walk(symbols, scopes, diag, body)
+                scope_pop(scopes)
+                i = i + 2
+            end
+        end
+        out 0
+    end
+
+    if node.node_type == AstType.WhenStmt do
+        old_scope = scope_current_id(scopes)
+        scope_id = scope_push(scopes, ScopeKind.Block)
+        if fat_str_len(node.name) > 0 do
+            let declarationId = pass3_register_local(symbols, scopes, node.name, SymbolKind.Variable, node.line)
+            ideFactResolve(node as int, declarationId, scope_current_id(scopes), 1)
+        end
+        child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            child = vec_get_rt(node.children, i)
+            pass3_walk(symbols, scopes, diag, child)
+            i = i + 1
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    if node.node_type == AstType.Block do
+        old_scope = scope_current_id(scopes)
+        scope_id = scope_push(scopes, ScopeKind.Block)
+        ideFactScope(node as int, scope_id)
+        child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            child = vec_get_rt(node.children, i)
+            pass3_walk(symbols, scopes, diag, child)
+            i = i + 1
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    if node.node_type == AstType.TryStmt do
+        # `err` is an implicit variable bound to the thrown value inside the
+        # revert handler. Register it for the whole try/revert scope.
+        old_scope = scope_current_id(scopes)
+        scope_id = scope_push(scopes, ScopeKind.Block)
+        pass3_register_local(symbols, scopes, fat_str_new("err"), SymbolKind.Variable, node.line)
+        child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            child = vec_get_rt(node.children, i)
+            pass3_walk(symbols, scopes, diag, child)
+            i = i + 1
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    if node.node_type == AstType.BundleExpr do
+        child_count = vec_len_rt(node.children)
+        var i = 0
+        when i < child_count loop
+            child = vec_get_rt(node.children, i)
+            pass3_walk(symbols, scopes, diag, child)
+            i = i + 1
+        end
+        if fat_str_len(node.name) > 0 do
+            let declarationId = pass3_register_local(symbols, scopes, node.name, SymbolKind.Const, node.line)
+            ideFactResolve(node as int, declarationId, scope_current_id(scopes), 1)
+        end
+        out 0
+    end
+
+    if node.node_type == AstType.MapExpr do
+        child_count = vec_len_rt(node.children)
+        if child_count > 0 do
+            pass3_walk(symbols, scopes, diag, vec_get_rt(node.children, 0))
+        end
+        scope_push(scopes, ScopeKind.Block)
+        if fat_str_len(node.name) > 0 and fat_cstr_eq(node.name, "map") == 0 do
+            let declarationId = pass3_register_local(symbols, scopes, node.name, SymbolKind.Variable, node.line)
+            ideFactResolve(node as int, declarationId, scope_current_id(scopes), 1)
+        end
+        var mi = 1
+        when mi < child_count loop
+            pass3_walk(symbols, scopes, diag, vec_get_rt(node.children, mi))
+            mi = mi + 1
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    if node.node_type == AstType.ExposeAttr do
+        child_count = vec_len_rt(node.children)
+        if child_count > 0 do
+            child = vec_get_rt(node.children, 0)
+            pass3_walk(symbols, scopes, diag, child)
+        end
+        out 0
+    end
+
+    # Implicit locals: Vir allows `x = expr` without prior `var`/`let`.
+    # LHS lives on node.name; children are RHS only (see parse_stmt Assign).
+    if node.node_type == AstType.Assign do
+        if fat_str_len(node.name) > 0 do
+            found = pass3_lookup_chain(symbols, scopes, scope_current_id(scopes), node.name)
+            if found == -1 do
+                found = pass3_register_implicit_local(symbols, scopes, node.name, SymbolKind.Variable, node.line)
+            end
+            ideFactResolve(node as int, found, scope_current_id(scopes), 3)
+        end
+        child_count = vec_len_rt(node.children)
+        if child_count >= 2 do
+            lhs = vec_get_rt(node.children, 0)
+            if lhs.node_type == AstType.TupleExpr do
+                pass3_register_pattern_binders(symbols, scopes, diag, lhs)
+            end
+        end
+        var i = 0
+        when i < child_count loop
+            child = vec_get_rt(node.children, i)
+            pass3_walk(symbols, scopes, diag, child)
+            i = i + 1
+        end
+        out 0
+    end
+
+    # for i in lo..hi: register loop binder before walking the body.
+    if node.node_type == AstType.ForRange do
+        # Range form is [start, end, body]; array form is [iterable, body].
+        # Keep child_count/index loop-carried so the bootstrap backend preserves
+        # them across recursive calls; straight-line locals here are caller-
+        # clobbered and previously caused the body walk to be skipped.
+        var
+            child_count = vec_len_rt(node.children)
+            bound_index = 0
+        when bound_index + 1 < child_count loop
+            pass3_walk(symbols, scopes, diag, vec_get_rt(node.children, bound_index))
+            bound_index = bound_index + 1
+        end
+        scope_push(scopes, ScopeKind.Loop)
+        if fat_str_len(node.name) > 0 do
+            let declarationId = pass3_register_local(symbols, scopes, node.name, SymbolKind.Variable, node.line)
+            ideFactResolve(node as int, declarationId, scope_current_id(scopes), 1)
+        end
+        if child_count > 1 do
+            pass3_walk(symbols, scopes, diag, vec_get_rt(node.children, child_count - 1))
+        end
+        scope_pop(scopes)
+        out 0
+    end
+
+    # Default: recurse into children
+    child_count = vec_len_rt(node.children)
+    var i = 0
+    when i < child_count loop
+        child = vec_get_rt(node.children, i)
+        pass3_walk(symbols, scopes, diag, child)
+        i = i + 1
+    end
+    out 0
+end.
+
+export pass3_walk

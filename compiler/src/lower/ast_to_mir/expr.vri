@@ -1,0 +1,987 @@
+##
+ * compiler/src/lower/ast_to_mir/expr.vri — Expressions & Literals Lowering
+ * ==========================================================================
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+include parser
+include mir
+include ast_to_mir_context
+include ast_to_mir_layout
+include ast_to_mir_builder
+include ast_to_mir_calls
+include ast_to_mir_expr_ops
+
+func lower_expr_impl(b: MirBuilder, expr: &AstNode):
+	expr_type = ast_node_type_of(expr)
+
+	if expr_type == AstType.Call or expr_type == AstType.BuiltinCall or expr_type == AstType.MethodCall do
+		out lower_expr_calls(b, expr, expr_type)
+	end
+
+	if expr_type == AstType.BinOp or expr_type == AstType.Compare or expr_type == AstType.UnaryNot or expr_type == AstType.SwizzleExpr or expr_type == AstType.SafeAccessExpr or expr_type == AstType.ErxExpr or expr_type == AstType.TaskExpr or expr_type == AstType.WaitExpr or expr_type == AstType.QuantizeExpr or expr_type == AstType.PercentExpr or expr_type == AstType.UnaryMinus or expr_type == AstType.AddrOf do
+		out lower_expr_ops(b, expr, expr_type)
+	end
+
+	if expr_type == AstType.Assign do
+		var b_stmt = lower_stmt(b, expr)
+		var v_res = get_var_vreg(b_stmt, ast_node_name(expr))
+		if v_res >= 0 do
+			out expr_result(b_stmt, mir_opnd_vreg(v_res))
+		end
+		out expr_result(b_stmt, g_lower_expr_result_opnd as MirOperand)
+	end
+
+    # Enum constructors are resolved by semantic pass 3.  They never become
+    # ordinary function calls and require no runtime/prelude helper.
+    if expr_type == AstType.EnumConstruct do
+        out lower_enum_construct(b, expr, ast_node_name2(expr), ast_node_name(expr))
+    end
+
+    # 1. Literal Int
+	if expr_type == AstType.LiteralInt do
+		var (b2, v) = builder_new_vreg(b)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(ast_node_int_val(expr)), mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+	if expr_type == AstType.PrecompBlock do
+		var (b2, v) = builder_new_vreg(b)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(ast_node_int_val(expr)), mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+    # 2. Literal Float (raw 64-bit IEEE 754 bits from offset 48)
+	if expr_type == AstType.LiteralFloat do
+		var (b2, v) = builder_new_vreg(b)
+		f_bits = native_read_i64(expr as i64, 48)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(f_bits), mir_opnd_none())
+		mir_instr_set_type(ins, MirType.F64 as i64)
+		b2 = builder_add_instr(b2, ins)
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+    # 2b. Literal Bool
+	if expr_type == AstType.LiteralBool do
+		var (b2, v) = builder_new_vreg(b)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(ast_node_int_val(expr)), mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+    # 2c. Literal None
+	if expr_type == AstType.LiteralNone do
+		var (b2, v) = builder_new_vreg(b)
+		ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(v), mir_opnd_imm(0), mir_opnd_none())
+		b2 = builder_add_instr(b2, ins)
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+    # 3. Literal Str — src1 = string-pool id (100% static, zero runtime alloc)
+	if expr_type == AstType.LiteralStr do
+		var (b1, sid) = builder_intern(b, ast_node_name(expr))
+		var (b2, v) = builder_new_vreg(b1)
+		b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
+		out expr_result(b2, mir_opnd_vreg(v))
+	end
+
+    # 3b. InterpExpr — lowered to str_cat (bid 11) and int_to_str (bid 19) in Arena
+	if expr_type == AstType.InterpExpr do
+		n_segs = ast_node_child_count(expr)
+		if n_segs == 0 do
+			var (b1, sid) = builder_intern(b, fat_str_new(""))
+			var (b2, v) = builder_new_vreg(b1)
+			b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(v), mir_opnd_imm(sid))
+			out expr_result(b2, mir_opnd_vreg(v))
+		end
+
+		# Lower first segment and convert non-string values deterministically.
+		first_child = ast_node_child(expr, 0)
+		var b_cur = lower_interp_segment(b, first_child)
+		var cur_opnd = g_lower_expr_result_opnd as MirOperand
+
+		# If only 1 segment and already evaluated:
+		if n_segs == 1 do
+			out expr_result(b_cur, cur_opnd)
+		end
+
+		# Concatenate subsequent segments using str_cat (bid 11)
+		var si = 1
+		when si < n_segs loop
+			seg_child = ast_node_child(expr, si)
+			b_cur = lower_interp_segment(b_cur, seg_child)
+			var seg_opnd = g_lower_expr_result_opnd as MirOperand
+
+			# Call str_cat(cur_opnd, seg_opnd) (bid 11)
+			b_cur = emit_set_arg(b_cur, 0, cur_opnd)
+			b_cur = emit_set_arg(b_cur, 1, seg_opnd)
+			var (b_cat, res_v) = builder_new_vreg(b_cur)
+			b_cur = emit_intrinsic(b_cat, MIR_INTR_BUILTIN, mir_opnd_vreg(res_v), mir_opnd_imm(11))
+			cur_opnd = mir_opnd_vreg(res_v)
+			si = si + 1
+		end
+		out expr_result(b_cur, cur_opnd)
+	end
+
+    # 4. Identifier
+	if expr_type == AstType.Identifier do
+		fname = ast_node_name(expr)
+		if g_func_ref_param_hash != 0 do
+			ref_idx = hash_table_lookup(g_func_ref_param_hash, g_func_ref_param_names, fname)
+			if ref_idx >= 0 do
+				ptr_vreg = vec_get_rt(g_func_ref_param_vregs, ref_idx)
+				var (b_load, val_vreg) = builder_new_vreg(b)
+				b_load = emit_load(b_load, val_vreg, mir_opnd_vreg(ptr_vreg))
+				out expr_result(b_load, mir_opnd_vreg(val_vreg))
+			end
+		end
+		v = get_var_vreg(b, fname)
+		if v >= 0 do
+			out expr_result(b, mir_opnd_vreg(v))
+		else
+            if fat_cstr_eq(fname, "true") == 1 do
+                out expr_result(b, mir_opnd_imm(1))
+            end
+            if fat_cstr_eq(fname, "false") == 1 do
+                out expr_result(b, mir_opnd_imm(0))
+            end
+            if fat_cstr_eq(fname, "null") == 1 do
+                out expr_result(b, mir_opnd_imm(0))
+            end
+            if fat_cstr_eq(fname, "void") == 1 do
+                out expr_result(b, mir_opnd_imm(0))
+            end
+            if g_const_hash > 0 do
+                c_idx = hash_table_lookup(g_const_hash, g_const_names, fname)
+                if c_idx >= 0 do
+                    c_val = vec_get_rt(g_const_values, c_idx)
+                    out expr_result(b, mir_opnd_imm(c_val))
+                end
+            end
+			global_slot = global_slot_lookup(fname)
+			if global_slot >= 0 do
+				var (b_global, global_vreg) = builder_new_vreg(b)
+				b_global = emit_intrinsic(b_global, MIR_INTR_GLOBAL_LOAD, mir_opnd_vreg(global_vreg), mir_opnd_imm(global_slot))
+				out expr_result(b_global, mir_opnd_vreg(global_vreg))
+			end
+			let resolved_fn = resolve_callee_alias(fname)
+			let is_fn = (find_func_ast(resolved_fn as i64) as i64 != 0) or (find_func_ast(fname as i64) as i64 != 0)
+			let is_ffi = (ffi_import_find(resolved_fn) >= 0) or (ffi_import_find(fname) >= 0)
+			if not is_fn and not is_ffi do
+				var sb_err = sb_new()
+				sb_err = sb_append(sb_err, "virc: error: lowering unresolved identifier: ")
+				var f_len = fat_str_len(fname)
+				var fi = 0
+				when fi < f_len loop
+					sb_err = sb_append_char(sb_err, fat_str_byte_at(fname, fi))
+					fi = fi + 1
+				end
+				print_ln(sb_to_string(sb_err))
+				sb_free(sb_err)
+				sys_exit(1)
+			end
+			var (b1, cid) = builder_intern(b, resolved_fn)
+			var (b2, dst) = builder_new_vreg(b1)
+			b2 = emit_intrinsic(b2, MIR_INTR_ADDR_OF, mir_opnd_vreg(dst), mir_opnd_imm(cid))
+			out expr_result(b2, mir_opnd_vreg(dst))
+		end
+	end
+
+    # 5. BinOp & Compare — full OpType→MirOp; Land/Lor → CFG (no silent Add)
+	if expr_type == AstType.PatternExpr do
+		if ast_node_child_count(expr) >= 2 do
+			var b3 = lower_expr(b, ast_node_child(expr, 0))
+			var opnd_l = g_lower_expr_result_opnd as MirOperand
+			var b4 = lower_expr(b3, ast_node_child(expr, 1))
+			var opnd_r = g_lower_expr_result_opnd as MirOperand
+			var (b5, dst) = builder_new_vreg(b4)
+			b5 = emit_set_arg(b5, 0, opnd_l)
+			b5 = emit_set_arg(b5, 1, opnd_r)
+			out expr_result(emit_intrinsic(b5, MIR_INTR_PATTERN, mir_opnd_vreg(dst), opnd_l), mir_opnd_vreg(dst))
+		end
+	end
+	if expr_type == AstType.ExistExpr do
+		if ast_node_child_count(expr) > 0 do
+			var b2 = lower_expr(b, ast_node_child(expr, 0))
+			var v = g_lower_expr_result_opnd as MirOperand
+			var (b3, dst) = builder_new_vreg(b2)
+			out expr_result(emit_intrinsic(b3, MIR_INTR_EXIST, mir_opnd_vreg(dst), v), mir_opnd_vreg(dst))
+		end
+	end
+	if expr_type == AstType.MapExpr do
+		if fat_str_len(ast_node_name(expr)) > 0 and fat_cstr_eq(ast_node_name(expr), "map") == 0 do
+			out lower_map_block_expr(b, expr)
+		end
+		var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+		var (b3, dst) = builder_new_vreg(b2)
+		out expr_result(emit_intrinsic(b3, MIR_INTR_MAP, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
+	end
+	if expr_type == AstType.ArrCompactExpr do
+		var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+		var (b3, dst) = builder_new_vreg(b2)
+		out expr_result(emit_intrinsic(b3, MIR_INTR_ARR_COMPACT, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
+	end
+	if expr_type == AstType.BundleExpr do
+		child_count = ast_node_child_count(expr)
+		if child_count > 0 do
+			c0 = ast_node_child(expr, 0)
+			if ast_node_type_of(c0) == AstType.LiteralStr do
+				var (b1, sid) = builder_intern(b, ast_node_name(c0))
+				var (b2, dst) = builder_new_vreg(b1)
+				out expr_result(emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(dst), mir_opnd_imm(sid)), mir_opnd_vreg(dst))
+			end
+		end
+		var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+		var (b3, dst) = builder_new_vreg(b2)
+		out expr_result(emit_intrinsic(b3, MIR_INTR_BUNDLE, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
+	end
+	if expr_type == AstType.ErrorExpr do
+		var (b1, dst) = builder_new_vreg(b)
+		out expr_result(emit_intrinsic(b1, MIR_INTR_ERROR, mir_opnd_vreg(dst), mir_opnd_none()), mir_opnd_vreg(dst))
+	end
+	if expr_type == AstType.PtrTypeExpr do
+        fname = ast_node_name(expr)
+        v = get_var_vreg(b, fname)
+        if v >= 0 do
+            out expr_result(b, mir_opnd_vreg(v))
+        end
+		var (b1, pid) = builder_intern(b, fname)
+		var (b2, dst) = builder_new_vreg(b1)
+		out expr_result(emit_intrinsic(b2, MIR_INTR_PTR, mir_opnd_vreg(dst), mir_opnd_imm(pid)), mir_opnd_vreg(dst))
+	end
+	if expr_type == AstType.PrecompBlock do
+		if ast_node_child_count(expr) > 0 do
+			out lower_expr(b, ast_node_child(expr, 0))
+		end
+		out expr_result(b, mir_opnd_imm(0))
+	end
+
+    # 8. Aggregate literals — SetArg each element then Intrinsic
+	if expr_type == AstType.ArrayLiteral do
+		out lower_aggregate(b, MIR_INTR_ARRAY, expr)
+	end
+	if expr_type == AstType.DictLiteral do
+		out lower_dict_literal(b, expr)
+	end
+	if expr_type == AstType.TupleExpr do
+		out lower_aggregate(b, MIR_INTR_TUPLE, expr)
+	end
+	if expr_type == AstType.EntityLiteral do
+		out lower_aggregate(b, MIR_INTR_ENTITY, expr)
+	end
+	if expr_type == AstType.SizeofExpr do
+		sz = get_type_byte_size(ast_node_name(expr))
+		out expr_result(b, mir_opnd_imm(sz))
+	end
+
+    # 9. Index — shapes: children[base,idx] OR name=base + children[idx]
+	if expr_type == AstType.IndexAccess or expr_type == AstType.ExprIndex do
+		if fat_cstr_eq(ast_node_name2(expr), "__slice__") == 1 do
+			bv = get_var_vreg(b, ast_node_name(expr))
+			var b2 = lower_expr(b, ast_node_child(expr, 0))
+			var start_op = g_lower_expr_result_opnd as MirOperand
+			var b3 = lower_expr(b2, ast_node_child(expr, 1))
+			var end_op = g_lower_expr_result_opnd as MirOperand
+			var (b4, slen_vreg) = builder_new_vreg(b3)
+			ins_sub = mir_instr_new(MirOp.Sub, mir_opnd_vreg(slen_vreg), end_op, start_op)
+			b4 = builder_add_instr(b4, ins_sub)
+
+			var (b5, tmp8) = builder_new_vreg(b4)
+			ins_mul = mir_instr_new(MirOp.Mul, mir_opnd_vreg(tmp8), mir_opnd_vreg(slen_vreg), mir_opnd_imm(8))
+			b5 = builder_add_instr(b5, ins_mul)
+			var (b6, alloc_sz) = builder_new_vreg(b5)
+			ins_add = mir_instr_new(MirOp.Add, mir_opnd_vreg(alloc_sz), mir_opnd_vreg(tmp8), mir_opnd_imm(16))
+			b6 = builder_add_instr(b6, ins_add)
+
+			b6 = emit_set_arg(b6, 0, mir_opnd_vreg(alloc_sz))
+			var (b7, dst_base) = builder_new_vreg(b6)
+			b7 = emit_intrinsic(b7, MIR_INTR_BUILTIN, mir_opnd_vreg(dst_base), mir_opnd_imm(3))
+
+			b7 = emit_set_arg(b7, 0, mir_opnd_vreg(dst_base))
+			b7 = emit_set_arg(b7, 1, mir_opnd_imm(0))
+			b7 = emit_set_arg(b7, 2, mir_opnd_vreg(slen_vreg))
+			b7 = emit_intrinsic(b7, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+
+			b7 = emit_set_arg(b7, 0, mir_opnd_vreg(dst_base))
+			b7 = emit_set_arg(b7, 1, mir_opnd_imm(8))
+			b7 = emit_set_arg(b7, 2, mir_opnd_vreg(slen_vreg))
+			b7 = emit_intrinsic(b7, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+
+			var (b8, iv) = builder_new_vreg(b7)
+			ins0 = mir_instr_new(MirOp.Move, mir_opnd_vreg(iv), mir_opnd_imm(0), mir_opnd_none())
+			b8 = builder_add_instr(b8, ins0)
+			loop_var_name = fat_str_concat(fat_str_new("__slice_i_"), ast_node_name(expr))
+			b8 = set_var_vreg(b8, loop_var_name, iv)
+
+			var (b9, cond_id) = builder_add_block(b8)
+			var (b10, body_id) = builder_add_block(b9)
+			var (b11, step_id) = builder_add_block(b10)
+			var (b12, end_id) = builder_add_block(b11)
+
+			b12 = emit_jump(b12, cond_id)
+			b12 = builder_push_loop(b12, end_id, step_id)
+			b12 = builder_set_current_block(b12, cond_id)
+
+			iv_cur = get_var_vreg(b12, loop_var_name)
+			var (b13, cmpv) = builder_new_vreg(b12)
+			insc = mir_instr_new(MirOp.CmpLt, mir_opnd_vreg(cmpv), mir_opnd_vreg(iv_cur), mir_opnd_vreg(slen_vreg))
+			b13 = builder_add_instr(b13, insc)
+			b13 = emit_jump_if_not(b13, mir_opnd_vreg(cmpv), end_id, body_id)
+
+			b13 = builder_set_current_block(b13, body_id)
+			var (b14, src_idx) = builder_new_vreg(b13)
+			ins_src = mir_instr_new(MirOp.Add, mir_opnd_vreg(src_idx), start_op, mir_opnd_vreg(iv_cur))
+			b14 = builder_add_instr(b14, ins_src)
+
+			var (b15, elem_val) = builder_new_vreg(b14)
+			b15 = emit_set_arg(b15, 0, mir_opnd_vreg(src_idx))
+			b15 = emit_intrinsic(b15, MIR_INTR_INDEX, mir_opnd_vreg(elem_val), mir_opnd_vreg(bv))
+
+			b15 = emit_set_arg(b15, 0, mir_opnd_vreg(iv_cur))
+			b15 = emit_set_arg(b15, 1, mir_opnd_vreg(elem_val))
+			b15 = emit_intrinsic(b15, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(dst_base))
+
+			b15 = emit_jump(b15, step_id)
+			b15 = builder_set_current_block(b15, step_id)
+			iv_cur2 = get_var_vreg(b15, loop_var_name)
+			var (b16, ivn) = builder_new_vreg(b15)
+			ins_add1 = mir_instr_new(MirOp.Add, mir_opnd_vreg(ivn), mir_opnd_vreg(iv_cur2), mir_opnd_imm(1))
+			b16 = builder_add_instr(b16, ins_add1)
+			ins_mov1 = mir_instr_new(MirOp.Move, mir_opnd_vreg(iv_cur2), mir_opnd_vreg(ivn), mir_opnd_none())
+			b16 = builder_add_instr(b16, ins_mov1)
+			b16 = set_var_vreg(b16, loop_var_name, iv_cur2)
+			b16 = emit_jump(b16, cond_id)
+			b16 = builder_pop_loop(b16)
+			b16 = builder_set_current_block(b16, end_id)
+
+			out expr_result(b16, mir_opnd_vreg(dst_base))
+		end
+	nch = ast_node_child_count(expr)
+	base = mir_opnd_none()
+	var vtype = fat_str_new("")
+	var vdesc = 0
+	var start_idx = 0
+	var num_idx = 0
+	if expr_type == AstType.IndexAccess do
+		b_mut = b
+		base_name = ast_node_name(expr)
+		bv = get_var_vreg(b_mut, base_name)
+		if bv >= 0 do
+			base = mir_opnd_vreg(bv)
+		end
+		if is_known_dict_var(base_name) == 0 do
+			vtype = get_var_type(base_name)
+			vdesc = get_var_tdesc(base_name)
+		end
+		start_idx = 0
+		num_idx = nch
+	else
+		var b_base = lower_expr(b, ast_node_child(expr, 0))
+		var base_op = g_lower_expr_result_opnd as MirOperand
+		b_mut = b_base
+		base = base_op
+		vtype = infer_expr_type_name(ast_node_child(expr, 0))
+		vdesc = infer_expr_tdesc(ast_node_child(expr, 0))
+		start_idx = 1
+		num_idx = nch - 1
+	end
+
+	flat_opnd = mir_opnd_none()
+	if num_idx <= 1 do
+		if num_idx == 1 do
+			var b_idx = lower_expr(b_mut, ast_node_child(expr, start_idx))
+			var idx_op = g_lower_expr_result_opnd as MirOperand
+			b_mut = b_idx
+			flat_opnd = idx_op
+		else
+			flat_opnd = mir_opnd_imm(0)
+		end
+	else
+		var k = 0
+		when k < num_idx loop
+			idx_ast = ast_node_child(expr, start_idx + k)
+			var b_next = lower_expr(b_mut, idx_ast)
+			var idx_op = g_lower_expr_result_opnd as MirOperand
+			b_mut = b_next
+			stride = 1
+			if vdesc != 0 do
+				stride = tdesc_stride(vdesc, k)
+			end
+			term_op = idx_op
+			if stride > 1 do
+				var (b_mul, mul_v) = builder_new_vreg(b_mut)
+				ins_m = mir_instr_new(MirOp.Mul, mir_opnd_vreg(mul_v), idx_op, mir_opnd_imm(stride))
+				b_mut = builder_add_instr(b_mul, ins_m)
+				term_op = mir_opnd_vreg(mul_v)
+			end
+			if k == 0 do
+				flat_opnd = term_op
+			else
+				var (b_add, add_v) = builder_new_vreg(b_mut)
+				ins_a = mir_instr_new(MirOp.Add, mir_opnd_vreg(add_v), flat_opnd, term_op)
+				b_mut = builder_add_instr(b_add, ins_a)
+				flat_opnd = mir_opnd_vreg(add_v)
+			end
+			k = k + 1
+		end
+	end
+
+	if base.op_type != MirOperandType.None do
+		if expr_type == AstType.IndexAccess and is_known_dict_var(ast_node_name(expr)) == 1 do
+			out lower_dict_index(b_mut, base, flat_opnd, dict_key_is_string(ast_node_child(expr, 0)))
+		end
+		var (b4, dst) = builder_new_vreg(b_mut)
+		b4 = emit_set_arg(b4, 0, flat_opnd)
+		var elem_m_typ = MirType.Int64
+		var is_signed: i64 = 1
+		if vdesc != 0 do
+			let code = tdesc_elem_code(vdesc)
+			if code == 1 do elem_m_typ = MirType.F32 end
+			if code == 2 do elem_m_typ = MirType.F16 end
+			if code == 3 do elem_m_typ = MirType.Int8; is_signed = 1 end
+			if code == 4 do elem_m_typ = MirType.Int8; is_signed = 0 end
+			if code == 5 do elem_m_typ = MirType.Int32 end
+			if code == 7 do elem_m_typ = MirType.F64 end
+		end
+		if is_flux_type_str(vtype) do
+			let f_elem = parse_flux_elem_type(vtype) as int
+			if f_elem == (TypeKind.Float as int) do
+				elem_m_typ = MirType.F64
+			end
+		end
+		b4 = emit_intrinsic_typed_with_bits(b4, MIR_INTR_INDEX, mir_opnd_vreg(dst), base, elem_m_typ, is_signed)
+		out expr_result(b4, mir_opnd_vreg(dst))
+	end
+	out expr_result(b_mut, mir_opnd_none())
+	end
+	if expr_type == AstType.FieldAccess do
+		nch = ast_node_child_count(expr)
+		if nch >= 1 do
+			base_ast = ast_node_child(expr, 0)
+			if ast_node_type_of(base_ast) == AstType.Identifier do
+				base_name_str = ast_node_name(base_ast)
+				field_name_str = ast_node_name(expr)
+				# A qualified variant of a tagged enum must allocate the same
+				# canonical representation as an unqualified constructor.
+				if enum_index_from_type_name(base_name_str) >= 0 do
+					out lower_enum_construct(b, expr, base_name_str, field_name_str)
+				end
+				dot_str = fat_str_new(".")
+				key = fat_str_concat(base_name_str, dot_str)
+				key = fat_str_concat(key, field_name_str)
+				if g_const_hash > 0 do
+					c_idx = hash_table_lookup(g_const_hash, g_const_names, key)
+					if c_idx >= 0 do
+						c_val = vec_get_rt(g_const_values, c_idx)
+						out expr_result(b, mir_opnd_imm(c_val))
+					end
+				end
+				base_name = ast_node_name(base_ast)
+				bv = get_var_vreg(b, base_name)
+				gv = global_slot_lookup(base_name)
+				if bv < 0 and gv < 0 do
+					print_str("virc: error: unresolved symbol or enum: base=")
+					print_str(native_read_i64(base_name, 0))
+					print_str(" field=")
+					print_ln(native_read_i64(field_name_str, 0))
+					sys_exit(1)
+					out expr_result(b, mir_opnd_imm(0))
+				end
+			end
+			var b2 = lower_expr(b, base_ast)
+			var base = g_lower_expr_result_opnd as MirOperand
+			fname = ast_node_name(expr)
+			if is_register_field(fname) == 1 do
+				start_bit = get_register_field_start(fname)
+				width = get_register_field_width(fname)
+				var (b3, dst) = builder_new_vreg(b2)
+				let pack_info = MIR_INTR_BIT_EXTRACT or (start_bit shl 8) or (width shl 16)
+				ins = mir_instr_new(MirOp.Intrinsic, mir_opnd_vreg(dst), base, mir_opnd_imm(pack_info))
+				b3 = builder_add_instr(b3, ins)
+				out expr_result(b3, mir_opnd_vreg(dst))
+			end
+			var (b3, dst) = builder_new_vreg(b2)
+			base_type = get_expr_entity_type(base_ast)
+			if is_packed_entity(base_type) do
+				f_off = get_scoped_field_offset(base_type, fname)
+				f_sz = get_scoped_field_size(base_type, fname)
+				f_sgn = get_scoped_field_signed(base_type, fname)
+				f_nested = get_scoped_field_is_nested(base_type, fname)
+				var (b4, addr) = builder_new_vreg(b3)
+				ins_a = mir_instr_new(MirOp.Add, mir_opnd_vreg(addr), base, mir_opnd_imm(f_off))
+				b4 = builder_add_instr(b4, ins_a)
+				if f_nested == 1 do
+					out expr_result(b4, mir_opnd_vreg(addr))
+				else
+					b4 = emit_load_typed(b4, dst, mir_opnd_vreg(addr), f_sz, f_sgn)
+					out expr_result(b4, mir_opnd_vreg(dst))
+				end
+			end
+			var fid = 0 - 1
+			if fat_str_len(base_type) > 0 do
+				fid = get_scoped_field_index(base_type, fname)
+			end
+			if fid < 0 do
+				if fat_cstr_eq(fname, "grad") == 1 do
+					fid = 1
+				else
+					base_name = ast_node_name(base_ast)
+					fid = find_field_index_for_base(base_name, fname)
+				end
+			end
+			var (b4, addr) = builder_new_vreg(b3)
+			ins_a = mir_instr_new(MirOp.Add, mir_opnd_vreg(addr), base, mir_opnd_imm(fid * 8))
+			b4 = builder_add_instr(b4, ins_a)
+			b4 = emit_load(b4, dst, mir_opnd_vreg(addr))
+			out expr_result(b4, mir_opnd_vreg(dst))
+		end
+	end
+
+    # 10. EnumAccess — enum name + variant name (source syntax: Enum.Variant)
+	if expr_type == AstType.EnumAccess do
+		enum_name_str = ast_node_name(expr)
+		variant_name_str = ast_node_name2(expr)
+		out lower_enum_construct(b, expr, enum_name_str, variant_name_str)
+	end
+
+    # 11. InputExpr
+ if expr_type == AstType.InputExpr do
+ var (b2, dst) = builder_new_vreg(b)
+ b2 = emit_intrinsic(b2, MIR_INTR_INPUT, mir_opnd_vreg(dst), mir_opnd_none())
+ out expr_result(b2, mir_opnd_vreg(dst))
+ end
+
+    # 12. CastExpr — preserve source/destination numeric categories in kind.
+ if expr_type == AstType.CastExpr do
+ nch = ast_node_child_count(expr)
+ if nch > 0 do
+ var cast_child = ast_node_child(expr, 0)
+ var b2 = lower_expr(b, cast_child)
+ var child_opnd = g_lower_expr_result_opnd as MirOperand
+ var (b3, dst) = builder_new_vreg(b2)
+ var cast_src_name = infer_expr_type_name(cast_child)
+ var cast_dst_name = ast_node_name(expr)
+ var cast_src_cat = 1
+ var cast_dst_cat = 1
+ var cast_dst_bits = 64
+ var cast_is_unsigned = 0
+ var cast_mir_type = MirType.Int64 as i64
+ if is_float_type_name(cast_src_name) do cast_src_cat = 2 end
+ if is_float_type_name(cast_dst_name) do
+     cast_dst_cat = 2
+     cast_mir_type = MirType.F64 as i64
+     if fat_cstr_eq(cast_dst_name, "f32") == 1 do cast_dst_bits = 32 end
+ end
+ var resolved_dst_name = get_mold_or_register_backing_type(cast_dst_name)
+ if fat_cstr_eq(resolved_dst_name, "i8") == 1 do cast_dst_bits = 8; cast_mir_type = MirType.Int8 as i64 end
+ if fat_cstr_eq(resolved_dst_name, "u8") == 1 do cast_dst_bits = 8; cast_is_unsigned = 1; cast_mir_type = MirType.Int8 as i64 end
+ if fat_cstr_eq(resolved_dst_name, "i16") == 1 do cast_dst_bits = 16; cast_mir_type = MirType.Int16 as i64 end
+ if fat_cstr_eq(resolved_dst_name, "u16") == 1 do cast_dst_bits = 16; cast_is_unsigned = 1; cast_mir_type = MirType.Int16 as i64 end
+ if fat_cstr_eq(resolved_dst_name, "i32") == 1 do cast_dst_bits = 32; cast_mir_type = MirType.Int32 as i64 end
+ if fat_cstr_eq(resolved_dst_name, "u32") == 1 do cast_dst_bits = 32; cast_is_unsigned = 1; cast_mir_type = MirType.Int32 as i64 end
+ if fat_cstr_eq(resolved_dst_name, "u64") == 1 or fat_cstr_eq(resolved_dst_name, "uint") == 1 or fat_cstr_eq(resolved_dst_name, "usize") == 1 do cast_dst_bits = 64; cast_is_unsigned = 1; cast_mir_type = MirType.Int64 as i64 end
+ var cast_kind = MIR_INTR_CAST + (cast_src_cat shl 8) + (cast_dst_cat shl 16) + (cast_dst_bits shl 24) + (cast_is_unsigned shl 32)
+ b3 = emit_intrinsic_typed(b3, cast_kind, mir_opnd_vreg(dst), child_opnd, cast_mir_type)
+ out expr_result(b3, mir_opnd_vreg(dst))
+ end
+ end
+
+    # 13. AwaitExpr — await expr | await pass
+ if expr_type == AstType.AwaitExpr do
+ if fat_cstr_eq(ast_node_name(expr), "pass") do
+ var (b2, dst) = builder_new_vreg(b)
+ b2 = emit_intrinsic(b2, MIR_INTR_AWAIT_PASS, mir_opnd_vreg(dst), mir_opnd_none())
+ out expr_result(b2, mir_opnd_vreg(dst))
+ end
+ nch = ast_node_child_count(expr)
+ if nch > 0 do
+ var b2 = lower_expr(b, ast_node_child(expr, 0))
+ var child_opnd = g_lower_expr_result_opnd as MirOperand
+ var (b3, dst) = builder_new_vreg(b2)
+ b3 = emit_intrinsic(b3, MIR_INTR_AWAIT, mir_opnd_vreg(dst), child_opnd)
+ out expr_result(b3, mir_opnd_vreg(dst))
+ end
+ end
+
+    # 15. CheckCpu / PatchPoint
+ if expr_type == AstType.CheckCpu do
+ var (b2, dst) = builder_new_vreg(b)
+ b2 = emit_intrinsic(b2, MIR_INTR_CHECK_CPU, mir_opnd_vreg(dst), mir_opnd_none())
+ out expr_result(b2, mir_opnd_vreg(dst))
+ end
+	if expr_type == AstType.PatchPoint do
+		var (b1, pid) = builder_intern(b, ast_node_name(expr))
+		var (b2, dst) = builder_new_vreg(b1)
+		b2 = emit_intrinsic(b2, MIR_INTR_PATCH_POINT, mir_opnd_vreg(dst), mir_opnd_imm(pid))
+		out expr_result(b2, mir_opnd_vreg(dst))
+	end
+
+    # 14. NamedArg — children[0] is value (name on .name)
+	if expr_type == AstType.NamedArg do
+		nch = ast_node_child_count(expr)
+		if nch > 0 do
+			out lower_expr(b, ast_node_child(expr, 0))
+		end
+	end
+
+	out expr_result(b, mir_opnd_none())
+end.
+
+
+func is_dict_type_name(type_name: string):
+	if type_name != 0 and fat_cstr_eq(type_name, "dict") == 1 do out 1 end
+	out 0
+end.
+
+func dict_key_is_string(node: &AstNode):
+	if fat_cstr_eq(infer_expr_type_name(node), "string") == 1 do out 1 end
+	out 0
+end.
+
+func lower_dict_key_equal(b: &MirBuilder, stored_key: &MirOperand, key: &MirOperand, key_is_string: int):
+	var (b_eq, eq_v) = builder_new_vreg(b)
+	if key_is_string == 1 do
+		b_eq = emit_set_arg(b_eq, 0, stored_key)
+		b_eq = emit_set_arg(b_eq, 1, key)
+		b_eq = emit_intrinsic(b_eq, MIR_INTR_BUILTIN, mir_opnd_vreg(eq_v), mir_opnd_imm(12))
+	else
+		b_eq = builder_add_instr(b_eq, mir_instr_new(MirOp.CmpEq, mir_opnd_vreg(eq_v), stored_key, key))
+	end
+	out expr_result(b_eq, mir_opnd_vreg(eq_v))
+end.
+
+func lower_dict_literal(b: MirBuilder, expr: &AstNode):
+	n = ast_node_child_count(expr) / 2
+	cap = n + 8
+	if cap < 8 do cap = 8 end
+	if cap > 256 do cap = 256 end
+	# Reserve backing storage once so growth can keep the dictionary pointer
+	# stable; the header still exposes the smaller logical capacity.
+	var reserved_cap = 256
+	b_mut = emit_set_arg(b, 0, mir_opnd_imm(16 + reserved_cap * 16))
+	var (b_base, base) = builder_new_vreg(b_mut)
+	b_base = emit_intrinsic(b_base, MIR_INTR_BUILTIN, mir_opnd_vreg(base), mir_opnd_imm(3))
+	b_mut = b_base
+	b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(base))
+	b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(0))
+	b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(0))
+	b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+	b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(base))
+	b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(8))
+	b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(cap))
+	b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+	var i = 0
+	when i < n loop
+		var key_node = ast_node_child(expr, i * 2)
+		var b_key = lower_expr(b_mut, key_node)
+		var kop = g_lower_expr_result_opnd as MirOperand
+		var b_val = lower_expr(b_key, ast_node_child(expr, i * 2 + 1))
+		var vop = g_lower_expr_result_opnd as MirOperand
+		b_mut = lower_dict_store(b_val, mir_opnd_vreg(base), kop, vop, dict_key_is_string(key_node))
+		i = i + 1
+	end
+	out expr_result(b_mut, mir_opnd_vreg(base))
+end.
+
+func lower_dict_index(b: MirBuilder, base: &MirOperand, key: &MirOperand, key_is_string: int):
+	var (b_len, len_v) = builder_new_vreg(b)
+	b_len = emit_load(b_len, len_v, base)
+	var (b_res, res_v) = builder_new_vreg(b_len)
+	b_res = emit_move(b_res, res_v, mir_opnd_imm(0))
+	var (b_i, i_v) = builder_new_vreg(b_res)
+	b_i = emit_move(b_i, i_v, mir_opnd_imm(0))
+	var (b1, cond_id) = builder_add_block(b_i)
+	var (b2, body_id) = builder_add_block(b1)
+	var (b3, match_id) = builder_add_block(b2)
+	var (b4, step_id) = builder_add_block(b3)
+	var (b5, end_id) = builder_add_block(b4)
+	b5 = emit_jump(b5, cond_id)
+	b5 = builder_set_current_block(b5, cond_id)
+	var (b_cmp, cmp_v) = builder_new_vreg(b5)
+	b_cmp = builder_add_instr(b_cmp, mir_instr_new(MirOp.CmpLt, mir_opnd_vreg(cmp_v), mir_opnd_vreg(i_v), mir_opnd_vreg(len_v)))
+	b_cmp = emit_jump_if_not(b_cmp, mir_opnd_vreg(cmp_v), end_id, body_id)
+	b_cmp = builder_set_current_block(b_cmp, body_id)
+	var (b_mul, off_v) = builder_new_vreg(b_cmp)
+	b_mul = builder_add_instr(b_mul, mir_instr_new(MirOp.Mul, mir_opnd_vreg(off_v), mir_opnd_vreg(i_v), mir_opnd_imm(16)))
+	var (b_add, key_addr) = builder_new_vreg(b_mul)
+	b_add = builder_add_instr(b_add, mir_instr_new(MirOp.Add, mir_opnd_vreg(key_addr), base, mir_opnd_vreg(off_v)))
+	var (b_add2, key_addr2) = builder_new_vreg(b_add)
+	b_add2 = builder_add_instr(b_add2, mir_instr_new(MirOp.Add, mir_opnd_vreg(key_addr2), mir_opnd_vreg(key_addr), mir_opnd_imm(16)))
+	var (b_load, stored_key) = builder_new_vreg(b_add2)
+	b_load = emit_load(b_load, stored_key, mir_opnd_vreg(key_addr2))
+	var b_eq = lower_dict_key_equal(b_load, mir_opnd_vreg(stored_key), key, key_is_string)
+	var eq_opnd = g_lower_expr_result_opnd as MirOperand
+	b_eq = emit_jump_if(b_eq, eq_opnd, match_id, step_id)
+	b_eq = builder_set_current_block(b_eq, match_id)
+	var (b_val_addr, val_addr) = builder_new_vreg(b_eq)
+	b_val_addr = builder_add_instr(b_val_addr, mir_instr_new(MirOp.Add, mir_opnd_vreg(val_addr), mir_opnd_vreg(key_addr2), mir_opnd_imm(8)))
+	var (b_val, val_v) = builder_new_vreg(b_val_addr)
+	b_val = emit_load(b_val, val_v, mir_opnd_vreg(val_addr))
+	b_val = emit_move(b_val, res_v, mir_opnd_vreg(val_v))
+	b_val = emit_move(b_val, i_v, mir_opnd_vreg(len_v))
+	b_val = emit_jump(b_val, step_id)
+	b_val = builder_set_current_block(b_val, step_id)
+	var (b_inc, next_i) = builder_new_vreg(b_val)
+	b_inc = builder_add_instr(b_inc, mir_instr_new(MirOp.Add, mir_opnd_vreg(next_i), mir_opnd_vreg(i_v), mir_opnd_imm(1)))
+	b_inc = emit_move(b_inc, i_v, mir_opnd_vreg(next_i))
+	b_inc = emit_jump(b_inc, cond_id)
+	b_inc = builder_set_current_block(b_inc, end_id)
+	out expr_result(b_inc, mir_opnd_vreg(res_v))
+end.
+
+func lower_dict_store(b: MirBuilder, base: &MirOperand, key: &MirOperand, val: &MirOperand, key_is_string: int):
+	var (b_len, len_v) = builder_new_vreg(b)
+	b_len = emit_load(b_len, len_v, base)
+	var (b_cap_addr, cap_addr) = builder_new_vreg(b_len)
+	b_cap_addr = builder_add_instr(b_cap_addr, mir_instr_new(MirOp.Add, mir_opnd_vreg(cap_addr), base, mir_opnd_imm(8)))
+	var (b_cap, cap_v) = builder_new_vreg(b_cap_addr)
+	b_cap = emit_load(b_cap, cap_v, mir_opnd_vreg(cap_addr))
+	var (b_found, found_v) = builder_new_vreg(b_cap)
+	b_found = emit_move(b_found, found_v, mir_opnd_imm(0))
+	var (b_i, i_v) = builder_new_vreg(b_found)
+	b_i = emit_move(b_i, i_v, mir_opnd_imm(0))
+	var (b1, cond_id) = builder_add_block(b_i)
+	var (b2, body_id) = builder_add_block(b1)
+	var (b3, match_id) = builder_add_block(b2)
+	var (b4, step_id) = builder_add_block(b3)
+	var (b5, append_check_id) = builder_add_block(b4)
+	var (b6, append_id) = builder_add_block(b5)
+	var (b7, grow_id) = builder_add_block(b6)
+	var (b8, grow_body_id) = builder_add_block(b7)
+	var (b9, capacity_error_id) = builder_add_block(b8)
+	var (b10, append_body_id) = builder_add_block(b9)
+	var (b11, end_id) = builder_add_block(b10)
+	b11 = emit_jump(b11, cond_id)
+	b11 = builder_set_current_block(b11, cond_id)
+	var (b_cmp, cmp_v) = builder_new_vreg(b11)
+	b_cmp = builder_add_instr(b_cmp, mir_instr_new(MirOp.CmpLt, mir_opnd_vreg(cmp_v), mir_opnd_vreg(i_v), mir_opnd_vreg(len_v)))
+	b_cmp = emit_jump_if_not(b_cmp, mir_opnd_vreg(cmp_v), append_check_id, body_id)
+	b_cmp = builder_set_current_block(b_cmp, body_id)
+	var (b_mul, off_v) = builder_new_vreg(b_cmp)
+	b_mul = builder_add_instr(b_mul, mir_instr_new(MirOp.Mul, mir_opnd_vreg(off_v), mir_opnd_vreg(i_v), mir_opnd_imm(16)))
+	var (b_add, key_addr) = builder_new_vreg(b_mul)
+	b_add = builder_add_instr(b_add, mir_instr_new(MirOp.Add, mir_opnd_vreg(key_addr), base, mir_opnd_vreg(off_v)))
+	var (b_add2, key_addr2) = builder_new_vreg(b_add)
+	b_add2 = builder_add_instr(b_add2, mir_instr_new(MirOp.Add, mir_opnd_vreg(key_addr2), mir_opnd_vreg(key_addr), mir_opnd_imm(16)))
+	var (b_load, stored_key) = builder_new_vreg(b_add2)
+	b_load = emit_load(b_load, stored_key, mir_opnd_vreg(key_addr2))
+	var b_eq = lower_dict_key_equal(b_load, mir_opnd_vreg(stored_key), key, key_is_string)
+	var eq_opnd = g_lower_expr_result_opnd as MirOperand
+	b_eq = emit_jump_if(b_eq, eq_opnd, match_id, step_id)
+	b_eq = builder_set_current_block(b_eq, match_id)
+	var (b_val_addr, val_addr) = builder_new_vreg(b_eq)
+	b_val_addr = builder_add_instr(b_val_addr, mir_instr_new(MirOp.Add, mir_opnd_vreg(val_addr), mir_opnd_vreg(key_addr2), mir_opnd_imm(8)))
+	b_val_addr = emit_store(b_val_addr, mir_opnd_vreg(val_addr), val)
+	b_val_addr = emit_move(b_val_addr, found_v, mir_opnd_imm(1))
+	b_val_addr = emit_move(b_val_addr, i_v, mir_opnd_vreg(len_v))
+	b_val_addr = emit_jump(b_val_addr, step_id)
+	b_val_addr = builder_set_current_block(b_val_addr, step_id)
+	var (b_inc, next_i) = builder_new_vreg(b_val_addr)
+	b_inc = builder_add_instr(b_inc, mir_instr_new(MirOp.Add, mir_opnd_vreg(next_i), mir_opnd_vreg(i_v), mir_opnd_imm(1)))
+	b_inc = emit_move(b_inc, i_v, mir_opnd_vreg(next_i))
+	b_inc = emit_jump(b_inc, cond_id)
+	b_inc = builder_set_current_block(b_inc, append_check_id)
+	var (b_nf, not_found_v) = builder_new_vreg(b_inc)
+	b_nf = builder_add_instr(b_nf, mir_instr_new(MirOp.CmpEq, mir_opnd_vreg(not_found_v), mir_opnd_vreg(found_v), mir_opnd_imm(0)))
+	b_nf = emit_jump_if_not(b_nf, mir_opnd_vreg(not_found_v), end_id, append_id)
+	b_nf = builder_set_current_block(b_nf, append_id)
+	var (b_room, room_v) = builder_new_vreg(b_nf)
+	b_room = builder_add_instr(b_room, mir_instr_new(MirOp.CmpLt, mir_opnd_vreg(room_v), mir_opnd_vreg(len_v), mir_opnd_vreg(cap_v)))
+	b_room = emit_jump_if_not(b_room, mir_opnd_vreg(room_v), grow_id, append_body_id)
+	b_room = builder_set_current_block(b_room, grow_id)
+	var (b_can_grow, can_grow_v) = builder_new_vreg(b_room)
+	b_can_grow = builder_add_instr(b_can_grow, mir_instr_new(MirOp.CmpLt, mir_opnd_vreg(can_grow_v), mir_opnd_vreg(cap_v), mir_opnd_imm(256)))
+	b_can_grow = emit_jump_if_not(b_can_grow, mir_opnd_vreg(can_grow_v), capacity_error_id, grow_body_id)
+	b_can_grow = builder_set_current_block(b_can_grow, grow_body_id)
+	var b_grow = emit_store(b_can_grow, mir_opnd_vreg(cap_addr), mir_opnd_imm(256))
+	b_room = emit_jump(b_grow, append_body_id)
+	b_room = builder_set_current_block(b_room, capacity_error_id)
+	b_room = emit_set_arg(b_room, 0, mir_opnd_imm(70))
+	b_room = emit_intrinsic(b_room, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(18))
+	b_room = emit_jump(b_room, end_id)
+	b_room = builder_set_current_block(b_room, append_body_id)
+	var (b_aoff, append_off) = builder_new_vreg(b_room)
+	b_aoff = builder_add_instr(b_aoff, mir_instr_new(MirOp.Mul, mir_opnd_vreg(append_off), mir_opnd_vreg(len_v), mir_opnd_imm(16)))
+	var (b_ak0, append_key_addr0) = builder_new_vreg(b_aoff)
+	b_ak0 = builder_add_instr(b_ak0, mir_instr_new(MirOp.Add, mir_opnd_vreg(append_key_addr0), base, mir_opnd_vreg(append_off)))
+	var (b_ak, append_key_addr) = builder_new_vreg(b_ak0)
+	b_ak = builder_add_instr(b_ak, mir_instr_new(MirOp.Add, mir_opnd_vreg(append_key_addr), mir_opnd_vreg(append_key_addr0), mir_opnd_imm(16)))
+	b_ak = emit_store(b_ak, mir_opnd_vreg(append_key_addr), key)
+	var (b_av, append_val_addr) = builder_new_vreg(b_ak)
+	b_av = builder_add_instr(b_av, mir_instr_new(MirOp.Add, mir_opnd_vreg(append_val_addr), mir_opnd_vreg(append_key_addr), mir_opnd_imm(8)))
+	b_av = emit_store(b_av, mir_opnd_vreg(append_val_addr), val)
+	var (b_lnext, len_next) = builder_new_vreg(b_av)
+	b_lnext = builder_add_instr(b_lnext, mir_instr_new(MirOp.Add, mir_opnd_vreg(len_next), mir_opnd_vreg(len_v), mir_opnd_imm(1)))
+	b_lnext = emit_store(b_lnext, base, mir_opnd_vreg(len_next))
+	b_lnext = builder_set_current_block(emit_jump(b_lnext, end_id), end_id)
+	out b_lnext
+end.
+
+func lower_map_emit_value(b: MirBuilder, out_base: &MirOperand, len_v: i64, value_expr: &AstNode):
+	var b_val = lower_expr(b, value_expr)
+	var val_op = g_lower_expr_result_opnd as MirOperand
+	out lower_map_emit_operand(b_val, out_base, len_v, val_op)
+end.
+
+func lower_map_emit_operand(b: MirBuilder, out_base: &MirOperand, len_v: i64, val_op: &MirOperand):
+	b_val = b
+	var (b_len, cur_len) = builder_new_vreg(b_val)
+	b_len = emit_load(b_len, cur_len, out_base)
+	b_val = b_len
+	b_val = emit_set_arg(b_val, 0, mir_opnd_vreg(cur_len))
+	b_val = emit_set_arg(b_val, 1, val_op)
+	b_val = emit_intrinsic(b_val, MIR_INTR_INDEX_STORE, mir_opnd_none(), out_base)
+	var (b_next, next_len) = builder_new_vreg(b_val)
+	b_next = builder_add_instr(b_next, mir_instr_new(MirOp.Add, mir_opnd_vreg(next_len), mir_opnd_vreg(cur_len), mir_opnd_imm(1)))
+	b_next = emit_store(b_next, out_base, mir_opnd_vreg(next_len))
+	out b_next
+end.
+
+func lower_map_condition(b: MirBuilder, cond: &AstNode, binder_name: &string, current_addr: &MirOperand):
+	if (cond.node_type == AstType.Compare or cond.node_type == AstType.BinOp) and ast_node_op_of(cond) == OpType.Eq and ast_node_child_count(cond) >= 2 do
+		left = ast_node_child(cond, 0)
+		right = ast_node_child(cond, 1)
+		if left.node_type == AstType.BinOp and ast_node_op_of(left) == OpType.ModOp and ast_node_child_count(left) >= 2 do
+			mod_left = ast_node_child(left, 0)
+			mod_right = ast_node_child(left, 1)
+			if mod_left.node_type == AstType.Identifier and fat_str_eq(mod_left.name, binder_name as string) == 1 do
+				var (b_load_cur, cur_v) = builder_new_vreg(b)
+				b_load_cur = emit_load(b_load_cur, cur_v, current_addr)
+				var b_mod_rhs = lower_expr(b_load_cur, mod_right)
+				var rhs_op = g_lower_expr_result_opnd as MirOperand
+				var (b_mod, mod_v) = builder_new_vreg(b_mod_rhs)
+				b_mod = builder_add_instr(b_mod, mir_instr_new(MirOp.Mod, mir_opnd_vreg(mod_v), mir_opnd_vreg(cur_v), rhs_op))
+				var b_cmp_rhs = lower_expr(b_mod, right)
+				var cmp_rhs = g_lower_expr_result_opnd as MirOperand
+				var (b_cmp, cmp_v) = builder_new_vreg(b_cmp_rhs)
+				b_cmp = builder_add_instr(b_cmp, mir_instr_new(MirOp.CmpEq, mir_opnd_vreg(cmp_v), mir_opnd_vreg(mod_v), cmp_rhs))
+				out expr_result(b_cmp, mir_opnd_vreg(cmp_v))
+			end
+		end
+	end
+	out lower_expr(b, cond)
+end.
+
+func lower_map_body_emit(b: MirBuilder, out_base: &MirOperand, len_v: i64, body: &AstNode, binder_name: &string, binder_op: &MirOperand, current_addr: &MirOperand):
+	if (body as i64) == 0 do out b end
+	var body_t = ast_node_type_of(body)
+	if body_t == AstType.Block do
+		var n = ast_node_child_count(body)
+		if n <= 0 do out b end
+		out lower_map_body_emit(b, out_base, len_v, ast_node_child(body, 0), binder_name, binder_op, current_addr)
+	end
+	if body_t == AstType.ReturnStmt do
+		if ast_node_child_count(body) > 0 do
+			ret_expr = ast_node_child(body, 0)
+			if ret_expr.node_type == AstType.Identifier and fat_str_eq(ret_expr.name, binder_name as string) == 1 do
+				var (b_reload, reload_v) = builder_new_vreg(b)
+				b_reload = emit_load(b_reload, reload_v, current_addr)
+				out lower_map_emit_operand(b_reload, out_base, len_v, mir_opnd_vreg(reload_v))
+			end
+			out lower_map_emit_value(b, out_base, len_v, ret_expr)
+		end
+		out b
+	end
+	if body_t == AstType.IfStmt do
+		if ast_node_child_count(body) >= 2 do
+			var (b_cond_base, cond_reload) = builder_new_vreg(b)
+			b_cond_base = emit_load(b_cond_base, cond_reload, current_addr)
+			b_cond_base = set_var_vreg(b_cond_base, binder_name as string, cond_reload)
+			var b_cond = lower_map_condition(b_cond_base, ast_node_child(body, 0), binder_name, current_addr)
+			var cond_op = g_lower_expr_result_opnd as MirOperand
+			var (b_then, then_id) = builder_add_block(b_cond)
+			var (b_end, end_id) = builder_add_block(b_then)
+			b_end = emit_jump_if_not(b_end, cond_op, end_id, then_id)
+			b_end = builder_set_current_block(b_end, then_id)
+			b_end = lower_map_body_emit(b_end, out_base, len_v, ast_node_child(body, 1), binder_name, binder_op, current_addr)
+			if not builder_current_block_terminated(b_end) do
+				b_end = emit_jump(b_end, end_id)
+			end
+			out builder_set_current_block(b_end, end_id)
+		end
+	end
+	out b
+end.
+
+func lower_map_block_expr(b: MirBuilder, expr: &AstNode):
+	child_count = ast_node_child_count(expr)
+	if child_count < 2 do
+		var (b_empty, empty_dst) = builder_new_vreg(b)
+		b_empty = emit_set_arg(b_empty, 0, mir_opnd_imm(16))
+		b_empty = emit_intrinsic(b_empty, MIR_INTR_BUILTIN, mir_opnd_vreg(empty_dst), mir_opnd_imm(3))
+		out expr_result(b_empty, mir_opnd_vreg(empty_dst))
+	end
+	source_expr = ast_node_child(expr, 0)
+	body = ast_node_child(expr, 1)
+	var b_src = lower_expr(b, source_expr)
+	var src_op = g_lower_expr_result_opnd as MirOperand
+	var (b_len, src_len) = builder_new_vreg(b_src)
+	b_len = emit_load(b_len, src_len, src_op)
+	var (b_bytes_mul, bytes_payload) = builder_new_vreg(b_len)
+	b_bytes_mul = builder_add_instr(b_bytes_mul, mir_instr_new(MirOp.Mul, mir_opnd_vreg(bytes_payload), mir_opnd_vreg(src_len), mir_opnd_imm(8)))
+	var (b_bytes, alloc_bytes) = builder_new_vreg(b_bytes_mul)
+	b_bytes = builder_add_instr(b_bytes, mir_instr_new(MirOp.Add, mir_opnd_vreg(alloc_bytes), mir_opnd_vreg(bytes_payload), mir_opnd_imm(16)))
+	b_bytes = emit_set_arg(b_bytes, 0, mir_opnd_vreg(alloc_bytes))
+	var (b_alloc, out_v) = builder_new_vreg(b_bytes)
+	b_alloc = emit_intrinsic(b_alloc, MIR_INTR_BUILTIN, mir_opnd_vreg(out_v), mir_opnd_imm(3))
+	b_alloc = emit_store(b_alloc, mir_opnd_vreg(out_v), mir_opnd_imm(0))
+	var (b_cap_addr, cap_addr) = builder_new_vreg(b_alloc)
+	b_cap_addr = builder_add_instr(b_cap_addr, mir_instr_new(MirOp.Add, mir_opnd_vreg(cap_addr), mir_opnd_vreg(out_v), mir_opnd_imm(8)))
+	b_cap_addr = emit_store(b_cap_addr, mir_opnd_vreg(cap_addr), mir_opnd_vreg(src_len))
+	var (b_i, i_v) = builder_new_vreg(b_cap_addr)
+	b_i = emit_move(b_i, i_v, mir_opnd_imm(0))
+	var (b_out_len, out_len_v) = builder_new_vreg(b_i)
+	b_out_len = emit_move(b_out_len, out_len_v, mir_opnd_imm(0))
+	b_out_len = emit_set_arg(b_out_len, 0, mir_opnd_imm(8))
+	var (b_cell_alloc, current_cell) = builder_new_vreg(b_out_len)
+	b_cell_alloc = emit_intrinsic(b_cell_alloc, MIR_INTR_BUILTIN, mir_opnd_vreg(current_cell), mir_opnd_imm(3))
+	var (b1, cond_id) = builder_add_block(b_cell_alloc)
+	var (b2, body_id) = builder_add_block(b1)
+	var (b3, step_id) = builder_add_block(b2)
+	var (b4, end_id) = builder_add_block(b3)
+	b4 = emit_jump(b4, cond_id)
+	b4 = builder_set_current_block(b4, cond_id)
+	var (b_cmp, cmp_v) = builder_new_vreg(b4)
+	b_cmp = builder_add_instr(b_cmp, mir_instr_new(MirOp.CmpLt, mir_opnd_vreg(cmp_v), mir_opnd_vreg(i_v), mir_opnd_vreg(src_len)))
+	b_cmp = emit_jump_if_not(b_cmp, mir_opnd_vreg(cmp_v), end_id, body_id)
+	b_cmp = builder_set_current_block(b_cmp, body_id)
+	var (b_elem, elem_v) = builder_new_vreg(b_cmp)
+	b_elem = emit_set_arg(b_elem, 0, mir_opnd_vreg(i_v))
+	b_elem = emit_intrinsic(b_elem, MIR_INTR_INDEX, mir_opnd_vreg(elem_v), src_op)
+	b_elem = emit_store(b_elem, mir_opnd_vreg(current_cell), mir_opnd_vreg(elem_v))
+	b_elem = set_var_vreg(b_elem, ast_node_name(expr), elem_v)
+	b_elem = lower_map_body_emit(b_elem, mir_opnd_vreg(out_v), out_len_v, body, ast_node_name(expr) as i64, mir_opnd_vreg(elem_v), mir_opnd_vreg(current_cell))
+	b_elem = emit_jump(b_elem, step_id)
+	b_elem = builder_set_current_block(b_elem, step_id)
+	var (b_inc, next_i) = builder_new_vreg(b_elem)
+	b_inc = builder_add_instr(b_inc, mir_instr_new(MirOp.Add, mir_opnd_vreg(next_i), mir_opnd_vreg(i_v), mir_opnd_imm(1)))
+	b_inc = emit_move(b_inc, i_v, mir_opnd_vreg(next_i))
+	b_inc = emit_jump(b_inc, cond_id)
+	b_inc = builder_set_current_block(b_inc, end_id)
+	out expr_result(b_inc, mir_opnd_vreg(out_v))
+end.
+
+func lower_expr(b: &MirBuilder, expr: &AstNode):
+	out lower_expr_impl(b, expr)
+end.
+
+func scan_has_local_arena_alloc(node: &AstNode):
+    if node == 0 do out 0 end
+    let nt = ast_node_type_of(node)
+    if nt == AstType.ArrayLiteral do out 1 end
+    let nc = ast_node_child_count(node)
+    var i = 0
+    when i < nc loop
+        let ch = ast_node_child(node, i)
+        if scan_has_local_arena_alloc(ch) == 1 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+

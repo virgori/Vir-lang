@@ -1,0 +1,182 @@
+# ═════════════════════════════════════════════════════════════════════
+# Module: static/etag.vri
+# Pure Vir HTTP ETag & Conditional Request Engine (RFC 7232)
+# Handles FNV-1a Hash, Weak/Strong ETag Matching & HTTP 304 Response
+# ═════════════════════════════════════════════════════════════════════
+
+func etag_str_len(s: ptr) -> int:
+    if s == 0 do out 0 end
+    var i = 0
+    when read_byte(s, i) != 0 loop
+        i = i + 1
+    end
+    out i
+end.
+
+func etag_hex_char(nibble: int) -> int:
+    let n = nibble & 15
+    if n < 10 do out 48 + n end
+    out 97 + (n - 10)
+end.
+
+# Compute FNV-1a 64-bit hash over file_size and mtime, formatted as "\"<16hex>\""
+func etag_compute_fnv1a(file_size: int, mtime: int, out_etag: ptr, max_len: int) -> int:
+    if out_etag == 0 do out 0 end
+    if max_len < 19 do out 0 end # 1 ('"') + 16 (hex) + 1 ('"') + 1 (null) = 19 bytes
+
+    # FNV-1a 64-bit basis
+    var hash = 14695981039346656037
+    let prime = 1099511628211
+
+    # Mix file_size bytes (8 bytes)
+    var b_idx = 0
+    var temp_sz = file_size
+    when b_idx < 8 loop
+        let b = temp_sz & 255
+        hash = hash xor b
+        hash = hash * prime
+        temp_sz = temp_sz shr 8
+        b_idx = b_idx + 1
+    end
+
+    # Mix mtime bytes (8 bytes)
+    b_idx = 0
+    var temp_mt = mtime
+    when b_idx < 8 loop
+        let b = temp_mt & 255
+        hash = hash xor b
+        hash = hash * prime
+        temp_mt = temp_mt shr 8
+        b_idx = b_idx + 1
+    end
+
+    # Format into "\"<16hex>\""
+    write_byte(out_etag, 0, 34) # '"'
+    var i = 0
+    when i < 16 loop
+        let shift = (15 - i) * 4
+        let nibble = (hash shr shift) & 15
+        write_byte(out_etag, 1 + i, etag_hex_char(nibble))
+        i = i + 1
+    end
+    write_byte(out_etag, 17, 34) # '"'
+    write_byte(out_etag, 18, 0)
+    out 18
+end.
+
+# Strip optional weak prefix 'W/' and leading/trailing quotes for comparison
+func etag_normalize(etag: ptr, out_buf: ptr, max_len: int) -> int:
+    if etag == 0 do out 0 end
+    if out_buf == 0 do out 0 end
+    if max_len <= 0 do out 0 end
+    let l = etag_str_len(etag)
+    var start = 0
+    # Check for "W/" or "w/"
+    if l >= 2 do
+        let c0 = read_byte(etag, 0)
+        let c1 = read_byte(etag, 1)
+        if ((c0 == 87) | (c0 == 119)) & (c1 == 47) do
+            start = 2
+        end
+    end
+    # Strip leading quote
+    if (start < l) & (read_byte(etag, start) == 34) do
+        start = start + 1
+    end
+
+    var end_pos = l
+    if (end_pos > start) & (read_byte(etag, end_pos - 1) == 34) do
+        end_pos = end_pos - 1
+    end
+
+    let span = end_pos - start
+    if span >= max_len do
+        write_byte(out_buf, 0, 0)
+        out 0
+    end
+    var i = 0
+    when i < span loop
+        if i < (max_len - 1) do
+            write_byte(out_buf, i, read_byte(etag, start + i))
+            i = i + 1
+        else
+            i = span
+        end
+    end
+    write_byte(out_buf, i, 0)
+    out i
+end.
+
+# Check conditional ETag match (RFC 7232 §3.2)
+# Returns 1 if matching (Client cache fresh -> send HTTP 304)
+# Returns 0 if mismatch (Send full HTTP 200 body)
+func etag_check_condition(req_if_none_match: ptr, actual_etag: ptr) -> int:
+    if req_if_none_match == 0 do out 0 end
+    if actual_etag == 0 do out 0 end
+
+    # Wildcard '*' always matches existing resource
+    if (read_byte(req_if_none_match, 0) == 42) & (read_byte(req_if_none_match, 1) == 0) do
+        out 1
+    end
+
+    let norm_req = alloc(64) as ptr
+    let l_req = etag_normalize(req_if_none_match, norm_req, 64)
+
+    let norm_act = alloc(64) as ptr
+    let l_act = etag_normalize(actual_etag, norm_act, 64)
+
+    if l_req != l_act do out 0 end
+    if l_req == 0 do out 0 end
+
+    var i = 0
+    when i < l_req loop
+        if read_byte(norm_req, i) != read_byte(norm_act, i) do out 0 end
+        i = i + 1
+    end
+
+    out 1
+end.
+
+# Build minimal standard HTTP 304 Not Modified response
+func http_build_304_response(etag: ptr, out_buf: ptr, max_len: int) -> int:
+    if out_buf == 0 as ptr do out 0 end
+    if max_len <= 0 do out 0 end
+    var p = 0
+
+    let p1 = "HTTP/1.1 304 Not Modified\r\nETag: " as ptr
+    var i = 0
+    let l1 = etag_str_len(p1)
+    when i < l1 loop
+        if p < (max_len - 1) do
+            write_byte(out_buf, p, read_byte(p1, i))
+            p = p + 1
+        end
+        i = i + 1
+    end
+
+    if etag != 0 as ptr do
+        i = 0
+        let le = etag_str_len(etag)
+        when i < le loop
+            if p < (max_len - 1) do
+                write_byte(out_buf, p, read_byte(etag, i))
+                p = p + 1
+            end
+            i = i + 1
+        end
+    end
+
+    let p2 = "\r\nConnection: keep-alive\r\n\r\n" as ptr
+    i = 0
+    let l2 = etag_str_len(p2)
+    when i < l2 loop
+        if p < (max_len - 1) do
+            write_byte(out_buf, p, read_byte(p2, i))
+            p = p + 1
+        end
+        i = i + 1
+    end
+
+    write_byte(out_buf, p, 0)
+    out p
+end.

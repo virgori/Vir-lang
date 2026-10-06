@@ -1,0 +1,337 @@
+# Module: protocol/json_slice
+# Raw JSON slice scanner/view for HTTP-oriented token offsets.
+#
+# This module does not validate documents or convert JSON values. Callers must
+# use Vir stdlib JSON for parsing, conversion, and serialization semantics.
+# Offsets are relative to the supplied byte buffer slice.
+
+const JSON_TYPE_UNKNOWN = 0
+const JSON_TYPE_NULL    = 1
+const JSON_TYPE_BOOL    = 2
+const JSON_TYPE_NUMBER  = 3
+# Deprecated compatibility alias; number tokens may include fractions/exponents.
+const JSON_TYPE_INT     = JSON_TYPE_NUMBER
+const JSON_TYPE_STRING  = 4
+const JSON_TYPE_ARRAY   = 5
+const JSON_TYPE_OBJECT  = 6
+
+func json_str_len(s: ptr) -> int:
+    var count = 0
+    var p = s
+    var running = true
+    when running loop
+        var b = read_byte(p, 0)
+        if b == 0 do
+            running = false
+        else
+            count = count + 1
+            p = p + 1
+        end
+    end
+    out count
+end.
+
+func json_write_i64(buf: ptr, idx: int, val: int):
+    var v = val
+    var base = idx * 8
+    var i = 0
+    when i < 8 loop
+        write_byte(buf, base + i, v mod 256)
+        v = v / 256
+        i = i + 1
+    end
+end.
+
+func json_read_i64(buf: ptr, idx: int) -> int:
+    var res = 0
+    var mult = 1
+    var base = idx * 8
+    var i = 0
+    when i < 8 loop
+        var b = read_byte(buf, base + i)
+        res = res + (b * mult)
+        mult = mult * 256
+        i = i + 1
+    end
+    out res
+end.
+
+func json_skip_whitespace(buf: ptr, pos: int, end_pos: int) -> int:
+    var cur = pos
+    when cur < end_pos loop
+        var b = read_byte(buf, cur)
+        if b == 32 or b == 9 or b == 10 or b == 13 do
+            cur = cur + 1
+        else
+            out cur
+        end
+    end
+    out cur
+end.
+
+# Returns content start, and writes content len to out_len (excluding quotes)
+func json_scan_string(buf: ptr, pos: int, end_pos: int, out_len: ptr) -> int:
+    if pos >= end_pos or read_byte(buf, pos) != 34 do # '"'
+        out -1
+    end
+    var start = pos + 1
+    var cur = start
+    var escaped = false
+    when cur < end_pos loop
+        var b = read_byte(buf, cur)
+        if escaped do
+            escaped = false
+            cur = cur + 1
+        else
+            if b == 92 do # '\'
+                escaped = true
+                cur = cur + 1
+            else
+                if b == 34 do # closing '"'
+                    json_write_i64(out_len, 0, cur - start)
+                    out start
+                else
+                    cur = cur + 1
+                end
+            end
+        end
+    end
+    out -1
+end.
+
+# Scans a value (scalar, array, or object) and writes its type and total length
+func json_scan_value(buf: ptr, pos: int, end_pos: int, out_type: ptr, out_len: ptr) -> int:
+    var p = json_skip_whitespace(buf, pos, end_pos)
+    if p >= end_pos do
+        out -1
+    end
+    var b = read_byte(buf, p)
+
+    # String
+    if b == 34 do
+        var dummy = alloc(8)
+        var c_start = json_scan_string(buf, p, end_pos, dummy)
+        if c_start < 0 do
+            out -1
+        end
+        var c_len = json_read_i64(dummy, 0)
+        json_write_i64(out_type, 0, JSON_TYPE_STRING)
+        json_write_i64(out_len, 0, c_len + 2) # including quotes
+        out p
+    end
+
+    # Number
+    if (b >= 48 and b <= 57) or b == 45 do
+        var cur = p + 1
+        when cur < end_pos loop
+            var nb = read_byte(buf, cur)
+            if (nb >= 48 and nb <= 57) or nb == 46 or nb == 101 or nb == 69 or nb == 43 or nb == 45 do
+                cur = cur + 1
+            else
+                json_write_i64(out_type, 0, JSON_TYPE_NUMBER)
+                json_write_i64(out_len, 0, cur - p)
+                out p
+            end
+        end
+        json_write_i64(out_type, 0, JSON_TYPE_NUMBER)
+        json_write_i64(out_len, 0, cur - p)
+        out p
+    end
+
+    # Boolean: true
+    if b == 116 do # 't'
+        if p + 4 <= end_pos and read_byte(buf, p+1) == 114 and read_byte(buf, p+2) == 117 and read_byte(buf, p+3) == 101 do
+            json_write_i64(out_type, 0, JSON_TYPE_BOOL)
+            json_write_i64(out_len, 0, 4)
+            out p
+        end
+        out -1
+    end
+
+    # Boolean: false
+    if b == 102 do # 'f'
+        if p + 5 <= end_pos and read_byte(buf, p+1) == 97 and read_byte(buf, p+2) == 108 and read_byte(buf, p+3) == 115 and read_byte(buf, p+4) == 101 do
+            json_write_i64(out_type, 0, JSON_TYPE_BOOL)
+            json_write_i64(out_len, 0, 5)
+            out p
+        end
+        out -1
+    end
+
+    # Null
+    if b == 110 do # 'n'
+        if p + 4 <= end_pos and read_byte(buf, p+1) == 117 and read_byte(buf, p+2) == 108 and read_byte(buf, p+3) == 108 do
+            json_write_i64(out_type, 0, JSON_TYPE_NULL)
+            json_write_i64(out_len, 0, 4)
+            out p
+        end
+        out -1
+    end
+
+    # Array: [ ... ]
+    if b == 91 do # '['
+        var depth = 1
+        var cur = p + 1
+        var in_str = false
+        var esc = false
+        when cur < end_pos and depth > 0 loop
+            var ab = read_byte(buf, cur)
+            if in_str do
+                if esc do
+                    esc = false
+                else
+                    if ab == 92 do
+                        esc = true
+                    else
+                        if ab == 34 do
+                            in_str = false
+                        end
+                    end
+                end
+            else
+                if ab == 34 do
+                    in_str = true
+                else
+                    if ab == 91 do # '['
+                        depth = depth + 1
+                    else
+                        if ab == 93 do # ']'
+                            depth = depth - 1
+                        end
+                    end
+                end
+            end
+            cur = cur + 1
+        end
+        if depth == 0 do
+            json_write_i64(out_type, 0, JSON_TYPE_ARRAY)
+            json_write_i64(out_len, 0, cur - p)
+            out p
+        end
+        out -1
+    end
+
+    # Object: { ... }
+    if b == 123 do # '{'
+        var depth = 1
+        var cur = p + 1
+        var in_str = false
+        var esc = false
+        when cur < end_pos and depth > 0 loop
+            var ob = read_byte(buf, cur)
+            if in_str do
+                if esc do
+                    esc = false
+                else
+                    if ob == 92 do
+                        esc = true
+                    else
+                        if ob == 34 do
+                            in_str = false
+                        end
+                    end
+                end
+            else
+                if ob == 34 do
+                    in_str = true
+                else
+                    if ob == 123 do # '{'
+                        depth = depth + 1
+                    else
+                        if ob == 125 do # '}'
+                            depth = depth - 1
+                        end
+                    end
+                end
+            end
+            cur = cur + 1
+        end
+        if depth == 0 do
+            json_write_i64(out_type, 0, JSON_TYPE_OBJECT)
+            json_write_i64(out_len, 0, cur - p)
+            out p
+        end
+        out -1
+    end
+
+    out -1
+end.
+
+# Locates an object key and outputs the value start, length, and type
+func json_find_field(buf: ptr, obj_start: int, obj_len: int, key: ptr, out_val_start: ptr, out_val_len: ptr, out_type: ptr) -> bool:
+    var end_pos = obj_start + obj_len
+    var cur = json_skip_whitespace(buf, obj_start, end_pos)
+    if cur >= end_pos or read_byte(buf, cur) != 123 do # '{'
+        out false
+    end
+    cur = cur + 1
+
+    var key_len = json_str_len(key)
+    var searching = true
+    var slot_klen = alloc(8)
+    var slot_vtype = alloc(8)
+    var slot_vlen = alloc(8)
+
+    when searching loop
+        cur = json_skip_whitespace(buf, cur, end_pos)
+        if cur >= end_pos or read_byte(buf, cur) == 125 do # '}'
+            out false
+        end
+
+        # Read key string
+        var k_start = json_scan_string(buf, cur, end_pos, slot_klen)
+        if k_start < 0 do
+            out false
+        end
+        var k_len = json_read_i64(slot_klen, 0)
+        cur = k_start + k_len + 1 # advance past closing '"'
+
+        # Check key match
+        var is_match = (k_len == key_len)
+        if is_match do
+            var ki = 0
+            when ki < key_len loop
+                if read_byte(buf, k_start + ki) != read_byte(key, ki) do
+                    is_match = false
+                end
+                ki = ki + 1
+            end
+        end
+
+        # Expect ':'
+        cur = json_skip_whitespace(buf, cur, end_pos)
+        if cur >= end_pos or read_byte(buf, cur) != 58 do # ':'
+            out false
+        end
+        cur = cur + 1
+
+        # Scan value
+        var val_start = json_scan_value(buf, cur, end_pos, slot_vtype, slot_vlen)
+        if val_start < 0 do
+            out false
+        end
+        var val_type = json_read_i64(slot_vtype, 0)
+        var val_len = json_read_i64(slot_vlen, 0)
+
+        if is_match do
+            if val_type == JSON_TYPE_STRING do
+                # Strip outer quotes from string value
+                json_write_i64(out_val_start, 0, val_start + 1)
+                json_write_i64(out_val_len, 0, val_len - 2)
+            else
+                json_write_i64(out_val_start, 0, val_start)
+                json_write_i64(out_val_len, 0, val_len)
+            end
+            json_write_i64(out_type, 0, val_type)
+            out true
+        end
+
+        # Advance past value
+        cur = val_start + val_len
+        cur = json_skip_whitespace(buf, cur, end_pos)
+        if cur < end_pos and read_byte(buf, cur) == 44 do # ','
+            cur = cur + 1
+        end
+    end
+    out false
+end.

@@ -1,0 +1,317 @@
+##
+ * vir/compiler/lir_codegen.vri — LIR to Machine Code (ARM64)
+ * ==============================================================
+ * VIRC-PLN-0004 Phase 10 / VIRC-ISS-0006: Modularized LIR Codegen Subsystem.
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+import print_str, print_int from rt_io
+import sys_exit from rt_syscall
+include lir
+include mir
+include ffi_imports
+include codegen
+include target
+include context
+import g_has_custom_entry, g_entry_function_name from compiler.context
+
+include lir_codegen_types
+include lir_codegen_intrinsics
+include lir_codegen_calls
+include lir_codegen_rt_stubs_base
+include lir_codegen_rt_stubs_math
+include lir_codegen_emit_vector
+include lir_codegen_emit_func
+
+func emit_lir_module_arm64(lir_funcs: i64, target_spec: &TargetSpec):
+    arm64_prepare_func_index(lir_funcs)
+    var is_linux = 0
+    if (target_spec as i64) == 1 do
+        is_linux = 1
+    eif (target_spec as i64) > 1 do
+        if target_spec_os(target_spec as i64) == TargetOS.Linux do
+            is_linux = 1
+        end
+    end
+    var va_base = 0x100000268
+    if is_linux == 1 do
+        va_base = 0x410000
+    eif ffi_import_used_count() > 0 do
+        va_base = 0x100000800
+    end
+    var cb = codebuf_new(TargetArch.ARM64)
+    let n_funcs = vec_len_rt(lir_funcs)
+    var func_offs = vec_new_cap_rt(4096)
+    var call_fixups_box = alloc(8)
+    native_write_i64(call_fixups_box, 0, vec_new_cap_rt(65536))
+    var str_fixups_box = alloc(8)
+    native_write_i64(str_fixups_box, 0, vec_new_cap_rt(65536))
+
+    var fi = 0
+    when fi < n_funcs loop
+        func_offs = vec_push_rt(func_offs, codebuf_offset(cb) as i64)
+        let lf = vec_get_rt(lir_funcs, fi)
+        cb = emit_lir_arm64_into(cb, lf, 0 - 1, lir_funcs, call_fixups_box, str_fixups_box, is_linux)
+        fi = fi + 1
+    end
+
+    var vir_free_off = 0 - 1
+    let vf_name = fat_str_new("vir_free")
+    let vf_idx = lir_find_func_index(lir_funcs, vf_name)
+    if vf_idx >= 0 and vf_idx < n_funcs do
+        vir_free_off = vec_get_rt(func_offs, vf_idx)
+    end
+    var rt_promote_graph_off = 0 - 1
+    let pg_name = fat_str_new("rt_promote_graph")
+    let pg_idx = lir_find_func_index(lir_funcs, pg_name)
+    if pg_idx >= 0 and pg_idx < n_funcs do
+        rt_promote_graph_off = vec_get_rt(func_offs, pg_idx)
+    end
+    var rt_offs = vec_new_cap_rt(1024)
+    cb = emit_lir_rt_stubs(cb, rt_offs, is_linux, vir_free_off, rt_promote_graph_off)
+
+
+
+    let cur_start_off = codebuf_offset(cb)
+    cb.start_offset = cur_start_off
+    native_write_i64(cb as i64, 24, cur_start_off)
+    if is_linux == 1 do
+        # ── Linux ARM64 ELF Entry: [SP] = argc, SP + 8 = argv ──
+        cb = arm64_ldr_uoff(cb, 19, 31, 0)   # X19 = argc
+        cb = arm64_add_imm(cb, 20, 31, 8)    # X20 = argv
+        cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+        cb = arm64_mov_from_sp(cb, 29)
+
+        # ── Initialize 256MB Global Arena Heap via Linux mmap ──
+        cb = arm64_mov_imm16(cb, 0, 0)
+        cb = arm64_movz_imm64(cb, 1, 268435456)
+        cb = arm64_mov_imm16(cb, 2, 3)         # PROT_READ | PROT_WRITE
+        cb = arm64_mov_imm16(cb, 3, 34)        # MAP_PRIVATE | MAP_ANONYMOUS (0x22)
+        cb = codebuf_emit_u32(cb, 0x92800004) # MOVN X4, #0 (-1 fd)
+        cb = arm64_mov_imm16(cb, 5, 0)
+        cb = arm64_mov_imm16(cb, 8, 222)       # X8 = 222 (SYS_mmap)
+        cb = arm64_svc(cb, 0)                  # SVC #0
+    else
+        # ── macOS Mach-O Entry: dyld passes X0 = argc, X1 = argv ──
+        cb = arm64_mov_rr(cb, 19, 0)     # X19 = argc
+        cb = arm64_mov_rr(cb, 20, 1)     # X20 = argv
+
+        cb = arm64_stp_pre(cb, 29, 30, 31, 0 - 16)
+        cb = arm64_mov_from_sp(cb, 29)
+
+        # ── Initialize 8GB Global Arena Heap via macOS mmap ──
+        cb = arm64_mov_imm16(cb, 0, 0)
+        cb = arm64_movz_imm64(cb, 1, 0x200000000)
+        cb = arm64_mov_imm16(cb, 2, 3)         # PROT_READ | PROT_WRITE
+        cb = arm64_mov_imm16(cb, 3, 4098)      # MAP_ANON | MAP_PRIVATE (0x1002)
+        cb = codebuf_emit_u32(cb, 0x92800004) # MOVN X4, #0 (-1 fd)
+        cb = arm64_mov_imm16(cb, 5, 0)
+        cb = arm64_mov_imm16(cb, 16, 197)     # SYS_mmap
+        cb = codebuf_emit_u32(cb, 0xF2A04010) # MOVK X16, #0x200, LSL #16
+        cb = arm64_svc(cb, 0x80)
+    end
+
+    # X28 = heap base returned in X0
+    cb = arm64_mov_rr(cb, 28, 0)
+    # Reserve 32 KiB at the arena base for argc/argv and module globals.
+    # Global slots start at X28+32 and are addressed directly by intrinsics.
+    cb = arm64_mov_imm16(cb, 10, 32768)
+    cb = arm64_add_rrr(cb, 1, 28, 10)
+    cb = arm64_str_uoff(cb, 1, 28, 0)
+    if is_linux == 1 do
+        cb = arm64_movz_imm64(cb, 11, 268435456)
+    else
+        cb = arm64_movz_imm64(cb, 11, 0x80000000)
+    end
+    cb = arm64_add_rrr(cb, 11, 28, 11)
+    cb = arm64_str_uoff(cb, 11, 28, 24)
+    cb = arm64_str_uoff(cb, 11, 28, 80)
+    # Save argc and argv in heap header:
+    cb = arm64_str_uoff(cb, 19, 28, 8)     # *(X28 + 8) = argc
+    cb = arm64_str_uoff(cb, 20, 28, 16)    # *(X28 + 16) = argv
+    if n_funcs > 0 do
+        init_name = fat_str_new("__vir_global_init")
+        init_idx = lir_find_func_index(lir_funcs, init_name)
+        if init_idx >= 0 do
+            init_at = codebuf_offset(cb) as i64
+            cb = arm64_bl_imm26(cb, 0)
+            cb = patch_bl_site(cb, init_at, vec_get_rt(func_offs, init_idx))
+        end
+        var target_entry = fat_str_new("main")
+        if g_has_custom_entry == 1 and fat_str_len(g_entry_function_name) > 0 do
+            target_entry = g_entry_function_name
+        end
+        main_name = target_entry
+        main_idx = lir_find_func_index(lir_funcs, main_name)
+        if main_idx < 0 and g_has_custom_entry == 0 do
+            fallback_main_name = fat_str_new("__main__")
+            main_idx = lir_find_func_index(lir_funcs, fallback_main_name)
+        end
+        if main_idx < 0 do
+            main_idx = n_funcs - 1
+        end
+        at = codebuf_offset(cb) as i64
+        cb = arm64_bl_imm26(cb, 0)
+        main_off = vec_get_rt(func_offs, main_idx)
+        cb = patch_bl_site(cb, at, main_off)
+    end
+    # Preserve main's result in X0 so the process exit status reflects the
+    # program result.  Only synthesize success when there is no entry function.
+    if n_funcs <= 0 do
+        cb = arm64_mov_imm16(cb, 0, 0)
+    end
+    if is_linux == 1 do
+        cb = arm64_mov_imm16(cb, 8, 93)        # X8 = 93 (SYS_exit on Linux)
+        cb = arm64_svc(cb, 0)
+    else
+        cb = arm64_mov_imm16(cb, 16, 1)        # SYS_exit on macOS
+        cb = codebuf_emit_u32(cb, 0xF2A04010)
+        cb = arm64_svc(cb, 0x80)
+    end
+    cb = arm64_ldp_post(cb, 29, 30, 31, 16)
+    cb = arm64_ret(cb)
+
+    # ARM64 foreign thunk: adrp x16, GOT@PAGE; ldr x16,[x16,GOT@PAGEOFF]; br x16.
+    # macho_emit patches ADRP/LDR once its final __DATA address is known.
+    ffi_arm64_stubs_reset()
+    let n_ffi = ffi_import_used_count()
+    var ffi_i = 0
+    when ffi_i < n_ffi loop
+        ffi_id = ffi_import_used_at(ffi_i)
+        ffi_arm64_stub_add(ffi_id as int, codebuf_offset(cb) as int)
+        cb = codebuf_emit_u32(cb, 0x90000010)
+        cb = codebuf_emit_u32(cb, 0xF9400210)
+        cb = codebuf_emit_u32(cb, 0xD61F0200)
+        ffi_i = ffi_i + 1
+    end
+
+    if is_linux == 0 and ffi_import_used_count() > 0 do
+        va_base = 0x100000800
+    end
+
+    let call_fixups = native_read_i64(call_fixups_box, 0)
+    let nf = vec_len_rt(call_fixups)
+    var ci = 0
+    var dest = 0 - 1
+    when ci < nf loop
+        let fx = vec_get_rt(call_fixups, ci)
+        let f_tkind = native_read_i64(fx as i64, 8)
+        let f_tid = native_read_i64(fx as i64, 16)
+        let f_at = native_read_i64(fx as i64, 0)
+        if f_tkind == 2 do
+            if f_tid >= 0 and f_tid < n_funcs do
+                let dest_adr = vec_get_rt(func_offs, f_tid)
+                let f_rd = native_read_i64(fx as i64, 24)
+
+                va_pc = va_base + f_at
+                va_dest = va_base + dest_adr
+
+                pc_page = va_pc and (0 - 4096)
+                target_page = va_dest and (0 - 4096)
+                page_delta = target_page - pc_page
+                page_imm = ((page_delta - (page_delta mod 4096)) / 4096) and 0x1FFFFF
+                immlo = page_imm and 3
+                immhi = (page_imm shr 2) and 0x7FFFF
+                adrp_word = 0x90000000 or (immlo shl 29) or (immhi shl 5) or (f_rd and 0x1F)
+                cb = codebuf_patch_u32(cb, f_at as int, adrp_word as int)
+
+                lo12 = va_dest and 0xFFF
+                add_word = 0x91000000 or ((lo12 as int) shl 10) or ((f_rd as int and 0x1F) shl 5) or (f_rd as int and 0x1F)
+                cb = codebuf_patch_u32(cb, (f_at + 4) as int, add_word as int)
+            end
+        else
+            dest = 0 - 1
+            if f_tkind == 0 do
+                if f_tid >= 0 and f_tid < n_funcs do
+                    dest = vec_get_rt(func_offs, f_tid)
+                end
+            eif f_tkind == 3 do
+                dest = ffi_arm64_stub_offset(f_tid as int)
+            else
+                if f_tid >= 0 and f_tid < LIR_RT_STUB_COUNT do
+                    dest = vec_get_rt(rt_offs, f_tid)
+                end
+            end
+            if dest < 0 do
+                dest = vec_get_rt(rt_offs, LIR_RT_UNRESOLVED)
+            end
+            cb = patch_bl_site(cb, f_at, dest)
+        end
+        ci = ci + 1
+    end
+
+    # ── String Literal Pool & Patch ADR Sites ──
+    let str_fixups = native_read_i64(str_fixups_box, 0)
+    n_sfx = vec_len_rt(str_fixups)
+    if n_sfx > 0 do
+        pool_offsets = vec_new_cap_rt(n_sfx)
+        var sfi = 0
+        when sfi < n_sfx loop
+            sfx = vec_get_rt(str_fixups, sfi)
+            s_val = native_read_i64(sfx as i64, 8) as string
+            s_data = native_read_i64(s_val as i64, 0)
+            s_len = native_read_i64(s_val as i64, 8)
+            found_off = codebuf_offset(cb) as i64
+            var bi = 0
+            when bi < s_len loop
+                b_ch = native_read_u8(s_data, bi)
+                cb = codebuf_emit_byte(cb, b_ch)
+                bi = bi + 1
+            end
+            cb = codebuf_emit_byte(cb, 0)
+            pool_offsets = vec_push_rt(pool_offsets, found_off)
+            sfi = sfi + 1
+        end
+
+        pad = (4 - (codebuf_offset(cb) mod 4)) mod 4
+        var pi = 0
+        when pi < pad loop
+            cb = codebuf_emit_byte(cb, 0)
+            pi = pi + 1
+        end
+
+        sfi = 0
+        when sfi < n_sfx loop
+            sfx = vec_get_rt(str_fixups, sfi)
+            s_at = native_read_i64(sfx as i64, 0)
+            s_rd = native_read_i64(sfx as i64, 16)
+            s_target = vec_get_rt(pool_offsets, sfi)
+
+            va_pc = va_base + s_at
+            va_target = va_base + s_target
+
+            pc_page = va_pc and (0 - 4096)
+            target_page = va_target and (0 - 4096)
+            page_delta = target_page - pc_page
+            page_imm = ((page_delta - (page_delta mod 4096)) / 4096) and 0x1FFFFF
+            immlo = page_imm and 3
+            immhi = (page_imm shr 2) and 0x7FFFF
+            adrp_word = 0x90000000 or (immlo shl 29) or (immhi shl 5) or (s_rd as int and 0x1F)
+            cb = codebuf_patch_u32(cb, s_at as int, adrp_word as int)
+
+            lo12 = va_target and 0xFFF
+            add_word = 0x91000000 or ((lo12 as int) shl 10) or ((s_rd as int and 0x1F) shl 5) or (s_rd as int and 0x1F)
+            cb = codebuf_patch_u32(cb, (s_at + 4) as int, add_word as int)
+
+            sfi = sfi + 1
+        end
+    end
+
+    out cb
+end.
+
+# Single-func helper → module path.
+func emit_lir_arm64(func_obj: &LirFunc, assigned_phys: i64, assigned_stack: i64, target_spec: &TargetSpec):
+    funcs = vec_new_rt()
+    funcs = vec_push_rt(funcs, func_obj)
+    out emit_lir_module_arm64(funcs, target_spec)
+end.
+
+export emit_lir_arm64, emit_lir_module_arm64, emit_lir_arm64_into
+export emit_lir_intrinsic, emit_lir_setarg, emit_lir_rt_stubs
+export lir_intr_is_marker, lir_intr_is_identity, lir_intr_is_payload, lir_instr_has_def
+export lir_fixup_new, lir_fixup_at_off, lir_fixup_target_block, lir_fixup_kind
+export lir_call_fixup_new, lir_stub_for_builtin_id
+export patch_bl_site, lir_find_func_index

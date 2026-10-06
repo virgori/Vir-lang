@@ -1,0 +1,338 @@
+# Compiler CLI environment adapter. No libc/FFI import and no environment dump.
+# Darwin constants are from SDK sys/sysctl.h and sys/syscall.h:
+# CTL_KERN=1, KERN_PROCARGS2=49, SYS_sysctl=202.
+# The returned value is caller-owned; 0 means absent, negative means unavailable.
+
+import vir_alloc, vir_free from rt_alloc
+import native_read_u8, native_write_u8, native_read_i64, native_write_i64,
+       rt_strlen, rt_strdup, rt_itoa from rt_string_rt
+import sys_platform, Platform, sys_getpid, sys_open, sys_read, sys_close,
+       sys_getcwd, VIR_O_RDONLY from rt_syscall
+
+extern func syscall3(num: int, a1: int, a2: int, a3: int) -> int
+extern func syscall4(num: int, a1: int, a2: int, a3: int, a4: int) -> int
+extern func syscall6(num: int, a1: int, a2: int, a3: int, a4: int, a5: int, a6: int) -> int
+
+func cliWriteU32(address: int, offset: int, value: int):
+    var index = 0
+    when index < 4 loop
+        native_write_u8(address, offset + index, (value shr (index * 8)) and 255)
+        index = index + 1
+    end
+end.
+
+func cliReadU32(address: int, offset: int):
+    var
+        value = 0
+        index = 0
+    when index < 4 loop
+        value = value + (native_read_u8(address, offset + index) shl (index * 8))
+        index = index + 1
+    end
+    out value
+end.
+
+# Pure bounded parser shared by native lookup and malformed-buffer tests.
+func cliFindEnvironment:
+    in buffer: int
+       size: int
+       start: int
+       name: int
+    if buffer == 0 do out 0 - 1 end
+    if name == 0 do out 0 - 1 end
+    if size < 0 do out 0 - 1 end
+    if start < 0 do out 0 - 1 end
+    if start > size do out 0 - 1 end
+    let nameLength = rt_strlen(name)
+    var position = start
+    when position < size loop
+        var endPosition = position
+        when endPosition < size loop
+            if native_read_u8(buffer, endPosition) == 0 do break end
+            endPosition = endPosition + 1
+        end
+        if endPosition >= size do out 0 - 1 end
+        if endPosition - position > nameLength do
+            var
+                matches = 1
+                index = 0
+            when index < nameLength loop
+                if native_read_u8(buffer, position + index) != native_read_u8(name, index) do
+                    matches = 0
+                end
+                index = index + 1
+            end
+            if matches == 1 do
+                if native_read_u8(buffer, position + nameLength) == 61 do
+                    let
+                        valueStart = position + nameLength + 1
+                        valueLength = endPosition - valueStart
+                        result = vir_alloc(valueLength + 1)
+                    index = 0
+                    when index < valueLength loop
+                        native_write_u8(result, index, native_read_u8(buffer, valueStart + index))
+                        index = index + 1
+                    end
+                    native_write_u8(result, valueLength, 0)
+                    out result
+                end
+            end
+        end
+        position = endPosition + 1
+    end
+    out 0
+end.
+
+func cliDarwinEnvironmentStart(buffer: int, size: int):
+    if size < 5 do out 0 - 1 end
+    let argumentCount = cliReadU32(buffer, 0)
+    if argumentCount > size do out 0 - 1 end
+    var position = 4
+    # Executable path, then padding before argv[0].
+    when position < size loop
+        if native_read_u8(buffer, position) == 0 do break end
+        position = position + 1
+    end
+    when position < size loop
+        if native_read_u8(buffer, position) != 0 do break end
+        position = position + 1
+    end
+    var index = 0
+    when index < argumentCount loop
+        when position < size loop
+            if native_read_u8(buffer, position) == 0 do break end
+            position = position + 1
+        end
+        if position >= size do out 0 - 1 end
+        position = position + 1
+        index = index + 1
+    end
+    out position
+end.
+
+func cliIsDarwinPlatform(platform: int):
+    if platform == Platform.MacOS_ARM64 do out 1 end
+    if platform == Platform.MacOS_x86_64 do out 1 end
+    out 0
+end.
+
+func cliIsLinuxPlatform(platform: int):
+    if platform == Platform.Linux_ARM64 do out 1 end
+    if platform == Platform.Linux_x86_64 do out 1 end
+    if platform == Platform.Linux_RISCV64 do out 1 end
+    out 0
+end.
+
+func cliEnvironmentGet(name: int):
+    let
+        platform = sys_platform()
+        capacity = 1048576
+        buffer = vir_alloc(capacity)
+    var
+        size = 0
+        start = 0
+    if cliIsDarwinPlatform(platform) == 1 do
+        let
+            mib = vir_alloc(12)
+            sizePointer = vir_alloc(8)
+        cliWriteU32(mib, 0, 1)
+        cliWriteU32(mib, 4, 49)
+        cliWriteU32(mib, 8, sys_getpid())
+        native_write_i64(sizePointer, 0, capacity)
+        let status = syscall6(0x20000CA, mib, 3, buffer, sizePointer, 0, 0)
+        size = native_read_i64(sizePointer, 0)
+        vir_free(mib)
+        vir_free(sizePointer)
+        if status != 0 do
+            vir_free(buffer)
+            out 0 - (1000 + status)
+        end
+        if size <= 0 do
+            vir_free(buffer)
+            out 0 - 2
+        end
+        if size > capacity do
+            vir_free(buffer)
+            out 0 - 2
+        end
+        start = cliDarwinEnvironmentStart(buffer, size)
+        if start < 0 do
+            vir_free(buffer)
+            out 0 - 3
+        end
+    eif cliIsLinuxPlatform(platform) == 1 do
+        let descriptor = sys_open("/proc/self/environ" as int, VIR_O_RDONLY, 0)
+        if descriptor < 0 do
+            vir_free(buffer)
+            out 0 - 1
+        end
+        var readFailed = 0
+        when size < capacity loop
+            let count = sys_read(descriptor, buffer + size, capacity - size)
+            if count < 0 do readFailed = 1; break end
+            if count == 0 do break end
+            size = size + count
+        end
+        sys_close(descriptor)
+        if readFailed == 1 do
+            vir_free(buffer)
+            out 0 - 1
+        end
+        if size >= capacity do
+            vir_free(buffer)
+            out 0 - 1
+        end
+    else
+        vir_free(buffer)
+        out 0 - 1
+    end
+    let result = cliFindEnvironment(buffer, size, start, name)
+    vir_free(buffer)
+    out result
+end.
+
+func cliExecutablePath():
+    let platform = sys_platform()
+    if cliIsDarwinPlatform(platform) == 1 do
+        let capacity = 65536
+        let buffer = vir_alloc(capacity)
+        let mib = vir_alloc(12)
+        let sizePointer = vir_alloc(8)
+        cliWriteU32(mib, 0, 1)
+        cliWriteU32(mib, 4, 49)
+        cliWriteU32(mib, 8, sys_getpid())
+        native_write_i64(sizePointer, 0, capacity)
+        let status = syscall6(0x20000CA, mib, 3, buffer, sizePointer, 0, 0)
+        vir_free(mib)
+        vir_free(sizePointer)
+        if status == 0 do
+            let raw_exe = buffer + 4
+            let fd = sys_open(raw_exe, VIR_O_RDONLY, 0)
+            if fd >= 0 do
+                let resolved = vir_alloc(4096)
+                let fcntl_st = syscall3(0x200005C, fd, 50, resolved)
+                sys_close(fd)
+                vir_free(buffer)
+                if fcntl_st == 0 do
+                    out resolved
+                end
+                vir_free(resolved)
+            else
+                let copy = rt_strdup(raw_exe)
+                vir_free(buffer)
+                out copy
+            end
+        else
+            vir_free(buffer)
+        end
+    eif cliIsLinuxPlatform(platform) == 1 do
+        let fd = sys_open("/proc/self/exe" as int, VIR_O_RDONLY, 0)
+        if fd >= 0 do
+            let resolved = vir_alloc(4096)
+            var num = 78
+            if platform == Platform.Linux_x86_64 do
+                num = 267
+            end
+            let size = syscall4(num, 0 - 100, "/proc/self/exe" as int, resolved, 4095)
+            sys_close(fd)
+            if size > 0 do
+                if size < 4096 do
+                    native_write_u8(resolved, size, 0)
+                    out resolved
+                end
+            end
+            vir_free(resolved)
+        end
+    end
+    let arg0 = get_arg(0)
+    if arg0 != 0 do
+        if rt_strlen(arg0) > 0 do
+            out rt_strdup(arg0)
+        end
+    end
+    out 0
+end.
+
+func cliCanonicalPath(input_path: int):
+    if input_path == 0 do out 0 end
+    let platform = sys_platform()
+    if cliIsDarwinPlatform(platform) == 1 do
+        let fd = sys_open(input_path, VIR_O_RDONLY, 0)
+        if fd >= 0 do
+            let resolved = vir_alloc(4096)
+            let fcntl_st = syscall3(0x200005C, fd, 50, resolved)
+            sys_close(fd)
+            if fcntl_st == 0 do
+                out resolved
+            end
+            vir_free(resolved)
+        end
+    eif cliIsLinuxPlatform(platform) == 1 do
+        let fd = sys_open(input_path, VIR_O_RDONLY, 0)
+        if fd >= 0 do
+            let resolved = vir_alloc(4096)
+            var fd_buf = vir_alloc(64)
+            let fd_str = rt_itoa(fd)
+            let prefix = "/proc/self/fd/"
+            var bi = 0
+            when bi < 14 loop
+                native_write_u8(fd_buf, bi, native_read_u8(prefix as int, bi))
+                bi = bi + 1
+            end
+            let fslen = rt_strlen(fd_str as i64)
+            var si = 0
+            when si < fslen loop
+                native_write_u8(fd_buf, bi + si, native_read_u8(fd_str as int, si))
+                si = si + 1
+            end
+            native_write_u8(fd_buf, bi + si, 0)
+            var num = 78
+            if platform == Platform.Linux_x86_64 do
+                num = 267
+            end
+            let size = syscall4(num, 0 - 100, fd_buf, resolved, 4095)
+            sys_close(fd)
+            vir_free(fd_buf)
+            vir_free(fd_str as int)
+            if size > 0 do
+                if size < 4096 do
+                    native_write_u8(resolved, size, 0)
+                    out resolved
+                end
+            end
+            vir_free(resolved)
+        end
+    end
+    if native_read_u8(input_path, 0) != 47 do
+        let cwd = vir_alloc(4096)
+        let cwd_st = sys_getcwd(cwd, 4096)
+        if cwd_st >= 0 do
+            let clen = rt_strlen(cwd)
+            let ilen = rt_strlen(input_path)
+            if ilen == 1 and native_read_u8(input_path, 0) == 46 do
+                out cwd
+            end
+            let joined = vir_alloc(clen + ilen + 2)
+            var ji = 0
+            when ji < clen loop
+                native_write_u8(joined, ji, native_read_u8(cwd, ji))
+                ji = ji + 1
+            end
+            native_write_u8(joined, ji, 47)
+            ji = ji + 1
+            var ki = 0
+            when ki < ilen loop
+                native_write_u8(joined, ji + ki, native_read_u8(input_path, ki))
+                ki = ki + 1
+            end
+            native_write_u8(joined, ji + ki, 0)
+            vir_free(cwd)
+            out joined
+        end
+        vir_free(cwd)
+    end
+    out rt_strdup(input_path)
+end.
+
+export cliEnvironmentGet, cliFindEnvironment, cliDarwinEnvironmentStart, cliWriteU32, cliReadU32,
+       cliIsDarwinPlatform, cliIsLinuxPlatform, cliExecutablePath, cliCanonicalPath

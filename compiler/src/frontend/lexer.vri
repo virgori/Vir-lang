@@ -1,0 +1,498 @@
+
+ # vir/compiler/lexer.vri — Vir Source Lexer (Pure Vir)
+ # =====================================================
+ # Converted from C (core/src/lexer.c) for self-hosting.
+ #
+ # Features
+ #   - Full v1.2 keyword set (English standard)
+ #   - Multi-char operators (?=, ?., :~, >>, ||, ->, ..)
+ #   - Block comments: #*# ... #*# (preferred) and ## ... ## (legacy)
+ #   - Hex literal support (0x...)
+ #   - Paren-depth tracking (brackets / grouping; NEWLINE still emitted for §1.0)
+ #   - String escape sequences (\n, \t, \\, \", \')
+
+include types_prelude
+import Result, Ok, Err from result_prelude
+import fat_str_new, fat_str_concat, fat_str_len, fat_str_byte_at, fat_str_eq, fat_str_eq_span, fat_str_slice,
+    fat_str_sentinel_pad, fat_char_to_str, rt_streq, str_from_cstr, sb_new, sb_append_char, sb_to_string, sb_len,
+    StringBuilder, native_read_u8, native_write_u8, native_read_i64, native_write_i64, rt_memcpy from rt_string_rt
+import g_active_source_manager, sm_file_from_line, sm_line_from_expanded, sm_add_span, sm_col_from_byte_offset from source_manager
+
+
+include lexer_tokens
+include lexer_cursor
+include lexer_numbers
+include lexer_strings
+
+func lex_word(ref lex: Lexer):
+
+    start_line = lex.line
+    start_col = lex.col
+    start_pos = lex.pos
+
+    scanning = true
+    when scanning and lex.pos < lex.source_len loop
+        c = native_read_u8(g_lexer_source_data, lex.pos)
+        flags = native_read_u8(g_lex_ascii, c)
+        if c >= 128 or (flags & LEX_C_ID_CONT) != 0 do
+            lex.pos = lex.pos + 1
+        else
+            scanning = false
+        end
+    end
+
+    span_len = lex.pos - start_pos
+    kw_type = lookup_keyword_span(lex.keywords, lex.source, start_pos, span_len)
+    if kw_type != TokType.Error do
+        tok = token_new(kw_type, start_line, start_col)
+        tok.start = start_pos
+        tok.len = span_len
+        out (lex, tok)
+    end
+
+    tok = token_new(TokType.Ident, start_line, start_col)
+    tok.start = start_pos
+    tok.len = span_len
+    out (lex, tok)
+end.
+# ═══════════════════════════════════════════════════════
+func tokenize_finalize(ref lex: Lexer):
+    let tc = vec_len(lex.tokens)
+    var ti = 0
+    when ti < tc loop
+        token_update_span(vec_get(lex.tokens, ti) as Token)
+        ti = ti + 1
+    end
+    g_lexer_tokens = lex.tokens as i64
+    out lex
+end.
+
+func tokenize(ref lex: Lexer):
+
+    ident_intern_reset()
+    g_lexer_source = lex.source as i64
+    g_lexer_source_data = native_read_i64(lex.source as i64, 0)
+    prev_was_newline = true
+
+    when not is_eof(lex) loop
+        lex = skip_trivia(lex)
+        if is_eof(lex) do
+            # Trailing space/tab/CR reaches EOF here.  Do not bypass the
+            # sentinel appended by the normal loop-exit path.
+            lex.tokens = vec_push(lex.tokens, token_new(TokType.Eof, lex.line, lex.col))
+            out tokenize_finalize(lex)
+        end
+
+        c = lex_peek(lex)
+        c_flags = native_read_u8(g_lex_ascii, c)
+
+        # Newline (statement / list separator, §1.0) — emit inside parens too
+        if c == 10 do
+            var (lex2, _) = lex_advance(lex)
+            lex = lex2
+            if not prev_was_newline do
+                lex.tokens = vec_push(lex.tokens, token_new(TokType.Newline, lex.line, lex.col))
+                prev_was_newline = true
+            end
+            skip  # continue
+        end
+
+        prev_was_newline = false
+
+        # String literal
+        if c == 34 or c == 39 do # " or '
+            if c == 34 and string_has_interp(lex) == 1 do
+                lex = lex_interpolated_string(lex)
+                skip
+            end
+            var (lex2, tok) = lex_string(lex)
+            lex = lex2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # Number literal
+        if (c_flags & LEX_C_DIGIT) != 0 do
+            var (lex2, tok) = lex_number(lex)
+            lex = lex2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # Words dominate compiler source. Recognize them before walking the
+        # long multi-character operator cascade below.
+        if (c_flags & LEX_C_ID_START) != 0 or c >= 128 do
+            var (lex2, tok) = lex_word(lex)
+            lex = lex2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # Multi-char operators
+        c2 = lex_peek_at(lex, 1)
+
+        if c == 61 and c2 == 61 do # ==
+            tok = token_new(TokType.Eq, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        if c == 33 and c2 == 61 do # !=
+            tok = token_new(TokType.Ne, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        if c == 62 and c2 == 61 do # >=
+            tok = token_new(TokType.Ge, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        if c == 60 and c2 == 61 do # <=
+            tok = token_new(TokType.Le, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # &mut (mutable borrow — 4 chars)
+        if c == 38 and c2 == 109 and lex_peek_at(lex, 2) == 117 and lex_peek_at(lex, 3) == 116 do
+            tok = token_new(TokType.BorrowMut, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            var (l3, _) = lex_advance(l2)
+            var (l4, _) = lex_advance(l3)
+            lex = l4
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # ?=/= (safe not-equal — 4 chars)
+        if c == 63 and c2 == 61 and lex_peek_at(lex, 2) == 47 and lex_peek_at(lex, 3) == 61 do
+            tok = token_new(TokType.SafeNe, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            var (l3, _) = lex_advance(l2)
+            var (l4, _) = lex_advance(l3)
+            lex = l4
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # ?= (safe equal)
+        if c == 63 and c2 == 61 do
+            tok = token_new(TokType.SafeEq, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # ?. (safe member access)
+        if c == 63 and c2 == 46 do
+            tok = token_new(TokType.SafeAccess, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # :~ (pattern match)
+        if c == 58 and c2 == 126 do
+            tok = token_new(TokType.Pattern, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # `::` is not a Vir token. Reject it explicitly so users get one
+        # stable diagnostic instead of two cascading ':' parse errors.
+        if c == 58 and c2 == 58 do
+            let invalidQualifierMessage = fat_str_new("invalid token '::'; use '.' for qualified names")
+            lex.error_msg = invalidQualifierMessage
+            g_lexer_error = invalidQualifierMessage as i64
+            g_lexer_error_offset = lex.pos
+            tok = token_new(TokType.Error, lex.line, lex.col)
+            tok.str_val = "invalid token '::'; use '.' for qualified names"
+            tok.int_val = 112
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # ** (MatMul)
+        if c == 42 and c2 == 42 do
+            tok = token_new(TokType.MatMul, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # >< (FMA)
+        if c == 62 and c2 == 60 do
+            tok = token_new(TokType.Fma, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # !! (AtomicBang)
+        if c == 33 and c2 == 33 do
+            tok = token_new(TokType.AtomicBang, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # <- (SendArrow)
+        if c == 60 and c2 == 45 do
+            tok = token_new(TokType.SendArrow, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # && (logical AND)
+        if c == 38 and c2 == 38 do
+            tok = token_new(TokType.LogicalAnd, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # || (logical OR)
+        if c == 124 and c2 == 124 do
+            tok = token_new(TokType.LogicalOr, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # -> (arrow)
+        if c == 45 and c2 == 62 do
+            tok = token_new(TokType.Arrow, lex.line, lex.col)
+            tok.start = lex.pos
+            tok.len = 2
+            tok.str_val = fat_str_new("->")
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # <<= (bit shift left assign — 3 chars)
+        if c == 60 and c2 == 60 and lex_peek_at(lex, 2) == 61 do
+            tok = token_new(TokType.BitShlAssign, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            var (l3, _) = lex_advance(l2)
+            lex = l3
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # >>= (bit shift right assign — 3 chars)
+        if c == 62 and c2 == 62 and lex_peek_at(lex, 2) == 61 do
+            tok = token_new(TokType.BitShrAssign, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            var (l3, _) = lex_advance(l2)
+            lex = l3
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # << (bit shift left)
+        if c == 60 and c2 == 60 do
+            tok = token_new(TokType.BitShl, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # >> (type cast per spec §10.5 — NOT bit shift; use keyword `shr`)
+        if c == 62 and c2 == 62 do
+            tok = token_new(TokType.Cast, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # += (PlusAssign)
+        if c == 43 and c2 == 61 do
+            tok = token_new(TokType.PlusAssign, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # -= (MinusAssign)
+        if c == 45 and c2 == 61 do
+            tok = token_new(TokType.MinusAssign, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # *= (StarAssign)
+        if c == 42 and c2 == 61 do
+            tok = token_new(TokType.StarAssign, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # /= (SlashAssign)
+        if c == 47 and c2 == 61 do
+            tok = token_new(TokType.SlashAssign, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # %= (ModAssign)
+        if c == 37 and c2 == 61 do
+            tok = token_new(TokType.ModAssign, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # &= (BitAndAssign)
+        if c == 38 and c2 == 61 do
+            tok = token_new(TokType.BitAndAssign, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # |= (BitOrAssign)
+        if c == 124 and c2 == 61 do
+            tok = token_new(TokType.BitOrAssign, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # ^= (BitXorAssign)
+        if c == 94 and c2 == 61 do
+            tok = token_new(TokType.BitXorAssign, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # .. (range)
+        if c == 46 and c2 == 46 do
+            tok = token_new(TokType.DotDot, lex.line, lex.col)
+            var (l1, _) = lex_advance(lex)
+            var (l2, _) = lex_advance(l1)
+            lex = l2
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+
+        # Single-char operators / delimiters (256-byte table; multi-char rules above win).
+        single_val = native_read_i64(g_lex_single, c * 8)
+        single_tok = TokType.Eof
+        if single_val != 0 do single_tok = single_val as TokType end
+        if single_tok == TokType.LParen or single_tok == TokType.LBracket or single_tok == TokType.LBrace do
+            lex.paren_depth = lex.paren_depth + 1
+        end
+        if single_tok == TokType.RParen or single_tok == TokType.RBracket or single_tok == TokType.RBrace do
+            if lex.paren_depth > 0 do
+                lex.paren_depth = lex.paren_depth - 1
+            end
+        end
+
+        if single_tok != TokType.Eof do
+            tok = token_new(single_tok, lex.line, lex.col)
+            tok.start = lex.pos
+            tok.len = 1
+            lex.pos = lex.pos + 1
+            lex.tokens = vec_push(lex.tokens, tok)
+            skip
+        end
+
+        # Unknown character — report error token & set error_msg
+        err_str = fat_str_new("unexpected character")
+        lex.error_msg = err_str
+        g_lexer_error = err_str as i64
+        g_lexer_error_offset = lex.pos
+        tok = token_new(TokType.Error, lex.line, lex.col)
+        tok.str_val = fat_char_to_str(c)
+        var (lex2, _) = lex_advance(lex)
+        lex = lex2
+        lex.tokens = vec_push(lex.tokens, tok)
+    end
+
+    # Push sentinel EOF token
+    lex.tokens = vec_push(lex.tokens, token_new(TokType.Eof, lex.line, lex.col))
+    out tokenize_finalize(lex)
+end.
+
+# C-string entry: read_file_str / get_arg return raw pointers; lexer needs fat string.
+func lexer_lex(source_cstr: int):
+    let source = str_from_cstr(source_cstr)
+    var lex = lexer_new(source)
+    out tokenize(lex)
+end.
+
+# ═══════════════════════════════════════════════════════
+# Token Name (for debug / error messages)
+# ═══════════════════════════════════════════════════════
+
+
+export Lexer, Token, TokType, lexer_new, tokenize, tokenize_finalize, token_name, lexer_error_message, lexer_token_count, lexer_token_get, ident_intern_reset, ident_intern_span, utf8_source_invalid_offset_bytes, lexer_lex, token_lexeme, is_digit, is_alpha, is_word_char, token_new

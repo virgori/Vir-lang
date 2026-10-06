@@ -1,0 +1,832 @@
+##
+ * vir/compiler/ide_semantic.vri — IDE semantic snapshot buffer (lifetime + modules).
+ ##
+
+include rt_vec_rt
+
+include rt_string_rt
+
+include context
+
+include symbol_table
+
+include scope_tree
+
+include source_manager
+
+const IDE_KIND_VAR: int = 0
+const IDE_KIND_MODULE: int = 1
+
+# Declaration kinds for the unified symbol graph (`ide.symbols` in the JSON snapshot).
+const IDE_SYM_MODULE: int = 1
+const IDE_SYM_FUNCTION: int = 2
+const IDE_SYM_TYPE: int = 3
+const IDE_SYM_CONSTANT: int = 4
+const IDE_SYM_IMPORT: int = 5
+
+const IDE_STATE_DECLARED: int = 1
+const IDE_STATE_ALIVE: int = 2
+const IDE_STATE_MOVED: int = 4
+const IDE_STATE_OUT: int = 8
+const IDE_STATE_INVALID: int = 16
+
+var g_ide_occ: int = 0
+var g_ide_modules: int = 0
+var g_ide_funcs: int = 0
+var g_ide_call_edges: int = 0
+
+var g_ide_pass8_symbols: int = 0
+var g_ide_pass8_scopes: int = 0
+var g_ide_shape_dims: int = 0
+var g_ide_imports: int = 0
+var g_ide_active_refs: int = 0
+var g_ide_type_refs: int = 0
+
+func ide_reset():
+    g_ide_occ = vec_new_rt()
+    g_ide_modules = vec_new_rt()
+    g_ide_funcs = vec_new_rt()
+    g_ide_call_edges = vec_new_rt()
+    g_ide_shape_dims = vec_new_rt()
+    g_ide_imports = vec_new_rt()
+    g_ide_active_refs = vec_new_rt()
+    g_ide_type_refs = vec_new_rt()
+    g_ide_pass8_symbols = 0
+    g_ide_pass8_scopes = 0
+end.
+
+# state 0 = known compile-time dimension literal (ok for static shape)
+func ide_push_shape_dim(line: int, value: int, state: int):
+    if ide_enabled() == 0 do
+        out 0
+    end
+    var rec = vec_new_rt()
+    rec = vec_push_rt(rec, line)
+    rec = vec_push_rt(rec, value)
+    rec = vec_push_rt(rec, state)
+    g_ide_shape_dims = vec_push_rt(g_ide_shape_dims, rec)
+    out 0
+end.
+
+func ide_pass8_bind(ref symbols: SymbolTable, ref scopes: ScopeTree):
+    g_ide_pass8_symbols = symbols as i64
+    g_ide_pass8_scopes = scopes as i64
+end.
+
+func ide_enabled():
+    if g_ide_semantic == 1 do
+        out 1
+    end
+    out 0
+end.
+
+func ide_push_occ(symbol_id: int, line: int, col: int, end_line: int, end_col: int, kind: int, state: int):
+    if ide_enabled() == 0 do
+        out 0
+    end
+    var rec = vec_new_rt()
+    rec = vec_push_rt(rec, symbol_id)
+    rec = vec_push_rt(rec, line)
+    rec = vec_push_rt(rec, col)
+    rec = vec_push_rt(rec, end_line)
+    rec = vec_push_rt(rec, end_col)
+    rec = vec_push_rt(rec, kind)
+    rec = vec_push_rt(rec, state)
+    g_ide_occ = vec_push_rt(g_ide_occ, rec)
+    out 0
+end.
+
+func ide_lookup_sym(name: int):
+    if g_ide_pass8_symbols == 0 do
+        out 0
+    end
+    var symbols = g_ide_pass8_symbols as SymbolTable
+    var scopes = g_ide_pass8_scopes as ScopeTree
+    let sid = scope_current_id(scopes)
+    let found = symbol_lookup(symbols, scopes, sid, name as i64)
+    if found < 0 do
+        out 0
+    end
+    out found
+end.
+
+func ide_note_var(name: int, line: int, col: int, state: int):
+    if ide_enabled() == 0 do
+        out 0
+    end
+    if fat_str_len(name) == 0 do
+        out 0
+    end
+    let sym_id = ide_lookup_sym(name)
+    var c = col
+    if c <= 0 do c = 1 end
+    var elen = fat_str_len(name)
+    if elen <= 0 do elen = 1 end
+    ide_push_occ(sym_id, line, c, line, c + elen, IDE_KIND_VAR, state)
+    out 0
+end.
+
+# Map an expanded-text line back to the file the user is editing. Returns -1 when the
+# node came from an included module (it still takes part in the graph, but is never
+# reported as a position in the edited document).
+func ide_root_line(exp_line: int):
+    if exp_line <= 0 do
+        out -1
+    end
+    if g_active_source_manager == 0 do
+        out exp_line
+    end
+    if sm_file_from_line(g_active_source_manager, exp_line) != 0 do
+        out -1
+    end
+    out sm_line_from_expanded(g_active_source_manager, exp_line)
+end.
+
+func ide_name_eq(fat: int, query: int):
+    if fat == query as i64 do out 1 end
+    if fat == 0 or query == 0 do out 0 end
+    out fat_str_eq(fat, query)
+end.
+
+func ide_str_eq(a: int, b: int):
+    out ide_name_eq(a, b)
+end.
+
+func ide_find_module_index(name: int):
+    if name == 0 do out 0 - 1 end
+    let n = vec_len_rt(g_ide_modules)
+    var i = 0
+    when i < n loop
+        let rec = vec_get_rt(g_ide_modules, i)
+        let m_name = vec_get_rt(rec, 0)
+        if ide_name_eq(m_name, name) == 1 do
+            out i
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func ide_register_module(mod_name: int, alias: int, line: int, col: int, resolved: int):
+    if ide_enabled() == 0 do
+        out 0
+    end
+    let rl = ide_root_line(line)
+    if rl < 0 do
+        out 0
+    end
+    let existing = ide_find_module_index(mod_name)
+    if existing >= 0 do
+        if fat_str_len(alias) > 0 do
+            let erec = vec_get_rt(g_ide_modules, existing)
+            if vec_get_rt(erec, 5) == 0 do
+                vec_set_rt(erec, 5, alias as i64)
+                vec_set_rt(g_ide_modules, existing, erec)
+            end
+        end
+        out 0
+    end
+    var rec = vec_new_rt()
+    rec = vec_push_rt(rec, mod_name as i64)
+    rec = vec_push_rt(rec, rl)
+    rec = vec_push_rt(rec, col)
+    rec = vec_push_rt(rec, resolved)
+    rec = vec_push_rt(rec, 0)
+    if fat_str_len(alias) > 0 do
+        rec = vec_push_rt(rec, alias as i64)
+    else
+        rec = vec_push_rt(rec, 0)
+    end
+    g_ide_modules = vec_push_rt(g_ide_modules, rec)
+    out 0
+end.
+
+func ide_register_include(mod_name: int, line: int, col: int, resolved: int):
+    ide_register_module(mod_name, 0, line, col, resolved)
+    out 0
+end.
+
+func ide_find_func_index(name: int):
+    if name == 0 do out 0 - 1 end
+    let n = vec_len_rt(g_ide_funcs)
+    var i = 0
+    when i < n loop
+        let rec = vec_get_rt(g_ide_funcs, i)
+        let fn_name = vec_get_rt(rec, 0)
+        if ide_name_eq(fn_name, name) == 1 do
+            out i
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+func ide_register_decl(name: int, line: int, col: int, end_col: int, symbol_id: int, kind: int):
+    if ide_enabled() == 0 do
+        out 0
+    end
+    if fat_str_len(name) == 0 do
+        out 0
+    end
+    if ide_find_func_index(name) >= 0 do
+        out 0
+    end
+    var rec = vec_new_rt()
+    rec = vec_push_rt(rec, name as i64)
+    rec = vec_push_rt(rec, ide_root_line(line))
+    rec = vec_push_rt(rec, col)
+    rec = vec_push_rt(rec, end_col)
+    rec = vec_push_rt(rec, symbol_id)
+    rec = vec_push_rt(rec, 0)
+    rec = vec_push_rt(rec, kind)
+    g_ide_funcs = vec_push_rt(g_ide_funcs, rec)
+    out 0
+end.
+
+func ide_register_function(name: int, line: int, col: int, end_col: int, symbol_id: int):
+    ide_register_decl(name, line, col, end_col, symbol_id, IDE_SYM_FUNCTION)
+    out 0
+end.
+
+func ide_find_import_index(binding: int, mod_name: int):
+    if binding == 0 do out 0 - 1 end
+    let n = vec_len_rt(g_ide_imports)
+    var i = 0
+    when i < n loop
+        let rec = vec_get_rt(g_ide_imports, i)
+        let b = vec_get_rt(rec, 0)
+        let m = vec_get_rt(rec, 2)
+        if ide_name_eq(b, binding) == 1 and ide_name_eq(m, mod_name) == 1 do
+            out i
+        end
+        i = i + 1
+    end
+    out 0 - 1
+end.
+
+# One entry per imported symbol: `import a, b as c from mod` registers `a` and `b`.
+# `binding` is the local name (alias if any), `orig` the exported name.
+func ide_register_import(binding: int, orig: int, mod_name: int, line: int):
+    if ide_enabled() == 0 do
+        out 0
+    end
+    if fat_str_len(orig) == 0 do
+        out 0
+    end
+    let rl = ide_root_line(line)
+    if rl < 0 do
+        out 0
+    end
+    if ide_find_import_index(binding, mod_name) >= 0 do
+        out 0
+    end
+    var rec = vec_new_rt()
+    rec = vec_push_rt(rec, binding as i64)
+    rec = vec_push_rt(rec, rl)
+    rec = vec_push_rt(rec, mod_name as i64)
+    rec = vec_push_rt(rec, orig as i64)
+    g_ide_imports = vec_push_rt(g_ide_imports, rec)
+    out 0
+end.
+
+func ide_add_call_edge(from_func: int, to_name: int):
+    if ide_enabled() == 0 do
+        out 0
+    end
+    if fat_str_len(to_name) == 0 do
+        out 0
+    end
+    var edge = vec_new_rt()
+    edge = vec_push_rt(edge, from_func)
+    edge = vec_push_rt(edge, to_name as i64)
+    g_ide_call_edges = vec_push_rt(g_ide_call_edges, edge)
+    out 0
+end.
+
+func ide_mark_func_reachable(idx: int):
+    if idx < 0 do
+        out 0
+    end
+    let rec = vec_get_rt(g_ide_funcs, idx)
+    vec_set_rt(rec, 5, 1)
+    vec_set_rt(g_ide_funcs, idx, rec)
+    out 0
+end.
+
+# Type annotations are strings on AST nodes (`Vec<Foo>`, `&Foo`, `Option<Foo>`). Record the
+# owner and the annotation; the identifiers inside are matched against declared types in
+# `ide_expand_type_refs` once every declaration is known (types may be declared later).
+func ide_note_type_ref(from_func: int, type_str: int):
+    if ide_enabled() == 0 do
+        out 0
+    end
+    if fat_str_len(type_str) == 0 do
+        out 0
+    end
+    var rec = vec_new_rt()
+    rec = vec_push_rt(rec, from_func)
+    rec = vec_push_rt(rec, type_str as i64)
+    g_ide_type_refs = vec_push_rt(g_ide_type_refs, rec)
+    out 0
+end.
+
+func ide_is_ident_byte(b: int):
+    if b >= 48 and b <= 57 do out 1 end
+    if b >= 65 and b <= 90 do out 1 end
+    if b >= 97 and b <= 122 do out 1 end
+    if b == 95 do out 1 end
+    out 0
+end.
+
+# Does type_str[start..end) spell exactly `name`?
+func ide_type_run_equals(type_str: int, start: int, end_pos: int, name: int):
+    if fat_str_len(name) != end_pos - start do
+        out 0
+    end
+    var k = 0
+    let run_len = end_pos - start
+    when k < run_len loop
+        if fat_str_byte_at(type_str, start + k) != fat_str_byte_at(name, k) do
+            out 0
+        end
+        k = k + 1
+    end
+    out 1
+end.
+
+func ide_expand_type_refs():
+    let nr = vec_len_rt(g_ide_type_refs)
+    let nd = vec_len_rt(g_ide_funcs)
+    var ri = 0
+    when ri < nr loop
+        let rrec = vec_get_rt(g_ide_type_refs, ri)
+        let owner = vec_get_rt(rrec, 0)
+        let ts = vec_get_rt(rrec, 1)
+        let tn = fat_str_len(ts)
+        var pos = 0
+        when pos < tn loop
+            if ide_is_ident_byte(fat_str_byte_at(ts, pos)) == 1 do
+                var run_end = pos
+                when run_end < tn and ide_is_ident_byte(fat_str_byte_at(ts, run_end)) == 1 loop
+                    run_end = run_end + 1
+                end
+                var di = 0
+                when di < nd loop
+                    let drec = vec_get_rt(g_ide_funcs, di)
+                    if vec_get_rt(drec, 6) == IDE_SYM_TYPE do
+                        if ide_type_run_equals(ts, pos, run_end, vec_get_rt(drec, 0)) == 1 do
+                            ide_add_call_edge(owner, vec_get_rt(drec, 0))
+                        end
+                    end
+                    di = di + 1
+                end
+                pos = run_end
+            else
+                pos = pos + 1
+            end
+        end
+        ri = ri + 1
+    end
+    out 0
+end.
+
+# Reachability over the reference graph.
+#   nodes : every declaration (function / type / constant) of the expanded compilation unit
+#   edges : (owner declaration | 0 for top-level code) -> referenced name
+#   roots : `main`, and everything referenced from top-level code (incl. `export`)
+# A declaration is *active* when a root reaches it directly or transitively (calls,
+# callbacks passed as values, type uses, constant uses). Afterwards every name that a
+# root or a reachable declaration references is recorded in `g_ide_active_refs`, which
+# decides the state of imported symbols and module names.
+func ide_finalize_functions():
+    if ide_enabled() == 0 do
+        out 0
+    end
+    ide_expand_type_refs()
+    let nf = vec_len_rt(g_ide_funcs)
+    var adj = vec_new_rt()
+    var ai = 0
+    when ai < nf loop
+        adj = vec_push_rt(adj, vec_new_rt())
+        ai = ai + 1
+    end
+
+    var queue = vec_new_rt()
+    var target_entry = fat_str_new("main" as string)
+    if g_has_custom_entry == 1 and fat_str_len(g_entry_function_name) > 0 do
+        target_entry = g_entry_function_name
+    end
+    var main_idx = ide_find_func_index(target_entry as int)
+    if main_idx < 0 and g_has_custom_entry == 0 do
+        main_idx = ide_find_func_index(fat_str_new("Main" as string) as int)
+    end
+    if main_idx >= 0 do
+        queue = vec_push_rt(queue, main_idx)
+        ide_mark_func_reachable(main_idx)
+    end
+
+    # Resolve every edge once. `edge_from[i]` is the owner index, -1 for top-level code.
+    var edge_from = vec_new_rt()
+    let ec = vec_len_rt(g_ide_call_edges)
+    var ei = 0
+    when ei < ec loop
+        let edge = vec_get_rt(g_ide_call_edges, ei)
+        let from_name = vec_get_rt(edge, 0)
+        let cidx = ide_find_func_index(vec_get_rt(edge, 1))
+        if from_name == 0 do
+            edge_from = vec_push_rt(edge_from, 0 - 1)
+            if cidx >= 0 do
+                let rec = vec_get_rt(g_ide_funcs, cidx)
+                if vec_get_rt(rec, 5) == 0 do
+                    ide_mark_func_reachable(cidx)
+                    queue = vec_push_rt(queue, cidx)
+                end
+            end
+        else
+            let fidx = ide_find_func_index(from_name)
+            edge_from = vec_push_rt(edge_from, fidx)
+            if fidx >= 0 and cidx >= 0 do
+                var list = vec_get_rt(adj, fidx)
+                list = vec_push_rt(list, cidx)
+                vec_set_rt(adj, fidx, list)
+            end
+        end
+        ei = ei + 1
+    end
+
+    var qi = 0
+    when qi < vec_len_rt(queue) loop
+        let cur = vec_get_rt(queue, qi)
+        let outs = vec_get_rt(adj, cur)
+        let on = vec_len_rt(outs)
+        var oi = 0
+        when oi < on loop
+            let nxt = vec_get_rt(outs, oi)
+            let nrec = vec_get_rt(g_ide_funcs, nxt)
+            if vec_get_rt(nrec, 5) == 0 do
+                ide_mark_func_reachable(nxt)
+                queue = vec_push_rt(queue, nxt)
+            end
+            oi = oi + 1
+        end
+        qi = qi + 1
+    end
+
+    # Names referenced from live code (roots + reachable declarations).
+    var ej = 0
+    when ej < ec loop
+        let fidx2 = vec_get_rt(edge_from, ej)
+        var live = 0
+        if fidx2 < 0 do
+            if vec_get_rt(vec_get_rt(g_ide_call_edges, ej), 0) == 0 do
+                live = 1
+            end
+        else
+            if vec_get_rt(vec_get_rt(g_ide_funcs, fidx2), 5) == 1 do
+                live = 1
+            end
+        end
+        if live == 1 do
+            g_ide_active_refs = vec_push_rt(g_ide_active_refs, vec_get_rt(vec_get_rt(g_ide_call_edges, ej), 1))
+        end
+        ej = ej + 1
+    end
+    out 0
+end.
+
+func ide_name_actively_referenced(name: int):
+    if name == 0 do out 0 end
+    let n = vec_len_rt(g_ide_active_refs)
+    var i = 0
+    when i < n loop
+        let ref_item = vec_get_rt(g_ide_active_refs, i)
+        if ide_name_eq(ref_item, name) == 1 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func ide_module_name_referenced(name: int):
+    if name == 0 do out 0 end
+    let n = vec_len_rt(g_ide_active_refs)
+    var i = 0
+    when i < n loop
+        let ref_item = vec_get_rt(g_ide_active_refs, i)
+        if ide_name_eq(ref_item, name) == 1 do
+            out 1
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func ide_import_resolved(rec: int):
+    if ide_find_func_index(vec_get_rt(rec, 3)) >= 0 do
+        out 1
+    end
+    out 0
+end.
+
+func ide_import_active(rec: int):
+    if ide_name_actively_referenced(vec_get_rt(rec, 0)) == 1 do
+        out 1
+    end
+    out 0
+end.
+
+# A module is active when one of its imported symbols is active, or when the module
+# name itself is referenced from live code (qualified access).
+func ide_module_active(mod_name: int, alias: int):
+    let n = vec_len_rt(g_ide_imports)
+    var i = 0
+    when i < n loop
+        let rec = vec_get_rt(g_ide_imports, i)
+        let imp_mod = vec_get_rt(rec, 2)
+        if ide_name_eq(imp_mod, mod_name) == 1 do
+            if ide_import_active(rec) == 1 do
+                out 1
+            end
+        end
+        i = i + 1
+    end
+    if ide_module_name_referenced(mod_name) == 1 do
+        out 1
+    end
+    if alias != 0 do
+        out ide_module_name_referenced(alias)
+    end
+    out 0
+end.
+
+func ide_mark_module_used(mod_name: int):
+    if ide_enabled() == 0 do
+        out 0
+    end
+    let n = vec_len_rt(g_ide_modules)
+    var i = 0
+    when i < n loop
+        let rec = vec_get_rt(g_ide_modules, i)
+        let nm = vec_get_rt(rec, 0)
+        if ide_name_eq(nm, mod_name) == 1 do
+            let used = vec_get_rt(rec, 4)
+            vec_set_rt(rec, 4, used + 1)
+            vec_set_rt(g_ide_modules, i, rec)
+            out 0
+        end
+        i = i + 1
+    end
+    out 0
+end.
+
+func ide_append_json_escaped_name(sb: StringBuilder, name: int):
+    let n = fat_str_len(name)
+    var i = 0
+    when i < n loop
+        let b = fat_str_byte_at(name, i)
+        if b == 34 or b == 92 do
+            sb = sb_append_char(sb, 92)
+        end
+        sb = sb_append_char(sb, b)
+        i = i + 1
+    end
+    out sb
+end.
+
+func ide_append_occurrences_json(sb: StringBuilder):
+    sb = sb_append(sb, "\"occurrences\":[" as int)
+    let n = vec_len_rt(g_ide_occ)
+    var i = 0
+    when i < n loop
+        if i > 0 do sb = sb_append(sb, "," as int) end
+        let rec = vec_get_rt(g_ide_occ, i)
+        sb = sb_append(sb, "{\"symbolId\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 0))
+        sb = sb_append(sb, ",\"line\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 1))
+        sb = sb_append(sb, ",\"col\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 2))
+        sb = sb_append(sb, ",\"endLine\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 3))
+        sb = sb_append(sb, ",\"endCol\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 4))
+        sb = sb_append(sb, ",\"kind\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 5))
+        sb = sb_append(sb, ",\"state\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 6))
+        sb = sb_append(sb, "}" as int)
+        i = i + 1
+    end
+    sb = sb_append(sb, "]" as int)
+    out sb
+end.
+
+func ide_append_modules_json(sb: StringBuilder):
+    sb = sb_append(sb, "\"modules\":[" as int)
+    let n = vec_len_rt(g_ide_modules)
+    var i = 0
+    when i < n loop
+        if i > 0 do sb = sb_append(sb, "," as int) end
+        let rec = vec_get_rt(g_ide_modules, i)
+        let nm = vec_get_rt(rec, 0) as string
+        let line = vec_get_rt(rec, 1)
+        let col = vec_get_rt(rec, 2)
+        let resolved = vec_get_rt(rec, 3)
+        var used = 0
+        if resolved != 0 do
+            used = ide_module_active(nm, vec_get_rt(rec, 5))
+        end
+        sb = sb_append(sb, "{\"name\":\"" as int)
+        sb = ide_append_json_escaped_name(sb, nm)
+        sb = sb_append(sb, "\",\"line\":" as int)
+        sb = sb_append_int(sb, line)
+        sb = sb_append(sb, ",\"col\":" as int)
+        sb = sb_append_int(sb, col)
+        sb = sb_append(sb, ",\"state\":\"" as int)
+        if resolved == 0 do
+            sb = sb_append(sb, "unresolved" as int)
+        else
+            if used > 0 do
+                sb = sb_append(sb, "active" as int)
+            else
+                sb = sb_append(sb, "inactive" as int)
+            end
+        end
+        sb = sb_append(sb, "\"}" as int)
+        i = i + 1
+    end
+    sb = sb_append(sb, "]" as int)
+    out sb
+end.
+
+func ide_append_functions_json(sb: StringBuilder):
+    sb = sb_append(sb, "\"functions\":[" as int)
+    let n = vec_len_rt(g_ide_funcs)
+    var i = 0
+    var emitted = 0
+    when i < n loop
+        let rec = vec_get_rt(g_ide_funcs, i)
+        if vec_get_rt(rec, 1) <= 0 or vec_get_rt(rec, 6) != IDE_SYM_FUNCTION do
+            i = i + 1
+            skip
+        end
+        if emitted > 0 do sb = sb_append(sb, "," as int) end
+        emitted = emitted + 1
+        let nm = vec_get_rt(rec, 0) as string
+        sb = sb_append(sb, "{\"name\":\"" as int)
+        sb = ide_append_json_escaped_name(sb, nm)
+        sb = sb_append(sb, "\",\"line\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 1))
+        sb = sb_append(sb, ",\"col\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 2))
+        sb = sb_append(sb, ",\"endCol\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 3))
+        sb = sb_append(sb, ",\"symbolId\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 4))
+        sb = sb_append(sb, ",\"state\":\"" as int)
+        if vec_get_rt(rec, 5) == 1 do
+            sb = sb_append(sb, "active" as int)
+        else
+            sb = sb_append(sb, "inactive" as int)
+        end
+        sb = sb_append(sb, "\"}" as int)
+        i = i + 1
+    end
+    sb = sb_append(sb, "]" as int)
+    out sb
+end.
+
+func ide_append_symbol_head(sb: StringBuilder, name: string, kind: string, line: int, col: int):
+    sb = sb_append(sb, "{\"name\":\"" as int)
+    sb = ide_append_json_escaped_name(sb, name)
+    sb = sb_append(sb, "\",\"kind\":\"" as int)
+    sb = sb_append(sb, kind as int)
+    sb = sb_append(sb, "\",\"line\":" as int)
+    sb = sb_append_int(sb, line)
+    sb = sb_append(sb, ",\"col\":" as int)
+    sb = sb_append_int(sb, col)
+    sb = sb_append(sb, ",\"endCol\":" as int)
+    sb = sb_append_int(sb, col + fat_str_len(name))
+    sb = sb_append(sb, ",\"state\":\"" as int)
+    out sb
+end.
+
+func ide_append_symbol_tail(sb: StringBuilder, state: string):
+    sb = sb_append(sb, state as int)
+    sb = sb_append(sb, "\"}" as int)
+    out sb
+end.
+
+# Unified per-symbol state consumed by the editor. The compiler is the only place where
+# usage is decided; the extension just renders it. Positions: `line` is 1-based in the
+# edited file; `col` is 0 when the parser did not record a column (editor locates the
+# name on that line).
+func ide_append_symbols_json(sb: StringBuilder):
+    sb = sb_append(sb, "\"symbols\":[" as int)
+    var emitted = 0
+
+    let nm_count = vec_len_rt(g_ide_modules)
+    var mi = 0
+    when mi < nm_count loop
+        let mrec = vec_get_rt(g_ide_modules, mi)
+        let mname = vec_get_rt(mrec, 0) as string
+        if emitted > 0 do sb = sb_append(sb, "," as int) end
+        emitted = emitted + 1
+        sb = ide_append_symbol_head(sb, mname, "module", vec_get_rt(mrec, 1), 0)
+        if vec_get_rt(mrec, 3) == 0 do
+            sb = ide_append_symbol_tail(sb, "unresolved" as string)
+        eif ide_module_active(mname, vec_get_rt(mrec, 5)) == 1 do
+            sb = ide_append_symbol_tail(sb, "active" as string)
+        else
+            sb = ide_append_symbol_tail(sb, "inactive" as string)
+        end
+        mi = mi + 1
+    end
+
+    let nd = vec_len_rt(g_ide_funcs)
+    var di = 0
+    when di < nd loop
+        let drec = vec_get_rt(g_ide_funcs, di)
+        if vec_get_rt(drec, 1) > 0 do
+            var kind_name = "function"
+            let dk = vec_get_rt(drec, 6)
+            if dk == IDE_SYM_TYPE do kind_name = "type" end
+            if dk == IDE_SYM_CONSTANT do kind_name = "constant" end
+            if emitted > 0 do sb = sb_append(sb, "," as int) end
+            emitted = emitted + 1
+            sb = ide_append_symbol_head(sb, vec_get_rt(drec, 0) as string, kind_name as string, vec_get_rt(drec, 1), 0)
+            if vec_get_rt(drec, 5) == 1 do
+                sb = ide_append_symbol_tail(sb, "active" as string)
+            else
+                sb = ide_append_symbol_tail(sb, "inactive" as string)
+            end
+        end
+        di = di + 1
+    end
+
+    let ni = vec_len_rt(g_ide_imports)
+    var ii = 0
+    when ii < ni loop
+        let irec = vec_get_rt(g_ide_imports, ii)
+        if vec_get_rt(irec, 1) > 0 do
+            if emitted > 0 do sb = sb_append(sb, "," as int) end
+            emitted = emitted + 1
+            sb = ide_append_symbol_head(sb, vec_get_rt(irec, 3) as string, "import", vec_get_rt(irec, 1), 0)
+            if ide_import_resolved(irec) == 0 do
+                sb = ide_append_symbol_tail(sb, "unresolved" as string)
+            eif ide_import_active(irec) == 1 do
+                sb = ide_append_symbol_tail(sb, "active" as string)
+            else
+                sb = ide_append_symbol_tail(sb, "inactive" as string)
+            end
+        end
+        ii = ii + 1
+    end
+
+    sb = sb_append(sb, "]" as int)
+    out sb
+end.
+
+func ide_append_shape_dimensions_json(sb: StringBuilder):
+    sb = sb_append(sb, "\"shapeDimensions\":[" as int)
+    let n = vec_len_rt(g_ide_shape_dims)
+    var i = 0
+    when i < n loop
+        if i > 0 do sb = sb_append(sb, "," as int) end
+        let rec = vec_get_rt(g_ide_shape_dims, i)
+        sb = sb_append(sb, "{\"line\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 0))
+        sb = sb_append(sb, ",\"value\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 1))
+        sb = sb_append(sb, ",\"state\":" as int)
+        sb = sb_append_int(sb, vec_get_rt(rec, 2))
+        sb = sb_append(sb, "}" as int)
+        i = i + 1
+    end
+    sb = sb_append(sb, "]" as int)
+    out sb
+end.
+
+func ide_append_json_block(sb: StringBuilder):
+    if ide_enabled() == 0 do
+        out sb
+    end
+    sb = sb_append(sb, ",\"ide\":{" as int)
+    sb = ide_append_occurrences_json(sb)
+    sb = sb_append(sb, "," as int)
+    sb = ide_append_modules_json(sb)
+    sb = sb_append(sb, "," as int)
+    sb = ide_append_functions_json(sb)
+    sb = sb_append(sb, "," as int)
+    sb = ide_append_shape_dimensions_json(sb)
+    sb = sb_append(sb, "," as int)
+    sb = ide_append_symbols_json(sb)
+    sb = sb_append(sb, "}" as int)
+    out sb
+end.
+
+export ide_reset, ide_enabled, ide_pass8_bind, ide_note_var, ide_register_include, ide_mark_module_used,
+       ide_register_decl, ide_register_import, ide_register_module, ide_note_type_ref, ide_register_function, ide_add_call_edge, ide_finalize_functions, ide_push_shape_dim, ide_append_json_block
+
+export IDE_STATE_DECLARED, IDE_STATE_ALIVE, IDE_STATE_MOVED, IDE_STATE_OUT, IDE_STATE_INVALID

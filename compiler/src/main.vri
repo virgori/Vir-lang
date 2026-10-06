@@ -1,0 +1,262 @@
+##
+ * vir/compiler/main.vri — Vir Self-Hosting Compiler Driver
+ * =========================================================
+ * Phase 5: Bootstrap — Vir compiles itself to a standalone binary.
+ *
+ * Pipeline
+ *   source.vri → lex → parse → HIR → MIR → LIR → Q-IR → codegen → Mach-O
+ *
+ * Produces a standalone Mach-O ARM64 executable that uses direct
+ * BSD syscalls — no Python, no C library, no external linker needed.
+ *
+ * Usage (Stage 1 — bootstrapped via C runtime)
+ *   vir jit stdlib/vir/compiler/main.vri <input.vri> [-o output]
+ *
+ * Usage (Stage 2 — self-hosted)
+ *   ./virc <input.vri> [-o output]
+ *
+ * Date: 9/3/2026
+ ##
+
+include source_manager
+include ide_semantic
+include lexer
+include parser
+include pipeline
+include codegen
+include binary
+include main_path_util
+include main_module_resolver
+include main_include_expander
+include main_import_expander
+
+# (legacy link_single_kernel import removed: linker.vri is not part of the self-hosted driver)
+
+include rt_alloc
+include rt_string_rt
+include rt_vec_rt
+include rt_io
+
+func append_prog_children(dst: AstNode, src: AstNode):
+    if src.node_type != AstType.Program do
+        out dst
+    end
+    i = 0
+    when i < vec_len_rt(src.children) loop
+        dst = ast_add_child(dst, vec_get_rt(src.children, i))
+        i = i + 1
+    end
+    out dst
+end.
+
+func resolve_includes(prog: AstNode):
+    # Includes are expanded at text level (expand_includes_text) before parse.
+    out prog
+end.
+
+#*#
+Legacy stage-0 driver.  The full driver is compiler.virc and retaining
+this dead path pulls obsolete file builtins into native link resolution.
+func compile(source: string, output_path: string):
+
+    # Step 0: Expand includes + imports as text (physical splice)
+    print "virc: resolving includes..."
+    g_imp_mod = 0
+    g_imp_syms = 0
+    g_imp_sym_count = 0
+    g_imp_alias = 0
+    source = text_ascii_sanitize(source)
+    source = expand_includes_text(source)
+    if g_inc_err != 0 do
+        print "virc: include cannot read module"
+        out 1
+    end
+    source = expand_imports_text(source)
+    if g_inc_err == 1 do
+        print "virc: include cannot read module"
+        out 1
+    end
+    if g_inc_err == 3 do
+        print "virc: import symbol not exported"
+        out 1
+    end
+    if g_inc_err != 0 do
+        print "virc: include cannot read module"
+        out 1
+    end
+    source = expand_includes_text(source)
+    if g_inc_err != 0 do
+        print "virc: include cannot read module"
+        out 1
+    end
+
+    # Step 1: Tokenize
+    print "virc: tokenizing..."
+    lex = lexer_new(source)
+    lex = tokenize(lex)
+
+    if lexer_error_message() != 0 do
+        print "virc: lex error"
+        out 1
+    end
+
+    tok_count = vec_len(lex.tokens)
+
+    # Parser expects rt-vec of token pointers; lexer uses collections Vec.
+    tok_rt = vec_new_rt()
+    ti = 0
+    when ti < tok_count loop
+        tok = vec_get(lex.tokens, ti)
+        tok_rt = vec_push_rt(tok_rt, tok)
+        ti = ti + 1
+    end
+
+    # Step 2: Parse
+    print "virc: parsing..."
+    parser = parser_new(tok_rt)
+    var (parser2, ast) = parse_program(parser)
+
+    if ast.node_type == AstType.Program and vec_len_rt(ast.children) == 0 do
+        print "virc: parse produced empty program"
+        out 1
+    end
+
+    # Step 2b: AST include resolve is a no-op (text expand above)
+    ast = resolve_includes(ast)
+
+    # Step 3: Lower
+    print "virc: lowering..."
+    ctx = compile_pipeline("", ast, 0)
+
+    if ctx.error_count > 0 do
+        print "virc: lower error"
+        out 1
+    end
+
+    func_count = vec_len(ctx.prog.functions)
+    if func_count == 0 do
+        print "virc: no functions lowered"
+        out 1
+    end
+
+    # Step 4: Optimize (identity under C-core bootstrap)
+    print "virc: optimizing..."
+    ctx.prog = optimize_module(ctx.prog)
+
+    # Step 5: Code generation (ARM64)
+    print "virc: generating ARM64 machine code..."
+    code = codegen_emit_module(ctx.prog, TargetArch.ARM64)
+    code_size = codebuf_offset(code)
+
+    # Step 6: Link into Mach-O executable
+    print "virc: linking Mach-O ARM64 executable..."
+    binary = emit_macho_executable(code)
+
+    # Step 7: Write output (C-core: output_path is a C string from get_arg)
+    print "virc: writing..."
+    f = file_open(output_path, "w")
+    if f == 0 do
+        print "virc: error_msg: cannot create output file"
+        out 1
+    end
+
+    file_size = buf_size(binary)
+    write_buf_to_file(f, binary)
+    file_close(f)
+
+    print "virc: done"
+    print file_size
+    out 0
+end.
+# ═══════════════════════════════════════════════════════
+# Main Entry Point
+# ═══════════════════════════════════════════════════════
+
+func compiler_legacy_main:
+    print "╔══════════════════════════════════════════════╗"
+    print "║  virc — Vir Self-Hosting Compiler v2.0      ║"
+    print "║  Phase 5: Bootstrap Binary                   ║"
+    print "╚══════════════════════════════════════════════╝"
+
+    if arg_count() < 1 do
+        print "Usage: virc <input.vri> [-o output]"
+        print ""
+        print "Compiles a Vir source file to a standalone"
+        print "Mach-O ARM64 binary. No Python, no C runtime."
+        out 1
+    end
+
+    input_path = get_arg(0)
+    output_path = "a.out"
+
+    # Parse -o flag
+    if arg_count() >= 3 do
+        if rt_streq(get_arg(1), "-o" as int) do
+            output_path = get_arg(2)
+        end
+    end
+
+    # Directory of main source (for relative includes)
+    g_inc_base = 0
+    plen = rt_strlen(input_path)
+    last_slash = 0 - 1
+    pi = 0
+    when pi < plen loop
+        if native_read_u8(input_path, pi) == 47 do
+            last_slash = pi
+        end
+        pi = pi + 1
+    end
+    if last_slash >= 0 do
+        dbuf = vir_alloc(last_slash + 1)
+        pi = 0
+        when pi < last_slash loop
+            native_write_u8(dbuf, pi, native_read_u8(input_path, pi))
+            pi = pi + 1
+        end
+        native_write_u8(dbuf, last_slash, 0)
+        g_inc_base = dbuf
+    end
+
+    # Read source file (C-core: get_arg returns C strings; use builtin file I/O)
+    print "virc: reading..."
+    f = file_open(input_path, "r")
+    if f == 0 do
+        print "virc: error_msg: cannot open input"
+        out 1
+    end
+
+    source_cstr = file_read(f)
+    file_close(f)
+
+    if source_cstr == 0 do
+        out 1
+    end
+
+    # Builtin file_read returns a C string; lexer expects .byte_len via str_from_cstr.
+    source = str_from_cstr(source_cstr)
+
+    # Compile!
+    result = compile(source, output_path)
+    out result
+end.
+#*#
+export g_ideStdlibRegistry, g_virc_sysroot, g_virc_stdlib_dir, g_virc_stdlib_registry, join_path_cstr, file_exists_cstr, find_file_up
+export main, expand_includes_text, expand_imports_text, text_ascii_sanitize, g_inc_base, g_inc_err, g_inc_main_file
+
+export g_ideImportOrigins, g_ideEarlyDiagnostics, g_ideVirtualFiles, try_read_file, path_normalize_fat, text_find_import
+
+func ideCaptureResolvedModule(name: int, parentPath: int, line: int, body: int):
+    if g_ideFactsEnabled == 0 do out 0 end
+    let entry = vir_alloc(48)
+    native_write_i64(entry, 0, name)
+    native_write_i64(entry, 8, g_inc_canonical_id)
+    native_write_i64(entry, 16, g_inc_resolved_path)
+    native_write_i64(entry, 24, parentPath)
+    native_write_i64(entry, 32, line)
+    var resolved = 0
+    if body != 0 do resolved = 1 end
+    native_write_i64(entry, 40, resolved)
+    g_ideResolvedModules = vec_push_rt(g_ideResolvedModules, entry)
+end.
+export g_ideResolvedModules

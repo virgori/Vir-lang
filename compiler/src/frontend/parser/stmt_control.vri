@@ -1,0 +1,859 @@
+##
+ * compiler/src/frontend/parser/stmt_control.vri — Control Flow & Block Parsing
+ * =============================================================================
+ ##
+
+include types_prelude
+include rt_string_rt
+include lexer
+include ide_facts
+include parser_ast
+include parser_state
+include parser_diagnostics
+include parser_expr
+
+# ═══════════════════════════════════════════════════════
+# Statement Parsing
+# ═══════════════════════════════════════════════════════
+
+func parse_block(ref p: Parser):
+
+    block = ast_new(AstType.Block)
+    p = skip_newlines(p)
+    let blockStart = peek(p)
+    ideFactOrigin(block as int, native_read_i64(blockStart as int, 72), native_read_i64(blockStart as int, 8))
+
+    should_continue = true
+    when should_continue loop
+        if check(p, TokType.End) or check(p, TokType.Else) or check(p, TokType.Eif) or check(p, TokType.Eof) or check(p, TokType.EnsureKw) or check(p, TokType.RevertKw) do
+            should_continue = false
+        eif check(p, TokType.ThrowKw) do
+            var (p_t, _) = advance(p)
+            var (p_t2, throw_expr) = parse_expr(p_t)
+            n_throw = ast_new(AstType.ThrowStmt)
+            n_throw.line = peek(p).line
+            n_throw = ast_add_child(n_throw, throw_expr)
+            block = ast_add_child(block, n_throw)
+            p = p_t2
+            p = skip_newlines(p)
+        else
+            let old_pos = p.pos
+            var (p2, stmt) = parse_statement(p)
+            if p2.pos == old_pos and rt_strlen(p2.error_msg) == 0 do
+                # Forced progress if parse_statement failed to consume any token
+                var (p_adv, _) = advance(p)
+                p = p_adv
+            else
+                p = p2
+                block = ast_add_child(block, stmt)
+            end
+
+            if rt_strlen(p.error_msg) > 0 do
+                let blockEnd = peek(p)
+                ideFactScopeEnd(block as int, native_read_i64(blockEnd as int, 8))
+                out (p, block)
+            end
+            # Skip optional trailing semicolons
+            when check(p, TokType.Semicolon) loop
+                var (p_semi, _) = advance(p)
+                p = p_semi
+            end
+            p = skip_newlines(p)
+        end
+    end
+    let blockEnd = peek(p)
+    ideFactScopeEnd(block as int, native_read_i64(blockEnd as int, 8))
+    out (p, block)
+end.
+
+func const_colon_starts_type_annotation(ref p: Parser) -> bool:
+    var
+        offset = 1
+        paren_depth = 0
+        bracket_depth = 0
+
+    when (p.pos + offset) < p.token_count loop
+        let token_type = peek_n(p, offset).tok_type
+        let at_top = paren_depth == 0 and bracket_depth == 0
+        if at_top and token_type == TokType.Assign do
+            out true
+        end
+        if at_top and (token_type == TokType.Newline or token_type == TokType.Semicolon or token_type == TokType.Comma or token_type == TokType.End or token_type == TokType.Eof) do
+            out false
+        end
+        if token_type == TokType.LParen do
+            paren_depth = paren_depth + 1
+        eif token_type == TokType.RParen and paren_depth > 0 do
+            paren_depth = paren_depth - 1
+        eif token_type == TokType.LBracket do
+            bracket_depth = bracket_depth + 1
+        eif token_type == TokType.RBracket and bracket_depth > 0 do
+            bracket_depth = bracket_depth - 1
+        end
+        offset = offset + 1
+    end
+    out false
+end.
+
+func parse_var_decl_single(ref p: Parser, is_const: bool):
+
+    if check(p, TokType.LParen) do
+        var (p_lp, lp_tok) = advance(p)
+        decl = ast_new(AstType.VarDecl)
+        decl.int_val = 16384; # tuple destructuring flag
+        decl.line = lp_tok.line  # avoid node.line==0 → virc.vri:2 misreport
+        p2 = p_lp
+        when not check(p2, TokType.RParen) and not check(p2, TokType.Eof) loop
+            var (p3, id_tok, ok) = expect_name_tok(p2, "expected tuple var name")
+            if ok do
+                id_node = ast_new(AstType.Identifier)
+                id_node.name = id_tok.str_val
+                id_node.line = id_tok.line
+                decl = ast_add_child(decl, id_node)
+            end
+            p2 = p3
+            var (p4, had_comma) = match_tok(p2, TokType.Comma)
+            if had_comma do
+                p2 = p4
+            end
+        end
+        var (p5, _, _) = expect_tok(p2, TokType.RParen, "expected ')'")
+        p2 = p5
+        var (p6, matched) = match_tok(p2, TokType.Assign)
+        if matched do
+            var (p7, init) = parse_expr(p6)
+            decl = ast_add_child(decl, init)
+            out (p7, decl)
+        end
+        out (p2, decl)
+    end
+
+    # Allow contextual keywords (e.g. `ptr`) as variable names in declarations.
+    # If `ptr` (TokType.PtrKw) appears where a variable name is expected, treat it as ident.
+    if check(p, TokType.PtrKw) do
+        var (p_ptr, ptr_tok) = advance(p)
+        p2 = p_ptr
+        name_tok = ptr_tok
+        name_tok.str_val = fat_str_new("ptr")
+        ok = true
+    else
+        var (p2x, name_tok_x, ok_x) = expect_name_tok(p, "expected variable name")
+        p2 = p2x
+        name_tok = name_tok_x
+        ok = ok_x
+    end
+    if not ok do
+        out (p2, ast_new(AstType.VarDecl))
+    end
+
+    decl_type = AstType.VarDecl
+    if is_const do
+        decl_type = AstType.ConstDecl
+    end
+    let declarationSpan = native_read_i64(name_tok as int, 72)
+    decl = ast_new(decl_type)
+    decl_name = name_tok.str_val
+    decl.name = decl_name
+    decl.line = name_tok.line
+    decl.int_val = name_tok.col
+
+    p3 = p2
+    # Type annotation: x: int = 10. Parser handles are mutable, so decide
+    # whether ':' starts a type annotation before advancing it; otherwise p2
+    # aliases the advanced parser and `const X: 42` loses its initializer.
+    if check(p3, TokType.Colon) do
+        let colon_is_type = not is_const or const_colon_starts_type_annotation(p3)
+        if colon_is_type do
+            var (p_col, _) = advance(p3)
+            var (p_end_type, type_str) = parse_type_expr_string(p_col)
+            decl.name2 = type_str
+            p3 = p_end_type
+        end
+    end
+
+    var (p4, matched) = match_tok(p3, TokType.Assign)
+    if matched do
+        p3 = p4
+    end
+    if not matched do
+        # Also accept : as separator for const decls (const FOO: 42)
+        var (p3b, matched2) = match_tok(p2, TokType.Colon)
+        if matched2 do
+            matched = true
+            p3 = p3b
+        end
+    end
+    if matched do
+        var (p5, init) = parse_expr(p3)
+        saved_name2 = decl.name2
+        decl = ast_add_child(decl, init)
+        # ast_add_child corrupts soft .name/.name2 — restore for lowering / var map.
+        decl.name = decl_name
+        decl.name2 = saved_name2
+        native_write_i64(decl as int, 72, declarationSpan)
+        ideFactOrigin(decl as int, declarationSpan, native_read_i64(decl as int, 32))
+        out (p5, decl)
+    end
+    decl.name = decl_name
+    native_write_i64(decl as int, 72, declarationSpan)
+    ideFactOrigin(decl as int, declarationSpan, native_read_i64(decl as int, 32))
+    out (p3, decl)
+end.
+func is_destruct_decl_ahead(ref p: Parser) -> bool:
+    if not check(p, TokType.LParen) do
+        out false
+    end
+    var offset = 1
+    var depth = 1
+    when (p.pos + offset) < p.token_count loop
+        let t = peek_n(p, offset)
+        if t.tok_type == TokType.Eof or t.tok_type == TokType.End do
+            out false
+        eif t.tok_type == TokType.LParen do
+            depth = depth + 1
+        eif t.tok_type == TokType.RParen do
+            depth = depth - 1
+            if depth == 0 do
+                let t_after = peek_n(p, offset + 1)
+                if t_after.tok_type == TokType.Assign do
+                    out true
+                end
+                out false
+            end
+        end
+        offset = offset + 1
+    end
+    out false
+end.
+func parse_var_decl(ref p: Parser, is_const: bool, kw_col: int, kw_line: int):
+
+    var is_newline_block = false
+    if check(p, TokType.Newline) do
+        is_newline_block = true
+    end
+    p = skip_newlines(p)
+
+    if check(p, TokType.Eof) do
+        p = parse_error(p, "unexpected end of file in declaration")
+        out (p, ast_new(AstType.VarDecl))
+    end
+
+    let tok = peek(p)
+    if is_newline_block and tok.col <= kw_col do
+        p = parse_error_at(p, "expected declaration indented after keyword", tok.line)
+        out (p, ast_new(AstType.VarDecl))
+    end
+
+    var (p2, first_decl) = parse_var_decl_single(p, is_const)
+    if rt_strlen(p2.error_msg) > 0 do
+        out (p2, first_decl)
+    end
+
+    var last_decl_line = first_decl.line
+
+    var group = ast_new(AstType.VarDeclGroup)
+    group.line = kw_line
+    group = ast_add_child(group, first_decl)
+    var count = 1
+    var p_curr = p2
+
+    when true loop
+        # 1. Comma is NOT a declaration separator (Spec v2.0 §1.0)
+        if check(p_curr, TokType.Comma) do
+            let tok = peek(p_curr)
+            let tok_next = peek_n(p_curr, 1)
+            var is_decl_continuation = false
+            if not is_reserved_keyword(tok_next.tok_type) do
+                if tok_next.tok_type == TokType.Ident or tok_next.tok_type == TokType.PtrKw or tok_next.tok_type == TokType.LParen do
+                    is_decl_continuation = true
+                end
+            end
+            if is_decl_continuation do
+                p_curr = parse_error_code_loc(p_curr, 1001, "comma is not allowed as declaration separator; use newline or ';'", tok.line, tok.col)
+                break
+            end
+            var (p_comma, _) = advance(p_curr)
+            p_curr = p_comma
+            break
+        end
+
+        # 2. Check for separator: semicolon and/or newline
+        var had_semi = false
+        if check(p_curr, TokType.Semicolon) do
+            had_semi = true
+            var (p_semi, _) = advance(p_curr)
+            p_curr = p_semi
+        end
+
+        var had_newline = false
+        if check(p_curr, TokType.Newline) do
+            had_newline = true
+            p_curr = skip_newlines(p_curr)
+        end
+
+        let tok = peek(p_curr)
+        if tok.line > last_decl_line do
+            had_newline = true
+        end
+
+        if not had_semi and not had_newline do
+            break
+        end
+
+        # 3. Check for boundary tokens
+        if tok.tok_type == TokType.Eof or tok.tok_type == TokType.End or tok.tok_type == TokType.Else or tok.tok_type == TokType.Eif or tok.tok_type == TokType.EnsureKw or tok.tok_type == TokType.RevertKw do
+            break
+        end
+
+        # 4. Indentation / line boundary check
+        if had_newline do
+            if tok.col <= kw_col do
+                break
+            end
+        else
+            if tok.line != kw_line and tok.col <= kw_col do
+                break
+            end
+        end
+
+        # 5. Check if next token can start a declaration
+        if is_reserved_keyword(tok.tok_type) do
+            break
+        end
+
+        var can_start_decl = false
+        if tok.tok_type == TokType.LParen do
+            can_start_decl = is_destruct_decl_ahead(p_curr)
+        eif is_name_token(tok.tok_type) or tok.tok_type == TokType.Ident or tok.tok_type == TokType.PtrKw do
+            let tok_next = peek_n(p_curr, 1)
+            if tok_next.line == tok.line and (tok_next.tok_type == TokType.Assign or tok_next.tok_type == TokType.Colon) do
+                can_start_decl = true
+            end
+        end
+
+        if not can_start_decl do
+            break
+        end
+
+        # 6. Parse the next declaration
+        var (p_sub, nxt_decl) = parse_var_decl_single(p_curr, is_const)
+        if rt_strlen(p_sub.error_msg) > 0 do
+            p_curr = p_sub
+            break
+        end
+
+        last_decl_line = nxt_decl.line
+
+        # 7. Check for duplicate declaration name within the same group
+        var is_dup = false
+        var d_i = 0
+        when d_i < vec_len_rt(group.children) loop
+            let prev_decl = vec_get_rt(group.children, d_i) as AstNode
+            if fat_str_eq(prev_decl.name, nxt_decl.name) == 1 do
+                is_dup = true
+            end
+            d_i = d_i + 1
+        end
+        if is_dup do
+            var dup_col = nxt_decl.int_val
+            if dup_col <= 0 do dup_col = 1 end
+            p_curr = parse_error_code_loc(p_curr, 1001, "duplicate variable name in declaration group", nxt_decl.line, dup_col)
+            break
+        end
+
+        group = ast_add_child(group, nxt_decl)
+        count = count + 1
+        p_curr = p_sub
+    end
+
+    if count == 1 do
+        out (p_curr, first_decl)
+    end
+    out (p_curr, group)
+end.
+func parse_const_decl(ref p: Parser, kw_col: int, kw_line: int):
+
+    var (p2, decl) = parse_var_decl(p, true, kw_col, kw_line)
+    out (p2, decl)
+end.
+func parse_if_stmt(ref p: Parser):
+
+    line = peek(p).line
+    var (p2, cond) = parse_expr(p)
+
+    # Optional colon / 'do' / 'then' after condition
+    var (p2b, _) = match_tok(p2, TokType.Colon)
+    p2 = p2b
+    var (p2c, _) = match_tok(p2, TokType.Do)
+    p2 = p2c
+    var (p2d, _) = match_tok(p2, TokType.Then)
+    p2 = p2d
+
+    # Implicit block opening (v1.2: no 'then' keyword needed)
+    p2 = skip_newlines(p2)
+
+    var (p3, then_block) = parse_block(p2)
+
+    if_node = ast_new(AstType.IfStmt)
+    if_node.line = line
+    if_node = ast_add_child(if_node, cond)
+    if_node = ast_add_child(if_node, then_block)
+
+    # Handle eif (elif)
+    if check(p3, TokType.Eif) do
+        var (p4, _) = advance(p3)
+        var (p5, elif_as_if) = parse_if_stmt(p4)
+        else_block = ast_new(AstType.Block)
+        else_block = ast_add_child(else_block, elif_as_if)
+        if_node = ast_add_child(if_node, else_block)
+        out (p5, if_node)
+    end
+
+    # Handle else — continuation (§1.1): no ':'
+    var (p4, has_else) = match_tok(p3, TokType.Else)
+    if has_else do
+        if check(p4, TokType.Colon) do
+            var (p_err, _, _) = expect_name_tok(p4, "'else' does not take ':' (spec 1.1)")
+            p4 = p_err
+        end
+        p4 = skip_newlines(p4)
+        var (p5, else_block) = parse_block(p4)
+        if_node = ast_add_child(if_node, else_block)
+        p4 = p5
+    end
+
+    var (p5, _, _) = expect_tok(p4, TokType.End, "expected 'end' after if block")
+    out (p5, if_node)
+end.
+
+# §21: next case arm begins at `pattern:` / `else`.
+func case_arm_starts_here(ref p: Parser):
+    if check(p, TokType.End) or check(p, TokType.Eof) do
+        out false
+    end
+    if check(p, TokType.Else) do
+        out true
+    end
+
+    idx = p.pos
+    if idx >= p.token_count do
+        out false
+    end
+    t = vec_get_rt(p.tokens, idx).tok_type
+
+    if t == TokType.Int do
+        idx = idx + 1
+        if idx + 1 < p.token_count and vec_get_rt(p.tokens, idx).tok_type == TokType.DotDot and vec_get_rt(p.tokens, idx + 1).tok_type == TokType.Int do
+            idx = idx + 2
+        end
+        if idx < p.token_count and vec_get_rt(p.tokens, idx).tok_type == TokType.Colon do
+            out true
+        end
+        out false
+    end
+
+    if t == TokType.Str or t == TokType.True or t == TokType.False or t == TokType.NoneLit do
+        idx = idx + 1
+        if idx < p.token_count and vec_get_rt(p.tokens, idx).tok_type == TokType.Colon do
+            out true
+        end
+        out false
+    end
+
+    if not is_name_token(t) do
+        out false
+    end
+
+    idx = idx + 1
+    when idx < p.token_count and vec_get_rt(p.tokens, idx).tok_type == TokType.Dot loop
+        idx = idx + 1
+        if idx >= p.token_count do
+            out false
+        end
+        if not is_name_token(vec_get_rt(p.tokens, idx).tok_type) do
+            out false
+        end
+        idx = idx + 1
+    end
+
+    if idx < p.token_count and vec_get_rt(p.tokens, idx).tok_type == TokType.LParen do
+        depth = 1
+        idx = idx + 1
+        when depth > 0 and idx < p.token_count loop
+            tt = vec_get_rt(p.tokens, idx).tok_type
+            if tt == TokType.LParen do
+                depth = depth + 1
+            end
+            if tt == TokType.RParen do
+                depth = depth - 1
+            end
+            idx = idx + 1
+        end
+    end
+
+    if idx < p.token_count and vec_get_rt(p.tokens, idx).tok_type == TokType.Colon do
+        out true
+    end
+
+    out false
+end.
+
+func parse_case_stmt(ref p: Parser):
+
+    line = peek(p).line
+    var (p2, expr) = parse_expr(p)
+    if check(p2, TokType.Colon) do
+        p2 = parse_error_at(p2, "case expression does not take ':'; ':' belongs after each pattern", line)
+        var (p_header_colon, _) = advance(p2)
+        p2 = p_header_colon
+    end
+    p2 = skip_newlines(p2)
+    n = ast_new(AstType.CaseExpr)
+    n.line = line
+    n = ast_add_child(n, expr)
+    arm_count = 0
+    when not check(p2, TokType.Else) and not check(p2, TokType.End) and not check(p2, TokType.Eof) loop
+        if check(p2, TokType.Case) do
+            repeated_case_line = peek(p2).line
+            p2 = parse_error_at(p2, "do not repeat 'case' before an arm; write pattern ':'", repeated_case_line)
+            var (p_after_repeated_case, _) = advance(p2)
+            p2 = p_after_repeated_case
+        end
+        # Pattern: _ | else | Int | Str | Ident[(...)]
+        pat = ast_new(AstType.Identifier)
+        pat.name = fat_str_new("_")
+        pat.int_val = 0 - 1
+        pat.line = peek(p2).line
+        if check(p2, TokType.Else) do
+            var (p3, _) = advance(p2)
+            p2 = p3
+        eif check(p2, TokType.Int) do
+            var (p3, it) = advance(p2)
+            pat = ast_new(AstType.LiteralInt)
+            pat.int_val = it.int_val
+            pat.line = it.line
+            p2 = p3
+            if check(p2, TokType.DotDot) do
+                var (p_dd, _) = advance(p2)
+                var (p_hi, hi_tok, _) = expect_tok(p_dd, TokType.Int, "expected upper bound integer in range")
+                range_node = ast_new(AstType.BinOp)
+                range_node.op = 36
+                range_node.line = it.line
+                range_node = ast_add_child(range_node, pat)
+                hi_node = ast_new(AstType.LiteralInt)
+                hi_node.int_val = hi_tok.int_val
+                hi_node.line = hi_tok.line
+                range_node = ast_add_child(range_node, hi_node)
+                pat = range_node
+                p2 = p_hi
+            end
+        eif check(p2, TokType.Str) do
+            var (p3, st) = advance(p2)
+            pat = ast_new(AstType.LiteralStr)
+            pat.name = st.str_val
+            pat.line = st.line
+            p2 = p3
+        eif is_name_token(peek(p2).tok_type) or check(p2, TokType.NoneLit) or check(p2, TokType.True) or check(p2, TokType.False) do
+            var (p3, idt) = advance(p2)
+            let patternSpan = native_read_i64(idt as int, 72)
+            let patternLine = native_read_i64(idt as int, 8)
+            pat = ast_new(AstType.Identifier)
+            pat.line = patternLine
+            if idt.tok_type == TokType.NoneLit do
+                pat.name = fat_str_new("None")
+            eif idt.tok_type == TokType.True do
+                pat.name = fat_str_new("true")
+            eif idt.tok_type == TokType.False do
+                pat.name = fat_str_new("false")
+            else
+                pat.name = tok_lex(idt)
+            end
+            pat.int_val = 0 - 3
+            ideFactOrigin(pat as int, patternSpan, patternLine)
+            p2 = p3
+            # Qualified variant pattern: `Option.Some(v)` only.
+            # Keep the enum name separately so lowering never has to guess in
+            # the presence of two enums that share a variant name.
+            if check(p2, TokType.Dot) do
+                enum_name = pat.name
+                var (p_sep, _) = advance(p2)
+                var (p_variant, variant_tok, variant_ok) = expect_name_tok(p_sep, "expected enum variant after qualifier")
+                p2 = p_variant
+                if variant_ok do
+                    let variantPatternSpan = native_read_i64(variant_tok as int, 72)
+                    let variantPatternLine = native_read_i64(variant_tok as int, 8)
+                    pat.name2 = enum_name
+                    pat.name = tok_lex(variant_tok)
+                    ideFactOrigin(pat as int, variantPatternSpan, variantPatternLine)
+                    if g_ideFactsEnabled == 1 do
+                        let qualifier: int = ast_new(AstType.Identifier) as int
+                        native_write_i64(qualifier, 0, enum_name as int)
+                        native_write_i64(qualifier, 32, patternLine)
+                        native_write_i64(qualifier, 72, patternSpan)
+                        ideFactOrigin(qualifier, patternSpan, patternLine)
+                        ideFactTypeUse(qualifier)
+                    end
+                end
+            end
+            # Tagged payload Some(v) / Ok(count): keep binder idents as children of `pat`.
+            if check(p2, TokType.LParen) do
+                var (p_lp, _) = advance(p2)
+                depth = 1
+                p2 = p_lp
+                when depth > 0 and not check(p2, TokType.Eof) loop
+                    if check(p2, TokType.LParen) do
+                        depth = depth + 1
+                        var (p_adv, _) = advance(p2)
+                        p2 = p_adv
+                    eif check(p2, TokType.RParen) do
+                        depth = depth - 1
+                        var (p_adv2, _) = advance(p2)
+                        p2 = p_adv2
+                    eif is_name_token(peek(p2).tok_type) or check(p2, TokType.NoneLit) or check(p2, TokType.True) or check(p2, TokType.False) do
+                        var (p_id, id_tok) = advance(p2)
+                        id_name = fat_str_new("_")
+                        if id_tok.tok_type == TokType.NoneLit do
+                            id_name = fat_str_new("None")
+                        eif id_tok.tok_type == TokType.True do
+                            id_name = fat_str_new("true")
+                        eif id_tok.tok_type == TokType.False do
+                            id_name = fat_str_new("false")
+                        else
+                            id_name = tok_lex(id_tok)
+                        end
+                        # Nested tag Some(Ok(x)): Ident followed by '(' — reject with diagnostic per spec.
+                        if check(p_id, TokType.LParen) do
+                            p2 = parse_error_at(p_id, "nested enum pattern matching is not supported; match outer variant then inner", id_tok.line)
+                        else
+                            if not fat_str_eq(id_name, fat_str_new("true")) and not fat_str_eq(id_name, fat_str_new("false")) and not fat_str_eq(id_name, fat_str_new("None")) do
+                                binder = ast_new(AstType.Identifier)
+                                binder.name = id_name
+                                binder.line = id_tok.line
+                                ideFactOrigin(binder as int, native_read_i64(id_tok as int, 72), native_read_i64(id_tok as int, 8))
+                                pat = ast_add_child(pat, binder)
+                            end
+                            p2 = p_id
+                        end
+                    else
+                        var (p_adv3, _) = advance(p2)
+                        p2 = p_adv3
+                    end
+                end
+            end
+        else
+            # Force progress
+            var (p3, _) = advance(p2)
+            p2 = p3
+        end
+        var (p4, has_arm_colon) = match_tok(p2, TokType.Colon)
+        if not has_arm_colon do
+            if check(p4, TokType.Error) do
+                bad_tok = peek(p4)
+                bad_line = bad_tok.line
+                var (p_bad, _) = advance(p4)
+                p4 = p_bad
+                # The lexer emits Error here for the forbidden qualification
+                # separator. Preserve its stable user-facing diagnostic instead
+                # of replacing it with a cascading missing-colon error.
+                p4 = parse_error_at(p4, "invalid token '::'; use '.' for qualified names", bad_line)
+            else
+                p4 = parse_error_at(p4, "expected ':' after case pattern", pat.line)
+            end
+        end
+        p4 = skip_newlines(p4)
+        body = ast_new(AstType.Block)
+        p5 = p4
+        if has_arm_colon do
+            # A colon arm owns a statement block.  Stop at the next arm
+            # (`pattern:` / `else`, optional `case`) or case terminator.
+            arm_open = true
+            when arm_open loop
+                if check(p5, TokType.End) or check(p5, TokType.Eof) or case_arm_starts_here(p5) do
+                    if vec_len_rt(body.children) == 0 do
+                        p5 = parse_error_at(p5, "case arm must contain at least one statement", pat.line)
+                    end
+                    arm_open = false
+                else
+                    old_arm_pos = p5.pos
+                    var (p_arm, arm_stmt) = parse_statement(p5)
+                    if p_arm.pos == old_arm_pos do
+                        var (p_force, _) = advance(p5)
+                        p5 = p_force
+                    else
+                        p5 = p_arm
+                        body = ast_add_child(body, arm_stmt)
+                    end
+                    when check(p5, TokType.Semicolon) or check(p5, TokType.Comma) loop
+                        var (p_sep, _) = advance(p5)
+                        p5 = p_sep
+                    end
+                    p5 = skip_newlines(p5)
+                end
+            end
+        else
+            var (p_one, one_stmt) = parse_statement(p4)
+            p5 = p_one
+            body = one_stmt
+        end
+        n = ast_add_child(n, pat)
+        n = ast_add_child(n, body)
+        arm_count = arm_count + 1
+        p2 = p5
+        var (p2s, _) = match_tok(p2, TokType.Semicolon)
+        p2 = p2s
+        p2 = skip_newlines(p2)
+    end
+    if arm_count == 0 do
+        p2 = parse_error_at(p2, "case requires at least one pattern arm", line)
+    end
+    var (p3, has_else) = match_tok(p2, TokType.Else)
+    if has_else do
+        if check(p3, TokType.Colon) do
+            p3 = parse_error_at(p3, "'else' does not take ':' in case", peek(p3).line)
+            var (p3_col, _) = advance(p3)
+            p3 = p3_col
+        end
+        p3 = skip_newlines(p3)
+        var (p4, else_body) = parse_block(p3)
+        if vec_len_rt(else_body.children) == 0 do
+            p4 = parse_error_at(p4, "case else arm must contain at least one statement", line)
+        end
+        n = ast_add_child(n, else_body)
+        n.int_val = 1
+        p3 = p4
+    end
+    # §21: control block closes with `end` (not `end.`).
+    var (p4, _, _) = expect_tok(p3, TokType.End, "expected 'end' after case")
+    if check(p4, TokType.Dot) do
+        p4 = parse_error_at(p4, "case control block closes with 'end', not 'end.'", line)
+        var (p_after_end_dot, _) = advance(p4)
+        p4 = p_after_end_dot
+    end
+    out (p4, n)
+end.
+func parse_loop_stmt(ref p: Parser):
+
+    line = peek(p).line
+    # Bare `loop` is an infinite loop. Represent it as `while true` so the
+    # existing MIR/HIR lowering does not mistake the first body token for a
+    # counted-loop expression.
+    if check(p, TokType.Newline) or check(p, TokType.Semicolon) or check(p, TokType.Colon) do
+        var (p_sep, _) = match_tok(p, TokType.Colon)
+        var (p_sep2, _) = match_tok(p_sep, TokType.Semicolon)
+        p_sep2 = skip_newlines(p_sep2)
+        var (p_body, body) = parse_block(p_sep2)
+        var (p_end, _, _) = expect_tok(p_body, TokType.End, "expected 'end' after loop block")
+        cond = ast_new(AstType.LiteralInt)
+        cond.int_val = 1
+        cond.line = line
+        n = ast_new(AstType.WhileStmt)
+        n.line = line
+        n = ast_add_child(n, cond)
+        n = ast_add_child(n, body)
+        out (p_end, n)
+    end
+    var (p2, count) = parse_expr(p)
+    var (p2b, _) = match_tok(p2, TokType.Colon)
+    p2 = p2b
+    p2 = skip_newlines(p2)
+    var (p3, body) = parse_block(p2)
+    var (p4, _, _) = expect_tok(p3, TokType.End, "expected 'end' after loop block")
+    n = ast_new(AstType.LoopStmt)
+    n.line = line
+    n = ast_add_child(n, count)
+    n = ast_add_child(n, body)
+    out (p4, n)
+end.
+func parse_when_loop_stmt(ref p: Parser, is_when_kw: int):
+
+    line = peek(p).line
+    var (p2, cond) = parse_expr(p)
+    if not check(p2, TokType.Loop) do
+        if is_when_kw == 1 do
+            p2 = parse_error_at(p2, "expected `loop` after when condition", line)
+        else
+            p2 = parse_error_at(p2, "expected `loop` after while condition", line)
+        end
+        out (p2, ast_new(AstType.WhileStmt))
+    end
+    var (p3, _) = advance(p2)
+    # Spec §9.2: `when cond loop` — body follows; `:` after loop is optional.
+    var (p4, _) = match_tok(p3, TokType.Colon)
+    p4 = skip_newlines(p4)
+    var (p5, body) = parse_block(p4)
+    if is_when_kw == 1 do
+        p6 = expect_block_end(p5, "expected 'end' after when ... loop block")
+    else
+        p6 = expect_block_end(p5, "expected 'end' after while ... loop block")
+    end
+    var (p7, _) = match_tok(p6, TokType.Dot)
+    n = ast_new(AstType.WhileStmt)
+    n.line = line
+    n = ast_add_child(n, cond)
+    n = ast_add_child(n, body)
+    out (p7, n)
+end.
+func parse_return_stmt(ref p: Parser):
+
+    line = peek(p).line
+    # C-parser parity: the stdlib idiom `out skip` / `out break` exits the
+    # enclosing loop.  Treating `skip` as a return expression desynchronizes
+    # parsing and would give the loop the wrong control-flow semantics.
+    if check(p, TokType.Skip) or check(p, TokType.Break) do
+        var (p2, _) = advance(p)
+        n = ast_new(AstType.BreakStmt)
+        n.line = line
+        var (p3, _) = match_tok(p2, TokType.Semicolon)
+        out (p3, n)
+    end
+    n = ast_new(AstType.ReturnStmt)
+    n.line = line
+    has_val = not check(p, TokType.Newline) and not check(p, TokType.End) and not check(p, TokType.Eof) and not check(p, TokType.Else) and not check(p, TokType.Semicolon)
+    if has_val do
+        var (p2, val) = parse_expr(p)
+        n = ast_add_child(n, val)
+        out (p2, n)
+    end
+    out (p, n)
+end.
+func parse_print_stmt(ref p: Parser, originSpan: int, originLine: int):
+
+    line = peek(p).line
+    n = ast_new(AstType.PrintStmt)
+    n.line = line
+    ideFactOrigin(n as int, originSpan, originLine)
+    var (p2, val) = parse_expr(p)
+    n = ast_add_child(n, val)
+    out (p2, n)
+end.
+
+# Consume a generic parameter/argument list beginning at '<'.  Declarations
+# such as `entity Map<K, V>` and `func map_get<K, V>` do not need the generic
+# names in the current soft AST, but the parser must consume them atomically.
+func skip_generic_list(ref p: Parser):
+    if check(p, TokType.Lt) do
+        let lt_tok = peek(p)
+        p = parse_error_loc(p, "legacy generic syntax '<...>' is not supported; use 'of (...)'", lt_tok.line, lt_tok.col)
+        out p
+    end
+    if is_tok_of(peek(p)) and p.pos + 1 < p.token_count and vec_get_rt(p.tokens, p.pos + 1).tok_type == TokType.LParen do
+        var (p_of, _) = advance(p)   # consume 'of'
+        var (p_lp, _) = advance(p_of) # consume '('
+        p = p_lp
+        var depth = 1
+        when not check(p, TokType.Eof) loop
+            if check(p, TokType.LParen) do
+                depth = depth + 1
+            eif check(p, TokType.RParen) do
+                depth = depth - 1
+            end
+            var (p2, _) = advance(p)
+            p = p2
+            if depth == 0 do
+                break
+            end
+        end
+        out p
+    end
+    out p
+end.

@@ -1,0 +1,678 @@
+##
+ * compiler/src/lower/lir_codegen/rt_stubs_math/matmul.vri — matmul and FMA runtime stubs
+ * VIRC-PLN-0009: extracted verbatim from compiler/src/lower/lir_codegen/rt_stubs_math.vri.
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+include codegen
+include target
+include lir_codegen_types
+include lir_codegen_intrinsics
+include lir_codegen_calls
+include lir_codegen_rt_stubs_base
+
+func emit_lir_rt_matmul_stub(cb: &CodeBuf):
+    # a ** b: general matrix multiplication (M x K times K x N -> M x N)
+    # Inputs:
+    #   X0 = matrix A ptr (elements at offset 16)
+    #   X1 = matrix B ptr (elements at offset 16)
+    #   X2 = M (rows of A)
+    #   X3 = K (cols of A / rows of B)
+    #   X4 = N (cols of B)
+    # Output:
+    #   X0 = matrix C ptr (elements at offset 16)
+
+    # Save is_32bit (passed in X5) to X17 before X5 is overwritten
+    cb = arm64_mov_rr(cb, 17, 5)
+
+    # 0. If autodiff is active (*(X28 + 8) == 1), record X0, X1, M, K, N
+    cb = arm64_ldr_uoff(cb, 14, 28, 8)
+    cb = arm64_movz_imm64(cb, 15, 1)
+    cb = arm64_cmp_rr(cb, 14, 15)
+    cb = arm64_bne_imm19(cb, 6 * 4)
+    cb = arm64_str_uoff(cb, 0, 28, 16)
+    cb = arm64_str_uoff(cb, 1, 28, 24)
+    cb = arm64_str_uoff(cb, 2, 28, 32)
+    cb = arm64_str_uoff(cb, 3, 28, 40)
+    cb = arm64_str_uoff(cb, 4, 28, 48)
+
+    # 1. Total elements in C: numel = M * N
+    cb = arm64_mul_rrr(cb, 5, 2, 4) # X5 = numel
+
+    # 2. Total allocation size: 16 + numel * (8 or 4), rounded to 16 bytes.
+    cb = arm64_cmp_imm0(cb, 17)
+    cb = arm64_bne_imm19(cb, 3 * 4)
+    cb = arm64_lsl_imm(cb, 15, 5, 3)    # 64-bit: numel * 8
+    cb = arm64_b_imm26(cb, 2 * 4)
+    cb = arm64_lsl_imm(cb, 15, 5, 2)    # 32-bit: numel * 4
+    cb = arm64_add_imm(cb, 15, 15, 31)   # X15 + 31
+    cb = arm64_lsr_imm(cb, 15, 15, 4)
+    cb = arm64_lsl_imm(cb, 15, 15, 4)   # aligned to 16 bytes
+
+    # 3. Bump allocate on Arena *X28.  The payload (header + 16) is
+    # cache-line aligned as required by tensor<T>[S...].
+    cb = arm64_ldr_uoff(cb, 14, 28, 0)  # X14 = bump top
+    cb = arm64_add_imm(cb, 14, 14, 79)
+    cb = arm64_lsr_imm(cb, 14, 14, 6)
+    cb = arm64_lsl_imm(cb, 14, 14, 6)
+    cb = arm64_sub_imm(cb, 14, 14, 16)  # X14 + 16 is 64-byte aligned
+    cb = arm64_add_rrr(cb, 16, 14, 15)  # X16 = new bump top
+    cb = arm64_str_uoff(cb, 16, 28, 0)  # *X28 = new bump top
+
+    # 4. Store header (len=numel, cap=numel)
+    cb = arm64_str_uoff(cb, 5, 14, 0)   # C->len = numel
+    cb = arm64_str_uoff(cb, 5, 14, 8)   # C->cap = numel
+
+    # If autodiff is active, record C, tape_count, and is_float=0:
+    cb = arm64_ldr_uoff(cb, 15, 28, 8)
+    cb = arm64_cmp_imm0(cb, 15)
+    cb = arm64_beq_imm19(cb, 7 * 4)
+    cb = arm64_str_uoff(cb, 14, 28, 56) # C
+    cb = arm64_ldr_uoff(cb, 15, 28, 64) # tape_count
+    cb = arm64_add_imm(cb, 15, 15, 1)
+    cb = arm64_str_uoff(cb, 15, 28, 64)
+    cb = arm64_movz_imm64(cb, 15, 0)     # is_float = 0
+    cb = arm64_str_uoff(cb, 15, 28, 72)
+
+    # 5. Base of data pointers
+    cb = arm64_add_imm(cb, 0, 0, 16)    # X0 = &A[0]
+    cb = arm64_add_imm(cb, 1, 1, 16)    # X1 = &B[0]
+    cb = arm64_add_imm(cb, 5, 14, 16)   # X5 = &C[0]
+
+    # 6. Triple loop:
+    # Outer loop: for (i = 0; i < M; i++)
+    cb = arm64_movz_imm64(cb, 6, 0)     # X6 = i = 0
+    let loop_i_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 6, 2)         # cmp i, M
+    cb = arm64_bge_imm19(cb, 0)         # placeholder forward branch out of loop_i
+    let fixup_exit_i = (codebuf_offset(cb) - 4) as int
+
+    # Middle loop: for (j = 0; j < N; j++)
+    cb = arm64_movz_imm64(cb, 7, 0)     # X7 = j = 0
+    let loop_j_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 7, 4)         # cmp j, N
+    cb = arm64_bge_imm19(cb, 0)         # placeholder forward branch out of loop_j
+    let fixup_exit_j = (codebuf_offset(cb) - 4) as int
+
+    # Inner loop: sum = 0; for (k = 0; k < K; k++)
+    cb = arm64_movz_imm64(cb, 9, 0)     # X9 = sum = 0
+    cb = arm64_movz_imm64(cb, 8, 0)     # X8 = k = 0
+    let loop_k_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 8, 3)         # cmp k, K
+    cb = arm64_bge_imm19(cb, 0)         # placeholder forward branch out of loop_k
+    let fixup_exit_k = (codebuf_offset(cb) - 4) as int
+
+    # Body of inner loop:
+    # A[i * K + k]:
+    cb = arm64_mul_rrr(cb, 10, 6, 3)    # X10 = i * K
+    cb = arm64_add_rrr(cb, 10, 10, 8)   # X10 = i * K + k
+
+    # B[k * N + j]:
+    cb = arm64_mul_rrr(cb, 12, 8, 4)    # X12 = k * N
+    cb = arm64_add_rrr(cb, 12, 12, 7)   # X12 = k * N + j
+
+    cb = arm64_cmp_imm0(cb, 17)
+    cb = arm64_bne_imm19(cb, 4 * 4)
+    cb = arm64_ldr_reg_lsl3(cb, 11, 0, 10) # X11 = A[i * K + k] (64-bit)
+    cb = arm64_ldr_reg_lsl3(cb, 13, 1, 12) # X13 = B[k * N + j] (64-bit)
+    cb = arm64_b_imm26(cb, 3 * 4)
+    cb = arm64_ldr_w_reg_lsl2(cb, 11, 0, 10) # X11 = A[i * K + k] (32-bit)
+    cb = arm64_ldr_w_reg_lsl2(cb, 13, 1, 12) # X13 = B[k * N + j] (32-bit)
+
+    # sum += X11 * X13
+    cb = arm64_madd_rrrr(cb, 9, 11, 13, 9)
+
+    # k++
+    cb = arm64_add_imm(cb, 8, 8, 1)
+
+    # loop back to loop_k_start
+    let delta_k = (loop_k_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, delta_k)
+
+    # Fixup exit_k
+    let exit_k = codebuf_offset(cb) as int
+    let delta_fk = exit_k - fixup_exit_k
+    let imm19_k = (delta_fk shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, fixup_exit_k, (0x5400000A or (imm19_k shl 5)) as int)
+
+    # Store sum to C[i * N + j]:
+    cb = arm64_mul_rrr(cb, 10, 6, 4)    # X10 = i * N
+    cb = arm64_add_rrr(cb, 10, 10, 7)   # X10 = i * N + j
+    cb = arm64_cmp_imm0(cb, 17)
+    cb = arm64_bne_imm19(cb, 3 * 4)
+    cb = arm64_str_reg_lsl3(cb, 9, 5, 10) # C[i * N + j] = sum (64-bit)
+    cb = arm64_b_imm26(cb, 2 * 4)
+    cb = arm64_str_w_reg_lsl2(cb, 9, 5, 10) # C[i * N + j] = sum (32-bit)
+
+    # j++
+    cb = arm64_add_imm(cb, 7, 7, 1)
+
+    # loop back to loop_j_start
+    let delta_j = (loop_j_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, delta_j)
+
+    # Fixup exit_j
+    let exit_j = codebuf_offset(cb) as int
+    let delta_fj = exit_j - fixup_exit_j
+    let imm19_j = (delta_fj shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, fixup_exit_j, (0x5400000A or (imm19_j shl 5)) as int)
+
+    # i++
+    cb = arm64_add_imm(cb, 6, 6, 1)
+
+    # loop back to loop_i_start
+    let delta_i = (loop_i_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, delta_i)
+
+    # Fixup exit_i
+    let exit_i = codebuf_offset(cb) as int
+    let delta_fi = exit_i - fixup_exit_i
+    let imm19_i = (delta_fi shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, fixup_exit_i, (0x5400000A or (imm19_i shl 5)) as int)
+
+    # Return C pointer in X0
+    cb = arm64_mov_rr(cb, 0, 14)
+    out arm64_ret(cb)
+end.
+
+func emit_lir_rt_fma_stub(cb: &CodeBuf):
+    # `a >< b` is a tensor dot-product/matmul whose inner accumulation uses
+    # MADD/FMA.  It has the same ABI as the general matmul kernel:
+    # X0=A, X1=B, X2=M, X3=K, X4=N.  There is no hidden/stale X2 accumulator.
+    out emit_lir_rt_matmul_stub(cb)
+end.
+
+# F64 matmul stub — same ABI as integer matmul but elements are IEEE-754 doubles
+# stored as 8-byte slots (bit-for-bit compatible with f64).
+# Uses FMUL + FADD (no FMA fusion here, acceptable precision for spec).
+# ABI: X0=A ptr, X1=B ptr, X2=M, X3=K, X4=N → X0=C ptr
+func emit_lir_rt_matmul_f64_stub(cb: &CodeBuf):
+    # Save is_32bit (passed in X5) to X17 before X5 is overwritten
+    cb = arm64_mov_rr(cb, 17, 5)
+
+    # 0. If autodiff is active (*(X28 + 8) == 1), record X0, X1, M, K, N
+    cb = arm64_ldr_uoff(cb, 14, 28, 8)
+    cb = arm64_movz_imm64(cb, 15, 1)
+    cb = arm64_cmp_rr(cb, 14, 15)
+    cb = arm64_bne_imm19(cb, 6 * 4)
+    cb = arm64_str_uoff(cb, 0, 28, 16)
+    cb = arm64_str_uoff(cb, 1, 28, 24)
+    cb = arm64_str_uoff(cb, 2, 28, 32)
+    cb = arm64_str_uoff(cb, 3, 28, 40)
+    cb = arm64_str_uoff(cb, 4, 28, 48)
+
+    # 1. Total elements in C: numel = M * N
+    cb = arm64_mul_rrr(cb, 5, 2, 4)  # X5 = numel
+
+    # 2. Total allocation size: 16 + numel * (8, 4, or 2), rounded to 16 bytes
+    cb = arm64_cmp_imm0(cb, 17)
+    cb = arm64_bne_imm19(cb, 3 * 4)
+    cb = arm64_lsl_imm(cb, 15, 5, 3)    # 64-bit: numel * 8
+    cb = arm64_b_imm26(cb, 7 * 4)
+    cb = arm64_mov_imm16(cb, 16, 1)
+    cb = arm64_cmp_rr(cb, 17, 16)
+    cb = arm64_bne_imm19(cb, 3 * 4)
+    cb = arm64_lsl_imm(cb, 15, 5, 2)    # 32-bit: numel * 4
+    cb = arm64_b_imm26(cb, 2 * 4)
+    cb = arm64_lsl_imm(cb, 15, 5, 1)    # 16-bit: numel * 2
+    cb = arm64_add_imm(cb, 15, 15, 31)   # X15 + 31
+    cb = arm64_lsr_imm(cb, 15, 15, 4)
+    cb = arm64_lsl_imm(cb, 15, 15, 4)   # aligned to 16
+
+    # 3. Bump allocate on Arena *X28 with a 64-byte-aligned payload.
+    cb = arm64_ldr_uoff(cb, 14, 28, 0)  # X14 = bump top
+    cb = arm64_add_imm(cb, 14, 14, 79)
+    cb = arm64_lsr_imm(cb, 14, 14, 6)
+    cb = arm64_lsl_imm(cb, 14, 14, 6)
+    cb = arm64_sub_imm(cb, 14, 14, 16)  # X14 + 16 is 64-byte aligned
+    cb = arm64_add_rrr(cb, 16, 14, 15)  # X16 = new bump top
+    cb = arm64_str_uoff(cb, 16, 28, 0)  # *X28 = new bump top
+
+    # 4. Store header (len=numel, cap=numel)
+    cb = arm64_str_uoff(cb, 5, 14, 0)   # C->len = numel
+    cb = arm64_str_uoff(cb, 5, 14, 8)   # C->cap = numel
+
+    # If autodiff is active, record C, tape_count, and is_float=1:
+    cb = arm64_ldr_uoff(cb, 15, 28, 8)
+    cb = arm64_cmp_imm0(cb, 15)
+    cb = arm64_beq_imm19(cb, 7 * 4)
+    cb = arm64_str_uoff(cb, 14, 28, 56) # C
+    cb = arm64_ldr_uoff(cb, 15, 28, 64) # tape_count
+    cb = arm64_add_imm(cb, 15, 15, 1)
+    cb = arm64_str_uoff(cb, 15, 28, 64)
+    cb = arm64_movz_imm64(cb, 15, 1)     # is_float = 1
+    cb = arm64_str_uoff(cb, 15, 28, 72)
+
+    # 5. Base of data pointers
+    cb = arm64_add_imm(cb, 0, 0, 16)    # X0 = &A[0]
+    cb = arm64_add_imm(cb, 1, 1, 16)    # X1 = &B[0]
+    cb = arm64_add_imm(cb, 5, 14, 16)   # X5 = &C[0]
+
+    # Branch to 32-bit or 16-bit float loop if X17 != 0:
+    cb = arm64_cmp_imm0(cb, 17)
+    cb = arm64_bne_imm19(cb, 0)
+    let fixup_non64_branch = (codebuf_offset(cb) - 4) as int
+
+    # 6a. Triple loop (float 64-bit):
+    # Outer: for i = 0..M
+    cb = arm64_movz_imm64(cb, 6, 0)     # X6 = i = 0
+    let f_loop_i_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 6, 2)
+    cb = arm64_bge_imm19(cb, 0)
+    let f_fixup_exit_i = (codebuf_offset(cb) - 4) as int
+
+    # Middle: for j = 0..N
+    cb = arm64_movz_imm64(cb, 7, 0)     # X7 = j = 0
+    let f_loop_j_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 7, 4)
+    cb = arm64_bge_imm19(cb, 0)
+    let f_fixup_exit_j = (codebuf_offset(cb) - 4) as int
+
+    # Inner: sum_f64 = 0.0; for k = 0..K
+    cb = arm64_movz_imm64(cb, 9, 0)     # X9 = 0 (integer zero)
+    cb = arm64_scvtf_dx(cb, 9, 9)       # D9 = (double)X9 = 0.0
+    cb = arm64_movz_imm64(cb, 8, 0)     # X8 = k = 0
+    let f_loop_k_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 8, 3)
+    cb = arm64_bge_imm19(cb, 0)
+    let f_fixup_exit_k = (codebuf_offset(cb) - 4) as int
+
+    # Body of inner loop:
+    # D10 = A[i * K + k]
+    cb = arm64_mul_rrr(cb, 10, 6, 3)    # X10 = i * K
+    cb = arm64_add_rrr(cb, 10, 10, 8)   # X10 = i * K + k
+    cb = arm64_ldr_d_reg_lsl3(cb, 10, 0, 10)  # D10 = A[i*K+k]
+
+    # D11 = B[k * N + j]
+    cb = arm64_mul_rrr(cb, 11, 8, 4)    # X11 = k * N
+    cb = arm64_add_rrr(cb, 11, 11, 7)   # X11 = k * N + j
+    cb = arm64_ldr_d_reg_lsl3(cb, 11, 1, 11)  # D11 = B[k*N+j]
+
+    # D9 += D10 * D11  using FMADD D9, D10, D11, D9
+    cb = arm64_fmadd_dddd(cb, 9, 10, 11, 9)
+
+    # k++
+    cb = arm64_add_imm(cb, 8, 8, 1)
+
+    # loop back to f_loop_k_start
+    let f_delta_k = (f_loop_k_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, f_delta_k)
+
+    # Fixup exit_k
+    let f_exit_k = codebuf_offset(cb) as int
+    let f_delta_fk = f_exit_k - f_fixup_exit_k
+    let f_imm19_k = (f_delta_fk shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, f_fixup_exit_k, (0x5400000A or (f_imm19_k shl 5)) as int)
+
+    # Store sum D9 to C[i * N + j]
+    cb = arm64_mul_rrr(cb, 10, 6, 4)    # X10 = i * N
+    cb = arm64_add_rrr(cb, 10, 10, 7)   # X10 = i * N + j
+    cb = arm64_str_d_reg_lsl3(cb, 9, 5, 10)   # C[i*N+j] = D9
+
+    # j++
+    cb = arm64_add_imm(cb, 7, 7, 1)
+
+    # loop back to f_loop_j_start
+    let f_delta_j = (f_loop_j_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, f_delta_j)
+
+    # Fixup exit_j
+    let f_exit_j = codebuf_offset(cb) as int
+    let f_delta_fj = f_exit_j - f_fixup_exit_j
+    let f_imm19_j = (f_delta_fj shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, f_fixup_exit_j, (0x5400000A or (f_imm19_j shl 5)) as int)
+
+    # i++
+    cb = arm64_add_imm(cb, 6, 6, 1)
+
+    # loop back to f_loop_i_start
+    let f_delta_i = (f_loop_i_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, f_delta_i)
+
+    # Fixup exit_i
+    let f_exit_i = codebuf_offset(cb) as int
+    let f_delta_fi = f_exit_i - f_fixup_exit_i
+    let f_imm19_i = (f_delta_fi shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, f_fixup_exit_i, (0x5400000A or (f_imm19_i shl 5)) as int)
+
+    # Return C pointer in X0
+    cb = arm64_mov_rr(cb, 0, 14)
+    cb = arm64_ret(cb)
+
+    # 6b. Check if 32-bit (X17 == 1) or 16-bit (X17 == 2):
+    let non64_start = codebuf_offset(cb) as int
+    let delta_non64 = non64_start - fixup_non64_branch
+    let imm19_non64 = (delta_non64 shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, fixup_non64_branch, (0x54000001 or (imm19_non64 shl 5)) as int)
+
+    cb = arm64_mov_imm16(cb, 16, 1)
+    cb = arm64_cmp_rr(cb, 17, 16)
+    cb = arm64_bne_imm19(cb, 0)
+    let fixup_f16_branch = (codebuf_offset(cb) - 4) as int
+
+    # Triple loop (float 32-bit):
+    # Outer: for i = 0..M
+    cb = arm64_movz_imm64(cb, 6, 0)     # X6 = i = 0
+    let f32_loop_i_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 6, 2)
+    cb = arm64_bge_imm19(cb, 0)
+    let f32_fixup_exit_i = (codebuf_offset(cb) - 4) as int
+
+    # Middle: for j = 0..N
+    cb = arm64_movz_imm64(cb, 7, 0)     # X7 = j = 0
+    let f32_loop_j_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 7, 4)
+    cb = arm64_bge_imm19(cb, 0)
+    let f32_fixup_exit_j = (codebuf_offset(cb) - 4) as int
+
+    # Inner: sum_f32 = 0.0f; for k = 0..K
+    cb = arm64_fmov_szr(cb, 9)          # S9 = 0.0f
+    cb = arm64_movz_imm64(cb, 8, 0)     # X8 = k = 0
+    let f32_loop_k_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 8, 3)
+    cb = arm64_bge_imm19(cb, 0)
+    let f32_fixup_exit_k = (codebuf_offset(cb) - 4) as int
+
+    # Body:
+    cb = arm64_mul_rrr(cb, 10, 6, 3)    # X10 = i * K
+    cb = arm64_add_rrr(cb, 10, 10, 8)   # X10 = i * K + k
+    cb = arm64_ldr_s_reg_lsl2(cb, 10, 0, 10)  # S10 = A[i*K+k]
+
+    cb = arm64_mul_rrr(cb, 11, 8, 4)    # X11 = k * N
+    cb = arm64_add_rrr(cb, 11, 11, 7)   # X11 = k * N + j
+    cb = arm64_ldr_s_reg_lsl2(cb, 11, 1, 11)  # S11 = B[k*N+j]
+
+    cb = arm64_fmadd_ssss(cb, 9, 10, 11, 9)
+
+    cb = arm64_add_imm(cb, 8, 8, 1)
+
+    let f32_delta_k = (f32_loop_k_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, f32_delta_k)
+
+    let f32_exit_k = codebuf_offset(cb) as int
+    let f32_delta_fk = f32_exit_k - f32_fixup_exit_k
+    let f32_imm19_k = (f32_delta_fk shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, f32_fixup_exit_k, (0x5400000A or (f32_imm19_k shl 5)) as int)
+
+    cb = arm64_mul_rrr(cb, 10, 6, 4)    # X10 = i * N
+    cb = arm64_add_rrr(cb, 10, 10, 7)   # X10 = i * N + j
+    cb = arm64_str_s_reg_lsl2(cb, 9, 5, 10)   # C[i*N+j] = S9
+
+    cb = arm64_add_imm(cb, 7, 7, 1)
+    let f32_delta_j = (f32_loop_j_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, f32_delta_j)
+
+    let f32_exit_j = codebuf_offset(cb) as int
+    let f32_delta_fj = f32_exit_j - f32_fixup_exit_j
+    let f32_imm19_j = (f32_delta_fj shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, f32_fixup_exit_j, (0x5400000A or (f32_imm19_j shl 5)) as int)
+
+    cb = arm64_add_imm(cb, 6, 6, 1)
+    let f32_delta_i = (f32_loop_i_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, f32_delta_i)
+
+    let f32_exit_i = codebuf_offset(cb) as int
+    let f32_delta_fi = f32_exit_i - f32_fixup_exit_i
+    let f32_imm19_i = (f32_delta_fi shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, f32_fixup_exit_i, (0x5400000A or (f32_imm19_i shl 5)) as int)
+
+    # Return C pointer in X0
+    cb = arm64_mov_rr(cb, 0, 14)
+    cb = arm64_ret(cb)
+
+    # 6c. Triple loop (float 16-bit):
+    let f16_start = codebuf_offset(cb) as int
+    let delta_f16 = f16_start - fixup_f16_branch
+    let imm19_f16 = (delta_f16 shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, fixup_f16_branch, (0x54000001 or (imm19_f16 shl 5)) as int)
+
+    # Outer: for i = 0..M
+    cb = arm64_movz_imm64(cb, 6, 0)     # X6 = i = 0
+    let f16_loop_i_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 6, 2)
+    cb = arm64_bge_imm19(cb, 0)
+    let f16_fixup_exit_i = (codebuf_offset(cb) - 4) as int
+
+    # Middle: for j = 0..N
+    cb = arm64_movz_imm64(cb, 7, 0)     # X7 = j = 0
+    let f16_loop_j_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 7, 4)
+    cb = arm64_bge_imm19(cb, 0)
+    let f16_fixup_exit_j = (codebuf_offset(cb) - 4) as int
+
+    # Inner: sum_s = 0.0f; for k = 0..K
+    cb = arm64_fmov_szr(cb, 9)          # S9 = 0.0f
+    cb = arm64_movz_imm64(cb, 8, 0)     # X8 = k = 0
+    let f16_loop_k_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 8, 3)
+    cb = arm64_bge_imm19(cb, 0)
+    let f16_fixup_exit_k = (codebuf_offset(cb) - 4) as int
+
+    # Body:
+    cb = arm64_mul_rrr(cb, 10, 6, 3)    # X10 = i * K
+    cb = arm64_add_rrr(cb, 10, 10, 8)   # X10 = i * K + k
+    cb = arm64_ldr_h_reg_lsl1(cb, 10, 0, 10)  # H10 = A[i*K+k]
+    cb = arm64_fcvt_sh(cb, 10, 10)      # S10 = (float)H10
+
+    cb = arm64_mul_rrr(cb, 11, 8, 4)    # X11 = k * N
+    cb = arm64_add_rrr(cb, 11, 11, 7)   # X11 = k * N + j
+    cb = arm64_ldr_h_reg_lsl1(cb, 11, 1, 11)  # H11 = B[k*N+j]
+    cb = arm64_fcvt_sh(cb, 11, 11)      # S11 = (float)H11
+
+    cb = arm64_fmadd_ssss(cb, 9, 10, 11, 9)
+
+    cb = arm64_add_imm(cb, 8, 8, 1)
+
+    let f16_delta_k = (f16_loop_k_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, f16_delta_k)
+
+    let f16_exit_k = codebuf_offset(cb) as int
+    let f16_delta_fk = f16_exit_k - f16_fixup_exit_k
+    let f16_imm19_k = (f16_delta_fk shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, f16_fixup_exit_k, (0x5400000A or (f16_imm19_k shl 5)) as int)
+
+    # Store sum to C[i * N + j]:
+    cb = arm64_fcvt_hs(cb, 9, 9)        # H9 = (half)S9
+    cb = arm64_mul_rrr(cb, 10, 6, 4)    # X10 = i * N
+    cb = arm64_add_rrr(cb, 10, 10, 7)   # X10 = i * N + j
+    cb = arm64_str_h_reg_lsl1(cb, 9, 5, 10)   # C[i*N+j] = H9
+
+    cb = arm64_add_imm(cb, 7, 7, 1)
+    let f16_delta_j = (f16_loop_j_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, f16_delta_j)
+
+    let f16_exit_j = codebuf_offset(cb) as int
+    let f16_delta_fj = f16_exit_j - f16_fixup_exit_j
+    let f16_imm19_j = (f16_delta_fj shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, f16_fixup_exit_j, (0x5400000A or (f16_imm19_j shl 5)) as int)
+
+    cb = arm64_add_imm(cb, 6, 6, 1)
+    let f16_delta_i = (f16_loop_i_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, f16_delta_i)
+
+    let f16_exit_i = codebuf_offset(cb) as int
+    let f16_delta_fi = f16_exit_i - f16_fixup_exit_i
+    let f16_imm19_i = (f16_delta_fi shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, f16_fixup_exit_i, (0x5400000A or (f16_imm19_i shl 5)) as int)
+
+    # Return C pointer in X0
+    cb = arm64_mov_rr(cb, 0, 14)
+    out arm64_ret(cb)
+end.
+
+# F64 FMA stub — same as f64 matmul but uses FMADD for inner accumulation.
+# Since emit_lir_rt_matmul_f64_stub already uses FMADD, they are identical.
+func emit_lir_rt_fma_f64_stub(cb: &CodeBuf):
+    out emit_lir_rt_matmul_f64_stub(cb)
+end.
+
+func emit_lir_rt_matmul_quantized_stub(cb: &CodeBuf):
+    # Quantized matmul: compact ** input (M x K times K x N -> M x N)
+    # Inputs:
+    #   X0 = matrix A (QuantizedTensor ptr: numel at 0, bits at 8, scale at 16, packed bytes at 32)
+    #   X1 = matrix B (Tensor ptr: numel at 0, cap at 8, elements at 16)
+    #   X2 = M (rows of A)
+    #   X3 = K (cols of A / rows of B)
+    #   X4 = N (cols of B)
+    # Output:
+    #   X0 = matrix C (Tensor ptr: elements at 16 as int64)
+
+    # 1. Read bits and scale from QuantizedTensor header
+    cb = arm64_ldr_uoff(cb, 17, 0, 8)  # X17 = bits (4 or 8)
+    cb = arm64_ldr_uoff(cb, 16, 0, 16) # X16 = scale
+
+    # 2. Total elements in C: numel = M * N
+    cb = arm64_mul_rrr(cb, 5, 2, 4)     # X5 = numel
+
+    # 3. Total allocation size: 16 + numel * 8, rounded to 16 bytes
+    cb = arm64_lsl_imm(cb, 15, 5, 3)    # X15 = numel * 8
+    cb = arm64_add_imm(cb, 15, 15, 31)
+    cb = arm64_lsr_imm(cb, 15, 15, 4)
+    cb = arm64_lsl_imm(cb, 15, 15, 4)   # aligned to 16 bytes
+
+    # 4. Bump allocate on Arena *X28
+    cb = arm64_ldr_uoff(cb, 14, 28, 0)  # X14 = bump top (base of C)
+    cb = arm64_add_imm(cb, 14, 14, 79)
+    cb = arm64_lsr_imm(cb, 14, 14, 6)
+    cb = arm64_lsl_imm(cb, 14, 14, 6)
+    cb = arm64_sub_imm(cb, 14, 14, 16)  # X14 + 16 is 64-byte aligned
+    cb = arm64_add_rrr(cb, 13, 14, 15)  # X13 = new bump top
+    cb = arm64_str_uoff(cb, 13, 28, 0)  # *X28 = new bump top
+
+    # 5. Store header (len = numel, cap = numel)
+    cb = arm64_str_uoff(cb, 5, 14, 0)
+    cb = arm64_str_uoff(cb, 5, 14, 8)
+
+    # 6. Base pointers
+    cb = arm64_add_imm(cb, 0, 0, 32)    # X0 = &A_bytes[0]
+    cb = arm64_add_imm(cb, 1, 1, 16)    # X1 = &B_elements[0]
+    cb = arm64_add_imm(cb, 5, 14, 16)   # X5 = &C_elements[0]
+
+    # 7. Triple loop:
+    # Outer loop: for (i = 0; i < M; i++)
+    cb = arm64_movz_imm64(cb, 6, 0)     # X6 = i = 0
+    let loop_i_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 6, 2)         # cmp i, M
+    cb = arm64_bge_imm19(cb, 0)
+    let fixup_exit_i = (codebuf_offset(cb) - 4) as int
+
+    # Middle loop: for (j = 0; j < N; j++)
+    cb = arm64_movz_imm64(cb, 7, 0)     # X7 = j = 0
+    let loop_j_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 7, 4)         # cmp j, N
+    cb = arm64_bge_imm19(cb, 0)
+    let fixup_exit_j = (codebuf_offset(cb) - 4) as int
+
+    # Inner loop: sum = 0.0; for (k = 0; k < K; k++)
+    cb = arm64_movz_imm64(cb, 9, 0)
+    cb = arm64_scvtf_dx(cb, 9, 9)       # D9 = sum = 0.0
+    cb = arm64_movz_imm64(cb, 8, 0)     # X8 = k = 0
+    let loop_k_start = codebuf_offset(cb)
+    cb = arm64_cmp_rr(cb, 8, 3)         # cmp k, K
+    cb = arm64_bge_imm19(cb, 0)
+    let fixup_exit_k = (codebuf_offset(cb) - 4) as int
+
+    # Body of inner loop:
+    # idx = i * K + k
+    cb = arm64_mul_rrr(cb, 10, 6, 3)    # X10 = i * K
+    cb = arm64_add_rrr(cb, 10, 10, 8)   # X10 = idx = i * K + k
+
+    # Check bits in X17: if bits != 4, jump to 8-bit branch (15 instructions ahead)
+    cb = arm64_movz_imm64(cb, 15, 4)
+    cb = arm64_cmp_rr(cb, 17, 15)
+    cb = arm64_bne_imm19(cb, 15 * 4)
+
+    # --- 4-bit unpacking branch (14 instructions) ---
+    cb = arm64_lsr_imm(cb, 11, 10, 1)   # X11 = byte index = idx >> 1
+    cb = arm64_ldrb_reg(cb, 12, 0, 11)  # X12 = A_bytes[byte index]
+    cb = arm64_movz_imm64(cb, 15, 1)
+    cb = arm64_and_rrr(cb, 15, 10, 15)  # X15 = idx & 1
+    cb = arm64_cmp_imm0(cb, 15)
+    cb = arm64_beq_imm19(cb, 2 * 4)     # if even, skip lsr
+    cb = arm64_lsr_imm(cb, 12, 12, 4)   # odd: shift high nibble down
+    cb = arm64_movz_imm64(cb, 15, 15)   # 0x0F
+    cb = arm64_and_rrr(cb, 11, 12, 15)  # X11 = nibble in [0, 15]
+    cb = arm64_movz_imm64(cb, 15, 8)
+    cb = arm64_cmp_rr(cb, 11, 15)
+    cb = arm64_blt_imm19(cb, 2 * 4)     # if nibble < 8, positive
+    cb = arm64_sub_imm(cb, 11, 11, 16)  # sign-extend: nibble - 16
+    cb = arm64_b_imm26(cb, 6 * 4)       # jump past 8-bit unpacking (5 instructions)
+
+    # --- 8-bit unpacking branch (5 instructions) ---
+    cb = arm64_ldrb_reg(cb, 11, 0, 10)  # X11 = A_bytes[idx] (0..255)
+    cb = arm64_movz_imm64(cb, 15, 128)
+    cb = arm64_cmp_rr(cb, 11, 15)
+    cb = arm64_blt_imm19(cb, 2 * 4)     # if < 128, positive
+    cb = arm64_sub_imm(cb, 11, 11, 256) # sign-extend: X11 - 256
+
+    # Convert quantized weight in X11 to double in D11
+    cb = arm64_scvtf_dx(cb, 11, 11)     # D11 = (double)W
+
+    # Load B[k * N + j] into X10
+    cb = arm64_mul_rrr(cb, 12, 8, 4)    # X12 = k * N
+    cb = arm64_add_rrr(cb, 12, 12, 7)   # X12 = k * N + j
+    cb = arm64_ldr_reg_lsl3(cb, 10, 1, 12) # X10 = B[k * N + j]
+
+    # Convert X10 to double in D10 (preserving IEEE 754 floats without truncation)
+    cb = arm64_mov_imm16(cb, 13, 2047)
+    cb = arm64_lsr_imm(cb, 15, 10, 52)
+    cb = arm64_and_rrr(cb, 15, 15, 13)
+    cb = arm64_cmp_imm0(cb, 15)
+    cb = arm64_beq_imm19(cb, 4 * 4)
+    cb = arm64_cmp_rr(cb, 15, 13)
+    cb = arm64_beq_imm19(cb, 2 * 4)
+    cb = arm64_fmov_dx(cb, 10, 10)
+    cb = arm64_b_imm26(cb, 2 * 4)
+    cb = arm64_scvtf_dx(cb, 10, 10)
+
+    # D9 += W (D11) * B (D10)
+    cb = arm64_fmadd_dddd(cb, 9, 11, 10, 9)
+
+    # k++
+    cb = arm64_add_imm(cb, 8, 8, 1)
+    let delta_k = (loop_k_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, delta_k)
+
+    # Fixup exit_k
+    let exit_k = codebuf_offset(cb) as int
+    let delta_fk = exit_k - fixup_exit_k
+    let imm19_k = (delta_fk shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, fixup_exit_k, (0x5400000A or (imm19_k shl 5)) as int)
+
+    # Multiply sum by scale (in X16)
+    cb = arm64_scvtf_dx(cb, 16, 16)     # D16 = (double)scale
+    cb = arm64_fmul_ddd(cb, 9, 9, 16)   # D9 = D9 * D16
+
+    # Store sum to C[i * N + j]
+    cb = arm64_mul_rrr(cb, 10, 6, 4)    # X10 = i * N
+    cb = arm64_add_rrr(cb, 10, 10, 7)   # X10 = i * N + j
+    cb = arm64_str_d_reg_lsl3(cb, 9, 5, 10) # C[i * N + j] = D9 (double)
+
+    # j++
+    cb = arm64_add_imm(cb, 7, 7, 1)
+    let delta_j = (loop_j_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, delta_j)
+
+    # Fixup exit_j
+    let exit_j = codebuf_offset(cb) as int
+    let delta_fj = exit_j - fixup_exit_j
+    let imm19_j = (delta_fj shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, fixup_exit_j, (0x5400000A or (imm19_j shl 5)) as int)
+
+    # i++
+    cb = arm64_add_imm(cb, 6, 6, 1)
+    let delta_i = (loop_i_start - codebuf_offset(cb)) as int
+    cb = arm64_b_imm26(cb, delta_i)
+
+    # Fixup exit_i
+    let exit_i = codebuf_offset(cb) as int
+    let delta_fi = exit_i - fixup_exit_i
+    let imm19_i = (delta_fi shr 2) and 0x7FFFF
+    codebuf_patch_u32(cb, fixup_exit_i, (0x5400000A or (imm19_i shl 5)) as int)
+
+    # Return C pointer in X0
+    cb = arm64_mov_rr(cb, 0, 14)
+    out arm64_ret(cb)
+end.

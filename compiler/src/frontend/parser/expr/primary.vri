@@ -1,0 +1,697 @@
+##
+ * compiler/src/frontend/parser/expr/primary.vri — primary expression parsing
+ * VIRC-PLN-0009: extracted verbatim from compiler/src/frontend/parser/expr.vri.
+ ##
+
+include types_prelude
+include rt_string_rt
+include lexer
+include ide_facts
+include parser_ast
+include parser_builtins
+include parser_state
+include parser_diagnostics
+
+func parse_primary(ref p: Parser):
+
+    let primaryParser = p as int
+    let primaryTokens = native_read_i64(primaryParser, 0)
+    let primaryPosition = native_read_i64(primaryParser, 8)
+    var primaryLine = 0
+    var primarySpan = 0
+    if primaryPosition >= 0 and primaryPosition < native_read_i64(primaryParser, 16) do
+        let primaryToken = native_read_i64(primaryTokens, primaryPosition * 8)
+        primaryLine = native_read_i64(primaryToken, 8)
+        primarySpan = native_read_i64(primaryToken, 72)
+    end
+    t = peek(p)
+
+    # Lexer error tokens carry their canonical diagnostic in str_val. Consume
+    # them here so an invalid token is not downgraded to "expected expression".
+    if t.tok_type == TokType.Error do
+        bad_kind = t.int_val
+        bad_line = t.line
+        var (p2, bad_tok) = advance(p)
+        if bad_kind == 112 do
+            p2 = parse_error_at(p2, "invalid token '::'; use '.' for qualified names", bad_line)
+        else
+            p2 = parse_error_at(p2, tok_lex(bad_tok), bad_line)
+        end
+        n = ast_new(AstType.Identifier)
+        n.name = fat_str_new("<invalid>")
+        n.line = bad_line
+        out (p2, n)
+    end
+
+    # Integer literal
+    if t.tok_type == TokType.Int do
+        var (p2, t2) = advance(p)
+        n = ast_new(AstType.LiteralInt)
+        n.int_val = t2.int_val
+        n.line = t2.line
+        native_write_i64(n as int, 32, primaryLine)
+        native_write_i64(n as int, 72, primarySpan)
+        ideFactOrigin(n as int, primarySpan, primaryLine)
+        out (p2, n)
+    end
+
+    # Float literal
+    if t.tok_type == TokType.Float do
+        var (p2, t2) = advance(p)
+        n = ast_new(AstType.LiteralFloat)
+        # Preserve raw IEEE-754 payload.  The self-host compiler's aggregate
+        # float ABI is not used for literal transport.
+        native_write_i64(n as int, 48, native_read_i64(t2 as int, 56))
+        n.line = t2.line
+        native_write_i64(n as int, 32, primaryLine)
+        native_write_i64(n as int, 72, primarySpan)
+        ideFactOrigin(n as int, primarySpan, primaryLine)
+        out (p2, n)
+    end
+
+    # §26.5 canonical quantization: quantize(value, bits: N).
+    # Keep both operands in the AST; bits is never discarded into a marker.
+    if t.tok_type == TokType.QuantizeKw do
+        var (p2, _) = advance(p)
+        var (p3, _, _) = expect_tok(p2, TokType.LParen, "expected '(' after quantize")
+        var (p4, value_expr) = parse_expr(p3)
+        var (p5, _, _) = expect_tok(p4, TokType.Comma, "expected ',' before quantize bits")
+        p5 = skip_newlines(p5)
+
+        # Canonical named form uses `bits: N`; retain positional N as a
+        # compatibility input while semantic analysis enforces constness/range.
+        if is_name_token(peek(p5).tok_type) and fat_cstr_eq(tok_lex(peek(p5)), "bits") == 1 do
+            var (p6, _) = advance(p5)
+            var (p7, _, _) = expect_tok(p6, TokType.Colon, "expected ':' after quantize bits")
+            p5 = p7
+        end
+        var (p8, bits_expr) = parse_expr(p5)
+        var (p9, _, _) = expect_tok(p8, TokType.RParen, "expected ')' after quantize")
+        q = ast_new(AstType.QuantizeExpr)
+        q.name = fat_str_new("quantize")
+        q.line = t.line
+        q.int_val = 0 - 1
+        if bits_expr.node_type == AstType.LiteralInt do q.int_val = bits_expr.int_val end
+        q = ast_add_child(q, value_expr)
+        q = ast_add_child(q, bits_expr)
+        out (p9, q)
+    end
+
+    # §4.4 / §7.3 sizeof(Type)
+    if t.tok_type == TokType.SizeofKw do
+        var (p2, _) = advance(p)
+        var (p3, _, _) = expect_tok(p2, TokType.LParen, "expected '(' after sizeof")
+        var (p4, type_name) = parse_type_expr_string(p3)
+        var (p5, _, _) = expect_tok(p4, TokType.RParen, "expected ')' after sizeof type")
+        sz_node = ast_new(AstType.SizeofExpr)
+        sz_node.name = type_name
+        sz_node.line = t.line
+        out (p5, sz_node)
+    end
+
+    # String literal
+    if t.tok_type == TokType.Str do
+        var (p2, t2) = advance(p)
+        n = ast_new(AstType.LiteralStr)
+        n.name = t2.str_val
+        n.line = t2.line
+        native_write_i64(n as int, 32, primaryLine)
+        native_write_i64(n as int, 72, primarySpan)
+        ideFactOrigin(n as int, primarySpan, primaryLine)
+        out (p2, n)
+    end
+
+    # Interpolated string: InterpStart Str Ident [Dot Ident] Str ... InterpEnd
+    if t.tok_type == TokType.InterpStart do
+        var (p2, _) = advance(p)
+        interp = ast_new(AstType.InterpExpr)
+        interp.line = t.line
+        when not check(p2, TokType.InterpEnd) and not check(p2, TokType.Eof) loop
+            it = peek(p2)
+            if it.tok_type == TokType.Str do
+                var (p3, st) = advance(p2)
+                seg = ast_new(AstType.LiteralStr)
+                seg.name = st.str_val
+                seg.line = st.line
+                interp = ast_add_child(interp, seg)
+                p2 = p3
+            eif it.tok_type == TokType.LParen do
+                # General expression: $(expr)
+                var (p3, _) = advance(p2)
+                var (p4, inner_expr) = parse_expr(p3)
+                var (p5, _, _) = expect_tok(p4, TokType.RParen, "expected ')' in interpolation")
+                interp = ast_add_child(interp, inner_expr)
+                p2 = p5
+            eif it.tok_type == TokType.Ident or it.tok_type == TokType.ThisKw do
+                var (p3, id_t) = advance(p2)
+                var curr_node = ast_new(AstType.Identifier)
+                if id_t.tok_type == TokType.ThisKw do
+                    curr_node.name = fat_str_new("this")
+                else
+                    curr_node.name = tok_lex(id_t)
+                end
+                curr_node.line = id_t.line
+                # Chained dot field access: $user.name, $a.b.c
+                when check(p3, TokType.Dot) loop
+                    var (p4, _) = advance(p3)
+                    var (p5, fld_t, _) = expect_name_tok(p4, "expected field after '.'")
+                    fa = ast_new(AstType.FieldAccess)
+                    fa.name = tok_lex(fld_t)
+                    fa.line = fld_t.line
+                    fa = ast_add_child(fa, curr_node)
+                    curr_node = fa
+                    p3 = p5
+                end
+                interp = ast_add_child(interp, curr_node)
+                p2 = p3
+            else
+                # Malformed interpolation is a parser error.  Silently
+                # dropping a token could turn a broken source string into a
+                # different valid program.
+                p2 = parse_error_at(p2, "unexpected token in string interpolation", it.line)
+                var (p3, _) = advance(p2)
+                p2 = p3
+            end
+        end
+        var (p3, _, _) = expect_tok(p2, TokType.InterpEnd, "expected end of interpolated string")
+        out (p3, interp)
+    end
+
+    # 'this' keyword used as identifier in method body
+    if t.tok_type == TokType.ThisKw do
+        var (p2, this_tok) = advance(p)
+        n = ast_new(AstType.Identifier)
+        n.name = fat_str_new("this")
+        n.line = t.line
+        out (p2, n)
+    end
+
+    # `ptr` as type/primary expression
+    if t.tok_type == TokType.PtrKw do
+        var (p2, _) = advance(p)
+        n = ast_new(AstType.PtrTypeExpr)
+        n.name = fat_str_new("ptr")
+        n.line = t.line
+        out (p2, n)
+    end
+
+    # `map(...)` functional map
+    if t.tok_type == TokType.MapKw do
+        var (p2, _) = advance(p)
+        n = ast_new(AstType.MapExpr)
+        n.name = fat_str_new("map")
+        n.line = t.line
+        if is_name_token(peek(p2).tok_type) do
+            var (p_name, bind_tok) = advance(p2)
+            if check(p_name, TokType.In) do
+                var (p_in, _) = advance(p_name)
+                var (p_src, src_expr) = parse_expr(p_in)
+                var (p_col, _, _) = expect_tok(p_src, TokType.Colon, "expected ':' after map source")
+                p_col = skip_newlines(p_col)
+                var (p_body, body) = parse_block(p_col)
+                var (p_end, _, _) = expect_tok(p_body, TokType.End, "expected 'end' after map block")
+                var (p_dot, _) = match_tok(p_end, TokType.Dot)
+                n.name = bind_tok.str_val
+                n = ast_add_child(n, src_expr)
+                n = ast_add_child(n, body)
+                out (p_dot, n)
+            end
+        end
+        if check(p2, TokType.LParen) do
+            var (p3, _) = advance(p2)
+            p3 = skip_newlines(p3)
+            if not check(p3, TokType.RParen) do
+                var (p4, arg) = parse_expr(p3)
+                p3 = p4
+                n = ast_add_child(n, arg)
+                ml = true
+                when ml loop
+                    var (p5, matched) = match_list_sep(p3, true)
+                    p3 = p5
+                    if not matched or check(p3, TokType.RParen) do
+                        ml = false
+                    else
+                        var (p6, arg2) = parse_expr(p3)
+                        p3 = p6
+                        n = ast_add_child(n, arg2)
+                    end
+                end
+            end
+            var (p7, _, _) = expect_tok(p3, TokType.RParen, "expected ')' after map args")
+            out (p7, n)
+        end
+        out (p2, n)
+    end
+    # `port(...)` channel creation
+    if t.tok_type == TokType.PortKw do
+        var (p2, _) = advance(p)
+        n = ast_new(AstType.BuiltinCall)
+        n.name = fat_str_new("port")
+        n.line = t.line
+        n.builtin_id = 90
+        if check(p2, TokType.LParen) do
+            var (p3, _) = advance(p2)
+            p3 = skip_newlines(p3)
+            if not check(p3, TokType.RParen) do
+                var (p4, arg) = parse_expr(p3)
+                p3 = p4
+                n = ast_add_child(n, arg)
+            end
+            var (p5, _, _) = expect_tok(p3, TokType.RParen, "expected ')' after port")
+            out (p5, n)
+        end
+        out (p2, n)
+    end
+
+    # `arr_compact(...)` / bare keyword
+    if t.tok_type == TokType.ArrCompactKw do
+        var (p2, _) = advance(p)
+        n = ast_new(AstType.ArrCompactExpr)
+        n.name = fat_str_new("arr_compact")
+        n.line = t.line
+        if check(p2, TokType.LParen) do
+            var (p3, _) = advance(p2)
+            if not check(p3, TokType.RParen) do
+                var (p4, arg) = parse_expr(p3)
+                p3 = p4
+                n = ast_add_child(n, arg)
+            end
+            var (p5, _, _) = expect_tok(p3, TokType.RParen, "expected ')' after arr_compact")
+            out (p5, n)
+        end
+        out (p2, n)
+    end
+
+    # `erx` is the current integer error register; `error` remains the legacy
+    # error-value expression and must not be conflated with it.
+    if t.tok_type == TokType.ErxKw do
+        var (p2, _) = advance(p)
+        n = ast_new(AstType.ErxExpr)
+        n.name = fat_str_new("erx")
+        n.line = t.line
+        out (p2, n)
+    end
+    if t.tok_type == TokType.ErrorKw do
+        var (p2, _) = advance(p)
+        n = ast_new(AstType.ErrorExpr)
+        n.name = fat_str_new("error")
+        n.line = t.line
+        out (p2, n)
+    end
+
+    # Boolean true
+    if t.tok_type == TokType.True do
+        var (p2, _) = advance(p)
+        n = ast_new(AstType.LiteralBool)
+        n.int_val = 1
+        n.line = t.line
+        native_write_i64(n as int, 32, primaryLine)
+        native_write_i64(n as int, 72, primarySpan)
+        ideFactOrigin(n as int, primarySpan, primaryLine)
+        out (p2, n)
+    end
+
+    # Boolean false
+    if t.tok_type == TokType.False do
+        var (p2, _) = advance(p)
+        n = ast_new(AstType.LiteralBool)
+        n.int_val = 0
+        n.line = t.line
+        native_write_i64(n as int, 32, primaryLine)
+        native_write_i64(n as int, 72, primarySpan)
+        ideFactOrigin(n as int, primarySpan, primaryLine)
+        out (p2, n)
+    end
+
+    # Null / none
+    if t.tok_type == TokType.NoneLit do
+        var (p2, _) = advance(p)
+        # Lowercase `none` is the null literal. Uppercase `None` is the
+        # conventional Option variant and must participate in normal enum
+        # name resolution instead of silently becoming address zero.
+        if fat_cstr_eq(tok_lex(t), "None") == 1 do
+            n = ast_new(AstType.Identifier)
+            n.name = fat_str_new("None")
+        else
+            n = ast_new(AstType.LiteralNone)
+            n.int_val = 0
+        end
+        n.line = t.line
+        native_write_i64(n as int, 32, primaryLine)
+        native_write_i64(n as int, 72, primarySpan)
+        ideFactOrigin(n as int, primarySpan, primaryLine)
+        out (p2, n)
+    end
+
+    # Identifier (may be call, index, entity literal...)
+    if is_name_token(t.tok_type) do
+        var (p2, id_tok) = advance(p)
+        id_name = tok_lex(id_tok)
+        p = p2
+
+        # A generic call or entity literal may place type arguments between
+        # the identifier and `(`. Resolve that lookahead before classifying
+        # the parenthesized form.
+        var (p_gen, skipped_gen, gen_args) = try_parse_generic_call_args(p)
+        if skipped_gen do
+            p = p_gen
+        else
+            gen_args = fat_str_new("")
+        end
+
+        # Entity instantiation uses parentheses 'Entity(...)', NOT curly braces.
+        if check(p, TokType.LBrace) do
+            var (p_err, _) = advance(p)
+            p_err = parse_error_code_loc(p_err, 1004, "entity instantiation uses parentheses 'Entity(...)', not curly braces '{...}'", id_tok.line, id_tok.col)
+            out (p_err, ast_new(AstType.LiteralInt))
+        end
+
+        # Entity/record literal: IDENT ['<' TypeArgs '>'] '(' field: val, ... ')'
+        if check(p, TokType.LParen) and check_entity_literal(p) do
+            var (p3, _) = advance(p)  # consume '('
+            el = ast_new(AstType.EntityLiteral)
+            el.name = id_name
+            el.name2 = gen_args
+            el.line = primaryLine
+            ideFactOrigin(el as int, primarySpan, primaryLine)
+            p3 = skip_newlines(p3);    # skip optional newline/semicolon after '('
+            var (p3, _) = match_tok(p3, TokType.Semicolon)
+            p3 = skip_newlines(p3)
+            when not check(p3, TokType.RParen) and not check(p3, TokType.Eof) loop
+                var (p4, fname, ok) = expect_name_tok(p3, "expected field name")
+                let labelLine = native_read_i64(fname as int, 8)
+                let labelSpan = native_read_i64(fname as int, 72)
+                let labelName = tok_lex(fname)
+                p3 = p4
+                if not ok do
+                    out (p3, el)
+                end
+                var (p5, _, _) = expect_tok(p3, TokType.Colon, "expected ':' after field")
+                p3 = p5
+                var (p6, val) = parse_expr(p3)
+                p3 = p6
+                val.name2 = fname.str_val
+                if g_ideFactsEnabled == 1 do
+                    let fieldLabel = ast_new(AstType.FieldAccess)
+                    native_write_i64(fieldLabel as int, 0, labelName as int)
+                    native_write_i64(fieldLabel as int, 32, labelLine)
+                    native_write_i64(fieldLabel as int, 72, labelSpan)
+                    ideFactOrigin(fieldLabel as int, labelSpan, labelLine)
+                    ideFactSetProjection(val as int, fieldLabel as int)
+                end
+                el = ast_add_child(el, val)
+                # Accept ',' or ';' between fields (stdlib uses both).
+                var (p7, had_comma) = match_tok(p3, TokType.Comma)
+                if had_comma do
+                    p3 = p7
+                else
+                    var (p7b, _) = match_tok(p7, TokType.Semicolon)
+                    p3 = p7b
+                end
+                p3 = skip_newlines(p3)
+            end
+            var (p8, _, _) = expect_tok(p3, TokType.RParen, "expected ')' after entity literal")
+            el.name2 = gen_args
+            out (p8, el)
+        end
+
+        # Check for function call: IDENT '('
+        if check(p, TokType.LParen) do
+            bid = lookup_builtin(p.builtins, id_name)
+            if bid != BuiltinId.None do
+                # Builtin call
+                call = ast_new(AstType.BuiltinCall)
+                let this_bid = bid as i64
+                let this_builtin_name = id_name
+                call.builtin_id = this_bid
+                call.name = this_builtin_name
+                call.line = id_tok.line
+                var (p_lp, _) = advance(p)  # consume '('
+                p = skip_newlines(p_lp)
+                if not check(p, TokType.RParen) do
+                    var (p4, arg) = parse_expr(p)
+                    p = p4
+                    call = ast_add_child(call, arg)
+                    should_loop = true
+                    when should_loop loop
+                        var (p5, matched) = match_list_sep(p, true)
+                        p = p5
+                        if not matched or check(p, TokType.RParen) do
+                            should_loop = false
+                        else
+                            var (p6, arg2) = parse_expr(p)
+                            p = p6
+                            call = ast_add_child(call, arg2)
+                        end
+                    end
+                end
+                var (p7, _, _) = expect_tok(p, TokType.RParen, "expected ')' after builtin args")
+                # ast_add_child corrupts soft .name / .builtin_id — restore after children.
+                # Write builtin_id last so it survives if only the final field store sticks.
+                call.name = this_builtin_name
+                call.builtin_id = this_bid
+                out (p7, call)
+            end
+
+            # Regular function call
+            call = ast_new(AstType.Call)
+            let this_call_name = id_name
+            call.name = this_call_name
+            call.name2 = gen_args
+            call.line = id_tok.line
+            var (p_lp, _) = advance(p)  # consume '('
+            p = skip_newlines(p_lp)
+            if not check(p, TokType.RParen) do
+                # Detect named args: IDENT followed by '='
+                is_named = false
+                if p.pos + 1 < p.token_count do
+                    na_tok1 = vec_get_rt(p.tokens, p.pos)
+                    na_tok2 = vec_get_rt(p.tokens, p.pos + 1)
+                    if is_name_token(na_tok1.tok_type) and na_tok2.tok_type == TokType.Assign do
+                        is_named = true
+                    end
+                end
+                if is_named do
+                    call.int_val = 1
+                    should_loop2 = true
+                    when should_loop2 loop
+                        var (p_n1, name_ident_tok) = advance(p)  # consume name
+                        var (p_n2, _) = advance(p_n1)  # consume '='
+                        var (p_na, val_expr) = parse_expr(p_n2)
+                        p = p_na
+                        val_expr.name = tok_lex(name_ident_tok)
+                        call = ast_add_child(call, val_expr)
+                        # §1.0 / §6.4: named-arg sep is "," | ";" | NEWLINE
+                        var (p_sc, sc_matched) = match_list_sep(p, true)
+                        p = p_sc
+                        if not sc_matched or check(p, TokType.RParen) do
+                            should_loop2 = false
+                        end
+                    end
+                else
+                    var (p4, arg) = parse_expr(p)
+                    p = p4
+                    call = ast_add_child(call, arg)
+                    should_loop = true
+                    when should_loop loop
+                        # §1.0: positional arg sep is "," | ";" | NEWLINE
+                        var (p5, matched) = match_list_sep(p, true)
+                        p = p5
+                        if not matched or check(p, TokType.RParen) do
+                            should_loop = false
+                        else
+                            var (p6, arg2) = parse_expr(p)
+                            p = p6
+                            call = ast_add_child(call, arg2)
+                        end
+                    end
+                end
+            end
+            var (p7, _, _) = expect_tok(p, TokType.RParen, "expected ')' after arguments")
+            # ast_add_child corrupts soft .name — restore after children.
+            call.name = this_call_name
+            call.name2 = gen_args
+            ideFactOrigin(call as int, primarySpan, primaryLine)
+            out (p7, call)
+        end
+
+        # Check for index access: IDENT '['
+        if check(p, TokType.LBracket) do
+            var (p3, lbr_tok) = advance(p)  # consume '['
+            if check(p3, TokType.Comma) do
+                p_err = parse_error_at(p3, "unexpected ',' at start of index", peek(p3).line)
+                out (p_err, ast_new(AstType.IndexAccess))
+            end
+            if check(p3, TokType.RBracket) do
+                p_err = parse_error_at(p3, "expected expression after '['", peek(p3).line)
+                out (p_err, ast_new(AstType.IndexAccess))
+            end
+            var (p4, idx_expr) = parse_expr(p3)
+            if check(p4, TokType.DotDot) do
+                var (p4b, _) = advance(p4)
+                var (p4c, end_expr) = parse_expr(p4b)
+                var (p5, _, _) = expect_tok(p4c, TokType.RBracket, "expected ']' after slice")
+                access = ast_new(AstType.IndexAccess)
+                access.name = id_name
+                access.name2 = fat_str_new("__slice__")
+                access.line = id_tok.line
+                access = ast_add_child(access, idx_expr)
+                access = ast_add_child(access, end_expr)
+                ideFactOrigin(access as int, primarySpan, primaryLine)
+                out (p5, access)
+            end
+            access = ast_new(AstType.IndexAccess)
+            access.name = id_name
+            access.line = id_tok.line
+            access = ast_add_child(access, idx_expr)
+            p_cur = p4
+            var idx_loop = true
+            when idx_loop loop
+                if check(p_cur, TokType.Comma) do
+                    var (p_comma, _) = advance(p_cur)
+                    if check(p_comma, TokType.RBracket) do
+                        p_cur = parse_error_at(p_comma, "unexpected ',' before ']'", peek(p_comma).line)
+                        idx_loop = false
+                    else
+                        var (p_next, next_idx) = parse_expr(p_comma)
+                        access = ast_add_child(access, next_idx)
+                        p_cur = p_next
+                    end
+                else
+                    idx_loop = false
+                end
+            end
+            var (p5, _, _) = expect_tok(p_cur, TokType.RBracket, "expected ']' after index")
+            ideFactOrigin(access as int, primarySpan, primaryLine)
+            out (p5, access)
+        end
+
+        # Plain identifier
+        n = ast_new(AstType.Identifier)
+        n.name = id_name
+        n.line = id_tok.line
+        let n_ptr = n as i64
+        let tok_ptr = id_tok as i64
+        let tok_col = native_read_i64(tok_ptr, 16)
+        let tok_span = native_read_i64(tok_ptr, 72)
+        native_write_i64(n_ptr, 40, tok_col)
+        native_write_i64(n_ptr, 72, tok_span)
+        out (p, n)
+    end
+
+    # Input expression
+    if t.tok_type == TokType.Input do
+        var (p2, _) = advance(p)
+        n = ast_new(AstType.InputExpr)
+        n.line = t.line
+        out (p2, n)
+    end
+
+    # Parenthesised expression or tuple: (expr) / (a, b, …)
+    if t.tok_type == TokType.LParen do
+        var (p2, _) = advance(p)
+        p2 = skip_newlines(p2)
+        if check(p2, TokType.RParen) do
+            # Empty tuple ()
+            var (p3, _) = advance(p2)
+            tup = ast_new(AstType.TupleExpr)
+            tup.line = t.line
+            out (p3, tup)
+        end
+        var (p3, inner) = parse_expr(p2)
+        p2 = p3
+        if check(p2, TokType.Comma) do
+            tup = ast_new(AstType.TupleExpr)
+            tup.line = t.line
+            tup = ast_add_child(tup, inner)
+            when check(p2, TokType.Comma) loop
+                var (p4, _) = advance(p2)
+                p4 = skip_newlines(p4)
+                if check(p4, TokType.RParen) do
+                    p2 = p4
+                else
+                    var (p5, elem) = parse_expr(p4)
+                    tup = ast_add_child(tup, elem)
+                    p2 = p5
+                end
+            end
+            var (p6, _, _) = expect_tok(p2, TokType.RParen, "expected ')' to close tuple")
+            out (p6, tup)
+        end
+        var (p4, _, _) = expect_tok(p2, TokType.RParen, "expected ')'")
+        out (p4, inner)
+    end
+
+    # Array or Dict literal: [elem, ...] or [key: val, ...]
+    if t.tok_type == TokType.LBracket do
+        var (p2, _) = advance(p)
+        p2 = skip_newlines(p2)
+        arr = ast_new(AstType.ArrayLiteral)
+        arr.line = t.line
+        if not check(p2, TokType.RBracket) do
+            var (p3, elem) = parse_expr(p2)
+            p2 = skip_newlines(p3)
+            if check(p2, TokType.Colon) do
+                # Dict Literal: [key: val, ...]
+                arr.node_type = AstType.DictLiteral
+                arr.name = fat_str_new("dict")
+                var (p_col, _) = advance(p2)
+                p_col = skip_newlines(p_col)
+                var (p_val, val_elem) = parse_expr(p_col)
+                p2 = skip_newlines(p_val)
+                arr = ast_add_child(arr, elem)
+                arr = ast_add_child(arr, val_elem)
+                when check(p2, TokType.Comma) loop
+                    var (p4, _) = advance(p2)
+                    p4 = skip_newlines(p4)
+                    if check(p4, TokType.RBracket) do
+                        p2 = p4
+                    else
+                        var (p5, key_next) = parse_expr(p4)
+                        p5 = skip_newlines(p5)
+                        var (p6, _, _) = expect_tok(p5, TokType.Colon, "expected ':' after dict key")
+                        p6 = skip_newlines(p6)
+                        var (p7, val_next) = parse_expr(p6)
+                        p2 = skip_newlines(p7)
+                        arr = ast_add_child(arr, key_next)
+                        arr = ast_add_child(arr, val_next)
+                    end
+                end
+            eif check(p2, TokType.Semicolon) do
+                # Fill syntax: [init_val; count]
+                var (p_semi, _) = advance(p2)
+                p_semi = skip_newlines(p_semi)
+                var (p_cnt, count_tok, _) = expect_tok(p_semi, TokType.Int, "expected integer for array fill count")
+                p2 = skip_newlines(p_cnt)
+                let fill_count = count_tok.int_val
+                var fi = 0
+                when fi < fill_count loop
+                    arr = ast_add_child(arr, elem)
+                    fi = fi + 1
+                end
+            else
+                arr = ast_add_child(arr, elem)
+                should_loop = true
+                when should_loop loop
+                    p2 = skip_newlines(p2)
+                    var (p4, matched) = match_tok(p2, TokType.Comma)
+                    p2 = skip_newlines(p4)
+                    if check(p2, TokType.RBracket) or not matched do
+                        should_loop = false
+                    else
+                        var (p5, elem2) = parse_expr(p2)
+                        p2 = skip_newlines(p5)
+                        arr = ast_add_child(arr, elem2)
+                    end
+                end
+            end
+        end
+        p2 = skip_newlines(p2)
+        var (p6, _, _) = expect_tok(p2, TokType.RBracket, "expected ']' after literal")
+        out (p6, arr)
+    end
+
+    # Error — expected expression
+    p = parse_error_code(p, 1004, "expected expression")
+    out (p, ast_new(AstType.LiteralInt))
+end.

@@ -1,0 +1,784 @@
+##
+ * compiler/src/lower/ast_to_mir/calls.vri — Function & Method Call Lowering
+ * ==========================================================================
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+include parser
+include mir
+include ast_to_mir_context
+include ast_to_mir_layout
+include ast_to_mir_builder
+
+func lower_call_args(b: &MirBuilder, expr: &AstNode, start_child: i64, arg_base: i64):
+    # Stage into fresh vregs first — a nested call clobbers X0..Xn / prior SetArgs.
+	if g_mir_scratch_args == 0 do g_mir_scratch_args = vec_new_rt() end
+	scratch_start = g_mir_scratch_top
+	n = ast_node_child_count(expr)
+	var i = start_child
+	var ai = 0
+	b_mut = b
+	when i < n loop
+		arg = ast_node_child(expr, i)
+		var b2 = lower_expr(b_mut, arg)
+		var aop = g_lower_expr_result_opnd as MirOperand
+		var arg_flux_t = infer_expr_type_name(arg)
+		if (arg_flux_t as i64) == 0 or fat_str_len(arg_flux_t) == 0 do
+			if ast_node_type_of(arg) == AstType.Identifier do
+				arg_flux_t = get_var_type(ast_node_name(arg))
+			end
+		end
+		if is_flux_type_str(arg_flux_t) do
+			var (b_cl, cl_op) = emit_flux_clone(b2, aop, arg_flux_t)
+			b2 = b_cl
+			aop = cl_op
+		end
+		if g_mir_scratch_top < vec_len_rt(g_mir_scratch_args) do
+			vec_set_rt(g_mir_scratch_args, g_mir_scratch_top, aop as i64)
+		else
+			g_mir_scratch_args = vec_push_rt(g_mir_scratch_args, aop as i64)
+		end
+		g_mir_scratch_top = g_mir_scratch_top + 1
+		b_mut = b2
+		ai = ai + 1
+		i = i + 1
+	end
+	var j = 0
+	when j < ai loop
+		let staged_arg = vec_get_rt(g_mir_scratch_args, scratch_start + j) as MirOperand
+		let staged_arg_node = ast_node_child(expr, start_child + j)
+		let staged_arg_type = infer_expr_type_name(staged_arg_node)
+		var s_typ: i64 = 0
+		if fat_cstr_eq(staged_arg_type, "float") == 1 or fat_cstr_eq(staged_arg_type, "f64") == 1 do
+			s_typ = MirType.F64 as i64
+		end
+		b_mut = emit_set_arg_typed(b_mut, arg_base + j, staged_arg, s_typ)
+		j = j + 1
+	end
+	g_mir_scratch_top = scratch_start
+	out (b_mut, ai)
+end.
+
+func interp_type_is_int(type_name: string):
+    if fat_cstr_eq(type_name, "int") == 1 or fat_cstr_eq(type_name, "i64") == 1 or fat_cstr_eq(type_name, "i32") == 1 or fat_cstr_eq(type_name, "i16") == 1 or fat_cstr_eq(type_name, "i8") == 1 do out true end
+    if fat_cstr_eq(type_name, "u64") == 1 or fat_cstr_eq(type_name, "u32") == 1 or fat_cstr_eq(type_name, "u16") == 1 or fat_cstr_eq(type_name, "u8") == 1 do out true end
+    out false
+end.
+
+func lower_interp_segment(b: MirBuilder, node: &AstNode):
+    nt = ast_node_type_of(node)
+    if nt == AstType.LiteralStr do
+        var (b1, sid) = builder_intern(b, ast_node_name(node))
+        var (b2, dst) = builder_new_vreg(b1)
+        b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(dst), mir_opnd_imm(sid))
+        out expr_result(b2, mir_opnd_vreg(dst))
+    end
+    if nt == AstType.LiteralBool or nt == AstType.LiteralNone do
+        text = fat_str_new("none")
+        if nt == AstType.LiteralBool do
+            text = fat_str_new("false")
+            if ast_node_int_val(node) != 0 do text = fat_str_new("true") end
+        end
+        var (b1, sid) = builder_intern(b, text)
+        var (b2, dst) = builder_new_vreg(b1)
+        b2 = emit_intrinsic(b2, MIR_INTR_STR_LIT, mir_opnd_vreg(dst), mir_opnd_imm(sid))
+        out expr_result(b2, mir_opnd_vreg(dst))
+    end
+
+    var b1 = lower_expr(b, node)
+    var value = g_lower_expr_result_opnd as MirOperand
+    # Pass 6 stores the checked interpolation TypeKind in int_val. Do not
+    # re-infer here: lowering-time inference cannot reliably recover field,
+    # index, call and method return types.
+    interp_kind = ast_node_int_val(node) as TypeKind
+    if interp_kind == TypeKind.None do
+        var (b_none, none_sid) = builder_intern(b1, fat_str_new("none"))
+        var (b_none2, none_dst) = builder_new_vreg(b_none)
+        b_none2 = emit_intrinsic(b_none2, MIR_INTR_STR_LIT, mir_opnd_vreg(none_dst), mir_opnd_imm(none_sid))
+        out expr_result(b_none2, mir_opnd_vreg(none_dst))
+    end
+    if interp_kind == TypeKind.Int do
+        b1 = emit_set_arg(b1, 0, value)
+        var (b2, dst) = builder_new_vreg(b1)
+        b2 = emit_intrinsic(b2, MIR_INTR_BUILTIN, mir_opnd_vreg(dst), mir_opnd_imm(19))
+        out expr_result(b2, mir_opnd_vreg(dst))
+    end
+    if interp_kind == TypeKind.Bool do
+        b1 = emit_set_arg(b1, 0, value)
+        var (b2, dst) = builder_new_vreg(b1)
+        # Compiler-private target-neutral helper id, outside the public builtin registry.
+        b2 = emit_intrinsic(b2, MIR_INTR_BUILTIN, mir_opnd_vreg(dst), mir_opnd_imm(1000))
+        out expr_result(b2, mir_opnd_vreg(dst))
+    end
+    # Only TypeKind.String can reach this path; unsupported kinds are rejected
+    # by semantic analysis before MIR lowering.
+    out expr_result(b1, value)
+end.
+
+func lower_check_call_error(b: MirBuilder):
+    if g_try_revert_block < 0 do out b end
+    var (b_err, call_err_vreg) = builder_new_vreg(b)
+    b_err = emit_intrinsic(b_err, MIR_INTR_ERX, mir_opnd_vreg(call_err_vreg), mir_opnd_none())
+    var (b_ok, call_ok_id) = builder_add_block(b_err)
+    var (b_fail, call_fail_id) = builder_add_block(b_ok)
+    b_err = emit_jump_if_not(b_fail, mir_opnd_vreg(call_err_vreg), call_ok_id, call_fail_id)
+    b_err = builder_set_current_block(b_err, call_fail_id)
+    if g_try_err_vreg >= 0 do
+        b_err = emit_move(b_err, g_try_err_vreg, mir_opnd_vreg(call_err_vreg))
+    end
+    if g_arena_mark_stack != 0 and vec_len_rt(g_arena_mark_stack) > 0 do
+        var ams_len = vec_len_rt(g_arena_mark_stack)
+        var ams_i = ams_len - 1
+        when ams_i >= g_try_arena_depth loop
+            var mk_vreg = vec_get_rt(g_arena_mark_stack, ams_i) as i64
+            b_err = emit_intrinsic(b_err, MIR_MEM_RESET, mir_opnd_none(), mir_opnd_vreg(mk_vreg))
+            ams_i = ams_i - 1
+        end
+    end
+    b_err = emit_jump(b_err, g_try_revert_block)
+    b_err = builder_set_current_block(b_err, call_ok_id)
+    out b_err
+end.
+
+func lower_prepare_call_error(b: MirBuilder):
+    if g_try_revert_block < 0 do out b end
+    # A foreign/runtime callee does not implement Vir's erx ABI. Clear the
+    # register at the call boundary so only an explicit Vir throw survives.
+    # Keep the clear value explicit.  Besides making the MIR contract
+    # unambiguous, this lets an older bootstrap backend (which historically
+    # inspected the intrinsic tag operand as a fallback source) emit zero too.
+    out emit_intrinsic(b, MIR_INTR_ERX, mir_opnd_none(), mir_opnd_imm(0))
+end.
+
+func lower_call_with_ref_support_ast(b: MirBuilder, expr: &AstNode, callee: string, cid: i64, callee_vreg: i64, fn_ast: &AstNode, fn_type_str: &string, arg_start: i64):
+    tot_ch = ast_node_child_count(expr)
+    n_args = tot_ch - arg_start
+    if n_args < 0 do n_args = 0 end
+    staged_args = vec_new_rt()
+    writeback_vnames = vec_new_rt()
+    writeback_addrs = vec_new_rt()
+    var b_cur = b
+    var arg_i = 0
+    when arg_i < n_args loop
+        arg = ast_node_child(expr, arg_start + arg_i)
+        pmode = get_call_param_mode(fn_ast, fn_type_str, arg_i)
+        if pmode == 0 do
+            var b_eval = lower_expr(b_cur, arg)
+            var aop = g_lower_expr_result_opnd as MirOperand
+            var arg_flux_t = infer_expr_type_name(arg)
+            if (arg_flux_t as i64) == 0 or fat_str_len(arg_flux_t) == 0 do
+                if ast_node_type_of(arg) == AstType.Identifier do
+                    arg_flux_t = get_var_type(ast_node_name(arg))
+                end
+            end
+            if is_flux_type_str(arg_flux_t) do
+                var (b_cl, cl_op) = emit_flux_clone(b_eval, aop, arg_flux_t)
+                b_eval = b_cl
+                aop = cl_op
+            end
+            b_cur = b_eval
+            staged_args = vec_push_rt(staged_args, aop as i64)
+        else
+            arg_t = ast_node_type_of(arg)
+            if arg_t == AstType.Identifier do
+                vname = ast_node_name(arg)
+                var is_forwarded = false
+                if g_func_ref_param_hash != 0 do
+                    ref_idx = hash_table_lookup(g_func_ref_param_hash, g_func_ref_param_names, vname)
+                    if ref_idx >= 0 do
+                        ptr_vr = vec_get_rt(g_func_ref_param_vregs, ref_idx)
+                        staged_args = vec_push_rt(staged_args, mir_opnd_vreg(ptr_vr) as i64)
+                        is_forwarded = true
+                    end
+                end
+                if not is_forwarded do
+                    var (b_s, addr_vr) = builder_new_vreg(b_cur)
+                    let ref_slot = g_next_ref_slot
+                    g_next_ref_slot = g_next_ref_slot + 1
+                    b_s = emit_intrinsic(b_s, MIR_INTR_LOAD_ADDR, mir_opnd_vreg(addr_vr), mir_opnd_imm(ref_slot))
+                    b_cur = b_s
+                    if pmode == 1 do
+                        v_cur = get_var_vreg(b_cur, vname)
+                        if v_cur >= 0 do
+                            b_cur = emit_store(b_cur, mir_opnd_vreg(addr_vr), mir_opnd_vreg(v_cur))
+                        end
+                    else
+                        b_cur = emit_store(b_cur, mir_opnd_vreg(addr_vr), mir_opnd_imm(0))
+                    end
+                    staged_args = vec_push_rt(staged_args, mir_opnd_vreg(addr_vr) as i64)
+                    writeback_vnames = vec_push_rt(writeback_vnames, vname as i64)
+                    writeback_addrs = vec_push_rt(writeback_addrs, addr_vr)
+                end
+            eif arg_t == AstType.FieldAccess do
+                base_ast = ast_node_child(arg, 0)
+                fname = ast_node_name(arg)
+                base_type = get_expr_entity_type(base_ast)
+                var b_b = lower_expr(b_cur, base_ast)
+                var base_op = g_lower_expr_result_opnd as MirOperand
+                b_cur = b_b
+                var fid = 0 - 1
+                if fat_str_len(base_type) > 0 do fid = get_scoped_field_index(base_type, fname) end
+                if fid < 0 do fid = find_field_index_for_base(ast_node_name(base_ast), fname) end
+                if fid < 0 do fid = 0 end
+                var (b_faddr, faddr_vr) = builder_new_vreg(b_cur)
+                b_faddr = builder_add_instr(b_faddr, mir_instr_new(MirOp.Add, mir_opnd_vreg(faddr_vr), base_op, mir_opnd_imm(fid * 8)))
+                b_cur = b_faddr
+                staged_args = vec_push_rt(staged_args, mir_opnd_vreg(faddr_vr) as i64)
+            eif arg_t == AstType.IndexAccess or arg_t == AstType.ExprIndex do
+                var base_op = mir_opnd_none()
+                var idx_ast = 0 as AstNode
+                if arg_t == AstType.IndexAccess do
+                    base_name = ast_node_name(arg)
+                    bv = get_var_vreg(b_cur, base_name)
+                    if bv >= 0 do base_op = mir_opnd_vreg(bv) end
+                    idx_ast = ast_node_child(arg, 0)
+                else
+                    var b_b = lower_expr(b_cur, ast_node_child(arg, 0))
+                    var bop = g_lower_expr_result_opnd as MirOperand
+                    b_cur = b_b
+                    base_op = bop
+                    idx_ast = ast_node_child(arg, 1)
+                end
+                var b_i = lower_expr(b_cur, idx_ast)
+                var idx_op = g_lower_expr_result_opnd as MirOperand
+                b_cur = b_i
+                var (b_mul, mul_v) = builder_new_vreg(b_cur)
+                b_mul = builder_add_instr(b_mul, mir_instr_new(MirOp.Mul, mir_opnd_vreg(mul_v), idx_op, mir_opnd_imm(8)))
+                var (b_add16, add16_v) = builder_new_vreg(b_mul)
+                b_add16 = builder_add_instr(b_add16, mir_instr_new(MirOp.Add, mir_opnd_vreg(add16_v), mir_opnd_vreg(mul_v), mir_opnd_imm(16)))
+                var (b_iaddr, iaddr_vr) = builder_new_vreg(b_add16)
+                b_iaddr = builder_add_instr(b_iaddr, mir_instr_new(MirOp.Add, mir_opnd_vreg(iaddr_vr), base_op, mir_opnd_vreg(add16_v)))
+                b_cur = b_iaddr
+                staged_args = vec_push_rt(staged_args, mir_opnd_vreg(iaddr_vr) as i64)
+            else
+                var b_eval = lower_expr(b_cur, arg)
+                var aop = g_lower_expr_result_opnd as MirOperand
+                b_cur = b_eval
+                staged_args = vec_push_rt(staged_args, aop as i64)
+            end
+        end
+        arg_i = arg_i + 1
+    end
+
+    # Keep the ABI call sequence contiguous: ERX-clear, SetArg*, Call.
+    b_cur = lower_prepare_call_error(b_cur)
+    let setarg_ffi_id = ffi_import_find(callee)
+    var foreign_integer_index = 0
+    var foreign_float_index = 0
+    var j = 0
+    when j < n_args loop
+        let a_opnd = vec_get_rt(staged_args, j) as MirOperand
+        var abi_argument_index = j
+        var s_typ: i64 = 0
+        if setarg_ffi_id >= 0 do
+            let foreign_param_type = ffi_import_param_type(setarg_ffi_id, j)
+            if fat_cstr_eq(foreign_param_type, "float") == 1 or fat_cstr_eq(foreign_param_type, "f64") == 1 do
+                s_typ = MirType.F64 as i64
+                abi_argument_index = foreign_float_index
+                foreign_float_index = foreign_float_index + 1
+            else
+                abi_argument_index = foreign_integer_index
+                foreign_integer_index = foreign_integer_index + 1
+            end
+        end
+        b_cur = emit_set_arg_typed(b_cur, abi_argument_index, a_opnd, s_typ)
+        j = j + 1
+    end
+
+    var (b_call, dst_v) = builder_new_vreg(b_cur)
+    var ins_c = 0 as MirInstr
+    if callee_vreg >= 0 do
+        ins_c = mir_instr_new(MirOp.Call, mir_opnd_vreg(dst_v), mir_opnd_imm(n_args), mir_opnd_vreg(callee_vreg))
+    else
+        ins_c = mir_instr_new(MirOp.Call, mir_opnd_vreg(dst_v), mir_opnd_imm(n_args), mir_opnd_imm(cid))
+    end
+    var call_return_type = fn_type_str
+    let call_ffi_id = setarg_ffi_id
+    if call_ffi_id >= 0 do
+        call_return_type = ffi_import_return_type(call_ffi_id)
+    eif (fn_ast as i64) != 0 do
+        call_return_type = ast_node_name2(fn_ast)
+    end
+    if fat_cstr_eq(call_return_type, "float") == 1 or fat_cstr_eq(call_return_type, "f64") == 1 do
+        mir_instr_set_type(ins_c, MirType.F64 as i64)
+    end
+    if fat_cstr_eq(callee, "q80CreateView") == 1 or fat_cstr_eq(callee, "q80ValidateView") == 1 or fat_cstr_eq(callee, "q80Gemv") == 1 or fat_cstr_eq(callee, "q80Gemm") == 1 or fat_cstr_eq(callee, "q80GemvScalar") == 1 or fat_cstr_eq(callee, "q80GemvSimd") == 1 or fat_cstr_eq(callee, "q80GemvNeon") == 1 do
+        var q_type = ast_node_name2(expr)
+        if fat_cstr_eq(callee, "q80CreateView") == 0 and ast_node_child_count(expr) > 0 do
+            let view_arg = ast_node_child(expr, 0)
+            q_type = infer_expr_type_name(view_arg)
+            if ast_node_type_of(view_arg) == AstType.AddrOf and ast_node_child_count(view_arg) > 0 do
+                let view_target = ast_node_child(view_arg, 0)
+                if ast_node_type_of(view_target) == AstType.Identifier do
+                    q_type = get_var_type(ast_node_name(view_target))
+                end
+            end
+        end
+        if is_quantized_type_str(q_type as int) == false do
+            q_type = format_quantized_q80_unknown_type()
+        end
+        set_quantized_instr_metadata(ins_c, q_type)
+    end
+    b_call = builder_add_instr(b_call, ins_c)
+    # External C/Wasm callees do not implement Vir's ERX return channel.
+    # The boundary was cleared before the call, so do not synthesize a
+    # fallible-call CFG after a target-neutral FFI import.
+    if setarg_ffi_id < 0 do
+        b_call = lower_check_call_error(b_call)
+    end
+
+    var wb_i = 0
+    let n_wb = vec_len_rt(writeback_vnames)
+    when wb_i < n_wb loop
+        let wb_name = vec_get_rt(writeback_vnames, wb_i) as string
+        let wb_addr = vec_get_rt(writeback_addrs, wb_i) as i64
+        var (b_ld, res_v) = builder_new_vreg(b_call)
+        b_ld = emit_load(b_ld, res_v, mir_opnd_vreg(wb_addr))
+        b_call = b_ld
+        v_exist = get_var_vreg(b_call, wb_name)
+        if v_exist >= 0 do
+            b_call = emit_move(b_call, v_exist, mir_opnd_vreg(res_v))
+        else
+            var (b_nv, new_v) = builder_new_vreg(b_call)
+            b_nv = emit_move(b_nv, new_v, mir_opnd_vreg(res_v))
+            b_call = set_var_vreg(b_nv, wb_name, new_v)
+        end
+        wb_i = wb_i + 1
+    end
+    out expr_result(b_call, mir_opnd_vreg(dst_v))
+end.
+
+func lower_call_with_ref_support(b: MirBuilder, expr: &AstNode, callee: string, cid: i64, callee_vreg: i64):
+    var fn_ast = find_func_ast(callee as i64)
+    var fn_type_str = fat_str_new("")
+    if (fn_ast as i64) == 0 do
+        let v_t = get_var_type(callee)
+        if (v_t as i64) != 0 and fat_str_len(v_t) > 0 do
+            let fn_chk = find_func_ast(v_t)
+            if (fn_chk as i64) != 0 do
+                fn_ast = fn_chk
+            else
+                fn_type_str = v_t
+            end
+        end
+    end
+    out lower_call_with_ref_support_ast(b, expr, callee, cid, callee_vreg, fn_ast, fn_type_str, 0)
+end.
+
+
+# ═══════════════════════════════════════════════════════
+# Call Expression Lowering Dispatcher
+# ═══════════════════════════════════════════════════════
+func lower_expr_calls(b: MirBuilder, expr: &AstNode, expr_type: AstType):
+	if expr_type == AstType.Call do
+		# Positional entity construction `Ent(v0, v1, ...)` parses as a Call
+		# reclassify to an aggregate when the callee names an entity type.
+		callee = resolve_callee_alias(ast_node_name(expr))
+		if is_entity_name(callee) == 1 do
+			out lower_aggregate(b, MIR_INTR_ENTITY, expr)
+		end
+		if fat_cstr_eq(callee, "flux") == 1 do
+			out lower_aggregate(b, MIR_INTR_ARRAY, expr)
+		end
+		if fat_cstr_eq(callee, "flux_splat") == 1 and ast_node_child_count(expr) >= 2 do
+			var b_v = lower_expr(b, ast_node_child(expr, 0))
+			var val_op = g_lower_expr_result_opnd as MirOperand
+			var b_l = lower_expr(b_v, ast_node_child(expr, 1))
+			var lanes_op = g_lower_expr_result_opnd as MirOperand
+			var s_lanes = 4
+			if mir_opnd_type(lanes_op) == MirOperandType.Imm do
+				s_lanes = mir_opnd_imm_val(lanes_op)
+			end
+			if s_lanes <= 0 do s_lanes = 4 end
+			let alloc_sz = 16 + s_lanes * 8
+			b_l = emit_set_arg(b_l, 0, mir_opnd_imm(alloc_sz))
+			var (b_base, base_vr) = builder_new_vreg(b_l)
+			ins_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(base_vr) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+			annotate_owned_alloc(ins_alloc, base_vr, alloc_sz, 16, ast_node_line(expr))
+			b_base = builder_add_instr(b_base, ins_alloc)
+			b_base = emit_set_arg(b_base, 0, mir_opnd_vreg(base_vr))
+			b_base = emit_set_arg(b_base, 1, mir_opnd_imm(0))
+			b_base = emit_set_arg(b_base, 2, mir_opnd_imm(s_lanes))
+			b_base = emit_intrinsic(b_base, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+			b_base = emit_set_arg(b_base, 0, mir_opnd_vreg(base_vr))
+			b_base = emit_set_arg(b_base, 1, mir_opnd_imm(8))
+			b_base = emit_set_arg(b_base, 2, mir_opnd_imm(s_lanes))
+			b_base = emit_intrinsic(b_base, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+			var splat_ins = mir_instr_new(MirOp.Splat as i64, mir_opnd_vreg(base_vr) as i64, val_op, mir_opnd_imm(s_lanes))
+			mir_instr_set_type(splat_ins, MirType.Vector as i64)
+			let sp_aux = vec_aux_pack(1, s_lanes, 16, 0)
+			mir_instr_set_aux(splat_ins, sp_aux)
+			b_base = builder_add_instr(b_base, splat_ins)
+			out expr_result(b_base, mir_opnd_vreg(base_vr))
+		end
+		if fat_cstr_eq(callee, "flux_dot") == 1 and ast_node_child_count(expr) >= 2 do
+			var b_a = lower_expr(b, ast_node_child(expr, 0))
+			var a_op = g_lower_expr_result_opnd as MirOperand
+			var b_b = lower_expr(b_a, ast_node_child(expr, 1))
+			var b_op = g_lower_expr_result_opnd as MirOperand
+			var d_lanes = 4
+			var a_t = infer_expr_type_name(ast_node_child(expr, 0))
+			if is_flux_type_str(a_t) do d_lanes = parse_flux_lanes(a_t) end
+			if d_lanes <= 0 do d_lanes = 4 end
+			var (b_sum, sum_vr) = builder_new_vreg(b_b)
+			b_sum = builder_add_instr(b_sum, mir_instr_new(MirOp.Move, mir_opnd_vreg(sum_vr), mir_opnd_imm(0), mir_opnd_none()))
+			var di = 0
+			var b_dot = b_sum
+			when di < d_lanes loop
+				b_dot = emit_set_arg(b_dot, 0, mir_opnd_imm(di))
+				var (b_la, la_v) = builder_new_vreg(b_dot)
+				b_la = emit_intrinsic(b_la, MIR_INTR_INDEX, mir_opnd_vreg(la_v), a_op)
+				b_la = emit_set_arg(b_la, 0, mir_opnd_imm(di))
+				var (b_lb, lb_v) = builder_new_vreg(b_la)
+				b_lb = emit_intrinsic(b_lb, MIR_INTR_INDEX, mir_opnd_vreg(lb_v), b_op)
+				var (b_mul, mul_v) = builder_new_vreg(b_lb)
+				b_mul = builder_add_instr(b_mul, mir_instr_new(MirOp.Mul, mir_opnd_vreg(mul_v), mir_opnd_vreg(la_v), mir_opnd_vreg(lb_v)))
+				var (b_add, new_sum_v) = builder_new_vreg(b_mul)
+				b_add = builder_add_instr(b_add, mir_instr_new(MirOp.Add, mir_opnd_vreg(new_sum_v), mir_opnd_vreg(sum_vr), mir_opnd_vreg(mul_v)))
+				sum_vr = new_sum_v
+				b_dot = b_add
+				di = di + 1
+			end
+			out expr_result(b_dot, mir_opnd_vreg(sum_vr))
+		end
+		if fat_cstr_eq(callee, "flux_norm") == 1 and ast_node_child_count(expr) >= 1 do
+			var b_a = lower_expr(b, ast_node_child(expr, 0))
+			var a_op = g_lower_expr_result_opnd as MirOperand
+			var d_lanes = 4
+			var a_t = infer_expr_type_name(ast_node_child(expr, 0))
+			if is_flux_type_str(a_t) do d_lanes = parse_flux_lanes(a_t) end
+			if d_lanes <= 0 do d_lanes = 4 end
+			var (b_sum, sum_vr) = builder_new_vreg(b_a)
+			b_sum = builder_add_instr(b_sum, mir_instr_new(MirOp.Move, mir_opnd_vreg(sum_vr), mir_opnd_imm(0), mir_opnd_none()))
+			var di = 0
+			var b_dot = b_sum
+			when di < d_lanes loop
+				b_dot = emit_set_arg(b_dot, 0, mir_opnd_imm(di))
+				var (b_la, la_v) = builder_new_vreg(b_dot)
+				b_la = emit_intrinsic(b_la, MIR_INTR_INDEX, mir_opnd_vreg(la_v), a_op)
+				var (b_mul, mul_v) = builder_new_vreg(b_la)
+				b_mul = builder_add_instr(b_mul, mir_instr_new(MirOp.Mul, mir_opnd_vreg(mul_v), mir_opnd_vreg(la_v), mir_opnd_vreg(la_v)))
+				var (b_add, new_sum_v) = builder_new_vreg(b_mul)
+				b_add = builder_add_instr(b_add, mir_instr_new(MirOp.Add, mir_opnd_vreg(new_sum_v), mir_opnd_vreg(sum_vr), mir_opnd_vreg(mul_v)))
+				sum_vr = new_sum_v
+				b_dot = b_add
+				di = di + 1
+			end
+			var (b_init, x_vr) = builder_new_vreg(b_dot)
+			b_init = builder_add_instr(b_init, mir_instr_new(MirOp.Shr, mir_opnd_vreg(x_vr), mir_opnd_vreg(sum_vr), mir_opnd_imm(1)))
+			var (b_inc, x1_vr) = builder_new_vreg(b_init)
+			b_inc = builder_add_instr(b_inc, mir_instr_new(MirOp.Add, mir_opnd_vreg(x1_vr), mir_opnd_vreg(x_vr), mir_opnd_imm(1)))
+			x_vr = x1_vr
+			var step = 0
+			var b_step = b_inc
+			when step < 10 loop
+				var (b_cmp, cmp_vr) = builder_new_vreg(b_step)
+				b_cmp = builder_add_instr(b_cmp, mir_instr_new(MirOp.CmpEq, mir_opnd_vreg(cmp_vr), mir_opnd_vreg(x_vr), mir_opnd_imm(0)))
+				var (b_denom, denom_vr) = builder_new_vreg(b_cmp)
+				b_denom = builder_add_instr(b_denom, mir_instr_new(MirOp.Add, mir_opnd_vreg(denom_vr), mir_opnd_vreg(x_vr), mir_opnd_vreg(cmp_vr)))
+				var (b_div, div_vr) = builder_new_vreg(b_denom)
+				b_div = builder_add_instr(b_div, mir_instr_new(MirOp.Div, mir_opnd_vreg(div_vr), mir_opnd_vreg(sum_vr), mir_opnd_vreg(denom_vr)))
+				var (b_add, add_vr) = builder_new_vreg(b_div)
+				b_add = builder_add_instr(b_add, mir_instr_new(MirOp.Add, mir_opnd_vreg(add_vr), mir_opnd_vreg(x_vr), mir_opnd_vreg(div_vr)))
+				var (b_next, next_vr) = builder_new_vreg(b_add)
+				b_next = builder_add_instr(b_next, mir_instr_new(MirOp.Shr, mir_opnd_vreg(next_vr), mir_opnd_vreg(add_vr), mir_opnd_imm(1)))
+				x_vr = next_vr
+				b_step = b_next
+				step = step + 1
+			end
+			out expr_result(b_step, mir_opnd_vreg(x_vr))
+		end
+		if (fat_cstr_eq(callee, "flux_load") == 1 or fat_cstr_eq(callee, "flux.load") == 1) and ast_node_child_count(expr) >= 1 do
+			var b_ptr = lower_expr(b, ast_node_child(expr, 0))
+			var ptr_op = g_lower_expr_result_opnd as MirOperand
+			var ld_lanes = 4
+			if ast_node_child_count(expr) >= 2 do
+				var b_l = lower_expr(b_ptr, ast_node_child(expr, 1))
+				var l_op = g_lower_expr_result_opnd as MirOperand
+				if mir_opnd_type(l_op) == MirOperandType.Imm do ld_lanes = mir_opnd_imm_val(l_op) end
+				b_ptr = b_l
+			end
+			if ld_lanes <= 0 do ld_lanes = 4 end
+			let alloc_sz = 16 + ld_lanes * 8
+			b_ptr = emit_set_arg(b_ptr, 0, mir_opnd_imm(alloc_sz))
+			var (b_ld, ld_base) = builder_new_vreg(b_ptr)
+			ins_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(ld_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+			annotate_owned_alloc(ins_alloc, ld_base, alloc_sz, 16, ast_node_line(expr))
+			b_ld = builder_add_instr(b_ld, ins_alloc)
+			b_ld = emit_set_arg(b_ld, 0, mir_opnd_vreg(ld_base))
+			b_ld = emit_set_arg(b_ld, 1, mir_opnd_imm(0))
+			b_ld = emit_set_arg(b_ld, 2, mir_opnd_imm(ld_lanes))
+			b_ld = emit_intrinsic(b_ld, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+			b_ld = emit_set_arg(b_ld, 0, mir_opnd_vreg(ld_base))
+			b_ld = emit_set_arg(b_ld, 1, mir_opnd_imm(8))
+			b_ld = emit_set_arg(b_ld, 2, mir_opnd_imm(ld_lanes))
+			b_ld = emit_intrinsic(b_ld, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+			var vld_ins = mir_instr_new(MirOp.VLoad as i64, mir_opnd_vreg(ld_base) as i64, ptr_op, mir_opnd_none())
+			mir_instr_set_type(vld_ins, MirType.Vector as i64)
+			mir_instr_set_aux(vld_ins, vec_aux_pack(1, ld_lanes, 16, 0))
+			b_ld = builder_add_instr(b_ld, vld_ins)
+			out expr_result(b_ld, mir_opnd_vreg(ld_base))
+		end
+		if (fat_cstr_eq(callee, "flux_store") == 1 or fat_cstr_eq(callee, "flux.store") == 1) and ast_node_child_count(expr) >= 2 do
+			var b_ptr = lower_expr(b, ast_node_child(expr, 0))
+			var ptr_op = g_lower_expr_result_opnd as MirOperand
+			var b_val = lower_expr(b_ptr, ast_node_child(expr, 1))
+			var val_op = g_lower_expr_result_opnd as MirOperand
+			var st_lanes = 4
+			var st_t = infer_expr_type_name(ast_node_child(expr, 1))
+			if is_flux_type_str(st_t) do st_lanes = parse_flux_lanes(st_t) end
+			if st_lanes <= 0 do st_lanes = 4 end
+			var vst_ins = mir_instr_new(MirOp.VStore as i64, mir_opnd_none(), ptr_op, val_op)
+			mir_instr_set_type(vst_ins, MirType.Vector as i64)
+			mir_instr_set_aux(vst_ins, vec_aux_pack(1, st_lanes, 16, 0))
+			b_val = builder_add_instr(b_val, vst_ins)
+			out expr_result(b_val, mir_opnd_imm(0))
+		end
+		# Parser lookup_builtin can miss (fat vs C-string table names) and
+		# emit a Call instead of BuiltinCall. Reclassify by callee name.
+		b_id = builtin_id_from_name(callee)
+		if b_id > 0 do
+			if b_id == 9 and ast_node_child_count(expr) >= 1 do
+				arg0 = ast_node_child(expr, 0)
+				if ast_node_type_of(arg0) == AstType.LiteralStr do
+					slen = fat_str_len(ast_node_name(arg0))
+					out expr_result(b, mir_opnd_imm(slen))
+				end
+			end
+			var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+			var (b3, dst) = builder_new_vreg(b2)
+			out expr_result(emit_intrinsic(b3, MIR_INTR_BUILTIN, mir_opnd_vreg(dst), mir_opnd_imm(b_id)), mir_opnd_vreg(dst))
+		end
+		# Dynamic / Indirect Call: if callee is a local variable in scope
+		callee_vreg = get_var_vreg(b, callee)
+		if callee_vreg >= 0 do
+			out lower_call_with_ref_support(b, expr, callee, 0, callee_vreg)
+		end
+		var (b1, cid) = builder_intern(b, callee)
+		out lower_call_with_ref_support(b1, expr, callee, cid, 0 - 1)
+	end
+
+    # 6b. BuiltinCall — port/lock/atomic map to MIR_INTR_*; else BUILTIN+Call
+	if expr_type == AstType.BuiltinCall do
+		if fat_cstr_eq(ast_node_name(expr), "__mir_send") or fat_cstr_eq(ast_node_name(expr), "port_send") do
+			var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+			var (b3, dst) = builder_new_vreg(b2)
+			out expr_result(emit_intrinsic(b3, MIR_INTR_SEND, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
+		end
+		if fat_cstr_eq(ast_node_name(expr), "__mir_recv") or fat_cstr_eq(ast_node_name(expr), "port_recv") do
+			var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+			var (b3, dst) = builder_new_vreg(b2)
+			out expr_result(emit_intrinsic(b3, MIR_INTR_RECV, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
+		end
+		if fat_cstr_eq(ast_node_name(expr), "__mir_lock") or fat_cstr_eq(ast_node_name(expr), "atomic_bang") do
+			var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+			var (b3, dst) = builder_new_vreg(b2)
+			var kind = MIR_INTR_LOCK
+			if fat_cstr_eq(ast_node_name(expr), "atomic_bang") do
+				kind = MIR_INTR_ATOMIC
+			end
+			out expr_result(emit_intrinsic(b3, kind, mir_opnd_vreg(dst), mir_opnd_imm(nargs)), mir_opnd_vreg(dst))
+		end
+        bid = resolve_builtin_id(expr)
+        if bid == 9 and ast_node_child_count(expr) >= 1 do
+            arg0 = ast_node_child(expr, 0)
+            if ast_node_type_of(arg0) == AstType.LiteralStr do
+                slen = fat_str_len(ast_node_name(arg0))
+                out expr_result(b, mir_opnd_imm(slen))
+            end
+        end
+		var (b2, nargs) = lower_call_args(b, expr, 0, 0)
+		var (b3, dst) = builder_new_vreg(b2)
+		out expr_result(emit_intrinsic(b3, MIR_INTR_BUILTIN, mir_opnd_vreg(dst), mir_opnd_imm(bid)), mir_opnd_vreg(dst))
+	end
+
+    # 6c. MethodCall — semantic resolution order:
+    # entity method -> callable field -> free-function UFCS.
+	if expr_type == AstType.MethodCall do
+		mname = ast_node_name(expr)
+		if fat_cstr_eq(mname, "len") == 1 and ast_node_child_count(expr) == 1 do
+			recv_len = ast_node_child(expr, 0)
+			recv_type = get_expr_entity_type(recv_len)
+			callee_kind = ast_node_builtin_id(expr)
+			if callee_kind != 201 and callee_kind != 202 and fat_str_len(get_scoped_method_name(recv_type, mname)) == 0 do
+				var b_len_recv = lower_expr(b, recv_len)
+				var recv_op = g_lower_expr_result_opnd as MirOperand
+				var (b_len_dst, len_dst) = builder_new_vreg(b_len_recv)
+				b_len_dst = emit_set_arg(b_len_dst, 0, recv_op)
+				out expr_result(emit_intrinsic(b_len_dst, MIR_INTR_BUILTIN, mir_opnd_vreg(len_dst), mir_opnd_imm(1)), mir_opnd_vreg(len_dst))
+			end
+		end
+		if fat_cstr_eq(mname, "backward") == 1 do
+			recv = ast_node_child(expr, 0)
+			var b2 = lower_expr(b, recv)
+			var rop = g_lower_expr_result_opnd as MirOperand
+			var (b3, dst) = builder_new_vreg(b2)
+			out expr_result(emit_intrinsic(b3, MIR_INTR_BACKWARD, mir_opnd_vreg(dst), rop), mir_opnd_vreg(dst))
+		end
+		nch = ast_node_child_count(expr)
+		if nch <= 0 do
+			print_ln("virc: error: UFCS call without receiver")
+			sys_exit(1)
+			out expr_result(b, mir_opnd_imm(0))
+		end
+		recv = ast_node_child(expr, 0)
+		recv_type = get_expr_entity_type(recv)
+		callee_kind = ast_node_builtin_id(expr)
+		resolved_name = ast_node_name2(expr)
+		var method_ast = 0 as AstNode
+		var sig_ast = 0 as AstNode
+		if callee_kind == 201 and fat_str_len(recv_type) == 0 and fat_str_len(resolved_name) > 0 do
+			recv_type = resolved_name
+		end
+		# Semantic checking stores the parser-owned receiver type. Resolve kinds
+		# 0/201 through AST-to-MIR's method table so MIR owns the qualified name.
+		if (callee_kind == 0 or callee_kind == 201) and fat_str_len(recv_type) > 0 do
+			method_key = get_scoped_method_name(recv_type, mname)
+			if fat_str_len(method_key) > 0 do
+				callee_kind = 201
+				resolved_name = method_key
+			eif scoped_field_is_callable(recv_type, mname) == 1 do
+				callee_kind = 202
+			end
+		end
+		if callee_kind == 202 do
+			# Callable fields are ordinary function values. Evaluate receiver once,
+			# load the field, and pass only explicit arguments.
+			if fat_str_len(recv_type) == 0 and fat_str_len(resolved_name) > 0 do
+				recv_type = resolved_name
+			end
+			var b2 = lower_expr(b, recv)
+			var rop = g_lower_expr_result_opnd as MirOperand
+			fid = get_scoped_field_index(recv_type, mname)
+			if fid < 0 do
+				print_ln("virc: error: unresolved callable UFCS field")
+				sys_exit(1)
+				out expr_result(b2, mir_opnd_imm(0))
+			end
+			var (b3, addr) = builder_new_vreg(b2)
+			b3 = builder_add_instr(b3, mir_instr_new(MirOp.Add, mir_opnd_vreg(addr), rop, mir_opnd_imm(fid * 8)))
+			var (b4, fn_vreg) = builder_new_vreg(b3)
+			b4 = emit_load(b4, fn_vreg, mir_opnd_vreg(addr))
+			field_t = get_scoped_field_type(recv_type, mname)
+			out lower_call_with_ref_support_ast(b4, expr, mname, 0, fn_vreg, 0 as AstNode, field_t, 1)
+		end
+		if callee_kind != 201 and callee_kind != 203 do
+			var sb_err1 = sb_new()
+			sb_err1 = sb_append(sb_err1, "virc: error: lowering unresolved method or UFCS call: ")
+			var m_len = fat_str_len(mname)
+			var mi = 0
+			when mi < m_len loop
+				sb_err1 = sb_append_char(sb_err1, fat_str_byte_at(mname, mi))
+				mi = mi + 1
+			end
+			print_ln(sb_to_string(sb_err1))
+			sb_free(sb_err1)
+			sys_exit(1)
+			out expr_result(b, mir_opnd_imm(0))
+		end
+		if callee_kind == 203 do
+			if fat_str_len(resolved_name) == 0 do
+				var sb_err2 = sb_new()
+				sb_err2 = sb_append(sb_err2, "virc: error: lowering unresolved UFCS free function target: ")
+				var m_len = fat_str_len(mname)
+				var mi = 0
+				when mi < m_len loop
+					sb_err2 = sb_append_char(sb_err2, fat_str_byte_at(mname, mi))
+					mi = mi + 1
+				end
+				print_ln(sb_to_string(sb_err2))
+				sb_free(sb_err2)
+				sys_exit(1)
+				out expr_result(b, mir_opnd_imm(0))
+			end
+			method_ast = find_func_ast(resolved_name as i64)
+			if (method_ast as i64) != 0 do
+				sig_ast = method_ast
+				if fat_str_len(resolved_name) == 0 do
+					let fn_target_name = ast_node_name(method_ast)
+					if fat_str_len(fn_target_name) > 0 do
+						resolved_name = fn_target_name
+					end
+				end
+			else
+				let is_ffi = (ffi_import_find(resolved_name) >= 0)
+				if not is_ffi do
+					var sb_err2 = sb_new()
+					sb_err2 = sb_append(sb_err2, "virc: error: lowering unresolved UFCS free function target: ")
+					var r_len = fat_str_len(resolved_name)
+					var ri = 0
+					when ri < r_len loop
+						sb_err2 = sb_append_char(sb_err2, fat_str_byte_at(resolved_name, ri))
+						ri = ri + 1
+					end
+					print_ln(sb_to_string(sb_err2))
+					sb_free(sb_err2)
+					sys_exit(1)
+					out expr_result(b, mir_opnd_imm(0))
+				end
+			end
+		end
+		if callee_kind == 201 and fat_str_len(resolved_name) == 0 do
+			resolved_name = mname
+		end
+		var (b0, mid) = builder_intern(b, resolved_name)
+		var is_module_call = false
+		if callee_kind == 203 and recv.node_type == AstType.Identifier do
+			let mod_prefix = fat_str_concat(recv.name, fat_str_new("."))
+			let mod_p_len = fat_str_len(mod_prefix)
+			if fat_str_len(resolved_name) > mod_p_len do
+				let sub_pref = fat_str_slice(resolved_name, 0, mod_p_len)
+				if fat_str_eq(sub_pref, mod_prefix) == 1 do
+					is_module_call = true
+				end
+			end
+		end
+
+		# Normalize method/UFCS into an ordinary call AST so ref/out argument
+		# staging, address passing, and writeback use the same code path.
+		call_expr = ast_new(AstType.Call)
+		call_expr.name = resolved_name
+		if not is_module_call do
+			call_expr = ast_add_child(call_expr, recv)
+		end
+		var m_ai = 1
+		when m_ai < nch loop
+			call_expr = ast_add_child(call_expr, ast_node_child(expr, m_ai))
+			m_ai = m_ai + 1
+		end
+		if (method_ast as i64) == 0 do
+			method_ast = find_func_ast(resolved_name as i64)
+			sig_ast = method_ast
+		end
+		if (method_ast as i64) != 0 do
+			var has_explicit_this = false
+			if ast_node_child_count(method_ast) > 0 do
+				m_p0 = ast_node_child(method_ast, 0)
+				if fat_cstr_eq(ast_node_name(m_p0), "this") do has_explicit_this = true end
+			end
+			if not has_explicit_this and callee_kind == 201 do
+				sig_ast = ast_new(AstType.FuncDef)
+				this_param = ast_new(AstType.ParamDef)
+				this_param.name = fat_str_new("this")
+				this_param.int_val = 0
+				sig_ast = ast_add_child(sig_ast, this_param)
+				var spi = 0
+				when spi < ast_node_child_count(method_ast) loop
+					sp = ast_node_child(method_ast, spi)
+					spt = ast_node_type_of(sp)
+					if spt == AstType.Identifier or spt == AstType.ParamDef or spt == AstType.RefParam or spt == AstType.OutParam do
+						sig_ast = ast_add_child(sig_ast, sp)
+					end
+					spi = spi + 1
+				end
+			end
+		end
+			var no_type_str = fat_str_new("")
+			out lower_call_with_ref_support_ast(b0, call_expr, resolved_name, mid, 0 - 1, sig_ast, no_type_str, 0)
+		end
+
+    # 5e. PatternExpr / ExistExpr / Map / ArrCompact / Bundle / Error / Ptr
+	out b
+end.

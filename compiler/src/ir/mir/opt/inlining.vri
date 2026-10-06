@@ -1,0 +1,320 @@
+##
+ * compiler/src/ir/mir/opt/inlining.vri — Function inlining and IPO cascade
+ * ======================================================================
+ * Intra-module leaf function inlining with size/depth limits and
+ * interprocedural optimization cascade.
+ ##
+
+include types_prelude
+include mir_types
+include mir_ops
+include mir_builder
+include mir_opt_context
+include mir_opt_sccp
+include mir_opt_sroa
+include mir_opt_target
+include mir_opt_constfold
+include mir_opt_dce
+
+func mir_strings_get(strings: i64, idx: i64):
+    if strings < 0 do out "" end
+    if idx < 0 or idx >= vec_len_rt(strings) do out "" end
+    out vec_get_rt(strings, idx)
+end.
+
+func mir_program_find_func(program: i64, name: string):
+    if program < 0 do out 0 end
+    var fi = vec_len_rt(program) - 1
+    when fi >= 0 loop
+        f = vec_get_rt(program, fi)
+        if fat_str_eq(mir_func_name(f) as int, name as int) == 1 do out f end
+        fi = fi - 1
+    end
+    out 0
+end.
+
+func mir_count_all_instrs(blocks: i64):
+    total = 0
+    var bi = 0
+    when bi < vec_len_rt(blocks) loop
+        instrs = mir_block_head(vec_get_rt(blocks, bi))
+        if instrs >= 0 do total = total + vec_len_rt(instrs) end
+        bi = bi + 1
+    end
+    out total
+end.
+
+func mir_blocks_contain_call(blocks: i64):
+    var bi = 0
+    when bi < vec_len_rt(blocks) loop
+        instrs = mir_block_head(vec_get_rt(blocks, bi))
+        if instrs >= 0 do
+            var ii = 0
+            when ii < vec_len_rt(instrs) loop
+                if mir_instr_op(vec_get_rt(instrs, ii)) == MirOp.Call do out true end
+                ii = ii + 1
+            end
+        end
+        bi = bi + 1
+    end
+    out false
+end.
+
+func mir_inline_remap_opnd(opnd: &MirOperand, param_vregs: i64, arg_vals: i64, vreg_base: i64):
+    if mir_opnd_type(opnd) != MirOperandType.VReg do out opnd end
+    vid = mir_opnd_vreg_id(opnd)
+    if param_vregs >= 0 do
+        var pi = 0
+        when pi < vec_len_rt(param_vregs) loop
+            if vec_get_rt(param_vregs, pi) == vid do
+                out vec_get_rt(arg_vals, pi)
+            end
+            pi = pi + 1
+        end
+    end
+    out mir_opnd_vreg(vreg_base + vid)
+end.
+
+func mir_inline_clone_instr(ins: &MirInstr, param_vregs: i64, arg_vals: i64, vreg_base: i64):
+    op = mir_instr_op(ins)
+    dst = mir_inline_remap_opnd(mir_instr_dst(ins), param_vregs, arg_vals, vreg_base)
+    s1 = mir_inline_remap_opnd(mir_instr_src1(ins), param_vregs, arg_vals, vreg_base)
+    s2 = mir_inline_remap_opnd(mir_instr_src2(ins), param_vregs, arg_vals, vreg_base)
+    if op == MirOp.Return do
+        out mir_instr_new(MirOp.Move, dst, s1, mir_opnd_none())
+    end
+    if op == MirOp.Intrinsic do
+        s2k = mir_instr_src2(ins)
+        if mir_opnd_type(s2k) == MirOperandType.Imm and mir_opnd_imm_val(s2k) == MIR_INTR_PARAM do
+            out mir_instr_new(MirOp.Nop, mir_opnd_none(), mir_opnd_none(), mir_opnd_none())
+        end
+    end
+    let cloned = mir_instr_new(op, dst, s1, s2)
+    mir_instr_set_aux(cloned, mir_instr_aux(ins))
+    mir_instr_set_type(cloned, mir_instr_type(ins))
+    mir_instr_set_alloc_kind(cloned, mir_instr_alloc_kind(ins))
+    mir_instr_set_region(cloned, mir_instr_region(ins))
+    var epoch = mir_instr_epoch(ins)
+    if epoch > 0 do epoch = epoch + vreg_base end
+    mir_instr_set_epoch(cloned, epoch)
+    mir_instr_set_size(cloned, mir_instr_size(ins))
+    mir_instr_set_align(cloned, mir_instr_align(ins))
+    mir_instr_set_provenance(cloned, mir_instr_provenance(ins))
+    mir_instr_set_parent_rel(cloned, mir_instr_parent_rel(ins))
+    mir_instr_set_src_origin(cloned, mir_instr_src_origin(ins))
+    mir_instr_set_bits(cloned, mir_instr_bits(ins))
+    mir_instr_set_quant_meta(cloned, mir_instr_quant_meta(ins))
+    if mir_instr_provenance(ins) == 1 and mir_opnd_type(dst) == MirOperandType.VReg do
+        let cloned_id = mir_opnd_vreg_id(dst)
+        mir_instr_set_owner_id(cloned, cloned_id)
+        mir_instr_set_alloc_id(cloned, cloned_id)
+    else
+        mir_instr_set_owner_id(cloned, mir_instr_owner_id(ins))
+        mir_instr_set_alloc_id(cloned, mir_instr_alloc_id(ins))
+    end
+    out cloned
+end.
+
+func mir_opt_collect_call_args(instrs: i64, call_idx: i64, nargs: i64):
+    args = vec_new_rt()
+    var ai = 0
+    when ai < nargs loop
+        args = vec_push_rt(args, mir_opnd_none())
+        ai = ai + 1
+    end
+    ci = call_idx - 1
+    when ci >= 0 loop
+        ins = vec_get_rt(instrs, ci)
+        if mir_instr_op(ins) != MirOp.SetArg do
+            ci = 0 - 1
+        else
+            slot = mir_opnd_imm_val(mir_instr_src1(ins))
+            if slot >= 0 and slot < nargs do
+                vec_set_rt(args, slot, mir_instr_src2(ins))
+            end
+            ci = ci - 1
+        end
+    end
+    out args
+end.
+
+func mir_callee_param_vregs(callee_blocks: i64):
+    pmap = vec_new_rt()
+    var bi = 0
+    when bi < vec_len_rt(callee_blocks) loop
+        instrs = mir_block_head(vec_get_rt(callee_blocks, bi))
+        if instrs >= 0 do
+            var ii = 0
+            when ii < vec_len_rt(instrs) loop
+                ins = vec_get_rt(instrs, ii)
+                if mir_instr_op(ins) == MirOp.Intrinsic do
+                    s2 = mir_instr_src2(ins)
+                    if mir_opnd_type(s2) == MirOperandType.Imm and mir_opnd_imm_val(s2) == MIR_INTR_PARAM do
+                        idx = mir_opnd_imm_val(mir_instr_src1(ins))
+                        dst = mir_instr_dst(ins)
+                        if mir_opnd_type(dst) == MirOperandType.VReg do
+                            var grow = vec_len_rt(pmap)
+                            when grow <= idx loop
+                                pmap = vec_push_rt(pmap, 0 - 1)
+                                grow = grow + 1
+                            end
+                            vec_set_rt(pmap, idx, mir_opnd_vreg_id(dst))
+                        end
+                    end
+                end
+                ii = ii + 1
+            end
+        end
+        bi = bi + 1
+    end
+    out pmap
+end.
+
+func mir_inline_name_hash(name: string):
+    var name_ptr = name as i64
+    if name_ptr == 0 do out 0 end
+    var data_ptr = native_read_i64(name_ptr, 0)
+    var len = native_read_i64(name_ptr, 8)
+    if data_ptr == 0 or len <= 0 do out 0 end
+    var h = 2166136261
+    var limit = len
+    if limit > 64 do limit = 64 end
+    var i = 0
+    when i < limit loop
+        var b = native_read_u8(data_ptr, i)
+        h = (h ^ b) * 16777619
+        i = i + 1
+    end
+    out (h & MIR_INLINE_VISIT_MASK)
+end.
+
+func mir_inline_visit_begin():
+    g_inline_pass_epoch = g_inline_pass_epoch + 1
+    if g_inline_visit == 0 do
+        g_inline_visit = vec_new_rt()
+        var s = 0
+        when s < MIR_INLINE_VISIT_SLOTS loop
+            g_inline_visit = vec_push_rt(g_inline_visit, 0)
+            s = s + 1
+        end
+    end
+end.
+
+func mir_inline_visit_check_mark(callee_name: string):
+    slot = mir_inline_name_hash(callee_name)
+    stored = vec_get_rt(g_inline_visit, slot)
+    key = (g_inline_pass_epoch * 4294967296) + slot
+    if stored == key do
+        out 1
+    end
+    vec_set_rt(g_inline_visit, slot, key)
+    out 0
+end.
+
+func mir_opt_try_inline_at(blocks: i64, b_idx: i64, call_idx: i64):
+    if g_mir_opt_program < 0 or g_mir_opt_current_func == 0 do out blocks end
+    caller = g_mir_opt_current_func
+    b = vec_get_rt(blocks, b_idx)
+    instrs = mir_block_head(b)
+    if instrs < 0 do out blocks end
+    call_ins = vec_get_rt(instrs, call_idx)
+    if mir_instr_op(call_ins) != MirOp.Call do out blocks end
+    if mir_opnd_type(mir_instr_src2(call_ins)) != MirOperandType.Imm do out blocks end
+    pool_id = mir_opnd_imm_val(mir_instr_src2(call_ins))
+    callee_name = mir_strings_get(mir_func_strings(caller), pool_id)
+    if mir_inline_visit_check_mark(callee_name) != 0 do out blocks end
+    callee = mir_program_find_func(g_mir_opt_program, callee_name)
+    if callee == 0 do out blocks end
+    callee_blocks = mir_func_blocks(callee)
+    if vec_len_rt(callee_blocks) != 1 do out blocks end
+    if mir_count_all_instrs(callee_blocks) > MIR_INLINE_MAX_INSTRS do out blocks end
+    if mir_blocks_contain_call(callee_blocks) do out blocks end
+    if mir_count_all_instrs(blocks) > MIR_INLINE_CALLER_BUDGET do out blocks end
+
+    nargs = mir_opnd_imm_val(mir_instr_src1(call_ins))
+    arg_vals = mir_opt_collect_call_args(instrs, call_idx, nargs)
+    param_vregs = mir_callee_param_vregs(callee_blocks)
+    vreg_base = mir_func_next_vreg(caller)
+    new_instrs = vec_new_rt()
+    var ii = 0
+    when ii < call_idx loop
+        ins = vec_get_rt(instrs, ii)
+        if ii < (call_idx - nargs) or mir_instr_op(ins) != MirOp.SetArg do
+            new_instrs = vec_push_rt(new_instrs, ins)
+        end
+        ii = ii + 1
+    end
+    ret_val = mir_opnd_none()
+    var cbi = 0
+    when cbi < vec_len_rt(callee_blocks) loop
+        c_instrs = mir_block_head(vec_get_rt(callee_blocks, cbi))
+        if c_instrs >= 0 do
+            var ci = 0
+            when ci < vec_len_rt(c_instrs) loop
+                raw = vec_get_rt(c_instrs, ci)
+                if mir_instr_op(raw) == MirOp.Return do
+                    ret_val = mir_inline_remap_opnd(mir_instr_src1(raw), param_vregs, arg_vals, vreg_base)
+                else
+                    cloned = mir_inline_clone_instr(raw, param_vregs, arg_vals, vreg_base)
+                    if mir_instr_op(cloned) != MirOp.Nop do
+                        new_instrs = vec_push_rt(new_instrs, cloned)
+                    end
+                end
+                ci = ci + 1
+            end
+        end
+        cbi = cbi + 1
+    end
+    call_dst = mir_instr_dst(call_ins)
+    if mir_opnd_type(call_dst) == MirOperandType.VReg do
+        if mir_opnd_type(ret_val) != MirOperandType.None do
+            new_instrs = vec_push_rt(new_instrs, mir_instr_new(MirOp.Move, call_dst, ret_val, mir_opnd_none()))
+        else
+            new_instrs = vec_push_rt(new_instrs, mir_instr_new(MirOp.Move, call_dst, mir_opnd_imm(0), mir_opnd_none()))
+        end
+    end
+    ii = call_idx + 1
+    when ii < vec_len_rt(instrs) loop
+        new_instrs = vec_push_rt(new_instrs, vec_get_rt(instrs, ii))
+        ii = ii + 1
+    end
+    vec_set_rt(blocks, b_idx, mir_block_replace_head(b, new_instrs))
+    mir_opt_note_change()
+    out blocks
+end.
+
+func mir_opt_inlining(blocks: i64):
+    mir_inline_visit_begin()
+    n_blocks = vec_len_rt(blocks)
+    var b_idx = 0
+    when b_idx < n_blocks loop
+        instrs = mir_block_head(vec_get_rt(blocks, b_idx))
+        if instrs >= 0 do
+            var i = 0
+            when i < vec_len_rt(instrs) loop
+                if mir_instr_op(vec_get_rt(instrs, i)) == MirOp.Call do
+                    blocks = mir_opt_try_inline_at(blocks, b_idx, i)
+                    instrs = mir_block_head(vec_get_rt(blocks, b_idx))
+                end
+                i = i + 1
+            end
+        end
+        b_idx = b_idx + 1
+    end
+    out blocks
+end.
+
+func mir_opt_ipo_inline_cascade(blocks: i64):
+    blocks = mir_opt_sccp(blocks)
+    blocks = mir_opt_sroa(blocks)
+    blocks = mir_opt_dae(blocks)
+    blocks = mir_opt_constant_folding(blocks)
+    blocks = mir_opt_dce(blocks)
+    out blocks
+end.
+
+export mir_strings_get, mir_program_find_func, mir_count_all_instrs,
+       mir_blocks_contain_call, mir_inline_remap_opnd, mir_inline_clone_instr,
+       mir_opt_collect_call_args, mir_callee_param_vregs, mir_inline_name_hash,
+       mir_inline_visit_begin, mir_inline_visit_check_mark, mir_opt_try_inline_at,
+       mir_opt_inlining, mir_opt_ipo_inline_cascade

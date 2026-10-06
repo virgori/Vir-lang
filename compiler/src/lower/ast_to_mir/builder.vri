@@ -1,0 +1,905 @@
+##
+ * compiler/src/lower/ast_to_mir/builder.vri — MirBuilder Primitives & Emitters
+ * =============================================================================
+ ##
+
+include types_prelude
+include rt_vec_rt
+include rt_string_rt
+include parser
+include mir
+include ast_to_mir_context
+include ast_to_mir_layout
+
+func as_mir_func(f: &MirFunc):
+	out f
+end.
+func builder_func(b: i64):
+	f = native_read_i64(b as i64, 32)
+	if f != 0 do out f end
+    fb = native_read_i64(b as i64, 24)
+	f = vec_get_rt(fb, 0)
+	native_write_i64(b as i64, 32, f)
+	out f
+end.
+
+func builder_set_func(b: &MirBuilder, f: &MirFunc):
+	fb = native_read_i64(b as i64, 24)
+	if vec_len_rt(fb) == 0 do
+		fb = vec_push_rt(fb, f as i64)
+	else
+		vec_set_rt(fb, 0, f as i64)
+    end
+    native_write_i64(b as i64, 24, fb)
+	native_write_i64(b as i64, 32, f as i64)
+	out b
+end.
+
+func name_hash_bucket(name: &string):
+	n = fat_str_len(name) as i64
+	h = n * 17
+	var i = 0
+	when i < n loop
+		h = h * 131 + (fat_str_byte_at(name, i) as i64)
+		i = i + 1
+	end
+	if h < 0 do
+		h = 0 - h
+	end
+	out h mod MIR_VAR_BUCKETS
+end.
+
+func builder_pack(cb: i64, vc: i64, loops: i64, fb: i64, cur_func: i64, cur_block: i64):
+    p = alloc(48)
+    native_write_i64(p, 0, cb)
+    native_write_i64(p, 8, vc)
+    native_write_i64(p, 16, loops)
+    native_write_i64(p, 24, fb)
+    native_write_i64(p, 32, cur_func)
+    native_write_i64(p, 40, cur_block)
+    out p
+end.
+
+func builder_new(func_id: i64, fname: &string):
+	buckets = vec_new_rt()
+	var bi = 0
+	when bi < MIR_VAR_BUCKETS loop
+		# Allocate buckets on first write. Most small functions use only a
+		# handful of the 64 slots, so eager vectors waste tens of thousands
+		# of allocations during self-host lowering.
+		buckets = vec_push_rt(buckets, 0)
+		bi = bi + 1
+	end
+	b0 = mir_create_block(0)
+	blocks = vec_new_rt()
+	blocks = vec_push_rt(blocks, b0)
+	f = mir_func_new(func_id, fname, 0, vec_new_rt(), 1, 0, blocks, vec_new_rt(), buckets)
+	fb = vec_new_rt()
+	fb = vec_push_rt(fb, f)
+	out builder_pack(0, 0, vec_new_rt(), fb, f as i64, b0 as i64)
+end.
+
+func builder_intern(b: &MirBuilder, s: &string):
+	var (f2, sid) = mir_intern_string(builder_func(b), s)
+	out (builder_set_func(b, f2), sid)
+end.
+
+func builder_new_vreg(b: &MirBuilder):
+	reg = native_read_i64(b as i64, 8)
+    native_write_i64(b as i64, 8, reg + 1)
+	out (b, reg)
+end.
+
+func builder_add_block(b: &MirBuilder):
+	f = builder_func(b)
+    f_blocks = native_read_i64(f as i64, 48)
+	id = vec_len_rt(f_blocks)
+	blk = mir_create_block(id)
+    f_blocks = vec_push_rt(f_blocks, blk)
+    native_write_i64(f as i64, 48, f_blocks)
+    native_write_i64(f as i64, 32, id + 1)
+	out (b, id)
+end.
+
+func builder_set_current_block(b: &MirBuilder, cb: i64):
+    native_write_i64(b as i64, 0, cb)
+	block_ptr = 0
+	if cb >= 0 do
+		f = builder_func(b)
+		f_blocks = native_read_i64(f as i64, 48)
+		if cb < vec_len_rt(f_blocks) do block_ptr = vec_get_rt(f_blocks, cb) end
+	end
+	native_write_i64(b as i64, 40, block_ptr)
+    out b
+end.
+
+func builder_add_instr(b: &MirBuilder, instr: &MirInstr):
+    cb = native_read_i64(b as i64, 0)
+	if cb < 0 do
+		out b
+	end
+	blk = native_read_i64(b as i64, 40)
+	if blk == 0 do
+		f = builder_func(b)
+		f_blocks = native_read_i64(f as i64, 48)
+		blk = vec_get_rt(f_blocks, cb)
+		native_write_i64(b as i64, 40, blk)
+	end
+    blk_head = native_read_i64(blk as i64, 16)
+	blk_head = vec_push_rt(blk_head, instr as i64)
+	native_write_i64(blk as i64, 16, blk_head)
+	out b
+end.
+
+func builder_current_block_terminated(b: &MirBuilder):
+    cb = native_read_i64(b as i64, 0)
+    if cb < 0 do out true end
+    blk = native_read_i64(b as i64, 40)
+    if blk == 0 do
+        f = builder_func(b)
+        f_blocks = native_read_i64(f as i64, 48)
+        if cb >= vec_len_rt(f_blocks) do out false end
+        blk = vec_get_rt(f_blocks, cb)
+    end
+    instrs = native_read_i64(blk as i64, 16)
+    n = vec_len_rt(instrs)
+    if n <= 0 do out false end
+    last = vec_get_rt(instrs, n - 1)
+    op = native_read_i64(last as i64, 0)
+    out op == MirOp.Jump or op == MirOp.JumpIf or op == MirOp.JumpIfNot or op == MirOp.Return
+end.
+
+func builder_edge_exists(b: &MirBuilder, from_b: i64, to_b: i64):
+	if from_b < 0 or to_b < 0 do
+		out 0
+	end
+	f = builder_func(b)
+    f_blocks = native_read_i64(f as i64, 48)
+	src = vec_get_rt(f_blocks, from_b)
+	succs = native_read_i64(src as i64, 32)
+	n = vec_len_rt(succs)
+	var i = 0
+	when i < n loop
+		if vec_get_rt(succs, i) == to_b do
+			out 1
+		end
+		i = i + 1
+	end
+	out 0
+end.
+
+func builder_add_edge(b: &MirBuilder, from_b: i64, to_b: i64):
+	if from_b >= 0 and to_b >= 0 do
+		if builder_edge_exists(b, from_b, to_b) == 0 do
+			f = builder_func(b)
+			f_blocks = native_read_i64(f as i64, 48)
+			src = vec_get_rt(f_blocks, from_b)
+			dst = vec_get_rt(f_blocks, to_b)
+			src_succs = native_read_i64(src as i64, 32)
+			if src_succs == 0 do src_succs = vec_new_rt() end
+			src_succs = vec_push_rt(src_succs, to_b)
+            native_write_i64(src as i64, 32, src_succs)
+			dst_preds = native_read_i64(dst as i64, 40)
+			if dst_preds == 0 do dst_preds = vec_new_rt() end
+			dst_preds = vec_push_rt(dst_preds, from_b)
+            native_write_i64(dst as i64, 40, dst_preds)
+		end
+	end
+	out b
+end.
+
+func builder_push_loop(b: &MirBuilder, break_id: i64, cont_id: i64):
+	lt = loop_target_new(break_id, cont_id)
+    ls = native_read_i64(b as i64, 16)
+    ls = vec_push_rt(ls, lt)
+    native_write_i64(b as i64, 16, ls)
+	out b
+end.
+
+func builder_pop_loop(b: &MirBuilder):
+    ls = native_read_i64(b as i64, 16)
+    if vec_len_rt(ls) > 0 do
+        vec_pop_rt(ls)
+    end
+    out b
+end.
+
+func builder_loop_top(b: &MirBuilder):
+    ls = native_read_i64(b as i64, 16)
+	n = vec_len_rt(ls)
+	if n <= 0 do
+		out loop_target_new(0 - 1, 0 - 1)
+	end
+	out vec_get_rt(ls, n - 1)
+end.
+
+func builder_loop_depth(b: &MirBuilder):
+    ls = native_read_i64(b as i64, 16)
+    if ls <= 0 do out 0 end
+    out vec_len_rt(ls)
+end.
+
+func buckets_get_var(buckets: i64, name: &string):
+	if buckets == 0 or name == 0 do out 0 - 1 end
+	bid = name_hash_bucket(name)
+	bucket = vec_get_rt(buckets, bid)
+	if bucket == 0 do out 0 - 1 end
+	var i = 0
+	n = vec_len_rt(bucket)
+	when i < n loop
+		vm = vec_get_rt(bucket, i)
+		vname = var_map_name(vm)
+		if fat_str_eq(vname, name as string) == 1 do
+			out var_map_vreg(vm)
+		end
+		i = i + 1
+	end
+	out 0 - 1
+end.
+
+func buckets_set_var(buckets: i64, name: &string, vreg: i64):
+	if buckets == 0 or (name as i64) == 0 do out 0 end
+	bid = name_hash_bucket(name as i64)
+	bucket = vec_get_rt(buckets, bid)
+	if bucket == 0 do bucket = vec_new_rt() end
+	var i = 0
+	n = vec_len_rt(bucket)
+	var found = false
+	when i < n loop
+		vm = vec_get_rt(bucket, i)
+		vname = var_map_name(vm)
+		if fat_str_eq(vname, name) == 1 do
+			vec_set_rt(bucket, i, var_map_new(vname, vreg))
+			found = true
+			i = n
+		end
+		i = i + 1
+	end
+	if not found do
+		bucket = vec_push_rt(bucket, var_map_new(name, vreg))
+	end
+	vec_set_rt(buckets, bid, bucket)
+	out 0
+end.
+
+func buckets_remove_var(buckets: i64, name: &string):
+	if buckets == 0 or (name as i64) == 0 do out 0 end
+	bid = name_hash_bucket(name as i64)
+	bucket = vec_get_rt(buckets, bid)
+	if bucket == 0 do out 0 end
+	new_bucket = vec_new_rt()
+	var i = 0
+	n = vec_len_rt(bucket)
+	when i < n loop
+		vm = vec_get_rt(bucket, i)
+		vname = var_map_name(vm)
+		if fat_str_eq(vname, name) == 0 do
+			new_bucket = vec_push_rt(new_bucket, vm)
+		end
+		i = i + 1
+	end
+	vec_set_rt(buckets, bid, new_bucket)
+	out 0
+end.
+
+func get_var_vreg(b: i64, name: &string):
+	f = builder_func(b)
+	buckets = native_read_i64(f as i64, 64)
+	out buckets_get_var(buckets, name as i64)
+end.
+
+func set_var_vreg(b: MirBuilder, name: &string, vreg: i64):
+	f = builder_func(b)
+	buckets = native_read_i64(f as i64, 64)
+	buckets_set_var(buckets, name, vreg)
+	out b
+end.
+
+func remove_var_vreg(b: MirBuilder, name: &string):
+	f = builder_func(b)
+	buckets = native_read_i64(f as i64, 64)
+	buckets_remove_var(buckets, name)
+	out b
+end.
+
+func push_scope():
+	if g_scope_stack == 0 do
+		g_scope_stack = vec_new_rt()
+	end
+	frame = vec_new_rt()
+	frame = vec_push_rt(frame, vec_new_rt())
+	frame = vec_push_rt(frame, vec_new_rt())
+	frame = vec_push_rt(frame, vec_new_rt())
+	g_scope_stack = vec_push_rt(g_scope_stack, frame)
+end.
+
+func record_var_declaration(name: &string):
+	if g_scope_stack != 0 and (name as i64) != 0 do
+		stack_len = vec_len_rt(g_scope_stack)
+		if stack_len > 1 do
+			cur_frame = vec_get_rt(g_scope_stack, stack_len - 1)
+			names = vec_get_rt(cur_frame, 0)
+			vregs = vec_get_rt(cur_frame, 1)
+			types = vec_get_rt(cur_frame, 2)
+			var already_in_frame = false
+			var fi = 0
+			fn = vec_len_rt(names)
+			when fi < fn loop
+				entry_name = vec_get_rt(names, fi) as string
+				if fat_str_eq(entry_name, name) == 1 do
+					already_in_frame = true
+					fi = fn
+				end
+				fi = fi + 1
+			end
+			if not already_in_frame do
+				pv = buckets_get_var(g_current_func_buckets, name as i64)
+				pt = get_var_type(name)
+				if (pt as i64) == 0 do pt = fat_str_new("") end
+				names = vec_push_rt(names, name as i64)
+				vregs = vec_push_rt(vregs, pv)
+				types = vec_push_rt(types, pt as i64)
+				vec_set_rt(cur_frame, 0, names)
+				vec_set_rt(cur_frame, 1, vregs)
+				vec_set_rt(cur_frame, 2, types)
+			end
+		end
+	end
+end.
+
+func pop_scope():
+	if g_scope_stack != 0 do
+		stack_len = vec_len_rt(g_scope_stack)
+		if stack_len > 1 do
+			cur_frame = vec_get_rt(g_scope_stack, stack_len - 1)
+			names = vec_get_rt(cur_frame, 0)
+			vregs = vec_get_rt(cur_frame, 1)
+			types = vec_get_rt(cur_frame, 2)
+			fn = vec_len_rt(names)
+			var fi = 0
+			when fi < fn loop
+				vname = vec_get_rt(names, fi) as string
+				pv = vec_get_rt(vregs, fi)
+				pt = vec_get_rt(types, fi) as string
+				if pv >= 0 do
+					buckets_set_var(g_current_func_buckets, vname, pv)
+				else
+					buckets_remove_var(g_current_func_buckets, vname)
+				end
+				if (pt as i64) != 0 and fat_str_len(pt) > 0 do
+					set_var_type(vname, pt)
+				else
+					set_var_type(vname, fat_str_new(""))
+				end
+				fi = fi + 1
+			end
+			vec_pop_rt(g_scope_stack)
+		else
+			if stack_len == 1 do
+				vec_pop_rt(g_scope_stack)
+			end
+		end
+	end
+end.
+
+func emit_jump(b: MirBuilder, target: i64):
+	ins = mir_instr_new(MirOp.Jump, mir_opnd_none(), mir_opnd_imm(target), mir_opnd_none())
+	b = builder_add_instr(b, ins)
+    cb = native_read_i64(b as i64, 0)
+	b = builder_add_edge(b, cb, target)
+	out b
+end.
+
+func emit_jump_if(b: MirBuilder, cond: &MirOperand, then_id: i64, else_id: i64):
+	ins = mir_instr_new(MirOp.JumpIf, mir_opnd_none(), cond, mir_opnd_imm(then_id))
+	b = builder_add_instr(b, ins)
+	ins2 = mir_instr_new(MirOp.Jump, mir_opnd_none(), mir_opnd_imm(else_id), mir_opnd_none())
+	b = builder_add_instr(b, ins2)
+    cb = native_read_i64(b as i64, 0)
+	b = builder_add_edge(b, cb, then_id)
+	b = builder_add_edge(b, cb, else_id)
+	out b
+end.
+
+func emit_set_arg(b: MirBuilder, idx: i64, val: &MirOperand):
+	ins = mir_instr_new(MirOp.SetArg, mir_opnd_none(), mir_opnd_imm(idx), val)
+	out builder_add_instr(b, ins)
+end.
+
+func emit_set_arg_typed(b: MirBuilder, idx: i64, val: &MirOperand, typ: i64):
+	ins = mir_instr_new(MirOp.SetArg, mir_opnd_none(), mir_opnd_imm(idx), val)
+	if typ != 0 do mir_instr_set_type(ins, typ) end
+	out builder_add_instr(b, ins)
+end.
+
+func annotate_owned_alloc(ins: MirInstr, dst_vreg: i64, size: i64, align: i64, source_line: i64):
+	var region = 0
+	var epoch = 0
+	if g_arena_mark_stack != 0 do
+		region = vec_len_rt(g_arena_mark_stack)
+		if region > 0 do epoch = vec_get_rt(g_arena_mark_stack, region - 1) end
+	end
+	var alloc_kind = 0
+	if region == 0 do alloc_kind = 1 end
+	mir_instr_set_alloc_kind(ins, alloc_kind)
+	mir_instr_set_region(ins, region)
+	mir_instr_set_epoch(ins, epoch)
+	mir_instr_set_size(ins, size)
+	mir_instr_set_align(ins, align)
+	mir_instr_set_owner_id(ins, dst_vreg)
+	mir_instr_set_alloc_id(ins, dst_vreg)
+	mir_instr_set_provenance(ins, 1) # owned allocation root
+	mir_instr_set_parent_rel(ins, 0) # root, not a derived interior pointer
+	mir_instr_set_src_origin(ins, source_line)
+end.
+
+func emit_intrinsic(b: MirBuilder, kind: i64, dst: &MirOperand, src1: &MirOperand):
+	ins = mir_instr_new(MirOp.Intrinsic, dst, src1, mir_opnd_imm(kind))
+	if kind == MIR_INTR_BUILTIN and mir_opnd_type(src1) == MirOperandType.Imm and mir_opnd_imm_val(src1) == 3 and mir_opnd_type(dst) == MirOperandType.VReg do
+		annotate_owned_alloc(ins, mir_opnd_vreg_id(dst), 0, 16, 0)
+	end
+	out builder_add_instr(b, ins)
+end.
+
+func emit_intrinsic_typed(b: MirBuilder, kind: i64, dst: &MirOperand, src1: &MirOperand, typ: i64):
+	ins = mir_instr_new(MirOp.Intrinsic, dst, src1, mir_opnd_imm(kind))
+	mir_instr_set_type(ins, typ)
+	out builder_add_instr(b, ins)
+end.
+
+func emit_intrinsic_typed_with_bits(b: MirBuilder, kind: i64, dst: &MirOperand, src1: &MirOperand, typ: i64, bits: i64):
+	ins = mir_instr_new(MirOp.Intrinsic, dst, src1, mir_opnd_imm(kind))
+	mir_instr_set_type(ins, typ)
+	mir_instr_set_bits(ins, bits)
+	out builder_add_instr(b, ins)
+end.
+
+func emit_jump_if_not(b: MirBuilder, cond: &MirOperand, then_id: i64, else_id: i64):
+    # JumpIfNot → jump to then_id when cond==0 (false); else fall through to else_id.
+    cb = native_read_i64(b as i64, 0)
+	ins = mir_instr_new(MirOp.JumpIfNot, mir_opnd_none(), cond, mir_opnd_imm(then_id))
+	b = builder_add_instr(b, ins)
+    # Add edge to then_id (the exit/break branch) — required for correct dominance frontier
+    b = builder_add_edge(b, cb, then_id)
+	b = emit_jump(b, else_id)
+	out b
+end.
+
+func emit_move(b: MirBuilder, dst_v: i64, src: &MirOperand):
+	ins = mir_instr_new(MirOp.Move, mir_opnd_vreg(dst_v), src, mir_opnd_none())
+	out builder_add_instr(b, ins)
+end.
+
+func emit_store(b: &MirBuilder, addr: &MirOperand, val: &MirOperand):
+	ins = mir_instr_new(MirOp.Store, mir_opnd_none(), val, addr)
+	out builder_add_instr(b, ins)
+end.
+
+func emit_load(b: &MirBuilder, dst_v: i64, addr: &MirOperand):
+	ins = mir_instr_new(MirOp.Load, mir_opnd_vreg(dst_v), addr, mir_opnd_none())
+	out builder_add_instr(b, ins)
+end.
+
+func emit_store_typed(b: MirBuilder, addr: &MirOperand, val: &MirOperand, sz: i64):
+	ins = mir_instr_new(MirOp.Store, mir_opnd_none(), val, addr)
+	mir_instr_set_aux(ins, sz)
+	out builder_add_instr(b, ins)
+end.
+
+func emit_load_typed(b: MirBuilder, dst_v: i64, addr: &MirOperand, sz: i64, sgn: i64):
+	var aux = sz
+	if sgn == 1 do
+		aux = 0 - sz
+	end
+	ins = mir_instr_new(MirOp.Load, mir_opnd_vreg(dst_v), addr, mir_opnd_none())
+	mir_instr_set_aux(ins, aux)
+	out builder_add_instr(b, ins)
+end.
+
+func emit_flux_clone(b: MirBuilder, src_opnd: &MirOperand, flux_type: string):
+	var fc_lanes = parse_flux_lanes(flux_type)
+	if fc_lanes <= 0 do fc_lanes = 4 end
+	var fc_is_float = (parse_flux_elem_type(flux_type) as int) == (TypeKind.Float as int)
+	let fc_alloc_sz = 16 + fc_lanes * 8
+	var b_mut = emit_set_arg(b, 0, mir_opnd_imm(fc_alloc_sz))
+	var fc_base = native_read_i64(b_mut as i64, 8)
+	native_write_i64(b_mut as i64, 8, fc_base + 1)
+	var ins_fdc_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(fc_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+	annotate_owned_alloc(ins_fdc_alloc, fc_base, fc_alloc_sz, 16, 0)
+	b_mut = builder_add_instr(b_mut, ins_fdc_alloc)
+	b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(fc_base))
+	b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(0))
+	b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(fc_lanes))
+	b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+	b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(fc_base))
+	b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(8))
+	b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(fc_lanes))
+	b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+	var fc_i = 0
+	when fc_i < fc_lanes loop
+		var b2 = emit_set_arg(b_mut, 0, mir_opnd_imm(fc_i))
+		var fc_elem_v = native_read_i64(b2 as i64, 8)
+		native_write_i64(b2 as i64, 8, fc_elem_v + 1)
+		var fc_load_typ = MirType.Int64 as i64
+		if fc_is_float do fc_load_typ = MirType.F64 as i64 end
+		b2 = emit_intrinsic_typed(b2, MIR_INTR_INDEX, mir_opnd_vreg(fc_elem_v), src_opnd, fc_load_typ)
+		b2 = emit_set_arg(b2, 0, mir_opnd_imm(fc_i))
+		b2 = emit_set_arg(b2, 1, mir_opnd_vreg(fc_elem_v))
+		b2 = emit_intrinsic(b2, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(fc_base))
+		b_mut = b2
+		fc_i = fc_i + 1
+	end
+	out (b_mut, mir_opnd_vreg(fc_base))
+end.
+
+func lower_tensor_literal(b: MirBuilder, expr: &AstNode, elem_m_typ: i64, elem_sz: int, target_is_float: bool):
+	let n = ast_node_child_count(expr)
+	var alloc_sz = 16 + n * elem_sz
+	alloc_sz = (alloc_sz + 15) / 16 * 16
+	var b_mut = emit_set_arg(b, 0, mir_opnd_imm(alloc_sz))
+	var (b_base, base) = builder_new_vreg(b_mut)
+	var ins_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+	annotate_owned_alloc(ins_alloc, base, alloc_sz, 64, ast_node_line(expr))
+	b_base = builder_add_instr(b_base, ins_alloc)
+	b_mut = b_base
+	b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(base))
+	b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(0))
+	b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(n))
+	b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+	b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(base))
+	b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(8))
+	b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(n))
+	b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+	var i = 0
+	when i < n loop
+		let elem_ast = ast_node_child(expr, i)
+		var b2 = lower_expr(b_mut, elem_ast)
+		var aop = g_lower_expr_result_opnd as MirOperand
+		var source_t = infer_expr_type_name(elem_ast)
+		var source_is_float = is_float_type_name(source_t)
+		var source_is_int = fat_cstr_eq(source_t, "int") == 1 or fat_cstr_eq(source_t, "i64") == 1
+		var target_is_int = !target_is_float
+		if (source_is_int and target_is_float) or (source_is_float and target_is_int) do
+			var (b_cast, cast_v) = builder_new_vreg(b2)
+			var cast_src_cat = 1
+			var cast_dst_cat = 1
+			var cast_typ = MirType.Int64 as i64
+			if source_is_float do cast_src_cat = 2 end
+			if target_is_float do cast_dst_cat = 2; cast_typ = MirType.F64 as i64 end
+			var cast_kind = MIR_INTR_CAST + (cast_src_cat shl 8) + (cast_dst_cat shl 16)
+			b2 = emit_intrinsic_typed(b_cast, cast_kind, mir_opnd_vreg(cast_v), aop, cast_typ)
+			aop = mir_opnd_vreg(cast_v)
+		end
+		b2 = emit_set_arg(b2, 0, mir_opnd_imm(i))
+		b2 = emit_set_arg(b2, 1, aop)
+		b2 = emit_intrinsic_typed(b2, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(base), elem_m_typ)
+		b_mut = b2
+		i = i + 1
+	end
+	out expr_result(b_mut, mir_opnd_vreg(base))
+end.
+
+func lower_aggregate(b: MirBuilder, kind: i64, expr: &AstNode):
+	# Arrays / entities / tuples all lower to a heap buffer of n 8-byte slots.
+	# Allocate via the `alloc` builtin (id 3) and store each element with
+	# INDEX_STORE so the element count is not bounded by the ABI arg registers.
+	n = ast_node_child_count(expr)
+	if kind == MIR_INTR_ARRAY do
+		let alloc_sz = 16 + n * 8
+		b_mut = emit_set_arg(b, 0, mir_opnd_imm(alloc_sz))
+		var (b_base, base) = builder_new_vreg(b_mut)
+		ins_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+		annotate_owned_alloc(ins_alloc, base, alloc_sz, 16, ast_node_line(expr))
+		b_base = builder_add_instr(b_base, ins_alloc)
+		b_mut = b_base
+		b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(base))
+		b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(0))
+		b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(n))
+		b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+		b_mut = emit_set_arg(b_mut, 0, mir_opnd_vreg(base))
+		b_mut = emit_set_arg(b_mut, 1, mir_opnd_imm(8))
+		b_mut = emit_set_arg(b_mut, 2, mir_opnd_imm(n))
+		b_mut = emit_intrinsic(b_mut, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8))
+		var i = 0
+		when i < n loop
+			var b2 = lower_expr(b_mut, ast_node_child(expr, i))
+			var aop = g_lower_expr_result_opnd as MirOperand
+			b2 = emit_set_arg(b2, 0, mir_opnd_imm(i))
+			b2 = emit_set_arg(b2, 1, aop)
+			b2 = emit_intrinsic(b2, MIR_INTR_INDEX_STORE, mir_opnd_none(), mir_opnd_vreg(base))
+			b_mut = b2
+			i = i + 1
+		end
+		out expr_result(b_mut, mir_opnd_vreg(base))
+	end
+	if kind == MIR_INTR_ENTITY do
+		ent_name = resolve_callee_alias(ast_node_name(expr))
+		if is_packed_entity(ent_name) do
+			total_sz = get_type_byte_size(ent_name)
+			b_mut = emit_set_arg(b, 0, mir_opnd_imm(total_sz))
+			var (b_base, base) = builder_new_vreg(b_mut)
+			ins_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+			annotate_owned_alloc(ins_alloc, base, total_sz, 16, ast_node_line(expr))
+			b_base = builder_add_instr(b_base, ins_alloc)
+			b_mut = b_base
+			var i = 0
+			when i < n loop
+				arg = ast_node_child(expr, i)
+				var b2 = lower_expr(b_mut, arg)
+				var aop = g_lower_expr_result_opnd as MirOperand
+				b_mut = b2
+				fname = arg.name2
+				if fname == 0 or fat_str_len(fname) == 0 do
+					fname = get_entity_field_name_by_index(ent_name, i)
+				end
+				f_off = get_scoped_field_offset(ent_name, fname)
+				f_sz = get_scoped_field_size(ent_name, fname)
+				f_nested = get_scoped_field_is_nested(ent_name, fname)
+				if f_nested == 1 do
+					var k = 0
+					when k < f_sz loop
+						var (b_s, src_addr) = builder_new_vreg(b_mut)
+						ins_s = mir_instr_new(MirOp.Add, mir_opnd_vreg(src_addr), aop, mir_opnd_imm(k))
+						b_s = builder_add_instr(b_s, ins_s)
+						var (b_l, byte_val) = builder_new_vreg(b_s)
+						b_l = emit_load_typed(b_l, byte_val, mir_opnd_vreg(src_addr), 1, 0)
+						var (b_d, dst_addr) = builder_new_vreg(b_l)
+						ins_d = mir_instr_new(MirOp.Add, mir_opnd_vreg(dst_addr), mir_opnd_vreg(base), mir_opnd_imm(f_off + k))
+						b_d = builder_add_instr(b_d, ins_d)
+						b_mut = emit_store_typed(b_d, mir_opnd_vreg(dst_addr), mir_opnd_vreg(byte_val), 1)
+						k = k + 1
+					end
+				else
+					var (b_d, dst_addr) = builder_new_vreg(b_mut)
+					ins_d = mir_instr_new(MirOp.Add, mir_opnd_vreg(dst_addr), mir_opnd_vreg(base), mir_opnd_imm(f_off))
+					b_d = builder_add_instr(b_d, ins_d)
+					b_mut = emit_store_typed(b_d, mir_opnd_vreg(dst_addr), aop, f_sz)
+				end
+				i = i + 1
+			end
+			out expr_result(b_mut, mir_opnd_vreg(base))
+		end
+	end
+	# Entity / Tuple: flat 8-byte fields starting at offset 0
+	let tuple_sz = n * 8
+	b_mut = emit_set_arg(b, 0, mir_opnd_imm(tuple_sz))
+	var (b_base, base) = builder_new_vreg(b_mut)
+	ins_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+	annotate_owned_alloc(ins_alloc, base, tuple_sz, 16, ast_node_line(expr))
+	b_base = builder_add_instr(b_base, ins_alloc)
+	b_mut = b_base
+	var i = 0
+	when i < n loop
+		var b2 = lower_expr(b_mut, ast_node_child(expr, i))
+		var aop = g_lower_expr_result_opnd as MirOperand
+		b2 = emit_set_arg(b2, 0, mir_opnd_vreg(base))
+		b2 = emit_set_arg(b2, 1, mir_opnd_imm(i * 8))
+		b2 = emit_set_arg(b2, 2, aop)
+		b2 = emit_intrinsic(b2, MIR_INTR_BUILTIN, mir_opnd_none(), mir_opnd_imm(8)) # write_word(base, i*8, aop)
+		b_mut = b2
+		i = i + 1
+	end
+	out expr_result(b_mut, mir_opnd_vreg(base))
+end.
+
+func lower_enum_construct(b: &MirBuilder, expr: &AstNode, enum_name: string, variant_name: string):
+    variant_idx = enum_variant_index(enum_name as i64, variant_name as i64)
+    if variant_idx < 0 do
+        print_str("virc: error: unresolved enum constructor: ")
+        print_str(native_read_i64(variant_name, 0))
+        print_str("\n")
+        sys_exit(1)
+        out expr_result(b, mir_opnd_imm(0))
+    end
+    tag = vec_get_rt(g_enum_variant_tags, variant_idx)
+    arity = vec_get_rt(g_enum_variant_arities, variant_idx)
+    nargs = ast_node_child_count(expr)
+    arg_start = 0
+    if ast_node_type_of(expr) == AstType.FieldAccess or ast_node_type_of(expr) == AstType.EnumAccess do
+        nargs = 0
+    end
+    # Qualified payload constructors are parsed as MethodCall and rewritten
+    # semantically while retaining child[0] = enum receiver (see pass 3).
+    if ast_node_type_of(expr) == AstType.EnumConstruct and nargs == arity + 1 do
+        receiver = ast_node_child(expr, 0)
+        if ast_node_type_of(receiver) == AstType.Identifier and fat_str_eq(ast_node_name(receiver), enum_name) == 1 do
+            arg_start = 1
+            nargs = nargs - 1
+        end
+    end
+    if nargs != arity do
+        print_str("virc: error: enum constructor arity mismatch: ")
+        print_str(native_read_i64(variant_name, 0))
+        print_str("\n")
+        sys_exit(1)
+        out expr_result(b, mir_opnd_imm(0))
+    end
+
+    # Fieldless enums retain the existing immediate ABI.  If any variant has
+    # payload, every variant of that enum uses the tagged-union allocation so
+    # constructor and case always agree (including Option.None).
+    if not enum_variant_is_tagged(variant_idx) do
+        out expr_result(b, mir_opnd_imm(tag))
+    end
+
+    layout_size = enum_variant_layout_size(variant_idx)
+    b_mut = emit_set_arg(b, 0, mir_opnd_imm(layout_size))
+    var (b_alloc, base) = builder_new_vreg(b_mut)
+    b_alloc = emit_intrinsic(b_alloc, MIR_INTR_BUILTIN, mir_opnd_vreg(base), mir_opnd_imm(3))
+    b_mut = emit_store_typed(b_alloc, mir_opnd_vreg(base), mir_opnd_imm(tag), ENUM_TAG_SIZE)
+
+    var i = 0
+    when i < nargs loop
+        var b_arg = lower_expr(b_mut, ast_node_child(expr, arg_start + i))
+        var payload = g_lower_expr_result_opnd as MirOperand
+        var (b_addr, addr) = builder_new_vreg(b_arg)
+        offset = ENUM_TAG_SLOT_SIZE + i * ENUM_PAYLOAD_SLOT_SIZE
+        b_addr = builder_add_instr(b_addr, mir_instr_new(MirOp.Add, mir_opnd_vreg(addr), mir_opnd_vreg(base), mir_opnd_imm(offset)))
+        b_mut = emit_store(b_addr, mir_opnd_vreg(addr), payload)
+        i = i + 1
+    end
+    out expr_result(b_mut, mir_opnd_vreg(base))
+end.
+
+
+# NOTE: Do NOT pre-declare function stubs.
+
+func as_ast_node(n: &AstNode):
+	out n
+end.
+func ast_node_name(n: &AstNode):
+	out native_read_i64(n as i64, 0) as string
+end.
+func ast_node_name2(n: &AstNode):
+	out native_read_i64(n as i64, 8) as string
+end.
+func ast_node_type_of(n: &AstNode):
+	if (n as i64) == 0 do out 0 as AstType end
+	out native_read_i64(n as i64, 16) as AstType
+end.
+func ast_node_op_of(n: &AstNode):
+	out native_read_i64(n as i64, 24) as OpType
+end.
+func ast_node_line(n: &AstNode):
+	out native_read_i64(n as i64, 32)
+end.
+func ast_node_int_val(n: &AstNode):
+	out native_read_i64(n as i64, 40)
+end.
+func ast_node_float_val(n: &AstNode):
+	out native_read_i64(n as i64, 48)
+end.
+func ast_node_builtin_id(n: &AstNode):
+	out native_read_i64(n as i64, 56)
+end.
+
+func builtin_id_from_name_uncached(name: &string):
+    # Name → BuiltinId discriminant. Used when ast_add_child clobbers .builtin_id
+    # (soft ABI) so LIR would otherwise BL the unresolved stub (returns 0).
+    if fat_cstr_eq(name, "len") == 1 do out 1 end
+    if fat_cstr_eq(name, "push") == 1 do out 2 end
+    if fat_cstr_eq(name, "arr_push") == 1 do out 2 end
+    if fat_cstr_eq(name, "alloc") == 1 do out 3 end
+    if fat_cstr_eq(name, "free") == 1 or fat_cstr_eq(name, "dealloc") == 1 do out 4 end
+
+    if fat_cstr_eq(name, "read_byte") == 1 or fat_cstr_eq(name, "native_read_u8") == 1 or fat_cstr_eq(name, "read_u8") == 1 or fat_cstr_eq(name, "read8") == 1 do out 5 end
+    if fat_cstr_eq(name, "write_byte") == 1 or fat_cstr_eq(name, "native_write_u8") == 1 or fat_cstr_eq(name, "write_u8") == 1 or fat_cstr_eq(name, "write8") == 1 do out 6 end
+    if fat_cstr_eq(name, "read_word") == 1 or fat_cstr_eq(name, "native_read_i64") == 1 or fat_cstr_eq(name, "read_i64") == 1 or fat_cstr_eq(name, "read64") == 1 do out 7 end
+    if fat_cstr_eq(name, "write_word") == 1 or fat_cstr_eq(name, "native_write_i64") == 1 or fat_cstr_eq(name, "write_i64") == 1 or fat_cstr_eq(name, "write64") == 1 do out 8 end
+    if fat_cstr_eq(name, "memset") == 1 or fat_cstr_eq(name, "__memset") == 1 or fat_cstr_eq(name, "fill_bytes") == 1 or fat_cstr_eq(name, "native_mem_set") == 1 do out 32 end
+    if fat_cstr_eq(name, "memcpy") == 1 or fat_cstr_eq(name, "__memcpy") == 1 or fat_cstr_eq(name, "native_mem_copy") == 1 do out 31 end
+    if fat_cstr_eq(name, "str_len") == 1 do out 9 end
+    if fat_cstr_eq(name, "str_get") == 1 do out 10 end
+    if fat_cstr_eq(name, "__clz") == 1 or fat_cstr_eq(name, "clz") == 1 do out 33 end
+    if fat_cstr_eq(name, "__ctz") == 1 or fat_cstr_eq(name, "ctz") == 1 do out 34 end
+    if fat_cstr_eq(name, "__popcnt") == 1 or fat_cstr_eq(name, "popcnt") == 1 do out 35 end
+    if fat_cstr_eq(name, "__not") == 1 do out 37 end
+    if fat_cstr_eq(name, "__neg") == 1 do out 38 end
+    if fat_cstr_eq(name, "str_cat") == 1 do out 11 end
+    if fat_cstr_eq(name, "str_concat") == 1 do out 11 end
+    if fat_cstr_eq(name, "strcat") == 1 do out 11 end
+    if fat_cstr_eq(name, "str_eq") == 1 do out 12 end
+    if fat_cstr_eq(name, "file_open") == 1 or fat_cstr_eq(name, "native_file_open") == 1 do out 13 end
+    if fat_cstr_eq(name, "file_read") == 1 or fat_cstr_eq(name, "native_file_read") == 1 do out 14 end
+    if fat_cstr_eq(name, "file_write") == 1 or fat_cstr_eq(name, "native_file_write") == 1 do out 15 end
+    if fat_cstr_eq(name, "file_close") == 1 or fat_cstr_eq(name, "native_file_close") == 1 do out 16 end
+    if fat_cstr_eq(name, "file_write_byte") == 1 do out 17 end
+    if fat_cstr_eq(name, "exit_prog") == 1 do out 18 end
+    if fat_cstr_eq(name, "exit") == 1 do out 18 end
+    if fat_cstr_eq(name, "i_to_str") == 1 do out 19 end
+    if fat_cstr_eq(name, "int_to_str") == 1 do out 19 end
+    if fat_cstr_eq(name, "itoa") == 1 do out 19 end
+    if fat_cstr_eq(name, "str_to_i") == 1 do out 20 end
+    if fat_cstr_eq(name, "str_to_int") == 1 do out 20 end
+    if fat_cstr_eq(name, "arr_new") == 1 do out 21 end
+    if fat_cstr_eq(name, "print_str") == 1 do out 22 end
+    if fat_cstr_eq(name, "get_arg") == 1 or fat_cstr_eq(name, "rt_argv") == 1 or fat_cstr_eq(name, "rt_get_arg") == 1 do out 23 end
+    if fat_cstr_eq(name, "arg_count") == 1 or fat_cstr_eq(name, "rt_argc") == 1 do out 24 end
+    if fat_cstr_eq(name, "slurp_file") == 1 do out 25 end
+    if fat_cstr_eq(name, "slurp_len") == 1 do out 26 end
+    if fat_cstr_eq(name, "write_bytes") == 1 do out 27 end
+    if fat_cstr_eq(name, "arr_len") == 1 do out 1 end
+    if fat_cstr_eq(name, "atomic_load") == 1 do out 40 end
+    if fat_cstr_eq(name, "atomic_store") == 1 do out 41 end
+    if fat_cstr_eq(name, "atomic_cas") == 1 do out 42 end
+    if fat_cstr_eq(name, "atomic_add") == 1 do out 43 end
+    if fat_cstr_eq(name, "atomic_sub") == 1 do out 44 end
+    if fat_cstr_eq(name, "atomic_exchange") == 1 do out 71 end
+    if fat_cstr_eq(name, "atomic_swap") == 1 do out 71 end
+    if fat_cstr_eq(name, "atomic_fence") == 1 do out 39 end
+    if fat_cstr_eq(name, "atomic_load32") == 1 do out 72 end
+    if fat_cstr_eq(name, "atomic_store32") == 1 do out 73 end
+    if fat_cstr_eq(name, "atomic_add32") == 1 do out 74 end
+    if fat_cstr_eq(name, "atomic_sub32") == 1 do out 75 end
+    if fat_cstr_eq(name, "atomic_cas32") == 1 do out 76 end
+    if fat_cstr_eq(name, "atomic_exchange32") == 1 do out 77 end
+    if fat_cstr_eq(name, "atomic_swap32") == 1 do out 77 end
+    if fat_cstr_eq(name, "atomic_load64") == 1 do out 78 end
+    if fat_cstr_eq(name, "atomic_store64") == 1 do out 79 end
+    if fat_cstr_eq(name, "atomic_add64") == 1 do out 80 end
+    if fat_cstr_eq(name, "atomic_sub64") == 1 do out 81 end
+    if fat_cstr_eq(name, "atomic_cas64") == 1 do out 82 end
+    if fat_cstr_eq(name, "atomic_exchange64") == 1 do out 83 end
+    if fat_cstr_eq(name, "atomic_swap64") == 1 do out 83 end
+    if fat_cstr_eq(name, "arena_new") == 1 do out 49 end
+    if fat_cstr_eq(name, "arena_alloc") == 1 do out 50 end
+    if fat_cstr_eq(name, "arena_free") == 1 do out 51 end
+    # syscallN helpers — all map to BuiltinId.Syscall = 30
+    if fat_cstr_eq(name, "syscall0") == 1 do out 30 end
+    if fat_cstr_eq(name, "syscall1") == 1 do out 30 end
+    if fat_cstr_eq(name, "syscall2") == 1 do out 30 end
+    if fat_cstr_eq(name, "syscall3") == 1 do out 30 end
+    if fat_cstr_eq(name, "syscall4") == 1 do out 30 end
+    if fat_cstr_eq(name, "syscall5") == 1 do out 30 end
+    if fat_cstr_eq(name, "syscall6") == 1 do out 30 end
+    if fat_cstr_eq(name, "port") == 1 do out 90 end
+    if fat_cstr_eq(name, "vir_get_platform") == 1 or fat_cstr_eq(name, "sys_platform") == 1 do out 105 end
+    if fat_cstr_eq(name, "vir_get_platform") == 1 do out 105 end
+    out 0
+end.
+
+func builtin_id_from_name(name: string):
+    if g_builtin_lookup_buckets == 0 do
+        g_builtin_lookup_buckets = vec_new_rt()
+        var bi = 0
+        when bi < MIR_VAR_BUCKETS loop
+            g_builtin_lookup_buckets = vec_push_rt(g_builtin_lookup_buckets, vec_new_rt())
+            bi = bi + 1
+        end
+    end
+    bucket_id = name_hash_bucket(name as i64)
+    bucket = vec_get_rt(g_builtin_lookup_buckets, bucket_id)
+    count = vec_len_rt(bucket)
+    var i = 0
+    when i + 1 < count loop
+        if fat_str_eq(vec_get_rt(bucket, i) as string, name) == 1 do
+            out vec_get_rt(bucket, i + 1)
+        end
+        i = i + 2
+    end
+    builtin_id = builtin_id_from_name_uncached(name as i64)
+    bucket = vec_push_rt(bucket, name as i64)
+    bucket = vec_push_rt(bucket, builtin_id)
+    vec_set_rt(g_builtin_lookup_buckets, bucket_id, bucket)
+    out builtin_id
+end.
+
+func resolve_builtin_id(expr: &AstNode):
+    bid = ast_node_builtin_id(expr) as i64
+    if bid >= 1 and bid <= 120 do
+        out bid
+    end
+    out builtin_id_from_name(ast_node_name(expr))
+end.
+func ast_node_children(n: &AstNode):
+	out native_read_i64(n as i64, 64)
+end.
+func ast_node_child(n: &AstNode, i: i64):
+    kids = native_read_i64(n as i64, 64)
+	out vec_get_rt(kids, i) as AstNode
+end.
+func ast_node_child_count(n: &AstNode):
+    kids = native_read_i64(n as i64, 64)
+	out vec_len_rt(kids)
+end.
+
