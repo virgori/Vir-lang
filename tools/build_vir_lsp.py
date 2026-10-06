@@ -54,6 +54,7 @@ args.add_argument('--output', default=str(ROOT / 'bin/vir-lsp'))
 options = args.parse_args()
 
 subprocess.run(['python3', 'tools/sync_virc.py', '--check'], cwd=ROOT, check=True)
+subprocess.run(['python3', 'tools/bump_vir_lsp_version.py', '--check'], cwd=ROOT, check=True)
 
 virc_bundle_path = ROOT / 'compiler/generated/virc.vri'
 if not virc_bundle_path.is_file():

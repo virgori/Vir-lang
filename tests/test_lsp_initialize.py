@@ -11,6 +11,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VIR_LSP = Path(os.environ.get("VIR_LSP", ROOT / "bin/vir-lsp"))
+VIR_LSP_VERSION = json.loads(
+    (ROOT / "tools/vir-lsp/version.json").read_text(encoding="utf-8")
+)["public_version"]
 
 
 def send_message(proc, payload: dict):
@@ -47,7 +50,7 @@ def read_message(proc) -> dict:
 def test_cli_help_and_version():
     res = subprocess.run([str(VIR_LSP), "--version"], capture_output=True, text=True)
     assert res.returncode == 0, f"Expected 0, got {res.returncode}, stderr: {res.stderr}"
-    assert "vir-lsp 4.0.0" in res.stdout, f"Unexpected version output: {res.stdout}"
+    assert f"vir-lsp {VIR_LSP_VERSION}" in res.stdout, f"Unexpected version output: {res.stdout}"
     assert "unknown option" not in res.stderr.lower() and "unknown option" not in res.stdout.lower()
 
     res = subprocess.run([str(VIR_LSP), "--help"], capture_output=True, text=True)
@@ -90,7 +93,7 @@ def test_lsp_handshake():
         assert caps.get("definitionProvider") is True, f"Missing definitionProvider: {caps}"
         assert "serverInfo" in result, f"Missing serverInfo: {result}"
         assert result["serverInfo"]["name"] == "vir-lsp"
-        assert result["serverInfo"]["version"] == "4.0.0"
+        assert result["serverInfo"]["version"] == VIR_LSP_VERSION
         print("PASS: lsp initialize handshake")
 
         # 2. initialized notification

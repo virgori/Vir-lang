@@ -309,9 +309,9 @@ def test_version_mismatch_fail_closed():
     assert res_abi.returncode == 1
     assert "E2120" in res_abi.stdout or "E2120" in res_abi.stderr
 
-    # 2. compiler_min mismatch (compiler_min = 99.0.0)
+    # 2. compiler_min mismatch (compiler_min = 9999.0.0)
     (scratch_dir / "stdlib" / "stdlib.vri").write_text(
-        "root = vir\nschema = 1\nversion = 2.0.0\nabi_version = 2\ncompiler_min = 99.0.0\n",
+        "root = vir\nschema = 1\nversion = 2.0.0\nabi_version = 2\ncompiler_min = 9999.0.0\n",
         encoding="utf-8",
     )
     res_min = run_cmd([str(VIRC), "--sysroot", str(scratch_dir), "--print-sysroot"])
@@ -407,9 +407,9 @@ def test_compatibility_higher_compiler_min_fail_closed():
     shutil.copy2(ROOT / "stdlib" / "vir" / "core" / "types.vri", scratch_dir / "stdlib" / "vir" / "core" / "types.vri")
     shutil.copy2(ROOT / "stdlib" / "vir" / "rt" / "alloc.vri", scratch_dir / "stdlib" / "vir" / "rt" / "alloc.vri")
 
-    # compiler_min patch is higher than actual compiler (e.g. 4.2.999 > 4.2.1)
+    # compiler_min patch is higher than the active internal patch (2026.1.999 > 2026.1.0)
     (scratch_dir / "stdlib" / "stdlib.vri").write_text(
-        "root = vir\nschema = 1\nversion = 2.0.0\nabi_version = 2\ncompiler_min = 4.2.999\n",
+        "root = vir\nschema = 1\nversion = 2.0.0\nabi_version = 2\ncompiler_min = 2026.1.999\n",
         encoding="utf-8",
     )
     res = run_cmd([str(VIRC), "--sysroot", str(scratch_dir), "--print-sysroot"])
