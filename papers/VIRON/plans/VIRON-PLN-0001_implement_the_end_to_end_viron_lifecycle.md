@@ -3,9 +3,9 @@ id: "VIRON-PLN-0001"
 type: "PLAN"
 domain: "VIRON"
 title: "Implement the end-to-end Viron lifecycle"
-status: "DRAFT"
+status: "ACTIVE"
 created: "2026-10-03"
-updated: "2026-10-03"
+updated: "2026-10-07"
 owners:
   - "VIRON"
 components:
@@ -24,7 +24,8 @@ related:
     - "VIRON-ISS-0002"
     - "VIRON-ISS-0003"
   plans: []
-  reports: []
+  reports:
+    - "VIRON-RPT-0001"
 supersedes: null
 superseded_by: null
 tags:
@@ -120,16 +121,19 @@ qua các phase gates.
 
 ### 5.1 Project layout
 
-Layout mục tiêu đề xuất; tên cuối cùng được chốt ở Phase 0 và ghi vào SPEC:
+Layout mục tiêu độc lập được chuẩn hóa tại `tools/viron/`, đồng cấp với `tools/vir-lsp/`:
 
 ```text
-viron/
+tools/viron/
 ├── module.list
 ├── vir.toml
+├── version.json
+├── VERSIONING.md
+├── README.md
 ├── src/
 │   ├── main.vri
 │   ├── cli/
-│   ├── config/
+│   ├── diagnostic/
 │   ├── project/
 │   ├── manifest/
 │   ├── lock/
@@ -139,9 +143,9 @@ viron/
 │   ├── cache/
 │   ├── registry/
 │   ├── package/
-│   ├── stdlib/
+│   ├── stdlib_lifecycle/
 │   ├── security/
-│   └── diagnostic/
+│   └── process/
 └── tests/
     ├── fixtures/
     └── integration/
@@ -150,6 +154,11 @@ viron/
 Mọi Vir project do Viron tạo hoặc quản lý bắt buộc có `module.list`. `vir.toml`
 mô tả package/project intent; `vir.lock` ghi exact resolved dependency state;
 `module-map.json` là generated build input, không thay thế hai file trên.
+
+Compiler contract reconciliation: compiler hiện tại hỗ trợ `--sysroot <path>`
+(cùng `--print-sysroot`, `--print-stdlib`), nhưng chưa nhận cờ `--module-map`.
+Viron điều phối biên dịch thông qua `module.list` của project và input tường minh,
+không tạo workaround giả hoặc vi phạm ranh giới compiler.
 
 ### 5.2 Control flow
 
@@ -581,8 +590,7 @@ or packaging.
 - `VIRON-SPC-0004` — registry protocol/lifecycle (DRAFT).
 - `VIRON-SPC-0005` — security/integrity/concurrency (DRAFT).
 - `VIRON-SPC-0006` — toolchain/sysroot (DRAFT).
-- Verification REPORT: not created; create during Phase 10 against the implemented
-  revision rather than before evidence exists.
+- `VIRON-RPT-0001` — verification report for standalone reimplementation (REVIEW, PARTIALLY_RESOLVED).
 
 ## 15. Revision History
 
@@ -590,3 +598,6 @@ or packaging.
 |---|---|
 | 2026-10-03 | Created DRAFT end-to-end implementation plan from VIRON-ISS-0001..0003. |
 | 2026-10-03 | Defined local-first phase order, architecture, validation gates and rollback. |
+| 2026-10-07 | Reconciled Phase 0 contracts: standardized standalone tools/viron/ layout and documented compiler capabilities. |
+| 2026-10-07 | Linked VIRON-RPT-0001 |
+| 2026-10-07 | Status transitioned DRAFT -> REVIEW -> APPROVED -> ACTIVE for standalone implementation phases. |

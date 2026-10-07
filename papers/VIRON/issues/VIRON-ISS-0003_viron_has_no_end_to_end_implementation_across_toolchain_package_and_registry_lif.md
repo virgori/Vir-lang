@@ -3,11 +3,11 @@ id: "VIRON-ISS-0003"
 type: "ISSUE"
 domain: "VIRON"
 title: "Viron has no end-to-end implementation across toolchain package and registry lifecycles"
-status: "TRIAGED"
+status: "VERIFYING"
 severity: "S1"
 priority: "P0"
 created: "2026-10-03"
-updated: "2026-10-03"
+updated: "2026-10-07"
 owners:
   - "VIRON"
 components:
@@ -24,7 +24,8 @@ related:
     - "VIRON-ISS-0002"
   plans:
     - "VIRON-PLN-0001"
-  reports: []
+  reports:
+    - "VIRON-RPT-0001"
 supersedes: null
 superseded_by: null
 tags:
@@ -233,31 +234,18 @@ supply-chain compromise hoặc broad compiler outage đang xảy ra.
 
 ## 10. Acceptance Criteria
 
-- [ ] `VIRON-PLN-0001` được review/approved và liên kết cả
-  `VIRON-ISS-0001`, `VIRON-ISS-0002` cùng mọi VIRC/STLB paper phát sinh.
-- [ ] `VIRON-SPC-0001` đến `VIRON-SPC-0006` được reconcile với implementation
-  contract; chỉ chuyển REVIEW/ACTIVE sau conformance evidence.
-- [ ] Viron là project/executable độc lập có mandatory `module.list`, canonical
-  entrypoint và reproducible build tạo `bin/viron`.
-- [ ] Local-first fixture hoàn thành `new --lib`, check, build, test và package
-  với path dependency, exact lock và deterministic module map, không cần network.
-- [ ] Toolchain/sysroot contract hoạt động từ alternate CWD; compiler không tự
-  dò stdlib source tree hoặc truy cập network.
-- [ ] Resolver hỗ trợ exact/range/transitive dependencies, cycle/conflict
-  diagnostics và deterministic `vir.lock`, không dùng placeholder version.
-- [ ] Immutable cache/fetch path có staging, authenticated metadata,
-  checksum/signature, archive traversal defense, concurrency lock, offline/frozen,
-  repair và rollback tests.
-- [ ] Mock registry chứng minh search/fetch/package/`publish --dry-run`; publish
-  thật chỉ bật sau khi protocol/trust contract được duyệt.
-- [ ] `viron std` chứng minh install/list/update/verify/repair/rollback và giữ
-  tách biệt `self`, `toolchain`, project dependency và host-package lifecycle.
-- [ ] Legacy Homebrew naming, nonexistent Python implementation, duplicated
-  fixture algorithms và unconditional-pass tests được migrate/xóa có chủ đích.
-- [ ] CI chạy production Viron commands trên supported host/target matrix;
-  release job tạo checksum/signature/provenance và kiểm tra consumer download.
-- [ ] Một VIRON REPORT ghi revision, command, log/artifact evidence, negative
-  tests và traceability; linked issues chỉ RESOLVED khi report được VERIFIED.
+- [x] `VIRON-PLN-0001` được review/approved và liên kết cả `VIRON-ISS-0001`, `VIRON-ISS-0002` cùng mọi VIRC/STLB paper phát sinh.
+- [ ] `VIRON-SPC-0001` đến `VIRON-SPC-0006` được reconcile với implementation contract; chỉ chuyển REVIEW/ACTIVE sau conformance evidence.
+- [x] Viron là project/executable độc lập có mandatory `module.list`, canonical entrypoint và reproducible build tạo `bin/viron`.
+- [x] Local-first fixture hoàn thành `new --lib`, check, build, test và package với path dependency, exact lock và deterministic module map, không cần network.
+- [x] Toolchain/sysroot contract hoạt động từ alternate CWD; compiler không tự dò stdlib source tree hoặc truy cập network.
+- [x] Resolver hỗ trợ exact/range/transitive dependencies, cycle/conflict diagnostics và deterministic `vir.lock`, không dùng placeholder version.
+- [x] Immutable cache/fetch path có staging, authenticated metadata, checksum/signature, archive traversal defense, concurrency lock, offline/frozen, repair và rollback tests.
+- [x] Mock registry chứng minh search/fetch/package/`publish --dry-run`; publish thật chỉ bật sau khi protocol/trust contract được duyệt.
+- [x] `viron std` chứng minh install/list/update/verify/repair/rollback và giữ tách biệt `self`, `toolchain`, project dependency và host-package lifecycle.
+- [x] Legacy Homebrew naming, nonexistent Python implementation, duplicated fixture algorithms và unconditional-pass tests được migrate/xóa có chủ đích.
+- [ ] CI chạy production Viron commands trên supported host/target matrix; release job tạo checksum/signature/provenance và kiểm tra consumer download.
+- [x] Một VIRON REPORT ghi revision, command, log/artifact evidence, negative tests và traceability; linked issues chỉ RESOLVED khi report được VERIFIED (`VIRON-RPT-0001`).
 
 ## 11. Related Papers
 
@@ -272,7 +260,7 @@ supply-chain compromise hoặc broad compiler outage đang xảy ra.
 
 ### Reports
 
-- None; tạo verification REPORT khi implementation đạt exit criteria.
+- `VIRON-RPT-0001` — verification report for standalone reimplementation.
 
 ## 12. Revision History
 
@@ -281,3 +269,5 @@ supply-chain compromise hoặc broad compiler outage đang xảy ra.
 | 2026-10-03 | Opened and triaged the missing end-to-end Viron integration path. |
 | 2026-10-03 | Linked VIRON-PLN-0001. |
 | 2026-10-03 | Linked VIRON-ISS-0001 and VIRON-ISS-0002. |
+| 2026-10-07 | Linked VIRON-RPT-0001 |
+| 2026-10-07 | Status transitioned TRIAGED -> VERIFYING following native standalone viron implementation and verification. |

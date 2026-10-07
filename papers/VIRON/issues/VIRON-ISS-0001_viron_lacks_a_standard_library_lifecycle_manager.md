@@ -3,11 +3,11 @@ id: "VIRON-ISS-0001"
 type: "ISSUE"
 domain: "VIRON"
 title: "Viron lacks a standard library lifecycle manager"
-status: "TRIAGED"
+status: "VERIFYING"
 severity: "S2"
 priority: "P1"
 created: "2026-10-03"
-updated: "2026-10-06"
+updated: "2026-10-07"
 owners:
   - "VIRON"
 components:
@@ -25,7 +25,8 @@ related:
   plans:
     - "VIRC-PLN-0028"
     - "VIRON-PLN-0001"
-  reports: []
+  reports:
+    - "VIRON-RPT-0001"
 supersedes: null
 superseded_by: null
 tags:
@@ -234,29 +235,17 @@ tách compiler khỏi source-tree stdlib cần contract VIRON này sớm.
 
 ## 10. Acceptance Criteria
 
-- [ ] Một PLAN liên kết issue này xác định rõ ownership VIRON/STLB/VIRC và phân
-  loại stdlib nào compiler-coupled, stdlib nào independently versioned.
-- [ ] Contract release/compatibility cho compiler, sysroot, registry schema và
-  official libraries được chuẩn hóa, versioned và có diagnostics xác định.
-- [ ] Viron có `std` command family hoạt động end-to-end; command registration,
-  help, exit codes và structured diagnostics đều có test.
-- [ ] Install/update/verify dùng authenticated metadata, checksum/signature,
-  staging và atomic publish; corrupt hoặc interrupted operation giữ nguyên
-  installation tốt gần nhất.
-- [ ] Installed state ghi exact versions, provenance và compatibility; channel
-  trôi nổi không được ghi làm resolved state.
-- [ ] `std`, `self`, `toolchain` và project dependency update không gây side
-  effect chéo ngoài contract công khai.
-- [ ] Viron tạo sysroot/module map tất định từ resolved local state và compiler
-  build được từ ngoài repository mà không dò `./stdlib` hoặc `../stdlib`.
-- [ ] Offline/frozen, rollback/repair và concurrent invocation có integration
-  tests, bao gồm negative cases thiếu cache, incompatible release và checksum
-  mismatch.
-- [ ] Test Viron sử dụng implementation production thay vì chép lại SemVer/DAG
-  logic trong fixture; tên/coverage test phản ánh đúng behavior kiểm chứng.
-- [ ] Tài liệu `module.list` của mọi project Vir liên quan được cập nhật khi
-  thêm/move module, và source mới dùng stdlib qua canonical include/import.
-- [ ] `./paper validate` và toàn bộ test suite liên quan đều pass trước closure.
+- [x] Một PLAN liên kết issue này xác định rõ ownership VIRON/STLB/VIRC và phân loại stdlib nào compiler-coupled, stdlib nào independently versioned.
+- [ ] Contract release/compatibility cho compiler, sysroot, registry schema và official libraries được chuẩn hóa, versioned và có diagnostics xác định.
+- [x] Viron có `std` command family hoạt động end-to-end; command registration, help, exit codes và structured diagnostics đều có test.
+- [x] Install/update/verify dùng authenticated metadata, checksum/signature, staging và atomic publish; corrupt hoặc interrupted operation giữ nguyên installation tốt gần nhất.
+- [x] Installed state ghi exact versions, provenance và compatibility; channel trôi nổi không được ghi làm resolved state.
+- [x] `std`, `self`, `toolchain` và project dependency update không gây side effect chéo ngoài contract công khai.
+- [x] Viron tạo sysroot/module map tất định từ resolved local state và compiler build được từ ngoài repository mà không dò `./stdlib` hoặc `../stdlib`.
+- [x] Offline/frozen, rollback/repair và concurrent invocation có integration tests, bao gồm negative cases thiếu cache, incompatible release và checksum mismatch.
+- [x] Test Viron sử dụng implementation production thay vì chép lại SemVer/DAG logic trong fixture; tên/coverage test phản ánh đúng behavior kiểm chứng.
+- [x] Tài liệu `module.list` của mọi project Vir liên quan được cập nhật khi thêm/move module, và source mới dùng stdlib qua canonical include/import.
+- [x] `./paper validate` và toàn bộ test suite liên quan đều pass trước closure.
 
 ## 11. Related Papers
 
@@ -274,7 +263,7 @@ tách compiler khỏi source-tree stdlib cần contract VIRON này sớm.
 
 ### Reports
 
-- None.
+- `VIRON-RPT-0001`
 
 ## 12. Revision History
 
@@ -286,3 +275,5 @@ tách compiler khỏi source-tree stdlib cần contract VIRON này sớm.
 | 2026-10-03 | Linked VIRON-PLN-0001 |
 | 2026-10-06 | Linked VIRC-ISS-0043 |
 | 2026-10-06 | Linked VIRC-PLN-0028 |
+| 2026-10-07 | Linked VIRON-RPT-0001 |
+| 2026-10-07 | Status transitioned TRIAGED -> VERIFYING following native implementation and verification of std lifecycle. |

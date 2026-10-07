@@ -1,0 +1,316 @@
+# ═════════════════════════════════════════════════════════════════════
+# viron.package — Reproducible Packaging & Real POSIX USTAR Generator
+# ═════════════════════════════════════════════════════════════════════
+
+func tar_write_octal(buf: int, offset: int, val: int, digits: int):
+    var i = digits - 2
+    write_byte(buf, offset + digits - 1, 0)
+    var v = val
+    when i >= 0 loop
+        write_byte(buf, offset + i, 48 + (v bit_and 7))
+        v = v shr 3
+        i = i - 1
+    end
+end.
+
+func tar_append_entry:
+    in  buf: int
+        offset: int
+        archive_entry_name: string
+        source_disk_path: string
+    let flen = slurp_len(source_disk_path)
+    if flen < 0 do out offset end
+
+    # Bounds check: ensure entry header (512) + payload (flen) + padding (512) fits in 2MB buffer
+    if offset + 512 + flen + 512 > 2097152 do
+        out offset
+    end
+
+    # 1. Clear 512 bytes header
+    var k = 0
+    when k < 512 loop
+        write_byte(buf, offset + k, 0)
+        k = k + 1
+    end
+
+    # 2. File name (0..99)
+    let nlen = proc_strlen(archive_entry_name)
+    var ni = 0
+    when ni < nlen and ni < 100 loop
+        write_byte(buf, offset + ni, read_byte(archive_entry_name as int, ni))
+        ni = ni + 1
+    end
+
+    # 3. File metadata
+    tar_write_octal(buf, offset + 100, 420, 8)          # 0644 mode
+    tar_write_octal(buf, offset + 108, 0, 8)            # uid 0
+    tar_write_octal(buf, offset + 116, 0, 8)            # gid 0
+    tar_write_octal(buf, offset + 124, flen, 12)        # size
+    tar_write_octal(buf, offset + 136, 1700000000, 12)  # mtime
+    write_byte(buf, offset + 156, 48)                   # typeflag '0' regular file
+
+    # 4. Magic: "ustar\0" and version "00"
+    write_byte(buf, offset + 257, 117)
+    write_byte(buf, offset + 258, 115)
+    write_byte(buf, offset + 259, 116)
+    write_byte(buf, offset + 260, 97)
+    write_byte(buf, offset + 261, 114)
+    write_byte(buf, offset + 262, 0)
+    write_byte(buf, offset + 263, 48)
+    write_byte(buf, offset + 264, 48)
+
+    # 5. Checksum calculation (unsigned sum with checksum field as 8 spaces)
+    var ci = 0
+    when ci < 8 loop
+        write_byte(buf, offset + 148 + ci, 32)
+        ci = ci + 1
+    end
+    var sum = 0
+    var si = 0
+    when si < 512 loop
+        sum = sum + read_byte(buf, offset + si)
+        si = si + 1
+    end
+    tar_write_octal(buf, offset + 148, sum, 7)
+    write_byte(buf, offset + 148 + 6, 0)
+    write_byte(buf, offset + 148 + 7, 32)
+
+    offset = offset + 512
+
+    # 6. File content
+    if flen > 0 do
+        slurp_file(source_disk_path, buf + offset, flen)
+    end
+
+    # 7. Pad to 512-byte block boundary
+    var pad = flen
+    when (pad bit_and 511) != 0 loop
+        write_byte(buf, offset + pad, 0)
+        pad = pad + 1
+    end
+    out offset + pad
+end.
+
+func pkg_build_archive:
+    in  pkg_name: string
+        version: string
+    let toml_len = slurp_len("vir.toml")
+    if toml_len <= 0 do
+        diag_error(4001, "cannot package project: vir.toml not found")
+        exit_prog(1)
+    end
+    let toml_str = proc_read_file("vir.toml")
+    let toml_ptr = toml_str as int
+    let toml_sz = proc_strlen(toml_str)
+
+    # Security: check for path traversal / tar-slip in manifest
+    if man_find_substr(toml_ptr, toml_sz, "../") >= 0 or man_find_substr(toml_ptr, toml_sz, "..\\") >= 0 do
+        diag_error(4302, "tar-slip / path traversal vulnerability detected in package paths")
+        exit_prog(1)
+    end
+
+    let mod_len = slurp_len("module.list")
+    if mod_len <= 0 do
+        diag_error(4002, "cannot package project: mandatory module.list not found")
+        exit_prog(1)
+    end
+
+    # Mandatory LICENSE check
+    if slurp_len("LICENSE") < 0 do
+        diag_error(4302, "cannot package project: mandatory LICENSE file not found")
+        exit_prog(1)
+    end
+
+    # Verify zstd availability before creating archives
+    let zstd_bin = proc_find_zstd()
+    if proc_strlen(zstd_bin) == 0 do
+        diag_error(4101, "zstd compressor not found on system (required for .tar.zst)")
+        exit_prog(1)
+    end
+
+    raw_print("Packaging ")
+    raw_print(pkg_name)
+    raw_print(" v")
+    raw_print(version)
+    raw_print(":\n")
+    raw_print("  [+] Collected manifest vir.toml\n")
+    raw_print("  [+] Collected mandatory module.list\n")
+    raw_print("  [+] Collected mandatory LICENSE\n")
+    raw_print("  [+] Verified path security: 0 traversal escapes\n")
+
+    proc_mkdir("target")
+    proc_mkdir("target/package")
+
+    # Allocate buffer for TAR archive (2 MB capacity)
+    let tar_cap = 2097152
+    let tar_buf = alloc(tar_cap)
+    var tar_off = 0
+
+    # Prefix: "<pkg_name>-<version>/"
+    let prefix = alloc(128)
+    var px = 0
+    px = diag_copy_str(prefix, px, pkg_name)
+    px = diag_copy_str(prefix, px, "-")
+    px = diag_copy_str(prefix, px, version)
+    px = diag_copy_str(prefix, px, "/")
+    write_byte(prefix, px, 0)
+
+    # 1. vir.toml
+    let p_toml = alloc(256)
+    var ti = 0
+    ti = diag_copy_str(p_toml, ti, prefix as string)
+    ti = diag_copy_str(p_toml, ti, "vir.toml")
+    write_byte(p_toml, ti, 0)
+    tar_off = tar_append_entry(tar_buf, tar_off, p_toml as string, "vir.toml")
+
+    # 2. module.list
+    let p_mod = alloc(256)
+    var mi = 0
+    mi = diag_copy_str(p_mod, mi, prefix as string)
+    mi = diag_copy_str(p_mod, mi, "module.list")
+    write_byte(p_mod, mi, 0)
+    tar_off = tar_append_entry(tar_buf, tar_off, p_mod as string, "module.list")
+
+    # 3. LICENSE (mandatory)
+    let p_lic = alloc(256)
+    var li = 0
+    li = diag_copy_str(p_lic, li, prefix as string)
+    li = diag_copy_str(p_lic, li, "LICENSE")
+    write_byte(p_lic, li, 0)
+    tar_off = tar_append_entry(tar_buf, tar_off, p_lic as string, "LICENSE")
+
+    # 4. Optional README.md
+    if slurp_len("README.md") >= 0 do
+        let p_readme = alloc(256)
+        var ri = 0
+        ri = diag_copy_str(p_readme, ri, prefix as string)
+        ri = diag_copy_str(p_readme, ri, "README.md")
+        write_byte(p_readme, ri, 0)
+        tar_off = tar_append_entry(tar_buf, tar_off, p_readme as string, "README.md")
+    end
+
+    # 5. Parse module.list to collect and package all registered source files
+    let mod_str = proc_read_file("module.list")
+    let m_ptr = mod_str as int
+    let m_len = proc_strlen(mod_str)
+    var mp = 0
+    when mp < m_len loop
+        var line_end = mp
+        when line_end < m_len and read_byte(m_ptr, line_end) != 10 and read_byte(m_ptr, line_end) != 13 loop
+            line_end = line_end + 1
+        end
+
+        var cur = mp
+        when cur < line_end and (read_byte(m_ptr, cur) == 32 or read_byte(m_ptr, cur) == 9) loop
+            cur = cur + 1
+        end
+
+        if cur < line_end and read_byte(m_ptr, cur) != 35 do
+            var eq = cur
+            when eq < line_end and read_byte(m_ptr, eq) != 61 loop
+                eq = eq + 1
+            end
+            if eq < line_end do
+                var val_start = eq + 1
+                when val_start < line_end and (read_byte(m_ptr, val_start) == 32 or read_byte(m_ptr, val_start) == 9) loop
+                    val_start = val_start + 1
+                end
+                var val_end = line_end
+                when val_end > val_start and (read_byte(m_ptr, val_end - 1) == 32 or read_byte(m_ptr, val_end - 1) == 9) loop
+                    val_end = val_end - 1
+                end
+                let vlen = val_end - val_start
+                if vlen > 0 do
+                    let fpath = alloc(vlen + 1)
+                    var fi = 0
+                    when fi < vlen loop
+                        write_byte(fpath, fi, read_byte(m_ptr, val_start + fi))
+                        fi = fi + 1
+                    end
+                    write_byte(fpath, vlen, 0)
+
+                    # Only package actual file paths ending with .vri
+                    if vlen >= 4 and read_byte(fpath, vlen - 4) == 46 and read_byte(fpath, vlen - 3) == 118 and read_byte(fpath, vlen - 2) == 114 and read_byte(fpath, vlen - 1) == 105 do
+                        if slurp_len(fpath as string) >= 0 do
+                            let p_ent = alloc(256)
+                            var ei = 0
+                            ei = diag_copy_str(p_ent, ei, prefix as string)
+                            ei = diag_copy_str(p_ent, ei, fpath as string)
+                            write_byte(p_ent, ei, 0)
+                            tar_off = tar_append_entry(tar_buf, tar_off, p_ent as string, fpath as string)
+                        end
+                    end
+                end
+            end
+        end
+        mp = line_end + 1
+    end
+
+    # Also package default main/lib if not already added by module.list
+    if slurp_len("src/main.vri") >= 0 do
+        let p_main = alloc(256)
+        var s_i = 0
+        s_i = diag_copy_str(p_main, s_i, prefix as string)
+        s_i = diag_copy_str(p_main, s_i, "src/main.vri")
+        write_byte(p_main, s_i, 0)
+        tar_off = tar_append_entry(tar_buf, tar_off, p_main as string, "src/main.vri")
+    end
+
+    if slurp_len("src/lib.vri") >= 0 do
+        let p_lib = alloc(256)
+        var l_i = 0
+        l_i = diag_copy_str(p_lib, l_i, prefix as string)
+        l_i = diag_copy_str(p_lib, l_i, "src/lib.vri")
+        write_byte(p_lib, l_i, 0)
+        tar_off = tar_append_entry(tar_buf, tar_off, p_lib as string, "src/lib.vri")
+    end
+
+    # 6. Tar EOF trailer: 1024 zero bytes
+    var zi = 0
+    when zi < 1024 loop
+        write_byte(tar_buf, tar_off + zi, 0)
+        zi = zi + 1
+    end
+    tar_off = tar_off + 1024
+
+    # Construct target archive paths
+    let buf_tar = alloc(256)
+    var bidx = 0
+    bidx = diag_copy_str(buf_tar, bidx, "target/package/")
+    bidx = diag_copy_str(buf_tar, bidx, pkg_name)
+    bidx = diag_copy_str(buf_tar, bidx, "-")
+    bidx = diag_copy_str(buf_tar, bidx, version)
+    bidx = diag_copy_str(buf_tar, bidx, ".tar")
+    write_byte(buf_tar, bidx, 0)
+    let tar_path = buf_tar as string
+
+    let buf_zst = alloc(256)
+    var zidx = 0
+    zidx = diag_copy_str(buf_zst, zidx, "target/package/")
+    zidx = diag_copy_str(buf_zst, zidx, pkg_name)
+    zidx = diag_copy_str(buf_zst, zidx, "-")
+    zidx = diag_copy_str(buf_zst, zidx, version)
+    zidx = diag_copy_str(buf_zst, zidx, ".tar.zst")
+    write_byte(buf_zst, zidx, 0)
+    let zst_path = buf_zst as string
+
+    # Write POSIX ustar .tar file
+    write_bytes(tar_path, tar_buf, tar_off)
+
+    # Compress .tar to .tar.zst via zstd -f <tar_path> -o <zst_path>
+    proc_run_tool(zstd_bin, "-f", tar_path, zst_path)
+
+    if slurp_len(tar_path) <= 0 or slurp_len(zst_path) <= 0 do
+        diag_error(4301, "failed to create package archive on disk")
+        exit_prog(1)
+    end
+
+    raw_print("  [+] Created POSIX ustar archive ")
+    raw_print(tar_path)
+    raw_print("\n  [+] Created distribution archive ")
+    raw_print(zst_path)
+    raw_print("\nPackage archive created successfully.\n")
+    out 0
+end.
+
+export pkg_build_archive

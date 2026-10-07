@@ -3,11 +3,11 @@ id: "VIRON-ISS-0002"
 type: "ISSUE"
 domain: "VIRON"
 title: "Viron lacks an executable library development workflow"
-status: "TRIAGED"
+status: "VERIFYING"
 severity: "S1"
 priority: "P0"
 created: "2026-10-03"
-updated: "2026-10-03"
+updated: "2026-10-07"
 owners:
   - "VIRON"
 components:
@@ -25,7 +25,8 @@ related:
     - "VIRON-ISS-0003"
   plans:
     - "VIRON-PLN-0001"
-  reports: []
+  reports:
+    - "VIRON-RPT-0001"
 supersedes: null
 superseded_by: null
 tags:
@@ -231,31 +232,18 @@ mất dữ liệu, compromise hoặc broad compiler failure.
 
 ## 10. Acceptance Criteria
 
-- [ ] Có PLAN liên kết `VIRON-ISS-0001` và issue này, xác định milestone
-  vertical slice, ownership VIRON/STLB/VIRC, non-goals và migration khỏi các
-  test/code surface cũ.
-- [ ] Viron là project Vir độc lập có `module.list` bắt buộc, canonical source
-  entrypoint và reproducible command tạo `bin/viron`.
-- [ ] Toàn bộ source production của Viron/package engine qua `virc --check`;
-  imports dùng explicit exports và không dựa vào fail-open behavior.
-- [ ] `viron new --lib` hoặc command tương đương tạo project hợp lệ gồm
-  `vir.toml`, `module.list`, `src/lib.vri` và test fixture.
-- [ ] Một fixture library chạy được local `check`, `build` và `test` từ project
-  root lẫn alternate CWD với cùng canonical module identities.
-- [ ] Local path dependency được resolve, lock và đưa vào module map không cần
-  network; missing/cyclic/duplicate modules có diagnostics xác định.
-- [ ] Resolver xử lý exact version, version constraints và transitive graph;
-  không ghi placeholder `0.0.0` vào resolved state.
-- [ ] `package` tạo archive reproducible và kiểm tra đầy đủ manifest,
-  `module.list`, source, license/provenance và checksum.
-- [ ] `publish --dry-run` hoặc equivalent chạy toàn bộ validation mà không ghi
-  remote; publish thật chỉ được mở sau khi Registry contract được chốt.
-- [ ] Tests Python trỏ code không tồn tại được xóa/migrate có chủ đích; Viron
-  tests gọi production implementation và không chứa unconditional pass.
-- [ ] CI chạy chính các command Viron production cho fixture library; không có
-  resolver/package implementation riêng trong workflow script.
-- [ ] `./paper validate` và focused Viron/package/module tests đều pass trước
-  khi issue chuyển VERIFYING.
+- [x] Có PLAN liên kết `VIRON-ISS-0001` và issue này, xác định milestone vertical slice, ownership VIRON/STLB/VIRC, non-goals và migration khỏi các test/code surface cũ (`VIRON-PLN-0001`).
+- [x] Viron là project Vir độc lập có `module.list` bắt buộc, canonical source entrypoint và reproducible command tạo `bin/viron`.
+- [x] Toàn bộ source production của Viron/package engine qua `virc --check`; imports dùng explicit exports và không dựa vào fail-open behavior.
+- [x] `viron new --lib` hoặc command tương đương tạo project hợp lệ gồm `vir.toml`, `module.list`, `src/lib.vri` và test fixture.
+- [x] Một fixture library chạy được local `check`, `build` và `test` từ project root lẫn alternate CWD với cùng canonical module identities.
+- [x] Local path dependency được resolve, lock và đưa vào module map không cần network; missing/cyclic/duplicate modules có diagnostics xác định.
+- [x] Resolver xử lý exact version, version constraints và transitive graph; không ghi placeholder `0.0.0` vào resolved state.
+- [x] `package` tạo archive reproducible và kiểm tra đầy đủ manifest, `module.list`, source, license/provenance và checksum.
+- [x] `publish --dry-run` hoặc equivalent chạy toàn bộ validation mà không ghi remote; publish thật chỉ được mở sau khi Registry contract được chốt.
+- [x] Tests Python trỏ code không tồn tại được xóa/migrate có chủ đích; Viron tests gọi production implementation và không chứa unconditional pass.
+- [ ] CI chạy chính các command Viron production cho fixture library; không có resolver/package implementation riêng trong workflow script.
+- [x] `./paper validate` và focused Viron/package/module tests đều pass trước khi issue chuyển VERIFYING.
 
 ## 11. Related Papers
 
@@ -273,7 +261,7 @@ mất dữ liệu, compromise hoặc broad compiler failure.
 
 ### Reports
 
-- None.
+- `VIRON-RPT-0001`
 
 ## 12. Revision History
 
@@ -283,3 +271,5 @@ mất dữ liệu, compromise hoặc broad compiler failure.
 | 2026-10-03 | Linked VIRON-ISS-0001 |
 | 2026-10-03 | Linked VIRON-ISS-0003 |
 | 2026-10-03 | Linked VIRON-PLN-0001 |
+| 2026-10-07 | Linked VIRON-RPT-0001 |
+| 2026-10-07 | Status transitioned TRIAGED -> VERIFYING following native standalone viron implementation and library workflow verification. |
