@@ -1214,6 +1214,7 @@ run_group_10() {
         run_test_in_group 10 "tests/vri/test_bit_min.vri"
         run_test_in_group 10 "tests/vri/test_bit_tmp.vri"
         run_test_in_group 10 "tests/vri/test_int64_overflow_wrapping.vri"
+        run_test_in_group 10 "tests/vri/test_int64_min_formatting.vri"
         run_test_in_group 10 "tests/vri/test_mod_rt.vri"
         run_test_in_group 10 "tests/vri/test_modulo_kw.vri"
         run_test_in_group 10 "tests/vri/test_modulo_op.vri"
