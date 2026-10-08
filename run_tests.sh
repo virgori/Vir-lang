@@ -543,6 +543,94 @@ run_interp_mc_target() {
     GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
 }
 
+run_packed_opt_and_target_matrix() {
+    local g=7
+    local opt
+    local test="tests/strict_v2/packed_layout_mixed_width_e2e.vri"
+    local expected
+    expected=$(perl -0777 -ne '
+        if (/#\s*EXPECT_START\n((?:#[^\n]*\n)+?)#\s*EXPECT_END/m) {
+            my $b = $1; $b =~ s/^#[ \t]?//mg; chomp $b; print $b;
+        }
+    ' "$test")
+
+    # 1. Host optimization matrix execution (-O0..-O3)
+    for opt in -O0 -O1 -O2 -O3; do
+        local bin_path="./scratch/packed_opt_${opt}.out"
+        rm -f "$bin_path"
+        local compile_out
+        if ! compile_out=$($VIRC "$test" "$opt" -o "$bin_path" -q 2>&1); then
+            echo "  [FAIL-MC] Packed $opt host compile"
+            if [ -n "$compile_out" ]; then echo "$compile_out" | sed 's/^/    /' | head -20; fi
+            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+            return
+        fi
+        if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$bin_path" >/dev/null 2>&1 || true; fi
+        local actual
+        actual=$("$bin_path" 2>&1 | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba')
+        if [ "$actual" != "$expected" ]; then
+            echo "  [FAIL-MC] Packed $opt host output mismatch"
+            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+            return
+        fi
+    done
+    echo "  [PASS-MC] Packed host optimization matrix (-O0..-O3)"
+    GP_PASS[$g]=$((GP_PASS[$g]+1)); TOTAL_PASS=$((TOTAL_PASS+1))
+
+    # 2. Cross-target assembly inspection across (-O0..-O3)
+    for opt in -O0 -O1 -O2 -O3; do
+        # ARM64: must emit strb, strh, str w
+        local arm64_s="./scratch/packed_arm64_${opt}.s"
+        rm -f "$arm64_s"
+        if ! $VIRC "$test" --target linux-arm64 "$opt" -S -o "$arm64_s" -q >/dev/null 2>&1 \
+            || [ ! -s "$arm64_s" ] \
+            || ! grep -E -q "strb\b" "$arm64_s" \
+            || ! grep -E -q "strh\b" "$arm64_s" \
+            || ! grep -E -q "str\s+w" "$arm64_s"; then
+            echo "  [FAIL-MC] Packed ARM64 $opt assembly verification"
+            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+            return
+        fi
+
+        # x86-64: must emit mov byte ptr, mov word ptr, mov dword ptr
+        local x86_s="./scratch/packed_x86_${opt}.s"
+        rm -f "$x86_s"
+        if ! $VIRC "$test" --target linux-x86_64 "$opt" -S -o "$x86_s" -q >/dev/null 2>&1 \
+            || [ ! -s "$x86_s" ] \
+            || ! grep -Fq "byte ptr" "$x86_s" \
+            || ! grep -Fq "word ptr" "$x86_s" \
+            || ! grep -Fq "dword ptr" "$x86_s"; then
+            echo "  [FAIL-MC] Packed x86-64 $opt assembly verification"
+            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+            return
+        fi
+
+        # RISC-V 64: must emit sb, lbu with shifts and no unaligned sh/sw
+        local riscv_s="./scratch/packed_riscv_${opt}.s"
+        rm -f "$riscv_s"
+        if ! $VIRC "$test" --target linux-riscv64 "$opt" -S -o "$riscv_s" -q >/dev/null 2>&1 \
+            || [ ! -s "$riscv_s" ] \
+            || ! grep -E -q "sb\b" "$riscv_s" \
+            || ! grep -E -q "lbu\b" "$riscv_s"; then
+            echo "  [FAIL-MC] Packed RISC-V $opt assembly verification"
+            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+            return
+        fi
+
+        # Wasm32: must emit valid wasm module
+        local wasm_out="./scratch/packed_wasm_${opt}.wasm"
+        rm -f "$wasm_out"
+        if ! $VIRC "$test" --target wasm32 "$opt" -o "$wasm_out" -q >/dev/null 2>&1 \
+            || [ ! -s "$wasm_out" ]; then
+            echo "  [FAIL-MC] Packed Wasm32 $opt build"
+            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+            return
+        fi
+    done
+    echo "  [PASS-MC] Packed cross-target matrix (-O0..-O3: ARM64, x86-64, RISC-V, Wasm)"
+    GP_PASS[$g]=$((GP_PASS[$g]+1)); TOTAL_PASS=$((TOTAL_PASS+1))
+}
+
 echo "=========================================================================="
 if [ "$MODE" = "single" ]; then
     echo "  VIR COMPILER TEST SUITE — NHÓM $TARGET_GROUP"
@@ -1022,6 +1110,7 @@ run_group_7() {
         run_test_in_group 7 "tests/strict_v2/packed_u8_underflow_rejected.vri"
         run_test_in_group 7 "tests/strict_v2/entity_field_access_valid.vri"
         run_test_in_group 7 "tests/strict_v2/entity_brace_instantiation_rejected.vri"
+        run_packed_opt_and_target_matrix
     fi
     local pass_cnt=${GP_PASS[7]}
     local fail_cnt=${GP_FAIL[7]}
