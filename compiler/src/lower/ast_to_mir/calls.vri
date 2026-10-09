@@ -8,9 +8,111 @@ include rt_vec_rt
 include rt_string_rt
 include parser
 include mir
+include target
 include ast_to_mir_context
 include ast_to_mir_layout
 include ast_to_mir_builder
+
+func emit_aot_backward(b: MirBuilder, receiver: &MirOperand):
+	let ad_target = get_codegen_target()
+	if ad_target != TargetArch.ARM64 and ad_target != TargetArch.X86_64 do
+		print_str("virc: error: [E3108] AOT autodiff is unsupported for the selected target\n")
+		sys_exit(1)
+		out expr_result(b, mir_opnd_imm(0))
+	end
+	if g_ad_has_dynamic_control != 0 do
+		print_str("virc: error: [E3107] dynamic control flow in an AOT autodiff graph is not supported by this target capability\n")
+		sys_exit(1)
+		out expr_result(b, mir_opnd_imm(0))
+	end
+	if g_lower_ai_mode != 2 or mir_opnd_type(receiver) != MirOperandType.VReg do
+		print_str("virc: error: [E3105] backward target is not an AOT differentiable train value\n")
+		sys_exit(1)
+		out expr_result(b, mir_opnd_imm(0))
+	end
+	let root_vreg = ad_canonical_vreg(mir_opnd_vreg_id(receiver))
+	let node_count = vec_len_rt(g_ad_node_out)
+	var root_node = 0 - 1
+	var find_i = node_count - 1
+	when find_i >= 0 loop
+		if ad_canonical_vreg(vec_get_rt(g_ad_node_out, find_i)) == root_vreg do
+			root_node = find_i
+			find_i = 0 - 1
+		else
+			find_i = find_i - 1
+		end
+	end
+	if root_node < 0 do
+		print_str("virc: error: [E3105] unsupported autodiff root; no differentiable AOT tensor operation produces this value\n")
+		sys_exit(1)
+		out expr_result(b, mir_opnd_imm(0))
+	end
+	let root_meta = vec_get_rt(g_ad_node_aux, root_node)
+	let root_is_float = (root_meta shr 48) and 1
+	let root_is_f32 = (root_meta shr 49) and 1
+	let root_is_f16 = (root_meta shr 51) and 1
+	if root_is_float != 1 or root_is_f32 != 1 or root_is_f16 == 1 do
+		print_str("virc: error: [E3106] AOT autodiff currently requires dense tensor[f32; ...] matmul operands\n")
+		sys_exit(1)
+		out expr_result(b, mir_opnd_imm(0))
+	end
+
+	# Gradient values are ordinary compiler-managed SSA vregs.  No tensor header
+	# field is repurposed and the runtime never owns or traverses a graph.
+	var b_cur = b
+	ad_grad_reset()
+
+	# Materialize the public root gradient as an ordinary all-ones tensor.  Bit
+	# 54 selects seed materialization in the derivative kernel; this also makes
+	# `root.grad` observable under the same storage contract as operand grads.
+	let root_left_vreg = vec_get_rt(g_ad_node_left, root_node)
+	let root_right_vreg = vec_get_rt(g_ad_node_right, root_node)
+	b_cur = emit_set_arg(b_cur, 0, mir_opnd_vreg(root_left_vreg))
+	b_cur = emit_set_arg(b_cur, 1, mir_opnd_vreg(root_right_vreg))
+	b_cur = emit_set_arg(b_cur, 2, mir_opnd_imm(0))
+	b_cur = emit_set_arg(b_cur, 3, mir_opnd_imm(0))
+	b_cur = emit_set_arg(b_cur, 4, mir_opnd_imm(root_meta or (1 shl 52) or (1 shl 54)))
+	var (b_root, root_grad) = builder_new_vreg(b_cur)
+	b_cur = emit_intrinsic(b_root, MIR_INTR_BACKWARD, mir_opnd_vreg(root_grad), mir_opnd_vreg(root_vreg))
+	ad_grad_set(root_vreg, root_grad)
+
+	var last_dst = 0 - 1
+	var i = root_node
+	when i >= 0 loop
+		let left_vreg = vec_get_rt(g_ad_node_left, i)
+		let right_vreg = vec_get_rt(g_ad_node_right, i)
+		let out_vreg = vec_get_rt(g_ad_node_out, i)
+		var meta_base = vec_get_rt(g_ad_node_aux, i)
+		if i == root_node do meta_base = meta_base or (1 shl 52) end
+		let upstream_vreg = ad_grad_get(out_vreg)
+
+		# dA = G @ B^T.  The runtime returns a fresh gradient tensor or
+		# accumulates into the prior SSA gradient supplied for fan-out.
+		let prior_left = ad_grad_get(left_vreg)
+		b_cur = emit_set_arg(b_cur, 0, mir_opnd_vreg(left_vreg))
+		b_cur = emit_set_arg(b_cur, 1, mir_opnd_vreg(right_vreg))
+		if upstream_vreg >= 0 do b_cur = emit_set_arg(b_cur, 2, mir_opnd_vreg(upstream_vreg)) else b_cur = emit_set_arg(b_cur, 2, mir_opnd_imm(0)) end
+		if prior_left >= 0 do b_cur = emit_set_arg(b_cur, 3, mir_opnd_vreg(prior_left)) else b_cur = emit_set_arg(b_cur, 3, mir_opnd_imm(0)) end
+		b_cur = emit_set_arg(b_cur, 4, mir_opnd_imm(meta_base))
+		var (b_left, left_grad) = builder_new_vreg(b_cur)
+		b_cur = emit_intrinsic(b_left, MIR_INTR_BACKWARD, mir_opnd_vreg(left_grad), mir_opnd_vreg(out_vreg))
+		ad_grad_set(left_vreg, left_grad)
+
+		# dB = A^T @ G.  Bit 53 selects the right-operand derivative.
+		let prior_right = ad_grad_get(right_vreg)
+		b_cur = emit_set_arg(b_cur, 0, mir_opnd_vreg(left_vreg))
+		b_cur = emit_set_arg(b_cur, 1, mir_opnd_vreg(right_vreg))
+		if upstream_vreg >= 0 do b_cur = emit_set_arg(b_cur, 2, mir_opnd_vreg(upstream_vreg)) else b_cur = emit_set_arg(b_cur, 2, mir_opnd_imm(0)) end
+		if prior_right >= 0 do b_cur = emit_set_arg(b_cur, 3, mir_opnd_vreg(prior_right)) else b_cur = emit_set_arg(b_cur, 3, mir_opnd_imm(0)) end
+		b_cur = emit_set_arg(b_cur, 4, mir_opnd_imm(meta_base or (1 shl 53)))
+		var (b_right, right_grad) = builder_new_vreg(b_cur)
+		b_cur = emit_intrinsic(b_right, MIR_INTR_BACKWARD, mir_opnd_vreg(right_grad), mir_opnd_vreg(out_vreg))
+		ad_grad_set(right_vreg, right_grad)
+		last_dst = right_grad
+		i = i - 1
+	end
+	out expr_result(b_cur, mir_opnd_vreg(last_dst))
+end.
 
 func lower_call_args(b: &MirBuilder, expr: &AstNode, start_child: i64, arg_base: i64):
     # Stage into fresh vregs first — a nested call clobbers X0..Xn / prior SetArgs.
@@ -367,6 +469,128 @@ func lower_call_with_ref_support(b: MirBuilder, expr: &AstNode, callee: string, 
     out lower_call_with_ref_support_ast(b, expr, callee, cid, callee_vreg, fn_ast, fn_type_str, 0)
 end.
 
+func lower_native_store(b: MirBuilder, expr: &AstNode) -> ExprResult:
+    var b_data = lower_expr(b, ast_node_child(expr, 0))
+    var data_op = g_lower_expr_result_opnd as MirOperand
+    var b_idx = lower_expr(b_data, ast_node_child(expr, 1))
+    var idx_op = g_lower_expr_result_opnd as MirOperand
+    var b_val = lower_expr(b_idx, ast_node_child(expr, 2))
+    var val_op = g_lower_expr_result_opnd as MirOperand
+    var elem_t = ast_node_name2(expr)
+    if elem_t == 0 or fat_str_len(elem_t) == 0 do
+        elem_t = infer_expr_type_name(ast_node_child(expr, 2))
+    end
+    var sz = get_type_byte_size(elem_t)
+    if sz <= 0 do sz = 8 end
+    var (b_addr, eff_addr) = builder_new_vreg(b_val)
+    if mir_opnd_type(idx_op) == MirOperandType.Imm do
+        var idx_val = mir_opnd_imm_val(idx_op)
+        if idx_val == 0 do
+            var ins_mov = mir_instr_new(MirOp.Move, mir_opnd_vreg(eff_addr), data_op, mir_opnd_none())
+            b_addr = builder_add_instr(b_addr, ins_mov)
+        else
+            var byte_off = idx_val * sz
+            var ins_add = mir_instr_new(MirOp.Add, mir_opnd_vreg(eff_addr), data_op, mir_opnd_imm(byte_off))
+            b_addr = builder_add_instr(b_addr, ins_add)
+        end
+    else
+        if sz == 1 do
+            var ins_add = mir_instr_new(MirOp.Add, mir_opnd_vreg(eff_addr), data_op, idx_op)
+            b_addr = builder_add_instr(b_addr, ins_add)
+        else
+            var (b_scaled, scaled_vreg) = builder_new_vreg(b_val)
+            var ins_mul = mir_instr_new(MirOp.Mul, mir_opnd_vreg(scaled_vreg), idx_op, mir_opnd_imm(sz))
+            b_scaled = builder_add_instr(b_scaled, ins_mul)
+            var (b_final, final_vreg) = builder_new_vreg(b_scaled)
+            var ins_add = mir_instr_new(MirOp.Add, mir_opnd_vreg(final_vreg), data_op, mir_opnd_vreg(scaled_vreg))
+            b_addr = builder_add_instr(b_final, ins_add)
+            eff_addr = final_vreg
+        end
+    end
+    if sz > 8 do
+        var k = 0
+        var b_copy = b_addr
+        when k < sz loop
+            var (b_s, src_addr) = builder_new_vreg(b_copy)
+            var ins_s = mir_instr_new(MirOp.Add, mir_opnd_vreg(src_addr), val_op, mir_opnd_imm(k))
+            b_s = builder_add_instr(b_s, ins_s)
+            var (b_l, byte_val) = builder_new_vreg(b_s)
+            b_l = emit_load_typed(b_l, byte_val, mir_opnd_vreg(src_addr), 1, 0)
+            var (b_d, dst_addr) = builder_new_vreg(b_l)
+            var ins_d = mir_instr_new(MirOp.Add, mir_opnd_vreg(dst_addr), mir_opnd_vreg(eff_addr), mir_opnd_imm(k))
+            b_d = builder_add_instr(b_d, ins_d)
+            b_copy = emit_store_typed(b_d, mir_opnd_vreg(dst_addr), mir_opnd_vreg(byte_val), 1)
+            k = k + 1
+        end
+        out expr_result(b_copy, mir_opnd_imm(0))
+    else
+        var b_st = emit_store_typed(b_addr, mir_opnd_vreg(eff_addr), val_op, sz)
+        out expr_result(b_st, mir_opnd_imm(0))
+    end
+end.
+
+func lower_native_load(b: MirBuilder, expr: &AstNode) -> ExprResult:
+    var b_data = lower_expr(b, ast_node_child(expr, 0))
+    var data_op = g_lower_expr_result_opnd as MirOperand
+    var b_idx = lower_expr(b_data, ast_node_child(expr, 1))
+    var idx_op = g_lower_expr_result_opnd as MirOperand
+    var elem_t = ast_node_name2(expr)
+    var sz = get_type_byte_size(elem_t)
+    if sz <= 0 do sz = 8 end
+    var sgn = is_signed_type(elem_t)
+    var (b_addr, eff_addr) = builder_new_vreg(b_idx)
+    if mir_opnd_type(idx_op) == MirOperandType.Imm do
+        var idx_val = mir_opnd_imm_val(idx_op)
+        if idx_val == 0 do
+            var ins_mov = mir_instr_new(MirOp.Move, mir_opnd_vreg(eff_addr), data_op, mir_opnd_none())
+            b_addr = builder_add_instr(b_addr, ins_mov)
+        else
+            var byte_off = idx_val * sz
+            var ins_add = mir_instr_new(MirOp.Add, mir_opnd_vreg(eff_addr), data_op, mir_opnd_imm(byte_off))
+            b_addr = builder_add_instr(b_addr, ins_add)
+        end
+    else
+        if sz == 1 do
+            var ins_add = mir_instr_new(MirOp.Add, mir_opnd_vreg(eff_addr), data_op, idx_op)
+            b_addr = builder_add_instr(b_addr, ins_add)
+        else
+            var (b_scaled, scaled_vreg) = builder_new_vreg(b_idx)
+            var ins_mul = mir_instr_new(MirOp.Mul, mir_opnd_vreg(scaled_vreg), idx_op, mir_opnd_imm(sz))
+            b_scaled = builder_add_instr(b_scaled, ins_mul)
+            var (b_final, final_vreg) = builder_new_vreg(b_scaled)
+            var ins_add = mir_instr_new(MirOp.Add, mir_opnd_vreg(final_vreg), data_op, mir_opnd_vreg(scaled_vreg))
+            b_addr = builder_add_instr(b_final, ins_add)
+            eff_addr = final_vreg
+        end
+    end
+    if sz > 8 do
+        b_addr = emit_set_arg(b_addr, 0, mir_opnd_imm(sz))
+        var (b_alloc, dst_base) = builder_new_vreg(b_addr)
+        var ins_alloc = mir_instr_new(MirOp.Intrinsic as i64, mir_opnd_vreg(dst_base) as i64, mir_opnd_imm(3) as i64, mir_opnd_imm(MIR_INTR_BUILTIN) as i64)
+        b_alloc = builder_add_instr(b_alloc, ins_alloc)
+        var k = 0
+        var b_copy = b_alloc
+        when k < sz loop
+            var (b_s, src_addr) = builder_new_vreg(b_copy)
+            var ins_s = mir_instr_new(MirOp.Add, mir_opnd_vreg(src_addr), mir_opnd_vreg(eff_addr), mir_opnd_imm(k))
+            b_s = builder_add_instr(b_s, ins_s)
+            var (b_l, byte_val) = builder_new_vreg(b_s)
+            b_l = emit_load_typed(b_l, byte_val, mir_opnd_vreg(src_addr), 1, 0)
+            var (b_d, dst_addr) = builder_new_vreg(b_l)
+            var ins_d = mir_instr_new(MirOp.Add, mir_opnd_vreg(dst_addr), mir_opnd_vreg(dst_base), mir_opnd_imm(k))
+            b_d = builder_add_instr(b_d, ins_d)
+            b_copy = emit_store_typed(b_d, mir_opnd_vreg(dst_addr), mir_opnd_vreg(byte_val), 1)
+            k = k + 1
+        end
+        out expr_result(b_copy, mir_opnd_vreg(dst_base))
+    else
+        var (b_ld, dst_vreg) = builder_new_vreg(b_addr)
+        b_ld = emit_load_typed(b_ld, dst_vreg, mir_opnd_vreg(eff_addr), sz, sgn)
+        out expr_result(b_ld, mir_opnd_vreg(dst_vreg))
+    end
+end.
+
+
 
 # ═══════════════════════════════════════════════════════
 # Call Expression Lowering Dispatcher
@@ -536,6 +760,12 @@ func lower_expr_calls(b: MirBuilder, expr: &AstNode, expr_type: AstType):
 			b_val = builder_add_instr(b_val, vst_ins)
 			out expr_result(b_val, mir_opnd_imm(0))
 		end
+		if fat_cstr_eq(callee, "native_store") == 1 and ast_node_child_count(expr) >= 3 do
+			out lower_native_store(b, expr)
+		end
+		if fat_cstr_eq(callee, "native_load") == 1 and ast_node_child_count(expr) >= 2 do
+			out lower_native_load(b, expr)
+		end
 		# Parser lookup_builtin can miss (fat vs C-string table names) and
 		# emit a Call instead of BuiltinCall. Reclassify by callee name.
 		b_id = builtin_id_from_name(callee)
@@ -562,6 +792,12 @@ func lower_expr_calls(b: MirBuilder, expr: &AstNode, expr_type: AstType):
 
     # 6b. BuiltinCall — port/lock/atomic map to MIR_INTR_*; else BUILTIN+Call
 	if expr_type == AstType.BuiltinCall do
+		if fat_cstr_eq(ast_node_name(expr), "native_store") == 1 and ast_node_child_count(expr) >= 3 do
+			out lower_native_store(b, expr)
+		end
+		if fat_cstr_eq(ast_node_name(expr), "native_load") == 1 and ast_node_child_count(expr) >= 2 do
+			out lower_native_load(b, expr)
+		end
 		if fat_cstr_eq(ast_node_name(expr), "__mir_send") or fat_cstr_eq(ast_node_name(expr), "port_send") do
 			var (b2, nargs) = lower_call_args(b, expr, 0, 0)
 			var (b3, dst) = builder_new_vreg(b2)
@@ -614,8 +850,7 @@ func lower_expr_calls(b: MirBuilder, expr: &AstNode, expr_type: AstType):
 			recv = ast_node_child(expr, 0)
 			var b2 = lower_expr(b, recv)
 			var rop = g_lower_expr_result_opnd as MirOperand
-			var (b3, dst) = builder_new_vreg(b2)
-			out expr_result(emit_intrinsic(b3, MIR_INTR_BACKWARD, mir_opnd_vreg(dst), rop), mir_opnd_vreg(dst))
+			out emit_aot_backward(b2, rop)
 		end
 		nch = ast_node_child_count(expr)
 		if nch <= 0 do
@@ -632,6 +867,22 @@ func lower_expr_calls(b: MirBuilder, expr: &AstNode, expr_type: AstType):
 		if callee_kind == 201 and fat_str_len(recv_type) == 0 and fat_str_len(resolved_name) > 0 do
 			recv_type = resolved_name
 		end
+		if fat_str_len(recv_type) > 0 do
+			var semi_idx = -1
+			var si = 0
+			let rt_len = fat_str_len(recv_type)
+			when si < rt_len loop
+				if fat_str_byte_at(recv_type, si) == 59 do
+					semi_idx = si
+					si = rt_len
+				else
+					si = si + 1
+				end
+			end
+			if semi_idx >= 0 do
+				recv_type = fat_str_slice(recv_type, 0, semi_idx)
+			end
+		end
 		# Semantic checking stores the parser-owned receiver type. Resolve kinds
 		# 0/201 through AST-to-MIR's method table so MIR owns the qualified name.
 		if (callee_kind == 0 or callee_kind == 201) and fat_str_len(recv_type) > 0 do
@@ -641,6 +892,9 @@ func lower_expr_calls(b: MirBuilder, expr: &AstNode, expr_type: AstType):
 				resolved_name = method_key
 			eif scoped_field_is_callable(recv_type, mname) == 1 do
 				callee_kind = 202
+			eif (find_func_ast(mname as i64) as i64) != 0 do
+				callee_kind = 201
+				resolved_name = mname
 			end
 		end
 		if callee_kind == 202 do
@@ -736,11 +990,18 @@ func lower_expr_calls(b: MirBuilder, expr: &AstNode, expr_type: AstType):
 			end
 		end
 
+		var is_type_receiver = false
+		if callee_kind == 201 and recv.node_type == AstType.Identifier do
+			if is_entity_name(recv.name) == 1 and get_var_vreg(b, recv.name) < 0 do
+				is_type_receiver = true
+			end
+		end
+
 		# Normalize method/UFCS into an ordinary call AST so ref/out argument
 		# staging, address passing, and writeback use the same code path.
 		call_expr = ast_new(AstType.Call)
 		call_expr.name = resolved_name
-		if not is_module_call do
+		if not is_module_call and not is_type_receiver do
 			call_expr = ast_add_child(call_expr, recv)
 		end
 		var m_ai = 1
@@ -758,7 +1019,7 @@ func lower_expr_calls(b: MirBuilder, expr: &AstNode, expr_type: AstType):
 				m_p0 = ast_node_child(method_ast, 0)
 				if fat_cstr_eq(ast_node_name(m_p0), "this") do has_explicit_this = true end
 			end
-			if not has_explicit_this and callee_kind == 201 do
+			if not has_explicit_this and callee_kind == 201 and not is_type_receiver do
 				sig_ast = ast_new(AstType.FuncDef)
 				this_param = ast_new(AstType.ParamDef)
 				this_param.name = fat_str_new("this")
