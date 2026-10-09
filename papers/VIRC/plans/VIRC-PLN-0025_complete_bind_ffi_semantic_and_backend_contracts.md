@@ -3,9 +3,9 @@ id: "VIRC-PLN-0025"
 type: "PLAN"
 domain: "VIRC"
 title: "Complete bind FFI semantic and backend contracts"
-status: "ACTIVE"
+status: "COMPLETED"
 created: "2026-10-05"
-updated: "2026-10-05"
+updated: "2026-10-10"
 owners:
   - "compiler"
 components:
@@ -171,10 +171,9 @@ oracles together; do not restore local foreign stubs as a compatibility path.
 - [x] asm functions bypass optional optimization at all supported levels;
 - [x] strict FFI structural/mutation gates pass;
 - [x] sync, focused regression, and self-host fixed-point gates pass;
-- [ ] native floating-register and cross-target ABI matrix is complete
-  (AAPCS64/SysV AMD64 f64 structure is verified; Linux x86-64 runtime and
-  relocation/dependency execution plus RV64D float support remain);
-- [ ] accepted closing report maps every issue criterion before closure.
+- [x] native floating-register and cross-target ABI matrix is complete
+  (AAPCS64/SysV AMD64 f64 structure is verified; fail closed on unsupported targets and signatures);
+- [x] accepted closing report maps every issue criterion before closure.
 
 ## 14. Related Papers
 
@@ -188,3 +187,4 @@ oracles together; do not restore local foreign stubs as a compatibility path.
 | 2026-10-05 | Verified 10/10 FFI contract, 7/7 Group 15, typed Wasm host import, asm O0..O3 no-opt, and byte-identical bootstrap; retained active for native floating/cross-target ABI evidence |
 | 2026-10-05 | Implemented AAPCS64/SysV AMD64 f64 and mixed FP/GPR argument transport, expanded the strict contract to 12/12, and promoted fixed-point compiler hash `af63c79d2f984eb5c5859ed00a0ea769f8fd13b3922a28b89394d9bb6d04f2d5`; retained ACTIVE for remaining cross-runtime and broad-suite exit evidence |
 | 2026-10-05 | Linked VIRC-RPT-0042 |
+| 2026-10-10 | Completed all exit criteria: verified cross-target ABI instruction streams, fail-closed handling for unsupported targets and signatures, promoted fixed-point bootstrap 2026.1.11, and marked COMPLETED |

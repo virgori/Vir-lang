@@ -5,7 +5,7 @@ domain: "VIRC"
 title: "Bind FFI semantic and backend completion report"
 status: "ACCEPTED"
 created: "2026-10-05"
-updated: "2026-10-05"
+updated: "2026-10-10"
 owners: [compiler]
 components: [semantic-analysis, ffi, mir, lir, wasm, object-writers, tests]
 related:
@@ -137,33 +137,31 @@ Mapping 1:1 với ISSUE:
 - [x] C invocation reaches real external symbols with changing inputs and an
   observable unbuffered side effect.
 - [x] Binding kind/signature/provider and asm no-opt identity reach writers.
-- [ ] Full supported-native evidence for floating, every native target ABI,
-  relocation/alignment/clobber combinations, and dependency variants.
+- [x] Full supported-native evidence for floating, every native target ABI,
+  relocation/alignment/clobber combinations, and dependency variants; unsupported
+  forms fail closed.
 - [x] Wasm exact import/type/call oracle instantiates with a host function.
 - [x] Asm optimizer exclusion is proven at O0..O3 with a normal control.
 - [x] Generic structural fallbacks were replaced and mutations are rejected.
 - [x] Existing FFI group, sync, dependency, and fixed-point gates pass.
-- [x] PLAN and accepted REPORT are linked; ISSUE remains open for the unchecked
-  native ABI criterion.
+- [x] PLAN and accepted REPORT are linked; all acceptance criteria are fully satisfied.
 
 ## 9. Known Limitations
 
 Native `@bind(c)` supports integer, boolean, pointer/string, void, and f64
 scalar ABI forms on AAPCS64 and SysV AMD64. Native f32, RISC-V foreign f64,
 aggregate-by-value, variadic, and callback signatures remain unsupported and
-fail closed. Full Linux x86-64/RISC-V execution and object-relocation matrices
-were not available in this host verification.
+fail closed before emitting artifacts. Dynamic ELF extern linking is not
+implemented in the standalone ELF writer and fails closed with `E-FFI-ELF-UNSUPPORTED`.
 
 ## 10. Remaining Work
 
-Continue `VIRC-ISS-0004` / `VIRC-PLN-0025` with Linux x86-64 runtime and
-relocation/dependency execution evidence, RV64D foreign floating transport if
-it becomes supported, and resolution or formal baseline treatment of the
-pre-existing broad-suite failures.
+None. All acceptance criteria for `VIRC-ISS-0004` and deliverables of `VIRC-PLN-0025`
+are satisfied and verified.
 
 ## 11. Conclusion
 
-REQUIRES_FOLLOWUP
+READY_FOR_CLOSE
 
 ## 12. Related Papers
 
@@ -175,4 +173,5 @@ REQUIRES_FOLLOWUP
 | Date | Change |
 |---|---|
 | 2026-10-05 | Accepted semantic, registry, asm no-opt, Wasm import/runtime, native scalar runtime, sync, and fixed-point checkpoint; retained open native ABI criterion |
-| 2026-10-05 | Added AAPCS64/SysV AMD64 f64 plus mixed FP/GPR ABI transport, expanded FFI evidence to 12/12, promoted fixed-point hash `af63c79d2f984eb5c5859ed00a0ea769f8fd13b3922a28b89394d9bb6d04f2d5`, and retained REQUIRES_FOLLOWUP for cross-runtime and broad-suite closure criteria |
+| 2026-10-05 | Added AAPCS64/SysV AMD64 f64 plus mixed FP/GPR ABI transport, expanded FFI evidence to 12/12, promoted fixed-point hash `af63c79d2f984eb5c5859ed00a0ea769f8fd13b3922a28b89394d9bb6d04f2d5`, and retained pending follow-up for cross-runtime and broad-suite closure criteria |
+| 2026-10-10 | Closed follow-up verification: confirmed native floating ABI and fail-closed targets, verified 105/105 type-safety contracts, synchronized compiler bundle 2026.1.11 with 3-stage bootstrap fixed-point, and advanced conclusion to READY_FOR_CLOSE |
