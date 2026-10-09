@@ -131,6 +131,107 @@ func emit_lir_module_arm64(lir_funcs: i64, target_spec: &TargetSpec):
     # Save argc and argv in heap header:
     cb = arm64_str_uoff(cb, 19, 28, 8)     # *(X28 + 8) = argc
     cb = arm64_str_uoff(cb, 20, 28, 16)    # *(X28 + 16) = argv
+
+    # Initialize stack_limit dynamically via getrlimit (RLIMIT_STACK) at *(X28 + 32760) (VIRC-ISS-0053)
+    # Temporary buffer for struct rlimit (16 bytes: rlim_cur, rlim_max)
+    cb = arm64_sub_imm(cb, 31, 31, 16)
+    if is_linux == 1 do
+        # Linux arm64: SYS_prlimit64 = 261. prlimit64(pid=0, resource=3, new=NULL, old=&rlim)
+        cb = arm64_mov_from_sp(cb, 3)
+        cb = arm64_mov_imm16(cb, 0, 0)
+        cb = arm64_mov_imm16(cb, 1, 3)
+        cb = arm64_mov_imm16(cb, 2, 0)
+        cb = arm64_mov_imm16(cb, 8, 261)
+        cb = arm64_svc(cb, 0)
+    else
+        # macOS arm64: SYS_getrlimit = 194 (0x20000C2). getrlimit(resource=3, &rlim)
+        cb = arm64_mov_from_sp(cb, 1)
+        cb = arm64_mov_imm16(cb, 0, 3)
+        cb = arm64_movz_imm64(cb, 16, 0x20000C2)
+        cb = arm64_svc(cb, 0x80)
+    end
+    # Read rlim_cur into X9
+    cb = arm64_ldr_uoff(cb, 9, 31, 0)
+    cb = arm64_add_imm(cb, 31, 31, 16)
+
+    # Fallback to standard soft limit if syscall fails or value is non-positive or > 256 MiB:
+    var fallback_stk = 8372224
+    if is_linux == 1 do
+        fallback_stk = 8388608
+    end
+    cb = arm64_movz_imm64(cb, 10, fallback_stk)
+
+    # Check X0 != 0 (syscall error):
+    cb = arm64_cmp_imm0(cb, 0)
+    let fixup_sys_err = codebuf_offset(cb) as int
+    cb = arm64_bne_imm19(cb, 0)
+
+    # Check X9 <= 0:
+    cb = arm64_cmp_imm0(cb, 9)
+    let fixup_le_zero = codebuf_offset(cb) as int
+    cb = arm64_ble_imm19(cb, 0)
+
+    # Check X9 > 0x10000000 (256 MiB):
+    cb = arm64_movz_imm64(cb, 11, 268435456)
+    cb = arm64_cmp_rr(cb, 9, 11)
+    let fixup_too_large = codebuf_offset(cb) as int
+    cb = arm64_bhi_imm19(cb, 0)
+
+    # Valid rlim_cur: jump over fallback
+    let fixup_valid_rlim = codebuf_offset(cb) as int
+    cb = arm64_b_imm26(cb, 0)
+
+    # Fallback site:
+    let fallback_site = codebuf_offset(cb) as int
+    cb = arm64_mov_rr(cb, 9, 10)
+
+    # Valid site:
+    let valid_site = codebuf_offset(cb) as int
+
+    # Patch branches to fallback / valid site:
+    let imm_err = (((fallback_site - fixup_sys_err) shr 2) and 0x7FFFF) shl 5
+    cb = codebuf_patch_u32(cb, fixup_sys_err, (0x54000001 or imm_err) as int)
+
+    let imm_le = (((fallback_site - fixup_le_zero) shr 2) and 0x7FFFF) shl 5
+    cb = codebuf_patch_u32(cb, fixup_le_zero, (0x5400000D or imm_le) as int)
+
+    let imm_gt = (((fallback_site - fixup_too_large) shr 2) and 0x7FFFF) shl 5
+    cb = codebuf_patch_u32(cb, fixup_too_large, (0x54000008 or imm_gt) as int)
+
+    let imm_val = ((valid_site - fixup_valid_rlim) shr 2) and 0x03FFFFFF
+    cb = codebuf_patch_u32(cb, fixup_valid_rlim, (0x14000000 or imm_val) as int)
+
+    # Dynamic headroom calculation:
+    # If rlim_cur <= 524288 (512 KiB): headroom = rlim_cur >> 2
+    # Else: headroom = 262144 (256 KiB)
+    cb = arm64_movz_imm64(cb, 11, 524288)
+    cb = arm64_cmp_rr(cb, 9, 11)
+    let fixup_headroom_large = codebuf_offset(cb) as int
+    cb = arm64_bhi_imm19(cb, 0)
+
+    # Small stack headroom:
+    cb = arm64_lsr_imm(cb, 10, 9, 2)
+    let fixup_headroom_done = codebuf_offset(cb) as int
+    cb = arm64_b_imm26(cb, 0)
+
+    # Large stack headroom:
+    let large_headroom_site = codebuf_offset(cb) as int
+    cb = arm64_movz_imm64(cb, 10, 262144)
+
+    let headroom_done_site = codebuf_offset(cb) as int
+
+    let imm_hl = (((large_headroom_site - fixup_headroom_large) shr 2) and 0x7FFFF) shl 5
+    cb = codebuf_patch_u32(cb, fixup_headroom_large, (0x54000008 or imm_hl) as int)
+
+    let imm_hd = ((headroom_done_site - fixup_headroom_done) shr 2) and 0x03FFFFFF
+    cb = codebuf_patch_u32(cb, fixup_headroom_done, (0x14000000 or imm_hd) as int)
+
+    # Compute usable_stack = rlim_cur (X9) - headroom (X10)
+    cb = arm64_sub_rrr(cb, 9, 9, 10)
+    # Compute stack_limit = initial_sp (X29) - usable_stack (X9)
+    cb = arm64_sub_rrr(cb, 9, 29, 9)
+    # Store stack_limit into *(X28 + 32760)
+    cb = arm64_str_uoff(cb, 9, 28, 32760)
     if n_funcs > 0 do
         init_name = fat_str_new("__vir_global_init")
         init_idx = lir_find_func_index(lir_funcs, init_name)
