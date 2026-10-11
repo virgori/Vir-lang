@@ -4,8 +4,9 @@
 
 Before editing `.vri` files, search upward from the project/source location for
 the nearest `module.list`. The active resolver also has repository-specific
-fallbacks; inspect `compiler/src/main.vri` and `tools/module_graph.py` before
-describing resolution order.
+fallbacks; inspect `compiler/src/main/module_resolver.vri` and the native
+resolver fixture `tests/module/resolver_test.vri` before describing resolution
+order.
 
 For this repository:
 
@@ -65,31 +66,31 @@ two modules.
 
 ## Checks in this repository
 
-Resolve a canonical module:
+Resolve project modules by compiling the real entry with the active compiler:
 
 ```sh
-python3 tools/module_graph.py --root . --resolve parser
+./bin/virc <project-entry.vri> --check
 ```
 
-Build a graph from an entry module after confirming the registry base. This
-repository fixture is a verified minimal example:
+Run the repository's native module resolver, dependency-closure, and compiler
+project-ingestion gates together:
 
 ```sh
-python3 tools/module_graph.py --root tests/modules --entry flat_shared
+./run_tests.sh 3
 ```
 
-Do not assume `--entry main` is healthy merely because exact project-module
-resolution succeeds. The current graph helper and the compiler's active
-resolver need not share identical stdlib-root handling; a registry-base error
-is a real diagnostic to investigate, not permission to rewrite the path.
+Use `./bin/module-resolver-test` directly only for detailed diagnostics after
+the group has rebuilt it. Do not assume one module is healthy merely because a
+different entry resolves; a registry-base error is a real diagnostic to
+investigate, not permission to rewrite the path.
 
 Check compiler dependency duplication:
 
 ```sh
-python3 tools/check_module_dependencies.py --verbose
+./bin/vir-pass-check
 ```
 
-This checker may fail while `VIRC-ISS-0007` remains open. Preserve and report
+This verifier may fail while `VIRC-ISS-0007` remains open. Preserve and report
 the violations; do not auto-fix unrelated modules during a focused task.
 
 Run from the repository root and from a relevant alternate CWD when a resolver

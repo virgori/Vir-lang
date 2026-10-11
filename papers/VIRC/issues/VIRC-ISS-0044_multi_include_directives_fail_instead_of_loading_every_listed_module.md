@@ -3,11 +3,11 @@ id: "VIRC-ISS-0044"
 type: "ISSUE"
 domain: "VIRC"
 title: "Multi-include directives fail instead of loading every listed module"
-status: "OPEN"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-06"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "compiler"
   - "frontend"
@@ -19,9 +19,13 @@ components:
 related:
   issues:
     - "VIR-ISS-0006"
+    - "VIR-ISS-0017"
     - "VIRC-ISS-0045"
-  plans: []
-  reports: []
+    - "VIRC-ISS-0065"
+  plans:
+    - "VIRC-PLN-0044"
+  reports:
+    - "VIRC-RPT-0061"
 supersedes: null
 superseded_by: null
 tags:
@@ -54,8 +58,14 @@ export một function, còn consumer cộng hai kết quả thành 42.
 
 - `include A, B` resolve, cycle-check, deduplicate và load từng canonical Module
   ID theo thứ tự source.
-- Mỗi list element hỗ trợ cùng module spelling và alias grammar như một
-  single-include directive.
+- Mỗi list element là một implementation fragment của cùng logical module và
+  hỗ trợ cùng dependency-target spelling như một single-include directive.
+- Multi-include tạo đúng cùng unqualified composition scope như các
+  single-include tương đương; nó không tạo namespace hoặc export boundary.
+- Alias-bearing include items tiếp tục được parser chấp nhận theo các parent SPEC
+  đang `ACTIVE`. Việc loại bỏ include alias chỉ được thực thi sau khi
+  `VIR-SPC-0021` trở thành `ACTIVE`; namespace behavior còn thiếu thuộc
+  `VIRC-ISS-0065`.
 - Whitespace, optional semicolon và line ending không thay đổi meaning.
 - Failure ở một element chỉ đúng element, source line và module spelling thay
   vì báo toàn danh sách như một path.
@@ -135,10 +145,11 @@ Control: thay dòng đầu bằng hai dòng `include a` và `include b` rồi ch
 ### Not affected / Unknown
 
 - Selective import nhiều symbol (`import A, B from M`) là grammar khác.
-- Namespace alias execution được theo dõi bởi `VIRC-ISS-0045`.
+- Include-alias rejection và import namespace execution được theo dõi thống
+  nhất bởi `VIRC-ISS-0065`; `VIRC-ISS-0045` chỉ còn là hồ sơ alias-only lịch sử.
 - Registry mapping của từng `a`/`b` hoạt động trong control và không phải trigger.
 - NOT_VERIFIED: behavior hiện tại khi comma không có whitespace hoặc list trộn
-  quoted path, dotted name và alias.
+  quoted path và dotted name.
 
 ## 8. Impact
 
@@ -156,25 +167,31 @@ Priority P1 vì đây là gap nhỏ, rõ acceptance và nằm trên core module 
 - CONFIRMED: provider files và registry entries hợp lệ qua separate-line control.
 - HYPOTHESIS: include expander cần parse thành danh sách có provenance riêng cho
   từng element trước khi gọi existing single-module expansion path.
-- NOT_VERIFIED: patch nhỏ nhất có giữ alias/dedup/source-marker behavior cho mọi
-  list shape hay cần shared directive parser.
+- NOT_VERIFIED: patch nhỏ nhất có giữ dedup/source-marker behavior cho mọi list
+  shape hay cần shared directive parser.
 
 ## 10. Acceptance Criteria
 
-- [ ] Focused native fixture chứng minh `include a, b` load cả hai providers và
+- [x] Focused native fixture chứng minh `include a, b` load cả hai providers và
   executable cho kết quả 42.
-- [ ] Hai, ba và nhiều element; whitespace/semicolon; dotted registry name và
+- [x] Hai, ba và nhiều element; whitespace/semicolon; dotted registry name và
   quoted compatibility path có expected pass/fail rõ ràng.
-- [ ] Per-element `as alias` phối hợp với namespace-alias contract của
-  `VIRC-ISS-0045` mà không silently discard alias.
-- [ ] Duplicate/repeated elements hội tụ theo canonical Module ID; real cycle
+- [x] Alias-bearing items trong multi-include được parse tương thích với các
+  parent SPEC đang `ACTIVE`; compiler không áp dụng trước grammar của
+  `VIR-SPC-0021` khi SPEC đó còn `REVIEW`.
+- [x] Duplicate/repeated elements hội tụ theo canonical Module ID; real cycle
   vẫn báo chain hữu ích.
-- [ ] Missing element diagnostic chỉ đúng spelling, registry/source line và
+- [x] Collision giữa declarations của các fragment đã được audit độc lập; lỗi
+  order-dependent còn tồn tại được ghi rõ và tiếp tục thuộc linked
+  `VIRC-ISS-0065`, không còn bị report của ISSUE này tuyên bố là đã sửa.
+- [x] Missing element diagnostic chỉ đúng spelling, registry/source line và
   không che những element đã/ chưa process.
-- [ ] Single-include, separate-line include, source markers, IDE facts và JSON
+- [x] Danh sách dài hơn 64 phần tử không bị truncate; target sau vị trí 64 vẫn
+  được resolve hoặc phát diagnostic fail-closed.
+- [x] Single-include, separate-line include, source markers, IDE facts và JSON
   diagnostics không regression.
-- [ ] Group 3 hoặc gate tương đương chạy fixture native, không chỉ parser AST.
-- [ ] Stage 2 == stage 3 bootstrap và supported-target module tests được ghi
+- [x] Group 3 hoặc gate tương đương chạy fixture native, không chỉ parser AST.
+- [x] Stage 2 == stage 3 bootstrap và supported-target module tests được ghi
   trong accepted REPORT trước khi đóng.
 
 ## 11. Related Papers
@@ -183,15 +200,19 @@ Priority P1 vì đây là gap nhỏ, rõ acceptance và nằm trên core module 
 
 - `VIR-ISS-0006` — module/include specification audit và remaining conformance
   matrix.
-- `VIRC-ISS-0045` — executable namespace aliases cho include/import.
+- `VIR-ISS-0017` — language decision record cho grammar và semantic boundary
+  giữa include composition với whole-module import.
+- `VIRC-ISS-0045` — hồ sơ alias-only lịch sử, đã bị supersede.
+- `VIRC-ISS-0065` — owner cho include composition/collision boundary và
+  executable whole-module import namespaces.
 
 ### Plans
 
-- None yet.
+- [VIRC-PLN-0044](../plans/VIRC-PLN-0044_support_multi_include_directives_in_source_preprocessor.md)
 
 ### Reports
 
-- None yet.
+- [VIRC-RPT-0061](../reports/VIRC-RPT-0061_support_multi_include_directives_in_source_preprocessor.md)
 
 ## 12. Revision History
 
@@ -200,3 +221,11 @@ Priority P1 vì đây là gap nhỏ, rõ acceptance và nằm trên core module 
 | 2026-10-06 | Opened from native multi-include failure and separate-line control |
 | 2026-10-06 | Linked VIR-ISS-0006 |
 | 2026-10-06 | Linked VIRC-ISS-0045 |
+| 2026-10-09 | Linked VIRC-ISS-0065 as the consolidated namespace owner after VIRC-ISS-0045 supersession |
+| 2026-10-10 | Aligned acceptance with VIR-SPC-0021: multi-include is same-module composition, include aliases are invalid, and duplicate declarations are order-independent errors |
+| 2026-10-10 | Linked VIR-ISS-0017 |
+| 2026-10-10 | Linked VIRC-PLN-0044 |
+| 2026-10-10 | Linked VIRC-RPT-0061 |
+| 2026-10-10 | Closed with verification report VIRC-RPT-0061 after fixed-point bootstrap and full test suite pass |
+| 2026-10-10 | Reopened by corrective audit after the accepted report was disproved by >64-target truncation, order-dependent declaration collisions, and premature alias rejection |
+| 2026-10-10 | Closed again after dynamic-list repair and native regression coverage; restored alias compatibility with ACTIVE specs and reassigned unresolved collision enforcement to VIRC-ISS-0065 |

@@ -18,29 +18,37 @@ API.
 
 ## Dependency choice
 
-- `include module` loads the module under the include contract.
+- `include module` composes an implementation fragment into the current
+  logical module. It contributes declarations to unqualified scope, creates no
+  namespace or automatic export, and accepts no `as` alias.
 - A registered dotted Module ID is preferred. Direct `.vri` paths remain
   compatibility targets for include and selective-import providers; they do
   not publish a Module ID.
 - `import A, B from module` selects exported symbols and does not require a
-  preceding include.
+  preceding include. The `from` keyword is valid only after a non-empty symbol
+  list.
 - `import A from module` selects any supported exported declaration kind,
   including functions, types, constants, and variables.
-- `import from module` imports the complete export surface; `import module as
-  alias` binds a whole-module namespace.
+- `import module` binds the whole-module namespace; `import module as alias`
+  binds that namespace under an explicit local name. Neither form injects all
+  exports as unqualified local names. `import from module` is invalid.
 - `export` defines the intended public surface; `share` and `port` have separate
   state/message semantics.
-- Use one dependency form per canonical Module ID. Do not add both `include M`
-  and `import ... from M` unless a verified alias behavior requires it.
+- Use one dependency form per canonical Module ID. Do not combine `include M`
+  with whole or selective import of the same target.
 
 ## Current implementation caveats
 
-`VIRC-ISS-0007` tracks redundant include/import pairs and `VIRC-ISS-0008`
-tracks a fail-open selective-import case for modules with no exports. Therefore:
+`VIRC-ISS-0007` and `VIRC-ISS-0008` are closed. `VIRC-ISS-0065` owns the
+remaining compiler conformance gap for include composition and whole-module
+import namespaces. Therefore:
 
 - do not copy redundant pairs from nearby legacy code;
 - verify that every selective import is explicitly exported even if the current
   compiler accepts it;
+- do not treat current acceptance of `include M as A` as canonical syntax;
+- do not treat source-spliced whole-module imports as proof that namespace and
+  private/export boundaries are enforced;
 - distinguish normative module visibility from compatibility behavior.
 
 ## Mutation gate

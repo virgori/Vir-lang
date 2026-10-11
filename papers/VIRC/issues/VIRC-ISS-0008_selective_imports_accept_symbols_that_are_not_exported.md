@@ -3,11 +3,11 @@ id: "VIRC-ISS-0008"
 type: "ISSUE"
 domain: "VIRC"
 title: "Selective imports accept symbols that are not exported"
-status: "OPEN"
+status: "CLOSED"
 severity: "S1"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "VIRC"
 components:
@@ -21,8 +21,10 @@ related:
     - "VIR-ISS-0006"
     - "VIRC-ISS-0007"
     - "VIRC-ISS-0046"
-  plans: []
-  reports: []
+  plans:
+    - "VIRC-PLN-0043"
+  reports:
+    - "VIRC-RPT-0060"
 supersedes: null
 superseded_by: null
 tags:
@@ -195,24 +197,24 @@ behavior.
 
 ## 10. Acceptance Criteria
 
-- [ ] A selective import of any symbol from a module with no exports fails with
+- [x] A selective import of any symbol from a module with no exports fails with
   `E2113` (or a more specific stable diagnostic) at the import site.
-- [ ] A selective import of an explicitly exported symbol succeeds without a
+- [x] A selective import of an explicitly exported symbol succeeds without a
   preceding include.
-- [ ] A selective import of an existing but non-exported symbol fails whether
+- [x] A selective import of an existing but non-exported symbol fails whether
   or not the provider exports other symbols.
-- [ ] A preceding include, registry alias, compatible path spelling, repeated
+- [x] A preceding include, registry alias, compatible path spelling, repeated
   import, or diamond dependency cannot bypass export enforcement.
-- [ ] Diagnostics identify the requested symbol and canonical module identity
+- [x] Diagnostics identify the requested symbol and canonical module identity
   in classic and JSON modes; IDE facts do not report the failed import as a
   valid public binding.
-- [ ] Project and stdlib fixtures cover modules with zero exports, partial
+- [x] Project and stdlib fixtures cover modules with zero exports, partial
   export lists, aliases, entities/enums/constants/functions, and missing
   symbols.
-- [ ] Existing compiler/stdlib modules that intentionally expose APIs gain
+- [x] Existing compiler/stdlib modules that intentionally expose APIs gain
   explicit export declarations; no blanket export-all fallback remains for
   selective imports.
-- [ ] Modular and generated compiler sources are synchronized and stage 2 ==
+- [x] Modular and generated compiler sources are synchronized and stage 2 ==
   stage 3 under the repository self-host fixed-point contract.
 
 ## 11. Related Papers
@@ -234,7 +236,7 @@ behavior.
 
 ### Reports
 
-- None.
+- `VIRC-RPT-0060` — implementation and corrective verification report.
 
 ## 12. Revision History
 
@@ -245,3 +247,5 @@ behavior.
 | 2026-10-06 | Linked VIR-ISS-0005 |
 | 2026-10-06 | Linked VIRC-ISS-0046 |
 | 2026-10-06 | Linked VIR-ISS-0006 |
+| 2026-10-10 | Linked VIRC-PLN-0043 |
+| 2026-10-10 | Closed after fail-closed import enforcement, origin-aware nested dependency visibility, repeated-alias correction, fixed-point bootstrap, and native contract verification |

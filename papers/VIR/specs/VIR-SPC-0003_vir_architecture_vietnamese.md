@@ -2,13 +2,13 @@
 id: "VIR-SPC-0003"
 type: "SPEC"
 domain: "VIR"
-title: "Vir – Architecture Specification (Đặc tả Kiến trúc Vir v2.0)"
+title: "Vir – Architecture Specification (Đặc tả Kiến trúc Vir v2.2)"
 status: "ACTIVE"
-version: "2.0.1"
+version: "2.2.0"
 language: "vi"
 spec_class: "ARCHITECTURE"
 created: "2026-09-09"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "VIR"
   - "VIRC"
@@ -16,19 +16,23 @@ components: []
 aliases:
   - "docs/ARCHITECTURE_vi.md"
 related:
-  issues: []
-  plans: []
-  reports: []
+  issues:
+    - "VIR-ISS-0014"
+    - "VIR-ISS-0018"
+  plans:
+    - "VIR-PLN-0001"
+  reports:
+    - "VIR-RPT-0001"
 supersedes: null
 superseded_by: null
 tags:
   - "migrated-from-docs"
 ---
 
-# VIR-SPC-0003 — Vir – Architecture Specification (Đặc tả Kiến trúc Vir v2.0)
+# VIR-SPC-0003 — Vir – Architecture Specification (Đặc tả Kiến trúc Vir v2.2)
 
-> **Phiên bản:** 2.0.1 (Self-Hosted / Production)
-> **Cập nhật:** 2026-10-06
+> **Phiên bản:** 2.2.0 (Self-Hosted / Production)
+> **Cập nhật:** 2026-10-10
 > **Chuẩn ngôn ngữ:** Vir Language Specification v2.0 (§1.2, §26, §29, §30)  
 > **Trạng thái:** Tự lưu trữ hoàn toàn (Self-Hosted Sovereign Compiler) — Zero Python, Zero C shims, Zero libc, Zero External Linker.  
 > **Bản tiếng Anh (English Version):** [ARCHITECTURE.md](VIR-SPC-0001_vir_architecture.md) | [ARCHITECTURE_en.md](VIR-SPC-0002_vir_architecture_english.md)
@@ -115,8 +119,8 @@ Vir là ngôn ngữ lập trình hệ thống và AI-native hiệu năng cao, đ
    - Bộ Lexer của Vir là lexer đơn ngữ chuẩn, quét trực tiếp chuỗi ký tự UTF-8, không phân nhánh N-gram và không map từ khóa địa phương. Điều này bảo đảm tính nhất quán toán học, tốc độ phân tích siêu nhanh và loại bỏ hoàn toàn các nhập nhằng ngữ nghĩa.
 
 3. **Cú pháp Khối Nghiêm ngặt (Block Structure Law):**
-   - **Định nghĩa / Khai báo** (`func`, `entity`, `enum`, `register`, `mold`, `method`, v.v.) → bắt buộc đóng bằng **`end.`**
-   - **Luồng điều khiển / Câu lệnh** (`if`, `when`, `for`, `loop`, `case`, `try`, `arena`, v.v.) → bắt buộc đóng bằng **`end`**
+   - **Định nghĩa / Khai báo top-level** (`func`, `entity`, `enum`, `register`, `mold`, v.v.) → bắt buộc đóng bằng **`end.`**
+   - **Member lồng / Luồng điều khiển / Câu lệnh** (`method` trong entity, `if`, `when`, `for`, `loop`, `case`, `try`, `arena`, v.v.) → bắt buộc đóng bằng **`end`**. `method` cấp module là không hợp lệ; cơ chế mở rộng độc lập dùng `func` qua UFCS.
    - **Mở khối:**
      - Có biểu thức trước thân khối → sử dụng **`do`** hoặc **`loop`** (`if cond do`, `when cond loop`, `for i in 0..10 do`).
      - Không có biểu thức trước thân khối → sử dụng dấu hai chấm **`:`** (`func main:`, `try:`, `arena:`).
@@ -125,8 +129,8 @@ Vir là ngôn ngữ lập trình hệ thống và AI-native hiệu năng cao, đ
 4. **Hệ thống AI / ML Tích hợp Cấp Ngôn ngữ (Spec v2.0 §26):**
    - Hạng tử `tensor<T>[Dimensions...]` là kiểu dữ liệu hạng nhất (first-class type).
    - Toán tử nhân ma trận MatMul `**` và FMA `><` được hỗ trợ ở cấp độ phần cứng thông qua SIMD NEON / AVX.
-   - Hỗ trợ khối phân tách tính toán: `infer:` (tối ưu suy luận không gradient) và `train:` (tự động theo dõi đồ thị tính toán).
-   - Tích hợp vi phân tự động (Tape Autodiff) với `backward()` và lượng tử hóa đa bit `quantize(t, bits)`.
+   - Hỗ trợ khối phân tách tính toán: `infer:` (forward-only không gradient) và `train:` (reverse-mode autodiff ahead-of-time).
+   - Tích hợp AOT autodiff với `backward()` và lượng tử hóa đa bit `quantize(t, bits)`.
 
 ---
 
@@ -482,16 +486,23 @@ ightarrow [M, N]$).
 
 ### 7.3. Khối Ngữ cảnh Thực thi AI
 - **Khối `infer:` (Suy luận tối ưu):**
-  - Tắt hoàn toàn việc ghi vết đồ thị vi phân (zero autodiff overhead).
+  - Chỉ sinh forward code; không derivative program hay backward-only state.
   - Sử dụng chiến lược tái sử dụng bộ nhớ đệm (activation buffer reuse) để giảm thiểu footprint RAM.
 - **Khối `train:` (Huấn luyện có đạo hàm):**
-  - Tự động kích hoạt cơ chế theo dõi đồ thị tính toán (Gradient Tape).
-  - Mọi tensor tham số được tự động cấp phát trường `.grad` để tích luỹ gradient.
+  - Compiler xây operation graph typed/static và sinh forward/reverse program
+    liên kết trước target codegen.
+  - Gradient là tensor native thông thường; activation và execution state do
+    compiler lập kế hoạch, không kích hoạt runtime graph tape.
 
-### 7.4. Động cơ Vi phân Tự động (Tape Autodiff & `backward()`)
-- Hỗ trợ vi phân tự động chiều ngược (Reverse-mode Automatic Differentiation).
-- Trong khối `train:`, mỗi thao tác toán học trên tensor sẽ ghi lại một nút toán tử và các tham chiếu đầu vào vào băng vi phân (computation tape).
-- Khi gọi `loss.backward()`, động cơ duyệt ngược đồ thị tính toán từ đỉnh mục tiêu, áp dụng quy tắc dây chuyền (chain rule) để tính toán đạo hàm riêng cho từng tham số và lưu vào `.grad`.
+### 7.4. Vi phân Tự động Chiều ngược Ahead-of-Time (`backward()`)
+- Transformation trên typed HIR/MIR/SSA sinh các reverse operation theo thứ tự
+  phụ thuộc ngược tĩnh và direct target kernel cho operator được hỗ trợ.
+- `loss.backward()` đi vào reverse program đã sinh. Contribution fan-out được
+  cộng vào gradient tensor thông thường; không có runtime operator node,
+  parent-link traversal hay implicit tracing fallback.
+- Dynamic control flow dùng AOT reverse CFG cùng execution state gọn khi target
+  hỗ trợ. Operation, shape, effect hoặc target chưa hỗ trợ phải fail trước
+  artifact emission theo VIR-SPC-0017/0018 §26.4.
 
 ### 7.5. Nguyên thuỷ Lượng tử hoá Đa bit (`quantize`)
 - Hàm nguyên thuỷ `quantize(tensor, target_format)` hỗ trợ chuyển đổi tensor số thực chính xác cao sang các định dạng tiết kiệm tài nguyên:
@@ -659,5 +670,7 @@ end.
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-10 | 2.2.0 | Phân loại method trong entity là khối lồng đóng bằng `end`, dành `end.` cho khai báo sở hữu và loại `method` cấp module theo VIR-ISS-0018 |
+| 2026-10-08 | 2.1.0 | Thay runtime tape bằng AOT typed-IR reverse transformation, native gradient storage và fail-closed target capability rules |
 | 2026-10-06 | 2.0.1 | Sửa phân loại toán tử: `>>` là cast; dịch bit chỉ dùng `shl` và `shr` |
 | 2026-10-02 | 2.0.0 | Migrated from `docs/ARCHITECTURE_vi.md` and assigned stable ID `VIR-SPC-0003` |

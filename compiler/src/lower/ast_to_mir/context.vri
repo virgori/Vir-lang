@@ -11,6 +11,7 @@ include ffi_imports
 include type_table
 include mir
 import print_str, print_ln, g_disable_specialization, g_has_custom_entry, g_entry_function_name from compiler.context
+import is_module_namespace, module_alias_resolve from names_context
 
 var g_ast_lower_verbose: int = 0
 var g_lower_expr_result_opnd: i64 = 0
@@ -219,6 +220,12 @@ var g_field_indices: i64 = 0
 var g_register_field_names: i64 = 0
 var g_register_field_starts: i64 = 0
 var g_register_field_widths: i64 = 0
+var g_register_names: i64 = 0
+var g_register_hash: i64 = 0
+var g_scoped_regfield_names: i64 = 0
+var g_scoped_regfield_starts: i64 = 0
+var g_scoped_regfield_widths: i64 = 0
+var g_scoped_regfield_hash: i64 = 0
 var g_builtin_lookup_buckets: i64 = 0
 var g_mir_scratch_args: i64 = 0
 var g_mir_scratch_top: i64 = 0
@@ -239,6 +246,96 @@ var g_in_func_cleanup: i64 = 0
 var g_arena_mark_stack: i64 = 0   # Vec<i64> — created lazily
 var g_arena_escaped_stack: i64 = 0 # Vec<i64> — created lazily
 var g_try_arena_depth: i64 = 0
+
+# AOT reverse-mode lowering state.  This is compiler state, not a runtime
+# computation tape: tensor operators append typed/static records while a
+# `train` block is lowered, and `.backward()` consumes those records to emit
+# direct reverse kernels in source MIR order.
+var g_lower_ai_mode: i64 = 0
+var g_ad_node_out: i64 = 0
+var g_ad_node_left: i64 = 0
+var g_ad_node_right: i64 = 0
+var g_ad_node_aux: i64 = 0
+var g_ad_alias_from: i64 = 0
+var g_ad_alias_to: i64 = 0
+var g_ad_grad_primal: i64 = 0
+var g_ad_grad_value: i64 = 0
+var g_ad_has_dynamic_control: i64 = 0
+
+func ad_graph_reset():
+	g_ad_node_out = vec_new_rt()
+	g_ad_node_left = vec_new_rt()
+	g_ad_node_right = vec_new_rt()
+	g_ad_node_aux = vec_new_rt()
+	g_ad_alias_from = vec_new_rt()
+	g_ad_alias_to = vec_new_rt()
+	g_ad_grad_primal = vec_new_rt()
+	g_ad_grad_value = vec_new_rt()
+	g_ad_has_dynamic_control = 0
+end.
+
+func ad_canonical_vreg(vreg: i64):
+	var current = vreg
+	var depth = 0
+	when depth < 64 loop
+		var found = false
+		var i = vec_len_rt(g_ad_alias_from) - 1
+		when i >= 0 loop
+			if vec_get_rt(g_ad_alias_from, i) == current do
+				current = vec_get_rt(g_ad_alias_to, i)
+				found = true
+				i = 0 - 1
+			else
+				i = i - 1
+			end
+		end
+		if not found do out current end
+		depth = depth + 1
+	end
+	out current
+end.
+
+func ad_record_alias(dst_vreg: i64, src_vreg: i64):
+	if g_lower_ai_mode != 2 do out 0 end
+	let canonical = ad_canonical_vreg(src_vreg)
+	if dst_vreg != canonical do
+		g_ad_alias_from = vec_push_rt(g_ad_alias_from, dst_vreg)
+		g_ad_alias_to = vec_push_rt(g_ad_alias_to, canonical)
+	end
+	out 0
+end.
+
+func ad_record_matmul(out_vreg: i64, left_vreg: i64, right_vreg: i64, aux: i64):
+	if g_lower_ai_mode != 2 do out 0 end
+	g_ad_node_out = vec_push_rt(g_ad_node_out, out_vreg)
+	g_ad_node_left = vec_push_rt(g_ad_node_left, ad_canonical_vreg(left_vreg))
+	g_ad_node_right = vec_push_rt(g_ad_node_right, ad_canonical_vreg(right_vreg))
+	g_ad_node_aux = vec_push_rt(g_ad_node_aux, aux)
+	out 0
+end.
+
+func ad_grad_reset():
+	g_ad_grad_primal = vec_new_rt()
+	g_ad_grad_value = vec_new_rt()
+end.
+
+func ad_grad_get(primal_vreg: i64):
+	let canonical = ad_canonical_vreg(primal_vreg)
+	var i = vec_len_rt(g_ad_grad_primal) - 1
+	when i >= 0 loop
+		if vec_get_rt(g_ad_grad_primal, i) == canonical do
+			out vec_get_rt(g_ad_grad_value, i)
+		end
+		i = i - 1
+	end
+	out 0 - 1
+end.
+
+func ad_grad_set(primal_vreg: i64, grad_vreg: i64):
+	g_ad_grad_primal = vec_push_rt(g_ad_grad_primal, ad_canonical_vreg(primal_vreg))
+	g_ad_grad_value = vec_push_rt(g_ad_grad_value, grad_vreg)
+	out 0
+end.
 
 var g_entity_hash: i64 = 0
 var g_import_hash: i64 = 0
@@ -653,6 +750,12 @@ func set_global_prog_ast(ast: &AstNode):
     g_register_field_names = vec_new_rt()
     g_register_field_starts = vec_new_rt()
     g_register_field_widths = vec_new_rt()
+    g_register_names = vec_new_rt()
+    g_register_hash = hash_table_new()
+    g_scoped_regfield_names = vec_new_rt()
+    g_scoped_regfield_starts = vec_new_rt()
+    g_scoped_regfield_widths = vec_new_rt()
+    g_scoped_regfield_hash = hash_table_new()
 
     g_entity_hash = hash_table_new()
     g_import_hash = hash_table_new()
@@ -808,6 +911,15 @@ func set_global_prog_ast(ast: &AstNode):
                     g_const_values = vec_push_rt(g_const_values, vval)
                     hash_table_insert(g_const_hash, g_const_names, key, idx)
                 end
+                if is_user_module(cur_module) == 1 do
+                    let qual_vkey = fat_str_concat(fat_str_concat(cur_module, dot_str), key)
+                    if hash_table_lookup(g_const_hash, g_const_names, qual_vkey) < 0 do
+                        let qidx2 = vec_len_rt(g_const_names)
+                        g_const_names = vec_push_rt(g_const_names, qual_vkey as i64)
+                        g_const_values = vec_push_rt(g_const_values, vval)
+                        hash_table_insert(g_const_hash, g_const_names, qual_vkey, qidx2)
+                    end
+                end
                 vi = vi + 1
             end
         end
@@ -821,6 +933,15 @@ func set_global_prog_ast(ast: &AstNode):
                     g_const_names = vec_push_rt(g_const_names, const_name as i64)
                     g_const_values = vec_push_rt(g_const_values, val)
                     hash_table_insert(g_const_hash, g_const_names, const_name, idx)
+                end
+                if is_user_module(cur_module) == 1 do
+                    let qual_const = fat_str_concat(fat_str_concat(cur_module, fat_str_new(".")), const_name)
+                    if hash_table_lookup(g_const_hash, g_const_names, qual_const) < 0 do
+                        let qidx = vec_len_rt(g_const_names)
+                        g_const_names = vec_push_rt(g_const_names, qual_const as i64)
+                        g_const_values = vec_push_rt(g_const_values, val)
+                        hash_table_insert(g_const_hash, g_const_names, qual_const, qidx)
+                    end
                 end
             end
         end
@@ -843,6 +964,13 @@ func set_global_prog_ast(ast: &AstNode):
             entity_name = ast_node_name(child)
             var is_packed = 0
             if child_type == AstType.PackedDef do is_packed = 1 end
+            if child_type == AstType.RegisterDef do
+                if hash_table_lookup(g_register_hash, g_register_names, entity_name) < 0 do
+                    let r_idx = vec_len_rt(g_register_names)
+                    g_register_names = vec_push_rt(g_register_names, entity_name as i64)
+                    hash_table_insert(g_register_hash, g_register_names, entity_name, r_idx)
+                end
+            end
             if hash_table_lookup(g_entity_hash, g_entity_names, entity_name) < 0 do
                 idx = vec_len_rt(g_entity_names)
                 g_entity_names = vec_push_rt(g_entity_names, entity_name as i64)
@@ -851,18 +979,44 @@ func set_global_prog_ast(ast: &AstNode):
                 g_entity_nodes = vec_push_rt(g_entity_nodes, child as i64)
                 hash_table_insert(g_entity_hash, g_entity_names, entity_name, idx)
             end
+            if is_user_module(cur_module) == 1 do
+                let qual_ent = fat_str_concat(fat_str_concat(cur_module, fat_str_new(".")), entity_name)
+                if hash_table_lookup(g_entity_hash, g_entity_names, qual_ent) < 0 do
+                    let qe_idx = vec_len_rt(g_entity_names)
+                    g_entity_names = vec_push_rt(g_entity_names, qual_ent as i64)
+                    g_entity_is_packed = vec_push_rt(g_entity_is_packed, is_packed)
+                    g_entity_sizes = vec_push_rt(g_entity_sizes, 0)
+                    g_entity_nodes = vec_push_rt(g_entity_nodes, child as i64)
+                    hash_table_insert(g_entity_hash, g_entity_names, qual_ent, qe_idx)
+                end
+            end
             field_count = ast_node_child_count(child)
             var j = 0
             var actual_field_idx = 0
             when j < field_count loop
                 field = ast_node_child(child, j)
                 if ast_node_type_of(field) == AstType.FuncDef do
+                    if child.builtin_id != 0 do
+                        if field.builtin_id == 0 do
+                            field.builtin_id = child.builtin_id
+                        else
+                            let ent_p = child.builtin_id as string
+                            let m_p = field.builtin_id as string
+                            field.builtin_id = fat_str_concat(fat_str_concat(ent_p, fat_str_new(", ")), m_p) as int
+                        end
+                    end
                     method_key = qualified_member_name(entity_name, ast_node_name(field))
                     if hash_table_lookup(g_scoped_method_hash, g_scoped_method_names, method_key) < 0 do
                         method_idx = vec_len_rt(g_scoped_method_names)
                         g_scoped_method_names = vec_push_rt(g_scoped_method_names, method_key as i64)
                         g_scoped_method_nodes = vec_push_rt(g_scoped_method_nodes, field as i64)
                         hash_table_insert(g_scoped_method_hash, g_scoped_method_names, method_key, method_idx)
+                    end
+                    if hash_table_lookup(g_func_ast_hash, g_func_ast_names, method_key) < 0 do
+                        fn_idx = vec_len_rt(g_func_ast_names)
+                        g_func_ast_names = vec_push_rt(g_func_ast_names, method_key as i64)
+                        g_func_ast_nodes = vec_push_rt(g_func_ast_nodes, field as i64)
+                        hash_table_insert(g_func_ast_hash, g_func_ast_names, method_key, fn_idx)
                     end
                 else
                     field_name = ast_node_name(field)
@@ -891,14 +1045,24 @@ func set_global_prog_ast(ast: &AstNode):
                         g_field_indices = vec_push_rt(g_field_indices, actual_field_idx)
                         hash_table_insert(g_field_hash, g_field_names, field_name, idx)
                     end
-                    if child_type == AstType.RegisterDef and hash_table_lookup(g_regfield_hash, g_register_field_names, field_name) < 0 do
+                    if child_type == AstType.RegisterDef do
                         width = ast_node_builtin_id(field)
                         if width <= 0 do width = 1 end
-                        idx = vec_len_rt(g_register_field_names)
-                        g_register_field_names = vec_push_rt(g_register_field_names, field_name as i64)
-                        g_register_field_starts = vec_push_rt(g_register_field_starts, ast_node_int_val(field))
-                        g_register_field_widths = vec_push_rt(g_register_field_widths, width)
-                        hash_table_insert(g_regfield_hash, g_register_field_names, field_name, idx)
+                        let reg_scoped_key = qualified_member_name(entity_name, field_name)
+                        if hash_table_lookup(g_scoped_regfield_hash, g_scoped_regfield_names, reg_scoped_key) < 0 do
+                            let s_idx = vec_len_rt(g_scoped_regfield_names)
+                            g_scoped_regfield_names = vec_push_rt(g_scoped_regfield_names, reg_scoped_key as i64)
+                            g_scoped_regfield_starts = vec_push_rt(g_scoped_regfield_starts, ast_node_int_val(field))
+                            g_scoped_regfield_widths = vec_push_rt(g_scoped_regfield_widths, width)
+                            hash_table_insert(g_scoped_regfield_hash, g_scoped_regfield_names, reg_scoped_key, s_idx)
+                        end
+                        if hash_table_lookup(g_regfield_hash, g_register_field_names, field_name) < 0 do
+                            idx = vec_len_rt(g_register_field_names)
+                            g_register_field_names = vec_push_rt(g_register_field_names, field_name as i64)
+                            g_register_field_starts = vec_push_rt(g_register_field_starts, ast_node_int_val(field))
+                            g_register_field_widths = vec_push_rt(g_register_field_widths, width)
+                            hash_table_insert(g_regfield_hash, g_register_field_names, field_name, idx)
+                        end
                     end
                     actual_field_idx = actual_field_idx + 1
                 end
@@ -964,30 +1128,41 @@ func find_func_ast(fn_name: &string):
         if s_ptr != 0 and g_func_ast_names != 0 do
             let c_len = native_read_i64(s_ptr, 8) as int
             let c_cstr = native_read_i64(s_ptr, 0) as int
-            let n_fn = vec_len_rt(g_func_ast_names)
-            var k_fn = 0
-            when k_fn < n_fn loop
-                let cand_ptr = vec_get_rt(g_func_ast_names, k_fn) as int
-                if cand_ptr != 0 do
-                    let cand_len = native_read_i64(cand_ptr, 8) as int
-                    let cand_cstr = native_read_i64(cand_ptr, 0) as int
-                    if cand_len > c_len + 1 and c_cstr != 0 and cand_cstr != 0 do
-                        if native_read_u8(cand_cstr, cand_len - c_len - 1) == 46 do
-                            var match = 1
-                            var ci = 0
-                            when ci < c_len loop
-                                if native_read_u8(cand_cstr, cand_len - c_len + ci) != native_read_u8(c_cstr, ci) do
-                                    match = 0
+            if c_len > 0 and c_cstr != 0 do
+                let n_fn = vec_len_rt(g_func_ast_names)
+                var k_fn = 0
+                var match_count = 0
+                var found_node = 0 as AstNode
+                when k_fn < n_fn loop
+                    let cand_ptr = vec_get_rt(g_func_ast_names, k_fn) as int
+                    if cand_ptr != 0 do
+                        let cand_len = native_read_i64(cand_ptr, 8) as int
+                        let cand_cstr = native_read_i64(cand_ptr, 0) as int
+                        if cand_len > c_len + 1 and cand_cstr != 0 do
+                            if native_read_u8(cand_cstr, cand_len - c_len - 1) == 46 do
+                                var match = 1
+                                var ci = 0
+                                when ci < c_len loop
+                                    if native_read_u8(cand_cstr, cand_len - c_len + ci) != native_read_u8(c_cstr, ci) do
+                                        match = 0
+                                    end
+                                    ci = ci + 1
                                 end
-                                ci = ci + 1
-                            end
-                            if match == 1 do
-                                out vec_get_rt(g_func_ast_nodes, k_fn) as AstNode
+                                if match == 1 do
+                                    let pmod = fat_str_slice(cand_ptr as string, 0, cand_len - c_len - 1)
+                                    if is_module_namespace(pmod) == 0 do
+                                        match_count = match_count + 1
+                                        found_node = vec_get_rt(g_func_ast_nodes, k_fn) as AstNode
+                                    end
+                                end
                             end
                         end
                     end
+                    k_fn = k_fn + 1
                 end
-                k_fn = k_fn + 1
+                if match_count == 1 do
+                    out found_node
+                end
             end
         end
     end

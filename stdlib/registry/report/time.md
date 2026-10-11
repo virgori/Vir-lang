@@ -9,7 +9,7 @@
 - Public **only** `time.<method>` + types `Duration`, `Timer`.
 - Monotonic stamp: **`int` nanoseconds** (`time.now()`), not wall clock.
 - Wall: `time.unixSecs` / `unixMs` / `unixNs`.
-- Sleep / `timerStop`: **`Result`** (`Ok(0)` / `Err` invalid or platform fail).
+- Sleep / `timerStop`: **`Result`** (`Success(0)` / `Failure` invalid or platform fail).
 - Legacy free aliases (`now`, `duration_*`, `time_now`, `Instant`, …) **removed**; dependents migrated in-tree.
 
 ## Rename (registry)

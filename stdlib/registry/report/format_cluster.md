@@ -51,8 +51,8 @@ format.hex(255)
 include parse
 import parse from parse
 case parse.intRadix("0xff", 16)
-    Result.Ok(n): …
-    Result.Err(_): …
+    Result.Success(n): …
+    Result.Failure(_): …
 end
 
 include fmt
@@ -60,7 +60,7 @@ import fmt from fmt
 args = vec_new of (FmtArg)()
 vec_push of (FmtArg)(&args, fmt.int(42))
 case fmt.format("val=$0", args)
-    Result.Ok(s): …
+    Result.Success(s): …
 end
 ```
 

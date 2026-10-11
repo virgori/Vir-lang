@@ -3,11 +3,11 @@ id: "VIRC-ISS-0045"
 type: "ISSUE"
 domain: "VIRC"
 title: "Include and whole-module import aliases do not create executable namespaces"
-status: "OPEN"
+status: "REJECTED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-06"
-updated: "2026-10-06"
+updated: "2026-10-09"
 owners:
   - "compiler"
   - "frontend"
@@ -24,7 +24,7 @@ related:
   plans: []
   reports: []
 supersedes: null
-superseded_by: null
+superseded_by: "VIRC-ISS-0065"
 tags:
   - "include"
   - "import"
@@ -34,6 +34,12 @@ tags:
 ---
 
 # VIRC-ISS-0045 — Include and whole-module import aliases do not create executable namespaces
+
+> **Disposition:** The defect and evidence remain valid, but this paper is no
+> longer an independent implementation target. `VIRC-ISS-0065` supersedes it
+> and owns both default and aliased module namespace binding. `REJECTED` is the
+> terminal ISSUE state used because VPS does not define an ISSUE-level
+> `SUPERSEDED` status.
 
 ## 1. Summary
 
@@ -192,6 +198,11 @@ resolver, visibility, IDE và canonical module identity.
 
 - None yet.
 
+### Supersession
+
+- `VIRC-ISS-0065` — consolidated owner for default and aliased compile-time
+  module namespaces, collision isolation, visibility, and migration.
+
 ## 12. Revision History
 
 | Date | Change |
@@ -200,3 +211,5 @@ resolver, visibility, IDE và canonical module identity.
 | 2026-10-06 | Linked VIRC-ISS-0044 |
 | 2026-10-06 | Linked VIR-ISS-0006 |
 | 2026-10-06 | Linked VIRC-ISS-0046 |
+| 2026-10-09 | Linked VIRC-ISS-0065 |
+| 2026-10-09 | Superseded by VIRC-ISS-0065 and moved to REJECTED so this evidence remains historical but receives no separate PLAN or implementation |

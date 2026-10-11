@@ -3,9 +3,9 @@ id: "VIRC-PLN-0028"
 type: "PLAN"
 domain: "VIRC"
 title: "Toolchain sysroot discovery and CWD-independent standard library resolution"
-status: "ACTIVE"
+status: "COMPLETED"
 created: "2026-10-06"
-updated: "2026-10-07"
+updated: "2026-10-10"
 owners:
   - "compiler"
   - "toolchain"
@@ -225,8 +225,8 @@ Changes are isolated to compiler driver and module resolver. Can be reverted via
 - [x] Compilation succeeds from arbitrary working directories without vendoring stdlib;
 - [x] Self-hosting fixed-point verified;
 - [x] Dedicated test suite passes 100% (including version mismatch, PATH, containment, exact ABI key, block comments, string stripping, duplicate metadata rejection, SemVer overflow, token declaration boundaries, strict line grammar checks, module mapping escape rejection, UTF-8/delimiter decoys, directory target rejection, and dynamic key table growth — 42/42 PASS);
-- [ ] VPS Report `VIRC-RPT-0045` created and linked;
-- [ ] `VIRC-ISS-0043` closed with evidence.
+- [x] VPS Report `VIRC-RPT-0045` created, accepted and linked;
+- [x] `VIRC-ISS-0043` closed with evidence.
 
 ## 14. Related Papers
 
@@ -249,3 +249,4 @@ Changes are isolated to compiler driver and module resolver. Can be reverted via
 | 2026-10-07 | Round 6 audit remediation: token-level prelude declaration matching with identifier boundaries, strict registry line parsing rejecting malformed lines and empty directives, expanded to 37 contract tests, kept active |
 | 2026-10-07 | Round 6 audit completion: per-entry canonical containment preventing module mapping escapes, lexer parity for UTF-8 continuation (ch >= 128) and dot delimiter rejection, strict trailing token checks, duplicate module key rejection, expanded to 40/40 contract tests, kept active |
 | 2026-10-07 | Round 7 audit remediation: directory target rejection (file_is_regular_cstr and .vri suffix), unbounded dynamic duplicate key detection (seen_keys array doubling), fail-closed registry capacity gate, expanded to 42 contract tests (42/42 PASS), kept active |
+| 2026-10-10 | Completed after independent native verification: restored sysroot contracts in the Vir CLI runner, verified 40/40 focused cases, 506/506 min regression cases, 28/28 module cases, 22/22 Group 18 cases and 4/4 LSP registry_cwd checks; accepted VIRC-RPT-0045 and closed VIRC-ISS-0043 |

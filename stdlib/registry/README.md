@@ -26,7 +26,7 @@ Vec of (T) · Map of (K, V) · Set of (T) · Deque of (T)
 
 Write `Result of (T)` when the error type is the default [`Error`](error.md); use
 `Result of (T, E)` only when `E` is explicit. Void-success APIs use bare `Result`
-(`Ok()` / `Err`) — decision **A** locked; not `Result of (void)` until unit is a
+(`Success()` / `Failure`) — decision **A** locked; not `Result of (void)` until unit is a
 confirmed Vir generic argument.
 
 **Process (mandatory for redesign clusters)**
@@ -139,7 +139,7 @@ migration `previous`. New SPEC APIs without source yet = **`planned`**
 | `slice` (`mem/slice.vri`) | `slice` | borrowed binary view |
 | `collections.vec` | `vec` | owned growable `Vec of (T)` |
 | `option` (`core/option.vri`) | `option` | `Option of (T)` helpers (`Some`/`None` language-level) |
-| `result` (`core/result.vri`) | `result` | `Result of (T, E)` helpers (`Ok`/`Err` language-level) |
+| `result` (`core/result.vri`) | `result` | `Result of (T, E)` helpers (`Success`/`Failure` language-level) |
 | `error` (`error/error.vri`) | `error` | `ErrorKind` + `Error` + `IoError`; errno SSOT |
 | `string` (`str/string.vri`) | `string` | immutable UTF-8 text; `str_*` impl-only |
 | `builder` (`str/builder.vri`) | `builder` | mutable UTF-8 construction; always-valid |

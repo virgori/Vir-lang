@@ -1,21 +1,21 @@
 ---
 module: vec
 title: Vec
-summary: Owned growable typed collection Vec of (T) — namespace-only vec.*.
+summary: Owned growable typed collection Vec of (T) — constructors plus UFCS.
 source:
   - name: collections.vec
     path: vir/collections/vec.vri
-status: closed
+status: draft
 notes: >-
-  Implemented in collections/vec.vri. Callables today are vec_* (no generic entity
-  methods yet); registry names remain vec.*. Stride = size_of(T); ZST unsupported.
-  Self-extend, overflow guards, vec_swap, vec_copy_range landed.
+  Canonical surface uses Vec constructors and receiver-style UFCS. The current
+  implementation remains available through vec_* compatibility symbols while
+  generic UFCS is completed in the compiler.
 ---
 
 # Vec
 
-Owned, growable **typed** collection `Vec of (T)`. Public API is **namespace-only**:
-`vec.<op>(…)`.
+Owned, growable **typed** collection `Vec of (T)`. Constructors live on `Vec`;
+all operations use the receiver form `self.<op>`.
 
 ```text
 string  → UTF-8 text
@@ -25,27 +25,30 @@ Vec of (T)  → owned growable typed collection (element T)
 ```
 
 ```vir
-let v = vec.withCap(32)
-vec.push(v, 1)
-let x = vec.get(v, 0)
-vec.free(v)
+let v = Vec.alloc of (int)(32)
+v.push(1)
+let x = v.get(0)
+v.free()
 ```
 
-Callables today are `vec_*` free functions (Vir has no generic entity methods yet
-for a `vec` namespace object). Registry / docs use canonical `vec.*` names; map
-1:1 onto `vec_*` / `vec_copy_range` / `vec_swap` until a namespace facade can land.
+Callables today remain `vec_*` compatibility functions. They map 1:1 to this
+surface while compiler support for generic receiver dispatch is completed.
+Safe lookup is the flat UFCS operation `self.try`. Removal exposes two explicit
+methods: `self.remove(i)` preserves order, while
+`self.swapRemove(i)` performs O(1) unordered removal. Neither default arguments,
+overloading, nor typed operation selectors are part of this Vec contract.
 
 ## Boundary
 
 | In `vec` | Not in `vec` |
 |---|---|
 | Typed element storage / grow by **element** | Byte builder → [`buffer`](buffer.md) |
-| Panic `get` / Option `tryGet` | Borrowed binary view → [`slice`](slice.md) |
-| Owned range `copyRange` | Soft-bootstrap `compiler/vec_prelude` |
+| Panic `get` / Option `try` | Borrowed binary view → [`slice`](slice.md) |
+| Owned range `copy` | Soft-bootstrap `compiler/vec_prelude` |
 | Explicit `free` | Runtime `rt/vec_rt` (`*_rt`) |
 | | Raw `as_ptr` / `from_slice(ptr)` — **internal** |
 | | Higher-order `map`/`filter`/… — **uncurated** |
-| | Receiver `v.push` — **not public** |
+| | Compatibility `vec_*` symbols — **not canonical** |
 
 `Vec of (u8)` is **not** `Buffer`. Even after element-width correctness lands,
 `Vec of (u8)` remains a typed collection of `u8`; `Buffer` remains the binary
@@ -69,7 +72,7 @@ slot assumptions removed from the core surface.
 |---|---|
 | Contract | `Vec of (T)`, stride = `size_of(T)` |
 | Implementation | element-width addressing on core ops |
-| Still out | generic `vec` namespace object (no generic methods yet) |
+| Still out | compiler support for generic UFCS |
 
 ### Zero-sized types (closed)
 
@@ -99,7 +102,7 @@ Like [`buffer`](buffer.md): any operation that may **reallocate** invalidates
 raw pointers and any view into the old storage.
 
 May reallocate (non-exhaustive): `push`, `insert`, `extend`, `reserve`,
-`shrinkToFit`, and other paths that grow or relocate the backing store.
+`compact`, and other paths that grow or relocate the backing store.
 
 In-place ops that do not move storage (`set`, `swap`, `clear`, `truncate` that
 only shrinks `len`, order-preserving `remove` shift within the same allocation)
@@ -115,17 +118,20 @@ postcondition: capacity >= len + additional
 target absolute capacity and **not** a byte count. Implementations must not
 reinterpret `reserve(n)` as “set capacity to `n`”.
 
-### `remove` vs `swapRemove`
+### Removal operations
 
-| API | Order | Complexity (relative) |
+| Call form | Order | Complexity (relative) |
 |---|---|---|
-| `remove` | **preserves** order of remaining elements | shifts the tail — O(n) |
-| `swapRemove` | **does not** preserve order | no full-tail shift — O(1) |
+| `remove(i)` | **preserves** order of remaining elements | shifts the tail — O(n) |
+| `swapRemove(i)` | **does not** preserve order | no full-tail shift — O(1) |
+
+These are separate methods with separate callable identities. They do not
+require function overloading, default arguments, or selector resolution.
 
 ### `extend` self-extension
 
 ```vir
-vec.extend(v, v)
+v.extend(v)
 ```
 
 **Supported.** Implementation must snapshot source length (and read from a
@@ -149,7 +155,7 @@ deep-clone resources that `T` points to.
 | ID | Decision |
 |---|---|
 | V1 | Element Drop is a **language/implementation gate**. Missing destructor is **not** standardized “correct” behavior. |
-| V2 | Canonical docs use `vec.*`; source `vec_*` is a **migration gap**. |
+| V2 | Canonical docs use `Vec.*` constructors plus receiver UFCS; source `vec_*` is a **compatibility layer**. |
 | V3 | Lock move/copy; **no** public borrowed-element references until borrow contracts are enforced. |
 
 ### Ownership (locked)
@@ -160,7 +166,7 @@ Aligned with other locked collections:
 |---|---|
 | `push` / `insert` / `extend` | **Move** element(s) **into** the `Vec` |
 | `pop` / `remove` / `swapRemove` | **Move** element **out** to the caller |
-| `get` / `tryGet` / `first` / `last` | **Copy** only when `T` is safely copyable |
+| `get` / `try` / `first` / `last` | **Copy** only when `T` is safely copyable |
 | `clear` / `truncate` | End lifetime of removed elements |
 
 Because Element Drop is incomplete (V1): ops that discard elements **without**
@@ -184,7 +190,7 @@ Do **not** document missing Drop as desired permanent semantics.
 ### Ownership / free
 
 ```vir
-vec.free(v)
+v.free()
 ```
 
 | Op | Effect |
@@ -192,7 +198,7 @@ vec.free(v)
 | `clear` | `len = 0`; capacity retained; no element destructors (today) |
 | `truncate(newLen)` | if `newLen < len` → shrink `len`; if `newLen ≥ len` → **no-op** |
 | `reserve(additional)` | `capacity >= len + additional` |
-| `shrinkToFit` | capacity → `len` (or free if empty); may relocate |
+| `compact` | capacity → `len` (or free if empty); may relocate |
 | `free` | release storage; do not use afterward |
 
 Growth strategy today: double capacity (minimum 8 slots when growing from
@@ -201,7 +207,7 @@ Growth strategy today: double capacity (minimum 8 slots when growing from
 ## CORE SPEC surface note
 
 CORE SPEC minimal list is a **subset**. Extra ops already locked here
-(`filled`, `first`/`last`, `swapRemove`, `extend`, `clone`, `copyRange`, …)
+(`create`, `first`/`last`, `swapRemove`, `extend`, `clone`, `copy`, …)
 remain part of this module’s closed surface. HOF stay **uncurated** / out of
 this core wave. Ops not listed in either surface stay **out** unless marked
 `planned` with a full entry.
@@ -210,17 +216,18 @@ this core wave. Ops not listed in either surface stay **out** unless marked
 
 
 ```text
-vec
+Vec
 ├── new
-├── withCap
-├── filled
-│
+├── alloc
+└── create
+
+self
 ├── len
 ├── cap
 ├── isEmpty
 │
 ├── get
-├── tryGet
+├── try
 ├── set
 ├── first
 ├── last
@@ -239,11 +246,11 @@ vec
 ├── reverse
 ├── swap
 ├── clone
-├── copyRange
-├── eq
+├── copy
+├── equal
 │
 ├── reserve
-├── shrinkToFit
+├── compact
 ├── truncate
 ├── clear
 └── free
@@ -273,48 +280,64 @@ vec_extend_from_slice(ptr,count)
 grow / realloc helpers inside reserve
 ```
 
-## Migration map
+## Public rename map
 
-| Current | Public | Impl note | Action |
+| Previous | Canonical |
+|---|---|
+| `vec.new` | `Vec.new` |
+| `vec.withCap` | `Vec.alloc` |
+| `vec.filled` | `Vec.create` |
+| `vec.tryGet` | `self.try` |
+| `vec.swapRemove` | `self.swapRemove` |
+| `vec.copyRange` | `self.copy` |
+| `vec.eq` | `self.equal` |
+| `vec.shrinkToFit` | `self.compact` |
+
+All other public leaf names are unchanged and move from `vec.<op>(self, …)`
+to receiver form `self.<op>(…)`.
+
+## Implementation compatibility map
+
+| Current symbol | Canonical API | Impl note | Action |
 |---|---|---|---|
-| `vec_new` | `vec.new` | empty, no alloc | **rename** |
-| `vec_with_cap` | `vec.withCap` | preallocated capacity | **rename** |
-| `vec_filled` | `vec.filled` | `n` copies of value | **rename** |
+| `vec_new` | `Vec.new` | empty, no alloc | **rename** |
+| `vec_alloc` (`vec_with_cap` compat) | `Vec.alloc` | preallocated capacity | **mapped** |
+| `vec_create` (`vec_filled` compat) | `Vec.create` | `n` copies of value | **mapped** |
 | `vec_from_slice` | — | raw ptr | **internal** |
-| `vec_len` | `vec.len` | | **rename** |
-| `vec_cap` | `vec.cap` | | **rename** |
-| `vec_is_empty` | `vec.isEmpty` | | **rename** |
-| `vec_get` | `vec.get` | panic OOB | **rename** |
-| `vec_try_get` | `vec.tryGet` | `Option` | **rename** |
-| `vec_set` | `vec.set` | panic OOB | **rename** |
-| `vec_first` | `vec.first` | `Option` | **rename** |
-| `vec_last` | `vec.last` | `Option` | **rename** |
-| `vec_push` | `vec.push` | | **rename** |
-| `vec_pop` | `vec.pop` | `Option` | **rename** |
-| `vec_insert` | `vec.insert` | panic if `idx > len` | **rename** |
-| `vec_remove` | `vec.remove` | order-preserving; O(n) shift; returns `T` | **rename** |
-| `vec_swap_remove` | `vec.swapRemove` | O(1); order not preserved | **rename** |
-| `vec_extend` | `vec.extend` | self-extend **supported** | **rename** + harden |
+| `vec_len` | `self.len` | | **rename** |
+| `vec_cap` | `self.cap` | | **rename** |
+| `vec_is_empty` | `self.isEmpty` | | **rename** |
+| `vec_get` | `self.get` | panic OOB | **rename** |
+| `vec_try` (`vec_try_get` compat) | `self.try` | `Option` | **mapped** |
+| `vec_set` | `self.set` | panic OOB | **rename** |
+| `vec_first` | `self.first` | `Option` | **rename** |
+| `vec_last` | `self.last` | `Option` | **rename** |
+| `vec_push` | `self.push` | | **rename** |
+| `vec_pop` | `self.pop` | `Option` | **rename** |
+| `vec_insert` | `self.insert` | panic if `idx > len` | **rename** |
+| `vec_remove` | `self.remove` | order-preserving; returns `T` | **mapped** |
+| `vec_swap_remove` | `self.swapRemove` | unordered O(1) removal | **mapped** |
+| `vec_extend` | `self.extend` | self-extend **supported** | **rename** + harden |
 | `vec_extend_from_slice` | — | raw ptr | **internal** |
-| `vec_contains` | `vec.contains` | needs `T` `==` | **rename** |
-| `vec_find` | `vec.find` | `Option` of **index** | **rename** |
-| `vec_count` | `vec.count` | needs `T` `==` | **rename** |
-| `vec_reverse` | `vec.reverse` | in-place | **rename** |
-| `vec_swap` | `vec.swap` | exchange indices `a`,`b` | **present** |
-| `vec_clone` | `vec.clone` | deep storage / shallow `T` | **rename** |
-| `vec_copy_range` / `vec_slice` | `vec.copyRange` | owned copy of `[from,to)` | **present** (`vec_slice` compat alias) |
-| `vec_eq` | `vec.eq` | content equality | **rename** |
-| `vec_reserve` | `vec.reserve` | `cap >= len + additional` | **rename** |
-| `vec_shrink_to_fit` | `vec.shrinkToFit` | | **rename** |
-| `vec_truncate` | `vec.truncate` | shrink-only | **rename** |
-| `vec_clear` | `vec.clear` | | **rename** |
-| `vec_free` | `vec.free` | explicit release | **rename** |
+| `vec_contains` | `self.contains` | needs `T` `==` | **rename** |
+| `vec_find` | `self.find` | `Option` of **index** | **rename** |
+| `vec_count` | `self.count` | needs `T` `==` | **rename** |
+| `vec_reverse` | `self.reverse` | in-place | **rename** |
+| `vec_swap` | `self.swap` | exchange indices `a`,`b` | **present** |
+| `vec_clone` | `self.clone` | deep storage / shallow `T` | **rename** |
+| `vec_copy` (`vec_copy_range` / `vec_slice` compat) | `self.copy` | owned copy of `[from,to)` | **mapped** |
+| `vec_equal` (`vec_eq` compat) | `self.equal` | content equality | **mapped** |
+| `vec_reserve` | `self.reserve` | `cap >= len + additional` | **rename** |
+| `vec_compact` (`vec_shrink_to_fit` compat) | `self.compact` | | **mapped** |
+| `vec_truncate` | `self.truncate` | shrink-only | **rename** |
+| `vec_clear` | `self.clear` | | **rename** |
+| `vec_free` | `self.free` | explicit release | **rename** |
 | `vec_as_ptr` / `vec_as_slice` | — | raw / byte view | **internal** |
 | `vec_for_each` … `vec_dedup` | — | callback/`ptr` | **uncurated** |
 
 ## Equality / search constraint
 
-`contains`, `find`, `count`, and `eq` use element `==` / `!=` as written in
+`contains`, `find`, `count`, and `equal` use element `==` / `!=` as written in
 source. Vir does **not** yet express this as a formal trait bound in the
 registry — document as:
 
@@ -327,50 +350,50 @@ registry — document as:
 
 | ID | Symbol | Signature | Status |
 |---|---|---|---|
-| `vec.new` | `vec.new` | `vec.new() -> Vec of (T)` | proposed |
-| `vec.withCap` | `vec.withCap` | `vec.withCap(cap: int) -> Vec of (T)` | proposed |
-| `vec.filled` | `vec.filled` | `vec.filled(value: T, n: int) -> Vec of (T)` | proposed |
-| `vec.len` | `vec.len` | `vec.len(v: Vec of (T)) -> int` | proposed |
-| `vec.cap` | `vec.cap` | `vec.cap(v: Vec of (T)) -> int` | proposed |
-| `vec.isEmpty` | `vec.isEmpty` | `vec.isEmpty(v: Vec of (T)) -> bool` | proposed |
-| `vec.get` | `vec.get` | `vec.get(v: Vec of (T), i: int) -> T` | proposed |
-| `vec.tryGet` | `vec.tryGet` | `vec.tryGet(v: Vec of (T), i: int) -> Option of (T)` | proposed |
-| `vec.set` | `vec.set` | `vec.set(v: Vec of (T), i: int, x: T) -> void` | proposed |
-| `vec.first` | `vec.first` | `vec.first(v: Vec of (T)) -> Option of (T)` | proposed |
-| `vec.last` | `vec.last` | `vec.last(v: Vec of (T)) -> Option of (T)` | proposed |
-| `vec.push` | `vec.push` | `vec.push(v: Vec of (T), x: T) -> …` | proposed |
-| `vec.pop` | `vec.pop` | `vec.pop(v: Vec of (T)) -> Option of (T)` | proposed |
-| `vec.insert` | `vec.insert` | `vec.insert(v: Vec of (T), i: int, x: T) -> void` | proposed |
-| `vec.remove` | `vec.remove` | `vec.remove(v: Vec of (T), i: int) -> T` | proposed |
-| `vec.swapRemove` | `vec.swapRemove` | `vec.swapRemove(v: Vec of (T), i: int) -> T` | proposed |
-| `vec.extend` | `vec.extend` | `vec.extend(v: Vec of (T), other: Vec of (T)) -> void` | proposed |
-| `vec.contains` | `vec.contains` | `vec.contains(v: Vec of (T), x: T) -> bool` | proposed |
-| `vec.find` | `vec.find` | `vec.find(v: Vec of (T), x: T) -> Option of (int)` · index | proposed |
-| `vec.count` | `vec.count` | `vec.count(v: Vec of (T), x: T) -> int` | proposed |
-| `vec.reverse` | `vec.reverse` | `vec.reverse(v: Vec of (T)) -> void` | proposed |
-| `vec.swap` | `vec.swap` | `vec.swap(v: Vec of (T), a: int, b: int) -> void` | proposed |
-| `vec.clone` | `vec.clone` | `vec.clone(v: Vec of (T)) -> Vec of (T)` | proposed |
-| `vec.copyRange` | `vec.copyRange` | `vec.copyRange(v: Vec of (T), from: int, to: int) -> Vec of (T)` | proposed |
-| `vec.eq` | `vec.eq` | `vec.eq(a: Vec of (T), b: Vec of (T)) -> bool` | proposed |
-| `vec.reserve` | `vec.reserve` | `vec.reserve(v: Vec of (T), additional: int) -> void` | proposed |
-| `vec.shrinkToFit` | `vec.shrinkToFit` | `vec.shrinkToFit(v: Vec of (T)) -> void` | proposed |
-| `vec.truncate` | `vec.truncate` | `vec.truncate(v: Vec of (T), newLen: int) -> void` | proposed |
-| `vec.clear` | `vec.clear` | `vec.clear(v: Vec of (T)) -> void` | proposed |
-| `vec.free` | `vec.free` | `vec.free(v: Vec of (T)) -> void` | proposed |
+| `vec.new` | `Vec.new` | `Vec.new() -> Vec of (T)` | proposed |
+| `vec.withCap` | `Vec.alloc` | `Vec.alloc(cap: int) -> Vec of (T)` | proposed |
+| `vec.filled` | `Vec.create` | `Vec.create(value: T, n: int) -> Vec of (T)` | proposed |
+| `vec.len` | `self.len` | `self.len() -> int` | proposed |
+| `vec.cap` | `self.cap` | `self.cap() -> int` | proposed |
+| `vec.isEmpty` | `self.isEmpty` | `self.isEmpty() -> bool` | proposed |
+| `vec.get` | `self.get` | `self.get(i: int) -> T` | proposed |
+| `vec.tryGet` | `self.try` | `self.try(i: int) -> Option of (T)` | proposed |
+| `vec.set` | `self.set` | `self.set(i: int, x: T) -> void` | proposed |
+| `vec.first` | `self.first` | `self.first() -> Option of (T)` | proposed |
+| `vec.last` | `self.last` | `self.last() -> Option of (T)` | proposed |
+| `vec.push` | `self.push` | `self.push(x: T) -> …` | proposed |
+| `vec.pop` | `self.pop` | `self.pop() -> Option of (T)` | proposed |
+| `vec.insert` | `self.insert` | `self.insert(i: int, x: T) -> void` | proposed |
+| `vec.remove` | `self.remove` | `self.remove(i: int) -> T` | proposed |
+| `vec.swapRemove` | `self.swapRemove` | `self.swapRemove(i: int) -> T` | proposed |
+| `vec.extend` | `self.extend` | `self.extend(other: Vec of (T)) -> void` | proposed |
+| `vec.contains` | `self.contains` | `self.contains(x: T) -> bool` | proposed |
+| `vec.find` | `self.find` | `self.find(x: T) -> Option of (int)` · index | proposed |
+| `vec.count` | `self.count` | `self.count(x: T) -> int` | proposed |
+| `vec.reverse` | `self.reverse` | `self.reverse() -> void` | proposed |
+| `vec.swap` | `self.swap` | `self.swap(a: int, b: int) -> void` | proposed |
+| `vec.clone` | `self.clone` | `self.clone() -> Vec of (T)` | proposed |
+| `vec.copyRange` | `self.copy` | `self.copy(from: int, to: int) -> Vec of (T)` | proposed |
+| `vec.eq` | `self.equal` | `self.equal(other: Vec of (T)) -> bool` | proposed |
+| `vec.reserve` | `self.reserve` | `self.reserve(additional: int) -> void` | proposed |
+| `vec.shrinkToFit` | `self.compact` | `self.compact() -> void` | proposed |
+| `vec.truncate` | `self.truncate` | `self.truncate(newLen: int) -> void` | proposed |
+| `vec.clear` | `self.clear` | `self.clear() -> void` | proposed |
+| `vec.free` | `self.free` | `self.free() -> void` | proposed |
 
 ---
 
 <a id="vec.new"></a>
-## `vec.new`
+## `Vec.new`
 
 <!--
 id: vec.new
-api: vec.new
+api: Vec.new
 previous: vec_new
 -->
 
 ```vir
-vec.new() -> Vec of (T)
+Vec.new() -> Vec of (T)
 ```
 
 Empty vector; no allocation (`data = null`, `cap = 0` today).
@@ -395,7 +418,7 @@ No public `vec.empty()` constructor — `new` is the empty constructor;
 ### Example
 
 ```vir
-let v = vec.new of (int)()
+let v = Vec.new of (int)()
 ```
 
 ### Status
@@ -408,22 +431,22 @@ let v = vec.new of (int)()
 
 ### See also
 
-- `vec.withCap`
-- `vec.filled`
+- `Vec.alloc`
+- `Vec.create`
 
 ---
 
 <a id="vec.withCap"></a>
-## `vec.withCap`
+## `Vec.alloc`
 
 <!--
 id: vec.withCap
-api: vec.withCap
+api: Vec.alloc
 previous: vec_with_cap
 -->
 
 ```vir
-vec.withCap(cap: int) -> Vec of (T)
+Vec.alloc(cap: int) -> Vec of (T)
 ```
 
 Empty vector with preallocated capacity for `cap` **elements**.
@@ -445,35 +468,35 @@ Alloc failure per runtime.
 ### Example
 
 ```vir
-let v = vec.withCap(32)
+let v = Vec.alloc(32)
 ```
 
 ### Status
 
-`proposed` — **present** as `vec_with_cap`.
+`proposed` — **present** as `vec_alloc`; `vec_with_cap` is compatibility-only.
 
 ### Implementation mapping
 
-`vir/collections/vec.vri` → `vec_with_cap`.
+`vir/collections/vec.vri` → `vec_alloc`.
 
 ### See also
 
-- `vec.new`
-- `vec.reserve`
+- `Vec.new`
+- `self.reserve`
 
 ---
 
 <a id="vec.filled"></a>
-## `vec.filled`
+## `Vec.create`
 
 <!--
 id: vec.filled
-api: vec.filled
+api: Vec.create
 previous: vec_filled
 -->
 
 ```vir
-vec.filled(value: T, n: int) -> Vec of (T)
+Vec.create(value: T, n: int) -> Vec of (T)
 ```
 
 Vector of `n` elements, each equal to `value`.
@@ -499,34 +522,34 @@ Alloc failure per runtime.
 ### Example
 
 ```vir
-let v = vec.filled of (int)(0, 10)
+let v = Vec.create of (int)(0, 10)
 ```
 
 ### Status
 
-`proposed` — **present** as `vec_filled`.
+`proposed` — **present** as `vec_create`; `vec_filled` is compatibility-only.
 
 ### Implementation mapping
 
-`vir/collections/vec.vri` → `vec_filled`.
+`vir/collections/vec.vri` → `vec_create`.
 
 ### See also
 
-- `vec.withCap`
+- `Vec.alloc`
 
 ---
 
 <a id="vec.len"></a>
-## `vec.len`
+## `self.len`
 
 <!--
 id: vec.len
-api: vec.len
+api: self.len
 previous: vec_len
 -->
 
 ```vir
-vec.len(v: Vec of (T)) -> int
+self.len() -> int
 ```
 
 Number of elements (`len`), not capacity and not bytes.
@@ -534,7 +557,7 @@ Number of elements (`len`), not capacity and not bytes.
 ### Example
 
 ```vir
-let n = vec.len(v)
+let n = v.len()
 ```
 
 ### Status
@@ -547,22 +570,22 @@ let n = vec.len(v)
 
 ### See also
 
-- `vec.cap`
-- `vec.isEmpty`
+- `self.cap`
+- `self.isEmpty`
 
 ---
 
 <a id="vec.cap"></a>
-## `vec.cap`
+## `self.cap`
 
 <!--
 id: vec.cap
-api: vec.cap
+api: self.cap
 previous: vec_cap
 -->
 
 ```vir
-vec.cap(v: Vec of (T)) -> int
+self.cap() -> int
 ```
 
 Allocated capacity in **elements**.
@@ -577,22 +600,22 @@ Allocated capacity in **elements**.
 
 ### See also
 
-- `vec.len`
-- `vec.reserve`
+- `self.len`
+- `self.reserve`
 
 ---
 
 <a id="vec.isEmpty"></a>
-## `vec.isEmpty`
+## `self.isEmpty`
 
 <!--
 id: vec.isEmpty
-api: vec.isEmpty
+api: self.isEmpty
 previous: vec_is_empty
 -->
 
 ```vir
-vec.isEmpty(v: Vec of (T)) -> bool
+self.isEmpty() -> bool
 ```
 
 `true` when `len == 0`.
@@ -607,22 +630,22 @@ vec.isEmpty(v: Vec of (T)) -> bool
 
 ### See also
 
-- `vec.len`
-- `vec.new`
+- `self.len`
+- `Vec.new`
 
 ---
 
 <a id="vec.get"></a>
-## `vec.get`
+## `self.get`
 
 <!--
 id: vec.get
-api: vec.get
+api: self.get
 previous: vec_get
 -->
 
 ```vir
-vec.get(v: Vec of (T), i: int) -> T
+self.get(i: int) -> T
 ```
 
 Element at index `i`. Panic on OOB. Hot-path primitive (like `slice.get`).
@@ -634,7 +657,7 @@ Element at index `i`. Panic on OOB. Hot-path primitive (like `slice.get`).
 ### Example
 
 ```vir
-let x = vec.get(v, 0)
+let x = v.get(0)
 ```
 
 ### Status
@@ -647,22 +670,22 @@ let x = vec.get(v, 0)
 
 ### See also
 
-- `vec.tryGet`
-- `vec.set`
+- `self.try`
+- `self.set`
 
 ---
 
 <a id="vec.tryGet"></a>
-## `vec.tryGet`
+## `self.try`
 
 <!--
 id: vec.tryGet
-api: vec.tryGet
+api: self.try
 previous: vec_try_get
 -->
 
 ```vir
-vec.tryGet(v: Vec of (T), i: int) -> Option of (T)
+self.try(i: int) -> Option of (T)
 ```
 
 Element at `i`, or `None` if out of bounds. Does not panic.
@@ -677,26 +700,26 @@ Element at `i`, or `None` if out of bounds. Does not panic.
 
 ### Implementation mapping
 
-`vec_try_get`
+`vec_try` (`vec_try_get` compatibility alias)
 
 ### See also
 
-- `vec.get`
-- `vec.first`
+- `self.get`
+- `self.first`
 
 ---
 
 <a id="vec.set"></a>
-## `vec.set`
+## `self.set`
 
 <!--
 id: vec.set
-api: vec.set
+api: self.set
 previous: vec_set
 -->
 
 ```vir
-vec.set(v: Vec of (T), i: int, x: T) -> void
+self.set(i: int, x: T) -> void
 ```
 
 Replace element at `i`. Panic on OOB. Does not extend length.
@@ -721,22 +744,22 @@ returned handle is **not `stable`** for resource-owning `T` — same gate as
 
 ### See also
 
-- `vec.get`
-- `vec.push`
+- `self.get`
+- `self.push`
 
 ---
 
 <a id="vec.first"></a>
-## `vec.first`
+## `self.first`
 
 <!--
 id: vec.first
-api: vec.first
+api: self.first
 previous: vec_first
 -->
 
 ```vir
-vec.first(v: Vec of (T)) -> Option of (T)
+self.first() -> Option of (T)
 ```
 
 First element, or `None` if empty.
@@ -751,22 +774,22 @@ First element, or `None` if empty.
 
 ### See also
 
-- `vec.last`
-- `vec.tryGet`
+- `self.last`
+- `self.try`
 
 ---
 
 <a id="vec.last"></a>
-## `vec.last`
+## `self.last`
 
 <!--
 id: vec.last
-api: vec.last
+api: self.last
 previous: vec_last
 -->
 
 ```vir
-vec.last(v: Vec of (T)) -> Option of (T)
+self.last() -> Option of (T)
 ```
 
 Last element, or `None` if empty.
@@ -781,22 +804,22 @@ Last element, or `None` if empty.
 
 ### See also
 
-- `vec.first`
-- `vec.pop`
+- `self.first`
+- `self.pop`
 
 ---
 
 <a id="vec.push"></a>
-## `vec.push`
+## `self.push`
 
 <!--
 id: vec.push
-api: vec.push
+api: self.push
 previous: vec_push
 -->
 
 ```vir
-vec.push(v: Vec of (T), x: T) -> …
+self.push(x: T) -> …
 ```
 
 Append `x`, growing if needed. Today’s source returns the vector value; public
@@ -818,22 +841,22 @@ Growth is in **elements**.
 
 ### See also
 
-- `vec.pop`
-- `vec.extend`
+- `self.pop`
+- `self.extend`
 
 ---
 
 <a id="vec.pop"></a>
-## `vec.pop`
+## `self.pop`
 
 <!--
 id: vec.pop
-api: vec.pop
+api: self.pop
 previous: vec_pop
 -->
 
 ```vir
-vec.pop(v: Vec of (T)) -> Option of (T)
+self.pop() -> Option of (T)
 ```
 
 Remove and return the last element, or `None` if empty.
@@ -848,22 +871,22 @@ Remove and return the last element, or `None` if empty.
 
 ### See also
 
-- `vec.push`
-- `vec.last`
+- `self.push`
+- `self.last`
 
 ---
 
 <a id="vec.insert"></a>
-## `vec.insert`
+## `self.insert`
 
 <!--
 id: vec.insert
-api: vec.insert
+api: self.insert
 previous: vec_insert
 -->
 
 ```vir
-vec.insert(v: Vec of (T), i: int, x: T) -> void
+self.insert(i: int, x: T) -> void
 ```
 
 Insert `x` at `i`, shifting the tail right. Allows `i == len` (append-at-end).
@@ -886,26 +909,26 @@ Uses `mem_move` for the shift today.
 
 ### See also
 
-- `vec.remove`
-- `vec.push`
+- `self.remove`
+- `self.push`
 
 ---
 
 <a id="vec.remove"></a>
-## `vec.remove`
+## `self.remove`
 
 <!--
 id: vec.remove
-api: vec.remove
+api: self.remove
 previous: vec_remove
 -->
 
 ```vir
-vec.remove(v: Vec of (T), i: int) -> T
+self.remove(i: int) -> T
 ```
 
-Remove element at `i`, **preserving order** of the remaining elements. Returns
-the removed value. Shifts the tail — relative complexity **O(n)**.
+Removes and returns the element at `i`, shifts the tail left, and preserves the
+relative order of the remaining elements. Relative complexity is **O(n)**.
 
 ### Errors
 
@@ -919,7 +942,7 @@ impl shrinks (today: no shrink).
 
 ### Status
 
-`proposed`
+`proposed` — implementation present; generic receiver UFCS remains compiler-gated.
 
 ### Implementation mapping
 
@@ -927,38 +950,34 @@ impl shrinks (today: no shrink).
 
 ### See also
 
-- `vec.swapRemove`
+- `self.swapRemove`
+- `self.swap`
 
 ---
 
 <a id="vec.swapRemove"></a>
-## `vec.swapRemove`
+## `self.swapRemove`
 
 <!--
 id: vec.swapRemove
-api: vec.swapRemove
+api: self.swapRemove
 previous: vec_swap_remove
 -->
 
 ```vir
-vec.swapRemove(v: Vec of (T), i: int) -> T
+self.swapRemove(i: int) -> T
 ```
 
-Remove element at `i` in **O(1)** by swapping with the last element, then
-shrinking `len`. **Order is not preserved.** Does **not** shift the whole
-tail.
+Removes and returns the element at `i` in **O(1)** by replacing the removed slot
+with the last element, then shrinking `len`. **Order is not preserved.**
 
 ### Errors
 
 `i >= len` → panic.
 
-### Semantics
-
-Systems-programming escape hatch vs order-preserving `remove`.
-
 ### Status
 
-`proposed`
+`proposed` — implementation present; generic receiver UFCS remains compiler-gated.
 
 ### Implementation mapping
 
@@ -966,22 +985,22 @@ Systems-programming escape hatch vs order-preserving `remove`.
 
 ### See also
 
-- `vec.remove`
-- `vec.swap`
+- `self.remove`
+- `self.swap`
 
 ---
 
 <a id="vec.extend"></a>
-## `vec.extend`
+## `self.extend`
 
 <!--
 id: vec.extend
-api: vec.extend
+api: self.extend
 previous: vec_extend
 -->
 
 ```vir
-vec.extend(v: Vec of (T), other: Vec of (T)) -> void
+self.extend(other: Vec of (T)) -> void
 ```
 
 Append all elements of `other` onto `v`.
@@ -991,7 +1010,7 @@ Append all elements of `other` onto `v`.
 Public bulk append from another `Vec`. Raw `extend_from_slice(ptr,…)` is
 **internal**.
 
-**Self-extension** `vec.extend(v, v)` is **supported**: snapshot the source
+**Self-extension** `v.extend(v)` is **supported**: snapshot the source
 length / prefix before reallocating to append; must not UB. May reallocate →
 invalidates prior raw views into `v`.
 
@@ -1006,22 +1025,22 @@ invalidates prior raw views into `v`.
 
 ### See also
 
-- `vec.push`
-- `vec.clone`
+- `self.push`
+- `self.clone`
 
 ---
 
 <a id="vec.contains"></a>
-## `vec.contains`
+## `self.contains`
 
 <!--
 id: vec.contains
-api: vec.contains
+api: self.contains
 previous: vec_contains
 -->
 
 ```vir
-vec.contains(v: Vec of (T), x: T) -> bool
+self.contains(x: T) -> bool
 ```
 
 Whether any element equals `x` (`==`).
@@ -1040,22 +1059,22 @@ Requires `T` equality as used by the implementation — no invented trait bound.
 
 ### See also
 
-- `vec.find`
-- `vec.count`
+- `self.find`
+- `self.count`
 
 ---
 
 <a id="vec.find"></a>
-## `vec.find`
+## `self.find`
 
 <!--
 id: vec.find
-api: vec.find
+api: self.find
 previous: vec_find
 -->
 
 ```vir
-vec.find(v: Vec of (T), x: T) -> Option of (int)
+self.find(x: T) -> Option of (int)
 ```
 
 First **index** where the element equals `x`, or `None`.
@@ -1071,7 +1090,7 @@ Requires `T` equality as used by the implementation.
 ### Example
 
 ```vir
-let i = vec.find(v, x)
+let i = v.find(x)
 # Some(index) or None
 ```
 
@@ -1085,22 +1104,22 @@ let i = vec.find(v, x)
 
 ### See also
 
-- `vec.contains`
-- `vec.get`
+- `self.contains`
+- `self.get`
 
 ---
 
 <a id="vec.count"></a>
-## `vec.count`
+## `self.count`
 
 <!--
 id: vec.count
-api: vec.count
+api: self.count
 previous: vec_count
 -->
 
 ```vir
-vec.count(v: Vec of (T), x: T) -> int
+self.count(x: T) -> int
 ```
 
 Number of elements equal to `x`.
@@ -1115,21 +1134,21 @@ Number of elements equal to `x`.
 
 ### See also
 
-- `vec.contains`
+- `self.contains`
 
 ---
 
 <a id="vec.reverse"></a>
-## `vec.reverse`
+## `self.reverse`
 
 <!--
 id: vec.reverse
-api: vec.reverse
+api: self.reverse
 previous: vec_reverse
 -->
 
 ```vir
-vec.reverse(v: Vec of (T)) -> void
+self.reverse() -> void
 ```
 
 Reverse elements in place.
@@ -1144,20 +1163,20 @@ Reverse elements in place.
 
 ### See also
 
-- `vec.clone`
+- `self.clone`
 
 ---
 
 <a id="vec.swap"></a>
-## `vec.swap`
+## `self.swap`
 
 <!--
 id: vec.swap
-api: vec.swap
+api: self.swap
 -->
 
 ```vir
-vec.swap(v: Vec of (T), a: int, b: int) -> void
+self.swap(a: int, b: int) -> void
 ```
 
 Exchange elements at indices `a` and `b` in place.
@@ -1184,7 +1203,7 @@ Does not reallocate. Useful for sort / shuffle / heap without a three-step
 ### Example
 
 ```vir
-vec.swap(v, i, j)
+v.swap(i, j)
 ```
 
 ### Status
@@ -1197,22 +1216,22 @@ vec.swap(v, i, j)
 
 ### See also
 
-- `vec.swapRemove`
-- `vec.reverse`
+- `self.remove`
+- `self.reverse`
 
 ---
 
 <a id="vec.clone"></a>
-## `vec.clone`
+## `self.clone`
 
 <!--
 id: vec.clone
-api: vec.clone
+api: self.clone
 previous: vec_clone
 -->
 
 ```vir
-vec.clone(v: Vec of (T)) -> Vec of (T)
+self.clone() -> Vec of (T)
 ```
 
 Full-vector copy into new storage.
@@ -1221,7 +1240,7 @@ Full-vector copy into new storage.
 
 **Deep** with respect to `Vec` backing storage; **shallow** with respect to
 `T` — each element is copied by value; pointed-to resources are not
-deep-cloned. Distinct from `copyRange` (partial).
+deep-cloned. Distinct from `copy` (partial).
 
 ### Status
 
@@ -1233,22 +1252,22 @@ deep-cloned. Distinct from `copyRange` (partial).
 
 ### See also
 
-- `vec.copyRange`
-- `vec.eq`
+- `self.copy`
+- `self.equal`
 
 ---
 
 <a id="vec.copyRange"></a>
-## `vec.copyRange`
+## `self.copy`
 
 <!--
 id: vec.copyRange
-api: vec.copyRange
+api: self.copy
 previous: vec_slice
 -->
 
 ```vir
-vec.copyRange(v: Vec of (T), from: int, to: int) -> Vec of (T)
+self.copy(from: int, to: int) -> Vec of (T)
 ```
 
 New **owned** `Vec of (T)` containing a copy of the half-open range `[from, to)`.
@@ -1270,45 +1289,46 @@ Element indices; half-open.
 ### Semantics
 
 **Not** a borrowed view — do not name this `vec.slice`. **Not** a full-vector
-clone — that is `vec.clone`. Naming `copyRange` avoids reading as “clone the
-whole collection.”
+clone — that is `self.clone`. The range parameters keep `copy` distinct from
+copying the whole collection.
 
 Element copies are shallow w.r.t. `T` (same as `clone`).
 
 ### Example
 
 ```vir
-let whole = vec.clone(v)
-let part = vec.copyRange(v, 2, 5)
+let whole = v.clone()
+let part = v.copy(2, 5)
 # owned Vec of former elements [2,5)
 ```
 
 ### Status
 
-`proposed` — **present** as `vec_copy_range`; `vec_slice` kept as compat alias.
+`proposed` — **present** as `vec_copy`; `vec_copy_range` and `vec_slice` are
+compatibility aliases.
 
 ### Implementation mapping
 
-`vir/collections/vec.vri` → `vec_copy_range`.
+`vir/collections/vec.vri` → `vec_copy`.
 
 ### See also
 
-- `vec.clone`
+- `self.clone`
 - `slice.sub` *(borrowed binary — different type)*
 
 ---
 
 <a id="vec.eq"></a>
-## `vec.eq`
+## `self.equal`
 
 <!--
 id: vec.eq
-api: vec.eq
+api: self.equal
 previous: vec_eq
 -->
 
 ```vir
-vec.eq(a: Vec of (T), b: Vec of (T)) -> bool
+self.equal(other: Vec of (T)) -> bool
 ```
 
 Content equality: same length and pairwise `==` elements.
@@ -1324,25 +1344,25 @@ may lower to this. Requires element equality as used by the implementation.
 
 ### Implementation mapping
 
-`vec_eq`
+`vec_equal` (`vec_eq` compatibility alias)
 
 ### See also
 
-- `vec.clone`
+- `self.clone`
 
 ---
 
 <a id="vec.reserve"></a>
-## `vec.reserve`
+## `self.reserve`
 
 <!--
 id: vec.reserve
-api: vec.reserve
+api: self.reserve
 previous: vec_reserve
 -->
 
 ```vir
-vec.reserve(v: Vec of (T), additional: int) -> void
+self.reserve(additional: int) -> void
 ```
 
 Ensure capacity for at least `len + additional` **elements**.
@@ -1366,22 +1386,22 @@ invalidates prior raw views. Growth arithmetic must guard overflow
 
 ### See also
 
-- `vec.cap`
-- `vec.shrinkToFit`
+- `self.cap`
+- `self.compact`
 
 ---
 
 <a id="vec.shrinkToFit"></a>
-## `vec.shrinkToFit`
+## `self.compact`
 
 <!--
 id: vec.shrinkToFit
-api: vec.shrinkToFit
+api: self.compact
 previous: vec_shrink_to_fit
 -->
 
 ```vir
-vec.shrinkToFit(v: Vec of (T)) -> void
+self.compact() -> void
 ```
 
 Shrink capacity to `len` (free storage if empty).
@@ -1392,26 +1412,26 @@ Shrink capacity to `len` (free storage if empty).
 
 ### Implementation mapping
 
-`vec_shrink_to_fit`
+`vec_compact` (`vec_shrink_to_fit` compatibility alias)
 
 ### See also
 
-- `vec.reserve`
-- `vec.clear`
+- `self.reserve`
+- `self.clear`
 
 ---
 
 <a id="vec.truncate"></a>
-## `vec.truncate`
+## `self.truncate`
 
 <!--
 id: vec.truncate
-api: vec.truncate
+api: self.truncate
 previous: vec_truncate
 -->
 
 ```vir
-vec.truncate(v: Vec of (T), newLen: int) -> void
+self.truncate(newLen: int) -> void
 ```
 
 If `newLen < len`, set `len = newLen`. Does **not** grow when `newLen ≥ len`
@@ -1432,21 +1452,21 @@ not free capacity.
 
 ### See also
 
-- `vec.clear`
+- `self.clear`
 
 ---
 
 <a id="vec.clear"></a>
-## `vec.clear`
+## `self.clear`
 
 <!--
 id: vec.clear
-api: vec.clear
+api: self.clear
 previous: vec_clear
 -->
 
 ```vir
-vec.clear(v: Vec of (T)) -> void
+self.clear() -> void
 ```
 
 Set `len = 0`; capacity retained.
@@ -1466,22 +1486,22 @@ Move/resource destructors exist, revisit this contract.
 
 ### See also
 
-- `vec.truncate`
-- `vec.free`
+- `self.truncate`
+- `self.free`
 
 ---
 
 <a id="vec.free"></a>
-## `vec.free`
+## `self.free`
 
 <!--
 id: vec.free
-api: vec.free
+api: self.free
 previous: vec_free
 -->
 
 ```vir
-vec.free(v: Vec of (T)) -> void
+self.free() -> void
 ```
 
 Release owned storage. Do not use `v` afterward.
@@ -1500,22 +1520,25 @@ Public while explicit ownership is required (same stance as `buffer.free`).
 
 ### See also
 
-- `vec.new`
+- `Vec.new`
 - `buffer.free`
 
 ---
 
 ## Implementation readiness
 
-**Design status: closed** (V1–V3). Core ops exist under `vec_*` (migration gap V2).
-Element Drop + borrow refs = gates — do not auto-`stable` for owning `T`.
-No `.vri` redesign until authorized (Q5). Higher-order map/filter remain uncurated.
+**API naming is approved; dispatch remains draft.** Core operations exist under
+the `vec_*` compatibility layer. Element Drop + borrow refs remain gates — do
+not auto-`stable` for owning `T`. Higher-order map/filter remain uncurated.
 
 | Item | Status |
 |---|---|
 | `size_of(T)` stride / alloc / move | **done** (source) |
-| Overflow guards / ZST reject / self-extend / swap / copyRange | **done** (source) |
-| `vec.*` namespace object | **blocked** — use `vec_*` until generic methods |
+| Overflow guards / ZST reject / self-extend / swap / copy | **done** (source) |
+| `Vec.*` constructor dispatch | **blocked** — backend cannot lower type receivers yet (`STLB-ISS-0032`) |
+| Generic receiver UFCS | **blocked** — generic entity/free-function UFCS is unresolved (`STLB-ISS-0032`) |
+| Flat `self.try` naming | **decided** — avoids invalid three-level member paths (`STLB-ISS-0033`) |
+| Separate `remove` / `swapRemove` identities | **decided** — no default argument or selector dependency |
 | Element Drop on clear/truncate/remove | **gate** (V1) |
 | Higher-order map/filter/… | **uncurated** |
 

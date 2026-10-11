@@ -187,7 +187,7 @@ Vec of (T) · Map of (K, V) · Set of (T) · Deque of (T)
 Do not write bare `Result` / `Option` when the success payload type is known.
 
 **Void success (decision A — locked):** when success has **no payload**, write
-bare `Result` meaning `Ok()` | `Err(error)`. Do **not** use `Result of (void)` /
+bare `Result` meaning `Success()` | `Failure(error)`. Do **not** use `Result of (void)` /
 `Result of (())` until `void` / unit is confirmed as a valid Vir generic argument.
 
 ```text

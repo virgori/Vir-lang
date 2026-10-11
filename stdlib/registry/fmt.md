@@ -120,11 +120,11 @@ fmt.format(template, args) -> Result of (string)
 
 | Situation | Behavior |
 |---|---|
-| Missing argument | `Err` |
-| Extra unreferenced argument | `Err` |
-| Type mismatch | `Err` |
-| Bad placeholder syntax | `Err` |
-| Unsupported spec | `Err` |
+| Missing argument | `Failure` |
+| Extra unreferenced argument | `Failure` |
+| Type mismatch | `Failure` |
+| Bad placeholder syntax | `Failure` |
+| Unsupported spec | `Failure` |
 | Same index reused | OK |
 
 Use [`ErrorKind.InvalidData`](error.md) with message context and **byte offset**

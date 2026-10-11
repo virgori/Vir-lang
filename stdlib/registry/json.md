@@ -81,7 +81,7 @@ JsonValue    # tagged tree node
 | Float ctor | `json.numberFloat(f: float) -> JsonValue` — **planned** after float gate (Q4) |
 | Unbox | `json.asInt` · `json.asFloat` (**planned** with float path) |
 | Parse int in domain | → int-backed Number |
-| Parse int **out of domain** | → `Err` `InvalidData` (**Q3**) — never silent float |
+| Parse int **out of domain** | → `Failure` `InvalidData` (**Q3**) — never silent float |
 | Parse fractional / exp | → float path **only after** float gate; until then treat as gap / reject per impl policy documented as debt |
 | Forbidden | Overloading `json.number`; silent int→float |
 
@@ -96,7 +96,7 @@ with Q3/Q4. Exactness for integers outside domain = **reject**, not demote.
 json.parse(s) -> Result of (JsonValue)
 ```
 
-`Err` uses [`Error`](error.md) with **`ErrorKind.InvalidData`**, plus **byte
+`Failure` uses [`Error`](error.md) with **`ErrorKind.InvalidData`**, plus **byte
 offset**, **line**, **column**, and **reason** string. Do **not** invent a new
 `ErrorKind`. Source may still use `vir.data.error` parse-error entities —
 mapping onto `Error` + `InvalidData` is an **implementation gap**.
@@ -224,7 +224,7 @@ error (present).
 
 ### Errors
 
-`Err` → [`Error`](error.md) with `ErrorKind.InvalidData`, offset / line / col /
+`Failure` → [`Error`](error.md) with `ErrorKind.InvalidData`, offset / line / col /
 reason (D1). Source mapping = **implementation gap**.
 
 ### Status

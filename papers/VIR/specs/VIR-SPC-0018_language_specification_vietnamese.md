@@ -2,13 +2,13 @@
 id: "VIR-SPC-0018"
 type: "SPEC"
 domain: "VIR"
-title: "Đặc tả Ngôn ngữ Vir v3.1.1"
+title: "Đặc tả Ngôn ngữ Vir v3.6.0"
 status: "ACTIVE"
-version: "3.1.1"
+version: "3.6.0"
 language: "vi"
 spec_class: "SPECIFICATION"
 created: "2026-05-12"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "VIR"
 components: []
@@ -22,17 +22,28 @@ related:
     - "VIR-ISS-0006"
     - "VIR-ISS-0007"
     - "VIR-ISS-0008"
-  plans: []
-  reports: []
+    - "VIRC-ISS-0019"
+    - "VIR-ISS-0014"
+    - "VIR-ISS-0017"
+    - "VIR-ISS-0018"
+    - "VIR-ISS-0019"
+    - "VIRC-ISS-0046"
+    - "VIRC-ISS-0065"
+  plans:
+    - "VIR-PLN-0001"
+    - "VIR-PLN-0003"
+  reports:
+    - "VIR-RPT-0001"
+    - "VIR-RPT-0003"
 supersedes: null
 superseded_by: null
 tags:
   - "migrated-from-docs"
 ---
 
-# VIR-SPC-0018 — Đặc tả Ngôn ngữ Vir v3.1.1
+# VIR-SPC-0018 — Đặc tả Ngôn ngữ Vir v3.6.0
 
-*Phiên bản: 3.1.1 | Ngày: 6 tháng 10, 2026 | Trạng thái: Tài liệu sống*
+*Phiên bản: 3.6.0 | Ngày: 10 tháng 10, 2026 | Trạng thái: Tài liệu sống*
 *Thay thế: v1.2 (Tháng 3, 2026)*
 
 ---
@@ -79,8 +90,8 @@ Vir là một ngôn ngữ lập trình hệ thống biên dịch trực tiếp, 
 
 **Nguyên tắc cốt lõi:**
 - **Đóng khối — luật duy nhất:**
-  - **Định nghĩa / khai báo** (`func`, `async func`, `entity`, `method`, `enum`, `register`, `mold`, stub `@bind`, …) → đóng bằng **`end.`**
-  - **Luồng điều khiển / khối câu lệnh** (`if` / `eif` / `else`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, `isolate`, …) → đóng bằng **`end`**
+  - **Định nghĩa / khai báo top-level** (`func`, `async func`, `entity`, `enum`, `register`, `mold`, stub `@bind`, …) → đóng bằng **`end.`**
+  - **Member lồng, luồng điều khiển / khối câu lệnh** (`method` trong entity, `if` / `eif` / `else`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, `isolate`, …) → đóng bằng **`end`**
 - **Separator — một khái niệm duy nhất** (xem §1.0): mọi danh sách (statement, khai báo nhóm, named-arg, nhánh `case`, …) tách bằng **`;` hoặc xuống dòng (`NEWLINE`)**. Nhiều phần tử **cùng một dòng** → bắt buộc `;`
 - **Mở khối — hai nguyên tắc** (xem §1.1): (1) chỉ block độc lập mới có opener; continuation (`else`, `ensure`, `revert`, …) không `:` — (2) có `<expr>` trước thân → `do`/`loop`; không → `:`
 - Dấu hai chấm `:` cũng dùng cho khai báo kiểu và ánh xạ key-value (dict, case, map)
@@ -447,19 +458,23 @@ Module tuân thủ thứ tự nghiêm ngặt:
 include → import → const → var → entity → func → export → share
 ```
 
-### 3.2 Include — Nhúng toàn bộ file/lib
+### 3.2 Include — Ghép implementation
 
-`include` nạp một hoặc nhiều module đã đăng ký vào đồ thị biên dịch và thiết lập
-namespace. Alias chỉ đổi namespace cục bộ, không đổi canonical identity.
+`include` ghép một hoặc nhiều implementation fragment vào logical module hiện
+tại. Declarations của fragment tham gia unqualified scope và giữ source
+provenance, nhưng include không tạo module namespace hay export boundary riêng.
+Chỉ explicit export của module đã ghép mới là public.
 
 ```vir
 include math;
-include net.http as web;
-include math, io.file as file, net.http as web;
+include internal.logging;
+include math, io.file, internal.logging;
 ```
 
-Multi-include tương đương các directive riêng theo thứ tự trái sang phải; một
-`as` alias chỉ áp dụng cho item ngay trước nó.
+`include M as A` không hợp lệ vì include không có namespace để đổi tên.
+Multi-include tương đương các composition directive riêng. Duplicate
+declaration giữa các fragment hoặc giữa fragment và consumer là lỗi
+compile-time độc lập thứ tự; fragment đứng sau không ghi đè fragment trước.
 
 Dấu chấm `.` là separator duy nhất bên trong Module ID. `A::B` không phải cú
 pháp Vir hợp lệ và compiler phải từ chối ở mọi ngữ cảnh. Direct filesystem path
@@ -478,25 +493,30 @@ path-derived identity. Một unregistered dotted spelling có thể fallback b�
 cách đổi dot thành slash để tương thích mã cũ, nhưng project mới nên khai báo ID
 trong `module.list`.
 
+Hợp đồng đầy đủ về composition, namespace, visibility, identity và migration
+được quy định chuẩn tắc trong `VIR-SPC-0021`.
+
 ### 3.3 Import — Symbol đã export và namespace
 
 `import` **không yêu cầu phải include trước**. Nó chỉ lấy các symbol đã `export` từ file/module đích vào phạm vi hiện tại.
 
-**Cú pháp chuẩn Vir v3.1:**
+**Cú pháp chuẩn Vir v3.6:**
 
 ```vir
 import add, sub from math;           # selective import
 import MAX_RETRY from net.config;    # hằng dùng cùng một form
 import get from net.http as fetch;   # `get` là tên export bình thường
 import answer from "provider.vri";   # provider dùng direct-path compatibility
-import from net.http;                # toàn bộ export surface
+import net.http;                     # namespace của cả module
 import net.http as web;              # namespace của cả module
 ```
 
 Import không cần `include` trước. Selective import áp dụng thống nhất cho
-function, type, constant và variable đã export. `import from module` đưa toàn bộ
-exported declarations vào local scope. `import module as alias` tạo namespace
-và không inject unqualified names.
+function, type, constant và variable đã export. `from` chỉ hợp lệ sau một danh
+sách selective symbol không rỗng. `import module` tạo namespace chuẩn của cả
+module; `import module as alias` bind namespace đó dưới tên local tường minh.
+Cả hai form đều không inject toàn bộ export thành unqualified names. `import
+from module` là cú pháp không hợp lệ.
 
 ### 3.4 Export / Share / Port
 
@@ -1265,18 +1285,18 @@ entity Account:
 
     method deposit(amount: int):
         this.balance = this.balance + amount
-    end.
+    end
 
     method withdraw(amount: int):
         if amount > this.balance do
             throw 1
         end
         this.balance = this.balance - amount
-    end.
+    end
 
     method get_balance: int
         out this.balance
-    end.
+    end
 end.
 
 func main:
@@ -1286,6 +1306,14 @@ func main:
     print(acc.get_balance())     # → 1300
 end.
 ```
+
+`method` là khai báo member thuộc `entity`, không phải khai báo ở cấp
+module. Method đóng bằng `end`; entity sở hữu đóng bằng `end.`. Phần mở
+rộng ở cấp module dùng `func` với tham số receiver đầu tiên tường minh
+và có thể gọi qua UFCS. `method` ở cấp module là không hợp lệ.
+
+Hợp đồng khai báo tập trung, bao gồm ownership, `this` ngầm định và dấu
+kết thúc khối, được quy định chuẩn tắc trong `VIR-SPC-0022`.
 
 Ngoài ra, UFCS vẫn hoạt động — bất kỳ hàm nào có tham số đầu tiên tên `this` đều gọi được bằng cú pháp dấu chấm:
 
@@ -1704,6 +1732,11 @@ Khi compiler gặp `x.foo(args)`:
 3. Nếu tồn tại hàm `foo(x, args)` → gọi UFCS
 4. Nếu không → lỗi biên dịch
 
+Việc chọn method hoặc callable field là terminal theo tên: lỗi arity hay type
+sau khi chọn phải là lỗi biên dịch và KHÔNG ĐƯỢC fallback sang ứng viên có độ
+ưu tiên thấp hơn. Field cùng tên nhưng không callable không phải ứng viên gọi
+và KHÔNG ĐƯỢC ngăn bước 3. Xem `VIR-SPC-0023`.
+
 Bước 2 cho phép pattern hướng sự kiện (event-driven) — entity field lưu callback:
 
 ```vir
@@ -1743,6 +1776,22 @@ print u.name()             # → "hiển thị: Alice"    (gọi UFCS — có ng
 ```
 
 Field và hàm có thể dùng cùng tên mà không xung đột. Compiler **không bao giờ đoán** — `x.foo` luôn là field, `x.foo()` luôn là gọi hàm.
+
+**Phân giải UFCS và callable shadowing.** Với
+`receiver.member(args)`, compiler PHẢI lần lượt xét method của entity,
+structural callable field, rồi free function hữu hình đủ điều kiện. Field
+không callable KHÔNG ĐƯỢC ngăn bước free UFCS. Sau khi method hoặc callable
+field đã được chọn theo tên, mọi lỗi về số đối số, type, ownership hay yêu cầu
+gọi khác PHẢI được báo; compiler KHÔNG ĐƯỢC fallback sang ứng viên ưu tiên
+thấp hơn.
+
+Việc thêm entity method hoặc callable field CÓ THỂ chuyển hướng một lời gọi
+free UFCS hiện có. Việc đổi field cùng tên từ kiểu dữ liệu sang structural
+function type CÓ THỂ gây hiệu ứng tương tự. Đây là các thay đổi API có khả
+năng phá vỡ tương thích nguồn. Để chọn free function một cách tường minh,
+caller NÊN dùng `member(receiver, args)`, kèm qualification theo module khi
+cần. Hợp đồng chuẩn tắc đầy đủ nằm trong `VIR-SPC-0023`; khai báo entity method
+được quy định trong `VIR-SPC-0022`.
 
 ---
 
@@ -2821,11 +2870,11 @@ entity Point:
 
     method hash -> u64
         out (this.x as u64) * 31 + (this.y as u64)
-    end.
+    end
 
     method equals(other: Point) -> bool
         out this.x == other.x and this.y == other.y
-    end.
+    end
 end.
 
 var grid: dict of (Point, string) = [Point(x: 0, y: 0): "origin"]
@@ -3659,7 +3708,10 @@ infer:
 end
 ```
 
-`infer` block **tắt toàn bộ gradient tracking**: không cấp phát buffer autodiff, không lưu activation cho backward pass. Giảm RAM ~50% so với `train` mode. Dùng cho deployment / production serving.
+`infer` là block chỉ chạy forward. Compiler không sinh derivative code,
+gradient buffer hay activation/execution-state chỉ phục vụ backward cho các giá
+trị có toàn bộ lifetime trong block. Đặc tả không cam kết một tỷ lệ tiết kiệm
+bộ nhớ cố định.
 
 **Ngữ nghĩa:**
 - Mọi phép toán `tensor` / `**` bên trong đều được tối ưu hoá cho forward-only
@@ -3677,15 +3729,64 @@ train:
 end
 ```
 
-`train` block kích hoạt **autodiff native**: mọi phép toán tensor đều được tracing tự động; `.backward()` tính gradient ngược toàn đồ thị tính toán. Không cần thư viện ngoài.
+`train` kích hoạt **reverse-mode autodiff native theo mô hình ahead-of-time**.
+Sau phân tích kiểu, shape, effect và ownership, compiler chuyển operation graph
+ở typed HIR/MIR/SSA thành forward program và reverse program liên kết với nhau.
+`.backward()` gọi reverse code đã sinh tĩnh; runtime không tạo hay duyệt operator
+node, parent link hoặc dispatch tape ngầm.
+
+Derivative program có thể giữ activation tensor và execution state gọn (ví dụ
+nhánh đã đi hoặc số vòng lặp) khi đạo hàm cần chúng. Đây là native storage do
+compiler lập kế hoạch, không phải dynamic computation graph. Compiler không
+được âm thầm fallback sang runtime graph tracing.
+
+**Biên differentiability và compile-time:**
+
+- Dtype, rank, shape, derivative của operator và target capability phải được
+  giải quyết trước artifact emission. Tensor static-shape native chỉ hợp lệ khi
+  target đang chọn có đủ forward và reverse kernel cần thiết.
+- Phép toán scalar/tensor, lời gọi hàm, nhánh và vòng lặp chỉ differentiable khi
+  mọi đường phụ thuộc dữ liệu có derivative đã định kiểu và compiler dựng được
+  reverse CFG. Compiler/target chưa có capability phải báo diagnostic ổn định;
+  dynamic control flow không cho phép runtime tracing.
+- Rank hoặc shape tensor phụ thuộc dữ liệu nằm ngoài static tensor contract và
+  phải bị reject. Recursion, indirect/extern call, custom operator hoặc call có
+  side effect cần derivative contract được phê duyệt; nếu không phải fail closed.
+- Mutation và alias chỉ hợp lệ khi ownership/borrow analysis nhận diện đúng
+  version của giá trị và giữ mọi activation cần cho reverse. Reverse program
+  không replay I/O hay external effect quan sát được.
+- Custom-gradient, stop-gradient, higher-order derivative và opt-in runtime
+  graph API là non-goal của v3.2.0; compiler không được suy diễn ngầm các cơ chế
+  này và phải reject cho đến khi SPEC sau định nghĩa contract.
+
+**Contract gradient:**
+
+- `.backward()` trên tensor root seed gradient bằng tensor toàn số một có cùng
+  static shape và dtype; gradient giữ shape và differentiable accumulation dtype
+  của primal.
+- Các contribution từ fan-out được cộng trong reverse program. Mỗi lần gọi
+  `.backward()` thay thế reachable gradient set; accumulation chỉ diễn ra trong
+  lần gọi đó, nên gọi lặp là deterministic và không tự cộng với lần trước.
+- `value.grad` là public tensor projection sau backward thành công cho train
+  value reachable. Đọc trước backward, ngoài `train`, hoặc trên giá trị
+  unreachable/unsupported là lỗi compile-time.
+
+**Storage và cleanup:**
+
+- Activation, execution-state và gradient storage tuân ownership, borrow,
+  arena, promotion và alignment thông thường. Compiler lập lifetime và cleanup
+  trên normal, early-return và error exit.
+- Buffer reuse và checkpoint/recompute chỉ là optimization nếu giữ nguyên giá
+  trị/effect quan sát được. SPEC không cam kết hệ số RAM hay tốc độ cố định giữa
+  `infer` và `train`.
 
 **So sánh `infer` vs `train`:**
 
 | | `infer` | `train` |
 |---|---|---|
 | Gradient tracking | Tắt | Bật |
-| RAM overhead | Thấp nhất | ~2–3× so với infer |
-| Tốc độ | Nhanh nhất | Chậm hơn do tracing |
+| Storage cho backward | Không | Activation, execution state và gradient do compiler lập kế hoạch |
+| Reverse execution | Không | Reverse program sinh tĩnh |
 | `.backward()` | Không cho phép | Có |
 | Mục đích | Deployment / serving | Huấn luyện mô hình |
 
@@ -3704,6 +3805,49 @@ var model_q4 = quantize(model, bits: 4)    # INT4 — 87.5% giảm RAM (yêu c�
 | `bits: 16` | `f16` | 50% | Mất mát nhỏ — phù hợp hầu hết mô hình |
 | `bits: 8`  | `i8`  | 75% | Đủ cho inference production |
 | `bits: 4`  | INT4  | 87.5% | Yêu cầu NPU với hỗ trợ INT4 native |
+
+#### 26.5.1 Hợp đồng số học và layout
+
+Đầu vào của `quantize` phải là dense tensor có phần tử `f16`, `f32`, hoặc
+`f64`; `bits` phải là literal thời gian biên dịch thuộc `{4, 8, 16, 32}`.
+Compiler phải từ chối mọi lời gọi không thỏa điều kiện này trước khi sinh
+artifact.
+
+Giá trị runtime do `quantize` tạo có header nội bộ gồm bốn trường 64-bit theo
+thứ tự `numel`, `bits`, `scale`, `zero_point`, tiếp theo là payload tại byte
+offset 32. Header là chi tiết ABI nội bộ, không phải một record công khai có
+thể được tạo hoặc sửa bằng safe Vir. Mọi codec trong mục này dùng
+`zero_point = 0`.
+
+Với `bits: 8` và `bits: 4`, đặt `Qmax` lần lượt là 127 và 7. Mỗi phần tử đầu
+vào phải hữu hạn và có trị tuyệt đối nhỏ hơn `2^63`; vi phạm điều kiện này làm
+chương trình kết thúc bất thường với trạng thái runtime 133 trước khi trả về
+tensor lượng tử. Đặt:
+
+```text
+t_i   = trunc_toward_zero(x_i)
+m     = max_i(abs(t_i))
+scale = max(1, ceil(m / Qmax))
+q_i   = clamp(trunc_toward_zero(t_i / scale), -Qmax, Qmax)
+```
+
+`bits: 8` lưu từng `q_i` dưới dạng bù hai `i8`. `bits: 4` lưu bù hai 4-bit,
+phần tử chỉ số chẵn ở nibble thấp và phần tử chỉ số lẻ kế tiếp ở nibble cao.
+Nếu `numel` lẻ, nibble cao không dùng của byte cuối bắt buộc bằng 0. `-0.0`
+được chuẩn hóa thành integer 0. Khi dùng trong `infer`, giá trị logic được
+khôi phục bằng `q_i * scale`.
+
+Với `bits: 16`, payload là IEEE-754 binary16; với `bits: 32`, payload là
+IEEE-754 binary32. Chuyển đổi giảm độ chính xác dùng round-to-nearest,
+ties-to-even; `scale = 1` và `zero_point = 0`. Dấu của zero và phân loại IEEE
+của `+Infinity`, `-Infinity`, và NaN phải được bảo toàn. Payload và dấu cụ thể
+của NaN không được bảo đảm giữa các target, nhưng kết quả phải vẫn là NaN.
+
+Giá trị `QuantizedTensor` chỉ hợp lệ khi được tạo bởi compiler/runtime theo
+hợp đồng trên và metadata tĩnh của nó khớp với phép toán tiêu thụ. Việc giả
+mạo hoặc sửa header/payload qua raw pointer, FFI, hay intrinsic ghi bộ nhớ là
+unsafe behavior nằm ngoài hợp đồng ngôn ngữ; runtime không có nghĩa vụ chấp
+nhận hay chẩn đoán payload đó.
 
 ---
 
@@ -3752,7 +3896,7 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 | Từ khoá | Mục đích |
 |---------|---------|
 | `func` | Định nghĩa hàm |
-| `end.` | Đóng khối định nghĩa / khai báo (`func`, `entity`, `method`, `enum`, `register`, `mold`, stub `@bind`, …) — xem §1 |
+| `end.` | Đóng khối định nghĩa / khai báo top-level (`func`, `entity`, `enum`, `register`, `mold`, stub `@bind`, …); `method` trong entity là khối lồng và đóng bằng `end` — xem §1 và §7.2 |
 | `end` | Đóng khối điều khiển / câu lệnh (`if`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, …) — xem §1 |
 | `out` | Đưa kết quả ra ngoài — return / tham số `out` / phần tử `map` (một nghĩa; đích khác nhau — §6.1) |
 | `var` | Khai báo biến có thể thay đổi |
@@ -3801,10 +3945,10 @@ Mọi cụm từ ngôn ngữ tự nhiên đều được ánh xạ qua KeywordRe
 
 | Từ khoá | Mục đích |
 |---------|---------|
-| `include` | Nạp file và tạo namespace |
+| `include` | Ghép implementation fragment vào logical module hiện tại; không tạo namespace |
 | `import` | Đưa declarations đã export vào local scope hoặc bind namespace module |
 | `from` | Chỉ định module nguồn |
-| `as` | Đổi tên namespace, import, hoặc ép kiểu |
+| `as` | Đổi tên whole-module/selective import hoặc ép kiểu; không hợp lệ với include |
 | `export` | Xuất hàm cho module khác |
 | `share` | Chia sẻ biến cấp module |
 
@@ -3975,7 +4119,7 @@ Từ cao đến thấp:
 | `tensor[T; S...]` | — | Mảng N chiều NPU/GPU-aligned — row-major, aligned 64-byte, kiểm tra kích thước tại biên dịch (§26.1) |
 | `**` | — | Matmul — `[M,K]**[K,N]→[M,N]`; ánh xạ NEON FMMLA / AVX-512 / WASM simd128 (§26.2) |
 | `><` | — | Fused multiply-accumulate (FMA) — nhân + cộng tích lũy một lệnh, tránh round-off (§26.2) |
-| `infer` | — | Block inference không gradient — tắt autodiff, ~50% RAM ít hơn train (§26.3) |
+| `infer` | — | Block forward-only không gradient; không derivative program/backward state (§26.3) |
 | `train` | — | Block training autodiff native — `.backward()` tính gradient ngược tự động (§26.4) |
 | `quantize` | — | Nén độ chính xác tensor INT8/INT4 — tăng tốc inference, giảm RAM (§26.5) |
 | erx | — | Thanh ghi lỗi — đọc mã lỗi đã throw |
@@ -3993,12 +4137,12 @@ Từ cao đến thấp:
 | Map biểu thức | — | `map x in list: out expr end` — biến đổi |
 | Kiểu có kích thước | `int`, `float`, `string`, `bool` | + `i8`–`i64`, `u8`–`u64`, `ptr` |
 | Include đường dẫn | `include math;` | + `include net.http;` (ánh xạ thư mục) |
-| Include alias | — | `include net.http as web;` |
+| Include composition | — | `include internal;` thêm declarations cùng module, không tạo namespace hay tự export |
 | Import alias | — | `import get from net.http as fetch;` |
 
 ---
 
-*Đặc tả Ngôn ngữ Vir v3.1 — Ngôn ngữ lập trình hệ thống biên dịch native không phụ thuộc.*
+*Đặc tả Ngôn ngữ Vir v3.6 — Ngôn ngữ lập trình hệ thống biên dịch native không phụ thuộc.*
 *Mục tiêu: ARM64 (Mach-O), x86-64 (ELF), WebAssembly.*
 *Trình biên dịch tự lưu trữ: virc.vri (viết hoàn toàn bằng Vir).*
 
@@ -4006,6 +4150,12 @@ Từ cao đến thấp:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-10 | 3.6.0 | Kích hoạt VIR-SPC-0021: include là same-module implementation composition không alias, chỉ whole-module import bind namespace giới hạn bởi export, còn compiler conformance tiếp tục thuộc VIRC-ISS-0065 |
+| 2026-10-10 | 3.5.0 | Thêm tham chiếu tập trung cho entity/method và UFCS, chuẩn hoá callable-only shadowing cùng terminal no-fallback, giữ non-callable-field UFCS fallthrough, đồng thời ghi rõ direct-call pinning và rủi ro tương thích API theo VIR-ISS-0019 |
+| 2026-10-10 | 3.4.0 | Quy định method trong entity là khối lồng đóng bằng `end`, dành `end.` cho entity sở hữu, loại `method` cấp module và giữ free-function UFCS là cơ chế mở rộng độc lập theo VIR-ISS-0018 |
+| 2026-10-10 | 3.3.0 | Chọn `import module` làm form whole-module chuẩn, giới hạn `from` cho selective import có danh sách symbol không rỗng, loại `import from module` và ghi decision record tại VIR-ISS-0017 |
+| 2026-10-08 | 3.2.0 | Định nghĩa AOT-first reverse-mode autodiff, fail-closed differentiation/target rules, lifetime activation do compiler lập kế hoạch, semantics gradient/repeated backward công khai và bỏ cam kết tracing/RAM cố định |
+| 2026-10-08 | 3.1.2 | Chuẩn hóa layout, scale/zero-point, truncation, saturation, INT4 odd nibble, signed zero, NaN/Infinity, miền số nguyên và malformed-input policy cho `quantize` |
 | 2026-10-06 | 3.1.1 | Sửa toàn bộ ví dụ dịch bit Vir sang `shl`/`shr` và giữ `>>` riêng cho phép cast |
 | 2026-10-06 | 3.1.0 | Mô tả registered dotted Module ID, direct `.vri` path compatibility, legacy dot-to-path fallback và canonical convergence giữa các spelling tương đương |
 | 2026-10-06 | 3.0.0 | Chuẩn hóa module contract dựa trên registry, multi-include và namespace/umbrella import; thống nhất selective import cho mọi declaration kind; loại form forward/deferred cũ; reserve exact stdlib Module ID |

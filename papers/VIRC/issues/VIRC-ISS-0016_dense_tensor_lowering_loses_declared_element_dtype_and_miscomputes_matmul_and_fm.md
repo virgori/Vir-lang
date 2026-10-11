@@ -7,7 +7,7 @@ status: "CLOSED"
 severity: "S1"
 priority: "P0"
 created: "2026-10-03"
-updated: "2026-10-06"
+updated: "2026-10-08"
 owners:
   - "compiler"
 components:
@@ -22,6 +22,7 @@ related:
   issues:
     - "VIR-ISS-0002"
     - "VIRC-ISS-0022"
+    - "VIRC-ISS-0059"
   plans:
     - "VIRC-PLN-0026"
   reports:
@@ -204,3 +205,4 @@ correctness must be restored before performance or release claims are trusted.
 | 2026-10-05 | Implemented dedicated x86 f16 2-byte loop, full software IEEE-754 half precision conversion, structured tdesc store, removed dead TensorTypeMeta, added f16 rectangular and boundary fixtures, 11/11 mutation controls |
 | 2026-10-06 | Reopened: audit identified 8 residual tdesc_from_annotation call sites in AST->MIR lowering; refactored Pass 4 and Pass 6 to attach descriptors to AST nodes, eliminating all string decoding in lowering; criterion 2 left unchecked pending independent audit sign-off |
 | 2026-10-06 | Verified and closed: explicit annotations decode once in Pass 4, Pass 6 only fills inferred or missing descriptors, lowering has zero serialized tensor-type scans, the 12-test mutation/propagation suite passes on ARM64 and Linux x86-64, and fixed-point stage2 equals stage3 |
+| 2026-10-08 | Linked VIRC-ISS-0059 |

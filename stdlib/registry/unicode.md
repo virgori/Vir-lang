@@ -107,7 +107,7 @@ Plus types:
 
 ```text
 UnicodeCategory   # Lu, Ll, … — public with unicode.category
-Utf8Decoded       # codepoint + nbytes — decodeUtf8 Ok payload (Q1)
+Utf8Decoded       # codepoint + nbytes — decodeUtf8 Success payload (Q1)
 ```
 
 ## Scalar rules (closed)
@@ -195,7 +195,7 @@ Enum without accessor is not enough — **add** `category` even if missing today
 | `unicode.countUtf8` | `unicode.countUtf8` | `unicode.countUtf8(s: Slice) -> int` | proposed |
 
 `encodeUtf8` buffer shape follows implementer choice (`Buffer` append vs scratch)
-without public `ptr` + `out_len`. **`decodeUtf8` Ok type is locked (Q1):**
+without public `ptr` + `out_len`. **`decodeUtf8` Success type is locked (Q1):**
 `Utf8Decoded` — not an unverified tuple form.
 
 ---
@@ -256,7 +256,7 @@ entity Utf8Decoded:
     nbytes: int       # bytes consumed from the Slice
 ```
 
-`decodeUtf8` returns `Result of (Utf8Decoded)`. Malformed → `Err` with
+`decodeUtf8` returns `Result of (Utf8Decoded)`. Malformed → `Failure` with
 [`ErrorKind.InvalidData`](error.md); no silent `U+FFFD` success. Do **not**
 depend on tuple syntax for this public ABI.
 

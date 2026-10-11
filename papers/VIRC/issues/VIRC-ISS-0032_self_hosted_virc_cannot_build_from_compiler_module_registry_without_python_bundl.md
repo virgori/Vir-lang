@@ -3,11 +3,11 @@ id: "VIRC-ISS-0032"
 type: "ISSUE"
 domain: "VIRC"
 title: "Self-hosted virc cannot build from compiler module registry without Python bundle synchronization"
-status: "RESOLVED"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-04"
-updated: "2026-10-04"
+updated: "2026-10-11"
 owners:
   - "VIRC"
 components:
@@ -266,3 +266,4 @@ nhưng source-of-truth và self-hosting contract chưa hoàn chỉnh. Priority `
 | 2026-10-04 | Mở ISSUE từ audit native compiler project ingestion, ghi nhận Python marker replay, incomplete registry closure và acceptance criteria cho self-host build không phụ thuộc generated bundle |
 | 2026-10-04 | Linked VIRC-PLN-0017 |
 | 2026-10-04 | Linked VIRC-RPT-0033; marked RESOLVED with complete 3-stage bootstrap fixed-point evidence |
+| 2026-10-11 | Independent closure audit confirmed native compiler-project ingestion from repository root and alternate CWD, the 3-stage fixed point, and Group 27 (156/156); closed against accepted VIRC-RPT-0033 |

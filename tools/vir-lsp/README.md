@@ -3,7 +3,7 @@
 Native language server for Vir. The server analyzes unsaved buffers using the
 active compiler lexer, parser, name resolver, inference and borrow passes.
 
-The current server version is `1.3.0`. `vir-lsp` uses an independent Semantic
+The current server version is `1.3.1`. `vir-lsp` uses an independent Semantic
 Version and does not inherit the compiler's calendar version. See
 [VERSIONING.md](VERSIONING.md) for the bump policy.
 

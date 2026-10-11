@@ -3,11 +3,11 @@ id: "VIRC-ISS-0048"
 type: "ISSUE"
 domain: "VIRC"
 title: "Compiler accepts non-spec C and Rust syntax aliases"
-status: "OPEN"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-06"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "compiler"
   - "frontend"
@@ -17,9 +17,14 @@ components:
   - "language-conformance"
   - "regression-suite"
 related:
-  issues: []
-  plans: []
-  reports: []
+  issues:
+    - "VIR-ISS-0011"
+    - "VIRC-ISS-0055"
+    - "VIRC-ISS-0058"
+  plans:
+    - "VIRC-PLN-0040"
+  reports:
+    - "VIRC-RPT-0057"
 supersedes: null
 superseded_by: null
 tags:
@@ -229,35 +234,35 @@ the compatibility paths can be removed without breaking self-hosting.
 
 ## 10. Acceptance Criteria
 
-- [ ] Build a source-spelling inventory by comparing lexer/operator/keyword
+- [x] Build a source-spelling inventory by comparing lexer/operator/keyword
   tables with active `VIR-SPC-0015`, `VIR-SPC-0017`, and `VIR-SPC-0018`; record
   every removed spelling in the implementation REPORT.
-- [ ] Migrate active compiler, stdlib, examples and positive tests from `&&`,
+- [x] Migrate active compiler, stdlib, examples and positive tests from `&&`,
   infix `|`, prefix bitwise `~`, `<<`, `<<=`, `>>=`, and `return` to their
   canonical Vir equivalents before removing frontend support.
-- [ ] Remove the `return -> TokType.Out` keyword alias; a statement beginning
+- [x] Remove the `return -> TokType.Out` keyword alias; a statement beginning
   with `return` no longer produces `ReturnStmt` and a focused negative fixture
   points to `out`.
-- [ ] Remove `TokType.While` source handling, parser dispatch and the
+- [x] Remove `TokType.While` source handling, parser dispatch and the
   compatibility branch of `parse_when_loop_stmt`; a focused negative fixture
   points to `when condition loop` and does not fall through to E2001.
-- [ ] Remove lexer/parser support for `&&`, infix `|`, prefix bitwise `~`, `<<`,
+- [x] Remove lexer/parser support for `&&`, infix `|`, prefix bitwise `~`, `<<`,
   `<<=`, and `>>=` where those spellings are not assigned another canonical
   meaning by the SPEC.
-- [ ] Preserve positive conformance for `&`, `||`, `and`, `or`, `xor`,
+- [x] Preserve positive conformance for `&`, `||`, `and`, `or`, `xor`,
   `bnot(...)`, `shl`, `shr`, postfix swizzle `~`, and canonical compound
   assignments.
-- [ ] Preserve `value >> Type` as a cast in lexer, parser, semantic analysis and
+- [x] Preserve `value >> Type` as a cast in lexer, parser, semantic analysis and
   all supported backends; add a regression proving it is never reclassified as
   shift-right.
-- [ ] Negative syntax tests cover every removed spelling in classic and JSON
+- [x] Negative syntax tests cover every removed spelling in classic and JSON
   diagnostic modes with stable source spans and canonical replacement actions.
-- [ ] Repository conformance check rejects reintroduction of removed source
+- [x] Repository conformance check rejects reintroduction of removed source
   spellings while excluding comments, foreign embedded source and explicit
   negative fixtures.
-- [ ] `tools/sync_virc.py --check`, focused frontend tests, minimum/full relevant
+- [x] `tools/sync_virc.py --check`, focused frontend tests, minimum/full relevant
   suites, and stage 2 == stage 3 self-host bootstrap pass before closure.
-- [ ] Accepted REPORT maps each criterion to raw commands/results and records
+- [x] Accepted REPORT maps each criterion to raw commands/results and records
   any intentionally retained compatibility spelling as a separately approved
   SPEC decision or linked follow-up ISSUE.
 
@@ -265,15 +270,17 @@ the compatibility paths can be removed without breaking self-hosting.
 
 ### Issues
 
-- None.
+- `VIR-ISS-0011` — related canonical syntax conformance work.
+- `VIRC-ISS-0055` — related frontend/spec consistency work.
+- `VIRC-ISS-0058` — related frontend/spec consistency work.
 
 ### Plans
 
-- None yet.
+- `VIRC-PLN-0040` — completed implementation plan.
 
 ### Reports
 
-- None yet.
+- `VIRC-RPT-0057` — accepted implementation and verification report.
 
 ### Specifications
 
@@ -288,3 +295,9 @@ the compatibility paths can be removed without breaking self-hosting.
 | Date | Change |
 |---|---|
 | 2026-10-06 | Opened from lexer/parser inspection and direct native compiler probes of non-SPEC operators, `return`, and `while` |
+| 2026-10-08 | Linked VIRC-ISS-0055 |
+| 2026-10-08 | Linked VIRC-ISS-0058 |
+| 2026-10-08 | Linked VIR-ISS-0011 |
+| 2026-10-10 | Linked VIRC-PLN-0040 |
+| 2026-10-10 | Linked VIRC-RPT-0057 |
+| 2026-10-10 | Closed after accepted report, compiler 2026.1.12 fixed point, and 953/953 full suite |

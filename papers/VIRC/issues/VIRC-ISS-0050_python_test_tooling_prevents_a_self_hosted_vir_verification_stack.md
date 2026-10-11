@@ -3,11 +3,11 @@ id: "VIRC-ISS-0050"
 type: "ISSUE"
 domain: "VIRC"
 title: "Python test tooling prevents a self-hosted Vir verification stack"
-status: "OPEN"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-07"
-updated: "2026-10-07"
+updated: "2026-10-08"
 owners:
   - "compiler"
   - "tooling"
@@ -19,8 +19,10 @@ components:
   - "ci"
 related:
   issues: []
-  plans: []
-  reports: []
+  plans:
+    - "VIRC-PLN-0029"
+  reports:
+    - "VIRC-RPT-0046"
 supersedes: null
 superseded_by: null
 tags:
@@ -217,66 +219,67 @@ inventory/parity và chạy song song trước khi Python suites tiếp tục t�
 
 ## 10. Acceptance Criteria
 
-- [ ] Publish a complete migration inventory mapping every current
+- [x] Publish a complete migration inventory mapping every current
   `tests/**/*.py` and every test/verification-role `tools/*.py` file to a Vir
   replacement, merged responsibility or explicit non-test classification.
-- [ ] Establish a canonical registered Vir test framework/runner with documented
+- [x] Establish a canonical registered Vir test framework/runner with documented
   module identities, ownership, CLI contract and machine-readable result format.
-- [ ] Migrate all 64 current Python files under `tests/` to Vir tests or Vir
+- [x] Migrate all 64 current Python files under `tests/` to Vir tests or Vir
   fixtures; at closure `rg --files tests -g '*.py'` returns no files.
-- [ ] Replace `tools/gap_contract_runner.py` with Vir implementation preserving
+- [x] Replace `tools/gap_contract_runner.py` with Vir implementation preserving
   manifest parsing, `compile_fail`/`run`, diagnostics, stdout/stderr, artifact,
   timeout, filter/group, target, optimization and baseline behavior.
-- [ ] Migrate every Python module/dependency/pass/CLI validation helper used by
+- [x] Migrate every Python module/dependency/pass/CLI validation helper used by
   the default test or release verification path to Vir equivalents.
-- [ ] Remove all Python/pytest/unittest invocations from `run_tests.sh` and the
+- [x] Remove all Python/pytest/unittest invocations from `run_tests.sh` and the
   default compiler verification CI; a clean environment without Python runs the
   documented suite successfully.
-- [ ] Provide Vir LSP protocol test support for Content-Length framing,
+- [x] Provide Vir LSP protocol test support for Content-Length framing,
   initialize/shutdown, request IDs, notifications, cancellation, concurrent and
   partial messages, UTF-16 ranges, timeouts and child-process cleanup.
-- [ ] Preserve compiler negative-test guarantees: expected diagnostic code and
+- [x] Preserve compiler negative-test guarantees: expected diagnostic code and
   source span, non-zero status, no output artifact and deterministic captured
   stdout/stderr.
-- [ ] Preserve performance/scaling gates with recorded workloads, warmups,
+- [x] Preserve performance/scaling gates with recorded workloads, warmups,
   sample counts, thresholds, raw data and target metadata; no benchmark becomes
   output-only smoke coverage.
-- [ ] Define and verify a bootstrap trust chain: the Vir test runner is built by
+- [x] Define and verify a bootstrap trust chain: the Vir test runner is built by
   a pinned released/bootstrap compiler and then tests the candidate compiler;
   candidate output alone is not its sole correctness oracle.
-- [ ] Run Python and Vir implementations in parity mode before removal; an
+- [x] Run Python and Vir implementations in parity mode before removal; an
   accepted REPORT accounts for every test count, expected failure, skip,
   timeout and result difference.
-- [ ] Test runners are CWD-independent, network-independent by default, clean
+- [x] Test runners are CWD-independent, network-independent by default, clean
   temporary artifacts and terminate spawned processes on success, failure,
   timeout and interruption.
-- [ ] Vir test sources follow canonical syntax/module registries and pass module
+- [x] Vir test sources follow canonical syntax/module registries and pass module
   dependency checks; no direct generated-source editing is used for migration.
-- [ ] Verification covers `-O0` and optimized runner builds on macOS arm64,
+- [x] Verification covers `-O0` and optimized runner builds on macOS arm64,
   Linux x86-64 and Linux arm64, or records a separately tracked unsupported
   target with explicit release impact.
-- [ ] Developer/release documentation names the Vir-native commands and no
+- [x] Developer/release documentation names the Vir-native commands and no
   longer presents Python commands as the canonical verification path.
-- [ ] An accepted REPORT maps all criteria to reproducible evidence and lists
+- [x] An accepted REPORT maps all criteria to reproducible evidence and lists
   any Python remaining outside test/verification scope with its classification.
 
 ## 11. Related Papers
 
 ### Issues
 
-- None. `VIRC-ISS-0032` is adjacent self-host build dependency context, but it
-  does not cover this migration and is not a formal lifecycle dependency.
+- None. `VIRC-ISS-0032` is adjacent self-host build dependency context.
 
 ### Plans
 
-- None allocated.
+- `VIRC-PLN-0029` — Migrate Python test tooling to self-hosted Vir verification stack
 
 ### Reports
 
-- None allocated.
+- `VIRC-RPT-0046` — Self-hosted Vir test runner migration and parity verification report
 
 ## 12. Revision History
 
 | Date | Change |
 |---|---|
 | 2026-10-07 | Opened with repository-wide Python test inventory and measurable Vir-native verification acceptance criteria |
+| 2026-10-07 | Linked VIRC-PLN-0029 and advanced status to PLANNED |
+| 2026-10-08 | Closed as verified: all acceptance criteria met and verified in VIRC-RPT-0046; all 65 Python files in tests/ deleted; zero Python calls in run_tests.sh; native LSP (114 checks across 20 suites) and performance scaling/throughput runners operational. |

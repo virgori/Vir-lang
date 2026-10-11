@@ -12,6 +12,22 @@ include parser_builtins
 include parser_state
 include parser_diagnostics
 
+func get_qual_expr_name(node: &AstNode) -> string:
+    if (node as i64) == 0 do out fat_str_new("") end
+    if node.node_type == AstType.Identifier do
+        out node.name
+    eif node.node_type == AstType.FieldAccess do
+        if vec_len_rt(node.children) > 0 do
+            let base_s = get_qual_expr_name(vec_get_rt(node.children, 0) as AstNode)
+            if fat_str_len(base_s) > 0 do
+                out fat_str_concat(fat_str_concat(base_s, fat_str_new(".")), node.name)
+            end
+        end
+        out node.name
+    end
+    out fat_str_new("")
+end.
+
 func parse_unary(ref p: Parser):
 
     # Allow `a +\n b` / multiline args inside `()` once lexer emits NEWLINE (§1.0).
@@ -63,14 +79,13 @@ func parse_unary(ref p: Parser):
         out (p3, n)
     end
 
-    # Bitwise `~` → UnaryNot
-    if check(p, TokType.BitNot) do
+    # `~` is postfix swizzle only. Bitwise complement is the canonical
+    # `bnot(expr)` call and must not acquire a prefix compatibility meaning.
+    if check(p, TokType.Swizzle) do
         var (p2, t) = advance(p)
+        p2 = parse_error_loc(p2, "prefix '~' is not bitwise NOT; use 'bnot(expr)'", t.line, t.col)
         var (p3, operand) = parse_unary(p2)
-        n = ast_new(AstType.UnaryNot)
-        n.line = t.line
-        n = ast_add_child(n, operand)
-        out (p3, n)
+        out (p3, operand)
     end
 
     # `&mut expr` shared/mut borrow
@@ -197,7 +212,59 @@ func parse_unary(ref p: Parser):
             else
                 mgen_args = fat_str_new("")
             end
-            if check(p4, TokType.LParen) do
+            if check(p4, TokType.LParen) and check_entity_literal(p4) do
+                var (p5, _) = advance(p4)
+                el = ast_new(AstType.EntityLiteral)
+                let qual_base = get_qual_expr_name(left)
+                var el_name = tok_lex(field_tok)
+                if fat_str_len(qual_base) > 0 do
+                    el_name = fat_str_concat(fat_str_concat(qual_base, fat_str_new(".")), tok_lex(field_tok))
+                end
+                el.name = el_name
+                el.name2 = mgen_args
+                el.line = field_tok.line
+                el.span_id = field_tok.span_id
+                ideFactOrigin(el as int, field_tok.span_id, field_tok.line)
+                p5 = skip_newlines(p5)
+                var (p5_semi, _) = match_tok(p5, TokType.Semicolon)
+                p5 = skip_newlines(p5_semi)
+                when not check(p5, TokType.RParen) and not check(p5, TokType.Eof) loop
+                    var (p6, fname, ok) = expect_name_tok(p5, "expected field name")
+                    let labelLine = native_read_i64(fname as int, 8)
+                    let labelSpan = native_read_i64(fname as int, 72)
+                    let labelName = tok_lex(fname)
+                    p5 = p6
+                    if not ok do
+                        out (p5, el)
+                    end
+                    var (p7, _, _) = expect_tok(p5, TokType.Colon, "expected ':' after field")
+                    p5 = p7
+                    var (p8, val) = parse_expr(p5)
+                    p5 = p8
+                    val.name2 = fname.str_val
+                    if g_ideFactsEnabled == 1 do
+                        let fieldLabel = ast_new(AstType.FieldAccess)
+                        native_write_i64(fieldLabel as int, 0, labelName as int)
+                        native_write_i64(fieldLabel as int, 32, labelLine)
+                        native_write_i64(fieldLabel as int, 72, labelSpan)
+                        ideFactOrigin(fieldLabel as int, labelSpan, labelLine)
+                        ideFactSetProjection(val as int, fieldLabel as int)
+                    end
+                    el = ast_add_child(el, val)
+                    var (p9, had_comma) = match_tok(p5, TokType.Comma)
+                    if had_comma do
+                        p5 = p9
+                    else
+                        var (p9b, _) = match_tok(p9, TokType.Semicolon)
+                        p5 = p9b
+                    end
+                    p5 = skip_newlines(p5)
+                end
+                var (p10, _, _) = expect_tok(p5, TokType.RParen, "expected ')' after entity literal")
+                el.name2 = mgen_args
+                left = el
+                p2 = p10
+            eif check(p4, TokType.LParen) do
                 mc = ast_new(AstType.MethodCall)
                 mc_name = tok_lex(field_tok)
                 mc.name = mc_name
@@ -242,7 +309,7 @@ func parse_unary(ref p: Parser):
                 left = fa
                 p2 = p4
             end
-        eif (check(p2, TokType.BitNot) or check(p2, TokType.Swizzle)) and peek_n(p2, 1).tok_type == TokType.Ident do
+        eif check(p2, TokType.Swizzle) and peek_n(p2, 1).tok_type == TokType.Ident do
             # postfix swizzle: v~mask
             var (p3, op_tok) = advance(p2)
             var (p4, mask_tok) = advance(p3)
@@ -261,11 +328,18 @@ func parse_unary(ref p: Parser):
             left = ab
             p2 = p3
         eif check(p2, TokType.Exist) do
-            # postfix optional `?`
+            # binary `m ? key` or postfix optional `?`
             var (p3, op_tok) = advance(p2)
             ex = ast_new(AstType.ExistExpr)
             ex.line = op_tok.line
             ex = ast_add_child(ex, left)
+            let next_tok = peek(p3)
+            let n_tt = next_tok.tok_type
+            if n_tt != TokType.Newline and n_tt != TokType.Eof and n_tt != TokType.RBracket and n_tt != TokType.RParen and n_tt != TokType.Comma and n_tt != TokType.Colon and n_tt != TokType.End and n_tt != TokType.Do and n_tt != TokType.Semicolon and n_tt != TokType.Dot do
+                var (p4, right) = parse_unary(p3)
+                ex = ast_add_child(ex, right)
+                p3 = p4
+            end
             left = ex
             p2 = p3
         eif check(p2, TokType.LBracket) do

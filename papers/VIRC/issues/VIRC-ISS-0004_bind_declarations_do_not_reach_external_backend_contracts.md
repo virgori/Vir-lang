@@ -20,7 +20,8 @@ components:
   - "object-writers"
   - "tests"
 related:
-  issues: []
+  issues:
+    - "VIRC-ISS-0067"
   plans:
     - "VIRC-PLN-0025"
   reports:
@@ -182,7 +183,7 @@ correctness failure with silent wrong-code potential, so it is S1/P0.
 
 ### Issues
 
-- None.
+- `VIRC-ISS-0067` — registered VPS papers are absent from the committed repository snapshot.
 
 ### Plans
 
@@ -202,3 +203,6 @@ correctness failure with silent wrong-code potential, so it is S1/P0.
 | 2026-10-05 | Linked VIRC-PLN-0025 |
 | 2026-10-05 | Linked VIRC-RPT-0042 |
 | 2026-10-10 | Closed: verified full native ABI support (AAPCS64 & SysV AMD64), fail-closed handling for unsupported targets and signatures, Group 15 (7/7 PASS), and bit-identical 3-stage bootstrap fixed point; VIRC-PLN-0025 COMPLETED and VIRC-RPT-0042 READY_FOR_CLOSE |
+| 2026-10-10 | Reopened after independent audit: restored active FFI-001..012 coverage, corrected the FFI-012 fixture identity, and found the broad min suite at 470/471 plus clean-checkout VPS validation failures; closure gate remains unchecked |
+| 2026-10-10 | Closed after corrective verification: fixed MEM-OVERFLOW-001 fixture resolution/ownership, passed Group 27 at 156/156, min at 483/483, full at 942/942, and FFI at 12/12; isolated the unrelated clean-snapshot paper packaging defect under linked VIRC-ISS-0067 |
+| 2026-10-10 | Linked VIRC-ISS-0067 |

@@ -41,7 +41,7 @@ Opposite direction → [`format`](format.md).
 ## Failure model (closed)
 
 ```text
-Ok(value) | Err(Error { kind: ParseIntError | ParseFloatError, … })
+Success(value) | Failure(Error { kind: ParseIntError | ParseFloatError, … })
 ```
 
 Use existing [`ErrorKind.ParseIntError`](error.md) /
@@ -92,11 +92,11 @@ Decimal only:
 - Entire string must match
 
 ```text
-parse.int("255")   → Ok(255)
-parse.int("12x")   → Err(ParseIntError)
-parse.int("0xff")  → Err(ParseIntError)
-parse.int(" 1")    → Err(ParseIntError)
-parse.int("")      → Err(ParseIntError)
+parse.int("255")   → Success(255)
+parse.int("12x")   → Failure(ParseIntError)
+parse.int("0xff")  → Failure(ParseIntError)
+parse.int(" 1")    → Failure(ParseIntError)
+parse.int("")      → Failure(ParseIntError)
 ```
 
 ## Grammar — `parse.intRadix` (closed)
@@ -124,20 +124,20 @@ parse.intRadix(s, base) -> Result of (int)
 - Whole string consumed; no trim
 
 ```text
-parse.intRadix("0xff", 16)  → Ok(255)
-parse.intRadix("-ff", 16)   → Ok(-255)
-parse.intRadix("0xff", 10)  → Err(ParseIntError)
+parse.intRadix("0xff", 16)  → Success(255)
+parse.intRadix("-ff", 16)   → Success(-255)
+parse.intRadix("0xff", 10)  → Failure(ParseIntError)
 ```
 
 ### Contract examples (target)
 
 | Expression | Result |
 |---|---|
-| `parse.int("255")` | `Ok(255)` |
+| `parse.int("255")` | `Success(255)` |
 | `parse.int("12x")` | `ParseIntError` |
 | `parse.int("0xff")` | `ParseIntError` |
-| `parse.intRadix("0xff", 16)` | `Ok(255)` |
-| `parse.intRadix("-ff", 16)` | `Ok(-255)` |
+| `parse.intRadix("0xff", 16)` | `Success(255)` |
+| `parse.intRadix("-ff", 16)` | `Success(-255)` |
 
 These are **implementation targets**, not a claim that current `parse_int` /
 `str_to_i64` already pass.
@@ -204,14 +204,14 @@ Stable only after the float gate (F1–F6) passes.
 
 | Case | Expect |
 |---|---|
-| Decimal happy path | `Ok` |
-| `+` / `-` signs | `Ok` |
+| Decimal happy path | `Success` |
+| `+` / `-` signs | `Success` |
 | Empty / whitespace / trailing junk | `ParseIntError` |
 | `parse.int` with `0x`/`0b`/`0o` | `ParseIntError` |
-| Radix + matching prefix | `Ok` |
+| Radix + matching prefix | `Success` |
 | Radix + wrong prefix | `ParseIntError` |
 | Hex letters case | both cases OK for base 16 |
-| `INT64_MIN` / `INT64_MAX` | `Ok` |
+| `INT64_MIN` / `INT64_MAX` | `Success` |
 | Beyond int64 | `ParseIntError` |
 | Unsupported `base` | parameter contract (not ParseIntError) |
 
@@ -236,7 +236,7 @@ Default error type is [`Error`](error.md): `Result of (int)` / `Result of (float
 parse.int(s: string) -> Result of (int)
 ```
 
-Strict decimal whole-string parse → `Ok(int)` or `Err` (`ParseIntError`).
+Strict decimal whole-string parse → `Success(int)` or `Failure` (`ParseIntError`).
 
 ### Status
 

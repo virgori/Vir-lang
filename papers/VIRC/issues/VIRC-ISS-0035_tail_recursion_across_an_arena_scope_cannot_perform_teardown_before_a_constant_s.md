@@ -7,7 +7,7 @@ status: "CLOSED"
 severity: "S1"
 priority: "P1"
 created: "2026-10-04"
-updated: "2026-10-05"
+updated: "2026-10-08"
 owners:
   - "compiler"
 components:
@@ -187,3 +187,4 @@ Phân biệt rõ:
 | 2026-10-05 | Acceptance criteria verified in VIRC-RPT-0039, issue closed |
 | 2026-10-05 | Independent acceptance audit reproduced a P1 shadowed-callable miscompile and found the reset-order regression assertion incomplete; prior closure invalidated and issue returned through REOPENED to IMPLEMENTING |
 | 2026-10-05 | Shadowed-callable resolution and ordered reset-before-backedge regression verified at O0-O3; TCO, Group 6, memory, fixed-point, bundle-sync, and VPS gates passed; issue advanced through VERIFYING and RESOLVED to CLOSED |
+| 2026-10-08 | Strengthened the registered arena-TCO regression from 100,000 to 10,000,000 recursive steps at O1-O3, matching the original bounded-stack acceptance depth |

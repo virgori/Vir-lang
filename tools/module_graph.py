@@ -22,11 +22,31 @@ from pathlib import Path
 from typing import Dict, List, Set, Tuple, Optional
 
 class ModuleRegistryError(Exception):
-    def __init__(self, code: int, message: str, location: Optional[str] = None):
-        super().__init__(f"[E{code}] {message}" + (f" at {location}" if location else ""))
+    def __init__(
+        self,
+        code: int,
+        message: str,
+        location: Optional[str] = None,
+        mapping: Optional[str] = None,
+        related_location: Optional[str] = None,
+        related_mapping: Optional[str] = None,
+    ):
+        rendered = f"[E{code}] {message}"
+        if location:
+            rendered += f" at {location}"
+        if mapping is not None:
+            rendered += f"; project mapping: {mapping}"
+        if related_location:
+            rendered += f"; related: {related_location}"
+        if related_mapping is not None:
+            rendered += f"; standard library mapping: {related_mapping}"
+        super().__init__(rendered)
         self.code = code
         self.message = message
         self.location = location
+        self.mapping = mapping
+        self.related_location = related_location
+        self.related_mapping = related_mapping
 
 class ModuleEntry:
     def __init__(self, name: str, rel_path: str, phys_path: Path, is_dir: bool, source_registry: str, line_no: int):
@@ -76,6 +96,15 @@ class ModuleResolver:
             # Reject duplicate entries
             if key in self.entries:
                 prev = self.entries[key]
+                if prev.source_registry.endswith("stdlib.vri") and reg_name != "stdlib.vri":
+                    raise ModuleRegistryError(
+                        2123,
+                        f"Project module '{key}' collides with standard library",
+                        f"{reg_path}:{idx}",
+                        mapping=val,
+                        related_location=f"{prev.source_registry}:{prev.line_no}",
+                        related_mapping=prev.rel_path,
+                    )
                 raise ModuleRegistryError(
                     2121,
                     f"Duplicate module registration for '{key}' (previously defined at {prev.source_registry}:{prev.line_no})",
@@ -86,7 +115,7 @@ class ModuleResolver:
             for dir_key in self.dir_aliases:
                 if key.startswith(dir_key + "."):
                     raise ModuleRegistryError(
-                        2122,
+                        2126,
                         f"Prefix collision: module key '{key}' shadows existing directory alias '{dir_key}'",
                         f"{reg_path}:{idx}"
                     )
@@ -99,7 +128,7 @@ class ModuleResolver:
                 for existing_key in self.entries:
                     if existing_key.startswith(key + "."):
                         raise ModuleRegistryError(
-                            2122,
+                            2126,
                             f"Prefix collision between directory alias '{key}' and registered entry '{existing_key}'",
                             f"{reg_path}:{idx}"
                         )
@@ -291,15 +320,22 @@ class DependencyGraph:
 
         return order
 
-def main():
+def main() -> int:
     import argparse
     parser = argparse.ArgumentParser(description="Vir module resolver and graph generator")
     parser.add_argument("--root", type=Path, default=Path.cwd(), help="Repository root")
+    parser.add_argument("--sysroot", type=Path, help="Active Vir toolchain sysroot")
     parser.add_argument("--resolve", help="Resolve a single module spec")
     parser.add_argument("--entry", help="Build dependency graph from entrypoint")
     args = parser.parse_args()
 
-    resolver = ModuleResolver(args.root)
+    env_sysroot = os.environ.get("VIR_SYSROOT")
+    active_sysroot = args.sysroot or (Path(env_sysroot) if env_sysroot else args.root)
+    try:
+        resolver = ModuleResolver(args.root, stdlib_root=active_sysroot / "stdlib")
+    except ModuleRegistryError as error:
+        print(error, file=sys.stderr)
+        return 1
     if args.resolve:
         canon_id, phys = resolver.resolve(args.resolve)
         print(f"Resolved: {args.resolve} -> {canon_id} ({phys})")
@@ -310,6 +346,7 @@ def main():
         print(f"Topological order ({len(order)} modules):")
         for m in order:
             print(f"  {m} ({graph.id_to_path[m]})")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

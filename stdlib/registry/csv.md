@@ -67,7 +67,7 @@ let d = csv.parseDelim(text, 59)           # custom delimiter (e.g. ';')
 
 `csv.parse(text: string) -> Result of (CsvDocument)`
 
-Comma delimiter (RFC 4180). Parse failure → `Err` with invalid-data semantics.
+Comma delimiter (RFC 4180). Parse failure → `Failure` with invalid-data semantics.
 
 ---
 

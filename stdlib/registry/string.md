@@ -306,7 +306,7 @@ string
 
 `Result` / `Option` / `Vec` payload types follow language forms; error on
 `fromBytes` uses I/O-relevant / data kind — prefer
-`ErrorKind.InvalidData` (see [`error.md`](error.md)). Exact `Err` payload type
+`ErrorKind.InvalidData` (see [`error.md`](error.md)). Exact `Failure` payload type
 (`Error` vs dedicated decode error) follows source when implemented — must be
 recoverable.
 
@@ -354,7 +354,7 @@ Validate `s` as UTF-8, copy into a new `string`.
 
 ### Returns
 
-`Ok(string)` if valid; `Err(…)` with `ErrorKind.InvalidData` (or equivalent
+`Success(string)` if valid; `Failure(…)` with `ErrorKind.InvalidData` (or equivalent
 recoverable payload) if not.
 
 ### Semantics

@@ -7,16 +7,31 @@ status: "TRIAGED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-02"
-updated: "2026-10-02"
-owners: [language, compiler]
-components: [generics, parser, type-system, lowering, migration-tooling, tests]
+updated: "2026-10-08"
+owners:
+  - "language"
+  - "compiler"
+components:
+  - "generics"
+  - "parser"
+  - "type-system"
+  - "lowering"
+  - "migration-tooling"
+  - "tests"
 related:
-  issues: [VIR-ISS-0002]
+  issues:
+    - "VIR-ISS-0002"
+    - "VIRC-ISS-0058"
   plans: []
   reports: []
 supersedes: null
 superseded_by: null
-tags: [generic-syntax, of-syntax, type-identity, bootstrap, regression-gates]
+tags:
+  - "generic-syntax"
+  - "of-syntax"
+  - "type-identity"
+  - "bootstrap"
+  - "regression-gates"
 ---
 
 # VIR-ISS-0001 — Generic of syntax migration retains legacy string parsing and lacks closure gates
@@ -174,3 +189,4 @@ S2 rather than a claim of broad compiler failure.
 | Date | Change |
 |---|---|
 | 2026-10-02 | Created and triaged from active source and executed-test audit; limited to unfinished migration closure |
+| 2026-10-08 | Linked VIRC-ISS-0058 |

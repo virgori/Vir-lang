@@ -166,13 +166,14 @@ No deviations from the approved plan [VIRC-PLN-0034](file:///Users/gengyang/Vir-
 | x86-64 AOT signed load | `bin/virc -S tests/strict_v2/packed_signed_load_e2e.vri --target linux-x86_64` | PASS | Emits `movsx r10`, `movsx r13`, `movsxd rbx` |
 | RISC-V 64 AOT mixed-width | `bin/virc -S tests/strict_v2/packed_layout_mixed_width_e2e.vri --target linux-riscv64` | PASS | Emits byte-wise `sb` sequences and `lbu` sequences with shift/or; no unaligned `sh`/`sw` traps |
 | RISC-V 64 AOT signed load | `bin/virc -S tests/strict_v2/packed_signed_load_e2e.vri --target linux-riscv64` | PASS | Emits byte-wise `lbu` + `srai` sign extension sequences |
-| Wasm32 mixed-width | `bin/virc tests/strict_v2/packed_layout_mixed_width_e2e.vri --target wasm32-wasi-p1` | PASS | Emits `0x3c` (`i64.store8`), `0x3d` (`i64.store16`), `0x3e` (`i64.store32`), `0x31` (`load8_u`), `0x33` (`load16_u`), `0x35` (`load32_u`) |
-| Wasm32 signed load | `bin/virc tests/strict_v2/packed_signed_load_e2e.vri --target wasm32-wasi-p1` | PASS | Emits `0x30` (`i64.load8_s`), `0x32` (`i64.load16_s`), `0x34` (`i64.load32_s`) |
-| Packed host optimization matrix (-O0..-O3) | Included in `./run_tests.sh 7` | PASS | Validates execution output matches expected values across -O0, -O1, -O2, -O3 |
-| Packed cross-target matrix (-O0..-O3) | Included in `./run_tests.sh 7` | PASS | Validates assembly instructions across ARM64, x86-64, RISC-V 64, and Wasm across -O0..-O3 |
+| Wasm32 mixed-width | `bin/virc tests/strict_v2/packed_layout_mixed_width_e2e.vri --target wasm32` | PASS | Emits `0x3c` (`i64.store8`), `0x3d` (`i64.store16`), `0x3e` (`i64.store32`), `0x31` (`load8_u`), `0x33` (`load16_u`), `0x35` (`load32_u`) |
+| Wasm32 signed load | `bin/virc tests/strict_v2/packed_signed_load_e2e.vri --target wasm32` | PASS | Emits `0x30` (`i64.load8_s`), `0x32` (`i64.load16_s`), `0x34` (`i64.load32_s`) |
+| Packed host optimization matrix (-O0..-O3 across 4 fixtures) | Included in `./run_tests.sh 7` | PASS | Validates execution output matches expected values across -O0, -O1, -O2, -O3 for mixed width, signed load, unaligned mutation, and nested copy |
+| Packed cross-target matrix (-O0..-O3 across 4 fixtures) | Included in `./run_tests.sh 7` | PASS | Validates assembly instructions across ARM64, x86-64, RISC-V 64 (strict no unaligned memory ops in `main:`), and Wasm (bytecode opcode byte validation) across -O0..-O3 |
+| Fail-closed alignment verifier | `compiler/src/ir/mc/mc_verify.vri` | PASS | Rejects unaligned 64-bit load/store instructions (`offset mod 8 != 0`) across ARM64, x86-64, and RISC-V 64 |
 | Test suite Group 7 | `./run_tests.sh 7` | PASS | 59/59 tests passing (100% PASS) |
-| Fixed-point Bootstrap Stage 1 | `bin/virc compiler/generated/virc.vri -o bin/virc.stage1` | PASS | Binary built cleanly (18,378,292 bytes, SHA-256: `f3ae47f6045ee67d470f1676ef22e92eb3cff05014253a6b2a28956a20da2b76`) |
-| Fixed-point Bootstrap Stage 2 | `bin/virc compiler/generated/virc.vri -o bin/virc.stage2` | PASS | Binary built cleanly (18,378,292 bytes, SHA-256: `f3ae47f6045ee67d470f1676ef22e92eb3cff05014253a6b2a28956a20da2b76`) |
+| Fixed-point Bootstrap Stage 1 | `bin/virc compiler/generated/virc.vri -o bin/virc.stage1` | PASS | Binary built cleanly (18,254,960 bytes, SHA-256: `a457dd41dbd8854624a847303e35472cd833f80415f730271f03e0ef1b16c4b7`) |
+| Fixed-point Bootstrap Stage 2 | `bin/virc.stage1 compiler/generated/virc.vri -o bin/virc.stage2` | PASS | Binary built cleanly (18,254,960 bytes, SHA-256: `a457dd41dbd8854624a847303e35472cd833f80415f730271f03e0ef1b16c4b7`) |
 | Fixed-point Bit-Exact Comparison | `cmp bin/virc.stage1 bin/virc.stage2` | PASS | Exit code 0, byte-for-byte identical |
 | Versioning contract | `python3 tests/test_virc_version_policy.py` | PASS | PASS: Vir compiler version policy (2026.1.6, internal) |
 | Version metadata check | `python3 tools/bump_virc_version.py --check` | PASS | Metadata synchronized: 2026.1.6 |
@@ -180,7 +181,7 @@ No deviations from the approved plan [VIRC-PLN-0034](file:///Users/gengyang/Vir-
 
 ### Regression
 
-All 59 tests in `./run_tests.sh 7` (covering struct field layout, method calls, packed entities, nested structs, signed fields, unaligned mutation, host optimization matrix -O0..-O3, and cross-target matrix across ARM64, x86-64, RISC-V 64, and Wasm) pass with zero regressions.
+All 59 tests in `./run_tests.sh 7` (covering struct field layout, method calls, packed entities, nested structs, signed fields, unaligned mutation, host optimization matrix -O0..-O3 across 4 fixtures, and cross-target matrix across ARM64, x86-64, RISC-V 64, and Wasm) pass with zero regressions.
 
 ### Conformance
 
@@ -206,7 +207,7 @@ Mapping 1:1 with [VIRC-ISS-0060](file:///Users/gengyang/Vir-3.0/papers/VIRC/issu
 
 ## 10. Remaining Work
 
-None.
+None. All audit gates resolved and verified.
 
 ## 11. Conclusion
 
@@ -224,4 +225,6 @@ READY_FOR_CLOSE
 | 2026-10-09 | Initial report compiled with cross-target assembly and test suite evidence |
 | 2026-10-09 | Audit identified RISC-V unaligned trap hazards, missing fail-closed verifier for invalid aux, and unregistered cross-target matrix; marked for follow-up |
 | 2026-10-09 | Implemented RISC-V byte-wise reconstruction for unaligned memory safety, added fail-closed aux verifiers, registered Group 7 opt and cross-target matrices (59/59 PASS), confirmed bit-exact fixed point (SHA-256 match), and accepted report |
+| 2026-10-09 | Reopened from audit: addressing RISC-V/Wasm false-positive checks, full matrix coverage (signed load, mutation, nested copy), verifier for metadata lost to aux=0, and binary size correction |
+| 2026-10-09 | Resolved all audit findings: expanded matrix to 4 fixtures with bytecode and main-function opcode checks, added unaligned displacement verifier, verified bit-exact self-host bootstrap (18,254,960 bytes), accepted report |
 

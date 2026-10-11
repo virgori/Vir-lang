@@ -109,7 +109,7 @@ VPS pattern text.
 
 ### Errors
 
-Lexer/parser errors return `Result.Err` inside `vps_tokenize` today; compile path may panic —
+Lexer/parser errors return `Result.Failure` inside `vps_tokenize` today; compile path may panic —
 target `Result of (Pattern)` **open**.
 
 ### Example
@@ -632,7 +632,7 @@ virgex.toRegex(vps: string) -> Result of (string)
 ```
 
 Convert a VPS pattern string to an equivalent traditional regex string for interop / debugging.
-**Incomplete:** source returns `Result.Ok(vps)` unchanged — not a real translation.
+**Incomplete:** source returns `Result.Success(vps)` unchanged — not a real translation.
 
 ### Parameters
 
@@ -646,7 +646,7 @@ Vir Pattern Syntax source.
 
 ### Errors
 
-Target: `Err` on untranslatable VPS constructs. Stub does not fail.
+Target: `Failure` on untranslatable VPS constructs. Stub does not fail.
 
 ### Example
 

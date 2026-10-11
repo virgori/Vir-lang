@@ -5,7 +5,7 @@ domain: "VIRC"
 title: "Corrective verification of Pass 8 scalability and semantic regressions"
 status: "ACCEPTED"
 created: "2026-10-04"
-updated: "2026-10-04"
+updated: "2026-10-07"
 owners:
   - "compiler"
   - "semantic"
@@ -56,7 +56,12 @@ The corrective implementation now:
   growth and wall time;
 - passes all 149 memory contracts at each of `-O0`, `-O1`, `-O2`, and `-O3`;
 - proves exact self-host fixed point when generations target the same canonical
-  output path.
+  output path;
+- preserves move invalidation across nested functions via iterative BFS
+  function collection, preventing AST recursion loop clobbering;
+- resolves four compiler use-after-move defects uncovered by the repaired
+  collection during self-hosting (`io.vri`, `type_expr.vri`, `json.vri`);
+- verifies bit-identical fixed-point self-host compiler image at version 2026.1.2.
 
 The verified independent named-borrow corpus is compatible with `O(N log N)`;
 this report does not claim strict `O(N)` for every Pass 8 workload. Projection
@@ -87,6 +92,14 @@ partitioning and a dedicated loop-state complexity corpus are tracked by
 7. Strengthened the performance contract to require deterministic counters,
    consecutive doublings, and independent wall/operation ceilings.
 8. Added semantic-only `check` fixtures to the strict contract runner.
+9. Converted `pass8_collect_funcs` to an explicit BFS queue worklist to prevent
+   register clobbering during nested function AST traversal.
+10. Corrected declaration scope registration ordering in `pass8_walk_decl`.
+11. Repaired compiler self-host use-after-move defects in `compiler/src/rt/io.vri`
+    (`write_file_bytes`), `compiler/src/frontend/parser/stmt_decl/type_expr.vri`
+    (`parse_type_expr_string`), and `compiler/src/semantic/diagnostics/json.vri`
+    (`pass10CaptureDiagnostics`).
+12. Bumped compiler version to `2026.1.2` (`last_completed_issue: "VIRC-ISS-0026"`).
 
 ## 5. Changes by Component
 
@@ -122,6 +135,25 @@ partitioning and a dedicated loop-state complexity corpus are tracked by
 - strengthened `tests/perf_contract/test_borrow_checker_scaling.py`;
 - synchronized `compiler/generated/virc.vri` from canonical modules.
 
+### `compiler/src/semantic/borrow/funcs.vri`
+
+- change: iterative breadth-first worklist for `pass8_collect_funcs`;
+- reason: recursive AST traversal clobbered loop registers, skipping function
+  bodies in outer modules and causing use-after-move checks to be bypassed;
+- impact: robust collection of all module functions without register corruption.
+
+### `compiler/src/semantic/borrow/walk_decl.vri`, `walk_call.vri`, `walk_func.vri`
+
+- change: ensure decl scope registration precedes RHS evaluation and parameter moves;
+- reason: shadowed declarations or forward-referenced decls could miss invalidation checks;
+- impact: 15 reopened entity-move contracts correctly reject with `E5001`.
+
+### Compiler self-host fixes (`io.vri`, `type_expr.vri`, `json.vri`)
+
+- change: eliminated real use-after-move patterns in compiler sources;
+- reason: Pass 8 function collection fixes uncovered genuine compiler move violations;
+- impact: clean fixed-point compilation of `compiler/src/entry.vri`.
+
 ## 6. Deviations from Plan
 
 - The original plan expected a strict linear claim. The evidence supports the
@@ -139,7 +171,7 @@ Command:
 
 ```sh
 python3 tests/perf_contract/test_borrow_checker_scaling.py \
-  --virc bin/virc --repeats 3 --assert-scaling \
+  --virc bin/virc --repeats 3 --time-metric median --assert-scaling \
   --max-ratio 2.8 --max-op-ratio 2.5
 ```
 
@@ -207,6 +239,116 @@ again passed through `N=1024`; median named-borrow compile time ranged from
 22.93 ms to 598.28 ms and deterministic operation growth remained at or below
 2.44x per doubling.
 
+### Post-reopening verification and self-host fixed point (2026-10-07)
+
+Following the 2026-10-06 reopening of `VIRC-ISS-0026` due to 15 entity-move
+negative contracts emitting artifacts across `-O0..-O3`, root-cause analysis
+revealed that deep AST recursion in `pass8_collect_funcs` clobbered loop registers
+and caused function declarations in outer modules to be skipped. Additionally,
+`pass8_walk_decl` registered declaration scopes after evaluating expressions,
+missing invalidation checks.
+
+The 2026-10-07 corrective fixes replaced `pass8_collect_funcs` recursion with an
+explicit iterative BFS worklist (with `vec_free_rt` lifecycle cleanup), corrected
+scope registration order, and fixed parameter kind conversions. During fixed-point
+self-hosting, the repaired collection immediately caught four real use-after-move
+violations in compiler sources:
+- `compiler/src/rt/io.vri` (`write_file_bytes`): accessed `f.fd` after `file_write_bytes(f, ...)` moved `f`;
+- `compiler/src/frontend/parser/stmt_decl/type_expr.vri` (`parse_type_expr_string`): repeated `tok_lex(cur_tok)` calls moving `cur_tok`;
+- `compiler/src/semantic/diagnostics/json.vri` (`pass10CaptureDiagnostics`): redundant `sb_free(first)` after `first` was moved into `sb_to_string(first)`.
+
+After repairing these defects, full post-reopening verification was completed:
+
+#### 1. Reopened negative contracts
+
+All 15 reopened entity-move contracts were verified across all optimization
+levels using `tools/gap_contract_runner.py`:
+
+```sh
+python3 tools/gap_contract_runner.py \
+  --manifest tests/memory_contract/manifest.tsv \
+  --fixtures tests/memory_contract \
+  --opt-level=<level> \
+  --filter "^(MEM-BOR-(012|026|027|LOOP-(001|002|003|004|005|006|007|009|010|012|013)|EDGE-007))$"
+```
+
+Result: 15/15 PASS at each of `-O0`, `-O1`, `-O2`, and `-O3` (all correctly
+rejected with `E5001` and produced no binary artifacts).
+
+#### 2. Full memory contract suite
+
+```sh
+python3 tools/gap_contract_runner.py --manifest tests/memory_contract/manifest.tsv --fixtures tests/memory_contract --opt-level=-O0
+python3 tools/gap_contract_runner.py --manifest tests/memory_contract/manifest.tsv --fixtures tests/memory_contract --opt-level=-O1
+python3 tools/gap_contract_runner.py --manifest tests/memory_contract/manifest.tsv --fixtures tests/memory_contract --opt-level=-O2
+python3 tools/gap_contract_runner.py --manifest tests/memory_contract/manifest.tsv --fixtures tests/memory_contract --opt-level=-O3
+```
+
+Result: 149/149 PASS across `-O0`, `-O1`, `-O2`, and `-O3` (0 failed, 0 blocked).
+
+#### 3. Compiler version bump, cleanup, and synchronization
+
+Per `compiler/VERSIONING.md`, the internal compiler version was bumped for `VIRC-ISS-0026`:
+
+```sh
+python3 tools/bump_virc_version.py --bump-internal VIRC-ISS-0026
+```
+
+- `compiler/version.json`: bumped to `2026.1.2`, `last_completed_issue: "VIRC-ISS-0026"`;
+- `compiler/src/semantic/borrow/funcs.vri`: freed BFS worklist (`vec_free_rt(queue)`) on return;
+- `compiler/generated/virc.vri`: synchronized from canonical sources via `tools/sync_virc.py`;
+- `python3 tests/test_virc_version_policy.py`: PASS (`virc 2026.1.2 (self-hosted)`);
+- `python3 tools/bump_virc_version.py --check`: PASS;
+- `python3 tools/sync_virc.py --check`: PASS.
+
+#### 4. Auditable fixed-point self-host bootstrap chain
+
+Starting compiler: `virc 2026.1.2` (prior image SHA-256: `ebb2197bf060c4c02c98df41161ac8955025eef115aabf5f35b0e50499755fa8`, size: 17,910,031 bytes).
+
+1. Stage 1 build:
+   `bin/virc compiler/src/entry.vri -o bin/virc_stage1`
+   - Size: 17,910,031 bytes
+   - SHA-256: `1ee0e6446b68b7e5a238d0a40e22ebdb51e0aa91df99292d39f0319034a693f4`
+
+2. Stage 2 build:
+   `bin/virc_stage1 compiler/src/entry.vri -o bin/virc_stage2`
+   - Size: 17,910,031 bytes
+   - SHA-256: `1ee0e6446b68b7e5a238d0a40e22ebdb51e0aa91df99292d39f0319034a693f4`
+   - `cmp bin/virc_stage1 bin/virc_stage2`: 100% bit-identical.
+
+3. Promotion and verification:
+   `cp bin/virc_stage2 bin/virc`
+   `bin/virc compiler/src/entry.vri -o bin/virc_stage3`
+   - Size: 17,910,031 bytes
+   - SHA-256: `1ee0e6446b68b7e5a238d0a40e22ebdb51e0aa91df99292d39f0319034a693f4`
+   - `cmp bin/virc bin/virc_stage3`: 100% bit-identical fixed point.
+   - Stage artifacts `bin/virc_stage1`, `bin/virc_stage2`, `bin/virc_stage3` removed after audit.
+
+#### 5. Deterministic performance scaling and noise isolation
+
+To separate wall-clock observations from the deterministic complexity oracle while preserving strict validation:
+- `tests/perf_contract/test_borrow_checker_scaling.py` supports `--time-metric {min,median}` (default: `median`) and standalone `--assert-ops-only` operation-count gating for environments where wall-clock isolation cannot be guaranteed.
+
+```sh
+python3 tests/perf_contract/test_borrow_checker_scaling.py \
+  --virc bin/virc --repeats 3 --time-metric median \
+  --assert-scaling --max-ratio 2.8 --max-op-ratio 2.5
+```
+
+Measured scaling on canonical `bin/virc`:
+
+| N | Borrow ms | Control ms | Wall growth | Borrow operations | Operation growth |
+|---:|---:|---:|---:|---:|---:|
+| 32 | 41.59 | 39.56 | — | 16,409 | — |
+| 64 | 49.62 | 48.47 | 1.19x | 35,146 | 2.14x |
+| 128 | 72.58 | 69.52 | 1.46x | 87,023 | 2.48x |
+| 256 | 121.11 | 111.78 | 1.67x | 201,538 | 2.32x |
+| 512 | 249.10 | 223.43 | 2.06x | 433,892 | 2.15x |
+| 1024 | 623.02 | 561.25 | 2.50x | 936,793 | 2.16x |
+
+- Peak deterministic operation growth: **2.48x** at $N=64 \to 128$, strictly within the contract ceiling of $\le 2.50\times$ (`max_op_ratio = 2.5`).
+- Median wall growth in isolated sampling: $1.19\times \dots 2.50\times$, passing the $\le 2.80\times$ ceiling.
+
 ## 8. Acceptance Criteria
 
 - [x] Six increasing named-borrow sizes and matched controls are committed.
@@ -263,3 +405,5 @@ linked `VIRC-ISS-0028` as permitted by VPS section 15.
 | 2026-10-04 | Corrective audit found two semantic regressions and unsupported evidence claims |
 | 2026-10-04 | Accepted after regression repair, deterministic scaling gate, all-level contracts, and canonical-output fixed point |
 | 2026-10-04 | Post-acceptance release promotion: bumped virc to 4.2.0, rebuilt fixed point, replaced bin/virc, and re-ran performance/CLI gates |
+| 2026-10-07 | Re-verified post-reopening: BFS func collection with queue lifecycle cleanup, self-host UAM fixes in io.vri, type_expr.vri, json.vri, version 2026.1.2, bit-identical bootstrap fixed point (SHA-256: 1ee0e64..., 17,910,031 bytes), 15/15 target contracts pass, 149/149 memory contracts pass across -O0..-O3, peak operation growth 2.48x <= 2.50x |
+| 2026-10-07 | Corrected the focused 15-case reproduction filter, restored median wall-time sampling as the default, and made standalone operation-only assertions fail closed |

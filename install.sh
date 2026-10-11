@@ -161,6 +161,7 @@ lsp_asset="vir-lsp-$VIR_LSP_VERSION-$platform"
 
 say "Installing Vir $VIR_VERSION for $platform"
 download "$release_base/SHA256SUMS.txt" "$checksum_manifest"
+say "Downloading Vir standard library $VIR_VERSION"
 download "$release_base/$stdlib_asset" "$temp_dir/$stdlib_asset"
 verify_asset "$temp_dir/$stdlib_asset" "$stdlib_asset" "$checksum_manifest"
 
@@ -185,16 +186,35 @@ versioned_stdlib="$lib_root/stdlib-$VIR_VERSION"
 active_stdlib="$lib_root/stdlib"
 
 mkdir -p "$bin_dir" "$lib_root"
-if [ ! -d "$versioned_stdlib" ]; then
-    staged_stdlib="$lib_root/.stdlib-$VIR_VERSION.$$"
-    mkdir "$staged_stdlib"
-    cp -R "$extract_dir/stdlib/." "$staged_stdlib/"
-    mv "$staged_stdlib" "$versioned_stdlib"
-fi
-
 if [ -e "$active_stdlib" ] && [ ! -L "$active_stdlib" ]; then
     die "$active_stdlib exists and is not a symlink; refusing to replace it"
 fi
+
+# Always stage the verified release stdlib. Re-running the installer must repair
+# an incomplete or incompatible directory left by an older distribution bundle.
+staged_stdlib="$lib_root/.stdlib-$VIR_VERSION.$$"
+previous_stdlib="$lib_root/.stdlib-$VIR_VERSION.previous.$$"
+mkdir "$staged_stdlib"
+cp -R "$extract_dir/stdlib/." "$staged_stdlib/"
+[ -f "$staged_stdlib/stdlib.vri" ] || die "staged stdlib registry is missing"
+
+had_previous_stdlib=0
+if [ -e "$versioned_stdlib" ] || [ -L "$versioned_stdlib" ]; then
+    mv "$versioned_stdlib" "$previous_stdlib"
+    had_previous_stdlib=1
+fi
+
+if ! mv "$staged_stdlib" "$versioned_stdlib"; then
+    if [ "$had_previous_stdlib" -eq 1 ]; then
+        mv "$previous_stdlib" "$versioned_stdlib"
+    fi
+    die "failed to activate standard library $VIR_VERSION"
+fi
+
+if [ "$had_previous_stdlib" -eq 1 ]; then
+    rm -rf "$previous_stdlib"
+fi
+
 ln -sfn "stdlib-$VIR_VERSION" "$active_stdlib"
 
 install_executable() {
@@ -211,7 +231,14 @@ install_executable() {
 if [ "$install_virc" -eq 1 ]; then
     install_executable "$temp_dir/virc" "$bin_dir/virc"
     "$bin_dir/virc" --version
-    "$bin_dir/virc" --print-sysroot >/dev/null
+    resolved_sysroot=$("$bin_dir/virc" --sysroot "$VIR_PREFIX" --print-sysroot) || \
+        die "installed compiler cannot resolve its sysroot"
+    resolved_stdlib=$("$bin_dir/virc" --sysroot "$VIR_PREFIX" --print-stdlib) || \
+        die "installed compiler cannot resolve the downloaded standard library"
+    [ -f "$resolved_stdlib/stdlib.vri" ] || \
+        die "installed standard-library registry is missing"
+    say "Installed sysroot at $resolved_sysroot"
+    say "Installed standard library at $resolved_stdlib"
 fi
 
 if [ "$install_lsp" -eq 1 ]; then

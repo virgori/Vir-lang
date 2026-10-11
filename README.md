@@ -8,7 +8,7 @@ compiler/LSP tooling.
 
 Current tool versions:
 
-- Vir compiler: `2026.1` (`v2026.1.0` GitHub release)
+- Vir compiler: `2026.2` (`v2026.2.0` GitHub release)
 - vir-lsp: `1.3.0`
 
 ## Version conventions
@@ -18,8 +18,8 @@ The compiler uses calendar release versions:
 - `YYYY.R` is the public identity of an official compiler release. `2026.1` is
   the first official release in 2026.
 - GitHub tags and release archives use `vYYYY.R.0` so release tooling receives a
-  three-component version. Tag `v2026.1.0` therefore contains compiler
-  `2026.1`.
+  three-component version. Tag `v2026.2.0` therefore contains compiler
+  `2026.2`.
 - `YYYY.R.P`, where `P > 0`, identifies an internal patch build. Internal patch
   numbers are not official releases.
 - `virc --version` and compiler banners never include the tag prefix `v`; an
@@ -75,6 +75,7 @@ python3 tools/bump_vir_lsp_version.py --check
 
 ## Documentation
 
+- [2026.2.0 release notes](docs/releases/2026.2.0.md)
 - [2026.1.0 release notes](docs/releases/2026.1.0.md)
 - [English language specification](papers/VIR/specs/VIR-SPC-0017_language_specification_english.md)
 - [Vietnamese language specification](papers/VIR/specs/VIR-SPC-0018_language_specification_vietnamese.md)

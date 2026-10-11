@@ -188,3 +188,5 @@ oracles together; do not restore local foreign stubs as a compatibility path.
 | 2026-10-05 | Implemented AAPCS64/SysV AMD64 f64 and mixed FP/GPR argument transport, expanded the strict contract to 12/12, and promoted fixed-point compiler hash `af63c79d2f984eb5c5859ed00a0ea769f8fd13b3922a28b89394d9bb6d04f2d5`; retained ACTIVE for remaining cross-runtime and broad-suite exit evidence |
 | 2026-10-05 | Linked VIRC-RPT-0042 |
 | 2026-10-10 | Completed all exit criteria: verified cross-target ABI instruction streams, fail-closed handling for unsupported targets and signatures, promoted fixed-point bootstrap 2026.1.11, and marked COMPLETED |
+| 2026-10-10 | Reactivated after closure audit restored FFI-001..012 but found broad-suite and clean-checkout VPS gates non-green; closing-report criterion returned to pending |
+| 2026-10-10 | Completed after corrective rerun: FFI 12/12, Group 27 156/156, min 483/483, full 942/942, and accepted report conclusion restored; independent clean-snapshot paper packaging is linked as VIRC-ISS-0067 |

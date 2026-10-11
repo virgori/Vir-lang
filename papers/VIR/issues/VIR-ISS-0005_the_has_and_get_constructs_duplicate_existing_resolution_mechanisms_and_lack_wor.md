@@ -3,11 +3,11 @@ id: "VIR-ISS-0005"
 type: "ISSUE"
 domain: "VIR"
 title: "The has and get constructs duplicate existing resolution mechanisms and lack working semantics"
-status: "RESOLVED"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-06"
-updated: "2026-10-06"
+updated: "2026-10-11"
 owners:
   - "language"
 components:
@@ -18,8 +18,11 @@ related:
   issues:
     - "VIR-ISS-0007"
     - "VIRC-ISS-0008"
-  plans: []
-  reports: []
+    - "VIRC-ISS-0058"
+  plans:
+    - "VIR-PLN-0004"
+  reports:
+    - "VIR-RPT-0004"
 supersedes: null
 superseded_by: null
 tags:
@@ -328,3 +331,7 @@ documentation ISSUE. They require independent VIRC/tooling tracking.
 | 2026-10-06 | Linked VIRC-ISS-0008 |
 | 2026-10-06 | Linked VIR-ISS-0007 |
 | 2026-10-06 | Resolved the language-document scope in VIR-SPC-0006/0013/0014/0017/0018 and separated compiler conformance from VIR acceptance |
+| 2026-10-08 | Linked VIRC-ISS-0058 |
+| 2026-10-11 | Linked VIR-PLN-0004 |
+| 2026-10-11 | Linked VIR-RPT-0004 |
+| 2026-10-11 | Closed after independent audit confirmed all language-document criteria and accepted VIR-RPT-0004 concluded READY_FOR_CLOSE |

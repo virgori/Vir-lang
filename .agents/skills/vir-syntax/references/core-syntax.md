@@ -60,6 +60,10 @@ Use `skip` for the next iteration. `case`, `try:`, `arena:`, `select:`, and
 entity User:
     name: string
     age: int
+
+    method birthday:
+        this.age = this.age + 1
+    end
 end.
 
 enum Option of (T):
@@ -80,6 +84,85 @@ end
 Use `Enum.Variant`, never `Enum::Variant`. Payload enums are destructured with
 `case`; do not compare them directly with `==`. Entity construction uses field
 initializers such as `User(name: "A", age: 30)`.
+
+An entity member `method` is a nested block and closes with `end`; the owning
+entity closes with `end.`. `method` is invalid at module scope. Use a free
+`func` with an explicit first receiver parameter for standalone UFCS behavior.
+
+Do not translate class/extension syntax from another language. These are the
+two canonical declaration shapes:
+
+```vir
+entity Counter:
+    value: int
+
+    method add(delta: int) -> int:
+        out this.value + delta
+    end
+end.
+
+func reset(this: Counter):
+    this.value = 0
+end.
+```
+
+Never emit either of these forms:
+
+```vir
+# Invalid: a nested method does not own a dotted declaration boundary.
+entity Counter:
+    method read() -> int:
+        out this.value
+    end.
+end.
+
+# Invalid: module scope has no method declaration.
+method reset(this: Counter):
+    this.value = 0
+end.
+```
+
+## UFCS and callable shadowing
+
+Treat field access and callable resolution as separate operations:
+
+```vir
+entity HasLabel:
+    label: int
+end.
+
+func label(this: HasLabel) -> int:
+    out this.label + 7
+end.
+
+let value = HasLabel(label: 40)
+print(value.label)      # data-field access: 40
+print(value.label())    # free-function UFCS: 47
+```
+
+For `receiver.member(args)`, use this fixed order:
+
+1. same-named entity method;
+2. same-named field only when its declared type is structural `func(...)`;
+3. eligible visible free function with the receiver inserted as argument zero;
+4. compile error.
+
+Method and callable-field selection are terminal by name. If the selected
+candidate has the wrong arity or argument type, report that error and do not
+fall back. A non-callable field is skipped rather than treated as a shadowing
+candidate. Raw `ptr` is not a callable field.
+
+Direct syntax pins the free function when a callable member has the same name:
+
+```vir
+score.compute(5)       # method/callable-member priority applies
+compute(score, 5)      # explicitly selects the free function
+```
+
+Adding a method/callable field, or changing a data field to structural
+function type, may redirect existing dotted calls and is potentially
+source-breaking. Adding a non-callable field does not by itself block free
+UFCS.
 
 `packed entity`, `register`, `mold`, `flux`, `deck`, `map`, `reactive`,
 `bundle`, `expose`, `infer`, `train`, and `quantize` are Vir constructs, but

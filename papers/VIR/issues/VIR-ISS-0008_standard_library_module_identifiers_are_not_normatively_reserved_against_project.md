@@ -3,11 +3,11 @@ id: "VIR-ISS-0008"
 type: "ISSUE"
 domain: "VIR"
 title: "Standard library module identifiers are not normatively reserved against project collisions"
-status: "RESOLVED"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-06"
-updated: "2026-10-06"
+updated: "2026-10-11"
 owners:
   - "language"
 components:
@@ -19,8 +19,10 @@ related:
   issues:
     - "VIR-ISS-0006"
     - "VIRC-ISS-0047"
-  plans: []
-  reports: []
+  plans:
+    - "VIR-PLN-0004"
+  reports:
+    - "VIR-RPT-0004"
 supersedes: null
 superseded_by: null
 tags:
@@ -216,3 +218,6 @@ không phải acceptance gate của VIR documentation ISSUE này.
 | 2026-10-06 | Linked VIRC-ISS-0047 |
 | 2026-10-06 | Linked VIR-ISS-0006 |
 | 2026-10-06 | Resolved the exact-ID reservation contract in active focused, bilingual, and derived guidance documents without changing VIRC implementation status |
+| 2026-10-11 | Linked VIR-PLN-0004 |
+| 2026-10-11 | Linked VIR-RPT-0004 |
+| 2026-10-11 | Closed after independent audit confirmed load-time exact-ID reservation, prefix-only non-collision and accepted VIR-RPT-0004 concluded READY_FOR_CLOSE |

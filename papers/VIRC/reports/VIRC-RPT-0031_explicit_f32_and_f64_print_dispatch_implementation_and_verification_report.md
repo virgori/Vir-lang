@@ -5,7 +5,7 @@ domain: "VIRC"
 title: "Explicit f32 and f64 print dispatch implementation and verification report"
 status: "ACCEPTED"
 created: "2026-10-04"
-updated: "2026-10-04"
+updated: "2026-10-08"
 owners:
   - "compiler"
 components:
@@ -57,7 +57,8 @@ This report documents the resolution and corrective verification of `VIRC-ISS-00
 7. **Canonical Type Identity**: Added `type_primitive_kind_from_name` to the semantic type table and routed lowering float classification through it, eliminating a second ad-hoc alias parser.
 8. **Reference Metadata and Lowering**: Preserved `Ref`/`MutRef` in pass 4, retained the `&mut` flag through parser AST construction, and lowered primitive local borrows through dedicated stack slots so referenced float values are read through the same semantic type path.
 9. **Typed `let` Parsing**: Replaced the fragile two-token `const`/`let` colon lookahead with a balanced scan to the top-level assignment, so declarations such as `let r: &f64 = &value` retain their annotation.
-10. **Registered Regression Gate**: Registered `tests/test_f32_f64_print.py` in `run_tests.sh` group 4 and made the suite honor the `VIRC` environment override.
+10. **Registered Regression Gate**: Registered `tests/test_f32_f64_print.py` (and subsequently migrated to native `tests/codegen/f32_f64_test.vri`) in `run_tests.sh` group 4.
+11. **Assignment Inferred Type Propagation**: Implemented type propagation in `compiler/src/lower/ast_to_mir/stmt.vri` for `IndexAccess` and `ExprIndex` expressions and untyped variable targets, ensuring `v = t[0]` preserves the floating semantic type. Extended `tests/codegen/fixtures/f32_f64_tensor.vri` and `tests/codegen/f32_f64_test.vri` to verify the combined `index -> inferred variable -> print` pattern. Updated Group 26 fixtures (`test_print_c.vri`, `test_first_class_matmul_rect.vri`, `test_first_class_tensor.vri`) to expect floating decimal format.
 
 ## 5. Changes by Component
 
@@ -171,3 +172,4 @@ READY_FOR_CLOSE
 |---|---|
 | 2026-10-04 | Initial report created, verified with 3-stage bootstrap fixed-point, and accepted |
 | 2026-10-04 | Corrective audit added registered reference coverage, canonical TypeKind resolution, primitive borrow lowering, baseline comparison, and a fresh stage10/stage11 fixed point |
+| 2026-10-08 | Reopened audit and fix: resolved missing assignment type propagation for index expressions and untyped variables; updated native Group 4 suite (8/8 PASS) and verified Group 26 fixtures pass (34/37 PASS); bumped compiler version to 2026.1.3 |

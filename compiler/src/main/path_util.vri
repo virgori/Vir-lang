@@ -7,6 +7,7 @@ import vir_alloc from rt_alloc
 import fat_str_new, fat_str_len, fat_str_byte_at, fat_cstr_eq, fat_str_concat, fat_str_eq, rt_streq, str_from_cstr, rt_strlen, rt_itoa, vir_free from rt_string_rt
 import bvec_len, bvec_get, vec_len_rt, vec_get_rt, vec_new_rt, vec_push_rt from rt_vec_rt
 import read_file_str, print_str, print_ln, print_int, print_newline from rt_io
+import cliCanonicalPath from cli_environment
 include diagnostic_context
 include sem_pass10_diagnostics
 
@@ -35,6 +36,7 @@ var g_imp_sym_count = 0
 var g_imp_alias = 0;  # optional rename for single-symbol import … as X
 var g_imp_end = 0;    # byte offset immediately after the parsed import stmt
 var g_imp_chunk_line = 1; # original line of the currently extracted definition
+var g_imp_failed_sym = 0; # fat string of the failing imported symbol
 var g_inc_resolved_path = 0;   # C-string of last successfully read file path
 var g_inc_canonical_id = 0;    # C-string of canonical module ID
 var g_inc_main_file = 0;       # C-string of root input file
@@ -48,6 +50,12 @@ var g_reg_phys = 0
 var g_reg_lines = 0
 var g_reg_source = 0
 var g_reg_isdir = 0
+var g_reg_regfiles = 0
+const G_REG_STACK_MAX = 64
+var g_reg_stack_paths = 0
+var g_reg_stack_count = 0
+var g_reg_visited_paths = 0
+var g_reg_visited_count = 0
 var g_reg_count = 0
 var g_reg_stdlib_count = 0
 var g_reg_loaded = 0
@@ -72,6 +80,7 @@ func g_inc_init:
     g_inc_canonical_id = 0
     g_inc_cur_parent_file = 0
     g_inc_cur_parent_line = 0
+    g_imp_failed_sym = 0
     virc_registry_load()
 end.
 
@@ -91,8 +100,51 @@ func inc_report_early_error(code: int, parent_file: int, parent_line: int, extra
     if p_line <= 0 do p_line = 1 end
     report_error_loc(early_diag, code, 0, p_line, 1, extra)
     let d0 = vec_get_rt(early_diag.diagnostics, 0)
+    native_write_i64(d0 as i64, 72, 0)
+    native_write_i64(d0 as i64, 16, p_line)
+    native_write_i64(d0 as i64, 24, 1)
     if parent_file != 0 do
         native_write_i64(d0 as i64, 80, parent_file)
+    end
+    if g_ideFactsEnabled == 1 do
+        g_ideEarlyDiagnostics = native_read_i64(early_diag as int, 0)
+        out 0
+    end
+    pass10_emit_diagnostics(early_diag)
+    compilerAbort()
+end.
+
+func inc_report_early_error_related:
+    in
+        code: int
+        parent_file: int
+        parent_line: int
+        extra: string
+        related_file: int
+        related_line: int
+        related_note: string
+
+    inc_set_error(code)
+    var
+        early_diag = diagnostic_engine_new()
+        p_line = parent_line
+        r_line = related_line
+    if p_line <= 0 do p_line = 1 end
+    if r_line <= 0 do r_line = 1 end
+    report_error_loc_related(early_diag, code, 0, p_line, 1, extra, r_line, 1, related_note)
+    let d0 = vec_get_rt(early_diag.diagnostics, 0)
+    # Registry lines are physical lines in module.list, not expanded-source
+    # coordinates. Preserve them after the generic source-manager mapping.
+    native_write_i64(d0 as i64, 72, 0)
+    native_write_i64(d0 as i64, 16, p_line)
+    native_write_i64(d0 as i64, 24, 1)
+    native_write_i64(d0 as i64, 40, r_line)
+    native_write_i64(d0 as i64, 48, 1)
+    if parent_file != 0 do
+        native_write_i64(d0 as i64, 80, parent_file)
+    end
+    if related_file != 0 do
+        native_write_i64(d0 as i64, 96, related_file)
     end
     if g_ideFactsEnabled == 1 do
         g_ideEarlyDiagnostics = native_read_i64(early_diag as int, 0)
@@ -537,6 +589,60 @@ func join_path_cstr(dir: int, file: int) -> int:
     out buf
 end.
 
+func join_dotted_cstr(prefix: int, key: int) -> int:
+    if prefix == 0 do out key end
+    let plen = rt_strlen(prefix)
+    if plen == 0 do out key end
+    if key == 0 do out prefix end
+    let klen = rt_strlen(key)
+    if klen == 0 do out prefix end
+    let buf = vir_alloc(plen + 1 + klen + 1)
+    var i = 0
+    when i < plen loop
+        native_write_u8(buf, i, native_read_u8(prefix, i))
+        i = i + 1
+    end
+    native_write_u8(buf, plen, 46)
+    var j = 0
+    when j < klen loop
+        native_write_u8(buf, plen + 1 + j, native_read_u8(key, j))
+        j = j + 1
+    end
+    native_write_u8(buf, plen + 1 + klen, 0)
+    out buf
+end.
+
+func path_dirname_cstr(path: int) -> int:
+    if path == 0 do out "." as int end
+    let plen = rt_strlen(path)
+    var last_slash = 0 - 1
+    var i = 0
+    when i < plen loop
+        if native_read_u8(path, i) == 47 do
+            last_slash = i
+        end
+        i = i + 1
+    end
+    if last_slash < 0 do out "." as int end
+    if last_slash == 0 do out "/" as int end
+    let buf = vir_alloc(last_slash + 1)
+    var j = 0
+    when j < last_slash loop
+        native_write_u8(buf, j, native_read_u8(path, j))
+        j = j + 1
+    end
+    native_write_u8(buf, last_slash, 0)
+    out buf
+end.
+
+func get_canonical_path_cstr(path: int) -> int:
+    if path == 0 do out 0 end
+    let c = cliCanonicalPath(path)
+    if c != 0 do out c end
+    let norm = path_normalize_fat(str_from_cstr(path))
+    out native_read_i64(norm as i64, 0)
+end.
+
 func file_exists_cstr(path: int) -> int:
     if path == 0 do out 0 end
     if g_ideVirtualFiles != 0 do
@@ -675,3 +781,25 @@ func find_file_up(start_dir: int, target: int) -> int:
     out 0
 end.
 
+export native_read_i64, native_write_i64, native_read_u8, native_write_u8
+export native_file_open, native_file_read, native_file_close, G_INC_MAX, G_PREPROCESS_MAX
+export G_REG_MAX, G_MOD_MAX, g_inc_tab, g_inc_base, g_inc_err, g_inc_diag_code
+export g_inc_last_dir, g_imp_mod, g_imp_syms, g_imp_aliases, g_imp_sym_count, g_imp_alias
+export g_imp_end, g_imp_chunk_line, g_inc_resolved_path, g_inc_canonical_id
+export g_inc_main_file, g_inc_cur_parent_file, g_inc_cur_parent_line, g_inc_active_dir
+export g_reg_names, g_reg_paths, g_reg_phys, g_reg_lines, g_reg_source, g_reg_isdir
+export g_reg_regfiles, G_REG_STACK_MAX, g_reg_stack_paths, g_reg_stack_count
+export g_reg_visited_paths, g_reg_visited_count, g_reg_count, g_reg_stdlib_count
+export g_reg_loaded, g_ideStdlibRegistry, g_ideResolvedModules, g_virc_sysroot
+export g_virc_stdlib_dir, g_virc_stdlib_registry, g_reg_root, g_reg_stdlib_dir
+export g_reg_project_root, g_inc_init, inc_set_error, inc_report_early_error
+export inc_report_early_error_related, inc_print_error_prefix, g_inc_norm_key
+export path_normalize_fat, g_inc_has, g_inc_mark, fat_ends_with_vri, fat_has_slash
+export text_line_has_double_colon, module_to_relpath, read_include_try_stdlib_vir
+export join_dir_file, g_ideEarlyDiagnostics, g_ideVirtualFiles, g_ideImportOrigins
+export g_ideImportParentFile, g_ideImportParentLine, g_io_cache_keys, g_io_cache_vals
+export g_io_cache_count, G_IO_CACHE_MAX, io_cache_get, io_cache_put, io_cache_reset
+export try_read_file, try_read_under_prefix, trim_cstr, cstr_clone, join_path_cstr
+export join_dotted_cstr, path_dirname_cstr, get_canonical_path_cstr, file_exists_cstr
+export file_is_regular_cstr, virc_path_ends_with, virc_path_starts_with
+export virc_span_is_safe_relative, virc_path_is_safe_relative, find_file_up

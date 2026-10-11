@@ -108,7 +108,7 @@ process.exit(0)    # not env.exit
 | `env.unwrapOr(key, fallback)` | `string` | value or fallback; never `Option` · was SPEC `env.or` |
 | `env.int(key)` | `Option` of `int` | parse fail / missing → `None` *(today uses default — change)* |
 | `env.bool(key)` | `Option` of `bool` | parse fail / missing → `None` *(today uses default — change)* |
-| `env.require(key)` | `Result` · `Ok(string)` / `Err(…)` | explicit failure when missing |
+| `env.require(key)` | `Result` · `Success(string)` / `Failure(…)` | explicit failure when missing |
 
 No public `env.str` — identical to `env.get` with no extra meaning.
 
@@ -291,7 +291,7 @@ New value; must not contain NUL.
 
 ### Returns
 
-`Result` — `Ok` / `Err` with validation or set failure.
+`Result` — `Success` / `Failure` with validation or set failure.
 
 ### Errors
 
@@ -448,7 +448,7 @@ Variable name.
 
 ### Returns
 
-`Result` — `Ok(string)` or `Err(…)` when missing (message today mentions the key).
+`Result` — `Success(string)` or `Failure(…)` when missing (message today mentions the key).
 
 ### Errors
 

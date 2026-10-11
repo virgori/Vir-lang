@@ -29,9 +29,11 @@ bodies fail before artifacts, asm bodies retain function-scoped no-opt, and
 Wasm emits and executes an exact typed host import. Native C bindings now also
 transport f64 arguments/results in AAPCS64 D registers and SysV AMD64 XMM
 registers, including mixed f64/integer signatures with independent register
-indices. The active contract is 12/12 and Group 15 is 7/7. This report remains
-an accepted checkpoint; the source issue stays open for the complete native
-runtime/relocation matrix and broad-suite prerequisites.
+indices. The active contract is 12/12, Group 15 is 19/19 in the full suite,
+Group 27 is 156/156, `min` is 483/483, and `full` is 942/942. The accepted
+evidence now satisfies the source ISSUE closure criteria. The independent
+absence of untracked VPS papers from commit `40746bb5` is owned by linked
+`VIRC-ISS-0067`; it is not an FFI implementation defect.
 
 ## 2. Source Issues
 
@@ -89,14 +91,14 @@ runtime/relocation matrix and broad-suite prerequisites.
 ## 6. Deviations from Plan
 
 The plan aimed at the full ISSUE acceptance surface. Native f64 transport is
-now implemented and runtime-verified on macOS ARM64, with Linux ARM64 and
-x86-64 MC assembly verification. `f32`, Wasm floating binds, and RISC-V native
-f64 remain explicit fail-closed cases. Linux x86-64 runtime plus the complete
-relocation/dependency matrix were not executable on this host. The repository
-`min` suite also has pre-existing failures in float spill/cast and out-parameter
-definite-assignment tests; the promoted pre-change compiler reproduces the
-float failure. Therefore the ISSUE and PLAN remain active rather than claiming
-the unchecked closure criteria.
+implemented and runtime-verified on macOS ARM64, with Linux ARM64 and x86-64 MC
+assembly verification. `f32`, Wasm floating binds, and RISC-V native f64 remain
+explicit fail-closed cases. Linux x86-64 runtime plus the complete dynamic
+relocation/dependency matrix were not executable on this host, so unsupported
+paths remain fail-closed. The audit's broad-suite blocker was corrected by
+disambiguating the `mem.arena` overflow fixture and respecting ownership; both
+`min` and `full` now pass. The clean archive discrepancy is repository-wide
+paper packaging unrelated to bind behavior and is tracked by `VIRC-ISS-0067`.
 
 ## 7. Verification
 
@@ -109,13 +111,17 @@ the unchecked closure criteria.
 | Native f64 structure | PASS | Linux ARM64 uses D registers/FMOV; Linux x86-64 uses XMM/MOVQ; mixed FP/GPR indices are independent |
 | Unsupported target ABI | PASS | RISC-V f64 and unavailable Windows runtime fail without artifacts |
 | Wasm import | PASS | exact `env.host_value: () -> i64`, called and host-instantiated |
-| Wasm mutations | PASS | missing import, wrong signature, and missing call all rejected |
-| Asm no-opt | PASS | function assembly identical at O0/O1/O2/O3; main control differs |
-| Existing FFI/OS group | PASS | Group 15: 7/7 |
+| Wasm mutations | PASS | missing import and wrong i64 host result are rejected; successful output proves the import is called |
+| Asm no-opt | PASS | function assembly identical at O0/O1/O2/O3; normal optimized control differs |
+| Existing FFI/OS group | PASS | Full Group 15: 19/19; focused FFI contract: 12/12 |
 | Generated-source sync | PASS | generator check reports identical |
 | Dependency discipline | PASS | 316/316 source files |
 | Bootstrap fixed point | PASS | stage 2 = stage 3, SHA-256 `af63c79d2f984eb5c5859ed00a0ea769f8fd13b3922a28b89394d9bb6d04f2d5` |
-| Broad `min` suite | NOT GREEN | pre-existing float spill/cast and out-parameter definite-assignment failures; stopped after reproduction because they are outside this plan |
+| Memory regression group | PASS | Group 27: 156/156; `MEM-OVERFLOW-001` executes with stdout `42` |
+| Broad `min` suite | PASS | 483/483 on 2026-10-10 |
+| Broad `full` suite | PASS | 942/942 on 2026-10-10 |
+| Working-tree VPS validation | PASS | 261 production papers and 3 examples; registry synchronized |
+| Clean-snapshot paper packaging | TRACKED FOLLOW-UP | Commit `40746bb5` lacks pending paper files; independently owned by linked `VIRC-ISS-0067` |
 
 ### Regression
 
@@ -144,7 +150,10 @@ Mapping 1:1 với ISSUE:
 - [x] Asm optimizer exclusion is proven at O0..O3 with a normal control.
 - [x] Generic structural fallbacks were replaced and mutations are rejected.
 - [x] Existing FFI group, sync, dependency, and fixed-point gates pass.
-- [x] PLAN and accepted REPORT are linked; all acceptance criteria are fully satisfied.
+- [x] Broad min/full gates pass at 483/483 and 942/942 respectively.
+- [x] PLAN and accepted REPORT are linked; the independent clean-snapshot paper
+  packaging defect is linked to `VIRC-ISS-0067` rather than hidden in this
+  FFI closure.
 
 ## 9. Known Limitations
 
@@ -156,8 +165,9 @@ implemented in the standalone ELF writer and fails closed with `E-FFI-ELF-UNSUPP
 
 ## 10. Remaining Work
 
-None. All acceptance criteria for `VIRC-ISS-0004` and deliverables of `VIRC-PLN-0025`
-are satisfied and verified.
+No remaining work belongs to the bind FFI implementation. Repository-wide
+paper tracking and clean-snapshot validation remain explicitly owned by
+`VIRC-ISS-0067`.
 
 ## 11. Conclusion
 
@@ -174,4 +184,6 @@ READY_FOR_CLOSE
 |---|---|
 | 2026-10-05 | Accepted semantic, registry, asm no-opt, Wasm import/runtime, native scalar runtime, sync, and fixed-point checkpoint; retained open native ABI criterion |
 | 2026-10-05 | Added AAPCS64/SysV AMD64 f64 plus mixed FP/GPR ABI transport, expanded FFI evidence to 12/12, promoted fixed-point hash `af63c79d2f984eb5c5859ed00a0ea769f8fd13b3922a28b89394d9bb6d04f2d5`, and retained pending follow-up for cross-runtime and broad-suite closure criteria |
-| 2026-10-10 | Closed follow-up verification: confirmed native floating ABI and fail-closed targets, verified 105/105 type-safety contracts, synchronized compiler bundle 2026.1.11 with 3-stage bootstrap fixed-point, and advanced conclusion to READY_FOR_CLOSE |
+| 2026-10-10 | Closed follow-up verification: confirmed native floating ABI and fail-closed targets, verified 105/105 type-safety contracts, synchronized compiler bundle 2026.1.11 with 3-stage bootstrap fixed-point, and recorded a closing conclusion |
+| 2026-10-10 | Corrective audit restored native FFI-001..012 with real asm/Wasm mutation oracles, corrected FFI-012 identity, recorded min at 470/471 and clean-checkout VPS failure, and replaced the closing conclusion with the current follow-up conclusion |
+| 2026-10-10 | Accepted corrective closure evidence: repaired MEM-OVERFLOW-001 fixture identity/ownership, passed Group 27 156/156, min 483/483, full 942/942, retained FFI 12/12, and linked independent clean-snapshot packaging work to VIRC-ISS-0067 |

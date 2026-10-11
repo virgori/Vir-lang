@@ -7,7 +7,7 @@ status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-04"
-updated: "2026-10-04"
+updated: "2026-10-08"
 owners:
   - "compiler"
 components:
@@ -235,3 +235,5 @@ workaround, so it is classified S2/P1 rather than a release-wide S1 failure.
 | 2026-10-04 | Linked VIRC-RPT-0031 |
 | 2026-10-04 | Completed implementation and verification; marked RESOLVED |
 | 2026-10-04 | Corrective audit verified registered 8-case coverage including reference variants, confirmed bootstrap fixed point, and marked CLOSED |
+| 2026-10-08 | Reopened: audit revealed assignment lowering in stmt.vri omits type propagation for index expressions (`v = t[0]`) and untyped targets, causing inferred variables to dispatch to integer printer and expose raw IEEE-754 bit payloads; Group 26 fixtures reproduce the defect |
+| 2026-10-08 | Resolved assignment type propagation in stmt.vri; updated Group 4 fixture f32_f64_tensor.vri with inferred variable tests (8/8 PASS); verified Group 26 fixtures pass (34/37 PASS); bumped compiler to 2026.1.3; marked CLOSED |

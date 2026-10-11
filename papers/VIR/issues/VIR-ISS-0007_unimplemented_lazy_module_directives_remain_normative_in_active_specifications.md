@@ -3,11 +3,11 @@ id: "VIR-ISS-0007"
 type: "ISSUE"
 domain: "VIR"
 title: "Unimplemented lazy module directives remain normative in active specifications"
-status: "RESOLVED"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-06"
-updated: "2026-10-06"
+updated: "2026-10-11"
 owners:
   - "language"
 components:
@@ -19,8 +19,11 @@ related:
   issues:
     - "VIR-ISS-0005"
     - "VIR-ISS-0006"
-  plans: []
-  reports: []
+    - "VIRC-ISS-0058"
+  plans:
+    - "VIR-PLN-0004"
+  reports:
+    - "VIR-RPT-0004"
 supersedes: null
 superseded_by: null
 tags:
@@ -232,3 +235,7 @@ criteria của VIR documentation ISSUE này.
 | 2026-10-06 | Linked VIR-ISS-0005 |
 | 2026-10-06 | Linked VIR-ISS-0006 |
 | 2026-10-06 | Resolved the normative-document scope across the focused and bilingual active specifications; compiler conformance remains independent |
+| 2026-10-08 | Linked VIRC-ISS-0058 |
+| 2026-10-11 | Linked VIR-PLN-0004 |
+| 2026-10-11 | Linked VIR-RPT-0004 |
+| 2026-10-11 | Closed after independent audit found no normative deferred/lazy module form and accepted VIR-RPT-0004 concluded READY_FOR_CLOSE |

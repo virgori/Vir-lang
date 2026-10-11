@@ -3,11 +3,11 @@ id: "VIRC-ISS-0026"
 type: "ISSUE"
 domain: "VIRC"
 title: "Borrow checker NLL and state scans exhibit quadratic-to-cubic compile-time growth"
-status: "REOPENED"
+status: "CLOSED"
 severity: "S1"
 priority: "P1"
 created: "2026-10-04"
-updated: "2026-10-06"
+updated: "2026-10-07"
 owners:
   - "compiler"
   - "semantic"
@@ -341,22 +341,24 @@ spans direct calls, projections, duplicate owned arguments, and loop dataflow.
 - [ ] Bulk borrower release and state equality/union avoid quadratic full-set
   rescans, but a dedicated loop-convergence operation-count corpus is deferred
   to linked follow-up `VIRC-ISS-0028`.
-- [ ] The full memory contract passes at every supported optimization level,
+- [x] The full memory contract passes at every supported optimization level,
   including named borrow, shadowing, projection, CFG join, loop back-edge,
-  early exit, await, arena reset, and positive/negative cases. This criterion
-  was previously met by `VIRC-RPT-0029` but fails on the reopened evidence.
-- [ ] All 15 reopened entity-move negative contracts reject with E5001 and
+  early exit, await, arena reset, and positive/negative cases. Re-verified on
+  2026-10-07 with 149/149 pass across `-O0`, `-O1`, `-O2`, and `-O3`.
+- [x] All 15 reopened entity-move negative contracts reject with E5001 and
   produce no artifact at `-O0`, `-O1`, `-O2`, and `-O3`.
-- [ ] A focused regression matrix proves direct entity moves, parameter
+- [x] A focused regression matrix proves direct entity moves, parameter
   forwarding, projection moves, duplicate owned arguments, and loop back-edge
   joins preserve invalidated ownership state.
 - [x] Diagnostics and IDE loan/end facts remain deterministic and retain their
   required origin/end locations.
 - [x] Canonical sources and generated compiler sources are synchronized, and
-  fixed-point self-host verification passes.
+  fixed-point self-host verification passes. Re-verified on 2026-10-07 with
+  bit-identical fixed point at compiler version 2026.1.2.
 - [x] A VPS PLAN and REPORT link this ISSUE before closure; the REPORT records
   benchmark data, semantic regressions, limitations, and any remaining
-  target-specific gaps.
+  target-specific gaps. VIRC-RPT-0029 updated on 2026-10-07 with full
+  post-reopening evidence.
 
 ## 11. Related Papers
 
@@ -390,3 +392,5 @@ spans direct calls, projections, duplicate owned arguments, and loop dataflow.
 | 2026-10-04 | Closed with accepted corrective evidence in VIRC-RPT-0029 and explicit linked follow-up VIRC-ISS-0028 |
 | 2026-10-04 | Post-closure compiler release promoted to virc 4.2.0 with a new canonical-output fixed point recorded in VIRC-RPT-0029 |
 | 2026-10-06 | Reopened after 15 registered entity move/use-after-move negative contracts produced artifacts at O0, O1, O2, and O3, contradicting the 149/149 closure evidence |
+| 2026-10-07 | Resolved post-closure regressions: fixed iterative breadth-first pass8_collect_funcs with queue cleanup, pass8_walk_decl scope registration order, and pass8_type_kind_from_type_str ABI; fixed 4 compiler self-host use-after-move defects, bumped compiler version to 2026.1.2, verified bit-identical self-host fixed point (SHA-256: 1ee0e64...), 149/149 memory contracts pass across -O0..-O3, and updated VIRC-RPT-0029 with reproducible audit evidence |
+| 2026-10-07 | Closed after independent audit corrections: exact 15-case reproduction passed at -O0..-O3, median wall-time and deterministic operation gates passed, fixed-point self-host and compiler policy passed, VIRC-RPT-0029 remained ACCEPTED with READY_FOR_CLOSE, and deferred loop/projection work remained tracked by VIRC-ISS-0028 |

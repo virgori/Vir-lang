@@ -10,7 +10,7 @@ status: closed
 notes: >-
   Bridges only; UTF-8 codec stays in unicode. Public Slice in / Buffer out.
   Wire form UTF-16LE and UTF-32LE explicit; no silent host endian; no auto BOM.
-  Strict default; asciiLossy explicitly named. Err → ErrorKind.InvalidData.
+  Strict default; asciiLossy explicitly named. Failure → ErrorKind.InvalidData.
   No .vri until map applied.
 ---
 
@@ -26,8 +26,8 @@ encode ── encoding bridges ── Buffer / Slice
 ```
 
 ```vir
-let b = encode.utf8ToUtf16(slice)   # Result → Ok(Buffer) UTF-16LE
-let u = encode.utf16ToUtf8(slice)   # Result → Ok(Buffer) UTF-8 bytes
+let b = encode.utf8ToUtf16(slice)   # Result → Success(Buffer) UTF-16LE
+let u = encode.utf16ToUtf8(slice)   # Result → Success(Buffer) UTF-8 bytes
 ```
 
 Physical module today: `str/encode.vri` (`str.encode` in `stdlib.vri`). Public
@@ -63,7 +63,7 @@ Callers that need BOM prepend/strip do it themselves.
 
 ## Errors (closed)
 
-Malformed input → `Result` Err with [`ErrorKind.InvalidData`](error.md).
+Malformed input → `Result` Failure with [`ErrorKind.InvalidData`](error.md).
 Do **not** invent `InvalidEncoding` in this pass.
 
 ## Public surface (closed)
@@ -92,10 +92,10 @@ Allocation lives in `Buffer`.
 Canonical signatures (closed intent):
 
 ```vir
-encode.utf8ToUtf16(s: Slice) -> Result    # Ok(Buffer) UTF-16LE
-encode.utf16ToUtf8(s: Slice) -> Result    # Ok(Buffer) UTF-8
-encode.utf8ToUtf32(s: Slice) -> Result    # Ok(Buffer) UTF-32LE
-encode.utf32ToUtf8(s: Slice) -> Result    # Ok(Buffer) UTF-8
+encode.utf8ToUtf16(s: Slice) -> Result    # Success(Buffer) UTF-16LE
+encode.utf16ToUtf8(s: Slice) -> Result    # Success(Buffer) UTF-8
+encode.utf8ToUtf32(s: Slice) -> Result    # Success(Buffer) UTF-32LE
+encode.utf32ToUtf8(s: Slice) -> Result    # Success(Buffer) UTF-8
 encode.asciiLossy(s: Slice) -> Buffer     # non-ASCII → '?'
 ```
 
@@ -135,7 +135,7 @@ encode.utf8ToUtf16(s: Slice) -> Result of (Buffer)
 ```
 
 Decode UTF-8 via [`unicode`](unicode.md) SSOT; emit **UTF-16LE** into
-`Ok(Buffer)`. Invalid UTF-8 / scalar → `Err(… InvalidData …)`.
+`Success(Buffer)`. Invalid UTF-8 / scalar → `Failure(… InvalidData …)`.
 
 ### Status
 
@@ -151,7 +151,7 @@ encode.utf16ToUtf8(s: Slice) -> Result of (Buffer)
 ```
 
 Interpret `s` as **UTF-16LE** bytes; emit UTF-8 `Buffer`. Truncated/invalid
-surrogate pairs → `Err(InvalidData)`.
+surrogate pairs → `Failure(InvalidData)`.
 
 ### Status
 
@@ -181,7 +181,7 @@ Emit **UTF-32LE** code units into `Buffer`.
 encode.utf32ToUtf8(s: Slice) -> Result of (Buffer)
 ```
 
-Interpret `s` as **UTF-32LE**; emit UTF-8. Invalid scalar → `Err(InvalidData)`.
+Interpret `s` as **UTF-32LE**; emit UTF-8. Invalid scalar → `Failure(InvalidData)`.
 
 ### Status
 

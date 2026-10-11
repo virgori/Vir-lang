@@ -432,7 +432,7 @@ Zero duration is allowed. Negative duration is invalid.
 
 ### Returns
 
-Bare `Result` — `Ok()` when the sleep completes, `Err(error)` when the platform call fails.
+Bare `Result` — `Success()` when the sleep completes, `Failure(error)` when the platform call fails.
 
 ### Errors
 
@@ -1194,7 +1194,7 @@ Active timer created by `time.timer`.
 
 ### Returns
 
-Bare `Result` — `Ok()` on success.
+Bare `Result` — `Success()` on success.
 
 ### Errors
 

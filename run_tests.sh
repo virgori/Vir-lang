@@ -11,6 +11,7 @@
 
 cd "$(dirname "$0")"
 VIRC="${VIRC:-./bin/virc}"
+BOOTSTRAP_VIRC="${BOOTSTRAP_VIRC:-$VIRC}"
 export VIRC_UI=classic
 if [ ! -x "$VIRC" ]; then
     echo "Lỗi: Compiler không tồn tại hoặc không executable: $VIRC" >&2
@@ -83,6 +84,10 @@ run_test_in_group() {
     expected_action=$(sed -n 's/^#[[:space:]]*EXPECT_ACTION:[[:space:]]*//p' "$test" | head -1)
     local expected_compile_fail
     expected_compile_fail=$(sed -n 's/^#[[:space:]]*EXPECT_COMPILE_FAIL:[[:space:]]*//p' "$test" | head -1)
+    local expected_related_file
+    expected_related_file=$(sed -n 's/^#[[:space:]]*EXPECT_RELATED_FILE:[[:space:]]*//p' "$test" | head -1)
+    local expected_related_line
+    expected_related_line=$(sed -n 's/^#[[:space:]]*EXPECT_RELATED_LINE:[[:space:]]*//p' "$test" | head -1)
     local expected_stdin
     expected_stdin=$(perl -0777 -ne '
         if (/#\s*STDIN_START\n((?:#[^\n]*\n)+?)#\s*STDIN_END/m) {
@@ -97,13 +102,17 @@ run_test_in_group() {
         local reject_out
         reject_out=$($VIRC "$test" -o "$A_OUT" 2>&1)
         local reject_rc=$?
+        local related_out=""
+        if [ -n "$expected_related_file" ] || [ -n "$expected_related_line" ]; then
+            related_out=$(printf "%s\n" "$reject_out" | sed -n '/Related Location/,+8p')
+        fi
         if [ $reject_rc -ne 0 ]; then
             local fail_reason=""
             if [ -e "$A_OUT" ]; then
                 fail_reason="compiler vẫn sinh artifact cho negative test"
             elif [ -n "$expected_diag" ] && ! grep -Fq "[$expected_diag]" <<<"$reject_out"; then
                 fail_reason="kỳ vọng diagnostic code: $expected_diag"
-            elif [ -n "$expected_line" ] && ! grep -E -i -q "([Ll]ine[[:space:]]*:[[:space:]]*$expected_line\b|[Ll]ine[[:space:]]+$expected_line\b)" <<<"$reject_out"; then
+            elif [ -n "$expected_line" ] && ! grep -E -i -q "([Ll]ine[[:space:]]*:[[:space:]]*$expected_line\b|[Ll]ine[[:space:]]+$expected_line\b|:$expected_line:[0-9]+\])" <<<"$reject_out"; then
                 fail_reason="kỳ vọng diagnostic line: $expected_line"
             elif [ -n "$expected_col" ] && ! grep -E -i -q "([Cc]olumn[[:space:]]*:[[:space:]]*$expected_col\b|[Cc]olumn[[:space:]]+$expected_col\b|:[0-9]+:$expected_col:)" <<<"$reject_out"; then
                 fail_reason="kỳ vọng diagnostic column: $expected_col"
@@ -115,6 +124,10 @@ run_test_in_group() {
                 fail_reason="kỳ vọng diagnostic cause: $expected_cause"
             elif [ -n "$expected_action" ] && ! grep -Fq "$expected_action" <<<"$reject_out"; then
                 fail_reason="kỳ vọng diagnostic action: $expected_action"
+            elif [ -n "$expected_related_file" ] && ! grep -Fq "$expected_related_file" <<<"$related_out"; then
+                fail_reason="kỳ vọng related file: $expected_related_file"
+            elif [ -n "$expected_related_line" ] && ! grep -E -i -q "[Ll]ine[[:space:]]*:[[:space:]]*$expected_related_line\b" <<<"$related_out"; then
+                fail_reason="kỳ vọng related line: $expected_related_line"
             elif [ -n "$expected_compile_fail" ]; then
                 IFS=' ' read -r -a words <<< "$expected_compile_fail"
                 for word in "${words[@]}"; do
@@ -263,17 +276,74 @@ run_contract_suite_in_group() {
     local manifest="$3"
     local fixtures="$4"
     local target="${5:-macos-arm64}"
+    local filter="${6:-}"
     local suite_out
     local suite_rc
     local pass_cnt
     local fail_cnt
     local blocked_cnt
 
-    suite_out=$(python3 tools/gap_contract_runner.py \
-        --manifest "$manifest" \
-        --fixtures "$fixtures" \
-        --virc "$VIRC" \
-        --target "$target" 2>&1)
+    local runner_bin="./bin/vir-test"
+    local need_build=0
+    if [ ! -x "$runner_bin" ]; then
+        need_build=1
+    else
+        for src in tools/vir-test/src/*.vri tools/vir-test/src/*/*.vri tools/vir-test/module.list stdlib/vir/virgex/virgex.vri stdlib/vir/core/vec.vri; do
+            if [ -f "$src" ] && [ "$src" -nt "$runner_bin" ]; then
+                need_build=1
+                break
+            fi
+        done
+    fi
+
+    if [ "$need_build" -eq 1 ]; then
+        if [ ! -x "$BOOTSTRAP_VIRC" ]; then
+            echo "Lỗi: Bootstrap compiler không tồn tại hoặc không executable: $BOOTSTRAP_VIRC" >&2
+            GP_FAIL[$g]=$((GP_FAIL[$g] + 1))
+            TOTAL_FAIL=$((TOTAL_FAIL + 1))
+            return 1
+        fi
+        if [ -f "tools/vir-test/src/main.vri" ]; then
+            mkdir -p bin
+            local tmp_runner="bin/.vir-test.tmp.$$"
+            rm -f "$tmp_runner"
+            if ! "$BOOTSTRAP_VIRC" tools/vir-test/src/main.vri -o "$tmp_runner" >/dev/null 2>&1 || [ ! -f "$tmp_runner" ]; then
+                rm -f "$tmp_runner"
+                echo "Lỗi: Biên dịch native contract runner thất bại với bootstrap compiler ($BOOTSTRAP_VIRC)" >&2
+                GP_FAIL[$g]=$((GP_FAIL[$g] + 1))
+                TOTAL_FAIL=$((TOTAL_FAIL + 1))
+                return 1
+            fi
+            if [ "$(uname -s)" = "Darwin" ]; then
+                codesign -s - -f "$tmp_runner" >/dev/null 2>&1 || true
+            fi
+            if ! chmod +x "$tmp_runner" || ! mv -f "$tmp_runner" "$runner_bin"; then
+                rm -f "$tmp_runner"
+                echo "Lỗi: Không thể phân quyền hoặc cập nhật native contract runner ($runner_bin)" >&2
+                GP_FAIL[$g]=$((GP_FAIL[$g] + 1))
+                TOTAL_FAIL=$((TOTAL_FAIL + 1))
+                return 1
+            fi
+        fi
+    fi
+
+    if [ ! -x "$runner_bin" ]; then
+        echo "Lỗi: Không thể biên dịch hoặc khởi thi hành native contract runner: $runner_bin" >&2
+        GP_FAIL[$g]=$((GP_FAIL[$g] + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+        return 1
+    fi
+
+    local runner_args=(
+        --manifest "$manifest"
+        --fixtures "$fixtures"
+        --virc "$VIRC"
+        --target "$target"
+    )
+    if [ -n "$filter" ]; then
+        runner_args+=(--filter "$filter")
+    fi
+    suite_out=$("$runner_bin" "${runner_args[@]}" 2>&1)
     suite_rc=$?
 
     echo "$suite_out" | sed 's/^/  /'
@@ -546,88 +616,271 @@ run_interp_mc_target() {
 run_packed_opt_and_target_matrix() {
     local g=7
     local opt
-    local test="tests/strict_v2/packed_layout_mixed_width_e2e.vri"
-    local expected
-    expected=$(perl -0777 -ne '
-        if (/#\s*EXPECT_START\n((?:#[^\n]*\n)+?)#\s*EXPECT_END/m) {
-            my $b = $1; $b =~ s/^#[ \t]?//mg; chomp $b; print $b;
-        }
-    ' "$test")
+    local fixtures=(
+        "tests/strict_v2/packed_layout_mixed_width_e2e.vri"
+        "tests/strict_v2/packed_signed_load_e2e.vri"
+        "tests/strict_v2/packed_unaligned_mutation_e2e.vri"
+        "tests/strict_v2/packed_nested_layout_e2e.vri"
+    )
 
-    # 1. Host optimization matrix execution (-O0..-O3)
-    for opt in -O0 -O1 -O2 -O3; do
-        local bin_path="./scratch/packed_opt_${opt}.out"
-        rm -f "$bin_path"
-        local compile_out
-        if ! compile_out=$($VIRC "$test" "$opt" -o "$bin_path" -q 2>&1); then
-            echo "  [FAIL-MC] Packed $opt host compile"
-            if [ -n "$compile_out" ]; then echo "$compile_out" | sed 's/^/    /' | head -20; fi
-            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
-            return
-        fi
-        if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$bin_path" >/dev/null 2>&1 || true; fi
-        local actual
-        actual=$("$bin_path" 2>&1 | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba')
-        if [ "$actual" != "$expected" ]; then
-            echo "  [FAIL-MC] Packed $opt host output mismatch"
-            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
-            return
-        fi
+    for test in "${fixtures[@]}"; do
+        local test_base
+        test_base=$(basename "$test" .vri)
+        local expected
+        expected=$(perl -0777 -ne '
+            if (/#\s*EXPECT_START\n((?:#[^\n]*\n)+?)#\s*EXPECT_END/m) {
+                my $b = $1; $b =~ s/^#[ \t]?//mg; chomp $b; print $b;
+            }
+        ' "$test")
+
+        # 1. Host optimization matrix execution (-O0..-O3)
+        for opt in -O0 -O1 -O2 -O3; do
+            local bin_path="./scratch/packed_${test_base}_opt_${opt}.out"
+            rm -f "$bin_path"
+            local compile_out
+            if ! compile_out=$($VIRC "$test" "$opt" -o "$bin_path" -q 2>&1); then
+                echo "  [FAIL-MC] Packed $test_base $opt host compile"
+                if [ -n "$compile_out" ]; then echo "$compile_out" | sed 's/^/    /' | head -20; fi
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$bin_path" >/dev/null 2>&1 || true; fi
+            local actual
+            actual=$("$bin_path" 2>&1 | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba')
+            if [ "$actual" != "$expected" ]; then
+                echo "  [FAIL-MC] Packed $test_base $opt host output mismatch"
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+        done
+
+        # 2. Cross-target assembly inspection across (-O0..-O3)
+        for opt in -O0 -O1 -O2 -O3; do
+            # ARM64: must emit narrow store/load instructions
+            local arm64_s="./scratch/packed_${test_base}_arm64_${opt}.s"
+            rm -f "$arm64_s"
+            if ! $VIRC "$test" --target linux-arm64 "$opt" -S -o "$arm64_s" -q >/dev/null 2>&1 \
+                || [ ! -s "$arm64_s" ] \
+                || ! grep -E -q "\b(strb|strh|ldrsb|ldrsh|ldrsw)\b|str\s+w" "$arm64_s"; then
+                echo "  [FAIL-MC] Packed ARM64 $test_base $opt assembly verification"
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+
+            # x86-64: must emit mov byte ptr, mov word ptr, mov dword ptr, movsx, movsxd
+            local x86_s="./scratch/packed_${test_base}_x86_${opt}.s"
+            rm -f "$x86_s"
+            if ! $VIRC "$test" --target linux-x86_64 "$opt" -S -o "$x86_s" -q >/dev/null 2>&1 \
+                || [ ! -s "$x86_s" ] \
+                || ! grep -E -q "byte ptr|word ptr|dword ptr|movsx|movsxd" "$x86_s"; then
+                echo "  [FAIL-MC] Packed x86-64 $test_base $opt assembly verification"
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+
+            # RISC-V 64: must emit sb, lbu, and main: must NOT contain unaligned sh/sw/lh/lw
+            local riscv_s="./scratch/packed_${test_base}_riscv_${opt}.s"
+            rm -f "$riscv_s"
+            if ! $VIRC "$test" --target linux-riscv64 "$opt" -S -o "$riscv_s" -q >/dev/null 2>&1 \
+                || [ ! -s "$riscv_s" ] \
+                || ! grep -E -q "\bsb\b" "$riscv_s" \
+                || ! grep -E -q "\blbu\b" "$riscv_s"; then
+                echo "  [FAIL-MC] Packed RISC-V $test_base $opt assembly verification"
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+            if ! perl -ne 'if (/main:/.../(?:\.size|\Z)/) { exit 1 if /\b(sh|sw|lh|lw)\b/; }' "$riscv_s"; then
+                echo "  [FAIL-MC] Packed RISC-V $test_base $opt unaligned memory op in main"
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+
+            # Wasm32: must emit valid wasm module and contain explicit narrow store/load opcodes
+            local wasm_out="./scratch/packed_${test_base}_wasm_${opt}.wasm"
+            rm -f "$wasm_out"
+            if ! $VIRC "$test" --target wasm32 "$opt" -o "$wasm_out" -q >/dev/null 2>&1 \
+                || [ ! -s "$wasm_out" ]; then
+                echo "  [FAIL-MC] Packed Wasm32 $test_base $opt build"
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+            if ! perl -e '
+                undef $/;
+                open my $f, "<:raw", $ARGV[0] or exit 1;
+                my $b = <$f>;
+                my $has_store = ($b =~ /[\x3c\x3d\x3e]/);
+                my $has_load  = ($b =~ /[\x30-\x35]/);
+                exit( ($has_store && $has_load) ? 0 : 1 );
+            ' "$wasm_out"; then
+                echo "  [FAIL-MC] Packed Wasm32 $test_base $opt bytecode verification (missing narrow store/load opcodes)"
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+        done
     done
-    echo "  [PASS-MC] Packed host optimization matrix (-O0..-O3)"
+    echo "  [PASS-MC] Packed host optimization matrix (-O0..-O3 across 4 fixtures)"
+    GP_PASS[$g]=$((GP_PASS[$g]+1)); TOTAL_PASS=$((TOTAL_PASS+1))
+    echo "  [PASS-MC] Packed cross-target matrix (-O0..-O3: ARM64, x86-64, RISC-V, Wasm across 4 fixtures)"
+    GP_PASS[$g]=$((GP_PASS[$g]+1)); TOTAL_PASS=$((TOTAL_PASS+1))
+}
+
+run_register_opt_and_target_matrix() {
+    local g=16
+    local opt
+    local fixtures=(
+        "tests/strict_v2/volatile_widths_e2e.vri"
+        "tests/strict_v2/register_scoped_collision_e2e.vri"
+        "tests/strict_v2/register_entity_isolation_e2e.vri"
+        "tests/strict_v2/register_x86_e2e.vri"
+        "tests/test_register.vri"
+        "tests/test_volatile.vri"
+    )
+
+    # 1. Host optimization matrix execution (-O0..-O3 across fixtures)
+    for test in "${fixtures[@]}"; do
+        local test_base
+        test_base=$(basename "$test" .vri)
+        local expected
+        expected=$(perl -0777 -ne '
+            if (/#\s*EXPECT_START\n((?:#[^\n]*\n)+?)#\s*EXPECT_END/m) {
+                my $b = $1; $b =~ s/^#[ \t]?//mg; chomp $b; print $b;
+            } elsif (/#\s*EXPECT:\s*([^\n]+)/) {
+                print $1;
+            }
+        ' "$test")
+
+        for opt in -O0 -O1 -O2 -O3; do
+            local bin_path="./scratch/reg_${test_base}_opt_${opt}.out"
+            rm -f "$bin_path"
+            local compile_out
+            if ! compile_out=$($VIRC "$test" "$opt" -o "$bin_path" -q 2>&1); then
+                echo "  [FAIL-MC] Register/Volatile $test_base $opt host compile"
+                if [ -n "$compile_out" ]; then echo "$compile_out" | sed 's/^/    /' | head -20; fi
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$bin_path" >/dev/null 2>&1 || true; fi
+            local actual
+            actual=$("$bin_path" 2>&1 | sed -e :a -e '/^\n*$/{$d;N;};/\n$/ba')
+            if [ "$actual" != "$expected" ]; then
+                echo "  [FAIL-MC] Register/Volatile $test_base $opt host output mismatch"
+                echo "    Kỳ vọng: '$expected'"
+                echo "    Thực tế: '$actual'"
+                GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+                return
+            fi
+        done
+    done
+    echo "  [PASS-MC] Register & volatile optimization matrix (-O0..-O3 host execution across 6 fixtures)"
     GP_PASS[$g]=$((GP_PASS[$g]+1)); TOTAL_PASS=$((TOTAL_PASS+1))
 
-    # 2. Cross-target assembly inspection across (-O0..-O3)
-    for opt in -O0 -O1 -O2 -O3; do
-        # ARM64: must emit strb, strh, str w
-        local arm64_s="./scratch/packed_arm64_${opt}.s"
-        rm -f "$arm64_s"
-        if ! $VIRC "$test" --target linux-arm64 "$opt" -S -o "$arm64_s" -q >/dev/null 2>&1 \
-            || [ ! -s "$arm64_s" ] \
-            || ! grep -E -q "strb\b" "$arm64_s" \
-            || ! grep -E -q "strh\b" "$arm64_s" \
-            || ! grep -E -q "str\s+w" "$arm64_s"; then
-            echo "  [FAIL-MC] Packed ARM64 $opt assembly verification"
-            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
-            return
-        fi
+    # 2. Multi-target backend verification: ARM64 and x86-64 textual assembly (-S) and binary
+    local arm64_s="./scratch/reg_collision_arm64.s"
+    rm -f "$arm64_s"
+    if ! $VIRC "tests/strict_v2/register_scoped_collision_e2e.vri" --target linux-arm64 -S -o "$arm64_s" -q >/dev/null 2>&1 \
+        || [ ! -s "$arm64_s" ] \
+        || ! grep -q "\bubfx\b" "$arm64_s" \
+        || ! grep -q "\bbfi\b" "$arm64_s"; then
+        echo "  [FAIL-MC] Register ARM64 assembly verification (missing ubfx or bfi)"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
 
-        # x86-64: must emit mov byte ptr, mov word ptr, mov dword ptr
-        local x86_s="./scratch/packed_x86_${opt}.s"
-        rm -f "$x86_s"
-        if ! $VIRC "$test" --target linux-x86_64 "$opt" -S -o "$x86_s" -q >/dev/null 2>&1 \
-            || [ ! -s "$x86_s" ] \
-            || ! grep -Fq "byte ptr" "$x86_s" \
-            || ! grep -Fq "word ptr" "$x86_s" \
-            || ! grep -Fq "dword ptr" "$x86_s"; then
-            echo "  [FAIL-MC] Packed x86-64 $opt assembly verification"
-            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
-            return
-        fi
+    local arm64_vol_s="./scratch/reg_vol_arm64.s"
+    rm -f "$arm64_vol_s"
+    if ! $VIRC "tests/strict_v2/volatile_widths_e2e.vri" --target linux-arm64 -S -o "$arm64_vol_s" -q >/dev/null 2>&1 \
+        || [ ! -s "$arm64_vol_s" ] \
+        || ! grep -q "\bdmb\b" "$arm64_vol_s" \
+        || ! grep -q "\bldrh\b" "$arm64_vol_s" \
+        || ! grep -q "\bstrh\b" "$arm64_vol_s"; then
+        echo "  [FAIL-MC] Volatile ARM64 assembly verification (missing dmb, ldrh, or strh)"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
 
-        # RISC-V 64: must emit sb, lbu with shifts and no unaligned sh/sw
-        local riscv_s="./scratch/packed_riscv_${opt}.s"
-        rm -f "$riscv_s"
-        if ! $VIRC "$test" --target linux-riscv64 "$opt" -S -o "$riscv_s" -q >/dev/null 2>&1 \
-            || [ ! -s "$riscv_s" ] \
-            || ! grep -E -q "sb\b" "$riscv_s" \
-            || ! grep -E -q "lbu\b" "$riscv_s"; then
-            echo "  [FAIL-MC] Packed RISC-V $opt assembly verification"
-            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
-            return
-        fi
+    local arm64_vol_bin="./scratch/reg_vol_arm64.bin"
+    rm -f "$arm64_vol_bin"
+    if ! $VIRC "tests/strict_v2/volatile_widths_e2e.vri" --target linux-arm64 -o "$arm64_vol_bin" -q >/dev/null 2>&1 \
+        || [ ! -s "$arm64_vol_bin" ] \
+        || ! objdump -d "$arm64_vol_bin" 2>/dev/null | grep -E -q "\b(ldrh|strh|dmb)\b"; then
+        echo "  [FAIL-MC] Volatile ARM64 binary/barrier verification"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
 
-        # Wasm32: must emit valid wasm module
-        local wasm_out="./scratch/packed_wasm_${opt}.wasm"
-        rm -f "$wasm_out"
-        if ! $VIRC "$test" --target wasm32 "$opt" -o "$wasm_out" -q >/dev/null 2>&1 \
-            || [ ! -s "$wasm_out" ]; then
-            echo "  [FAIL-MC] Packed Wasm32 $opt build"
-            GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
-            return
-        fi
-    done
-    echo "  [PASS-MC] Packed cross-target matrix (-O0..-O3: ARM64, x86-64, RISC-V, Wasm)"
+    local x86_s="./scratch/reg_collision_x86.s"
+    rm -f "$x86_s"
+    if ! $VIRC "tests/strict_v2/register_scoped_collision_e2e.vri" --target linux-x86_64 -S -o "$x86_s" -q >/dev/null 2>&1 \
+        || [ ! -s "$x86_s" ] \
+        || ! grep -q -E "\bshr\b" "$x86_s" \
+        || ! grep -q -E "\bshl\b" "$x86_s" \
+        || ! grep -q -E "\band\b" "$x86_s" \
+        || ! grep -q -E "\bor\b" "$x86_s"; then
+        echo "  [FAIL-MC] Register x86-64 assembly verification (missing shr, shl, and, or)"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+
+    local x86_vol_s="./scratch/reg_vol_x86.s"
+    rm -f "$x86_vol_s"
+    if ! $VIRC "tests/strict_v2/volatile_widths_e2e.vri" --target linux-x86_64 -S -o "$x86_vol_s" -q >/dev/null 2>&1 \
+        || [ ! -s "$x86_vol_s" ] \
+        || ! grep -q "\bmfence\b" "$x86_vol_s" \
+        || ! grep -q "\bmovzx\b" "$x86_vol_s"; then
+        echo "  [FAIL-MC] Volatile x86-64 assembly verification (missing mfence or movzx)"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+
+    local x86_bin="./scratch/reg_x86.bin"
+    rm -f "$x86_bin"
+    if ! $VIRC "tests/strict_v2/register_x86_e2e.vri" --target linux-x86_64 -o "$x86_bin" -q >/dev/null 2>&1 \
+        || [ ! -s "$x86_bin" ]; then
+        echo "  [FAIL-MC] Register x86-64 binary lowering"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+
+    local x86_vol_bin="./scratch/reg_vol_x86.bin"
+    rm -f "$x86_vol_bin"
+    if ! $VIRC "tests/strict_v2/volatile_widths_e2e.vri" --target linux-x86_64 -o "$x86_vol_bin" -q >/dev/null 2>&1 \
+        || [ ! -s "$x86_vol_bin" ] \
+        || ! objdump -d "$x86_vol_bin" 2>/dev/null | grep -Fq "mfence"; then
+        echo "  [FAIL-MC] Volatile x86-64 mfence barrier binary verification"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+    echo "  [PASS-MC] Register & volatile ARM64 and x86-64 backend parity (direct binary and -S assembly)"
+    GP_PASS[$g]=$((GP_PASS[$g]+1)); TOTAL_PASS=$((TOTAL_PASS+1))
+
+    # 3. Fail-closed target rejection: RISC-V and Wasm (both binary and -S)
+    local riscv_out
+    riscv_out=$($VIRC "tests/strict_v2/register_x86_e2e.vri" --target linux-riscv64 -q 2>&1)
+    local riscv_rc=$?
+    if [ $riscv_rc -eq 0 ] || ! echo "$riscv_out" | grep -Fq "E-RISCV-UNSUPPORTED"; then
+        echo "  [FAIL-MC] Register RISC-V fail-closed binary verification"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+
+    local riscv_s_out
+    riscv_s_out=$($VIRC "tests/strict_v2/register_x86_e2e.vri" --target linux-riscv64 -S -q 2>&1)
+    local riscv_s_rc=$?
+    if [ $riscv_s_rc -eq 0 ] || ! echo "$riscv_s_out" | grep -Fq "E-RISCV-UNSUPPORTED"; then
+        echo "  [FAIL-MC] Register RISC-V fail-closed -S verification"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+
+    local wasm_out
+    wasm_out=$($VIRC "tests/strict_v2/register_x86_e2e.vri" --target wasm32 -q 2>&1)
+    local wasm_rc=$?
+    if [ $wasm_rc -eq 0 ] || ! echo "$wasm_out" | grep -Fq "E-WASM-UNSUPPORTED"; then
+        echo "  [FAIL-MC] Register Wasm fail-closed verification"
+        GP_FAIL[$g]=$((GP_FAIL[$g]+1)); TOTAL_FAIL=$((TOTAL_FAIL+1))
+        return
+    fi
+    echo "  [PASS-MC] Register RISC-V & Wasm compile-time fail-closed verification (binary & -S)"
     GP_PASS[$g]=$((GP_PASS[$g]+1)); TOTAL_PASS=$((TOTAL_PASS+1))
 }
 
@@ -645,10 +898,28 @@ run_group_1() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm  1: Tổng quan (§1.0 Separator, §1.1 Mở khối, §1.2 Pipeline IR)"
     echo "──────────────────────────────────────────────────────────────────────────"
-    if python3 tests/test_opt_pre_and_loop_transforms.py --virc "$VIRC"; then
+    local pre_runner="./bin/pre-loop-test"
+    local pre_src="tests/opt/pre_loop_test.vri"
+    if [ ! -x "$pre_runner" ] || [ "$pre_src" -nt "$pre_runner" ]; then
+        rm -f "$pre_runner"
+        mkdir -p bin
+        local tmp_pre="bin/.pre-loop-test.tmp.$$"
+        rm -f "$tmp_pre"
+        if "$BOOTSTRAP_VIRC" "$pre_src" -o "$tmp_pre" >/dev/null 2>&1 && [ -f "$tmp_pre" ]; then
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$tmp_pre" >/dev/null 2>&1 || true; fi
+            if ! chmod +x "$tmp_pre" || ! mv -f "$tmp_pre" "$pre_runner"; then
+                rm -f "$tmp_pre"
+            fi
+        else
+            rm -f "$tmp_pre"
+        fi
+    fi
+    if [ -x "$pre_runner" ] && "$pre_runner" --virc "$VIRC" >/dev/null 2>&1; then
+        echo "  [PASS-CONTRACT] MIR PRE and loop transformations structural contract"
         GP_PASS[1]=$((${GP_PASS[1]} + 1))
         TOTAL_PASS=$((TOTAL_PASS + 1))
     else
+        echo "  [FAIL-CONTRACT] MIR PRE or loop transformations structural contract"
         GP_FAIL[1]=$((${GP_FAIL[1]} + 1))
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
@@ -755,14 +1026,53 @@ run_group_3() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm  3: Hệ thống Module (include, import, export)"
     echo "──────────────────────────────────────────────────────────────────────────"
-    if python3 -m unittest tests/module/test_module_resolver.py >/dev/null && \
-       python3 tools/module_graph.py --root . --entry driver >/dev/null && \
-       python3 tools/module_graph.py --root . --entry bundle_entry >/dev/null; then
-        echo "  [PASS] module registry, diagnostics, and compiler dependency closure"
+    local mod_runner="./bin/module-resolver-test"
+    local mod_src="tests/module/resolver_test.vri"
+    if [ ! -x "$mod_runner" ] || [ "$mod_src" -nt "$mod_runner" ]; then
+        rm -f "$mod_runner"
+        mkdir -p bin
+        local tmp_mod="bin/.module-resolver-test.tmp.$$"
+        rm -f "$tmp_mod"
+        if "$BOOTSTRAP_VIRC" "$mod_src" -o "$tmp_mod" >/dev/null 2>&1 && [ -f "$tmp_mod" ]; then
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$tmp_mod" >/dev/null 2>&1 || true; fi
+            if ! chmod +x "$tmp_mod" || ! mv -f "$tmp_mod" "$mod_runner"; then
+                rm -f "$tmp_mod"
+            fi
+        else
+            rm -f "$tmp_mod"
+        fi
+    fi
+    if [ -x "$mod_runner" ] && "$mod_runner" >/dev/null 2>&1; then
+        echo "  [PASS-CONTRACT] module registry, diagnostics, and compiler dependency closure"
         GP_PASS[3]=$((${GP_PASS[3]} + 1))
         TOTAL_PASS=$((TOTAL_PASS + 1))
     else
-        echo "  [FAIL] module registry, diagnostics, or compiler dependency closure"
+        echo "  [FAIL-CONTRACT] module registry, diagnostics, or compiler dependency closure"
+        GP_FAIL[3]=$((${GP_FAIL[3]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
+    local pass_chk="./bin/vir-pass-check"
+    local pass_chk_src="tools/vir-pass-check/src/main.vri"
+    if [ ! -x "$pass_chk" ] || [ "$pass_chk_src" -nt "$pass_chk" ]; then
+        rm -f "$pass_chk"
+        mkdir -p bin
+        local tmp_chk="bin/.vir-pass-check.tmp.$$"
+        rm -f "$tmp_chk"
+        if "$BOOTSTRAP_VIRC" "$pass_chk_src" -o "$tmp_chk" >/dev/null 2>&1 && [ -f "$tmp_chk" ]; then
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$tmp_chk" >/dev/null 2>&1 || true; fi
+            if ! chmod +x "$tmp_chk" || ! mv -f "$tmp_chk" "$pass_chk"; then
+                rm -f "$tmp_chk"
+            fi
+        else
+            rm -f "$tmp_chk"
+        fi
+    fi
+    if [ -x "$pass_chk" ] && "$pass_chk" >/dev/null 2>&1; then
+        echo "  [PASS-CONTRACT] pass architecture orchestrators, stdlib boundary, and module dependency hygiene"
+        GP_PASS[3]=$((${GP_PASS[3]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        echo "  [FAIL-CONTRACT] pass architecture orchestrators, stdlib boundary, or module dependency hygiene"
         GP_FAIL[3]=$((${GP_FAIL[3]} + 1))
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
@@ -797,7 +1107,54 @@ run_group_3() {
         run_test_in_group 3 "tests/strict_v2/import_double_colon_rejected.vri"
         run_test_in_group 3 "tests/strict_v2/double_colon_in_data_e2e.vri"
         run_test_in_group 3 "tests/strict_v2/package_toposort_cycle_e2e.vri"
+        run_test_in_group 3 "tests/strict_v2/collections_vec_consumer_e2e.vri"
         run_test_in_group 3 "tests/strict_v2/canonical_vec_facade_e2e.vri"
+        run_test_in_group 3 "tests/modules/test_flat_include.vri"
+        run_test_in_group 3 "tests/modules/test_include_only.vri"
+        run_test_in_group 3 "tests/modules/test_multi_include_positive.vri"
+        run_test_in_group 3 "tests/modules/test_multi_include_alias_compat_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_multi_include_missing_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_multi_include_over_64_missing_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_only.vri"
+        run_test_in_group 3 "tests/modules/test_import_no_export_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_unexported_symbol_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_preceding_include_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_export_kinds_positive.vri"
+        run_test_in_group 3 "tests/modules/import_entity_methods/registered.vri"
+        run_test_in_group 3 "tests/modules/import_entity_methods/direct_path.vri"
+        run_test_in_group 3 "tests/modules/import_entity_methods/include_control.vri"
+        run_test_in_group 3 "tests/modules/import_entity_methods/unexported_rejected.vri"
+        run_test_in_group 3 "tests/strict_v2/entity_method_dotted_end_rejected.vri"
+        run_test_in_group 3 "tests/strict_v2/top_level_method_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_alias_positive.vri"
+        run_test_in_group 3 "tests/modules/test_import_repeated_alias_positive.vri"
+        run_test_in_group 3 "tests/modules/test_import_missing_symbol_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_direct_path_private_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_repeated_private_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_nested_dependency_positive.vri"
+        run_test_in_group 3 "tests/modules/test_import_nested_private_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_nested_include_private_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_diamond_dedup.vri"
+        run_test_in_group 3 "tests/modules/test_flat_diamond.vri"
+        run_test_in_group 3 "tests/modules/nested_registry_positive/entry.vri"
+        run_test_in_group 3 "tests/modules/registry_duplicate/duplicate_rejected.vri"
+        run_test_in_group 3 "tests/modules/registry_malformed/malformed_rejected.vri"
+        run_test_in_group 3 "tests/modules/registry_missing/missing_rejected.vri"
+        run_test_in_group 3 "tests/modules/registry_prefix_collision/prefix_collision_rejected.vri"
+        run_test_in_group 3 "tests/modules/registry_cross_file_duplicate/cross_file_duplicate_rejected.vri"
+        run_test_in_group 3 "tests/modules/registry_stdlib_collision/stdlib_collision_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_import_positive.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_import_alias_positive.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_import_collision_positive.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_import_unqualified_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_import_private_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_export_kinds_positive.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_private_const_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_private_enum_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_private_entity_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_shadowing_e2e.vri"
+        run_test_in_group 3 "tests/modules/test_mixed_include_import_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_include_duplicate_decl_rejected.vri"
     else
         run_test_in_group 3 "tests/bootstrap_codegen/cg_include_basic.vri"
         run_test_in_group 3 "tests/bootstrap_codegen/cg_include_nested.vri"
@@ -807,10 +1164,57 @@ run_group_3() {
         run_test_in_group 3 "tests/strict_v2/import_double_colon_rejected.vri"
         run_test_in_group 3 "tests/strict_v2/double_colon_in_data_e2e.vri"
         run_test_in_group 3 "tests/strict_v2/package_toposort_cycle_e2e.vri"
+        run_test_in_group 3 "tests/strict_v2/collections_vec_consumer_e2e.vri"
         run_test_in_group 3 "tests/strict_v2/canonical_vec_facade_e2e.vri"
         run_test_in_group 3 "tests/test_module_system.vri"
         run_test_in_group 3 "tests/test_vir_pkg_native.vri"
         run_test_in_group 3 "tests/vri/test_expose.vri"
+        run_test_in_group 3 "tests/modules/test_flat_include.vri"
+        run_test_in_group 3 "tests/modules/test_include_only.vri"
+        run_test_in_group 3 "tests/modules/test_multi_include_positive.vri"
+        run_test_in_group 3 "tests/modules/test_multi_include_alias_compat_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_multi_include_missing_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_multi_include_over_64_missing_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_only.vri"
+        run_test_in_group 3 "tests/modules/test_import_no_export_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_unexported_symbol_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_preceding_include_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_export_kinds_positive.vri"
+        run_test_in_group 3 "tests/modules/import_entity_methods/registered.vri"
+        run_test_in_group 3 "tests/modules/import_entity_methods/direct_path.vri"
+        run_test_in_group 3 "tests/modules/import_entity_methods/include_control.vri"
+        run_test_in_group 3 "tests/modules/import_entity_methods/unexported_rejected.vri"
+        run_test_in_group 3 "tests/strict_v2/entity_method_dotted_end_rejected.vri"
+        run_test_in_group 3 "tests/strict_v2/top_level_method_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_alias_positive.vri"
+        run_test_in_group 3 "tests/modules/test_import_repeated_alias_positive.vri"
+        run_test_in_group 3 "tests/modules/test_import_missing_symbol_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_direct_path_private_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_repeated_private_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_nested_dependency_positive.vri"
+        run_test_in_group 3 "tests/modules/test_import_nested_private_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_import_nested_include_private_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_diamond_dedup.vri"
+        run_test_in_group 3 "tests/modules/test_flat_diamond.vri"
+        run_test_in_group 3 "tests/modules/nested_registry_positive/entry.vri"
+        run_test_in_group 3 "tests/modules/registry_duplicate/duplicate_rejected.vri"
+        run_test_in_group 3 "tests/modules/registry_malformed/malformed_rejected.vri"
+        run_test_in_group 3 "tests/modules/registry_missing/missing_rejected.vri"
+        run_test_in_group 3 "tests/modules/registry_prefix_collision/prefix_collision_rejected.vri"
+        run_test_in_group 3 "tests/modules/registry_cross_file_duplicate/cross_file_duplicate_rejected.vri"
+        run_test_in_group 3 "tests/modules/registry_stdlib_collision/stdlib_collision_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_import_positive.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_import_alias_positive.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_import_collision_positive.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_import_unqualified_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_import_private_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_export_kinds_positive.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_private_const_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_private_enum_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_private_entity_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_whole_module_shadowing_e2e.vri"
+        run_test_in_group 3 "tests/modules/test_mixed_include_import_rejected.vri"
+        run_test_in_group 3 "tests/modules/test_include_duplicate_decl_rejected.vri"
     fi
     local pass_cnt=${GP_PASS[3]}
     local fail_cnt=${GP_FAIL[3]}
@@ -823,10 +1227,28 @@ run_group_4() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm  4: Kiểu dữ liệu (Primitives, Casts, Nil-safety)"
     echo "──────────────────────────────────────────────────────────────────────────"
-    if VIRC="$VIRC" python3 tests/test_f32_f64_print.py; then
+    local float_runner="./bin/f32-f64-test"
+    local float_src="tests/codegen/f32_f64_test.vri"
+    if [ ! -x "$float_runner" ] || [ "$float_src" -nt "$float_runner" ]; then
+        rm -f "$float_runner"
+        mkdir -p bin
+        local tmp_float="bin/.f32-f64-test.tmp.$$"
+        rm -f "$tmp_float"
+        if "$BOOTSTRAP_VIRC" "$float_src" -o "$tmp_float" >/dev/null 2>&1 && [ -f "$tmp_float" ]; then
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$tmp_float" >/dev/null 2>&1 || true; fi
+            if ! chmod +x "$tmp_float" || ! mv -f "$tmp_float" "$float_runner"; then
+                rm -f "$tmp_float"
+            fi
+        else
+            rm -f "$tmp_float"
+        fi
+    fi
+    if [ -x "$float_runner" ] && "$float_runner" --virc "$VIRC" >/dev/null 2>&1; then
+        echo "  [PASS-CONTRACT] Floating-point printing and cast verification"
         GP_PASS[4]=$((${GP_PASS[4]} + 1))
         TOTAL_PASS=$((TOTAL_PASS + 1))
     else
+        echo "  [FAIL-CONTRACT] Floating-point printing and cast verification"
         GP_FAIL[4]=$((${GP_FAIL[4]} + 1))
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
@@ -987,10 +1409,28 @@ run_group_6() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm  6: Hàm (Functions, out, Recursion, TCO)"
     echo "──────────────────────────────────────────────────────────────────────────"
-    if VIRC="$VIRC" python3 -m unittest tests/test_opt_tail_call.py; then
+    local tco_runner="./bin/tail-call-test"
+    local tco_src="tests/opt/tail_call_test.vri"
+    if [ ! -x "$tco_runner" ] || [ "$tco_src" -nt "$tco_runner" ]; then
+        rm -f "$tco_runner"
+        mkdir -p bin
+        local tmp_tco="bin/.tail-call-test.tmp.$$"
+        rm -f "$tmp_tco"
+        if "$BOOTSTRAP_VIRC" "$tco_src" -o "$tmp_tco" >/dev/null 2>&1 && [ -f "$tmp_tco" ]; then
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$tmp_tco" >/dev/null 2>&1 || true; fi
+            if ! chmod +x "$tmp_tco" || ! mv -f "$tmp_tco" "$tco_runner"; then
+                rm -f "$tmp_tco"
+            fi
+        else
+            rm -f "$tmp_tco"
+        fi
+    fi
+    if [ -x "$tco_runner" ] && "$tco_runner" --virc "$VIRC" >/dev/null 2>&1; then
+        echo "  [PASS-CONTRACT] LIR Tail-Call Optimization contract and stack boundaries"
         GP_PASS[6]=$((${GP_PASS[6]} + 1))
         TOTAL_PASS=$((TOTAL_PASS + 1))
     else
+        echo "  [FAIL-CONTRACT] LIR Tail-Call Optimization contract or stack boundaries"
         GP_FAIL[6]=$((${GP_FAIL[6]} + 1))
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
@@ -1247,6 +1687,15 @@ run_group_10() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm 10: Toán tử (Arithmetic, Bitwise, Logic, mod)"
     echo "──────────────────────────────────────────────────────────────────────────"
+    if VIRC="$VIRC" tests/test_noncanonical_syntax_contract.sh >/dev/null 2>&1; then
+        echo "  [PASS-CONTRACT] Noncanonical syntax diagnostics and repository source guard"
+        GP_PASS[10]=$((${GP_PASS[10]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        echo "  [FAIL-CONTRACT] Noncanonical syntax diagnostics or repository source guard"
+        GP_FAIL[10]=$((${GP_FAIL[10]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
     if [ "$MODE" = "min" ]; then
         run_test_in_group 10 "tests/test_adv_002_overflow.vri"
         run_test_in_group 10 "tests/test_adv_004_bitwise.vri"
@@ -1266,6 +1715,16 @@ run_group_10() {
         run_test_in_group 10 "tests/strict_v2/power_double_operator_rejected.vri"
         run_test_in_group 10 "tests/strict_v2/power_unary_minus_missing_operand_rejected.vri"
         run_test_in_group 10 "tests/strict_v2/power_negative_const_e2e.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_return_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_while_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_logical_and_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_bit_or_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_prefix_tilde_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_shift_left_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_shift_left_assign_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_shift_right_assign_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/canonical_operator_spellings_e2e.vri"
+        run_test_in_group 10 "tests/strict_v2/canonical_swizzle_e2e.vri"
     else
         run_test_in_group 10 "tests/test_adv_002_overflow.vri"
         run_test_in_group 10 "tests/test_adv_004_bitwise.vri"
@@ -1293,6 +1752,16 @@ run_group_10() {
         run_test_in_group 10 "tests/strict_v2/power_double_operator_rejected.vri"
         run_test_in_group 10 "tests/strict_v2/power_unary_minus_missing_operand_rejected.vri"
         run_test_in_group 10 "tests/strict_v2/power_negative_const_e2e.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_return_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_while_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_logical_and_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_bit_or_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_prefix_tilde_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_shift_left_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_shift_left_assign_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/noncanonical_shift_right_assign_rejected.vri"
+        run_test_in_group 10 "tests/strict_v2/canonical_operator_spellings_e2e.vri"
+        run_test_in_group 10 "tests/strict_v2/canonical_swizzle_e2e.vri"
         run_test_in_group 10 "tests/vri/test_adv_002_overflow.vri"
         run_test_in_group 10 "tests/vri/test_adv_004_bitwise.vri"
         run_test_in_group 10 "tests/vri/test_adv_005_shift.vri"
@@ -1332,6 +1801,12 @@ run_group_11() {
     if [ "$MODE" = "min" ]; then
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_method_shadow_wrong_arity_no_fallback_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_method_shadow_wrong_type_no_fallback_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_shadow_wrong_arity_no_fallback_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_shadow_wrong_type_no_fallback_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_noncallable_field_free_fallback_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_direct_free_call_bypasses_method_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_wrong_type_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_unresolved_receiver_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_entity_receiver_type_mismatch_rejected.vri"
@@ -1339,8 +1814,6 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_url_parse_positive_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/enum_constructor_for_case_out_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_x86_fn_ptr_spill_e2e.vri"
-        run_test_in_group 11 "tests/strict_v2/type_receiver_instance_method_rejected.vri"
-        run_test_in_group 11 "tests/strict_v2/type_receiver_generic_missing_args_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_receiver_forms_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_eval_order_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_cross_type_chain_e2e.vri"
@@ -1351,9 +1824,31 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_module_root_collision_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_module_order_ab_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_module_order_ba_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_method_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_multi_param_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_free_ufcs_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_free_ufcs_multi_arg_infer_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_callable_field_priority_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_declaration_order_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_ownership_move_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_nested_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_vec_model_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_method_chain_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_type_mismatch_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_failed_infer_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_no_candidate_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_private_module_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/type_receiver_instance_method_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/type_receiver_generic_missing_args_rejected.vri"
     else
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_wrong_type_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_method_shadow_wrong_arity_no_fallback_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_method_shadow_wrong_type_no_fallback_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_shadow_wrong_arity_no_fallback_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_callable_field_shadow_wrong_type_no_fallback_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_noncallable_field_free_fallback_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/ufcs_direct_free_call_bypasses_method_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_free_arg_wrong_type_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_unresolved_receiver_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_entity_receiver_type_mismatch_rejected.vri"
@@ -1374,8 +1869,6 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_too_many_args_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_wrong_arity_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_wrong_type_rejected.vri"
-        run_test_in_group 11 "tests/strict_v2/type_receiver_instance_method_rejected.vri"
-        run_test_in_group 11 "tests/strict_v2/type_receiver_generic_missing_args_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_receiver_forms_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_eval_order_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_cross_type_chain_e2e.vri"
@@ -1395,9 +1888,45 @@ run_group_11() {
         run_test_in_group 11 "tests/strict_v2/ufcs_module_root_collision_e2e.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_module_order_ab_rejected.vri"
         run_test_in_group 11 "tests/strict_v2/ufcs_module_order_ba_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_method_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_method_param_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_multi_param_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_free_ufcs_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_free_ufcs_multi_arg_infer_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_callable_field_priority_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_declaration_order_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_ownership_move_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_nested_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_vec_model_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_method_chain_e2e.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_type_mismatch_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_failed_infer_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_no_candidate_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_private_module_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_specialization_failure_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_ambiguous_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/generic_receiver_use_after_move_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/type_receiver_instance_method_rejected.vri"
+        run_test_in_group 11 "tests/strict_v2/type_receiver_generic_missing_args_rejected.vri"
         run_test_in_group 11 "tests/vri/test_ufcs.vri"
     fi
-    if VIRC="$VIRC" python3 tests/test_source_map_spans.py; then
+    local span_runner="./bin/source-map-test"
+    local span_src="tests/debug/source_map_test.vri"
+    if [ ! -x "$span_runner" ] || [ "$span_src" -nt "$span_runner" ]; then
+        rm -f "$span_runner"
+        mkdir -p bin
+        local tmp_span="bin/.source-map-test.tmp.$$"
+        rm -f "$tmp_span"
+        if "$BOOTSTRAP_VIRC" "$span_src" -o "$tmp_span" >/dev/null 2>&1 && [ -f "$tmp_span" ]; then
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$tmp_span" >/dev/null 2>&1 || true; fi
+            if ! chmod +x "$tmp_span" || ! mv -f "$tmp_span" "$span_runner"; then
+                rm -f "$tmp_span"
+            fi
+        else
+            rm -f "$tmp_span"
+        fi
+    fi
+    if [ -x "$span_runner" ] && "$span_runner" --virc "$VIRC" >/dev/null 2>&1; then
         echo "  [PASS-CONTRACT] UFCS/include/import source spans and one-line mutation oracle"
         GP_PASS[11]=$((${GP_PASS[11]} + 1))
         TOTAL_PASS=$((TOTAL_PASS + 1))
@@ -1591,6 +2120,12 @@ run_group_15() {
         run_test_in_group 15 "tests/vri/test_syscall.vri"
         run_test_in_group 15 "tests/test_bind.vri"
     fi
+    run_contract_suite_in_group 15 \
+        "FFI semantic, native ABI, asm no-opt, and Wasm import contracts" \
+        "tests/spec_gap_contract/manifest.tsv" \
+        "tests/spec_gap_contract" \
+        "macos-arm64" \
+        '| FFI $- @0!3 |'
     local pass_cnt=${GP_PASS[15]}
     local fail_cnt=${GP_FAIL[15]}
     local total_cnt=$((pass_cnt + fail_cnt))
@@ -1602,15 +2137,37 @@ run_group_16() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm 16: Register & Mold (Bit structures, pack)"
     echo "──────────────────────────────────────────────────────────────────────────"
-    if VIRC="$VIRC" python3 tests/test_narrow_cast_contract.py; then
+    local narrow_runner="./bin/narrow-cast-test"
+    local narrow_src="tests/types/narrow_cast_test.vri"
+    if [ ! -x "$narrow_runner" ] || [ "$narrow_src" -nt "$narrow_runner" ]; then
+        rm -f "$narrow_runner"
+        mkdir -p bin
+        local tmp_narrow="bin/.narrow-cast-test.tmp.$$"
+        rm -f "$tmp_narrow"
+        if "$BOOTSTRAP_VIRC" "$narrow_src" -o "$tmp_narrow" >/dev/null 2>&1 && [ -f "$tmp_narrow" ]; then
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$tmp_narrow" >/dev/null 2>&1 || true; fi
+            if ! chmod +x "$tmp_narrow" || ! mv -f "$tmp_narrow" "$narrow_runner"; then
+                rm -f "$tmp_narrow"
+            fi
+        else
+            rm -f "$tmp_narrow"
+        fi
+    fi
+    if [ -x "$narrow_runner" ] && "$narrow_runner" --virc "$VIRC" >/dev/null 2>&1; then
+        echo "  [PASS-CONTRACT] Mold narrow cast contract across -O0..-O3 and multi-target"
         GP_PASS[16]=$((${GP_PASS[16]} + 1))
         TOTAL_PASS=$((TOTAL_PASS + 1))
     else
+        echo "  [FAIL-CONTRACT] Mold narrow cast contract across -O0..-O3 or multi-target"
         GP_FAIL[16]=$((${GP_FAIL[16]} + 1))
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
     if [ "$MODE" = "min" ]; then
         run_test_in_group 16 "tests/test_register.vri"
+        run_test_in_group 16 "tests/strict_v2/volatile_widths_e2e.vri"
+        run_test_in_group 16 "tests/strict_v2/register_scoped_collision_e2e.vri"
+        run_test_in_group 16 "tests/strict_v2/register_entity_isolation_e2e.vri"
+        run_test_in_group 16 "tests/strict_v2/register_x86_e2e.vri"
         run_test_in_group 16 "tests/strict_v2/mold_packed_e2e.vri"
         run_test_in_group 16 "tests/strict_v2/mold_zero_width_rejected.vri"
         run_test_in_group 16 "tests/strict_v2/mold_width_overflow_rejected.vri"
@@ -1633,6 +2190,10 @@ run_group_16() {
         run_test_in_group 16 "tests/test_narrow_cast_flow.vri"
     else
         run_test_in_group 16 "tests/test_register.vri"
+        run_test_in_group 16 "tests/strict_v2/volatile_widths_e2e.vri"
+        run_test_in_group 16 "tests/strict_v2/register_scoped_collision_e2e.vri"
+        run_test_in_group 16 "tests/strict_v2/register_entity_isolation_e2e.vri"
+        run_test_in_group 16 "tests/strict_v2/register_x86_e2e.vri"
         run_test_in_group 16 "tests/strict_v2/mold_packed_e2e.vri"
         run_test_in_group 16 "tests/strict_v2/mold_zero_width_rejected.vri"
         run_test_in_group 16 "tests/strict_v2/mold_width_overflow_rejected.vri"
@@ -1654,6 +2215,7 @@ run_group_16() {
         run_test_in_group 16 "tests/test_narrow_casts.vri"
         run_test_in_group 16 "tests/test_narrow_cast_flow.vri"
     fi
+    run_register_opt_and_target_matrix
     local pass_cnt=${GP_PASS[16]}
     local fail_cnt=${GP_FAIL[16]}
     local total_cnt=$((pass_cnt + fail_cnt))
@@ -1691,10 +2253,28 @@ run_group_18() {
     echo "──────────────────────────────────────────────────────────────────────────"
     echo "► Nhóm 18: Điểm nhập (@entry, main, CLI args)"
     echo "──────────────────────────────────────────────────────────────────────────"
-    if python3 tests/cli_contract/runner.py --virc "$VIRC"; then
+    local cli_runner="./bin/cli-contract-test"
+    local cli_src="tests/cli_contract/cli_contract_test.vri"
+    if [ ! -x "$cli_runner" ] || [ "$cli_src" -nt "$cli_runner" ]; then
+        rm -f "$cli_runner"
+        mkdir -p bin
+        local tmp_cli="bin/.cli-contract-test.tmp.$$"
+        rm -f "$tmp_cli"
+        if "$BOOTSTRAP_VIRC" "$cli_src" -o "$tmp_cli" >/dev/null 2>&1 && [ -f "$tmp_cli" ]; then
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$tmp_cli" >/dev/null 2>&1 || true; fi
+            if ! chmod +x "$tmp_cli" || ! mv -f "$tmp_cli" "$cli_runner"; then
+                rm -f "$tmp_cli"
+            fi
+        else
+            rm -f "$tmp_cli"
+        fi
+    fi
+    if [ -x "$cli_runner" ] && "$cli_runner" --virc "$VIRC" >/dev/null 2>&1; then
+        echo "  [PASS-CONTRACT] CLI args, flags, machine json, and compiler driver contract"
         GP_PASS[18]=$((${GP_PASS[18]} + 1))
         TOTAL_PASS=$((TOTAL_PASS + 1))
     else
+        echo "  [FAIL-CONTRACT] CLI args, flags, machine json, or compiler driver contract"
         GP_FAIL[18]=$((${GP_FAIL[18]} + 1))
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
@@ -1985,7 +2565,17 @@ run_group_26() {
         run_test_in_group 26 "tests/strict_v2/fma_tensor_e2e.vri"
         run_test_in_group 26 "tests/strict_v2/fma_float_rectangular_e2e.vri"
         run_test_in_group 26 "tests/strict_v2/test_autodiff_e2e.vri"
+        run_test_in_group 26 "tests/strict_v2/test_autodiff_aot_graph.vri"
+        run_test_in_group 26 "tests/strict_v2/autodiff_dynamic_control_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/autodiff_grad_before_backward_negative.vri"
+        run_test_in_group 26 "tests/strict_v2/autodiff_unsupported_dtype_negative.vri"
         run_test_in_group 26 "tests/strict_v2/test_quantize_e2e.vri"
+        run_test_in_group 26 "tests/strict_v2/test_quantize_f16_input.vri"
+        run_test_in_group 26 "tests/strict_v2/test_quantize_f16_infer.vri"
+        run_test_in_group 26 "tests/strict_v2/test_quantize_all_widths_infer.vri"
+        run_test_in_group 26 "tests/strict_v2/test_quantize_edge_policy.vri"
+        run_test_in_group 26 "tests/strict_v2/quantize_nan_integer_trap_e2e.vri"
+        run_test_in_group 26 "tests/strict_v2/quantize_infinity_integer_trap_e2e.vri"
         run_test_in_group 26 "tests/strict_v2/quantize_frontend_positive.vri"
         run_test_in_group 26 "tests/strict_v2/test_float_matmul_e2e.vri"
         run_test_in_group 26 "tests/strict_v2/backward_outside_train_negative.vri"
@@ -2048,6 +2638,32 @@ run_group_27() {
         "tests/memory_contract/manifest.tsv" \
         "tests/memory_contract" \
         "${MEMORY_CONTRACT_TARGET:-macos-arm64}"
+
+    local perf_runner="./bin/perf-scaling-test"
+    local perf_src="tests/perf_contract/scaling_test.vri"
+    if [ ! -x "$perf_runner" ] || [ "$perf_src" -nt "$perf_runner" ]; then
+        rm -f "$perf_runner"
+        mkdir -p bin
+        local tmp_perf="bin/.perf-scaling-test.tmp.$$"
+        rm -f "$tmp_perf"
+        if "$BOOTSTRAP_VIRC" "$perf_src" -o "$tmp_perf" >/dev/null 2>&1 && [ -f "$tmp_perf" ]; then
+            if [ "$(uname -s)" = "Darwin" ]; then codesign -s - -f "$tmp_perf" >/dev/null 2>&1 || true; fi
+            if ! chmod +x "$tmp_perf" || ! mv -f "$tmp_perf" "$perf_runner"; then
+                rm -f "$tmp_perf"
+            fi
+        else
+            rm -f "$tmp_perf"
+        fi
+    fi
+    if [ -x "$perf_runner" ] && "$perf_runner" --virc "$VIRC" >/dev/null 2>&1; then
+        echo "  [PASS-CONTRACT] Performance scaling & arena throughput contracts"
+        GP_PASS[27]=$((${GP_PASS[27]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        echo "  [FAIL-CONTRACT] Performance scaling & arena throughput contracts"
+        GP_FAIL[27]=$((${GP_FAIL[27]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
     local pass_cnt=${GP_PASS[27]}
     local fail_cnt=${GP_FAIL[27]}
     local total_cnt=$((pass_cnt + fail_cnt))
@@ -2075,6 +2691,15 @@ run_group_28() {
         run_test_in_group 28 "tests/strict_v2/test_virgex_lexer_parser.vri"
         run_test_in_group 28 "tests/strict_v2/test_virgex_e2e_compiler.vri"
         run_test_in_group 28 "tests/strict_v2/test_virgex_multilingual_integration.vri"
+    fi
+    if tests/test_vps_parser_full_consumption.sh >/dev/null 2>&1; then
+        echo "  [PASS-CONTRACT] VPS full-token consumption and valid-form preservation"
+        GP_PASS[28]=$((${GP_PASS[28]} + 1))
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        echo "  [FAIL-CONTRACT] VPS full-token consumption and valid-form preservation"
+        GP_FAIL[28]=$((${GP_FAIL[28]} + 1))
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
     local pass_cnt=${GP_PASS[28]}
     local fail_cnt=${GP_FAIL[28]}

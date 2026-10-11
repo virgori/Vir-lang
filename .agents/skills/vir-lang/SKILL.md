@@ -3,8 +3,9 @@ name: vir-lang
 description: >-
   Mandatory router for every Vir, Virgori, virc, Viron, or .vri task. Use it
   before writing, reviewing, explaining, testing, or restructuring Vir code;
-  it selects the syntax, clean-code, memory, and module/stdlib companion skills
-  and requires claims to be verified against active Vir specifications and code.
+  it selects the syntax, clean-code, memory, module/stdlib, and native
+  verification companion skills and requires claims to be verified against
+  active Vir specifications and code.
 ---
 
 # Vir language router
@@ -26,9 +27,10 @@ may change.
 | Ownership, borrows, moves, lifetime, escape, allocation, `arena:`, cleanup, or memory-sensitive backend work | `vir-memory-management` |
 | `include`, `import`, `export`, stdlib APIs, module identity, or file moves | `vir-stdlib-modules` |
 | Creating, editing, auditing, or diagnosing `module.list` | `vir-module-list` and `vir-stdlib-modules` |
+| Running Vir tests, contract manifests, LSP suites, module/pass checks, performance gates, or replacing Python verification harnesses | `vir-native-verification` |
 | Compiler internals | All companions relevant to the changed semantics; also inspect `compiler/module.list` and canonical/generated provenance |
 
-A task may require all four companions. Do not suppress a companion merely
+A task may require multiple companions. Do not suppress a companion merely
 because another one also applies.
 
 ## Authority order
@@ -36,7 +38,10 @@ because another one also applies.
 Use the narrowest current authoritative source:
 
 1. Normative language: `papers/VIR/specs/VIR-SPC-0018_*` and
-   `VIR-SPC-0017_*`, with focused `VIR-SPC-0010` through `VIR-SPC-0016`.
+   `VIR-SPC-0017_*`, with focused specifications for the construct in scope.
+   Entity/method work requires `VIR-SPC-0022`; member-call or UFCS work
+   requires `VIR-SPC-0023`. Do not stop at the older `VIR-SPC-0010` through
+   `VIR-SPC-0016` series when a newer focused paper exists.
 2. Memory architecture: `papers/VIR/specs/VIR-SPC-0005_*` and allocator
    contracts under `papers/STLB/specs/`.
 3. Modules and public APIs: active `module.list`, `stdlib/stdlib.vri`, actual
@@ -66,12 +71,16 @@ Before emitting or changing Vir code:
 ## Base anti-hallucination rules
 
 - Source files use `.vri`.
-- Definitions use `func`, `entity`, `enum`, and close with `end.`.
+- Top-level definitions use `func`, `entity`, `enum`, and close with `end.`.
+- `method` is never a top-level declaration: it is lexically owned by an
+  `entity`, receives implicit `this`, and closes with `end`; the owning entity
+  closes with `end.`. Standalone receiver operations use `func`, not `method`
+  or an invented `extend` block.
 - Statement/control blocks close with `end`.
 - `if condition do`, `when condition loop`, `for item in values do`.
 - Use `eif`, `skip`, and `out`; never substitute `elif`, `continue`, or
   `return`.
-- Use `include` / `import ... from` / `import from ...` / `export`; never invent
+- Use `include` / `import module` / `import ... from module` / `export`; never invent
   Rust `use`, Go imports, or `A::B` paths. `get` is an ordinary identifier, not
   a standalone module directive.
 - Prefer registered dotted Module IDs. Direct `.vri` paths are supported
@@ -79,6 +88,36 @@ Before emitting or changing Vir code:
 - Boolean logic is `&`, `||`, `!`; bitwise operations use Vir word operators.
 - Ordinary generics use `of (...)`; do not generate `Name<T>`.
 - Do not invent a `saga` keyword. Compensation uses `try` / `revert`.
+- Do not infer member-call resolution from spelling alone. For `x.foo(args)`,
+  follow `VIR-SPC-0023`: entity method, then structural callable field, then
+  eligible free-function UFCS. A selected method/callable field fails
+  terminally on an invalid call; a non-callable field does not block free
+  UFCS. Use `foo(x, args)` to explicitly select the free function.
+
+## Compiler hard-limit prohibition
+
+Compiler code MUST NOT impose an arbitrary hard-coded ceiling on otherwise
+valid source programs, semantic graphs, runtime values, or tooling results.
+Examples include fixed maxima for tokens, AST nodes, symbols, scopes, modules,
+imports, exports, declarations, functions, fields, locals, diagnostics, IDE
+facts, completion items, container entries, or generated output. An internal
+buffer capacity MUST NOT become a language limit, cause silent truncation,
+trigger an unclassified process exit, or reject a valid program merely because
+the implementation reached that capacity.
+
+Use growable storage, exact/two-pass sizing, checked allocation, streaming, or
+a limit derived from an authoritative SPEC, target ABI, object format,
+instruction encoding, hardware property, or explicit user configuration. A
+true external limit is not arbitrary, but its source MUST be named in code and
+overflow MUST fail with a stable, source-located diagnostic when possible.
+Performance guards and denial-of-service budgets belong in explicit
+configuration/policy; they MUST NOT be disguised as semantic constants.
+
+When editing an affected path, audit nearby fixed-size allocations and bounded
+loops. If an existing arbitrary ceiling is encountered, fix it within scope or
+record it as a verified ISSUE; do not preserve it as precedent. Regression
+coverage MUST exercise growth beyond the former/default capacity and prove no
+truncation, overwrite, magic exit code, or capacity-dependent semantic change.
 
 ## Compiler version completion gate
 

@@ -3,11 +3,11 @@ id: "VIRC-ISS-0047"
 type: "ISSUE"
 domain: "VIRC"
 title: "Cross-registry collision diagnostics lose module identity and registry provenance"
-status: "OPEN"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-06"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "compiler"
   - "frontend"
@@ -21,8 +21,10 @@ related:
   issues:
     - "VIR-ISS-0008"
     - "VIRC-ISS-0043"
-  plans: []
-  reports: []
+  plans:
+    - "VIRC-PLN-0042"
+  reports:
+    - "VIRC-RPT-0059"
 supersedes: null
 superseded_by: null
 tags:
@@ -182,23 +184,23 @@ conformance sai ở core project configuration. Priority P1 vì sysroot resolver
 
 ## 10. Acceptance Criteria
 
-- [ ] Native focused test chứng minh exact project/stdlib collision fail tại
+- [x] Native focused test chứng minh exact project/stdlib collision fail tại
   registry load dù entry không được include/import.
-- [ ] Prefix-only matrix (`http`/`http.app`, `db.sqlite`/`db.sqlite3`) pass; exact
+- [x] Prefix-only matrix (`http`/`http.app`, `db.sqlite`/`db.sqlite3`) pass; exact
   directory-alias key collision cũng fail.
-- [ ] Cross-registry diagnostic chứa canonical ID, cả registry paths, line
+- [x] Cross-registry diagnostic chứa canonical ID, cả registry paths, line
   numbers và mapping values trong classic và JSON modes.
-- [ ] Duplicate stdlib, duplicate project và cross-registry collision có đúng
+- [x] Duplicate stdlib, duplicate project và cross-registry collision có đúng
   classification cùng first/second declaration provenance.
-- [ ] Native compiler, Python graph resolver và IDE/LSP registry path agree on
+- [x] Native compiler, Python graph resolver và IDE/LSP registry path agree on
   exact-reject/prefix-allow policy and stable diagnostic identity.
-- [ ] Collision validation uses the active sysroot stdlib selected under
+- [x] Collision validation uses the active sysroot stdlib selected under
   `VIRC-ISS-0043`, không một source-tree registry tình cờ khác version.
-- [ ] Không public CLI/manifest escape hatch; test-only hooks không ảnh hưởng
+- [x] Không public CLI/manifest escape hatch; test-only hooks không ảnh hưởng
   production contract.
-- [ ] Existing missing-target, prefix-collision, alias self-load, cycle/dedup and
+- [x] Existing missing-target, prefix-collision, alias self-load, cycle/dedup and
   CWD-independence tests remain green.
-- [ ] Stage 2 == stage 3 bootstrap và accepted REPORT ghi raw diagnostics/test
+- [x] Stage 2 == stage 3 bootstrap và accepted REPORT ghi raw diagnostics/test
   matrix trước khi ISSUE đóng.
 
 ## 11. Related Papers
@@ -210,11 +212,11 @@ conformance sai ở core project configuration. Priority P1 vì sysroot resolver
 
 ### Plans
 
-- None yet.
+- `VIRC-PLN-0042` — Standardize cross-registry collision diagnostics and provenance tracking.
 
 ### Reports
 
-- None yet.
+- `VIRC-RPT-0059` — Standardize cross-registry collision diagnostics and provenance verification report.
 
 ## 12. Revision History
 
@@ -223,3 +225,8 @@ conformance sai ở core project configuration. Priority P1 vì sysroot resolver
 | 2026-10-06 | Opened from native/Python exact-collision, prefix-only and duplicate-registry probes |
 | 2026-10-06 | Linked VIR-ISS-0008 |
 | 2026-10-06 | Linked VIRC-ISS-0043 |
+| 2026-10-10 | Linked VIRC-PLN-0042 |
+| 2026-10-10 | Linked VIRC-RPT-0059 |
+| 2026-10-10 | Closed as resolved per accepted verification report VIRC-RPT-0059 |
+| 2026-10-10 | Reopened by corrective audit after mapping-value, LSP provenance and parity evidence gaps were reproduced |
+| 2026-10-10 | Re-closed after corrective implementation and all VIRC-RPT-0059 verification gates passed |

@@ -15,17 +15,20 @@ For each claim, map it to:
 Use the repository runner with an exact filter, for example:
 
 ```sh
-python3 tools/gap_contract_runner.py \
+./bin/vir-test \
   --manifest tests/memory_contract/manifest.tsv \
   --fixtures tests/memory_contract \
-  --filter 'MEM-(ESC|BOR|LOOP|CAP|CLEAN)' \
-  --opt-level=-O0
+  --virc ./bin/virc \
+  --target macos-arm64 \
+  --filter '| MEM $- BOR $- @0!3 |' \
+  --opt-level -O0
 ```
 
-Expand across affected optimization levels and targets. Include both positive
-execution and compile-fail fixtures. For allocation-elimination or watermark
-claims, inspect MIR/LIR or disassembly; successful output alone does not prove
-the intended allocation path.
+The filter is Vir Pattern Syntax (VPS/Virgex), not a Python regular expression.
+Expand it with separately verified patterns across affected optimization levels
+and targets. Include both positive execution and compile-fail fixtures. For
+allocation-elimination or watermark claims, inspect MIR/LIR or disassembly;
+successful output alone does not prove the intended allocation path.
 
 ## Claims to avoid
 

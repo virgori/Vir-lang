@@ -143,7 +143,7 @@ include crypto.rng
 | ID | Requirement |
 |---|---|
 | S1 | Secret-dependent ops avoid secret-dependent compare / branch / memory access where applicable (constant-time intent). |
-| S2 | Incomplete / unsupported security ops are **fail-closed** (`Err` / verification failure) — never fake success. |
+| S2 | Incomplete / unsupported security ops are **fail-closed** (`Failure` / verification failure) — never fake success. |
 | S3 | Keys, nonces, salts, tokens, PKCE verifiers use **`crypto.rng` only** — never `rand`. |
 | S4 | Secret ownership and lifetime are explicit; prefer clear/zeroize when ownership allows. |
 | S5 | Native backends are external trust boundaries and must be documented. |
@@ -156,7 +156,7 @@ include crypto.rng
 | ID | Requirement |
 |---|---|
 | E1 | Fallible ops return `Result` (default error [`Error`](error.md) unless stated). |
-| E2 | Stubs return `Err`, not empty/zero presented as success. |
+| E2 | Stubs return `Failure`, not empty/zero presented as success. |
 | E3 | Invalid key / nonce / tag / cert / encoding → explicit error. |
 | E4 | Native/FFI failure maps into `Result`. |
 | E5 | Verification failure distinguishable from runtime/backend failure where needed. |
@@ -203,7 +203,7 @@ Crypto does **not** bypass the Vir borrow checker.
 |---|---|---|---|
 | `crypto.hash` | **PASS** | NIST empty/abc/56-byte + double-finish | experimental |
 | `crypto.hmac` | **PASS** | RFC 4231 case 1 + verify negatives | experimental |
-| `crypto.rng` | **PASS** | `/dev/urandom` non-zero + `bytes(0)` Err | experimental |
+| `crypto.rng` | **PASS** | `/dev/urandom` non-zero + `bytes(0)` Failure | experimental |
 | `crypto.mod` | **PASS** | re-exports hash/hmac/rng only | experimental |
 | `crypto` umbrella | blocked | legacy tree | stub/legacy |
 | `crypto.subtle` | blocked | — | blocked (E2002 / `[int; N]`) |
@@ -233,9 +233,9 @@ after in-tree stubs exist and link+runtime tests pass.
 
 Rules:
 
-- backend failure → `Result.Err`
+- backend failure → `Result.Failure`
 - **never** fall back to `rand` (xoshiro)
-- buffer fully initialized before `Ok`
+- buffer fully initialized before `Success`
 
 ## Area status
 
@@ -284,7 +284,7 @@ S-box not claimed CT without audit.
 ### `crypto.ed25519` — stub / fail-closed
 
 ```text
-sign   → Err (or non-usable empty — must not look like success)
+sign   → Failure (or non-usable empty — must not look like success)
 verify → failure / false
 ```
 

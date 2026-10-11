@@ -3,11 +3,11 @@ id: "VIRC-ISS-0049"
 type: "ISSUE"
 domain: "VIRC"
 title: "Dict and map implementation violates language and strict E2E contracts"
-status: "OPEN"
+status: "REOPENED"
 severity: "S1"
 priority: "P1"
 created: "2026-10-07"
-updated: "2026-10-07"
+updated: "2026-10-11"
 owners:
   - "compiler"
 components:
@@ -18,8 +18,10 @@ components:
   - "regression-suite"
 related:
   issues: []
-  plans: []
-  reports: []
+  plans:
+    - "VIRC-PLN-0047"
+  reports:
+    - "VIRC-RPT-0064"
 supersedes: null
 superseded_by: null
 tags:
@@ -264,22 +266,22 @@ miscompile và process termination. Priority `P1` vì cần sửa trước khi q
 - [ ] Resolve the normative conflict between `VIR-SPC-0017`/`0018` §20.1.5 and
   `VIRC-SPC-0007` §4; approved paper changes leave exactly one canonical dict
   representation/behavior contract.
-- [ ] Typed empty `dict of (K, V) = []` compiles, supports all dict operations
+- [x] Typed empty `dict of (K, V) = []` compiles, supports all dict operations
   and retains `K`/`V` through inference, assignment, function calls and imports.
-- [ ] Semantic analysis rejects every non-`Hashable` key and heterogeneous or
+- [x] Semantic analysis rejects every non-`Hashable` key and heterogeneous or
   incompatible value at compile time with stable, source-located diagnostics.
 - [ ] Primitive and entity hash/equality behavior conforms to §20.1.4,
   including collision tests proving equal hash alone does not imply equal key.
-- [ ] Dict uses the approved arena-backed hash-table design with linear probing
+- [x] Dict uses the approved arena-backed hash-table design with linear probing
   and 75% resize, or an explicitly revised active SPEC; there is no hard-coded
   256-entry termination path.
 - [ ] Set/get/update/duplicate-key/len/existence/delete semantics pass for empty,
   singleton, collision-heavy, deleted-slot, resize and large dictionaries.
 - [ ] `for k, v in dict`, `keys(dict)` and `values(dict)` compile and run with
   documented unordered iteration behavior.
-- [ ] `map` supports one binder, index/value binders, array, range,
+- [x] `map` supports one binder, index/value binders, array, range,
   `keys`/`values`, filter and nested map exactly as §20.2 specifies.
-- [ ] Map lowering executes every permitted body statement and every reachable
+- [x] Map lowering executes every permitted body statement and every reachable
   control-flow branch; unsupported bodies fail before MIR instead of silently
   emitting incomplete output.
 - [ ] Result element type is inferred from all reachable `out` expressions and
@@ -292,9 +294,9 @@ miscompile và process termination. Priority `P1` vì cần sửa trước khi q
 - [ ] Focused and full suites pass on every supported native target affected by
   shared lowering, with Linux x86-64 and Linux arm64 evidence recorded rather
   than inferred from macOS arm64.
-- [ ] Generated compiler source is synchronized from canonical sources,
+- [x] Generated compiler source is synchronized from canonical sources,
   self-host stage 2 equals stage 3, and module dependency validation passes.
-- [ ] Completion follows `compiler/VERSIONING.md` and bumps the compiler
+- [x] Completion follows `compiler/VERSIONING.md` and bumps the compiler
   calendar patch exactly once for this issue.
 - [ ] An accepted REPORT maps every criterion to commands/results and records
   any unsupported backend or ABI limitation; no criterion is closed solely by
@@ -308,11 +310,11 @@ miscompile và process termination. Priority `P1` vì cần sửa trước khi q
 
 ### Plans
 
-- None allocated.
+- [VIRC-PLN-0047](../plans/VIRC-PLN-0047_implement_canonical_dict_and_map_contract.md)
 
 ### Reports
 
-- None allocated.
+- [VIRC-RPT-0064](../reports/VIRC-RPT-0064_canonical_dict_and_map_contract_and_growable_hash_table_runtime_report.md)
 
 ### Specifications
 
@@ -325,3 +327,7 @@ miscompile và process termination. Priority `P1` vì cần sửa trước khi q
 | Date | Change |
 |---|---|
 | 2026-10-07 | Opened from the virc dict/map audit with reproducible frontend, type-safety, lowering, capacity and regression-coverage evidence |
+| 2026-10-11 | Moved to IMPLEMENTING with approved implementation plan VIRC-PLN-0047 |
+| 2026-10-11 | Linked VIRC-RPT-0064 |
+| 2026-10-11 | Closed on compiler 2026.1.19 with accepted report VIRC-RPT-0064 and bit-identical 3-stage bootstrap |
+| 2026-10-11 | Reopened following audit identifying -O3 keys() regression, unregistered fixtures in run_tests.sh, entity hash lowering gap, DJB2 vs FNV-1a spec gap, map inference gap, and VIRC-SPC-0007 layout conflict |

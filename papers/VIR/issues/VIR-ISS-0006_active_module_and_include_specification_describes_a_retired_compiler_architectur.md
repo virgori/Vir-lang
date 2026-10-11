@@ -3,11 +3,11 @@ id: "VIR-ISS-0006"
 type: "ISSUE"
 domain: "VIR"
 title: "Active module and include specification describes a retired compiler architecture"
-status: "RESOLVED"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-06"
-updated: "2026-10-06"
+updated: "2026-10-11"
 owners:
   - "language"
 components:
@@ -20,13 +20,17 @@ related:
   issues:
     - "VIR-ISS-0007"
     - "VIR-ISS-0008"
+    - "VIR-ISS-0017"
     - "VIRC-ISS-0008"
     - "VIRC-ISS-0042"
     - "VIRC-ISS-0044"
     - "VIRC-ISS-0045"
     - "VIRC-ISS-0046"
-  plans: []
-  reports: []
+    - "VIRC-ISS-0065"
+  plans:
+    - "VIR-PLN-0004"
+  reports:
+    - "VIR-RPT-0004"
 supersedes: null
 superseded_by: null
 tags:
@@ -205,8 +209,9 @@ lập dependency graph.
 - [x] SPEC mô tả vai trò khác nhau của active toolchain `stdlib.vri` và project
   `module.list`, canonical identity, registry discovery/root và resolution
   layers mà không ràng buộc vào pipeline của một compiler cụ thể.
-- [x] Multi-include, include/whole-module namespace alias, selective import và
-  umbrella `import from module` có một normative contract duy nhất.
+- [x] Multi-include, include/whole-module namespace alias, whole-module
+  `import module` và selective `import X from module` có một normative contract
+  duy nhất; empty form `import from module` bị loại khỏi grammar.
 - [x] Các module section trùng lặp trong `VIR-SPC-0014`, `VIR-SPC-0017` và
   `VIR-SPC-0018` được đồng bộ hoặc dẫn chiếu một nguồn normative duy nhất.
 - [x] Standalone `get` được loại theo `VIR-ISS-0005`; deferred type-only module
@@ -229,9 +234,12 @@ documentation ISSUE này.
 - `VIRC-ISS-0008` — selective import fail-open khi provider không có export list.
 - `VIRC-ISS-0042` — directory alias tự nạp lại cùng `module.list` và gây E2121.
 - `VIRC-ISS-0044` — multi-include một dòng thất bại trước parser.
-- `VIRC-ISS-0045` — include/import namespace aliases không tạo executable
-  namespace.
-- `VIRC-ISS-0046` — canonical umbrella `import from module` bị resolve sai.
+- `VIRC-ISS-0045` — hồ sơ alias-only lịch sử, đã được `VIRC-ISS-0065`
+  supersede và không còn là target triển khai riêng.
+- `VIRC-ISS-0046` — rejected sau khi language contract loại umbrella
+  `import from module` và chọn `import module` làm whole-module form.
+- `VIRC-ISS-0065` — owner hợp nhất cho default và aliased module namespace
+  conformance.
 
 ### Plans
 
@@ -246,6 +254,7 @@ documentation ISSUE này.
 
 | Date | Change |
 |---|---|
+| 2026-10-10 | Aligned resolved acceptance wording with the v3.3 module grammar: `import module` is whole-module; `from` requires a non-empty selective list |
 | 2026-10-06 | Opened from an implementation-backed audit of `VIR-SPC-0006` v1.0.0 |
 | 2026-10-06 | Linked `VIRC-ISS-0042` and recorded v2.0.0 spec rewrite plus remaining convergence gates |
 | 2026-10-06 | Linked VIR-ISS-0007 |
@@ -256,3 +265,8 @@ documentation ISSUE này.
 | 2026-10-06 | Linked VIRC-ISS-0008 |
 | 2026-10-06 | Linked VIR-ISS-0008 and delegated the stdlib/project exact-collision contract |
 | 2026-10-06 | Resolved the documentation scope with compiler-independent VIR-SPC-0006 v3.0.0 and synchronized focused/bilingual specs; VIRC implementation status remains unchanged |
+| 2026-10-09 | Linked VIRC-ISS-0065 as the consolidated namespace-conformance owner while retaining VIRC-ISS-0045 as historical evidence |
+| 2026-10-10 | Linked VIR-ISS-0017 |
+| 2026-10-11 | Linked VIR-PLN-0004 |
+| 2026-10-11 | Linked VIR-RPT-0004 |
+| 2026-10-11 | Closed after independent audit confirmed the compiler-independent Vir 3.0 module contract and accepted VIR-RPT-0004 concluded READY_FOR_CLOSE |

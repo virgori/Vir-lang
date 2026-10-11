@@ -60,8 +60,8 @@ via [`path.new`](path.md) (F3).
 | Path helpers (`exists`…`size`) | **present** in `fs` — keep under `fs.*` |
 | `fs.isFile` / `fs.isDir` | **present** as `path_is_file` / `path_is_dir` → **move** |
 | `fs.exists` arg | today may be `string`; **contract `Path`** (F2/F3) |
-| `fs.read` payload | today `string` → target **`Ok(Buffer)`** |
-| `fs.readText` | **missing** — strict UTF-8 → `Ok(string)` |
+| `fs.read` payload | today `string` → target **`Success(Buffer)`** |
+| `fs.readText` | **missing** — strict UTF-8 → `Success(string)` |
 | `fs.write` / `append` / `writeAtomic` | path **`Path`**; data **`Slice`** (F3) |
 | `writeText` / `appendText` / `writeTextAtomic` | **missing** |
 | `fs` vs `fs.fs` | duplicate → **merge first**, then apply public API |
@@ -146,7 +146,7 @@ No implicit `Buffer → Slice` conversion in this contract.
 | Fallible filesystem op | `Result` |
 | Normal absence (where applicable) | `Option` |
 | Ordinary I/O failure | `IoError` (or existing kind) |
-| `File.read` EOF | **`Ok(0)`** — not an error |
+| `File.read` EOF | **`Success(0)`** — not an error |
 | Abort / invariant | `throw` / panic — **not** for recoverable FS errors |
 
 Do not migrate filesystem to `throw int` for ordinary failures.
@@ -538,7 +538,7 @@ Path of a readable file (not a directory).
 
 ### Returns
 
-`Result` — `Ok(Buffer)` full file bytes; `Err(…)` on failure.
+`Result` — `Success(Buffer)` full file bytes; `Failure(…)` on failure.
 
 ### Errors
 
@@ -546,14 +546,14 @@ Invalid path; cannot open; incomplete read; other `IoError` kinds as today.
 
 ### Semantics
 
-Today’s `fs.read` returns `string`; public contract **changes** to `Ok(Buffer)`.
+Today’s `fs.read` returns `string`; public contract **changes** to `Success(Buffer)`.
 Whole-file binary primitive; no UTF-8 validation.
 
 ### Example
 
 ```vir
 let r = fs.read("model.gguf")
-# Ok(Buffer) or Err(...)
+# Success(Buffer) or Failure(...)
 ```
 
 ### Status
@@ -596,12 +596,12 @@ Path of a readable text file.
 
 ### Returns
 
-`Result` — `Ok(string)` on valid UTF-8.
+`Result` — `Success(string)` on valid UTF-8.
 
 ### Errors
 
 Same I/O failures as `fs.read`. Invalid UTF-8 →
-`Err(IoError { kind: ErrorKind.InvalidData, … })` — see [`error.md`](error.md).
+`Failure(IoError { kind: ErrorKind.InvalidData, … })` — see [`error.md`](error.md).
 **No** silent `�` replacement.
 No lossy behavior on this API.
 
@@ -666,7 +666,7 @@ Pass a `Buffer` via `buffer.slice(b)` — no implicit conversion.
 
 ### Returns
 
-`Result` — `Ok` on full write; `Err(…)` on failure.
+`Result` — `Success` on full write; `Failure(…)` on failure.
 
 ### Errors
 
@@ -1177,7 +1177,7 @@ Existing measurable file.
 
 ### Returns
 
-`Result` — `Ok(int)` byte length (`0` if empty); `Err` if unreadable.
+`Result` — `Success(int)` byte length (`0` if empty); `Failure` if unreadable.
 
 ### Errors
 
@@ -1232,7 +1232,7 @@ Access mode (`Read` / `Write` / … as defined by the type).
 
 ### Returns
 
-`Result` — `Ok(File)` handle, or `Err` on failure.
+`Result` — `Success(File)` handle, or `Failure` on failure.
 
 ### Errors
 
@@ -1283,7 +1283,7 @@ Destination path.
 
 ### Returns
 
-`Result` — `Ok(File)` or `Err`.
+`Result` — `Success(File)` or `Failure`.
 
 ### Errors
 
@@ -1336,9 +1336,9 @@ Destination buffer; capacity is the maximum byte count for this call.
 
 | Outcome | Meaning |
 |---|---|
-| `Ok(n)` with `n > 0` | Read `n` bytes |
-| `Ok(0)` | Normal EOF |
-| `Err(error)` | I/O failure |
+| `Success(n)` with `n > 0` | Read `n` bytes |
+| `Success(0)` | Normal EOF |
+| `Failure(error)` | I/O failure |
 
 ### Errors
 
@@ -1394,7 +1394,7 @@ Destination; must be filled completely on success.
 
 ### Returns
 
-`Result` — `Ok` when the full buffer is filled; `Err` on failure.
+`Result` — `Success` when the full buffer is filled; `Failure` on failure.
 
 ### Errors
 
@@ -1403,7 +1403,7 @@ equivalent kind).
 
 ### Semantics
 
-Stricter than `read`: short read / early EOF is an error, not `Ok(n)`.
+Stricter than `read`: short read / early EOF is an error, not `Success(n)`.
 
 ### Example
 
@@ -1453,7 +1453,7 @@ Minimum acceptable byte count (`0 ≤ min ≤ buf` capacity).
 
 ### Returns
 
-`Result` — `Ok(n)` with `n ≥ min` on success.
+`Result` — `Success(n)` with `n ≥ min` on success.
 
 ### Errors
 
@@ -1502,7 +1502,7 @@ None (receiver `File`).
 
 ### Returns
 
-`Result` — `Ok(Buffer)` owned payload; `Err` on I/O failure.
+`Result` — `Success(Buffer)` owned payload; `Failure` on I/O failure.
 
 ### Errors
 
@@ -1517,7 +1517,7 @@ public semantic. Handle API stays binary-first; whole-file text stays on `fs.rea
 
 ```vir
 # let r = f.all()
-# Ok(Buffer)
+# Success(Buffer)
 ```
 
 ### Status
@@ -1559,7 +1559,7 @@ Source bytes.
 
 ### Returns
 
-`Result` — `Ok(n)` bytes actually written when the implementation reports a
+`Result` — `Success(n)` bytes actually written when the implementation reports a
 count. **Short write is valid** at this primitive; callers retry or use
 `writeAll`.
 
@@ -1600,7 +1600,7 @@ previous: file_write_all
 ```vir
 (f: File).writeAll(data: Slice) -> Result
 
-Must not report void-success `Ok` until **all** bytes are written (or return `Err`).
+Must not report void-success `Success` until **all** bytes are written (or return `Failure`).
 Partial writes are not success under this contract.
 ```
 
@@ -1615,7 +1615,7 @@ Full binary payload to write.
 
 ### Returns
 
-`Result` — `Ok` when all bytes are written; `Err` on failure.
+`Result` — `Success` when all bytes are written; `Failure` on failure.
 
 ### Errors
 
@@ -1675,7 +1675,7 @@ Origin for the offset (`Start` / `Current` / `End`). Canonical type home is
 
 ### Returns
 
-`Result` — `Ok(pos)` new absolute byte position from start of file; `Err` on failure.
+`Result` — `Success(pos)` new absolute byte position from start of file; `Failure` on failure.
 
 ### Errors
 
@@ -1723,7 +1723,7 @@ None (receiver `File`).
 
 ### Returns
 
-`Result` — `Ok(int)` byte length.
+`Result` — `Success(int)` byte length.
 
 ### Errors
 
@@ -1825,7 +1825,7 @@ Directory path (`Path`, not bare `string`).
 
 ### Returns
 
-Bare `Result` — `Ok()` on success.
+Bare `Result` — `Success()` on success.
 
 ### Errors
 
@@ -1865,11 +1865,11 @@ None (receiver `File`).
 
 ### Returns
 
-Bare `Result` — `Ok()` when flush succeeds.
+Bare `Result` — `Success()` when flush succeeds.
 
 ### Errors
 
-I/O flush failures as `Err`.
+I/O flush failures as `Failure`.
 
 ### Status
 

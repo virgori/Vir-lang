@@ -1,7 +1,7 @@
 ---
 module: result
 title: Result
-summary: Result of (T, E) — Ok(T) or Err(E); namespace result.*; language-level constructors.
+summary: Result of (T, E) — Success(T) or Failure(E); receiver UFCS plus Result.all.
 source:
   - name: result
     path: vir/core/result.vri
@@ -9,8 +9,9 @@ source:
     path: vir/compiler/result.vri
 status: closed
 notes: >-
-  Design closed (R1–R3). Callable HOF → planned. result.all fail-fast + ownership;
-  planned until reclaim-on-error proven. A unchanged. No .vri (Q5).
+  Design closed (R1–R3). Callable HOF → planned. Result.all fail-fast + ownership;
+  planned until reclaim-on-error proven. Canonical implementation symbols are
+  present; receiver and type dispatch still depend on compiler UFCS support.
 ---
 
 # Result
@@ -20,8 +21,8 @@ type `E`.
 
 ```text
 Result of (T, E)
-├── Ok(T)
-└── Err(E)
+├── Success(T)
+└── Failure(E)
 ```
 
 ```text
@@ -29,36 +30,37 @@ Result  ≠  throw
 Result  ≠  panic
 ```
 
-`Err(E)` is a **recoverable, value-level** error channel. `panic` / `throw`
+`Failure(E)` is a **recoverable, value-level** error channel. `panic` / `throw`
 remain for invariant violation, bounds failure, and explicit abort — as locked
 for `io` / `fs`.
 
 Constructors are **language-level** enum variants:
 
 ```vir
-Ok(value)
-Err(error)
-# Result.Ok / Result.Err when qualified
+Result.Success(value)
+Result.Failure(error)
 ```
 
 No `result.ok(…)` / `result.err(…)` constructors.
 
-Operations use namespace **`result.*`**:
+Operations use receiver UFCS; aggregation is a type operation:
 
 ```vir
-result.isOk(r)
-result.mapErr(r, f)
-result.recover(r, f)
+self.isSuccess()
+self.mapFailure(f)
+self.recover(f)
+Result.all(results)
 ```
 
-Free names (`is_ok`, `unwrap`, …) are implementation / prelude only.
+The free functions in `vir/core/result.vri` are the implementation targets for
+UFCS; they are not a second public spelling.
 
 ## Boundary
 
 | In `result` | Not in `result` |
 |---|---|
-| Ok/Err algebra + convert to Option | Constructors `result.ok` / `result.err` |
-| `mapErr` / `recover` / `error` | `Error` / `IoError` types → **error** registry *(next)* |
+| Success/Failure algebra + convert to Option | Constructors `result.ok` / `result.err` |
+| `mapFailure` / `recover` / `error` | `Error` / `IoError` types → **error** registry *(next)* |
 | `all` over `Vec` of results | `andThen` alias |
 | | `inspect` / `flatten` / `transpose` — **out** (no source; do not inflate) |
 | | Free `is_ok` / `unwrap` as public aliases |
@@ -67,9 +69,9 @@ Free names (`is_ok`, `unwrap`, …) are implementation / prelude only.
 Bridge with Option (already locked):
 
 ```text
-option.toResult(opt, error)   Option → Result
-result.toOption(r)            Result → Option  (success side)
-result.error(r)               Result → Option  (error side)
+option.toResult(opt, error)  Option → Result
+self.toOption()              Result → Option  (success side)
+self.error()                 Result → Option  (error side)
 ```
 
 Primary consumers: `fs.*`, `File.*`, `Reader` / `Writer`, and other fallible
@@ -89,40 +91,42 @@ meaning remains parameterized `Result`.
 
 | Source / previous | Canonical |
 |---|---|
-| `unwrap_or` / was `result.or` | **`result.unwrapOr`** |
-| `unwrap_or_else` | **`result.orWith`** · planned (callable) |
-| `or_else` | **`result.recover`** |
+| `unwrap_or` / was `result.or` | **`self.unwrapOr`** |
+| `unwrap_or_else` | **`self.orWith`** · planned (callable) |
+| `or_else` | **`self.recover`** |
 
 ## Decisions R1–R3 (locked)
 
 | ID | Decision |
 |---|---|
-| R1 | HOF needing callable ABI (`map` / `mapErr` / `flatMap` / `recover` / `orWith`) → **`planned`**. Stay in target design; not `stable` until ABI confirmed. Align with option O2. |
-| R2 | Keep `result.all(results: Vec of (Result of (T, E))) -> Result of (Vec of (T), E)` in target surface; impl depends on `vec` + error ownership. |
+| R1 | HOF needing callable ABI (`map` / `mapFailure` / `flatMap` / `recover` / `orWith`) → **`planned`**. Stay in target design; not `stable` until ABI confirmed. Align with option O2. |
+| R2 | Keep `Result.all(results: Vec of (Result of (T, E))) -> Result of (Vec of (T), E)` in target surface; impl depends on `vec` + error ownership. |
 | R3 | Keep `Result of (T)`, `Result of (T, E)`, and bare `Result` for void success. **Do not reopen A.** |
 
-### `result.all` semantics (locked)
+### `Result.all` semantics (locked)
 
 Fail-fast in element order:
 
-1. All `Ok` → `Ok` of collected success payloads (moved, not owning-copied).
-2. First `Err(e)` → return that `e`; do not continue.
+1. All `Success` → `Success` of collected success payloads (moved, not owning-copied).
+2. First `Failure(e)` → return that `e`; do not continue.
 
 If the implementation cannot reclaim already-processed success payloads when a
-later element fails, `result.all` remains **`planned`**. Do not mark `stable` by
+later element fails, `Result.all` remains **`planned`**. Do not mark `stable` by
 ignoring retained resources.
 
 ## Public surface (closed)
 
 
 ```text
-result
-├── isOk · isErr
-├── unwrap · unwrapErr · expect · unwrapOr
+Result
+├── Success · Failure
+└── all                                      # planned · reclaim gate (R2)
+
+self
+├── isSuccess · isFailure
+├── unwrap · unwrapFailure · expect · unwrapOr
 ├── toOption · error
-│
-├── orWith · map · mapErr · flatMap · recover   # planned · callable ABI (R1)
-└── all                                          # planned · reclaim gate (R2)
+└── orWith · map · mapFailure · flatMap · recover   # callable ABI (R1)
 ```
 
 ### Semantic families
@@ -130,28 +134,28 @@ result
 | Family | Shape |
 |---|---|
 | `unwrapOr` / `orWith` | `Result` → success `T` |
-| `map` / `mapErr` / `flatMap` / `recover` | `Result` → `Result` |
+| `map` / `mapFailure` / `flatMap` / `recover` | `Result` → `Result` |
 | `toOption` / `error` | `Result` → `Option` |
 | `all` | `Vec` of `Result` → `Result` of `Vec` |
 
 ### Extract / fallback (vs Option)
 
 ```text
-result.unwrapOr(r, default)     Ok(v) → v; Err(_) → default
-result.orWith(r, f)       Ok(v) → v; Err(e) → f(e)
+self.unwrapOr(default)  Success(v) → v; Failure(_) → default
+self.orWith(f)          Success(v) → v; Failure(e) → f(e)
 ```
 
 **Contract difference from Option:**
 
 ```text
 option.orWith : () → T      (no payload on None)
-result.orWith : E → T       (callback receives the error)
+self.orWith : E → T       (callback receives the error)
 ```
 
 ### Recovery (not value fallback)
 
 ```text
-result.recover(r, f)      Ok(v) → Ok(v); Err(e) → f(e)
+self.recover(f)         Success(v) → Success(v); Failure(e) → f(e)
 ```
 
 `f(e)` returns **`Result`**. Do not name this `orElse` — avoids clash with
@@ -160,24 +164,24 @@ value-level `or` / `orWith`.
 Three non-overlapping operations:
 
 ```text
-result.unwrapOr(r, value)       Result → T
-result.orWith(r, f)       Result → T
-result.recover(r, f)      Result → Result
+self.unwrapOr(value)    Result → T
+self.orWith(f)          Result → T
+self.recover(f)         Result → Result
 ```
 
 ### Map pair
 
 ```text
-result.map(r, f)          Ok(v) → Ok(f(v)); Err(e) → Err(e)
-result.mapErr(r, f)       Ok(v) → Ok(v);    Err(e) → Err(f(e))
+self.map(f)             Success(v) → Success(f(v)); Failure(e) → Failure(e)
+self.mapFailure(f)      Success(v) → Success(v);    Failure(e) → Failure(f(e))
 ```
 
-`mapErr` is **core** (domain remapping of I/O / low-level errors).
+`mapFailure` is **core** (domain remapping of I/O / low-level errors).
 
 ### FlatMap
 
 ```text
-result.flatMap(r, f)      Ok(v) → f(v); Err(e) → Err(e)
+self.flatMap(f)         Success(v) → f(v); Failure(e) → Failure(e)
 ```
 
 `and_then` is **not** a separate public name — merge into `flatMap` (same as
@@ -187,22 +191,22 @@ result.flatMap(r, f)      Ok(v) → f(v); Err(e) → Err(e)
 
 | Current | Public | Returns | Action |
 |---|---|---|---|
-| `Ok` / `Err` | `Ok` / `Err` | constructors | **keep** language-level |
-| `is_ok` | `result.isOk` | `bool` | **rename** |
-| `is_err` | `result.isErr` | `bool` | **rename** |
-| `unwrap` | `result.unwrap` | `T` or panic | **rename** |
-| `unwrap_err` | `result.unwrapErr` | `E` or panic | **rename** |
-| `expect` | `result.expect` | `T` or panic | **rename** |
-| `unwrap_or` | `result.unwrapOr` | `T` | **rename** |
-| `unwrap_or_else` | `result.orWith` | `T` (`f(e)`) | **rename** |
-| `map` | `result.map` | `Result` | **rename** |
-| `map_err` | `result.mapErr` | `Result` | **rename** · **core** |
-| `flat_map` | `result.flatMap` | `Result` | **rename** |
-| `and_then` | `result.flatMap` | `Result` | **merge** / remove alias |
-| `or_else` | `result.recover` | `Result` | **rename** |
-| `result_to_option` / `ok` | `result.toOption` | `Option` | **merge** → one name |
-| `err` | `result.error` | `Option` of `E` | **rename** |
-| `try_all` | `result.all` | `Result` of `Vec` | **rename** |
+| `Ok` / `Err` | `Result.Success` / `Result.Failure` | enum variants | **breaking rename** |
+| `is_ok` | `self.isSuccess` | `bool` | **rename** |
+| `is_err` | `self.isFailure` | `bool` | **rename** |
+| `unwrap` | `self.unwrap` | `T` or panic | **rename** |
+| `unwrap_err` | `self.unwrapFailure` | `E` or panic | **rename** |
+| `expect` | `self.expect` | `T` or panic | **rename** |
+| `unwrap_or` | `self.unwrapOr` | `T` | **rename** |
+| `unwrap_or_else` | `self.orWith` | `T` (`f(e)`) | **rename** |
+| `map` | `self.map` | `Result` | **rename** |
+| `map_err` | `self.mapFailure` | `Result` | **rename** · **core** |
+| `flat_map` | `self.flatMap` | `Result` | **rename** |
+| `and_then` | `self.flatMap` | `Result` | **merge** / remove alias |
+| `or_else` | `self.recover` | `Result` | **rename** |
+| `result_to_option` / `ok` | `self.toOption` | `Option` | **merge** → one name |
+| `err` | `self.error` | `Option` of `E` | **rename** |
+| `try_all` | `Result.all` | `Result` of `Vec` | **rename** |
 
 ## Not in this surface
 
@@ -217,98 +221,98 @@ inspect / inspectErr / flatten / transpose
 
 | ID | Symbol | Signature | Status |
 |---|---|---|---|
-| `result.isOk` | `result.isOk` | `result.isOk(r: Result) -> bool` | proposed |
-| `result.isErr` | `result.isErr` | `result.isErr(r: Result) -> bool` | proposed |
-| `result.unwrap` | `result.unwrap` | `result.unwrap(r: Result) -> T` | proposed |
-| `result.unwrapErr` | `result.unwrapErr` | `result.unwrapErr(r: Result) -> E` | proposed |
-| `result.expect` | `result.expect` | `result.expect(r: Result, msg: string) -> T` | proposed |
-| `result.unwrapOr` | `result.unwrapOr` | `result.unwrapOr(r: Result, default: T) -> T` | proposed |
-| `result.orWith` | `result.orWith` | `result.orWith(r: Result, f: E -> T) -> T` | planned |
-| `result.map` | `result.map` | `result.map(r: Result of (T, E), f: …) -> Result of (…)` | planned |
-| `result.mapErr` | `result.mapErr` | `result.mapErr(r: Result of (T, E), f: …) -> Result of (…)` | planned |
-| `result.flatMap` | `result.flatMap` | `result.flatMap(r: Result of (T, E), f: …) -> Result of (…)` | planned |
-| `result.recover` | `result.recover` | `result.recover(r: Result of (T, E), f: …) -> Result of (…)` | planned |
-| `result.toOption` | `result.toOption` | `result.toOption(r: Result of (T, E)) -> Option of (T)` | proposed |
-| `result.error` | `result.error` | `result.error(r: Result of (T, E)) -> Option of (E)` | proposed |
-| `result.all` | `result.all` | `result.all(results: Vec of (Result of (T, E))) -> Result of (Vec of (T), E)` | planned |
+| `result.isSuccess` | `self.isSuccess` | `self.isSuccess() -> bool` | proposed |
+| `result.isFailure` | `self.isFailure` | `self.isFailure() -> bool` | proposed |
+| `result.unwrap` | `self.unwrap` | `self.unwrap() -> T` | proposed |
+| `result.unwrapFailure` | `self.unwrapFailure` | `self.unwrapFailure() -> E` | proposed |
+| `result.expect` | `self.expect` | `self.expect(msg: string) -> T` | proposed |
+| `result.unwrapOr` | `self.unwrapOr` | `self.unwrapOr(default: T) -> T` | proposed |
+| `result.orWith` | `self.orWith` | `self.orWith(f: E -> T) -> T` | planned |
+| `result.map` | `self.map` | `self.map(f: …) -> Result of (…)` | planned |
+| `result.mapFailure` | `self.mapFailure` | `self.mapFailure(f: …) -> Result of (…)` | planned |
+| `result.flatMap` | `self.flatMap` | `self.flatMap(f: …) -> Result of (…)` | planned |
+| `result.recover` | `self.recover` | `self.recover(f: …) -> Result of (…)` | planned |
+| `result.toOption` | `self.toOption` | `self.toOption() -> Option of (T)` | proposed |
+| `result.error` | `self.error` | `self.error() -> Option of (E)` | proposed |
+| `result.all` | `Result.all` | `Result.all(results: Vec of (Result of (T, E))) -> Result of (Vec of (T), E)` | planned |
 
 ---
 
-<a id="result.isOk"></a>
-## `result.isOk`
+<a id="result.isSuccess"></a>
+## `self.isSuccess`
 
 <!--
-id: result.isOk
-api: result.isOk
+id: result.isSuccess
+api: self.isSuccess
 previous: is_ok
 -->
 
 ```vir
-result.isOk(r: Result) -> bool
+self.isSuccess() -> bool
 ```
 
-`true` iff `r` is `Ok(_)`.
+`true` iff `r` is `Success(_)`.
 
 ### Status
 
-`proposed` — **present** as `is_ok`.
+`proposed` — implementation present.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `is_ok`.
+`vir/core/result.vri` → `isSuccess`.
 
 ### See also
 
-- `result.isErr`
+- `self.isFailure`
 
 ---
 
-<a id="result.isErr"></a>
-## `result.isErr`
+<a id="result.isFailure"></a>
+## `self.isFailure`
 
 <!--
-id: result.isErr
-api: result.isErr
+id: result.isFailure
+api: self.isFailure
 previous: is_err
 -->
 
 ```vir
-result.isErr(r: Result) -> bool
+self.isFailure() -> bool
 ```
 
-`true` iff `r` is `Err(_)`.
+`true` iff `r` is `Failure(_)`.
 
 ### Status
 
-`proposed` — **present** as `is_err`.
+`proposed` — implementation present.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `is_err`.
+`vir/core/result.vri` → `isFailure`.
 
 ### See also
 
-- `result.isOk`
+- `self.isSuccess`
 
 ---
 
 <a id="result.unwrap"></a>
-## `result.unwrap`
+## `self.unwrap`
 
 <!--
 id: result.unwrap
-api: result.unwrap
+api: self.unwrap
 previous: unwrap
 -->
 
 ```vir
-result.unwrap(r: Result) -> T
+self.unwrap() -> T
 ```
 
 | Case | Result |
 |---|---|
-| `Ok(v)` | `v` |
-| `Err(_)` | **panic** |
+| `Success(v)` | `v` |
+| `Failure(_)` | **panic** |
 
 Valid primitive; not preferred normal flow when errors are expected — prefer
 `or` / `orWith` / `recover` / `case`.
@@ -323,55 +327,55 @@ Valid primitive; not preferred normal flow when errors are expected — prefer
 
 ### See also
 
-- `result.expect`
-- `result.unwrapErr`
+- `self.expect`
+- `self.unwrapFailure`
 
 ---
 
-<a id="result.unwrapErr"></a>
-## `result.unwrapErr`
+<a id="result.unwrapFailure"></a>
+## `self.unwrapFailure`
 
 <!--
-id: result.unwrapErr
-api: result.unwrapErr
+id: result.unwrapFailure
+api: self.unwrapFailure
 previous: unwrap_err
 -->
 
 ```vir
-result.unwrapErr(r: Result) -> E
+self.unwrapFailure() -> E
 ```
 
 | Case | Result |
 |---|---|
-| `Err(e)` | `e` |
-| `Ok(_)` | **panic** |
+| `Failure(e)` | `e` |
+| `Success(_)` | **panic** |
 
 ### Status
 
-`proposed` — **present** as `unwrap_err`.
+`proposed` — implementation present.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `unwrap_err`.
+`vir/core/result.vri` → `unwrapFailure`.
 
 ### See also
 
-- `result.error`
-- `result.unwrap`
+- `self.error`
+- `self.unwrap`
 
 ---
 
 <a id="result.expect"></a>
-## `result.expect`
+## `self.expect`
 
 <!--
 id: result.expect
-api: result.expect
+api: self.expect
 previous: expect
 -->
 
 ```vir
-result.expect(r: Result, msg: string) -> T
+self.expect(msg: string) -> T
 ```
 
 Same as `unwrap` with custom panic message.
@@ -386,60 +390,60 @@ Same as `unwrap` with custom panic message.
 
 ### See also
 
-- `result.unwrap`
+- `self.unwrap`
 
 ---
 
 <a id="result.unwrapOr"></a>
-## `result.unwrapOr`
+## `self.unwrapOr`
 
 <!--
 id: result.unwrapOr
-api: result.unwrapOr
+api: self.unwrapOr
 previous: unwrap_or
 -->
 
 ```vir
-result.unwrapOr(r: Result, default: T) -> T
+self.unwrapOr(default: T) -> T
 ```
 
 | Case | Result |
 |---|---|
-| `Ok(v)` | `v` |
-| `Err(_)` | `default` |
+| `Success(v)` | `v` |
+| `Failure(_)` | `default` |
 
 ### Status
 
-`proposed` — **present** as `unwrap_or`.
+`proposed` — implementation present.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `unwrap_or`.
+`vir/core/result.vri` → `unwrapOr`.
 
 ### See also
 
-- `result.orWith`
-- `result.recover`
+- `self.orWith`
+- `self.recover`
 
 ---
 
 <a id="result.orWith"></a>
-## `result.orWith`
+## `self.orWith`
 
 <!--
 id: result.orWith
-api: result.orWith
+api: self.orWith
 previous: unwrap_or_else
 -->
 
 ```vir
-result.orWith(r: Result, f: …) -> T
+self.orWith(f: …) -> T
 ```
 
 | Case | Result |
 |---|---|
-| `Ok(v)` | `v` |
-| `Err(e)` | `f(e)` |
+| `Success(v)` | `v` |
+| `Failure(e)` | `f(e)` |
 
 ### Semantics
 
@@ -448,36 +452,36 @@ no absence payload.
 
 ### Status
 
-`proposed` — **present** as `unwrap_or_else`.
+`proposed` — implementation present; callable ABI remains the general gate.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `unwrap_or_else`.
+`vir/core/result.vri` → `orWith`.
 
 ### See also
 
-- `result.unwrapOr`
-- `result.recover`
+- `self.unwrapOr`
+- `self.recover`
 
 ---
 
 <a id="result.map"></a>
-## `result.map`
+## `self.map`
 
 <!--
 id: result.map
-api: result.map
+api: self.map
 previous: map
 -->
 
 ```vir
-result.map(r: Result of (T, E), f: (T) -> U) -> Result of (U, E)
+self.map(f: (T) -> U) -> Result of (U, E)
 ```
 
 | Case | Result |
 |---|---|
-| `Ok(v)` | `Ok(f(v))` |
-| `Err(e)` | `Err(e)` |
+| `Success(v)` | `Success(f(v))` |
+| `Failure(e)` | `Failure(e)` |
 
 ### Status
 
@@ -489,28 +493,28 @@ result.map(r: Result of (T, E), f: (T) -> U) -> Result of (U, E)
 
 ### See also
 
-- `result.mapErr`
-- `result.flatMap`
+- `self.mapFailure`
+- `self.flatMap`
 
 ---
 
-<a id="result.mapErr"></a>
-## `result.mapErr`
+<a id="result.mapFailure"></a>
+## `self.mapFailure`
 
 <!--
-id: result.mapErr
-api: result.mapErr
+id: result.mapFailure
+api: self.mapFailure
 previous: map_err
 -->
 
 ```vir
-result.mapErr(r: Result of (T, E), f: (E) -> F) -> Result of (T, F)
+self.mapFailure(f: (E) -> F) -> Result of (T, F)
 ```
 
 | Case | Result |
 |---|---|
-| `Ok(v)` | `Ok(v)` |
-| `Err(e)` | `Err(f(e))` |
+| `Success(v)` | `Success(v)` |
+| `Failure(e)` | `Failure(f(e))` |
 
 ### Semantics
 
@@ -519,36 +523,36 @@ success values.
 
 ### Status
 
-`proposed` — **present** as `map_err`.
+`proposed` — implementation present.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `map_err`.
+`vir/core/result.vri` → `mapFailure`.
 
 ### See also
 
-- `result.map`
-- `result.recover`
+- `self.map`
+- `self.recover`
 
 ---
 
 <a id="result.flatMap"></a>
-## `result.flatMap`
+## `self.flatMap`
 
 <!--
 id: result.flatMap
-api: result.flatMap
+api: self.flatMap
 previous: flat_map, and_then
 -->
 
 ```vir
-result.flatMap(r: Result of (T, E), f: (T) -> Result of (U, E)) -> Result of (U, E)
+self.flatMap(f: (T) -> Result of (U, E)) -> Result of (U, E)
 ```
 
 | Case | Result |
 |---|---|
-| `Ok(v)` | `f(v)` (`f` returns `Result`) |
-| `Err(e)` | `Err(e)` |
+| `Success(v)` | `f(v)` (`f` returns `Result`) |
+| `Failure(e)` | `Failure(e)` |
 
 ### Semantics
 
@@ -556,36 +560,36 @@ Sole public name for this operation. `and_then` is not canonical.
 
 ### Status
 
-`proposed` — **present** as `flat_map` (+ alias `and_then` → remove public).
+`proposed` — implementation present; the old `and_then` alias is removed.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `flat_map`.
+`vir/core/result.vri` → `flatMap`.
 
 ### See also
 
-- `result.map`
+- `self.map`
 - `option.flatMap`
 
 ---
 
 <a id="result.recover"></a>
-## `result.recover`
+## `self.recover`
 
 <!--
 id: result.recover
-api: result.recover
+api: self.recover
 previous: or_else
 -->
 
 ```vir
-result.recover(r: Result of (T, E), f: (E) -> Result of (T, E)) -> Result of (T, E)
+self.recover(f: (E) -> Result of (T, E)) -> Result of (T, E)
 ```
 
 | Case | Result |
 |---|---|
-| `Ok(v)` | `Ok(v)` |
-| `Err(e)` | `f(e)` (`f` returns `Result`) |
+| `Success(v)` | `Success(v)` |
+| `Failure(e)` | `f(e)` (`f` returns `Result`) |
 
 ### Semantics
 
@@ -594,36 +598,36 @@ Stay in Result algebra while handling the error channel. Not value fallback
 
 ### Status
 
-`proposed` — **present** as `or_else`.
+`proposed` — implementation present.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `or_else`.
+`vir/core/result.vri` → `recover`.
 
 ### See also
 
-- `result.orWith`
-- `result.mapErr`
+- `self.orWith`
+- `self.mapFailure`
 
 ---
 
 <a id="result.toOption"></a>
-## `result.toOption`
+## `self.toOption`
 
 <!--
 id: result.toOption
-api: result.toOption
+api: self.toOption
 previous: result_to_option, ok
 -->
 
 ```vir
-result.toOption(r: Result of (T, E)) -> Option of (T)
+self.toOption() -> Option of (T)
 ```
 
 | Case | Result |
 |---|---|
-| `Ok(v)` | `Some(v)` |
-| `Err(_)` | `None` |
+| `Success(v)` | `Some(v)` |
+| `Failure(_)` | `None` |
 
 ### Semantics
 
@@ -632,80 +636,80 @@ constructor). Merges `result_to_option` and free `ok`.
 
 ### Status
 
-`proposed` — **present** under two names.
+`proposed` — implementation present under the canonical name only.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `result_to_option` / `ok`.
+`vir/core/result.vri` → `toOption`.
 
 ### See also
 
-- `result.error`
+- `self.error`
 - `option.toResult`
 
 ---
 
 <a id="result.error"></a>
-## `result.error`
+## `self.error`
 
 <!--
 id: result.error
-api: result.error
+api: self.error
 previous: err
 -->
 
 ```vir
-result.error(r: Result of (T, E)) -> Option of (E)
+self.error() -> Option of (E)
 ```
 
 | Case | Result |
 |---|---|
-| `Ok(_)` | `None` |
-| `Err(e)` | `Some(e)` |
+| `Success(_)` | `None` |
+| `Failure(e)` | `Some(e)` |
 
 ### Semantics
 
 Error-side conversion → `Option` of `E`. Pair with `toOption`:
 
 ```text
-result.toOption(r)  → Option of T
-result.error(r)     → Option of E
+self.toOption()  → Option of T
+self.error()     → Option of E
 ```
 
 ### Status
 
-`proposed` — **present** as `err`.
+`proposed` — implementation present.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `err`.
+`vir/core/result.vri` → `error`.
 
 ### See also
 
-- `result.toOption`
-- `result.unwrapErr`
+- `self.toOption`
+- `self.unwrapFailure`
 
 ---
 
 <a id="result.all"></a>
-## `result.all`
+## `Result.all`
 
 <!--
 id: result.all
-api: result.all
+api: Result.all
 previous: try_all
 -->
 
 ```vir
-result.all(results: Vec of (Result of (T, E))) -> Result of (Vec of (T), E)
+Result.all(results: Vec of (Result of (T, E))) -> Result of (Vec of (T), E)
 ```
 
 Aggregate a vector of results.
 
 | Input | Output |
 |---|---|
-| all `Ok` | `Ok` of `Vec` of success values (order preserved) |
-| any `Err` | **first** `Err` (short-circuit) |
+| all `Success` | `Success` of `Vec` of success values (order preserved) |
+| any `Failure` | **first** `Failure` (short-circuit) |
 
 ### Semantics
 
@@ -716,16 +720,15 @@ Do not invent unsupported generic syntax in call sites; document meaning only.
 
 ### Status
 
-`proposed` — **present** as `try_all`.
+`proposed` — implementation present; type-receiver dispatch remains compiler-gated.
 
 ### Implementation mapping
 
-`vir/core/result.vri` → `try_all` (may need alignment with `vec.get` /
-namespace after Vec rename pass).
+`vir/core/result.vri` → `all`.
 
 ### See also
 
-- `result.flatMap`
+- `self.flatMap`
 - [`vec.md`](vec.md)
 
 ---
@@ -733,5 +736,5 @@ namespace after Vec rename pass).
 ## Implementation readiness
 
 **Design status: closed** (R1–R3). Error payloads: [`error.md`](error.md).
-Callable HOF and `all` stay `planned` until ABI / reclaim gates clear.
-No `.vri` until authorized (Q5).
+Callable HOF and `all` stay `planned` until ABI / reclaim gates clear. The
+canonical implementation symbols are present in `vir/core/result.vri`.

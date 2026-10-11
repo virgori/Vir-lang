@@ -18,7 +18,7 @@ Abort / invariant / development-failure helpers. **Not** recoverable
 [`Error`](error.md) / [`Result`](result.md) payloads.
 
 ```text
-Error / IoError     → recoverable values in Result.Err
+Error / IoError     → recoverable values in Result.Failure
 panic.*             → non-returning abort
 process.exit/abort  → process-level termination — [`process.md`](process.md)
 ```

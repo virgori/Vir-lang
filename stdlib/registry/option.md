@@ -651,14 +651,14 @@ option.toResult(opt: Option of (T), error: E) -> Result of (T, E)
 
 | Case | Result |
 |---|---|
-| `Some(v)` | `Ok(v)` |
-| `None` | `Err(error)` |
+| `Some(v)` | `Success(v)` |
+| `None` | `Failure(error)` |
 
 ### Semantics
 
 Conversion starts from `Option` → lives on `option`, not `result`. Move
 implementation from `compiler/option.vri` into user-facing `core/option.vri`.
-Error payload type follows current `Result` / `Err` conventions.
+Error payload type follows current `Result` / `Failure` conventions.
 
 ### Status
 

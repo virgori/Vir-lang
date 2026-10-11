@@ -32,14 +32,14 @@ re-implement sockets.
 
 ```vir
 case net.connectHost("127.0.0.1", 8080)
-    Ok(stream):
+    Success(stream):
         net.writeAll(stream, "ping")
         case net.readAll(stream)
-            Ok(body): ()
-            Err(_): ()
+            Success(body): ()
+            Failure(_): ()
         end
         net.close(stream)
-    Err(_): ()
+    Failure(_): ()
 end
 ```
 
@@ -47,7 +47,7 @@ end
 
 | In `net` | Not in `net` |
 |---|---|
-| `TcpStream`, `SocketAddr`, `IpAddr` | Full DNS (getaddrinfo) |
+| `TcpStream`, `SocketAddress`, `IpAddress` | Full DNS (getaddrinfo) |
 | Connect / read / write / close | HTTP parsing → [`http.md`](http.md) |
 | IPv4 literal + `localhost` resolve | TLS → [`tls.md`](tls.md) |
 
@@ -60,22 +60,26 @@ end
 | `tcp_read_all_string` | `net.readAll` | **remove** public export |
 | `tcp_close` | `net.close` | **remove** public export |
 | `dns_resolve` | `net.resolve` | **remove** public export |
+| `IpAddr` | `IpAddress` | **rename** public type |
+| `SocketAddr` | `SocketAddress` | **rename** public type |
+| `socket_addr` | `net.socketAddress` | **rename** public constructor |
+| `tcp_connect_addr` / `net.connectAddr` | `net.connectAddress` | **rename** public operation |
 
 ## API
 
 | ID | Symbol | Signature | Status |
 |---|---|---|---|
-| `net.IpAddr` | `IpAddr` | entity | stable |
-| `net.SocketAddr` | `SocketAddr` | entity | stable |
+| `net.IpAddress` | `IpAddress` | entity | proposed |
+| `net.SocketAddress` | `SocketAddress` | entity | proposed |
 | `net.TcpStream` | `TcpStream` | entity | stable |
 | `net.TcpListener` | `TcpListener` | entity | stable |
-| `net.ipv4` | `ipv4` | `ipv4(a,b,c,d) -> IpAddr` | stable |
-| `net.socketAddr` | `socket_addr` | `socket_addr(ip, port) -> SocketAddr` | stable |
-| `net.localhost` | `localhost` | `localhost(port) -> SocketAddr` | stable |
-| `net.resolve` | `net.resolve` | `net.resolve(hostname) -> Result of (IpAddr)` | stable |
+| `net.ipv4` | `ipv4` | `ipv4(a,b,c,d) -> IpAddress` | proposed |
+| `net.socketAddress` | `net.socketAddress` | `net.socketAddress(ip, port) -> SocketAddress` | proposed |
+| `net.localhost` | `localhost` | `localhost(port) -> SocketAddress` | proposed |
+| `net.resolve` | `net.resolve` | `net.resolve(hostname) -> Result of (IpAddress)` | proposed |
 | `net.connect` | `net.connect` | `net.connect(host, port) -> Result of (TcpStream)` | stable |
 | `net.connectHost` | `net.connectHost` | `net.connectHost(host, port) -> Result of (TcpStream)` | stable |
-| `net.connectAddr` | `net.connectAddr` | `net.connectAddr(addr) -> Result of (TcpStream)` | stable |
+| `net.connectAddress` | `net.connectAddress` | `net.connectAddress(address) -> Result of (TcpStream)` | proposed |
 | `net.writeAll` | `net.writeAll` | `net.writeAll(stream, text) -> Result of (())` | stable |
 | `net.readAll` | `net.readAll` | `net.readAll(stream) -> Result of (string)` | stable |
 | `net.close` | `net.close` | `net.close(stream) -> void` | stable |
@@ -83,7 +87,7 @@ end
 ## Implementation notes
 
 - Syscall-backed TCP on Darwin/Linux via `include syscall`.
-- Resolution: IPv4 dotted quad, `localhost` → 127.0.0.1; otherwise `Err`.
+- Resolution: IPv4 dotted quad, `localhost` → 127.0.0.1; otherwise `Failure`.
 - Snake_case helpers remain **file-private** (not exported).
 - `binding.form`, `binding.multipart`, and `binding.query` are stdlib-owned
   parsers used through their existing `include` IDs; no InterVir copies remain.

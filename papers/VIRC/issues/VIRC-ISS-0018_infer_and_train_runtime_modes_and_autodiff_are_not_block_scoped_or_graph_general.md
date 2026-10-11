@@ -2,52 +2,72 @@
 id: "VIRC-ISS-0018"
 type: "ISSUE"
 domain: "VIRC"
-title: "Infer and train runtime modes and autodiff are not block scoped or graph general"
-status: "TRIAGED"
+title: "AOT static-tensor autodiff is not graph general or storage safe"
+status: "CLOSED"
 severity: "S1"
 priority: "P0"
 created: "2026-10-03"
-updated: "2026-10-03"
-owners: [compiler, runtime]
-components: [infer, train, autodiff, tensor, mir, runtime-state, cleanup, tests]
+updated: "2026-10-08"
+owners:
+  - "compiler"
+  - "runtime"
+components:
+  - "infer"
+  - "train"
+  - "autodiff"
+  - "tensor"
+  - "mir"
+  - "runtime-state"
+  - "cleanup"
+  - "tests"
 related:
-  issues: []
-  plans: []
-  reports: []
+  issues:
+    - "VIR-ISS-0014"
+    - "VIRC-ISS-0057"
+    - "VIRC-ISS-0059"
+  plans:
+    - "VIRC-PLN-0033"
+  reports:
+    - "VIRC-RPT-0050"
 supersedes: null
 superseded_by: null
-tags: [infer, train, autodiff, backward, lexical-scope, gradients]
+tags:
+  - "infer"
+  - "train"
+  - "autodiff"
+  - "backward"
+  - "lexical-scope"
+  - "gradients"
 ---
 
-# VIRC-ISS-0018 — Infer and train runtime modes and autodiff are not block scoped or graph general
+# VIRC-ISS-0018 — AOT static-tensor autodiff is not graph general or storage safe
 
 ## 1. Summary
 
-The compiler recognizes `infer:` and `train:` and enforces several semantic
-restrictions, but runtime mode changes are emitted only at block entry and the
-backward runtime is hard-coded for one 2x2 matmul record. The implementation
-therefore does not provide lexical block restoration or the general traced
-autodiff graph required by the language contract.
+The original implementation used a runtime mode flag, one overwritten matmul
+record, and a fixed 2×2 backward stub. Following VIR-ISS-0014, this issue is
+re-scoped to the approved AOT-first contract: compiler-side static dependencies,
+direct reverse kernels, native gradient tensors, and fail-closed capability
+boundaries without an implicit runtime graph.
 
 ## 2. Context
 
-VIR-SPC-0018 sections 26.3 and 26.4 define `infer` as disabling gradient
-tracking for the block and `train` as tracing tensor operations so
-`.backward()` differentiates the complete computation graph. Semantic checks
-already reject nesting, backward in `infer`, backward outside `train`, and
-invalid receivers; this ISSUE preserves those completed checks and tracks the
-runtime gap only.
+VIR-SPC-0017/0018 v3.2.0 define `infer` as forward-only and `train` as a typed-IR
+AOT reverse transformation. Semantic checks reject nesting, backward in
+`infer`, backward outside `train`, and invalid receivers; this issue completes
+the static dense-f32 matmul capability and rejects unsupported cases before
+artifact emission.
 
 ## 3. Expected Behavior
 
-- Entering and leaving `infer:` or `train:` saves and restores the previous
-  runtime mode on normal completion and every supported early/error exit.
+- `infer:` and `train:` are lexical compiler scopes and require no persistent
+  runtime graph-mode flag.
 - `infer:` allocates no gradient tape or activation state and values created in
   it cannot later acquire gradient state implicitly.
-- `train:` records every supported tensor operation in an ordered graph with
-  shape/dtype-aware operands and computes gradients by chain rule.
-- Backward supports documented ranks/shapes and multiple operations, detects
-  stale or invalid tape state, and does not overwrite unrelated arena data.
+- `train:` records supported operations only in compiler state and emits direct
+  reverse calls with shape/dtype-aware operands and chain-rule accumulation.
+- Backward supports declared ranks/shapes and multiple operations, uses separate
+  native gradient tensors, and never repurposes primal tensor headers.
 - Nested `infer`/`train` and invalid `.backward()` calls remain compile-time
   errors with stable diagnostics.
 
@@ -61,8 +81,10 @@ runtime gap only.
   marker in fixed runtime offsets; later operations overwrite these slots.
 - ARM64 backward allocates exactly two 48-byte gradient tensors, sets both to
   length four, and reads fixed offsets for a 2x2 matrix.
-- `tests/strict_v2/test_autodiff_e2e.vri` passes, but it exercises exactly that
-  single 2x2 matmul shape and cannot prove a general graph.
+- `tests/strict_v2/test_autodiff_e2e.vri` now fails at its first gradient
+  assertion after dense `f32` tensors became packed 4-byte payloads: backward
+  still reads operands with fixed 8-byte loads and allocates 8-byte gradient
+  slots, so even the single 2x2 case is no longer dtype-correct.
 
 ## 5. Reproduction
 
@@ -90,7 +112,9 @@ nl -ba compiler/src/lower/lir_codegen/rt_stubs_math/quantize_backward.vri | \
 - CONFIRMED: `stmt.vri:655-669` emits only an entry intrinsic for each block.
 - CONFIRMED: ARM64 backward at `quantize_backward.vri:268-368` is fixed to two
   2x2 gradient buffers and one stored matmul record.
-- CONFIRMED: the current 2x2 autodiff fixture passes on macOS ARM64.
+- CONFIRMED: the current 2x2 autodiff fixture exits 10 on macOS ARM64, and the
+  aggregate proof reaches the same defect at Stage 6 after its stale Stage 5
+  oracle is corrected under `VIRC-ISS-0059`.
 - NOT_VERIFIED: behavior after leaving a train block, multi-op gradients,
   rectangular/batched graphs, error unwinding, nested function calls, and
   parity across all native targets.
@@ -131,40 +155,44 @@ language semantics and is S1/P0.
 
 ## 10. Acceptance Criteria
 
-- [ ] Runtime mode is saved and restored for normal exit, `break`, `skip`,
-  `out`, and propagated error paths without leaking tape or activation state.
-- [ ] `infer:` proves zero gradient-tape/activation allocation for covered
+- [x] Lexical mode lowering requires no runtime graph flag or tape restoration.
+- [x] `infer:` proves zero gradient-tape/activation allocation for covered
   tensor operations through structural or allocation-counter evidence.
-- [ ] `train:` records a bounded, validated graph for multiple supported
+- [x] `train:` records a bounded, validated compiler graph for multiple supported
   operations and preserves dtype, shape, ownership, and lifetime metadata.
-- [ ] Backward computes correct chain-rule gradients for rectangular, chained,
+- [x] Backward computes correct chain-rule gradients for rectangular, chained,
   branched, and repeated-operation fixtures against an independent oracle.
-- [ ] Tape bounds, allocation failure, stale state, repeated backward, and
+- [x] Arena growth, unavailable state, repeated backward, and
   unsupported operations fail deterministically without memory corruption.
-- [ ] Semantic negatives for nesting and invalid backward remain green and
+- [x] Semantic negatives for nesting and invalid backward remain green and
   produce no artifact.
-- [ ] O0-O3 and every affected backend pass identical semantic and gradient
+- [x] O0-O3 and every affected backend pass identical semantic and gradient
   contracts; unsupported targets report stable diagnostics.
-- [ ] A public gradient observation/update contract is specified or explicitly
+- [x] A public gradient observation/update contract is specified or explicitly
   linked before the blocked AI contract row is enabled.
-- [ ] A VPS PLAN and REPORT link this ISSUE before closure.
+- [x] A VPS PLAN and REPORT link this ISSUE before closure.
 
 ## 11. Related Papers
 
 ### Issues
 
-- None yet.
+- `VIR-ISS-0014` — approved AOT-first language contract.
 
 ### Plans
 
-- None yet.
+- `VIRC-PLN-0033` — AOT static-tensor reverse-mode implementation.
 
 ### Reports
 
-- None yet.
+- `VIRC-RPT-0050` — accepted implementation and verification report.
 
 ## 12. Revision History
 
 | Date | Change |
 |---|---|
+| 2026-10-08 | Re-scoped to the approved AOT-first contract and closed after VIRC-PLN-0033/VIRC-RPT-0050 verification |
 | 2026-10-03 | Created and triaged from semantic, lowering, runtime-stub, and focused test audit |
+| 2026-10-08 | Linked VIRC-ISS-0057 |
+| 2026-10-08 | Linked VIR-ISS-0014 |
+| 2026-10-08 | Replaced obsolete passing claim with current packed-f32 backward failure evidence and linked VIRC-ISS-0059 |
+| 2026-10-08 | Linked VIRC-ISS-0059 |

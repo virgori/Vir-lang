@@ -16,10 +16,10 @@ notes: >-
 
 # Error
 
-Recoverable error **values** used as `Result` error payloads (`Err(E)`).
+Recoverable error **values** used as `Result` error payloads (`Failure(E)`).
 
 ```text
-Error / IoError   → recoverable values in Result.Err
+Error / IoError   → recoverable values in Result.Failure
 panic / todo / …  → abort / invariant  (separate API — not error.*)
 ```
 
@@ -46,8 +46,8 @@ panic / todo / …  → abort / invariant  (separate API — not error.*)
 Aligns with locked I/O:
 
 ```text
-Reader.exact / atleast premature EOF  → Err(… UnexpectedEof …)
-fs.text invalid UTF-8                 → Err(… InvalidData …)
+Reader.exact / atleast premature EOF  → Failure(… UnexpectedEof …)
+fs.text invalid UTF-8                 → Failure(… InvalidData …)
 ```
 
 `Result` algebra stays in [`result.md`](result.md). This file defines **`E`**.
@@ -160,10 +160,10 @@ the OS path warrants).
 
 ```text
 Reader.exact / atleast → premature EOF
-  Err(IoError { kind: ErrorKind.UnexpectedEof, … })
+  Failure(IoError { kind: ErrorKind.UnexpectedEof, … })
 
 fs.text → invalid UTF-8
-  Err(IoError { kind: ErrorKind.InvalidData, … })
+  Failure(IoError { kind: ErrorKind.InvalidData, … })
 ```
 
 ## Public surface (closed)
@@ -236,7 +236,7 @@ error.fromErrno
    ↓
 IoError
    ↓
-Err(IoError)
+Failure(IoError)
 ```
 
 **Single mapping table** in the error module. `compiler/file`, `fs`, and `io`
@@ -620,4 +620,4 @@ Public error architecture is closed for this refactor:
 5. Keep cause chain; hide `ptr` from the public contract.
 
 Implementation may proceed against this registry. Cross-check `io.md` / `fs.md`
-Err examples against `ErrorKind.UnexpectedEof` / `InvalidData`.
+Failure examples against `ErrorKind.UnexpectedEof` / `InvalidData`.

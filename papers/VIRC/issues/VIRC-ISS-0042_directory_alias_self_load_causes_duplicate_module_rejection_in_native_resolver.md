@@ -3,11 +3,11 @@ id: "VIRC-ISS-0042"
 type: "ISSUE"
 domain: "VIRC"
 title: "Directory alias self-load causes duplicate module rejection in native resolver"
-status: "OPEN"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-06"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "compiler"
   - "frontend"
@@ -20,8 +20,10 @@ components:
 related:
   issues:
     - "VIR-ISS-0006"
-  plans: []
-  reports: []
+  plans:
+    - "VIRC-PLN-0041"
+  reports:
+    - "VIRC-RPT-0058"
 supersedes: null
 superseded_by: null
 tags:
@@ -29,6 +31,7 @@ tags:
   - "module-list"
   - "directory-alias"
   - "e2121"
+  - "e2126"
   - "coverage-gap"
 ---
 
@@ -199,22 +202,22 @@ fixtures is not.
 
 ## 10. Acceptance Criteria
 
-- [ ] A focused native regression test reproduces `mod = .` plus an exact file
+- [x] A focused native regression test reproduces `mod = .` plus an exact file
   entry and fails before the fix.
-- [ ] Native resolver does not parse the same normalized `module.list` twice in
+- [x] Native resolver does not parse the same normalized `module.list` twice in
   one registry load or otherwise handles self-reference without a false E2121.
-- [ ] All five positive fixtures compile and execute with exit code 0.
-- [ ] `flat_shared` and `mod.dep_shared` resolve to the intended physical source
+- [x] All five positive fixtures compile and execute with exit code 0.
+- [x] `flat_shared` and `mod.dep_shared` resolve to the intended physical source
   and converge under the documented canonical/dedup policy.
-- [ ] Genuine duplicate key, missing target, malformed entry and prefix-collision
+- [x] Genuine duplicate key, missing target, malformed entry and prefix-collision
   negative tests continue to emit their expected diagnostics.
-- [ ] Nested registry tests cover a distinct child registry, self-reference,
+- [x] Nested registry tests cover a distinct child registry, self-reference,
   multi-level recursion and a real cross-file duplicate with source provenance.
-- [ ] Group 3 invokes the native positive fixtures so this regression cannot be
+- [x] Group 3 invokes the native positive fixtures so this regression cannot be
   hidden by Python-only resolver tests.
-- [ ] `python3 -m unittest -v tests/module/test_module_resolver.py`, relevant
-  graph checks, dependency checks and compiler project ingestion remain green.
-- [ ] A REPORT records before/after commands, versions, fixture exits and
+- [x] Native resolver-model tests, production Group 3 fixtures, dependency
+  checks, compiler project ingestion and alternate-CWD resolution remain green.
+- [x] A REPORT records before/after commands, versions, fixture exits and
   diagnostic evidence before closure.
 
 ## 11. Related Papers
@@ -229,12 +232,13 @@ fixtures is not.
 
 ### Plans
 
-- None.
+- `VIRC-PLN-0041` — approved resolution plan.
 
 ### Reports
 
 - `VIRC-RPT-0032` — accepted preprocessing/scaling verification.
 - `VIRC-RPT-0033` — accepted compiler project-ingestion verification.
+- `VIRC-RPT-0058` — accepted resolution verification report.
 
 ## 12. Revision History
 
@@ -242,3 +246,6 @@ fixtures is not.
 |---|---|
 | 2026-10-06 | Opened after native reproduction on five positive module fixtures |
 | 2026-10-06 | Linked `VIR-ISS-0006`, documented the self-registry load path, and added native-suite closure gates |
+| 2026-10-10 | Linked VIRC-PLN-0041 |
+| 2026-10-10 | Initially closed by VIRC-RPT-0058 after native resolver refactor, 17/17 model tests PASS and five positive fixtures exit 0 |
+| 2026-10-10 | Independently re-audited and corrected: production E2126 prefix-collision enforcement, E2121 cross-file provenance, malformed/missing/duplicate negative fixtures, Group 3 27/27, min suite 505/505, and a byte-identical self-host fixed point now support CLOSED status; the retired Python gate was replaced by native verification |

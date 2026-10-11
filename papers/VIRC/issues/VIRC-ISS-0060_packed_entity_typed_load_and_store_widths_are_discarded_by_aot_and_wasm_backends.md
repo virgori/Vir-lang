@@ -286,3 +286,5 @@ operation.
 | 2026-10-09 | Closed following verified implementation in VIRC-PLN-0034 and accepted report VIRC-RPT-0051 |
 | 2026-10-09 | Reopened: audit revealed unaligned RISC-V access can trap, backend lowering lacks fail-closed verifier for invalid aux, and cross-target -O0..-O3 matrix is unregistered |
 | 2026-10-09 | Closed after verifying byte-wise RISC-V lowering, fail-closed metadata verifier, Group 7 test matrix (59/59 PASS), and bit-exact self-host fixed-point in VIRC-RPT-0051 |
+| 2026-10-09 | Reopened: audit revealed RISC-V/Wasm matrix false-positive risks, missing cross-target coverage for signed load, mutation and nested packed copy, verifier lacks detection for metadata lost to aux=0, and report binary size mismatch |
+| 2026-10-09 | Closed after verifying 4-fixture host and cross-target matrices (-O0..-O3), bytecode/opcode assertions, unaligned displacement fail-closed verifier, Group 7 (59/59 PASS), and bit-exact fixed-point (18,254,960 bytes) in VIRC-RPT-0051 |

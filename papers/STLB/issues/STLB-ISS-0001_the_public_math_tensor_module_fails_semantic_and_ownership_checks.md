@@ -7,16 +7,30 @@ status: "TRIAGED"
 severity: "S1"
 priority: "P0"
 created: "2026-10-03"
-updated: "2026-10-03"
-owners: [stdlib]
-components: [math-tensor, module-registry, typecheck, ownership, public-api, tests]
+updated: "2026-10-08"
+owners:
+  - "stdlib"
+components:
+  - "math-tensor"
+  - "module-registry"
+  - "typecheck"
+  - "ownership"
+  - "public-api"
+  - "tests"
 related:
-  issues: []
+  issues:
+    - "VIRC-ISS-0057"
   plans: []
   reports: []
 supersedes: null
 superseded_by: null
-tags: [stdlib, tensor, ownership, move, compile-failure, public-api]
+tags:
+  - "stdlib"
+  - "tensor"
+  - "ownership"
+  - "move"
+  - "compile-failure"
+  - "public-api"
 ---
 
 # STLB-ISS-0001 — The public math tensor module fails semantic and ownership checks
@@ -151,3 +165,4 @@ the issue is S1/P0.
 | Date | Change |
 |---|---|
 | 2026-10-03 | Created and triaged after direct semantic check of the registered public module |
+| 2026-10-08 | Linked VIRC-ISS-0057 |

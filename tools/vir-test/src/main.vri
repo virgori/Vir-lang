@@ -1,0 +1,781 @@
+# ═════════════════════════════════════════════════════════════════════
+# vir_test.main — Native Spec Gap Contract Test Runner Entry Point
+# ═════════════════════════════════════════════════════════════════════
+
+include virgex
+include vir_test.cli
+include vir_test.process
+include vir_test.manifest
+include vir_test.oracle
+include vir_test.reporter
+
+func main():
+    let cfg = cli_parse_args()
+    let virc_bin = cfg.virc_bin
+    let manifest_path = cfg.manifest_path
+    let fixtures_dir = cfg.fixtures_dir
+    let target = cfg.target
+    let opt_level = cfg.opt_level
+    let filter = cfg.filter
+    let group = cfg.group
+    let save_baseline = cfg.save_baseline
+    let check_baseline = cfg.check_baseline
+    let compile_timeout = cfg.compile_timeout
+    let test_timeout = cfg.test_timeout
+    let verbose = cfg.verbose
+    let has_filter = cfg.has_filter
+
+    var filter_pat = virgex.compile("")
+    if has_filter == 1 do
+        filter_pat = virgex.compile(filter as string)
+    end
+
+    # Validate compiler executable
+    if proc_file_exists(virc_bin) == 0 do
+        rep_print("Error: Compiler executable not found: " as int)
+        rep_print(virc_bin)
+        rep_print("\n" as int)
+        exit_prog(1)
+    end
+
+    # Read manifest file
+    let content = proc_read_file(manifest_path)
+    if proc_strlen(content) <= 0 do
+        rep_print("Error: unable to read manifest file: " as int)
+        rep_print(manifest_path)
+        rep_print("\n" as int)
+        exit_prog(1)
+    end
+
+    let tbl = manifest_parse(content)
+    let tbl_rows = tbl.rows
+    let tbl_count = tbl.count
+
+    # Compute matched tests count prior to running
+    var matched_count = 0
+    var mi = 0
+    when mi < tbl_count loop
+        let mrow = manifest_get_row(tbl_rows, tbl_count, mi)
+        if cli_filter_matches(mrow.test_id, group, has_filter, filter_pat) == 1 do
+            matched_count = matched_count + 1
+        end
+        mi = mi + 1
+    end
+
+    rep_print_header(manifest_path, virc_bin, target, opt_level, matched_count)
+
+    # Create private workspace directory for this process to prevent concurrency races
+    let my_pid = proc_sys_getpid()
+    let tmp_dir = proc_str_concat3(".vir_test_tmp_" as int, proc_int_to_str(my_pid), "" as int)
+    proc_mkdir(tmp_dir)
+
+    # Prepare Node WASI harness script inside tmp_dir
+    let wasi_script_path = proc_str_concat3(tmp_dir, "/wasi_runner.js" as int, "" as int)
+    let wasi_script = "const fs = require(\"fs\");\nconst { WASI } = require(\"wasi\");\nconst wasi = new WASI({ version: \"preview1\", args: [process.argv[2]], env: process.env, preopens: { \".\": \".\" } });\nconst wasmBuffer = fs.readFileSync(process.argv[2]);\nconst imports = wasi.getImportObject ? wasi.getImportObject() : { wasi_snapshot_preview1: wasi.wasiImport };\nWebAssembly.instantiate(wasmBuffer, imports).then(({ instance }) => {\n  let exitCode = 0;\n  if (wasi.start) {\n    exitCode = wasi.start(instance) || 0;\n  } else {\n    instance.exports._start();\n  }\n  if (process.argv[3] === \"inspect_slab\") {\n    const view = new DataView(instance.exports.memory.buffer);\n    console.log(`${view.getBigInt64(60000, true)}ok`);\n  }\n  process.exit(exitCode);\n}).catch((error) => {\n  console.error(error);\n  process.exit(1);\n});\n" as int
+    proc_write_file(wasi_script_path, wasi_script)
+
+    let ffi_wasm_script_path = proc_str_concat3(tmp_dir, "/ffi_wasm_runner.js" as int, "" as int)
+    let ffi_wasm_script = "const fs = require(\"fs\");\nconst { WASI } = require(\"wasi\");\nconst wasmPath = process.argv[2];\nconst mode = process.argv[3] || \"valid\";\nconst bytes = fs.readFileSync(wasmPath);\nconst wasmModule = new WebAssembly.Module(bytes);\nconst declared = WebAssembly.Module.imports(wasmModule).filter((entry) => entry.module === \"env\" && entry.name === \"host_value\" && entry.kind === \"function\");\nif (declared.length !== 1) { process.exit(1); }\nconst wasi = new WASI({ version: \"preview1\", args: [wasmPath], env: process.env, preopens: { \".\": \".\" } });\nconst imports = wasi.getImportObject ? wasi.getImportObject() : { wasi_snapshot_preview1: wasi.wasiImport };\nif (mode === \"missing\") {\n  WebAssembly.instantiate(bytes, imports).then(() => process.exit(1)).catch(() => process.exit(0));\n} else {\n  imports.env = { host_value: mode === \"wrong_type\" ? () => 42 : () => 42n };\n  WebAssembly.instantiate(bytes, imports).then(({ instance }) => {\n    const exitCode = wasi.start ? (wasi.start(instance) || 0) : (instance.exports._start(), 0);\n    process.exit(mode === \"wrong_type\" ? 1 : exitCode);\n  }).catch(() => process.exit(mode === \"wrong_type\" ? 0 : 1));\n}\n" as int
+    proc_write_file(ffi_wasm_script_path, ffi_wasm_script)
+
+    let results_arr = alloc(tbl_count * 8)
+    var res_count = 0
+
+    var run_idx = 0
+    var pass_cnt = 0
+    var fail_cnt = 0
+    var blocked_cnt = 0
+
+    var i = 0
+    when i < tbl_count loop
+        let row = manifest_get_row(tbl_rows, tbl_count, i)
+
+        if cli_filter_matches(row.test_id, group, has_filter, filter_pat) == 1 do
+            run_idx = run_idx + 1
+
+            let test_bin = proc_str_concat4(tmp_dir, "/" as int, row.test_id, ".bin" as int)
+            let test_stdout = proc_str_concat4(tmp_dir, "/" as int, row.test_id, ".stdout" as int)
+            let test_stderr = proc_str_concat4(tmp_dir, "/" as int, row.test_id, ".stderr" as int)
+            let test_asm = proc_str_concat4(tmp_dir, "/" as int, row.test_id, ".s" as int)
+
+            if cli_streq(row.kind, "blocked_contract" as int) == 1 do
+                blocked_cnt = blocked_cnt + 1
+                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "BLOCKED" as int, row.oracle)
+                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "BLOCKED" as int)
+                native_write_i64(results_arr, res_count * 8, rec as int)
+                res_count = res_count + 1
+            else
+                let fixture_path = proc_str_concat3(fixtures_dir, "/" as int, row.fixture)
+                if proc_file_exists(fixture_path) == 0 do
+                    fail_cnt = fail_cnt + 1
+                    rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Fixture not found" as int)
+                    let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                    native_write_i64(results_arr, res_count * 8, rec as int)
+                    res_count = res_count + 1
+                else
+                    let fcontent = proc_read_file(fixture_path)
+                    let vflags = fixture_extract_virc_flags(fcontent)
+
+                    # ── Kind: compile_fail ──
+                    if cli_streq(row.kind, "compile_fail" as int) == 1 do
+                        proc_unlink(test_bin)
+                        proc_unlink(test_stdout)
+                        proc_unlink(test_stderr)
+
+                        let c_exit = proc_compile_file_captured(
+                            virc_bin,
+                            fixture_path,
+                            test_bin,
+                            target,
+                            opt_level,
+                            0,
+                            vflags,
+                            test_stdout,
+                            test_stderr,
+                            compile_timeout
+                        )
+                        let c_out = proc_str_concat2(proc_read_file(test_stdout), proc_read_file(test_stderr))
+
+                        if proc_file_exists(test_bin) == 1 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Compiler unexpectedly generated an artifact for negative test" as int)
+                            proc_unlink(test_bin)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        eif c_exit == 0 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Compilation succeeded with 0, expected compile rejection" as int)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        eif c_exit == -999 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Compilation TIMEOUT" as int)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        else
+                            let matched = oracle_check_compile_fail(row.oracle, c_out)
+                            if matched == 1 do
+                                pass_cnt = pass_cnt + 1
+                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "diagnostic matched required keywords" as int)
+                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "PASS" as int)
+                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                res_count = res_count + 1
+                            else
+                                fail_cnt = fail_cnt + 1
+                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "diagnostic does not match oracle" as int)
+                                if verbose == 1 do
+                                    rep_print_verbose_fail(c_exit, 0, proc_read_file(test_stdout), proc_read_file(test_stderr))
+                                end
+                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                res_count = res_count + 1
+                            end
+                        end
+                        proc_unlink(test_stdout)
+                        proc_unlink(test_stderr)
+
+                    # ── Kind: check ──
+                    eif cli_streq(row.kind, "check" as int) == 1 do
+                        proc_unlink(test_bin)
+                        proc_unlink(test_stdout)
+                        proc_unlink(test_stderr)
+
+                        let c_exit = proc_compile_file_captured(
+                            virc_bin,
+                            fixture_path,
+                            test_bin,
+                            target,
+                            opt_level,
+                            1,
+                            vflags,
+                            test_stdout,
+                            test_stderr,
+                            compile_timeout
+                        )
+
+                        if c_exit != 0 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Semantic check failed" as int)
+                            if verbose == 1 do
+                                rep_print_verbose_fail(c_exit, 0, proc_read_file(test_stdout), proc_read_file(test_stderr))
+                            end
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        eif proc_file_exists(test_bin) == 1 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Semantic check unexpectedly emitted an artifact" as int)
+                            proc_unlink(test_bin)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        else
+                            pass_cnt = pass_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "Semantic check succeeded without emitting an artifact" as int)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "PASS" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        end
+                        proc_unlink(test_stdout)
+                        proc_unlink(test_stderr)
+
+                    # ── Kind: run ──
+                    eif cli_streq(row.kind, "run" as int) == 1 do
+                        proc_unlink(test_bin)
+                        proc_unlink(test_stdout)
+                        proc_unlink(test_stderr)
+
+                        let c_exit = proc_compile_file_captured(
+                            virc_bin,
+                            fixture_path,
+                            test_bin,
+                            target,
+                            opt_level,
+                            0,
+                            vflags,
+                            test_stdout,
+                            test_stderr,
+                            compile_timeout
+                        )
+
+                        if c_exit != 0 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Compilation failed with non-zero exit code" as int)
+                            if verbose == 1 do
+                                rep_print_verbose_fail(c_exit, 0, proc_read_file(test_stdout), proc_read_file(test_stderr))
+                            end
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        eif proc_file_exists(test_bin) == 0 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Compilation succeeded but artifact does not exist" as int)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        else
+                            proc_unlink(test_stdout)
+                            proc_unlink(test_stderr)
+                            let r_exit = proc_run_binary_captured(test_bin, test_stdout, test_stderr, test_timeout)
+                            let r_out = proc_read_file(test_stdout)
+                            let r_err = proc_read_file(test_stderr)
+
+                            if r_exit == -999 do
+                                fail_cnt = fail_cnt + 1
+                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Execution TIMEOUT" as int)
+                                if verbose == 1 do
+                                    rep_print_verbose_fail(0, r_exit, r_out, r_err)
+                                end
+                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                res_count = res_count + 1
+                            eif r_exit != 0 do
+                                fail_cnt = fail_cnt + 1
+                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Execution failed with non-zero exit code" as int)
+                                if verbose == 1 do
+                                    rep_print_verbose_fail(0, r_exit, r_out, r_err)
+                                end
+                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                res_count = res_count + 1
+                            else
+                                let exp_stdout = fixture_extract_expected_stdout(fcontent)
+                                let matched = oracle_check_stdout(row.oracle, exp_stdout, r_out)
+                                if matched == 0 do
+                                    fail_cnt = fail_cnt + 1
+                                    rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Stdout mismatch" as int)
+                                    if verbose == 1 do
+                                        rep_print_verbose_fail(0, r_exit, r_out, r_err)
+                                    end
+                                    let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                    native_write_i64(results_arr, res_count * 8, rec as int)
+                                    res_count = res_count + 1
+                                else
+                                    if cli_streq(row.test_id, "FFI-008" as int) == 1 do
+                                        let arm_asm = proc_str_concat3(tmp_dir, "/ffi008_arm.s" as int, "" as int)
+                                        let x86_asm = proc_str_concat3(tmp_dir, "/ffi008_x86.s" as int, "" as int)
+                                        proc_unlink(arm_asm)
+                                        proc_unlink(x86_asm)
+                                        proc_unlink(test_stdout)
+                                        proc_unlink(test_stderr)
+
+                                        let a_exit = proc_compile_asm_captured(virc_bin, fixture_path, arm_asm, "linux-arm64" as int, opt_level, 1, test_stdout, test_stderr, compile_timeout)
+                                        let x_exit = proc_compile_asm_captured(virc_bin, fixture_path, x86_asm, "linux-x86_64" as int, opt_level, 1, test_stdout, test_stderr, compile_timeout)
+
+                                        let arm_txt = proc_read_file(arm_asm)
+                                        let x86_txt = proc_read_file(x86_asm)
+                                        proc_unlink(arm_asm)
+                                        proc_unlink(x86_asm)
+
+                                        if a_exit != 0 or x_exit != 0 or oracle_check_ffi008_arm(arm_txt) == 0 or oracle_check_ffi008_x86(x86_txt) == 0 do
+                                            fail_cnt = fail_cnt + 1
+                                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Native FFI ABI assembly oracle failed" as int)
+                                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                            native_write_i64(results_arr, res_count * 8, rec as int)
+                                            res_count = res_count + 1
+                                        else
+                                            pass_cnt = pass_cnt + 1
+                                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "Runtime integer/pointer/void/stack/f64/mixed calls passed; ARM64 and x86-64 assembly use independent FP/GPR ABI registers" as int)
+                                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                            native_write_i64(results_arr, res_count * 8, rec as int)
+                                            res_count = res_count + 1
+                                        end
+                                    else
+                                        pass_cnt = pass_cnt + 1
+                                        rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "Stdout and exit code matched expected oracle" as int)
+                                        let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "PASS" as int)
+                                        native_write_i64(results_arr, res_count * 8, rec as int)
+                                        res_count = res_count + 1
+                                    end
+                                end
+                            end
+                            proc_unlink(test_bin)
+                            proc_unlink(test_stdout)
+                            proc_unlink(test_stderr)
+                        end
+
+                    # ── Kind: run_fail ──
+                    eif cli_streq(row.kind, "run_fail" as int) == 1 do
+                        proc_unlink(test_bin)
+                        proc_unlink(test_stdout)
+                        proc_unlink(test_stderr)
+
+                        let c_exit = proc_compile_file_captured(
+                            virc_bin,
+                            fixture_path,
+                            test_bin,
+                            target,
+                            opt_level,
+                            0,
+                            vflags,
+                            test_stdout,
+                            test_stderr,
+                            compile_timeout
+                        )
+
+                        if c_exit != 0 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Compilation failed" as int)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        eif proc_file_exists(test_bin) == 0 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Artifact missing" as int)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        else
+                            proc_unlink(test_stdout)
+                            proc_unlink(test_stderr)
+                            let r_exit = proc_run_binary_captured(test_bin, test_stdout, test_stderr, test_timeout)
+                            if r_exit == -999 do
+                                fail_cnt = fail_cnt + 1
+                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Execution TIMEOUT (exceeded limit)" as int)
+                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                res_count = res_count + 1
+                            eif r_exit == 0 do
+                                fail_cnt = fail_cnt + 1
+                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Execution succeeded with exit 0, expected trap/run failure" as int)
+                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                res_count = res_count + 1
+                            else
+                                let exp_exit = oracle_extract_expected_exit(row.oracle)
+                                let matched = oracle_check_exit_code(exp_exit, r_exit)
+                                if matched == 1 do
+                                    pass_cnt = pass_cnt + 1
+                                    rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "Execution correctly trapped/exited non-zero" as int)
+                                    let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "PASS" as int)
+                                    native_write_i64(results_arr, res_count * 8, rec as int)
+                                    res_count = res_count + 1
+                                else
+                                    fail_cnt = fail_cnt + 1
+                                    rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Execution exit code does not match expected" as int)
+                                    let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                    native_write_i64(results_arr, res_count * 8, rec as int)
+                                    res_count = res_count + 1
+                                end
+                            end
+                            proc_unlink(test_bin)
+                            proc_unlink(test_stdout)
+                            proc_unlink(test_stderr)
+                        end
+
+                    # ── Kind: structural ──
+                    eif cli_streq(row.kind, "structural" as int) == 1 do
+                        proc_unlink(test_bin)
+                        proc_unlink(test_stdout)
+                        proc_unlink(test_stderr)
+
+                        let c_exit = proc_compile_file_captured(
+                            virc_bin,
+                            fixture_path,
+                            test_bin,
+                            target,
+                            opt_level,
+                            0,
+                            vflags,
+                            test_stdout,
+                            test_stderr,
+                            compile_timeout
+                        )
+
+                        if c_exit != 0 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Structural gate failed: compilation failed" as int)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        eif proc_file_exists(test_bin) == 0 do
+                            fail_cnt = fail_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Structural gate failed: binary artifact not found" as int)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        else
+                            proc_unlink(test_stdout)
+                            proc_unlink(test_stderr)
+                            let r_exit = proc_run_binary_captured(test_bin, test_stdout, test_stderr, test_timeout)
+                            let r_out = proc_read_file(test_stdout)
+
+                            if r_exit == -999 do
+                                fail_cnt = fail_cnt + 1
+                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Execution TIMEOUT" as int)
+                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                res_count = res_count + 1
+                            eif r_exit != 0 do
+                                fail_cnt = fail_cnt + 1
+                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Structural check failed with non-zero exit" as int)
+                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                res_count = res_count + 1
+                            else
+                                let exp_stdout = fixture_extract_expected_stdout(fcontent)
+                                let matched = oracle_check_stdout(row.oracle, exp_stdout, r_out)
+                                if matched == 0 do
+                                    fail_cnt = fail_cnt + 1
+                                    rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Structural test behavioral stdout mismatch" as int)
+                                    let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                    native_write_i64(results_arr, res_count * 8, rec as int)
+                                    res_count = res_count + 1
+                                else
+                                    if cli_streq(row.test_id, "MEM-STRUCT-001" as int) == 1 do
+                                        proc_unlink(test_asm)
+                                        proc_unlink(test_stdout)
+                                        proc_unlink(test_stderr)
+
+                                        let s_exit = proc_compile_asm_captured(
+                                            virc_bin,
+                                            fixture_path,
+                                            test_asm,
+                                            target,
+                                            opt_level,
+                                            0,
+                                            test_stdout,
+                                            test_stderr,
+                                            compile_timeout
+                                        )
+
+                                        if s_exit != 0 or proc_file_exists(test_asm) == 0 do
+                                            fail_cnt = fail_cnt + 1
+                                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Structural gate failed: unable to emit assembly with -S" as int)
+                                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                            native_write_i64(results_arr, res_count * 8, rec as int)
+                                            res_count = res_count + 1
+                                        else
+                                            let asm_txt = proc_read_file(test_asm)
+                                            proc_unlink(test_asm)
+
+                                            if oracle_check_structural_free(asm_txt) == 1 do
+                                                pass_cnt = pass_cnt + 1
+                                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "Physical non-NOP free call instruction present in main assembly" as int)
+                                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "PASS" as int)
+                                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                                res_count = res_count + 1
+                                            else
+                                                fail_cnt = fail_cnt + 1
+                                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Structural gate failed: main does not contain a concrete branch/call instruction to vir_free/heap_free" as int)
+                                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                                res_count = res_count + 1
+                                            end
+                                        end
+                                    eif cli_streq(row.test_id, "FFI-003" as int) == 1 do
+                                        let
+                                            asm_o0_path = proc_str_concat3(tmp_dir, "/ffi003_o0.s" as int, "" as int)
+                                            asm_o1_path = proc_str_concat3(tmp_dir, "/ffi003_o1.s" as int, "" as int)
+                                            asm_o2_path = proc_str_concat3(tmp_dir, "/ffi003_o2.s" as int, "" as int)
+                                            asm_o3_path = proc_str_concat3(tmp_dir, "/ffi003_o3.s" as int, "" as int)
+                                        proc_unlink(asm_o0_path)
+                                        proc_unlink(asm_o1_path)
+                                        proc_unlink(asm_o2_path)
+                                        proc_unlink(asm_o3_path)
+
+                                        let
+                                            o0_exit = proc_compile_asm_captured(virc_bin, fixture_path, asm_o0_path, target, "-O0" as int, 1, test_stdout, test_stderr, compile_timeout)
+                                            o1_exit = proc_compile_asm_captured(virc_bin, fixture_path, asm_o1_path, target, "-O1" as int, 1, test_stdout, test_stderr, compile_timeout)
+                                            o2_exit = proc_compile_asm_captured(virc_bin, fixture_path, asm_o2_path, target, "-O2" as int, 1, test_stdout, test_stderr, compile_timeout)
+                                            o3_exit = proc_compile_asm_captured(virc_bin, fixture_path, asm_o3_path, target, "-O3" as int, 1, test_stdout, test_stderr, compile_timeout)
+                                            asm_o0 = proc_read_file(asm_o0_path)
+                                            asm_o1 = proc_read_file(asm_o1_path)
+                                            asm_o2 = proc_read_file(asm_o2_path)
+                                            asm_o3 = proc_read_file(asm_o3_path)
+                                        proc_unlink(asm_o0_path)
+                                        proc_unlink(asm_o1_path)
+                                        proc_unlink(asm_o2_path)
+                                        proc_unlink(asm_o3_path)
+
+                                        if o0_exit == 0 and o1_exit == 0 and o2_exit == 0 and o3_exit == 0 and oracle_check_ffi003_noopt(asm_o0, asm_o1, asm_o2, asm_o3) == 1 do
+                                            pass_cnt = pass_cnt + 1
+                                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "@bind(asm) body is stable at O0..O3 while the normal control remains optimizable" as int)
+                                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "PASS" as int)
+                                            native_write_i64(results_arr, res_count * 8, rec as int)
+                                            res_count = res_count + 1
+                                        else
+                                            fail_cnt = fail_cnt + 1
+                                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "@bind(asm) O0..O3 no-opt structural oracle failed" as int)
+                                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                            native_write_i64(results_arr, res_count * 8, rec as int)
+                                            res_count = res_count + 1
+                                        end
+                                    else
+                                        pass_cnt = pass_cnt + 1
+                                        rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "Structural check executed" as int)
+                                        let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "PASS" as int)
+                                        native_write_i64(results_arr, res_count * 8, rec as int)
+                                        res_count = res_count + 1
+                                    end
+                                end
+                            end
+                            proc_unlink(test_bin)
+                            proc_unlink(test_stdout)
+                            proc_unlink(test_stderr)
+                        end
+
+                    # ── Kind: wasm_run ──
+                    eif cli_streq(row.kind, "wasm_run" as int) == 1 do
+                        let node_bin = proc_find_node()
+                        if proc_strlen(node_bin) == 0 do
+                            blocked_cnt = blocked_cnt + 1
+                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "BLOCKED" as int, "Node.js is required for Wasm validation" as int)
+                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "BLOCKED" as int)
+                            native_write_i64(results_arr, res_count * 8, rec as int)
+                            res_count = res_count + 1
+                        else
+                            let wasm_bin = proc_str_concat4(tmp_dir, "/" as int, row.test_id, ".wasm" as int)
+                            proc_unlink(wasm_bin)
+                            proc_unlink(test_stdout)
+                            proc_unlink(test_stderr)
+
+                            let c_exit = proc_compile_file_captured(
+                                virc_bin,
+                                fixture_path,
+                                wasm_bin,
+                                "wasm32-wasi-p1" as int,
+                                opt_level,
+                                0,
+                                vflags,
+                                test_stdout,
+                                test_stderr,
+                                compile_timeout
+                            )
+
+                            if c_exit != 0 or proc_file_exists(wasm_bin) == 0 do
+                                fail_cnt = fail_cnt + 1
+                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Wasm compilation failed" as int)
+                                proc_unlink(wasm_bin)
+                                proc_unlink(test_stdout)
+                                proc_unlink(test_stderr)
+                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                res_count = res_count + 1
+                            else
+                                proc_unlink(test_stdout)
+                                proc_unlink(test_stderr)
+
+                                if cli_streq(row.test_id, "FFI-007" as int) == 1 do
+                                    let valid_exit = proc_run_cmd5_captured(
+                                        node_bin,
+                                        "--no-warnings" as int,
+                                        ffi_wasm_script_path,
+                                        wasm_bin,
+                                        "valid" as int,
+                                        test_stdout,
+                                        test_stderr,
+                                        test_timeout
+                                    )
+                                    let valid_out = proc_str_trim(proc_read_file(test_stdout))
+                                    proc_unlink(test_stdout)
+                                    proc_unlink(test_stderr)
+
+                                    let missing_exit = proc_run_cmd5_captured(
+                                        node_bin,
+                                        "--no-warnings" as int,
+                                        ffi_wasm_script_path,
+                                        wasm_bin,
+                                        "missing" as int,
+                                        test_stdout,
+                                        test_stderr,
+                                        test_timeout
+                                    )
+                                    proc_unlink(test_stdout)
+                                    proc_unlink(test_stderr)
+
+                                    let wrong_type_exit = proc_run_cmd5_captured(
+                                        node_bin,
+                                        "--no-warnings" as int,
+                                        ffi_wasm_script_path,
+                                        wasm_bin,
+                                        "wrong_type" as int,
+                                        test_stdout,
+                                        test_stderr,
+                                        test_timeout
+                                    )
+                                    proc_unlink(test_stdout)
+                                    proc_unlink(test_stderr)
+                                    proc_unlink(wasm_bin)
+
+                                    if valid_exit == 0 and cli_streq(valid_out, "42" as int) == 1 and missing_exit == 0 and wrong_type_exit == 0 do
+                                        pass_cnt = pass_cnt + 1
+                                        rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "Wasm env.host_value import, i64 call/result, missing-import mutation, and wrong-result mutation verified" as int)
+                                        let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "PASS" as int)
+                                        native_write_i64(results_arr, res_count * 8, rec as int)
+                                        res_count = res_count + 1
+                                    else
+                                        fail_cnt = fail_cnt + 1
+                                        rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Wasm FFI import/runtime mutation oracle failed" as int)
+                                        let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                        native_write_i64(results_arr, res_count * 8, rec as int)
+                                        res_count = res_count + 1
+                                    end
+                                else
+                                    var extra_arg = "" as int
+                                    if cli_streq(row.test_id, "MEM-WASM-001" as int) == 1 do
+                                        extra_arg = "inspect_slab" as int
+                                    end
+
+                                    let r_exit = proc_run_cmd5_captured(
+                                        node_bin,
+                                        "--no-warnings" as int,
+                                        wasi_script_path,
+                                        wasm_bin,
+                                        extra_arg,
+                                        test_stdout,
+                                        test_stderr,
+                                        test_timeout
+                                    )
+                                    let r_out = proc_read_file(test_stdout)
+
+                                    proc_unlink(wasm_bin)
+                                    proc_unlink(test_stdout)
+                                    proc_unlink(test_stderr)
+
+                                    if cli_streq(row.test_id, "MEM-WASM-001" as int) == 1 do
+                                        let trimmed_out = proc_str_trim(r_out)
+                                        if r_exit == 0 and cli_streq(trimmed_out, "0ok" as int) == 1 do
+                                            pass_cnt = pass_cnt + 1
+                                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "Wasm slab reused the released size-class slot" as int)
+                                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "PASS" as int)
+                                            native_write_i64(results_arr, res_count * 8, rec as int)
+                                            res_count = res_count + 1
+                                        else
+                                            fail_cnt = fail_cnt + 1
+                                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Wasm slab reuse validation/execution failed" as int)
+                                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                            native_write_i64(results_arr, res_count * 8, rec as int)
+                                            res_count = res_count + 1
+                                        end
+                                    else
+                                        if r_exit == -999 do
+                                            fail_cnt = fail_cnt + 1
+                                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Wasm execution TIMEOUT" as int)
+                                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                            native_write_i64(results_arr, res_count * 8, rec as int)
+                                            res_count = res_count + 1
+                                        eif r_exit != 0 do
+                                            fail_cnt = fail_cnt + 1
+                                            rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Wasm execution failed with non-zero exit code" as int)
+                                            let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                            native_write_i64(results_arr, res_count * 8, rec as int)
+                                            res_count = res_count + 1
+                                        else
+                                            let exp_stdout = fixture_extract_expected_stdout(fcontent)
+                                            let matched = oracle_check_stdout(row.oracle, exp_stdout, r_out)
+                                            if matched == 1 do
+                                                pass_cnt = pass_cnt + 1
+                                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "PASS" as int, "Wasm execution matched expected oracle" as int)
+                                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "PASS" as int)
+                                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                                res_count = res_count + 1
+                                            else
+                                                fail_cnt = fail_cnt + 1
+                                                rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Wasm stdout mismatch" as int)
+                                                let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                                                native_write_i64(results_arr, res_count * 8, rec as int)
+                                                res_count = res_count + 1
+                                            end
+                                        end
+                                    end
+                                end
+                            end
+                        end
+
+                    # ── Fallback: UNKNOWN TEST KIND MUST FAIL (Never auto-pass!) ──
+                    else
+                        fail_cnt = fail_cnt + 1
+                        rep_print_test_row(run_idx, matched_count, row.test_id, row.kind, "FAIL" as int, "Unknown test kind" as int)
+                        let rec = ResultRecord(test_id: row.test_id, kind: row.kind, status: "FAIL" as int)
+                        native_write_i64(results_arr, res_count * 8, rec as int)
+                        res_count = res_count + 1
+                    end
+
+                    let test_wasm_clean = proc_str_concat4(tmp_dir, "/" as int, row.test_id, ".wasm" as int)
+                    proc_unlink(test_bin)
+                    proc_unlink(test_stdout)
+                    proc_unlink(test_stderr)
+                    proc_unlink(test_asm)
+                    proc_unlink(test_wasm_clean)
+                end
+            end
+        end
+
+        i = i + 1
+    end
+
+    # Save baseline if requested
+    if cli_strlen(save_baseline) > 0 do
+        rep_save_baseline(save_baseline, results_arr, res_count)
+    end
+
+    # Check baseline if requested
+    var baseline_ok = 1
+    if cli_strlen(check_baseline) > 0 do
+        baseline_ok = rep_check_baseline(check_baseline, results_arr, res_count)
+    end
+
+    rep_print_summary(pass_cnt, fail_cnt, blocked_cnt, matched_count)
+
+    # Clean up temporary harness files and process directory
+    proc_unlink(wasi_script_path)
+    proc_unlink(ffi_wasm_script_path)
+    proc_rmdir(tmp_dir)
+
+    if cli_strlen(check_baseline) > 0 do
+        if baseline_ok == 1 do
+            exit_prog(0)
+        else
+            exit_prog(1)
+        end
+    end
+
+    if fail_cnt > 0 do
+        exit_prog(1)
+    end
+    exit_prog(0)
+end.

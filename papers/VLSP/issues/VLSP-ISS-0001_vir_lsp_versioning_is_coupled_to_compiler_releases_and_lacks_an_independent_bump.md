@@ -3,11 +3,11 @@ id: "VLSP-ISS-0001"
 type: "ISSUE"
 domain: "VLSP"
 title: "vir-lsp versioning is coupled to compiler releases and lacks an independent bump policy"
-status: "OPEN"
+status: "CLOSED"
 severity: "S3"
 priority: "P1"
 created: "2026-10-07"
-updated: "2026-10-07"
+updated: "2026-10-11"
 owners:
   - "lsp"
 components:
@@ -16,8 +16,10 @@ components:
   - "protocol"
 related:
   issues: []
-  plans: []
-  reports: []
+  plans:
+    - "VLSP-PLN-0002"
+  reports:
+    - "VLSP-RPT-0002"
 supersedes: null
 superseded_by: null
 tags:
@@ -132,3 +134,6 @@ response có thể lệch nhau sau một issue.
 |---|---|
 | 2026-10-07 | Opened from the `4.0.0` source/binary audit and defined the independent `1.3.0` SemVer contract |
 | 2026-10-07 | Recorded rebuilt `1.3.0` binary identity, initialize-response parity, protocol smoke tests, and binary hash |
+| 2026-10-11 | Linked VLSP-PLN-0002 |
+| 2026-10-11 | Linked VLSP-RPT-0002 |
+| 2026-10-11 | Closed after independent synchronization audit confirmed current 1.3.1 ownership, 121/121 native protocol regressions and accepted VLSP-RPT-0002 |

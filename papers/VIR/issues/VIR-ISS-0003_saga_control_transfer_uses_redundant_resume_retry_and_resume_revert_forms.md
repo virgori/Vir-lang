@@ -7,7 +7,7 @@ status: "TRIAGED"
 severity: "S3"
 priority: "P2"
 created: "2026-10-04"
-updated: "2026-10-04"
+updated: "2026-10-08"
 owners:
   - "language"
   - "compiler"
@@ -21,7 +21,8 @@ components:
   - "diagnostics"
   - "tests"
 related:
-  issues: []
+  issues:
+    - "VIRC-ISS-0058"
   plans: []
   reports: []
 supersedes: null
@@ -231,3 +232,4 @@ intentionally not performed here. The ISSUE therefore remains `TRIAGED`.
 |---|---|
 | 2026-10-04 | Resolved the normative VIR portion in v2.1 as `retry`/`rethrow`; retained TRIAGED status for deferred VIRC implementation and verification |
 | 2026-10-04 | Created and triaged from the current Saga syntax, parser, lowering, and focused runtime fixtures |
+| 2026-10-08 | Linked VIRC-ISS-0058 |

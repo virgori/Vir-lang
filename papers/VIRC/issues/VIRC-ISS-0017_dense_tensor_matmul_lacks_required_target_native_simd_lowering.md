@@ -7,7 +7,7 @@ status: "TRIAGED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-03"
-updated: "2026-10-04"
+updated: "2026-10-08"
 owners:
   - "compiler"
 components:
@@ -21,7 +21,9 @@ components:
   - "tests"
 related:
   issues:
+    - "VIR-ISS-0014"
     - "VIRC-ISS-0036"
+    - "VIRC-ISS-0057"
   plans: []
   reports: []
 supersedes: null
@@ -185,3 +187,5 @@ standalone correctness blocker.
 |---|---|
 | 2026-10-03 | Created and triaged from source and O3 disassembly audit of dense tensor matmul |
 | 2026-10-04 | Linked VIRC-ISS-0036 |
+| 2026-10-08 | Linked VIRC-ISS-0057 |
+| 2026-10-08 | Linked VIR-ISS-0014 |

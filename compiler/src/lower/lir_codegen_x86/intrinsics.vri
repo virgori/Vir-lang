@@ -122,21 +122,21 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
         out x86_emit_nop(cb)
     end
     if kind == MIR_INTR_TRAIN do
-        cb = x86_emit_mov_reg_imm32(cb, SCR as int, 1)
-        cb = x86_emit_mov_mem_reg(cb, X86_R15, 8, SCR as int)
-        cb = x86_emit_xor_rr(cb, SCR as int, SCR as int)
-        cb = x86_emit_mov_mem_reg(cb, X86_R15, 16, SCR as int)
-        cb = x86_emit_mov_mem_reg(cb, X86_R15, 24, SCR as int)
-        out cb
+		out x86_emit_nop(cb)
     end
     if kind == MIR_INTR_INFER do
-        cb = x86_emit_xor_rr(cb, SCR as int, SCR as int)
-        cb = x86_emit_mov_mem_reg(cb, X86_R15, 8, SCR as int)
-        out cb
+		out x86_emit_nop(cb)
     end
     if kind == MIR_INTR_QUANTIZE do
         cb = x86_emit_mov_rr(cb, X86_RSI, X86_RDI)
         cb = emit_to_rdi(cb, ins_src1, assigned_phys)
+        var elem_sz: i64 = 8
+        if ins_typ == (LirType.F32 as i64) do
+            elem_sz = 4
+        eif ins_typ == (LirType.F16 as i64) do
+            elem_sz = 2
+        end
+        cb = x86_emit_mov_reg_imm32(cb, X86_RDX, elem_sz as int)
         cb = emit_call_fixup_x86(cb, call_fixups, 1, LIR_RT_QUANTIZE, rd)
         if rd < 0 do
             cb = store_spilled_result_x86(cb, ins_dst as LirOperand, X86_RAX)
@@ -144,7 +144,21 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
         out cb
     end
     if kind == MIR_INTR_BACKWARD do
-        cb = emit_call_fixup_x86(cb, call_fixups, 1, LIR_RT_BACKWARD, rd)
+		# Stage through the machine stack so arbitrary register allocation cannot
+		# create argument-register move cycles.
+		var ai = 0
+		when ai < 5 loop
+			let aop = vec_get_rt(recent_setargs, ai) as LirOperand
+			let ar = resolve_or_imm_reg_x86(cb, aop, assigned_phys, SCR)
+			cb = x86_emit_push(cb, ar as int)
+			ai = ai + 1
+		end
+		cb = x86_emit_pop(cb, X86_R8)
+		cb = x86_emit_pop(cb, X86_RCX)
+		cb = x86_emit_pop(cb, X86_RDX)
+		cb = x86_emit_pop(cb, X86_RSI)
+		cb = x86_emit_pop(cb, X86_RDI)
+		cb = emit_call_fixup_x86(cb, call_fixups, 1, LIR_RT_BACKWARD, rd)
         if rd < 0 do
             cb = store_spilled_result_x86(cb, ins_dst as LirOperand, X86_RAX)
         end
@@ -381,6 +395,14 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
         end
         cb = emit_to_rdi(cb, target_src2, assigned_phys)
         out emit_call_fixup_x86(cb, call_fixups, 1, LIR_RT_PRINT_STR, rd)
+    end
+    if kind == MIR_INTR_PRINT_FLOAT do
+        var target_src_flt = ins_src1
+        if (target_src_flt as i64) == 0 or native_read_i64(target_src_flt as i64, 0) == 0 do
+            target_src_flt = ins_src2
+        end
+        cb = emit_to_rdi(cb, target_src_flt, assigned_phys)
+        out emit_call_fixup_x86(cb, call_fixups, 1, LIR_RT_PRINT_FLOAT, rd)
     end
     if kind == MIR_INTR_ADDR_OF do
         var target_rd = rd
@@ -682,6 +704,76 @@ func emit_lir_intrinsic_x86(cb: &CodeBuf, ins: LirInstr, rd: i64, rs1: i64, assi
         end
         out x86_emit_nop(cb)
     end
+    if (kind and 0xFF) == MIR_INTR_BIT_EXTRACT do
+        lsb = (kind shr 8) and 0x3F
+        width = (kind shr 16) and 0x7F
+        var target_reg = rd
+        if target_reg < 0 do target_reg = SCR end
+        r_base = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, SCR2)
+        if target_reg != r_base do
+            cb = x86_emit_mov_rr(cb, target_reg as int, r_base as int)
+        end
+        if lsb > 0 do
+            cb = x86_emit_shr_imm(cb, target_reg as int, lsb as int)
+        end
+        if width < 64 do
+            var mask: i64 = 0
+            if width == 63 do
+                mask = 0x7FFFFFFFFFFFFFFF
+            else
+                mask = (1 shl width) - 1
+            end
+            cb = x86_emit_mov_reg_imm64(cb, SCR2 as int, mask)
+            cb = x86_emit_and_rr(cb, target_reg as int, SCR2 as int)
+        end
+        if rd < 0 do
+            out store_spilled_result_x86(cb, ins_dst as LirOperand, target_reg)
+        end
+        out cb
+    end
+    if (kind and 0xFF) == MIR_INTR_BIT_INSERT do
+        lsb = (kind shr 8) and 0x3F
+        width = (kind shr 16) and 0x7F
+        s0 = vec_get_rt(recent_setargs, 0)
+        r_val = resolve_or_imm_reg_x86(cb, s0, assigned_phys, SCR2)
+        if r_val != SCR2 do
+            cb = x86_emit_mov_rr(cb, SCR2 as int, r_val as int)
+        end
+        var mask: i64 = 0
+        if width == 63 do
+            mask = 0x7FFFFFFFFFFFFFFF
+        eif width >= 64 do
+            mask = 0 - 1
+        else
+            mask = (1 shl width) - 1
+        end
+        cb = x86_emit_mov_reg_imm64(cb, X86_RAX, mask)
+        cb = x86_emit_and_rr(cb, SCR2 as int, X86_RAX)
+        if lsb > 0 do
+            cb = x86_emit_shl_imm(cb, SCR2 as int, lsb as int)
+        end
+        var target_rd = rd
+        if target_rd < 0 or target_rd == SCR2 do target_rd = SCR end
+        r_base = resolve_or_imm_reg_x86(cb, ins_src1, assigned_phys, target_rd)
+        if r_base != target_rd do
+            cb = x86_emit_mov_rr(cb, target_rd as int, r_base as int)
+        end
+        var clear_mask: i64 = 0
+        if width >= 64 do
+            clear_mask = 0
+        else
+            clear_mask = (mask shl lsb) xor (0 - 1)
+        end
+        cb = x86_emit_mov_reg_imm64(cb, X86_RAX, clear_mask)
+        cb = x86_emit_and_rr(cb, target_rd as int, X86_RAX)
+        cb = x86_emit_or_rr(cb, target_rd as int, SCR2 as int)
+        if rd < 0 do
+            out store_spilled_result_x86(cb, ins_dst as LirOperand, target_rd)
+        eif target_rd != rd do
+            cb = x86_emit_mov_rr(cb, rd as int, target_rd as int)
+        end
+        out cb
+    end
     cb = emit_to_rdi(cb, ins_src1, assigned_phys)
     stub2 = kind
     if stub2 < 1 or stub2 >= LIR_RT_STUB_COUNT do
@@ -727,4 +819,3 @@ func reverse_pending_stack_args_x86(cb: &CodeBuf, pending_stk: i64):
     end
     out cb
 end.
-

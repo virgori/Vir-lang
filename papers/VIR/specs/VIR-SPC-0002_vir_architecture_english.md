@@ -2,13 +2,13 @@
 id: "VIR-SPC-0002"
 type: "SPEC"
 domain: "VIR"
-title: "Vir – Architecture Specification (Vir v2.0)"
+title: "Vir – Architecture Specification (Vir v2.2)"
 status: "ACTIVE"
-version: "2.0.1"
+version: "2.2.0"
 language: "en"
 spec_class: "ARCHITECTURE"
 created: "2026-09-09"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "VIR"
   - "VIRC"
@@ -16,19 +16,23 @@ components: []
 aliases:
   - "docs/ARCHITECTURE_en.md"
 related:
-  issues: []
-  plans: []
-  reports: []
+  issues:
+    - "VIR-ISS-0014"
+    - "VIR-ISS-0018"
+  plans:
+    - "VIR-PLN-0001"
+  reports:
+    - "VIR-RPT-0001"
 supersedes: null
 superseded_by: null
 tags:
   - "migrated-from-docs"
 ---
 
-# VIR-SPC-0002 — Vir – Architecture Specification (Vir v2.0)
+# VIR-SPC-0002 — Vir – Architecture Specification (Vir v2.2)
 
-> **Version:** 2.0.1 (Self-Hosted / Production)
-> **Updated:** 2026-10-06
+> **Version:** 2.2.0 (Self-Hosted / Production)
+> **Updated:** 2026-10-10
 > **Language Standard:** Vir Language Specification v2.0 (§1.2, §26, §29, §30)  
 > **Status:** Sovereign Systems Language — Zero Python, Zero C runtime shims, Zero libc, Zero External Linker.  
 > **Canonical Pipeline:** `Source (.vri) → Lexer / Parser → AST → Semantic Analysis (10 Passes) → HIR/MIR (CFG + SSA) → MIR Opts → LIR → RegAlloc (Chaitin-Briggs + George-Appel IRC) → Direct Codegen → Mach-O / ELF / WASM`  
@@ -115,8 +119,8 @@ Vir is a sovereign, high-performance systems and AI-native programming language 
    - The Vir lexer processes UTF-8 character streams with single-pass greedy matching for standard Vir tokens, delivering deterministic parsing and microsecond-level lexical analysis.
 
 3. **Strict Block Closing & Opener Law:**
-   - **Definitions / Declarations** (`func`, `entity`, `enum`, `register`, `mold`, `method`, etc.) close with **`end.`**
-   - **Control Flow / Statement Blocks** (`if`, `when`, `for`, `loop`, `case`, `try`, `arena`, etc.) close with **`end`**
+   - **Top-level Definitions / Declarations** (`func`, `entity`, `enum`, `register`, `mold`, etc.) close with **`end.`**
+   - **Nested Member / Control Flow / Statement Blocks** (entity `method`, `if`, `when`, `for`, `loop`, `case`, `try`, `arena`, etc.) close with **`end`**. `method` is invalid at module scope; standalone extension behavior uses `func` through UFCS.
    - **Openers:**
      - Expression before body → opened by **`do`** or **`loop`** (`if cond do`, `when cond loop`, `for i in 0..10 do`).
      - No expression before body → opened by colon **`:`** (`func main:`, `try:`, `arena:`).
@@ -125,7 +129,7 @@ Vir is a sovereign, high-performance systems and AI-native programming language 
 4. **First-Class AI / Machine Learning (Spec v2.0 §26):**
    - Built-in rank-N `tensor<T>[Dimensions...]` is a first-class language type.
    - Matrix multiplication `**` and fused multiply-add `><` are dedicated hardware-level language operators accelerated by SIMD (NEON on ARM64, AVX on x86_64).
-   - Dedicated execution scopes: `infer:` for zero-overhead inference and `train:` for automatic computation graph tracking.
+   - Dedicated execution scopes: `infer:` for forward-only inference and `train:` for ahead-of-time reverse-mode autodiff.
    - Native reverse-mode autodiff (`loss.backward()`) and multi-bit quantization (`quantize(t, bits)`).
 
 ---
@@ -478,15 +482,23 @@ ightarrow [M, N]$).
 
 ### 7.3. Execution Contexts: `infer:` and `train:`
 - **`infer:` Block:**
-  - Disables computation graph tracking for zero autodiff memory overhead.
+  - Generates forward code only; no derivative program or backward-only state.
   - Employs static activation buffer reuse to minimize RAM consumption.
 - **`train:` Block:**
-  - Automatically activates the dynamic computation tape.
-  - Allocates `.grad` fields on parameter tensors to accumulate partial derivatives.
+  - Builds a typed/static operation graph in the compiler and emits coupled
+    forward and reverse programs before target code generation.
+  - Uses ordinary native gradient tensors and compiler-planned activation or
+    execution-state storage; it does not activate a runtime graph tape.
 
-### 7.4. Reverse-Mode Tape Autodiff (`backward()`)
-- During execution within `train:`, tensor mathematical operations record operation nodes and parent references onto an autodiff tape.
-- Invoking `loss.backward()` initiates a reverse topological traversal across the tape, applying the calculus chain rule to compute gradients stored directly in `.grad`.
+### 7.4. Ahead-of-Time Reverse-Mode Autodiff (`backward()`)
+- The typed HIR/MIR/SSA transformation emits reverse operations in static
+  reverse dependency order and direct target kernels for supported operators.
+- `loss.backward()` enters that generated reverse program. Fan-out
+  contributions accumulate into ordinary gradient tensors; no runtime operator
+  node, parent-link traversal, or implicit tracing fallback is permitted.
+- Dynamic control flow uses an AOT reverse CFG plus compact execution state when
+  supported. Unsupported operations, shapes, effects, or targets fail before
+  artifact emission as specified by VIR-SPC-0017/0018 §26.4.
 
 ### 7.5. Multi-Bit Quantization (`quantize`)
 - The built-in primitive `quantize(tensor, format)` enables precision conversions:
@@ -653,5 +665,7 @@ To maintain codebase transparency, the table below delineates obsolete early pro
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-10 | 2.2.0 | Classified entity methods as nested `end` blocks, reserved `end.` for the owning declaration, and removed module-scope `method` under VIR-ISS-0018 |
+| 2026-10-08 | 2.1.0 | Replaced runtime tape architecture with AOT typed-IR reverse transformation, native gradient storage, and fail-closed target capability rules |
 | 2026-10-06 | 2.0.1 | Corrected operator classification: `>>` is a cast; shifts use only `shl` and `shr` |
 | 2026-10-02 | 2.0.0 | Migrated from `docs/ARCHITECTURE_en.md` and assigned stable ID `VIR-SPC-0002` |

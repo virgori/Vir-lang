@@ -2,13 +2,13 @@
 id: "VIR-SPC-0017"
 type: "SPEC"
 domain: "VIR"
-title: "Vir Language Specification v3.1.1"
+title: "Vir Language Specification v3.6.0"
 status: "ACTIVE"
-version: "3.1.1"
+version: "3.6.0"
 language: "en"
 spec_class: "SPECIFICATION"
 created: "2026-05-12"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "VIR"
 components: []
@@ -22,17 +22,27 @@ related:
     - "VIR-ISS-0006"
     - "VIR-ISS-0007"
     - "VIR-ISS-0008"
-  plans: []
-  reports: []
+    - "VIR-ISS-0014"
+    - "VIR-ISS-0017"
+    - "VIR-ISS-0018"
+    - "VIR-ISS-0019"
+    - "VIRC-ISS-0046"
+    - "VIRC-ISS-0065"
+  plans:
+    - "VIR-PLN-0001"
+    - "VIR-PLN-0003"
+  reports:
+    - "VIR-RPT-0001"
+    - "VIR-RPT-0003"
 supersedes: null
 superseded_by: null
 tags:
   - "migrated-from-docs"
 ---
 
-# VIR-SPC-0017 — Vir Language Specification v3.1.1
+# VIR-SPC-0017 — Vir Language Specification v3.6.0
 
-*Version: 3.1.1 | Date: October 6, 2026 | Status: Living Document*
+*Version: 3.6.0 | Date: October 10, 2026 | Status: Living Document*
 *Supersedes: v1.2 (March 2026)*
 
 ---
@@ -79,8 +89,8 @@ Vir is a compiled, structured, block-scoped systems programming language. It com
 
 **Core principles:**
 - **Block closers — single rule:**
-  - **Definitions / declarations** (`func`, `async func`, `entity`, `method`, `enum`, `register`, `mold`, `@bind` stubs, …) → close with **`end.`**
-  - **Control-flow / statement blocks** (`if` / `eif` / `else`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, `isolate`, …) → close with **`end`**
+  - **Top-level definitions / declarations** (`func`, `async func`, `entity`, `enum`, `register`, `mold`, `@bind` stubs, …) → close with **`end.`**
+  - **Nested member, control-flow, and statement blocks** (entity `method`, `if` / `eif` / `else`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, `isolate`, …) → close with **`end`**
 - **Separator — one concept** (see §1.0): every list (statements, declaration groups, named-args, `case` arms, …) is separated by **`;` or newline (`NEWLINE`)**. Multiple items on the **same line** require `;`
 - **Block openers — two principles** (see §1.1): (1) only an independent block gets an opener; continuations (`else`, `ensure`, `revert`, …) take no `:` — (2) expression before the body → `do`/`loop`; otherwise → `:`
 - Colon `:` is also used for type annotation and key-value mapping (dict, case, map)
@@ -452,19 +462,23 @@ Modules follow a strict declaration order:
 include → import → const → var → entity → func → export → share
 ```
 
-### 3.2 Include — Physical File Loading
+### 3.2 Include — Implementation Composition
 
-Loads one or more registered modules and establishes namespaces. An alias
-changes only the local namespace, not canonical identity.
+`include` composes one or more implementation fragments into the current
+logical module. Included declarations participate in its unqualified scope and
+retain source provenance, but include creates no module namespace or separate
+export boundary. Only explicit exports of the composed module are public.
 
 ```vir
 include math;
-include net.http as web;
-include math, io.file as file, net.http as web;
+include internal.logging;
+include math, io.file, internal.logging;
 ```
 
-Multi-include is equivalent to separate directives evaluated left to right; an
-`as` alias applies only to the item immediately before it.
+`include M as A` is invalid because no include namespace exists to rename.
+Multi-include is equivalent to separate composition directives. Duplicate
+declarations across fragments or between a fragment and consumer are
+compile-time errors independent of include order; later fragments never win.
 
 The dot `.` is the only separator inside a Module ID. `A::B` is not valid Vir
 syntax and must be rejected in every context. Direct filesystem paths are a
@@ -483,6 +497,9 @@ it uses a path-derived identity. An unregistered dotted spelling may fall back
 to dot-to-slash lookup for legacy compatibility, but new projects should declare
 the ID in `module.list`.
 
+The complete composition, namespace, visibility, identity, and migration
+contract is normative in `VIR-SPC-0021`.
+
 ### 3.3 Import — Exported Symbols and Namespaces
 
 ```vir
@@ -490,14 +507,16 @@ import add, sub from math;           # selective import
 import MAX_RETRY from net.config;    # constants use the same selective form
 import get from net.http as fetch;   # `get` is an ordinary export name
 import answer from "provider.vri";   # direct-path compatibility provider
-import from net.http;                # complete export surface
+import net.http;                     # whole-module namespace
 import net.http as web;              # whole-module namespace
 ```
 
 Import does not require a preceding include. Selective import applies uniformly
-to exported functions, types, constants, and variables. `import from module`
-brings every exported declaration into local scope. `import module as alias`
-creates a namespace and does not inject unqualified names.
+to exported functions, types, constants, and variables. `from` is valid only
+after a non-empty selective symbol list. `import module` creates the canonical
+whole-module namespace, and `import module as alias` binds it under an explicit
+local name; neither form injects all exports as unqualified names. `import from
+module` is invalid syntax.
 
 ### 3.4 Export / Share / Port
 
@@ -1330,11 +1349,11 @@ entity User:
 
     method greet:
         print("Hello, $this.name")
-    end.
+    end
 
     method birthday:
         this.age = this.age + 1
-    end.
+    end
 end.
 
 var u = User(name: "Alice", age: 30)
@@ -1342,10 +1361,18 @@ u.greet()              # calls method — prints "Hello, Alice"
 u.birthday()           # mutates u.age → 31
 ```
 
-**Additionally**, standalone functions can be called as methods via UFCS (see [§11 UFCS](#11-ufcs--uniform-function-call-syntax)). When the compiler sees `x.foo()`:
-1. If `x` is an entity and `foo` is a field → field access
-2. If `foo` is a `method` of entity type → method call (implicit `this`)
-3. If `foo(x, ...)` exists as a standalone function → UFCS call
+`method` is an entity-member declaration, not a module-level declaration. A
+member method closes with `end`; the owning entity closes with `end.`. A
+module-level extension uses `func` with an explicit first receiver parameter
+and may be called through UFCS. Module-level `method` is invalid.
+
+The focused declaration contract, including ownership, implicit `this`, and
+terminators, is normative in `VIR-SPC-0022`.
+
+**Additionally**, standalone functions can be called as methods via UFCS (see [§11 UFCS](#11-ufcs--uniform-function-call-syntax)). Member access and calls are distinguished syntactically: `x.foo` is always field access, while `x.foo(args)` is a call. When the compiler sees `x.foo(args)`:
+1. If `foo` is a `method` of the entity type → method call (implicit `this`)
+2. If `foo` is a **callable field** (field of structural function type) → indirect call via field value
+3. If `foo(x, args)` exists as a standalone function → UFCS call
 4. Otherwise → compile error
 
 ### 7.3 Packed Entity
@@ -1713,6 +1740,11 @@ When the compiler sees `x.foo(args)`:
 3. If `foo(x, args)` exists as a standalone function → UFCS call
 4. Otherwise → compile error
 
+Method and callable-field selection are terminal by name: an arity or type
+failure after either selection is a compile error and MUST NOT fall back to a
+lower-priority candidate. A same-named non-callable field is not a call
+candidate and MUST NOT prevent step 3. See `VIR-SPC-0023`.
+
 Step 2 enables event-driven patterns where entity fields store callbacks:
 
 ```vir
@@ -1752,6 +1784,21 @@ print u.name()             # → "display: Alice"     (UFCS call  — has parens
 ```
 
 This means a field and a function can share the same identifier without conflict. The compiler **never** guesses — `x.foo` is always a field, `x.foo()` is always a call.
+
+**UFCS resolution and callable shadowing.** For `receiver.member(args)`, the
+compiler MUST try an entity method, then a structural callable field, then an
+eligible visible free function. A non-callable field MUST NOT prevent the free
+UFCS step. Once a method or callable field is selected by name, any
+argument-count, type, ownership, or other call-check failure MUST be reported;
+the compiler MUST NOT fall back to a lower-priority candidate.
+
+Adding an entity method or callable field MAY redirect an existing free UFCS
+call. Changing a same-named field from a data type to a structural function
+type MAY do the same. These are potentially source-breaking API changes. To
+explicitly select a free function, callers SHOULD use
+`member(receiver, args)`, with module qualification when necessary. The full
+normative contract is `VIR-SPC-0023`; entity method declarations are specified
+by `VIR-SPC-0022`.
 
 ---
 
@@ -2848,11 +2895,11 @@ entity Point:
 
     method hash -> u64
         out (this.x as u64) * 31 + (this.y as u64)
-    end.
+    end
 
     method equals(other: Point) -> bool
         out this.x == other.x and this.y == other.y
-    end.
+    end
 end.
 
 var grid: dict of (Point, string) = [Point(x: 0, y: 0): "origin"]
@@ -3675,7 +3722,10 @@ infer:
 end
 ```
 
-An `infer` block **disables all gradient tracking**: no autodiff buffers, no activations kept for backward. ~50% less RAM than `train` mode. Use for deployment / production serving.
+An `infer` block is forward-only. The compiler does not generate derivative
+code, gradient buffers, or backward-only activation/execution-state storage for
+operations whose lifetime is wholly inside the block. No fixed memory-saving
+ratio is part of the language contract.
 
 **Semantics:**
 - All `tensor` / `**` ops inside are optimized for forward-only
@@ -3693,15 +3743,70 @@ train:
 end
 ```
 
-A `train` block enables **native autodiff**: tensor ops are traced automatically; `.backward()` computes gradients over the full compute graph. No external library required.
+A `train` block enables **native ahead-of-time reverse-mode autodiff**. After
+type, shape, effect, and ownership analysis, the compiler transforms the typed
+HIR/MIR/SSA operation graph into a coupled forward program and reverse program.
+`.backward()` invokes statically generated reverse code; it does not create or
+traverse runtime operator nodes, parent links, or an implicit dispatch tape.
+
+The generated program may retain tensor activations and compact execution state
+(for example, the branch taken or loop iteration count) when required by the
+derivative. Such state is ordinary compiler-planned native storage, not a
+dynamic computation graph. The compiler must not silently fall back to runtime
+graph tracing.
+
+**Differentiability and compile-time boundary:**
+
+- Tensor dtype, rank, shape, operator derivative, and target capability must be
+  resolved before artifact emission. Native static-shape tensor operations are
+  eligible when the active target supplies the required forward and reverse
+  kernels.
+- Scalar/tensor arithmetic, function calls, branches, and loops are
+  differentiable only when every value-dependent path has a typed derivative
+  and the compiler can construct a reverse CFG. A target or compiler revision
+  that lacks this capability must reject the program with a stable diagnostic;
+  dynamic control flow alone never authorizes runtime tracing.
+- Data-dependent tensor rank or shape is outside the static tensor contract and
+  must be rejected. Recursion, indirect/extern calls, custom operators, or
+  side-effecting calls require an approved derivative contract; otherwise they
+  fail closed.
+- Mutation and aliasing are valid only when ownership/borrow analysis can
+  identify the differentiated value version and preserve every activation
+  required by reverse execution. Observable I/O and external effects are not
+  replayed by the reverse program.
+- Custom-gradient and stop-gradient syntax, higher-order derivatives, and an
+  opt-in runtime graph API are not defined in v3.2.0. Their use must not be
+  inferred implicitly and is rejected unless a later SPEC adds the contract.
+
+**Gradient contract:**
+
+- For a tensor root, `.backward()` seeds the root gradient with ones of the
+  root's static shape and dtype. Gradients have the primal tensor's shape and
+  differentiable accumulation dtype.
+- Contributions from fan-out paths are summed by the generated reverse
+  program. Each `.backward()` invocation replaces the reachable gradient set;
+  accumulation occurs within that invocation, so repeating the call is
+  deterministic and does not implicitly add the preceding invocation.
+- `value.grad` is a public tensor projection after a successful backward call
+  for a reachable train value. Reading it before backward, outside `train`, or
+  for an unreachable/unsupported value is a compile-time error.
+
+**Storage and cleanup:**
+
+- Activation, execution-state, and gradient storage obey the ordinary
+  ownership, borrow, arena, promotion, and alignment rules. The compiler plans
+  their lifetimes and must clean them on normal, early-return, and error exits.
+- Buffer reuse and checkpoint/recompute are permitted optimizations only when
+  they preserve observable values and effects. The SPEC promises no fixed RAM
+  multiplier or speed ratio between `infer` and `train`.
 
 **`infer` vs `train`:**
 
 | | `infer` | `train` |
 |---|---|---|
 | Gradient tracking | Off | On |
-| RAM overhead | Lowest | ~2–3× vs infer |
-| Speed | Fastest | Slower due to tracing |
+| Backward storage | None | Compiler-planned activations, execution state, and gradients |
+| Reverse execution | None | Statically generated reverse program |
 | `.backward()` | Not allowed | Yes |
 | Purpose | Deployment / serving | Model training |
 
@@ -3768,7 +3873,7 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 | Keyword | Purpose |
 |---------|---------|
 | `func` | Define a function |
-| `end.` | Close a definition / declaration block (`func`, `entity`, `method`, `enum`, `register`, `mold`, `@bind` stubs, …) — see §1 |
+| `end.` | Close a top-level definition / declaration block (`func`, `entity`, `enum`, `register`, `mold`, `@bind` stubs, …); an entity `method` is nested and closes with `end` — see §1 and §7.2 |
 | `end` | Close a control-flow / statement block (`if`, `when`, `for`, `loop`, `case`, `try`, `arena`, `map`, `select`, …) — see §1 |
 | `out` | Send a result outward — return / `out` params / `map` element (one meaning; destinations differ — §6.1) |
 | `var` | Mutable variable declaration |
@@ -3818,10 +3923,10 @@ All natural language phrases are mapped through the KeywordRegistry to canonical
 
 | Keyword | Purpose |
 |---------|---------|
-| `include` | Load a file and create namespace |
+| `include` | Compose an implementation fragment into the current logical module; creates no namespace |
 | `import` | Bring exported declarations into local scope or bind a module namespace |
 | `from` | Specify source module |
-| `as` | Alias for namespace, import, or type cast |
+| `as` | Alias a whole-module/selective import, or perform a type cast; not valid on include |
 | `export` | Export functions to other modules |
 | `share` | Share module-level state |
 
@@ -3974,7 +4079,7 @@ From highest to lowest:
 | Map expression | — | `map x in list: out expr end` — transformation |
 | Sized types | `int`, `float`, `string`, `bool` | + `i8`–`i64`, `u8`–`u64`, `ptr` |
 | Include paths | `include math;` | + `include net.http;` (dot-path directory mapping) |
-| Include alias | — | `include net.http as web;` |
+| Include composition | — | `include internal;` adds same-module declarations without a namespace or automatic export |
 | Import alias | — | `import get from net.http as fetch;` |
 | Borrow checker | — | Compile-time ownership, borrow, move safety — zero runtime overhead (§4.8) |
 | `&` / `&mut` | — | Shared / mutable borrow syntax — no move, validated by borrow checker |
@@ -4006,7 +4111,7 @@ From highest to lowest:
 | `tensor[T; S...]` | — | N-D NPU/GPU-aligned array — row-major, 64-byte aligned, sizes checked at compile time (§26.1) |
 | `**` | — | Matmul — `[M,K]**[K,N]→[M,N]`; NEON FMMLA / AVX-512 / WASM simd128 (§26.2) |
 | `><` | — | Fused multiply-accumulate (FMA) — multiply+accumulate in one instruction (§26.2) |
-| `infer` | — | Gradient-free inference block — autodiff off, ~50% less RAM than train (§26.3) |
+| `infer` | — | Gradient-free forward-only block; no derivative program or backward state (§26.3) |
 | `train` | — | Native autodiff training block — `.backward()` (§26.4) |
 | `quantize` | — | Compress tensor precision INT8/INT4 — faster inference, less RAM (§26.5) |
 | `port` | — | `port name: T` — typed MPSC signal port for inter-worker coordination (§23) |
@@ -4014,7 +4119,7 @@ From highest to lowest:
 
 ---
 
-*Vir Language Specification v3.1 — Systems programming language with zero-dependency native compilation.*
+*Vir Language Specification v3.6 — Systems programming language with zero-dependency native compilation.*
 *Targets: ARM64 (Mach-O), x86-64 (ELF), WebAssembly.*
 *Self-hosting compiler: virc.vri (written entirely in Vir).*
 
@@ -4022,6 +4127,12 @@ From highest to lowest:
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-10 | 3.6.0 | Activated VIR-SPC-0021: include is alias-free same-module implementation composition, whole-module import alone binds an export-limited namespace, and implementation conformance remains tracked by VIRC-ISS-0065 |
+| 2026-10-10 | 3.5.0 | Added focused entity/method and UFCS references, made callable-only shadowing and terminal no-fallback resolution explicit, preserved non-callable-field UFCS fallthrough, and documented direct-call pinning and API compatibility risk under VIR-ISS-0019 |
+| 2026-10-10 | 3.4.0 | Made entity methods nested `end` blocks, reserved `end.` for their owning entity declaration, rejected module-scope `method`, and retained free-function UFCS as the standalone extension mechanism under VIR-ISS-0018 |
+| 2026-10-10 | 3.3.0 | Made `import module` the canonical whole-module form, restricted `from` to non-empty selective imports, removed `import from module`, and recorded the decision under VIR-ISS-0017 |
+| 2026-10-09 | 3.2.0 | Editorial correction: aligned §7.2 member-call resolution with §11.4–11.5—`x.foo` is field access, while `x.foo(args)` resolves method, callable field, then free-function UFCS |
+| 2026-10-08 | 3.2.0 | Defined AOT-first reverse-mode autodiff, fail-closed differentiation and target rules, compiler-planned activation lifetimes, public gradient/repeated-backward semantics, and removed fixed tracing/RAM claims |
 | 2026-10-06 | 3.1.1 | Corrected all Vir shift examples to `shl`/`shr` and preserved `>>` exclusively as the cast operator |
 | 2026-10-06 | 3.1.0 | Documented registered dotted Module IDs, direct `.vri` path compatibility, legacy dot-to-path fallback, and canonical convergence across equivalent spellings |
 | 2026-10-06 | 3.0.0 | Standardized the registry-based module contract, multi-include and namespace/umbrella imports; unified selective imports across declaration kinds; removed untyped forward and deferred module forms; reserved exact stdlib Module IDs |

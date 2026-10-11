@@ -138,10 +138,10 @@ Until X.509 validation is real (backend or complete `crypto.x509`):
 
 | Case | Mechanism |
 |---|---|
-| Load cert/key/CA failure | `Err` |
-| Handshake / I/O failure | `Err` |
-| Hostname / verify failure | `Err` (distinct where useful) |
-| Missing native backend | link or runtime `Err` |
+| Load cert/key/CA failure | `Failure` |
+| Handshake / I/O failure | `Failure` |
+| Hostname / verify failure | `Failure` (distinct where useful) |
+| Missing native backend | link or runtime `Failure` |
 
 ## Tests (required)
 

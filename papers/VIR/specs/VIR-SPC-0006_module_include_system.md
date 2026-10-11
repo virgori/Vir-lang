@@ -4,11 +4,11 @@ type: "SPEC"
 domain: "VIR"
 title: "Hệ thống Module, Registry và Include/Import — Đặc tả Kỹ thuật"
 status: "ACTIVE"
-version: "3.2.0"
+version: "3.4.0"
 language: "vi"
 spec_class: "SPECIFICATION"
 created: "2026-03-10"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "VIR"
   - "VIRC"
@@ -25,6 +25,7 @@ related:
     - "VIR-ISS-0006"
     - "VIR-ISS-0007"
     - "VIR-ISS-0008"
+    - "VIR-ISS-0017"
     - "VIRC-ISS-0008"
     - "VIRC-ISS-0042"
     - "VIRC-ISS-0043"
@@ -32,8 +33,11 @@ related:
     - "VIRC-ISS-0045"
     - "VIRC-ISS-0046"
     - "VIRC-ISS-0047"
-  plans: []
+    - "VIRC-ISS-0065"
+  plans:
+    - "VIR-PLN-0003"
   reports:
+    - "VIR-RPT-0003"
     - "VIRC-RPT-0032"
     - "VIRC-RPT-0033"
 supersedes: null
@@ -57,7 +61,8 @@ tooling Vir phải cung cấp; nó không ghi trạng thái triển khai của m
 
 `VIR-SPC-0017` và `VIR-SPC-0018` quy định grammar toàn ngôn ngữ. Khi nội dung
 module bị trùng, tài liệu này là nguồn chi tiết cho registry, canonical identity
-và resolution semantics.
+và resolution semantics. `VIR-SPC-0021` là nguồn tập trung cho ranh giới giữa
+include composition và whole-module import namespace.
 
 ## 2. Mô hình module
 
@@ -289,24 +294,26 @@ phụ thuộc fallback này.
 ### 4.1. Grammar
 
 ```text
-include_directive := "include" include_item ("," include_item)*
-include_item      := dependency_target ("as" IDENT)?
+include_directive := "include" dependency_target ("," dependency_target)*
 ```
 
 ```vir
 include math
-include app.net.http as web
-include math, app.io.file as file, app.net.http as web
+include app.internal
+include math, app.io.file, app.net.http
 ```
 
 ### 4.2. Semantics
 
-`include` nạp toàn bộ source unit vào compilation graph và thiết lập namespace
-binding. Không có alias, local namespace dùng tên module chuẩn; `as name` thay
-local namespace bằng `name` mà không đổi canonical Module ID.
+`include` ghép source unit vào logical module hiện tại như một implementation
+fragment. Declarations của fragment tham gia unqualified scope của module được
+ghép; include không tạo module mới, namespace hay export boundary độc lập.
+`include M as A` không thuộc grammar vì không có namespace include để đổi tên.
 
-Multi-include tương đương các `include` riêng theo thứ tự trái sang phải. Mỗi
-alias chỉ áp dụng cho item ngay trước nó.
+Multi-include tương đương các `include` riêng cho cùng dãy target. Mỗi target có
+provenance và canonical identity riêng. Hai fragment, hoặc fragment và
+consumer, khai báo cùng tên trong cùng scope phải báo duplicate declaration
+độc lập thứ tự; không có last-include-wins.
 
 Với mỗi item, resolver phải:
 
@@ -314,7 +321,7 @@ Với mỗi item, resolver phải:
 2. từ chối dependency cycle và báo chain hữu ích;
 3. nạp một canonical identity nhiều nhất một lần;
 4. giữ source provenance cho diagnostics;
-5. tạo namespace binding đã yêu cầu.
+5. compose declarations vào logical module hiện tại mà không tự export chúng.
 
 ## 5. `import`, `export` và alias
 
@@ -337,15 +344,12 @@ mọi loại named declaration đã `export` vào local scope, gồm function, t
 constant và variable. Alias đổi local binding, không đổi tên export hoặc
 canonical Module ID.
 
-### 5.2. Umbrella import
+### 5.2. `from` không phải whole-module marker
 
-```vir
-import from app.api
-```
-
-Umbrella import đưa toàn bộ declarations đã `export` của provider vào local
-scope. Nó không đưa private declarations vào scope và không tạo quyền truy cập
-ngoài export surface.
+`from` chỉ phân cách non-empty danh sách `import_item` với dependency target
+trong selective import. Vì vậy `import from app.api` không thuộc grammar và
+phải bị từ chối. Vir không có form tự động inject toàn bộ export surface thành
+các tên local không qualified.
 
 ### 5.3. Whole-module namespace import
 
@@ -354,12 +358,12 @@ import app.net.http
 import app.net.http as web
 ```
 
-Whole-module import nạp provider và tạo namespace binding; nó không inject toàn
-bộ exports thành unqualified local names. `as web` chỉ đổi local namespace.
+Whole-module import nạp provider và tạo namespace binding; đây là form chuẩn để
+import một module. Nó không inject toàn bộ exports thành unqualified local
+names. `as web` chỉ đổi local namespace.
 
-Namespace alias của `include`/whole-module `import` khác selective-import
-alias: `web.get(...)` dùng namespace alias, còn `fetch(...)` dùng local symbol
-alias.
+Namespace alias của whole-module `import` khác selective-import alias:
+`web.get(...)` dùng namespace alias, còn `fetch(...)` dùng local symbol alias.
 
 ### 5.4. `export`
 
@@ -379,8 +383,9 @@ symbol, duplicate local alias và alias conflict đều là compile-time errors.
 ## 6. Dependency graph, dedup và diagnostics
 
 - Include/import guard khóa theo canonical Module ID, không theo raw spelling.
-- Reference lặp lại không được tạo duplicate definition hoặc duplicate
-  namespace binding.
+- Reference lặp lại cùng canonical target không được tạo duplicate definition
+  hoặc duplicate namespace binding. Dedup không được che collision giữa hai
+  fragments khác nhau.
 - Một module đang ở active dependency stack mà được yêu cầu lại tạo cycle
   error; Vir 3.0 không có type-only deferred-loading exception.
 - Registry errors được phát khi load registry và không được che bằng fallback.
@@ -395,8 +400,9 @@ Một implementation conforming phải có positive và negative coverage cho:
   entry/source;
 - registered dotted Module ID, quoted/bare direct path, legacy dotted-path
   fallback và canonical convergence khi các spelling cùng trỏ một source unit;
-- multi-include, include namespace alias, selective import alias, umbrella
-  import và whole-module namespace alias;
+- multi-include composition, rejection của include alias, duplicate fragment
+  declarations độc lập thứ tự, selective import alias, whole-module namespace
+  import và rejection của empty selective form `import from module`;
 - export-only visibility cho functions, types, constants và variables;
 - duplicate registry IDs, missing targets, mapping collisions, exact
   project/stdlib collisions và prefix-only non-collisions;
@@ -415,6 +421,7 @@ một compiler cụ thể không phải nội dung normative của SPEC.
 | Untyped forward declaration | Xóa declaration; định nghĩa `func` bình thường |
 | Standalone state import | Dùng selective `import` cho named export |
 | Type-only deferred module directive | Tái cấu trúc dependency graph hoặc dùng interface contract được đặc tả riêng trong tương lai |
+| `include M as A` | Dùng `include M` cho same-module composition hoặc `import M as A` cho namespace của module độc lập |
 
 Tên `get` không bị reserved khỏi API. `get(...)`, `http.get(...)` và
 `import get from net.http as fetch` vẫn hợp lệ.
@@ -428,3 +435,6 @@ Tên `get` không bị reserved khỏi API. `get(...)`, `http.get(...)` và
 | 2026-10-06 | 3.0.0 | Converted the paper to a compiler-independent language contract; removed legacy forward/state/deferred module forms; standardized multi-include, namespace/umbrella imports, registry placement/root behavior, and exact stdlib-ID reservation |
 | 2026-10-06 | 3.1.0 | Specified registered dotted Module IDs, direct `.vri` path compatibility, legacy dot-to-path fallback, and canonical convergence across equivalent spellings |
 | 2026-10-06 | 3.2.0 | Standardized stdlib registry metadata directives (schema, version, abi_version, compiler_min) and enforced root containment within active stdlib directory |
+| 2026-10-09 | 3.2.0 | Editorial traceability update: VIRC-ISS-0065 supersedes alias-only VIRC-ISS-0045 as the consolidated compiler namespace-conformance owner |
+| 2026-10-10 | 3.3.0 | Made `import module` the sole whole-module form, reserved `from` for non-empty selective imports, removed `import from module` from the language grammar, and recorded the decision under VIR-ISS-0017 |
+| 2026-10-10 | 3.4.0 | Activated the include/import boundary: include is unqualified same-module composition without aliases or automatic exports, while whole-module import alone creates an export-limited namespace, under VIR-ISS-0017 and VIR-SPC-0021 |

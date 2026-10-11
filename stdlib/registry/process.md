@@ -93,7 +93,7 @@ ExitStatus
   signal   # optional (platforms that support signal termination)
 ```
 
-Non-zero exit **code** is **not** an API `Err`. `Result.Err` = spawn/wait/I/O/OS
+Non-zero exit **code** is **not** an API `Failure`. `Result.Failure` = spawn/wait/I/O/OS
 failure. Program outcome lives in `ExitStatus`.
 
 ## Errors (closed)
@@ -103,7 +103,7 @@ Prefer [`IoError`](error.md) / `ErrorKind` already in registry for OS failures;
 `InvalidData` for invalid configuration. **No** `ProcessError` / new `ErrorKind`
 in this pass. Keep operation + OS errno in error context when available.
 
-Do **not** use `Err(string)`.
+Do **not** use `Failure(string)`.
 
 ## `exit` / `abort` (closed — P1)
 
@@ -185,7 +185,7 @@ blocking.
 | `env.abort` / free `abort` | `process.abort` | **move** |
 | Child raw `*_fd` | `Reader` / `Writer` | **hide** fd · typed I/O |
 | `Output` as `string` | `Buffer` | **change** |
-| `Err(string)` | `Err(Error)` | **change** |
+| `Failure(string)` | `Failure(Error)` | **change** |
 
 Flat names only — **no** `process.command.arg` nesting (P6).
 

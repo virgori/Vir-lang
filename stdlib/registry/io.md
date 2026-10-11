@@ -67,8 +67,8 @@ until(delim) / line() / lines() / byte()
 
 `until` outcomes:
 
-- EOF with no data → `Ok(None)`
-- Delimiter at start → `Ok(Some(empty Buffer))`
+- EOF with no data → `Success(None)`
+- Delimiter at start → `Success(Some(empty Buffer))`
 - Trailing data without delim → return that chunk; subsequent call hits EOF
 
 `line()` → `Result of (Option of (string))`: LF and CRLF; no whitespace trim;
@@ -101,10 +101,10 @@ migrate ordinary I/O failures to `throw int`.
 | Case | Mechanism |
 |---|---|
 | Recoverable I/O failure | `Result` |
-| Normal read progress | `Ok(n)` — `n` = bytes transferred |
-| Normal EOF from `read` | `Ok(0)` |
-| I/O failure | `Err(…)` — prefer `IoError` with `kind: ErrorKind` when structured; see [`error.md`](error.md) |
-| `exact` / `atleast` short EOF | `Err` with `ErrorKind.UnexpectedEof` |
+| Normal read progress | `Success(n)` — `n` = bytes transferred |
+| Normal EOF from `read` | `Success(0)` |
+| I/O failure | `Failure(…)` — prefer `IoError` with `kind: ErrorKind` when structured; see [`error.md`](error.md) |
+| `exact` / `atleast` short EOF | `Failure` with `ErrorKind.UnexpectedEof` |
 | Genuine absence (no value, not a fault) | `Option` (`Some` / `None`) |
 | Cleanup | `ensure` |
 | Abort / invariant / logic bug | `throw` / `panic` |
@@ -116,39 +116,39 @@ migrate ordinary I/O failures to `throw int`.
 
 ```vir
 reader.read(buf)
-    Ok(n)       # n bytes
-    Ok(0)       # EOF
-    Err(error)  # I/O failure
+    Success(n)       # n bytes
+    Success(0)       # EOF
+    Failure(error)  # I/O failure
 
 reader.exact(buf)
-    Ok(n)       # request satisfied (n == buf len)
-    Err(…)      # UnexpectedEof if EOF early; or other I/O failure
+    Success(n)       # request satisfied (n == buf len)
+    Failure(…)      # UnexpectedEof if EOF early; or other I/O failure
 
 reader.atleast(buf, min)
-    Ok(n)       # n >= min
-    Err(…)      # UnexpectedEof or I/O failure
+    Success(n)       # n >= min
+    Failure(…)      # UnexpectedEof or I/O failure
 
 reader.all()
-    Ok(Buffer)
-    Err(error)
+    Success(Buffer)
+    Failure(error)
 
 reader.until(delim)   # delim: one byte (int)
-    Ok(Buffer)
-    Err(error)
+    Success(Buffer)
+    Failure(error)
 
 reader.line()
-    Ok(string)  # UTF-8 text after line boundary
-    Err(error)
+    Success(string)  # UTF-8 text after line boundary
+    Failure(error)
 
 reader.byte()
     # three outcomes — EOF ≠ error
-    Ok(Some(b))   # one byte
-    Ok(None)      # EOF / no more bytes
-    Err(error)    # I/O failure
+    Success(Some(b))   # one byte
+    Success(None)      # EOF / no more bytes
+    Failure(error)    # I/O failure
 ```
 
 Docs describe outcomes with Vir `Result` / `Option` nesting when the type
-system allows `Ok(Option)` / `Err(IoError)`. **No new public syntax.** If nesting
+system allows `Success(Option)` / `Failure(IoError)`. **No new public syntax.** If nesting
 is awkward in a given compiler stage, keep the three outcomes in the contract
 and pick the nearest expressible encoding — never collapse error into `None`.
 
@@ -190,11 +190,11 @@ Do **not** invent a third public `bytes` type. Reuse existing memory types:
 | `read(buf)` | `Slice` | present (traits) |
 | `exact(buf)` | `Slice` | missing |
 | `atleast(buf, min)` | `Slice` | missing |
-| `all()` | `Ok(Buffer)` | today `read_all` → Buffer-ish; align to `Buffer` |
-| `until(delim)` | `Ok(Buffer)`, `delim: int` (one **byte**) | missing; not a string delimiter |
-| `line()` | `Ok(string)` | missing on trait; UTF-8 decode at line boundary |
-| `fs.read` | `Ok(Buffer)` | today `fs.read` → `string` — **change** payload |
-| `fs.text` | `Ok(string)` | **missing** — explicit text convenience |
+| `all()` | `Success(Buffer)` | today `read_all` → Buffer-ish; align to `Buffer` |
+| `until(delim)` | `Success(Buffer)`, `delim: int` (one **byte**) | missing; not a string delimiter |
+| `line()` | `Success(string)` | missing on trait; UTF-8 decode at line boundary |
+| `fs.read` | `Success(Buffer)` | today `fs.read` → `string` — **change** payload |
+| `fs.text` | `Success(string)` | **missing** — explicit text convenience |
 
 `until` and `line` are **not** aliases (locked): `until` is binary delimiter
 search (consume + exclude); `line` is UTF-8 text + LF/CRLF rules.
@@ -594,19 +594,19 @@ io.stderr().flush()
 
 ## 2. `Reader`
 
-Current: `interface Reader` with `read(buf: Slice) -> Result of (int)` (`Ok(n)` bytes; `Ok(0)` = EOF) in `vir/io/traits.vri`. **Not exported.**
+Current: `interface Reader` with `read(buf: Slice) -> Result of (int)` (`Success(n)` bytes; `Success(0)` = EOF) in `vir/io/traits.vri`. **Not exported.**
 
 | Public method | Signature (target) | Impl | Notes |
 |---|---|---|---|
-| `read` | `reader.read(buf: Slice) -> Result of (int)` | **present** | `Ok(n)` / `Ok(0)` / `Err` |
+| `read` | `reader.read(buf: Slice) -> Result of (int)` | **present** | `Success(n)` / `Success(0)` / `Failure` |
 | `exact` | `reader.exact(buf: Slice) -> Result of (int)` | **missing** | or `exact(n) -> Result of (Buffer)` per contract lock |
-| `atleast` | `reader.atleast(buf: Slice, min: int) -> Result of (int)` | **missing** | `n >= min` or `Err(UnexpectedEof)` |
+| `atleast` | `reader.atleast(buf: Slice, min: int) -> Result of (int)` | **missing** | `n >= min` or `Failure(UnexpectedEof)` |
 | `all` | `reader.all() -> Result of (Buffer)` | **present** as `read_all` | **rename** → method |
 | `limit` | `reader.limit(max: int) -> Reader` | **missing** | composable cap; no I/O yet |
 | `until` | `reader.until(delim) -> Result of (Option of (Buffer))` | **missing** | non-empty byte seq; consume+exclude |
 | `line` | `reader.line() -> Result of (Option of (string))` | **missing** on trait | LF/CRLF; `InvalidData` on bad UTF-8 |
 | `lines` | `reader.lines()` | **planned** | iterator type not locked |
-| `byte` | `reader.byte() -> Result of (Option of (u8))` | **incomplete** | EOF = `Ok(None)`; must not swallow fill errors |
+| `byte` | `reader.byte() -> Result of (Option of (u8))` | **incomplete** | EOF = `Success(None)`; must not swallow fill errors |
 
 ### Semantics
 
@@ -692,11 +692,11 @@ Destination view. `buf.len` = max bytes for this call.
 
 ### Returns
 
-`Result` — `Ok(n)` bytes read; `Ok(0)` = EOF; `Err(…)` = I/O failure.
+`Result` — `Success(n)` bytes read; `Success(0)` = EOF; `Failure(…)` = I/O failure.
 
 ### Errors
 
-I/O failure (today `Err`).
+I/O failure (today `Failure`).
 
 ### Example
 
@@ -728,7 +728,7 @@ Borrowed destination that must be filled entirely on success.
 
 ### Returns
 
-`Result` — `Ok(n)` with `n == buf.len`; `Err(UnexpectedEof)` if EOF early; other `Err` on I/O failure.
+`Result` — `Success(n)` with `n == buf.len`; `Failure(UnexpectedEof)` if EOF early; other `Failure` on I/O failure.
 
 ### Errors
 
@@ -772,7 +772,7 @@ Minimum bytes required; unit = bytes; `>= 0` and `<= buf.len`.
 
 ### Returns
 
-`Result` — `Ok(n)` with `n >= min`; `Err(UnexpectedEof)` or other I/O `Err`.
+`Result` — `Success(n)` with `n >= min`; `Failure(UnexpectedEof)` or other I/O `Failure`.
 
 ### Example
 
@@ -807,7 +807,7 @@ None (receiver).
 
 ### Returns
 
-`Result of (Buffer)` — empty Buffer allowed; `Err(…)` on I/O failure.
+`Result of (Buffer)` — empty Buffer allowed; `Failure(…)` on I/O failure.
 
 ### Errors
 
@@ -817,7 +817,7 @@ I/O error while reading.
 
 ```vir
 let data = reader.all()
-# Ok(Buffer) or Err(...)
+# Success(Buffer) or Failure(...)
 ```
 
 ### Notes
@@ -893,11 +893,11 @@ One byte (`0…255`), e.g. `0x0A` or `','` if that literal is one byte.
 
 ### Returns
 
-`Result` — `Ok(Buffer)` without the delimiter byte.
+`Result` — `Success(Buffer)` without the delimiter byte.
 
-- Data then EOF before `delim`: **`Ok(partial)`** (not an error).
-- Immediate EOF (no bytes): **`Ok` empty `Buffer`** (document as empty success).
-- I/O failure: `Err(…)`.
+- Data then EOF before `delim`: **`Success(partial)`** (not an error).
+- Immediate EOF (no bytes): **`Success` empty `Buffer`** (document as empty success).
+- I/O failure: `Failure(…)`.
 
 ### Errors
 
@@ -937,7 +937,7 @@ None.
 
 ### Returns
 
-`Result of (Option of (string))` — `None` at EOF with no line; `Err` on I/O or invalid UTF-8 (`InvalidData`).
+`Result of (Option of (string))` — `None` at EOF with no line; `Failure` on I/O or invalid UTF-8 (`InvalidData`).
 
 ### Errors
 
@@ -1214,7 +1214,7 @@ Destination stream.
 
 ### Returns
 
-Total bytes copied (today `copy` returns that in `Ok`).
+Total bytes copied (today `copy` returns that in `Success`).
 
 ### Errors
 
@@ -1720,13 +1720,13 @@ None at construction.
 
 1. ~~Error model~~ — **closed**.
 2. ~~Bytes / buffer~~ — **closed** (`Slice` / `Buffer` / `string`).
-3. ~~`byte()` outcomes~~ — **closed** (`Ok(Some)` / `Ok(None)` / `Err`); impl must stop swallowing.
-4. ~~`until` delim~~ — **closed** (consume, exclude from `Buffer`; partial-before-EOF = `Ok`).
+3. ~~`byte()` outcomes~~ — **closed** (`Success(Some)` / `Success(None)` / `Failure`); impl must stop swallowing.
+4. ~~`until` delim~~ — **closed** (consume, exclude from `Buffer`; partial-before-EOF = `Success`).
 5. `io.print(value)` — `string` only or via `format`?
 6. Constructor convention for buffered / line writers.
 7. `BufferedReader` implements `Reader` vs parallel concrete API.
 8. Export strategy without leaking `br_*`.
-9. Exact Vir encoding of nested `Result`+`Option` for `byte()` if `Ok(None)` is awkward in today’s compiler.
+9. Exact Vir encoding of nested `Result`+`Option` for `byte()` if `Success(None)` is awkward in today’s compiler.
 
 ## Notes
 

@@ -4,11 +4,11 @@ type: "SPEC"
 domain: "VIR"
 title: "Vir Syntax (AI Spec)"
 status: "ACTIVE"
-version: "2.1.0"
+version: "2.2.0"
 language: "en"
 spec_class: "SPECIFICATION"
 created: "2026-09-06"
-updated: "2026-10-04"
+updated: "2026-10-10"
 owners:
   - "VIR"
 components: []
@@ -17,6 +17,7 @@ aliases:
 related:
   issues:
     - "VIR-ISS-0003"
+    - "VIR-ISS-0018"
   plans: []
   reports: []
 supersedes: null
@@ -28,7 +29,7 @@ tags:
 # VIR-SPC-0015 — Vir Syntax (AI Spec)
 
 **Extension:** `.vri`  
-**Spec:** Vir v2.1
+**Spec:** Vir v2.2
 
 ## Comments
 
@@ -76,8 +77,12 @@ entity Foo: … end.
 
 | Construct | Close with |
 |---|---|
-| Definitions: `func`, `async func`, `entity`, `method`, `enum`, `register`, `mold`, … | `end.` |
-| Control / statement blocks: `if`, `when`, `for`, `loop`, `case`, `try`, `arena`, … | `end` |
+| Top-level definitions: `func`, `async func`, `entity`, `enum`, `register`, `mold`, … | `end.` |
+| Nested blocks: entity `method`, `if`, `when`, `for`, `loop`, `case`, `try`, `arena`, … | `end` |
+
+An entity member `method` is owned by the enclosing entity, so the method
+closes with `end` and only the entity closes with `end.`. `method` is invalid
+at module scope; use a free `func` with an explicit receiver for UFCS.
 
 Continuations (`else`, `eif`, `ensure`, `revert`) — **no** `:` opener.
 
@@ -173,5 +178,6 @@ var nested: dict of (string, Box of (int))
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-10 | 2.2.0 | Classified entity methods as nested `end` blocks, reserved `end.` for top-level declarations, and rejected module-scope `method` under VIR-ISS-0018 |
 | 2026-10-04 | 2.1.0 | Canonicalized local compensation control transfers as standalone `retry` and `rethrow` |
 | 2026-10-02 | 2.0.0 | Migrated from `docs/ai-spec/vir-lang/references/syntax.md` and assigned stable ID `VIR-SPC-0015` |

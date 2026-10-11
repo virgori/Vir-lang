@@ -3,11 +3,11 @@ id: "VIRC-ISS-0029"
 type: "ISSUE"
 domain: "VIRC"
 title: "Source include and import preprocessing scales superlinearly during source ingestion"
-status: "RESOLVED"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-04"
-updated: "2026-10-04"
+updated: "2026-10-11"
 owners:
   - "compiler"
   - "frontend"
@@ -301,3 +301,4 @@ CPU-bound.
 | 2026-10-04 | Created and triaged from source audit, controlled include/flat scaling corpora, cached-I/O comparison and CLI timing inspection |
 | 2026-10-04 | Linked VIRC-PLN-0016 |
 | 2026-10-04 | Resolved with linear streaming preprocessor, canonical module cache, Darwin clock repair, and verified in VIRC-RPT-0032 |
+| 2026-10-11 | Independent closure audit reran the native performance-scaling gate, Group 27 (156/156), and root/alternate-CWD frontend timing checks; closed against accepted VIRC-RPT-0032 |

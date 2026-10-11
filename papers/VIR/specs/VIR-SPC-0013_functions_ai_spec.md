@@ -4,11 +4,11 @@ type: "SPEC"
 domain: "VIR"
 title: "Vir Functions (AI Spec)"
 status: "ACTIVE"
-version: "3.0.0"
+version: "3.1.0"
 language: "en"
 spec_class: "SPECIFICATION"
 created: "2026-09-06"
-updated: "2026-10-06"
+updated: "2026-10-10"
 owners:
   - "VIR"
 components: []
@@ -18,6 +18,7 @@ related:
   issues:
     - "VIR-ISS-0004"
     - "VIR-ISS-0005"
+    - "VIR-ISS-0018"
   plans: []
   reports: []
 supersedes: null
@@ -28,7 +29,7 @@ tags:
 
 # VIR-SPC-0013 — Vir Functions (AI Spec)
 
-**Spec:** Vir v3.0
+**Spec:** Vir v3.1
 
 ## Declaration
 
@@ -112,7 +113,8 @@ Do not invent Python/`*`/`**` or Rust lifetime syntax.
 
 ## Methods & UFCS
 
-Methods inside `entity` use implicit `this`; close methods with `end.`.
+Methods inside `entity` use implicit `this`. Because the method is a nested
+member block, close it with `end`; the owning entity closes with `end.`.
 
 ```vir
 entity Account:
@@ -120,9 +122,12 @@ entity Account:
 
     method deposit(amount: int):
         this.balance = this.balance + amount
-    end.
+    end
 end.
 ```
+
+`method` is invalid at module scope. Use a free `func` with an explicit first
+receiver parameter for standalone UFCS extensions.
 
 UFCS: a free function whose first param is `this` may be called with `.`:
 
@@ -166,7 +171,8 @@ Only use `async` when the surrounding project already does; do not invent schedu
 
 ## Agent rules
 
-1. Always `end.` for function / method / entity / enum definitions.
+1. Use `end.` for top-level function/entity/enum definitions; use `end` for an
+   entity member method.
 2. Prefer `out` for results; never `return`.
 3. Match `in`/`ref`/`out` style of the nearest file in the repo.
 
@@ -174,6 +180,7 @@ Only use `async` when the surrounding project already does; do not invent schedu
 
 | Date | Version | Change |
 |---|---|---|
+| 2026-10-10 | 3.1.0 | Defined entity methods as nested `end` blocks, rejected module-scope `method`, and retained free-function UFCS for standalone extensions under VIR-ISS-0018 |
 | 2026-10-06 | 3.0.0 | Made function lookup declaration-order independent and removed the untyped forward-declaration form from the Vir 3.0 contract |
 | 2026-10-04 | 2.1.0 | Defined callable fields as typed structural function values and excluded implicit raw-`ptr` calls |
 | 2026-10-02 | 2.0.0 | Migrated from `docs/ai-spec/vir-lang/references/functions.md` and assigned stable ID `VIR-SPC-0013` |

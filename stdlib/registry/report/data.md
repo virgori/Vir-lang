@@ -12,7 +12,7 @@
 | `csv` | `data/csv.vri` | **OK** | Q7 next wave |
 | `toml` | `data/toml.vri` | **OK** | |
 | `xml` | `data/xml.vri` | **OK** | |
-| `yaml` | `data/yaml.vri` | **OK** | parse always Err (stub) |
+| `yaml` | `data/yaml.vri` | **OK** | parse always Failure (stub) |
 | `ini` | `data/ini.vri` | **OK** | |
 | `url` | `net/url.vri` | **OK** | |
 | flat `encode` | `encode/encode.vri` | FAIL via string | Wire codecs; ≠ Unicode encode.md |

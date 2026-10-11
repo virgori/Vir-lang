@@ -19,8 +19,8 @@ Before creating or changing a registry:
 1. Start at the entry `.vri` file and search upward for the nearest
    `module.list`.
 2. Inspect repository-specific fallbacks in
-   `compiler/src/main/module_resolver.vri` and `tools/module_graph.py` when
-   discovery behavior matters.
+   `compiler/src/main/module_resolver.vri` and the native resolver fixture
+   `tests/module/resolver_test.vri` when discovery behavior matters.
 3. Reuse the nearest applicable registry. Do not create a second registry
    merely to shorten paths.
 
@@ -144,28 +144,28 @@ Here `root = .` would have the same meaning and may be omitted.
 
 ## Verification
 
-From the Vir repository, first resolve the names without editing source:
+Compile the real project entry through the active native resolver without
+emitting an artifact:
 
 ```sh
-python3 tools/module_graph.py --root <project-root> --resolve server
-python3 tools/module_graph.py --root <project-root> --entry server
+./bin/virc <project-root>/cmd/server.vri --check
 ```
 
-Then compile the real entry file with the active compiler:
+For compiler registry, dependency-closure, and CWD behavior, run the native
+module group. It rebuilds stale native verifier binaries before execution:
 
 ```sh
-./bin/virc <project-root>/cmd/server.vri -o /tmp/vir-server-test
+./run_tests.sh 3
 ```
 
-For resolver changes, also test from a second current working directory and run
-the focused module tests:
+Run `./bin/module-resolver-test` directly only when its detailed output is
+needed after the group has ensured it is current. For resolver changes, repeat
+the real-entry `virc --check` from a second current working directory with
+absolute paths.
 
-```sh
-python3 -m unittest -v tests/module/test_module_resolver.py
-```
-
-Do not treat graph-tool success alone as proof that native `virc` behaves the
-same. Report both commands and preserve any unrelated registry failures.
+Do not treat a text-only registry comparison as proof that native `virc`
+behaves correctly. Report both the real-entry compiler check and the native
+group result, and preserve any unrelated registry failures.
 
 ## Editing boundary
 

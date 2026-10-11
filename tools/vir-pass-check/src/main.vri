@@ -1,0 +1,554 @@
+##
+ * tools/vir-pass-check/src/main.vri — Native Compiler Pass Architecture Verifier
+ * ==============================================================================
+ * Enforces VIRC-PLN-0003, VIRC-PLN-0005, VIRC-PLN-0029, and VIRC-ISS-0050:
+ * 1. Pass orchestrators (passBorrow.vri, passTypecheck.vri, passOptimize.vri)
+ *    must be clean orchestrators (<= 300 LOC, stable metadata, no prohibited patterns).
+ * 2. Standard library boundary: stdlib/stdlib.vri must contain zero compiler.* entries.
+ * 3. Module dependency hygiene: no compiler source file under compiler/src/ declares
+ *    both `include M` and `import ... from M` for the same module M.
+ ##
+
+extern func opendir(path: int) -> int
+extern func readdir(dir: int) -> int
+extern func closedir(dir: int) -> int
+extern func open(path: int, flags: int, mode: int) -> int
+extern func lseek(fd: int, offset: int, whence: int) -> int
+extern func read(fd: int, buf: int, count: int) -> int
+extern func close(fd: int) -> int
+extern func write(fd: int, buf: int, count: int) -> int
+extern func exit_prog(code: int)
+extern func vir_get_platform() -> int
+
+func raw_print(s: int):
+    write(1, s, str_len(s))
+    out 0
+end.
+
+# ── String Helpers ────────────────────────────────────────────────────────────
+
+func str_len(s: int) -> int:
+    if s == 0 do out 0 end
+    var i = 0
+    when read_byte(s, i) != 0 loop
+        i = i + 1
+    end
+    out i
+end.
+
+func str_streq(a: int, b: int) -> int:
+    if a == 0 and b == 0 do out 1 end
+    if a == 0 or b == 0 do out 0 end
+    let la = str_len(a)
+    let lb = str_len(b)
+    if la != lb do out 0 end
+    var i = 0
+    when i < la loop
+        if read_byte(a, i) != read_byte(b, i) do out 0 end
+        i = i + 1
+    end
+    out 1
+end.
+
+func str_contains(haystack: int, needle: int) -> int:
+    if haystack == 0 or needle == 0 do out 0 end
+    let hl = str_len(haystack)
+    let nl = str_len(needle)
+    if nl == 0 do out 1 end
+    if hl < nl do out 0 end
+    var i = 0
+    when i <= hl - nl loop
+        var match = 1
+        var j = 0
+        when j < nl loop
+            if read_byte(haystack, i + j) != read_byte(needle, j) do
+                match = 0
+                j = nl
+            end
+            j = j + 1
+        end
+        if match == 1 do out 1 end
+        i = i + 1
+    end
+    out 0
+end.
+
+func str_starts_with(s: int, prefix: int) -> int:
+    if s == 0 or prefix == 0 do out 0 end
+    let sl = str_len(s)
+    let pl = str_len(prefix)
+    if sl < pl do out 0 end
+    var i = 0
+    when i < pl loop
+        if read_byte(s, i) != read_byte(prefix, i) do out 0 end
+        i = i + 1
+    end
+    out 1
+end.
+
+func str_ends_with(s: int, suffix: int) -> int:
+    if s == 0 or suffix == 0 do out 0 end
+    let sl = str_len(s)
+    let sufl = str_len(suffix)
+    if sl < sufl do out 0 end
+    var i = 0
+    when i < sufl loop
+        if read_byte(s, sl - sufl + i) != read_byte(suffix, i) do out 0 end
+        i = i + 1
+    end
+    out 1
+end.
+
+func str_concat3(a: int, b: int, c: int) -> int:
+    let la = str_len(a)
+    let lb = str_len(b)
+    let lc = str_len(c)
+    let res = alloc(la + lb + lc + 1)
+    var p = 0
+    var i = 0
+    when i < la loop
+        write_byte(res, p, read_byte(a, i))
+        p = p + 1
+        i = i + 1
+    end
+    i = 0
+    when i < lb loop
+        write_byte(res, p, read_byte(b, i))
+        p = p + 1
+        i = i + 1
+    end
+    i = 0
+    when i < lc loop
+        write_byte(res, p, read_byte(c, i))
+        p = p + 1
+        i = i + 1
+    end
+    write_byte(res, p, 0)
+    out res
+end.
+
+func print_int(n: int):
+    if n == 0 do
+        print_str("0")
+        out 0
+    end
+    var v = n
+    var digits = alloc(32)
+    var dlen = 0
+    when v > 0 loop
+        write_byte(digits, dlen, 48 + (v mod 10))
+        v = v / 10
+        dlen = dlen + 1
+    end
+    var str_buf = alloc(dlen + 1)
+    var i = 0
+    when i < dlen loop
+        write_byte(str_buf, i, read_byte(digits, dlen - 1 - i))
+        i = i + 1
+    end
+    write_byte(str_buf, dlen, 0)
+    raw_print(str_buf)
+    free(str_buf)
+    free(digits)
+    out 0
+end.
+
+# ── File I/O Helper ───────────────────────────────────────────────────────────
+
+func read_file_content(path: int) -> int:
+    let fd = open(path, 0, 0) # O_RDONLY
+    if fd < 0 do out 0 end
+    let sz = lseek(fd, 0, 2)  # SEEK_END
+    if sz <= 0 do
+        close(fd)
+        let empty = alloc(1)
+        write_byte(empty, 0, 0)
+        out empty
+    end
+    lseek(fd, 0, 0)           # SEEK_SET
+    let buf = alloc(sz + 1)
+    let rd = read(fd, buf, sz)
+    close(fd)
+    if rd < 0 do
+        free(buf)
+        out 0
+    end
+    write_byte(buf, rd, 0)
+    out buf
+end.
+
+# ── Gate 1: Check Standard Library Boundary ───────────────────────────────────
+
+func check_stdlib_boundary() -> int:
+    let content = read_file_content("stdlib/stdlib.vri" as int)
+    if content == 0 do
+        print_str("  • stdlib/stdlib.vri not found\n")
+        out 1
+    end
+
+    var err_count = 0
+    var line_start = 0
+    var pos = 0
+    var line_num = 1
+    let total_len = str_len(content)
+
+    when pos <= total_len loop
+        let ch = read_byte(content, pos)
+        if ch == 10 or ch == 0 do # newline or EOF
+            let line_len = pos - line_start
+            if line_len > 0 do
+                let line_buf = alloc(line_len + 1)
+                var i = 0
+                when i < line_len loop
+                    write_byte(line_buf, i, read_byte(content, line_start + i))
+                    i = i + 1
+                end
+                write_byte(line_buf, line_len, 0)
+
+                # Skip leading whitespace
+                var p = 0
+                when p < line_len and (read_byte(line_buf, p) == 32 or read_byte(line_buf, p) == 9) loop
+                    p = p + 1
+                end
+
+                if p < line_len and read_byte(line_buf, p) != 35 do # not comment '#'
+                    if str_contains(line_buf, "compiler." as int) == 1 or str_contains(line_buf, "= compiler/" as int) == 1 do
+                        print_str("  • stdlib/stdlib.vri:")
+                        print_int(line_num)
+                        print_str(": Found compiler mapping in stdlib: '")
+                        print_str(line_buf as string)
+                        print_str("'\n")
+                        err_count = err_count + 1
+                    end
+                end
+                free(line_buf)
+            end
+            line_start = pos + 1
+            line_num = line_num + 1
+        end
+        pos = pos + 1
+    end
+    free(content)
+    out err_count
+end.
+
+# ── Gate 2: Check Pass Orchestrator ───────────────────────────────────────────
+
+func check_pass_orchestrator(path: int, name: int) -> int:
+    let content = read_file_content(path)
+    if content == 0 do
+        print_str("  • Orchestrator file not found: ")
+        print_str(name as string)
+        print_str("\n")
+        out 1
+    end
+
+    var err_count = 0
+    var non_empty_lines = 0
+    var line_start = 0
+    var pos = 0
+    let total_len = str_len(content)
+
+    when pos <= total_len loop
+        let ch = read_byte(content, pos)
+        if ch == 10 or ch == 0 do
+            let line_len = pos - line_start
+            if line_len > 0 do
+                var p = 0
+                when p < line_len and (read_byte(content, line_start + p) == 32 or read_byte(content, line_start + p) == 9) loop
+                    p = p + 1
+                end
+                if p < line_len and read_byte(content, line_start + p) != 35 do
+                    non_empty_lines = non_empty_lines + 1
+                end
+            end
+            line_start = pos + 1
+        end
+        pos = pos + 1
+    end
+
+    # 1. LOC limit (<= 300 logical lines)
+    if non_empty_lines > 300 do
+        print_str("  • ")
+        print_str(name as string)
+        print_str(": Orchestrator has ")
+        print_int(non_empty_lines)
+        print_str(" logical lines (limit: <= 300)\n")
+        err_count = err_count + 1
+    end
+
+    # 2. Metadata constants (PASS_*_ID and PASS_*_STAGE)
+    if str_contains(content, "PASS_" as int) == 0 or str_contains(content, "_ID:" as int) == 0 or str_contains(content, "_STAGE:" as int) == 0 do
+        print_str("  • ")
+        print_str(name as string)
+        print_str(": Missing PASS_*_ID or PASS_*_STAGE metadata constants\n")
+        err_count = err_count + 1
+    end
+
+    # 3. Exported run entry point
+    if str_contains(content, "export" as int) == 0 or (str_contains(content, "Run" as int) == 0 and str_contains(content, "_run" as int) == 0) do
+        print_str("  • ")
+        print_str(name as string)
+        print_str(": Missing exported pass run entry point (`pass*Run` or `pass_*_run`)\n")
+        err_count = err_count + 1
+    end
+
+    # 4. Prohibited transform bodies
+    if str_contains(content, "ast_new(AstType." as int) == 1 do
+        print_str("  • ")
+        print_str(name as string)
+        print_str(": Prohibited transform: AST rewrite node construction (ast_new)\n")
+        err_count = err_count + 1
+    end
+    if str_contains(content, "mir_instr_new" as int) == 1 do
+        print_str("  • ")
+        print_str(name as string)
+        print_str(": Prohibited transform: Direct MIR instruction synthesis (mir_instr_new)\n")
+        err_count = err_count + 1
+    end
+    if str_contains(content, "lir_emit_" as int) == 1 do
+        print_str("  • ")
+        print_str(name as string)
+        print_str(": Prohibited transform: Direct LIR lowering pattern (lir_emit_)\n")
+        err_count = err_count + 1
+    end
+    if str_contains(content, "pass6_type_strings_compatible" as int) == 1 do
+        print_str("  • ")
+        print_str(name as string)
+        print_str(": Prohibited transform: Inline type compatibility algorithm\n")
+        err_count = err_count + 1
+    end
+    if str_contains(content, "pass8_merge_loop_edge" as int) == 1 do
+        print_str("  • ")
+        print_str(name as string)
+        print_str(": Prohibited transform: Inline borrow transfer loop merge algorithm\n")
+        err_count = err_count + 1
+    end
+    if str_contains(content, "dominance_frontier" as int) == 1 do
+        print_str("  • ")
+        print_str(name as string)
+        print_str(": Prohibited transform: Inline dominance algorithm\n")
+        err_count = err_count + 1
+    end
+    if str_contains(content, "instruction_selection" as int) == 1 do
+        print_str("  • ")
+        print_str(name as string)
+        print_str(": Prohibited transform: Target instruction selection pattern\n")
+        err_count = err_count + 1
+    end
+
+    free(content)
+    out err_count
+end.
+
+# ── Gate 3: Check Module Dependencies Hygiene ─────────────────────────────────
+
+# Simple module name array: capacity 128 per file
+func check_file_dependencies(path: int) -> int:
+    let content = read_file_content(path)
+    if content == 0 do out 0 end
+
+    var includes = alloc(128 * 8)
+    var inc_count = 0
+    var imports = alloc(128 * 8)
+    var imp_count = 0
+
+    var line_start = 0
+    var pos = 0
+    var in_block_comment = 0
+    let total_len = str_len(content)
+
+    when pos <= total_len loop
+        let ch = read_byte(content, pos)
+        if ch == 10 or ch == 0 do
+            let line_len = pos - line_start
+            if line_len > 0 do
+                # Trim leading spaces
+                var p = line_start
+                when p < line_start + line_len and (read_byte(content, p) == 32 or read_byte(content, p) == 9) loop
+                    p = p + 1
+                end
+
+                # Check block comment '##'
+                if p + 1 < line_start + line_len and read_byte(content, p) == 35 and read_byte(content, p + 1) == 35 do
+                    if in_block_comment == 1 do
+                        in_block_comment = 0
+                    else
+                        in_block_comment = 1
+                    end
+                eif in_block_comment == 0 and p < line_start + line_len and read_byte(content, p) != 35 do
+                    # Code line: check 'include <mod>'
+                    let rem_len = (line_start + line_len) - p
+                    if rem_len > 8 and read_byte(content, p) == 105 and read_byte(content, p+1) == 110 and read_byte(content, p+2) == 99 and read_byte(content, p+3) == 108 and read_byte(content, p+4) == 117 and read_byte(content, p+5) == 100 and read_byte(content, p+6) == 101 and read_byte(content, p+7) == 32 do
+                        var mp = p + 8
+                        when mp < line_start + line_len and (read_byte(content, mp) == 32 or read_byte(content, mp) == 9 or read_byte(content, mp) == 34 or read_byte(content, mp) == 39) loop
+                            mp = mp + 1
+                        end
+                        var me = mp
+                        when me < line_start + line_len and read_byte(content, me) != 32 and read_byte(content, me) != 9 and read_byte(content, me) != 34 and read_byte(content, me) != 39 and read_byte(content, me) != 13 loop
+                            me = me + 1
+                        end
+                        let mlen = me - mp
+                        if mlen > 0 and inc_count < 128 do
+                            let mod_str = alloc(mlen + 1)
+                            var k = 0
+                            when k < mlen loop
+                                write_byte(mod_str, k, read_byte(content, mp + k))
+                                k = k + 1
+                            end
+                            write_byte(mod_str, mlen, 0)
+                            native_write_i64(includes, inc_count * 8, mod_str)
+                            inc_count = inc_count + 1
+                        end
+                    end
+
+                    # Check 'from <mod>' in line
+                    var fp = p
+                    when fp + 5 < line_start + line_len loop
+                        if read_byte(content, fp) == 32 and read_byte(content, fp+1) == 102 and read_byte(content, fp+2) == 114 and read_byte(content, fp+3) == 111 and read_byte(content, fp+4) == 109 and read_byte(content, fp+5) == 32 do
+                            var mp = fp + 6
+                            when mp < line_start + line_len and (read_byte(content, mp) == 32 or read_byte(content, mp) == 9 or read_byte(content, mp) == 34 or read_byte(content, mp) == 39) loop
+                                mp = mp + 1
+                            end
+                            var me = mp
+                            when me < line_start + line_len and read_byte(content, me) != 32 and read_byte(content, me) != 9 and read_byte(content, me) != 34 and read_byte(content, me) != 39 and read_byte(content, me) != 13 loop
+                                me = me + 1
+                            end
+                            let mlen = me - mp
+                            if mlen > 0 and imp_count < 128 do
+                                let mod_str = alloc(mlen + 1)
+                                var k = 0
+                                when k < mlen loop
+                                    write_byte(mod_str, k, read_byte(content, mp + k))
+                                    k = k + 1
+                                end
+                                write_byte(mod_str, mlen, 0)
+                                native_write_i64(imports, imp_count * 8, mod_str)
+                                imp_count = imp_count + 1
+                            end
+                        end
+                        fp = fp + 1
+                    end
+                end
+            end
+            line_start = pos + 1
+        end
+        pos = pos + 1
+    end
+    free(content)
+
+    # Check overlaps between includes and imports
+    var violations = 0
+    var i = 0
+    when i < inc_count loop
+        let inc_mod = native_read_i64(includes, i * 8)
+        var j = 0
+        when j < imp_count loop
+            let imp_mod = native_read_i64(imports, j * 8)
+            if str_streq(inc_mod, imp_mod) == 1 do
+                print_str("  • ")
+                print_str(path as string)
+                print_str(": Redundant dependency on '")
+                print_str(inc_mod as string)
+                print_str("' (declared in both include and import)\n")
+                violations = violations + 1
+            end
+            j = j + 1
+        end
+        i = i + 1
+    end
+
+    # Cleanup strings
+    i = 0
+    when i < inc_count loop
+        free(native_read_i64(includes, i * 8))
+        i = i + 1
+    end
+    free(includes)
+
+    i = 0
+    when i < imp_count loop
+        free(native_read_i64(imports, i * 8))
+        i = i + 1
+    end
+    free(imports)
+
+    out violations
+end.
+
+# Recursive directory walk for compiler/src
+var g_dep_file_count: int = 0
+var g_dep_violations: int = 0
+
+func walk_compiler_src(path: int):
+    let plat = vir_get_platform()
+    var name_off = 21
+    var type_off = 20
+    if plat == 2 or plat == 3 or plat == 4 do
+        name_off = 19
+        type_off = 18
+    end
+
+    let d = opendir(path)
+    if d == 0 do out 0 end
+
+    var ent = readdir(d)
+    when ent != 0 loop
+        let name_ptr = ent + name_off
+        let ent_type = read_byte(ent, type_off)
+        if str_streq(name_ptr, "." as int) == 0 and str_streq(name_ptr, ".." as int) == 0 do
+            let full_path = str_concat3(path, "/" as int, name_ptr)
+            if ent_type == 4 do # DT_DIR
+                walk_compiler_src(full_path)
+            eif ent_type == 8 or ent_type == 0 do # DT_REG
+                if str_ends_with(full_path, ".vri" as int) == 1 do
+                    g_dep_file_count = g_dep_file_count + 1
+                    let v = check_file_dependencies(full_path)
+                    g_dep_violations = g_dep_violations + v
+                end
+            end
+            free(full_path)
+        end
+        ent = readdir(d)
+    end
+    closedir(d)
+    out 0
+end.
+
+# ── Main Entry ────────────────────────────────────────────────────────────────
+
+func main():
+    raw_print("==============================================\n" as int)
+    raw_print("  vir-pass-check — Compiler Architecture Gate\n" as int)
+    raw_print("  Governed by VIRC-PLN-0003, PLN-0005 & PLN-0029\n" as int)
+    raw_print("==============================================\n\n" as int)
+
+    var total_errors = 0
+
+    # 1. Check Pass Orchestrators (3 orchestrators)
+    var orch_errors = 0
+    orch_errors = orch_errors + check_pass_orchestrator("compiler/src/ir/mir/passOptimize.vri" as int, "passOptimize.vri" as int)
+    orch_errors = orch_errors + check_pass_orchestrator("compiler/src/semantic/passBorrow.vri" as int, "passBorrow.vri" as int)
+    orch_errors = orch_errors + check_pass_orchestrator("compiler/src/semantic/passTypecheck.vri" as int, "passTypecheck.vri" as int)
+    total_errors = total_errors + orch_errors
+
+    # 2. Check Standard Library Boundary
+    let stdlib_errors = check_stdlib_boundary()
+    total_errors = total_errors + stdlib_errors
+
+    # 3. Check Module Dependencies Hygiene across compiler/src
+    walk_compiler_src("compiler/src" as int)
+    total_errors = total_errors + g_dep_violations
+
+    if total_errors > 0 do
+        raw_print("\nFAIL: Pass architecture violations detected (" as int)
+        print_int(total_errors)
+        raw_print(" violation(s))\n" as int)
+        exit_prog(1)
+    end
+
+    raw_print("PASS: Architecture verified (3 orchestrator(s) checked, stdlib boundary clean, " as int)
+    print_int(g_dep_file_count)
+    raw_print(" module dependencies clean).\n" as int)
+    exit_prog(0)
+end.

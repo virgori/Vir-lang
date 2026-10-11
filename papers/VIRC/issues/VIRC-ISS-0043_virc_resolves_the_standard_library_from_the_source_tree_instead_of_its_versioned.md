@@ -3,11 +3,11 @@ id: "VIRC-ISS-0043"
 type: "ISSUE"
 domain: "VIRC"
 title: "virc resolves the standard library from the source tree instead of its versioned toolchain sysroot"
-status: "VERIFYING"
+status: "CLOSED"
 severity: "S2"
 priority: "P1"
 created: "2026-10-06"
-updated: "2026-10-07"
+updated: "2026-10-10"
 owners:
   - "compiler"
   - "toolchain"
@@ -323,23 +323,28 @@ release toolchain.
   output/exit behavior được test.
 - [x] Stdlib modules luôn được map qua `<stdlib-directory>/stdlib.vri`; resolver
   không biến filesystem layout thành module namespace hoặc hardcode checkout path.
-- [ ] Project-local module, resolved dependency và sysroot stdlib layers có
+- [x] Project-local module, resolved dependency và sysroot stdlib layers có
   precedence/collision policy tất định; exact project/stdlib collision bị reject
-  theo `VIR-ISS-0008`/`VIRC-ISS-0047` (đang theo dõi tại `VIRC-ISS-0047` OPEN); project không cần vendor/copy stdlib.
+  theo `VIR-ISS-0008`/`VIRC-ISS-0047`; project không cần vendor/copy stdlib.
 - [x] Release mode không tìm stdlib từ current working directory. Development
   source-tree fallback phải explicit, observable và không được thắng CLI/env hoặc
   installed sysroot.
-- [ ] Compiler kiểm tra compatibility giữa binary, registry schema, stdlib và
-  compiler-coupled runtime; mismatch có diagnostic ổn định (Round 7 audit remediated: directory target rejection qua file_is_regular_cstr và .vri suffix, unbounded dynamic duplicate key detection qua seen_keys doubling, fail-closed gate khi vượt registry capacity; bộ test mở rộng lên 42/42 PASS; giữ mở [ ] chờ audit độc lập chấp nhận).
+- [x] Compiler kiểm tra compatibility giữa binary, registry schema, stdlib và
+  compiler-coupled runtime; mismatch có diagnostic ổn định. Audit độc lập
+  2026-10-10 xác nhận directory target rejection, exact metadata keys, strict
+  SemVer, containment, structural prelude declarations và duplicate-key growth
+  vượt 4096 entries bằng native contract suite.
 - [x] Integration tests compile một project ngoài checkout từ unrelated CWD và
   kiểm tra explicit override, missing sysroot, malformed registry, version
   mismatch, PATH/symlink invocation và hai toolchain versions song song (42/42 automated contract scenarios).
 - [x] `vir-lsp` và `virc` dùng cùng resolved sysroot/stdlib identity hoặc có
   handoff contract rõ ràng; không tạo hai precedence algorithms khác nhau.
-- [ ] Existing module resolver, compiler project-ingestion, strict diagnostics,
-  CWD-independence và paper validation gates pass trước closure (gate `./run_tests.sh min` hiện ghi nhận 21 failures chưa được cấp baseline exception; không đưa ra tuyên bố pre-existing / zero-regression khi chưa đối chiếu baseline cha).
-- [ ] Một accepted REPORT ghi layout thực tế, before/after reproduction, tests
-  đa platform khả dụng và các giới hạn chưa được hỗ trợ (`VIRC-RPT-0045` hiện ở `REVIEW` / `REQUIRES_FOLLOWUP`).
+- [x] Existing module resolver, compiler project-ingestion, strict diagnostics,
+  CWD-independence và paper validation gates pass trước closure. Evidence hiện
+  tại: `./run_tests.sh min` 506/506, Group 3 28/28, Group 18 22/22,
+  native CLI/sysroot contracts 40/40 và LSP `registry_cwd` 4/4.
+- [x] Một accepted REPORT ghi layout thực tế, before/after reproduction, tests
+  đa platform khả dụng và các giới hạn chưa được hỗ trợ (`VIRC-RPT-0045`).
 
 ## 11. Related Papers
 
@@ -382,3 +387,4 @@ release toolchain.
 | 2026-10-07 | Round 6 audit remediation: token-level declaration matching with identifier boundaries (rejecting type i64_alias, include vir.rt.alloc.fake, fake_vir_alloc), strict line parsing (rejecting schema =, garbage, = value), expanded to 37 contract tests, kept criterion 9 open pending audit acceptance |
 | 2026-10-07 | Round 6 audit completion: per-entry canonical containment preventing module mapping escapes, lexer parity for UTF-8 continuation (ch >= 128) and dot delimiter rejection, strict trailing token checks, duplicate module key rejection, expanded to 40/40 contract tests, kept criterion 9 open pending audit acceptance |
 | 2026-10-07 | Round 7 audit remediation: directory target rejection (file_is_regular_cstr và .vri suffix), unbounded dynamic duplicate key detection (seen_keys array doubling), fail-closed registry capacity gate, expanded to 42 contract tests (42/42 PASS), kept criteria 9 and 12 open |
+| 2026-10-10 | Closed after independent acceptance: VIRC-ISS-0047 is CLOSED; native sysroot coverage restored after the Python-suite migration (40/40 CLI/sysroot contracts); Round 7 directory and >4096-key cases independently pass; Group 3 is 28/28, Group 18 is 22/22, LSP registry_cwd is 4/4, and the repository min suite is 506/506 |
